@@ -1,0 +1,13 @@
+{
+  "plan_type": "pro",
+  "rate_limit": {
+    "primary_window": null,
+    "secondary_window": { "used_percent": 16, "reset_at": 1788968897, "limit_window_seconds": 604800 }
+  },
+  "additional_rate_limits": [
+    { "limit_name": "GPT-5.3-Codex-Spark", "rate_limit": {
+      "primary_window": { "used_percent": 8, "reset_at": 1788408000, "limit_window_seconds": 18000 },
+      "secondary_window": { "used_percent": 2, "reset_at": 1788968897, "limit_window_seconds": 604800 }
+    } }
+  ]
+}

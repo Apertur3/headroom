@@ -3,25 +3,25 @@
 name = "codex-main"
 vendor = "codex"
 location = "~/.codex"
-adapter = "native"
+adapter = "native-ts"
 
 [[accounts]]
 name = "claude-main"
 vendor = "claude"
 location = "~/.claude"
-adapter = "native"
+adapter = "native-ts"
 
 [[accounts]]
 name = "claude-2"
 vendor = "claude"
 location = "~/.claude2"
-adapter = "native"
+adapter = "native-ts"
 
 [[accounts]]
 name = "antigravity"
 vendor = "antigravity"
 location = "~/.gemini/antigravity-cli"
-adapter = "native"
+adapter = "engine"
 
 # Local pools are probed only; a wake command is reported when down and never run.
 # [[accounts]]
