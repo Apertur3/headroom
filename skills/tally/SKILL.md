@@ -31,10 +31,10 @@ states and freshness. Capability routing stays yours, in `~/.tally/routing.toml`
 
 ## Commands
 
-- `tally` — one line per meter with pace state and freshness.
-- `tally can <action-class> [--allow-unknown]` — go / no-go for an action class.
-- `tally --threshold 90` — exit 2 if any fresh window is at or above 90%.
-- `tally events --since 24h` — resets seen, free resets granted or used, source failures.
+- `tally` : one line per meter with pace state and freshness.
+- `tally can <action-class> [--allow-unknown]` : go / no-go for an action class.
+- `tally --threshold 90` : exit 2 if any fresh window is at or above 90%.
+- `tally events --since 24h` : resets seen, free resets granted or used, source failures.
 - MCP tools `quota_status`, `quota_can`, `quota_events` expose the same from a daemon.
 
 ## Pace states
