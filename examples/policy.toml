@@ -1,0 +1,3 @@
+# Copy to ~/.tally/policy.toml to override Tally's fail-closed pace policy.
+freeze_reserve_pct = 10
+staleness_minutes = 15

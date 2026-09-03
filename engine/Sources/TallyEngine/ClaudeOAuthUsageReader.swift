@@ -60,9 +60,15 @@ enum ClaudeOAuthUsageReader {
         if let limits = root["limits"] as? [[String: Any]] {
             for limit in limits where limit["kind"] as? String == "weekly_scoped" && limit["is_active"] as? Bool != false {
                 guard let scoped = scopedWindow(limit) else { continue }
-                let name = (((limit["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String ?? "").lowercased()
+                // The OAuth response identifies Fable as scope.model.display_name. Other
+                // active weekly-scoped limits are the routines/Cowork allowance. Do not
+                // depend on the legacy top-level seven_day_* field names: they disappear
+                // for these scoped meters on current Claude accounts.
+                let scope = limit["scope"] as? [String: Any]
+                let model = scope?["model"] as? [String: Any]
+                let name = (model?["display_name"] as? String ?? model?["name"] as? String ?? "").lowercased()
                 if name.contains("fable") { fable = scoped }
-                if name.contains("routine") || name.contains("cowork") { routines = scoped }
+                else { routines = scoped }
             }
         }
         return ClaudeUsageSnapshot(fiveHour: fiveHour, sevenDay: sevenDay, fable: fable, routines: routines)
@@ -76,7 +82,8 @@ enum ClaudeOAuthUsageReader {
     }
 
     private static func scopedWindow(_ value: [String: Any]) -> ClaudeUsageWindow? {
-        guard let percent = (value["percent"] as? NSNumber)?.doubleValue, percent.isFinite else { return nil }
+        let raw = (value["utilization"] as? NSNumber)?.doubleValue ?? (value["percent"] as? NSNumber)?.doubleValue
+        guard let percent = raw, percent.isFinite else { return nil }
         return ClaudeUsageWindow(percent: min(100, max(0, percent)), resetsAt: date(value["resets_at"]), minutes: 10_080)
     }
 
