@@ -5,9 +5,11 @@
   "description": "Local quota readings for AI subscriptions",
   "type": "module",
   "engines": { "node": ">=20" },
+  "files": ["dist", "engine.lock.json", "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"],
   "bin": { "tally": "dist/cli.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "engine:build": "swift build -c release --package-path engine"

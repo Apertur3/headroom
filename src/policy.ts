@@ -35,9 +35,15 @@ export function parsePolicy(text: string): Policy {
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
   if (!observation) return { state: "UNKNOWN", reason: "no observation" };
+  if (observation.window?.kind === "state") {
+    const state = observation.metadata?.state;
+    if (state === "UP") return { state, reason: "local pool up" };
+    if (state === "BUSY") return { state, reason: `local pool busy${observation.metadata?.waiting ? `; waiting ${observation.metadata.waiting}` : ""}` };
+    return { state: "DOWN", reason: observation.reason ?? "local pool down" };
+  }
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };
-  if (!observation.quantity || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
+  if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
   const fetched = new Date(observation.fetched_at).getTime();
   if (!Number.isFinite(fetched)) return { state: "UNKNOWN", reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
@@ -60,11 +66,15 @@ export function paceDecision(observation: Observation | undefined, policy = defa
 
 export function paceState(observation: Observation, policy = defaultPolicy, now = new Date()): PaceState { return paceDecision(observation, policy, now).state; }
 
-const severity: Record<PaceState, number> = { NOT_ENFORCED: -1, HARVEST: 0, NORMAL: 1, CONSERVE: 2, UNKNOWN: 3, FREEZE: 4 };
+const severity: Record<PaceState, number> = { NOT_ENFORCED: -1, UP: 0, HARVEST: 0, BUSY: 1, NORMAL: 1, CONSERVE: 2, UNKNOWN: 3, DOWN: 4, FREEZE: 5 };
 
 /** Fail closed over every meter consumed by an action. */
 export interface MeterPaceDecision { meter: string; state: PaceState; reason: string; }
-export interface CanDecision { allowed: boolean; meter: string; state: PaceState; reason: string; meters: MeterPaceDecision[]; }
+export interface CanDecision {
+  allowed: boolean; meter: string; state: PaceState; reason: string; meters: MeterPaceDecision[];
+  local_preference?: "fallback" | "prefer" | "never";
+  local_meter_considered?: boolean;
+}
 
 function windowLabel(observation: Observation): string {
   const minutes = observation.window?.minutes;
@@ -76,6 +86,7 @@ function windowLabel(observation: Observation): string {
 }
 
 function windowValue(observation: Observation, state: PaceState): string {
+  if (state === "UP" || state === "BUSY" || state === "DOWN") return state;
   return state === "NOT_ENFORCED" ? "n/a" : observation.quantity ? `${Math.round(observation.quantity.used)}%` : "UNKNOWN";
 }
 
@@ -97,5 +108,24 @@ export function canConsume(meters: string[], observations: Map<string, Observati
   if (!meters.length) throw new Error("An action must consume at least one meter");
   const states = meters.map((meter) => ({ meter, ...meterDecision(observations.get(meter), policy, now) }));
   const limiting = states.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
-  return { allowed: !states.some((item) => item.state === "FREEZE" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
+  return { allowed: !states.some((item) => item.state === "FREEZE" || item.state === "DOWN" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
+}
+
+/** Select local capacity as an alternative route without weakening subscription
+ * limits. `fallback` only opens local routing once all subscription meters are
+ * conserving, frozen, or unknown. */
+export function canRoute(
+  subscriptionMeters: string[], localMeters: string[], observations: Map<string, Observation | Observation[] | undefined>,
+  localPreference: "fallback" | "prefer" | "never", policy = defaultPolicy, allowUnknown = false, now = new Date(),
+): CanDecision {
+  const subscriptions = canConsume(subscriptionMeters, observations, policy, allowUnknown, now);
+  const localAvailable = localMeters.length > 0;
+  const fallbackEligible = subscriptions.meters.length > 0 && subscriptions.meters.every((item) => item.state === "CONSERVE" || item.state === "FREEZE" || item.state === "UNKNOWN");
+  const consider = localAvailable && localPreference !== "never" && (localPreference === "prefer" || fallbackEligible);
+  if (!consider) return { ...subscriptions, local_preference: localPreference, local_meter_considered: false };
+  const local = canConsume(localMeters, observations, policy, allowUnknown, now);
+  // A preferred/fallback local pool only wins if it is actually usable; a down
+  // local service never blocks a subscription that can still serve the action.
+  const decision = local.allowed ? local : subscriptions;
+  return { ...decision, local_preference: localPreference, local_meter_considered: true };
 }

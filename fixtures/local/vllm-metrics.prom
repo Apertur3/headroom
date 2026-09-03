@@ -1,0 +1,6 @@
+# HELP vllm:num_requests_running Number of requests currently running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 0
+# HELP vllm:num_requests_waiting Number of requests waiting for a worker.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting 2

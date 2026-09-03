@@ -1,11 +1,12 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { readConsumes, readPolicy } from "./config.js";
+import { readPolicy, readRouting } from "./config.js";
 import { pollAccounts, type PollResult } from "./collector.js";
 import { tallyHome } from "./paths.js";
-import { canConsume } from "./policy.js";
+import { canRoute } from "./policy.js";
 import { readAccounts } from "./registry.js";
+import { isLocalAccount } from "./types.js";
 import { safeTallyDirectory, TallyStore } from "./store.js";
 
 type Json = Record<string, unknown>;
@@ -110,10 +111,14 @@ export class TallyDaemon {
         }
         case "can": {
           const action = typeof params.action_class === "string" ? params.action_class : "";
-          const meters = (await readConsumes())[action];
+          const routing = await readRouting();
+          const meters = routing.consumes[action];
           if (!meters) return rpcError(request.id, -32602, `Unknown action class: ${action || "(missing)"}`);
+          await this.poll(undefined, false);
           const policy = await readPolicy();
-          result = canConsume(meters, new Map(meters.map((meter) => [meter, this.store.latestPerWindow(meter)])), policy, params.allow_unknown === true);
+          const localMeters = (await readAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+          const allMeters = [...new Set([...meters, ...localMeters])];
+          result = canRoute(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true);
           break;
         }
         case "refresh": {

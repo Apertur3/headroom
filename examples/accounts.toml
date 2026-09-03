@@ -23,16 +23,9 @@ vendor = "antigravity"
 location = "~/.gemini/antigravity-cli"
 adapter = "native"
 
-# Local adapter lands in slice 5. Tally reports this as UNKNOWN until then.
+# Local pools are probed only; a wake command is reported when down and never run.
 # [[accounts]]
 # name = "gpu-box-vllm"
 # kind = "local"
 # base_url = "http://10.0.0.20:8000"
-# adapter = "pending"
-#
-# [[accounts]]
-# name = "workstation"
-# kind = "local"
-# base_url = "http://10.0.0.9:8000"
-# wake = "ssh gateway wake-workstation"
-# adapter = "pending"
+# adapter = "native"

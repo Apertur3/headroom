@@ -12,9 +12,10 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const lockPath = join(repoRoot, "engine.lock.json");
 
 export interface LockedAsset { name: string; sha256?: string; url?: string }
+export interface NativeLockedAsset { name: string; sha256?: string | null; unpinned?: boolean; url?: string }
 export interface EngineLock {
   tag: string;
-  native?: { tag: string; binary: string };
+  native?: { tag: string; repository: string; binary: string; assets: Record<string, NativeLockedAsset> };
   repository: string;
   releaseAssets: string[];
   assets: Record<string, LockedAsset>;
@@ -30,6 +31,18 @@ export function platformAssetName(tag: string, os = platform(), cpu = arch()): s
       ? linuxTarget(cpu)
       : unsupported(os, cpu);
   return `CodexBarCLI-${tag}-${suffix}.tar.gz`;
+}
+
+export function nativePlatformAssetName(lock: EngineLock, os = platform(), cpu = arch()): NativeLockedAsset {
+  if (!lock.native) throw new Error("No native engine release section in engine.lock.json");
+  const target = os === "darwin"
+    ? cpu === "arm64" ? "macos-arm64" : cpu === "x64" ? "macos-x86_64" : unsupported(os, cpu)
+    : os === "linux"
+      ? cpu === "x64" ? "linux-x86_64" : cpu === "arm64" ? "linux-aarch64" : unsupported(os, cpu)
+      : unsupported(os, cpu);
+  const asset = lock.native.assets[target];
+  if (!asset) throw new Error(`No native engine release asset for ${os}/${cpu}`);
+  return asset;
 }
 
 function linuxTarget(cpu: string): string {
@@ -114,6 +127,47 @@ export async function installEngine(): Promise<{ tag: string; path: string; sha2
     throw error;
   }
   return { tag: lock.tag, path: await verifiedEnginePath(), sha256, firstPin };
+}
+
+/** Install Tally's own Swift engine only after its release archive is explicitly
+ * pinned. An `unpinned` placeholder is a build/release todo, never permission
+ * to fetch arbitrary release bytes. */
+export async function installNativeEngine(): Promise<{ installed: true; tag: string; path: string; sha256: string } | { installed: false; hint: string }> {
+  const lock = await readEngineLock();
+  if (!lock.native) return { installed: false, hint: "Native engine is not configured; build locally with npm run engine:build." };
+  const asset = nativePlatformAssetName(lock);
+  if (!asset.sha256 || asset.unpinned) return { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
+  const url = asset.url ?? `https://github.com/${lock.native.repository}/releases/download/${lock.native.tag}/${asset.name}`;
+  const response = await fetch(url, { headers: { "User-Agent": "tallyq" } });
+  if (!response.ok) throw new Error(`Native engine download failed: HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  if (sha256 !== asset.sha256) throw new Error(`SHA-256 mismatch for ${asset.name}`);
+  const root = join(tallyHome(), "engine", "native");
+  const staging = `${root}.staging-${process.pid}`;
+  await fs.rm(staging, { recursive: true, force: true });
+  await fs.mkdir(staging, { recursive: true, mode: 0o700 });
+  const archive = join(staging, asset.name);
+  try {
+    await fs.writeFile(archive, bytes, { mode: 0o600 });
+    const { stdout: entries } = await execFileAsync("tar", ["-tzf", archive]);
+    for (const entry of entries.split("\n").filter(Boolean)) {
+      if (entry.startsWith("/") || entry.split("/").includes("..")) throw new Error("Native engine archive contains an unsafe path");
+    }
+    await execFileAsync("tar", ["-xzf", archive, "-C", staging]);
+    await fs.rm(archive, { force: true });
+    const binary = join(staging, lock.native.binary);
+    await fs.access(binary);
+    await fs.chmod(binary, 0o700);
+    await fs.writeFile(join(staging, ".tally-native-engine.json"), JSON.stringify({ tag: lock.native.tag, asset: asset.name, sha256 }), { mode: 0o600 });
+    await fs.mkdir(dirname(root), { recursive: true, mode: 0o700 });
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rename(staging, root);
+  } catch (error) {
+    await fs.rm(staging, { recursive: true, force: true });
+    throw error;
+  }
+  return { installed: true, tag: lock.native.tag, path: join(root, lock.native.binary), sha256 };
 }
 
 async function findEngineBinary(root: string): Promise<string> {
