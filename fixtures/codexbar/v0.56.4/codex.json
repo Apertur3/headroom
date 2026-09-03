@@ -1,0 +1,24 @@
+[
+  {
+    "provider": "codex",
+    "source": "oauth",
+    "version": "0.56.4",
+    "usage": {
+      "accountEmail": "user@example.com",
+      "loginMethod": "pro",
+      "dataConfidence": "exact",
+      "primary": { "usedPercent": 12, "resetsAt": "2026-09-03T17:23:00Z", "windowMinutes": 300 },
+      "secondary": { "usedPercent": 3, "resetsAt": "2026-09-10T15:08:00Z", "windowMinutes": 10080 },
+      "extraRateWindows": [
+        { "id": "sha256:7f7c8f9a1a2a3b4c5d6e7f8090a1b2c3d4e5f60718293a4b5c6d7e8f90123456", "title": "Codex Spark 5-hour", "usedPercent": 8, "resetsAt": "2026-09-03T17:23:00Z", "windowMinutes": 300 },
+        { "id": "sha256:0f0e0d0c0b0a09080706050403020100ffeeddccbbaa99887766554433221100", "title": "Codex Spark Weekly", "usedPercent": 2, "resetsAt": "2026-09-10T15:08:00Z", "windowMinutes": 10080 }
+      ],
+      "codexResetCredits": {
+        "availableCount": 1,
+        "credits": [
+          { "id": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", "status": "available", "expires_at": "2026-09-08T17:23:00Z" }
+        ]
+      }
+    }
+  }
+]

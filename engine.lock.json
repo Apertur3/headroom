@@ -1,0 +1,27 @@
+{
+  "tag": "v0.56.4",
+  "repository": "steipete/CodexBar",
+  "releaseAssets": [
+    "CodexBar-macos-universal-0.56.4.dSYM.zip",
+    "CodexBar-macos-universal-0.56.4.zip",
+    "CodexBarCLI-v0.56.4-linux-aarch64.tar.gz",
+    "CodexBarCLI-v0.56.4-linux-aarch64.tar.gz.sha256",
+    "CodexBarCLI-v0.56.4-linux-musl-aarch64.tar.gz",
+    "CodexBarCLI-v0.56.4-linux-musl-aarch64.tar.gz.sha256",
+    "CodexBarCLI-v0.56.4-linux-musl-x86_64.tar.gz",
+    "CodexBarCLI-v0.56.4-linux-musl-x86_64.tar.gz.sha256",
+    "CodexBarCLI-v0.56.4-linux-x86_64.tar.gz",
+    "CodexBarCLI-v0.56.4-linux-x86_64.tar.gz.sha256",
+    "CodexBarCLI-v0.56.4-macos-arm64.tar.gz",
+    "CodexBarCLI-v0.56.4-macos-arm64.tar.gz.sha256",
+    "CodexBarCLI-v0.56.4-macos-x86_64.tar.gz",
+    "CodexBarCLI-v0.56.4-macos-x86_64.tar.gz.sha256"
+  ],
+  "assets": {
+    "CodexBarCLI-v0.56.4-macos-arm64.tar.gz": {
+      "name": "CodexBarCLI-v0.56.4-macos-arm64.tar.gz",
+      "sha256": "2da09522860e7022d36e2a96b286b749b582c89710215d9c43347eca7112d36d",
+      "url": "https://github.com/steipete/CodexBar/releases/download/v0.56.4/CodexBarCLI-v0.56.4-macos-arm64.tar.gz"
+    }
+  }
+}
