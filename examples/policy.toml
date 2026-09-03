@@ -5,8 +5,8 @@ pace_grace_fraction = 0.10
 staleness_minutes = 15
 poll_interval_minutes = 5
 # Keep the daemon-owned `agy` pseudo-terminal warm for real local quota summaries.
-# Defaults to true on macOS and Linux; set false to use the remote OAuth source only.
-# antigravity_keepalive = true
+# This keeps one background process and pseudo-terminal alive (small but continuous energy cost).
+antigravity_keepalive = true
 # Proxy environment variables are ignored. Set this explicitly when a proxy is required.
 # proxy = "http://127.0.0.1:8080"
 # Per-principal intervals override the default:

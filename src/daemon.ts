@@ -201,7 +201,13 @@ export class HeadroomDaemon {
           });
           result = Object.fromEntries(this.store.resetSeenFor(windows)); break;
         }
-        case "health": result = { socket: this.path, in_flight: this.inFlight.size, backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })), ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}) }; break;
+        case "health": result = {
+          socket: this.path,
+          in_flight: this.inFlight.size,
+          backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })),
+          keepalive: { running: this.keepalive?.running === true, pid: this.keepalive?.pid ?? null },
+          ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}),
+        }; break;
         default: return rpcError(request.id, -32601, "Method not found");
       }
       this.store.audit(caller, request.method, typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null, "ok");

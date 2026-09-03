@@ -11,9 +11,14 @@ export interface Policy {
   proxy?: string;
 }
 
+/** Keep the local Antigravity reader warm by default wherever `script` is available. */
+export function defaultAntigravityKeepalive(platform = process.platform): boolean {
+  return platform === "darwin" || platform === "linux";
+}
+
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {},
-  antigravity_keepalive: process.platform === "darwin" || process.platform === "linux",
+  antigravity_keepalive: defaultAntigravityKeepalive(),
 };
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
@@ -42,7 +47,7 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultPolicy.antigravity_keepalive, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), ...(proxy ? { proxy } : {}) };
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
