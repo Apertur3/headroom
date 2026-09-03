@@ -43,7 +43,7 @@ export async function discoverAccounts(home = homedir(), environment = process.e
   });
   const antigravityCLI = join(vendorHome("gemini", { home }), "antigravity-cli");
   if (await exists(antigravityCLI) || await agyOnPath(environment.PATH)) {
-    accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "engine" });
+    accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "native-ts" });
   }
   return accounts;
 }
