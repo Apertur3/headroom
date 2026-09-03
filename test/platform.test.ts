@@ -31,6 +31,7 @@ describe("service generators", () => {
     await expect(installService("cli.js", "win32", "C:\\Users\\alice", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }, "alice")).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Create /TN "Headroom Daemon" /XML "C:\\Users\\alice\\AppData\\Local\\headroom\\headroom-daemon.xml" /F' });
     await expect(uninstallService("win32", "C:\\Users\\alice", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Delete /TN "Headroom Daemon" /F' });
     expect(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).toContain('daemon.log');
+    expect(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).toContain('PATH=C:\\Users\\alice\\.local\\bin');
   });
 
   it("keeps a complete systemd user unit", async () => {
@@ -39,8 +40,10 @@ describe("service generators", () => {
     const unit = serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", "alice", "/home/alice");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain("StandardOutput=append:/home/alice/.headroom/logs/daemon.log");
+    expect(unit).toContain('Environment="PATH=/home/alice/.local/bin:/opt/homebrew/bin');
     const plist = serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", "alice", "/Users/alice");
     expect(plist).toContain("<key>StandardOutPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
     expect(plist).toContain("<key>StandardErrorPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
+    expect(plist).toContain("<key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/alice/.local/bin:/opt/homebrew/bin");
   });
 });

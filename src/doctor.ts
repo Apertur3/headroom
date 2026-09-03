@@ -19,11 +19,18 @@ export interface DoctorCheck { level: DoctorLevel; check: string; detail: string
 function check(level: DoctorLevel, name: string, detail: string, fix: string): DoctorCheck { return { level, check: name, detail, fix }; }
 function rendered(item: DoctorCheck): string { return `${item.level.padEnd(4)} ${item.check}: ${item.detail} — ${item.fix}`; }
 
-async function secureFile(path: string): Promise<boolean> {
+type FileStatus = "present" | "missing" | "unsafe";
+
+/** Config and service-managed logs are intentionally allowed to be 0644; only
+ * ownership, links, and writable permissions make these paths unsafe. */
+export async function doctorFileStatus(path: string): Promise<FileStatus> {
   try {
     const info = await lstat(path);
-    return info.isFile() && !info.isSymbolicLink() && (process.platform === "win32" || (info.mode & 0o077) === 0);
-  } catch { return false; }
+    if (!info.isFile() || info.isSymbolicLink()) return "unsafe";
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) return "unsafe";
+    if (process.platform !== "win32" && (info.mode & 0o022) !== 0) return "unsafe";
+    return "present";
+  } catch (error: unknown) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe"; }
 }
 
 async function credentialCheck(account: Account): Promise<DoctorCheck> {
@@ -36,7 +43,7 @@ async function credentialCheck(account: Account): Promise<DoctorCheck> {
     } catch { return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`); }
   }
   const path = credentialPath(account.vendor, account.vendor === "antigravity" ? undefined : account.location);
-  return (await secureFile(path))
+  return (await doctorFileStatus(path)) === "present"
     ? check("OK", `principal ${account.name} credential`, `credential file present (${path})`, "no action needed")
     : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, account.vendor === "antigravity" ? "run: gemini" : `run: ${account.vendor}`);
 }
@@ -50,7 +57,9 @@ function adapterCheck(account: Account): DoctorCheck {
 
 async function configCheck(name: "policy" | "routing", path: string): Promise<DoctorCheck> {
   try {
-    if (!(await secureFile(path))) return check("WARN", name, `not present; using built-in defaults (${path})`, name === "policy" ? "copy examples/policy.toml to this path" : "create routing.toml with [consumes]");
+    const status = await doctorFileStatus(path);
+    if (status === "missing") return check("WARN", name, `not present; using built-in defaults (${path})`, name === "policy" ? "copy examples/policy.toml to this path" : "create routing.toml with [consumes]");
+    if (status === "unsafe") return check("FAIL", name, `unsafe file (${path})`, `fix ownership or writable permissions on ${path}`);
     await (name === "policy" ? readPolicy() : readRouting());
     return check("OK", name, `valid ${path}`, "no action needed");
   } catch (error) {
@@ -88,12 +97,17 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   if (daemon.status === "available") {
     output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
     output.push(check("OK", "daemon health", "responding", "no action needed"));
-    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null } };
+    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
     const antigravity = accounts.find((account) => !isLocalAccount(account) && account.vendor === "antigravity");
     const keepalive = health.keepalive;
     if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
     else if (!keepaliveEnabled) output.push(check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
-    else if (keepalive?.running && keepalive.pid) output.push(check("OK", "Antigravity keepalive", `agy supervisor process ${keepalive.pid} is running`, "no action needed"));
+    else if (keepalive?.running && keepalive.pid) {
+      const local = antigravity ? keepalive.local_reads?.[antigravity.name] : undefined;
+      const uptime = keepalive.uptime_ms === undefined || keepalive.uptime_ms === null ? "?" : `${Math.floor(keepalive.uptime_ms / 1000)}s`;
+      const read = local ? `; local ${local.outcome ?? "unknown"} (${local.payload_kind ?? "unknown"})` : "; local read not recorded yet";
+      output.push(check("OK", "Antigravity keepalive", `agy supervisor process ${keepalive.pid} running ${uptime}${read}`, "no action needed"));
+    }
     else output.push(check("FAIL", "Antigravity keepalive", "agy process is not running", "set antigravity_keepalive = true and restart headroom service"));
   } else {
     output.push(check("FAIL", "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
@@ -105,9 +119,12 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
 
   output.push(await configCheck("policy", join(home, "policy.toml")));
   output.push(await configCheck("routing", process.env.HEADROOM_ROUTING ?? join(home, "routing.toml")));
-  output.push((await secureFile(daemonLogPath(home)))
+  const logStatus = await doctorFileStatus(daemonLogPath(home));
+  output.push(logStatus === "present"
     ? check("OK", "daemon log", daemonLogPath(home), "headroom logs --tail 50")
-    : check("WARN", "daemon log", `not written yet (${daemonLogPath(home)})`, "headroom install-service"));
+    : logStatus === "missing"
+      ? check("WARN", "daemon log", `not written yet (${daemonLogPath(home)})`, "headroom install-service")
+      : check("WARN", "daemon log", `unsafe log file (${daemonLogPath(home)})`, "fix ownership or writable permissions"));
   return output;
 }
 

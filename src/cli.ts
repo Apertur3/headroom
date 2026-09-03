@@ -206,7 +206,7 @@ function printLeases(items: Lease[]): void {
   for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
 }
 
-export function endedLeaseMessage(lease: Lease): string { return `ended ${lease.id} (owner ${lease.owner})`; }
+export function endedLeaseMessage(lease: Lease): string { return lease.already_ended ? `already ended ${lease.id} (owner ${lease.owner})` : `ended ${lease.id} (owner ${lease.owner})`; }
 
 async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {

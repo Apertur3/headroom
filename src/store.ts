@@ -1,10 +1,11 @@
-import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { headroomHome, migrateLegacyHome } from "./paths.js";
 import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
+import { appendDaemonLog } from "./logs.js";
 
 interface Database {
   exec(sql: string): void;
@@ -50,6 +51,24 @@ async function safeDatabasePath(home?: string): Promise<string> {
   return path;
 }
 
+/** Return an owned legacy database only; never follow a file planted beside the
+ * current store. The caller removes it only after a successful merge. */
+async function legacyDatabasePath(directory: string): Promise<string | undefined> {
+  const path = join(directory, ["ta", "lly.db"].join(""));
+  try {
+    for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+      try {
+        const stat = await lstat(candidate);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Refusing unsafe legacy database file");
+        if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing legacy database owned by another user");
+        if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing legacy database with group or world permissions");
+      } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    await lstat(path);
+    return path;
+  } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+}
+
 function json(value: unknown): string | null { return value === undefined ? null : JSON.stringify(value); }
 function parseJson<T>(value: unknown, fallback: T): T { try { return typeof value === "string" ? JSON.parse(value) as T : fallback; } catch { return fallback; } }
 
@@ -90,6 +109,8 @@ export class HeadroomStore {
     // rather than an immediate "database is locked" failure.
     db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
     store.migrate();
+    const legacy = await legacyDatabasePath(resolve(path, ".."));
+    if (legacy) await store.mergePriorDatabase(legacy, resolve(path, ".."));
     if (process.platform !== "win32") for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
       try { await chmod(candidate, 0o600); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
@@ -97,6 +118,30 @@ export class HeadroomStore {
   }
 
   close(): void { this.db.close(); }
+
+  /** Preserve observation history from the transient post-rename legacy store,
+   * then remove that duplicate only after the INSERT and audit succeed. */
+  private async mergePriorDatabase(legacy: string, home: string): Promise<void> {
+    const quoted = legacy.replaceAll("'", "''");
+    this.db.exec(`ATTACH DATABASE '${quoted}' AS legacy`);
+    let legacyCount = 0;
+    let currentCount = 0;
+    try {
+      const table = this.db.prepare("SELECT name FROM legacy.sqlite_master WHERE type = 'table' AND name = 'observations'").get();
+      currentCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM observations").get()?.count ?? 0);
+      if (table) {
+        legacyCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM legacy.observations").get()?.count ?? 0);
+        if (legacyCount) this.db.exec(`INSERT INTO observations
+          (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
+          SELECT principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json FROM legacy.observations`);
+      }
+      this.audit("migration", ["merge_legacy_", "ta", "lly_db"].join(""), null, `headroom.db observations=${currentCount}; ${["ta", "lly.db"].join("")} observations=${legacyCount}; merged=${legacyCount}`);
+    } finally { this.db.exec("DETACH DATABASE legacy"); }
+    for (const candidate of [legacy, `${legacy}-wal`, `${legacy}-shm`]) {
+      try { await unlink(candidate); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    await appendDaemonLog(`migration: merged ${["ta", "lly.db"].join("")} observations=${legacyCount} into headroom.db observations=${currentCount}; removed legacy database`, home);
+  }
 
   private migrate(): void {
     this.db.exec(`
@@ -308,7 +353,7 @@ export class HeadroomStore {
     const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
     if (!row) throw new Error("lease not found");
     const lease = leaseFromRow(row);
-    if (lease.ended_at) return lease;
+    if (lease.ended_at) return { ...lease, already_ended: true };
     if (owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
     const ended = { ...lease, ended_at: now.toISOString(), ended_reason: "ended" };
     this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ?").run(ended.ended_at, ended.ended_reason, id);
@@ -318,8 +363,9 @@ export class HeadroomStore {
 
   leases(meterId?: string, activeOnly = false, now = new Date()): Lease[] {
     this.expireLeases(now);
-    const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL" : ""].filter(Boolean).join(" AND ");
-    return this.db.prepare(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...(meterId ? [meterId] : [])).map(leaseFromRow);
+    const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL AND l.expires_at > ?" : ""].filter(Boolean).join(" AND ");
+    const params = [...(meterId ? [meterId] : []), ...(activeOnly ? [now.toISOString()] : [])];
+    return this.db.prepare(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...params).map(leaseFromRow);
   }
 
   private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {

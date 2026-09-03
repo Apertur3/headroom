@@ -87,7 +87,7 @@ async function directLeaseEnd(arguments_: Record<string, unknown>): Promise<Dire
 
 async function directLeases(): Promise<DirectResult> {
   const store = await HeadroomStore.open();
-  try { return { source: "direct", leases: store.leases() }; } finally { store.close(); }
+  try { return { source: "direct", leases: store.leases(undefined, true) }; } finally { store.close(); }
 }
 
 async function directResult(method: string, arguments_: Record<string, unknown>): Promise<DirectResult> {
