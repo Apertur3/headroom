@@ -63,7 +63,9 @@ export class TallyDaemon {
       if (stat.isSymbolicLink() || !stat.isSocket()) throw new Error("Refusing unsafe tally socket");
       if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing tally socket owned by another user");
       if ((stat.mode & 0o077) !== 0) throw new Error("Refusing tally socket with group or world permissions");
-      if (await daemonAvailable(this.path)) throw new Error("Tally daemon is already running");
+      const daemon = await daemonRequest(this.path, "health");
+      if (daemon.status === "available") throw new Error("Tally daemon is already running");
+      if (daemon.status === "unresponsive") throw new Error("Tally daemon socket is present but health did not respond within 2s");
       await unlink(this.path); // a safe, inaccessible stale socket only
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -185,20 +187,30 @@ export class TallyDaemon {
   }
 }
 
-async function daemonAvailable(path: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = createConnection(path);
-    socket.setTimeout(250);
-    socket.once("connect", () => { socket.destroy(); resolve(true); });
-    socket.once("error", () => resolve(false));
-    socket.once("timeout", () => { socket.destroy(); resolve(false); });
-  });
+async function socketExists(path: string): Promise<boolean> {
+  try { return (await lstat(path)).isSocket(); }
+  catch { return false; }
 }
 
-export async function rpc(path: string, method: string, params: Json = {}): Promise<unknown | undefined> {
+/**
+ * Probe health separately from a potentially slow request. A live daemon may
+ * need to poll before answering `status`; that must not look like no daemon.
+ */
+export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000): Promise<
+  | { status: "available"; result: unknown }
+  | { status: "absent" }
+  | { status: "unresponsive" }
+> {
+  const health = await rpc(path, "health", {}, healthTimeoutMs);
+  if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
+  const result = await rpc(path, method, params, 30_000);
+  return result === undefined ? { status: "unresponsive" } : { status: "available", result };
+}
+
+export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000): Promise<unknown | undefined> {
   return new Promise((resolve) => {
     const socket = createConnection(path);
-    socket.setEncoding("utf8"); socket.setTimeout(300);
+    socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
     const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
     socket.once("connect", () => socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, _caller: { pid: process.pid, process: process.argv[1] ?? "tally" } } })}\n`));

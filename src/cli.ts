@@ -3,9 +3,9 @@ import { readConsumes, readPolicy } from "./config.js";
 import { engineStatus, installEngine } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { pollAccounts } from "./collector.js";
-import { rpc, socketPath, TallyDaemon } from "./daemon.js";
+import { daemonRequest, socketPath, TallyDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { canConsume, paceState } from "./policy.js";
+import { canConsume, paceState, type CanDecision } from "./policy.js";
 import { accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { installService, uninstallService } from "./service.js";
@@ -43,6 +43,15 @@ function formatWindow(observation: Observation, state: PaceState): string {
   return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
 }
 
+/** Only fall back to SQLite when no daemon socket exists. A socket which cannot
+ * answer health is an operational problem, not permission to race its writer. */
+async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
+  const request = await daemonRequest(socketPath(), method, params);
+  if (request.status === "available") return request.result;
+  if (request.status === "unresponsive") throw new Error("Tally daemon socket is present but health did not respond within 2s");
+  return undefined;
+}
+
 function age(observation: Observation): string {
   const milliseconds = Math.max(0, Date.now() - new Date(observation.fetched_at).getTime());
   return milliseconds < 60_000 ? "<1m" : `${Math.floor(milliseconds / 60_000)}m`;
@@ -54,7 +63,7 @@ function formatMeters(observations: Observation[], policy: Awaited<ReturnType<ty
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
     const ordered = [...windows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
     const freshness = ordered.every((item) => item.freshness === "fresh") ? "fresh" : ordered.some((item) => item.freshness === "failed") ? "failed" : ordered.some((item) => item.freshness === "stale") ? "stale" : "not enforced";
-    return `${meter}  ${ordered.map((item) => formatWindow(item, paceState(item, policy))).join(" | ")}  (${freshness} ${age(ordered[0])})`;
+    return `${meter}  ${ordered.map((item) => `${formatWindow(item, paceState(item, policy))}${item.reason ? ` (${item.reason})` : ""}`).join(" | ")}  (${freshness} ${age(ordered[0])})`;
   });
 }
 
@@ -62,7 +71,7 @@ async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: tally history <meter> [--since 24h]");
   const at = argv.indexOf("--since");
-  const request = await rpc(socketPath(), "history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
+  const request = await requestDaemon("history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
   if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
   directReadNotice();
   const store = await TallyStore.open();
@@ -76,7 +85,7 @@ async function history(argv: string[]): Promise<number> {
 
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
-  const request = await rpc(socketPath(), "events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
+  const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
   if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
   directReadNotice();
   const store = await TallyStore.open();
@@ -90,13 +99,13 @@ async function events(argv: string[]): Promise<number> {
 
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
-  if (!action) throw new Error("Usage: tally can <action-class> [--allow-unknown]");
+  if (!action) throw new Error("Usage: tally can <action-class> [--allow-unknown] [--json]");
   const meters = (await readConsumes())[action];
   if (!meters) throw new Error(`Unknown action class: ${action}`);
-  const request = await rpc(socketPath(), "can", { action_class: action, allow_unknown: argv.includes("--allow-unknown") });
+  const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown") });
   if (request !== undefined) {
-    const decision = unwrapRpc(request) as { allowed: boolean; meter: string; state: PaceState };
-    console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state}`);
+    const decision = unwrapRpc(request) as CanDecision;
+    printCan(decision, argv.includes("--json"));
     return decision.allowed ? 0 : 2;
   }
   directReadNotice();
@@ -105,7 +114,7 @@ async function can(argv: string[]): Promise<number> {
     const latest = new Map(meters.map((meter) => [meter, store.latest(meter)]));
     const decision = canConsume(meters, latest, policy, argv.includes("--allow-unknown"));
     store.audit("cli", "can", action, decision.allowed ? "yes" : "no");
-    console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state}`);
+    printCan(decision, argv.includes("--json"));
     return decision.allowed ? 0 : 2;
   } finally { store.close(); }
 }
@@ -118,7 +127,7 @@ async function observe(argv: string[]): Promise<number> {
   if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 100)) throw new Error("--threshold must be 0 through 100");
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
-  const request = await rpc(socketPath(), "status");
+  const request = await requestDaemon("status");
   const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
   const { observations, failures, direct } = daemonObservations ? { observations: daemonObservations.filter((item) => !principal || item.principal_id === principal), failures: [], direct: false } : { ...(await pollAccounts(principal)), direct: true };
   if (direct) directReadNotice();
@@ -139,6 +148,12 @@ function unwrapRpc(value: unknown): unknown {
     throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
   }
   return value;
+}
+
+function printCan(decision: CanDecision, asJson: boolean): void {
+  if (asJson) { console.log(JSON.stringify(decision)); return; }
+  console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${decision.reason})`);
+  for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${meter.reason})`);
 }
 
 function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }

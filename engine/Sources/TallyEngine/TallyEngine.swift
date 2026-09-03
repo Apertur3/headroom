@@ -230,9 +230,13 @@ struct TallyEngine {
     static func claudeWindows(_ principal: Principal, meter: String, windows: [ClaudeUsageWindow?]) -> [Observation] {
         windows.compactMap { value in
             guard let value else { return nil }
+            if !value.isEnforced {
+                return notEnforcedWindow(principal, meter: meter, minutes: value.minutes ?? 10_080, source: "engine:native:claude", reason: "vendor marks scoped limit inactive")
+            }
+            guard let percent = value.percent else { return nil }
             return observation(
                 principal, meter: meter,
-                quantity: Quantity(used: value.percent, limit: 100, remaining: max(0, 100 - value.percent), unit: "percent"),
+                quantity: Quantity(used: percent, limit: 100, remaining: max(0, 100 - percent), unit: "percent"),
                 reset: value.resetsAt, observed: Date(), source: "engine:native:claude",
                 window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.minutes, enforcement: "hard"))
         }

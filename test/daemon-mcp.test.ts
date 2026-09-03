@@ -1,10 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { rpc, TallyDaemon } from "../src/daemon.js";
+import { daemonRequest, rpc, TallyDaemon } from "../src/daemon.js";
 import { handleMcp } from "../src/mcp.js";
-import { canConsume, paceState } from "../src/policy.js";
+import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -19,6 +20,30 @@ function fixture(): Observation {
 }
 
 describe("daemon JSON-RPC", () => {
+  it("uses a healthy fake daemon after its bounded health probe", async function () {
+    const root = await mkdtemp(join(tmpdir(), "tally-client-")); temporary.push(root);
+    const path = join(root, "tally.sock");
+    const methods: string[] = [];
+    const server = createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("data", (line: string) => {
+        const request = JSON.parse(line) as { id: number; method: string };
+        methods.push(request.method);
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: request.method === "status" ? [fixture()] : { ok: true } })}\n`);
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { server.once("error", reject).listen(path, resolve); });
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP fake Unix-socket daemon test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    try {
+      await expect(daemonRequest(path, "status")).resolves.toMatchObject({ status: "available", result: [expect.objectContaining({ meter_id: "codex-main:main" })] });
+      expect(methods).toEqual(["health", "status"]);
+    } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+  });
+
   it("starts on a private temp socket and coalesces concurrent status polls", async () => {
     const root = await mkdtemp(join(tmpdir(), "tally-daemon-")); temporary.push(root);
     const path = join(root, "tally.sock");
@@ -55,7 +80,7 @@ describe("not enforced windows", () => {
   it("are n/a, rather than UNKNOWN, and do not block can", () => {
     const observation = fixture();
     const absent: Observation = { ...observation, quantity: null, freshness: "not_enforced", reason: "vendor returned no 5-hour window" };
-    const policy = { freeze_reserve_pct: 10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {} };
+    const policy = defaultPolicy;
     expect(paceState(absent, policy, new Date("2026-09-03T12:00:00Z"))).toBe("NOT_ENFORCED");
     expect(canConsume([absent.meter_id], new Map([[absent.meter_id, absent]]), policy, false, new Date("2026-09-03T12:00:00Z"))).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
   });

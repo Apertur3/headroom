@@ -73,6 +73,10 @@ export class TallyStore {
     const path = await safeDatabasePath(home);
     const db = new DatabaseSync(path);
     const store = new TallyStore(db);
+    // Direct CLI reads may briefly overlap the daemon. WAL permits readers with
+    // its writer; the busy timeout turns a short writer handoff into a wait,
+    // rather than an immediate "database is locked" failure.
+    db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
     store.migrate();
     for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
       try { await chmod(candidate, 0o600); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -84,7 +88,6 @@ export class TallyStore {
 
   private migrate(): void {
     this.db.exec(`
-      PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY, principal_id TEXT NOT NULL, meter_id TEXT NOT NULL,
         window_json TEXT, quantity_json TEXT, resets_at TEXT, observed_at TEXT NOT NULL, fetched_at TEXT NOT NULL,
