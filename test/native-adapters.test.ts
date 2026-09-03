@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -129,6 +129,22 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
         expect.objectContaining({ source: "native:codex:session-log", truth: "official", freshness: "fresh", window: expect.objectContaining({ minutes: 10_080 }) }),
       ]));
       expect(observationsFromCodexRateLimitEvents(events, codex, at)).toContainEqual(expect.objectContaining({ freshness: "stale", window: expect.objectContaining({ minutes: 300 }) }));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("selects the newest event across the 20 newest session files and maps window_minutes 300 to 5h", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-codex-20-logs-"));
+    try {
+      await mkdir(join(root, "sessions"));
+      for (let index = 0; index < 21; index += 1) {
+        const timestamp = index === 20 ? "2026-09-03T23:59:00Z" : `2026-09-03T${String(index).padStart(2, "0")}:00:00Z`;
+        const path = join(root, "sessions", `${String(index).padStart(2, "0")}.jsonl`);
+        await writeFile(path, `${JSON.stringify({ timestamp, payload: { rate_limits: { primary: { used_percent: index, window_minutes: 300 } } } })}\n`);
+        await utimes(path, new Date("2026-09-03T00:00:00Z"), new Date(`2026-09-03T${index === 20 ? "00" : String(index + 1).padStart(2, "0")}:00:00Z`));
+      }
+      const events = await readCodexRateLimitEvents(root);
+      const rows = observationsFromCodexRateLimitEvents(events, codex, new Date("2026-09-03T19:30:00Z"));
+      expect(rows).toEqual([expect.objectContaining({ window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 19 }) })]);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

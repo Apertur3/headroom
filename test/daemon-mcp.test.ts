@@ -20,6 +20,37 @@ function fixture(): Observation {
 }
 
 describe("daemon JSON-RPC", () => {
+  it("keeps a warm local Antigravity read running while its remote source is backed off", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-warm-")); temporary.push(root);
+    const options: Array<Record<string, unknown> | undefined> = [];
+    const keepalive = { running: true, pid: 17, uptimeMs: 2_000, start() {}, stop() {} } as never;
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), keepalive, poller: async (_principal, option) => {
+      options.push(option as Record<string, unknown> | undefined);
+      return { observations: [], failures: [], antigravityLocal: { antigravity: { outcome: "failed", payload_kind: "placeholder", at: "2026-09-03T12:00:00Z" } } };
+    } });
+    const internal = daemon as unknown as { backoff: Map<string, { failures: number; until: number }>; poll(principal: string | undefined, forced: boolean): Promise<unknown>; antigravityLocal: Map<string, unknown> };
+    internal.backoff.set("all", { failures: 1, until: Date.now() + 60_000 });
+    await internal.poll(undefined, false);
+    expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
+    expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "placeholder" });
+    await daemon.stop();
+  });
+
+  it("returns only active leases through the daemon status/MCP lease surface", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-leases-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+    const internal = daemon as unknown as { store: { startLease(owner: string, meter: string, expected: number | null, ttl: number, note: string | null, now: Date): { id: string }; endLease(id: string, owner: string, force: boolean, now: Date): unknown }; handleLine(line: string): Promise<{ result: unknown }> };
+    const now = new Date();
+    const active = internal.store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
+    const ended = internal.store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
+    internal.store.endLease(ended.id, "cadence", false, now);
+    try {
+      await expect(internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"leases"}')).resolves.toMatchObject({ result: [expect.objectContaining({ id: active.id })] });
+      const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"leases"}');
+      expect((reply.result as Array<{ id: string }>).map((lease) => lease.id)).toEqual([active.id]);
+    } finally { await daemon.stop(); }
+  });
+
   it("uses a healthy fake daemon after its bounded health probe", async function () {
     const root = await mkdtemp(join(tmpdir(), "headroom-client-")); temporary.push(root);
     const path = join(root, "headroom.sock");

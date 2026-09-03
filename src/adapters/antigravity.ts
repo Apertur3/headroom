@@ -236,7 +236,9 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const message = error instanceof Error ? error.message : "";
     if (message === "expired") return failed(account, "token expired; run: gemini", timestamp);
     if (message === "unavailable" || message === "invalid") return failed(account, "no Gemini CLI OAuth credentials; run: gemini", timestamp);
-    const reason = error instanceof AntigravityHTTPError ? error.message : message.startsWith("vendor response") ? message : "Antigravity usage unavailable";
+    // Keep a sanitized transport/adapter diagnostic. The prior generic label
+    // hid actionable local daemon failures such as a missing agy binary.
+    const reason = error instanceof AntigravityHTTPError ? error.message : message ? redact(message).slice(0, 512) : "Antigravity usage unavailable";
     return failed(account, reason, timestamp);
   }
 }

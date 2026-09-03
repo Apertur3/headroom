@@ -33,6 +33,8 @@ export interface ProviderAccount {
   location: string;
   /** `native-ts` is credential-local TypeScript; `engine` is the optional Swift engine. */
   adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
+  /** Optional explicit agy executable for the daemon-owned warm local probe. */
+  agy_path?: string;
 }
 
 /** A local pool is a probed OpenAI-compatible capacity source. */
@@ -99,6 +101,8 @@ export interface Lease {
   ended_at: string | null;
   ended_reason: string | null;
   spent_percent: number;
+  /** Returned by an idempotent end request; never persisted. */
+  already_ended?: boolean;
 }
 
 export interface HeadroomEvent {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -22,6 +22,36 @@ function observation(overrides: Partial<Observation> = {}): Observation {
 }
 
 describe("SQLite observations and event detector", () => {
+  it("merges an adjacent legacy database observation history then logs and removes it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-db-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const legacy = await HeadroomStore.open(home);
+    legacy.insert(observation({ meter_id: "codex-main:legacy" }));
+    legacy.close();
+    await rename(join(home, "headroom.db"), join(home, ["ta", "lly.db"].join("")));
+    const store = await HeadroomStore.open(home);
+    try {
+      expect(store.history("codex-main:legacy", "2026-09-03T00:00:00Z")).toHaveLength(1);
+      await expect(import("node:fs/promises").then(({ lstat }) => lstat(join(home, ["ta", "lly.db"].join(""))))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(home, "logs", "daemon.log"), "utf8")).resolves.toContain(`merged ${["ta", "lly.db"].join("")} observations=1`);
+    } finally { store.close(); }
+  });
+
+  it("returns only active, unexpired leases and marks a repeated end idempotent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-leases-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      const active = store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
+      const ended = store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
+      store.endLease(ended.id, "cadence", false, now);
+      const expired = store.startLease("cadence", "codex-main:main", null, 1, null, now);
+      expect(store.leases(undefined, true, new Date(now.getTime() + 2))).toEqual([expect.objectContaining({ id: active.id, ended_at: null })]);
+      expect(store.endLease(ended.id, "cadence", false, now)).toMatchObject({ already_ended: true, id: ended.id });
+      expect(endedLeaseMessage({ ...ended, ended_at: now.toISOString(), ended_reason: "ended", already_ended: true })).toContain("already ended");
+      expect(expired.id).toBeTruthy();
+    } finally { store.close(); }
+  });
   it("allows two live connections to share a WAL database", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-wal-")); temporary.push(root);
     const home = join(root, ".headroom");

@@ -4,12 +4,13 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
-import { pollAccounts, type PollOptions, type PollResult } from "./collector.js";
-import { AgyKeepaliveSupervisor } from "./antigravity-keepalive.js";
+import { pollAccounts, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
+import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
+import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
 import { canRouteWithLeases } from "./policy.js";
 import { accountsPath, readAccounts } from "./registry.js";
-import { isLocalAccount, type Account, type Observation } from "./types.js";
+import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 
 type Json = Record<string, unknown>;
@@ -61,12 +62,13 @@ export class HeadroomDaemon {
   private stopping = false;
   private sessionToken: string | undefined;
   private keepalive: AgyKeepaliveSupervisor | undefined;
+  private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
 
-  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, keepalive?: AgyKeepaliveSupervisor) { this.keepalive = keepalive; }
+  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive?: AgyKeepaliveSupervisor) { this.keepalive = keepalive; }
 
   static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
-    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, options.keepalive);
+    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive);
   }
 
   async start(): Promise<void> {
@@ -78,8 +80,9 @@ export class HeadroomDaemon {
     this.installReloadHandlers();
     const policy = await readPolicy();
     const accounts = await this.currentAccounts();
-    if (policy.antigravity_keepalive && process.platform !== "win32" && accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-      this.keepalive ??= new AgyKeepaliveSupervisor();
+    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity");
+    if (policy.antigravity_keepalive && process.platform !== "win32" && antigravity) {
+      this.keepalive ??= new AgyKeepaliveSupervisor({ binary: resolveAgyBinary(antigravity.agy_path) });
       this.keepalive.start();
     }
     await this.schedulePrincipals();
@@ -186,7 +189,7 @@ export class HeadroomDaemon {
           if (params.force === true && (result as { owner: string }).owner !== params.owner) this.store.audit(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}`, "ok");
           break;
         }
-        case "leases": result = this.store.leases(); break;
+        case "leases": result = this.store.leases(undefined, true); break;
         case "refresh": {
           const principal = typeof params.principal === "string" ? params.principal : undefined;
           result = await this.poll(principal, true); break;
@@ -205,7 +208,12 @@ export class HeadroomDaemon {
           socket: this.path,
           in_flight: this.inFlight.size,
           backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })),
-          keepalive: { running: this.keepalive?.running === true, pid: this.keepalive?.pid ?? null },
+          keepalive: {
+            running: this.keepalive?.running === true,
+            pid: this.keepalive?.pid ?? null,
+            uptime_ms: this.keepalive?.uptimeMs ?? null,
+            local_reads: Object.fromEntries(this.antigravityLocal),
+          },
           ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}),
         }; break;
         default: return rpcError(request.id, -32601, "Method not found");
@@ -224,22 +232,29 @@ export class HeadroomDaemon {
     const policy = await readPolicy(); // mtime/reload safe: no cached config survives a request or SIGHUP.
     const interval = (policy.principal_intervals[principal ?? ""] ?? policy.poll_interval_minutes) * 60_000;
     const blocked = this.backoff.get(key);
-    if (blocked && blocked.until > now) return { rate_limited: true };
-    if (!forced && principal === undefined) {
+    // Keepalive's local source has no vendor request budget. It is deliberately
+    // attempted during a remote backoff so a newly-warmed agy can recover status.
+    const warmOnly = blocked !== undefined && blocked.until > now && this.keepalive?.running === true;
+    if (blocked && blocked.until > now && !warmOnly) return { rate_limited: true };
+    if (!forced && principal === undefined && !warmOnly) {
       try {
         const accounts = await this.currentAccounts();
         if (accounts.length && accounts.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
       } catch { /* A collection pass returns the useful configuration error. */ }
     }
-    if (forced && (this.lastPoll.get(key) ?? 0) + interval > now) return { rate_limited: true };
-    if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now) return { observations: [], failures: [] };
+    if (forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { rate_limited: true };
+    if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
     const current = this.inFlight.get(key);
     if (current) return current;
-    const task = this.poller(principal, { daemonOwnsAntigravity: this.keepalive?.running === true }).then((result) => {
+    const task = this.poller(principal, { daemonOwnsAntigravity: this.keepalive?.running === true, skipRemoteAntigravity: warmOnly }).then((result) => {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
       this.store.leases();
+      for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
+        this.antigravityLocal.set(principalId, read);
+        void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
+      }
       for (const principalId of new Set(result.observations.map((item) => item.principal_id))) {
         if (result.observations.some((item) => item.principal_id === principalId && item.source === "native:claude")) this.store.audit("daemon", "claude_probe", principalId, "called");
       }
@@ -250,7 +265,7 @@ export class HeadroomDaemon {
       } else if (protectedFailure) {
         const previous = this.backoff.get(key)?.failures ?? 0;
         this.backoff.set(key, { failures: previous + 1, until: Date.now() + Math.min(3_600_000, 60_000 * 2 ** previous) });
-      } else this.backoff.delete(key);
+      } else if (!warmOnly) this.backoff.delete(key);
       return result;
     }).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, task);
