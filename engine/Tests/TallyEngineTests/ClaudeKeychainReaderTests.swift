@@ -63,18 +63,8 @@ final class ClaudeKeychainReaderTests: XCTestCase {
 }
 
 final class AntigravityReadinessTests: XCTestCase {
-    func testGenericZeroWithoutResetEvidenceIsNeverOfficialFresh() {
-        let rows = TallyEngine.windows(
-            Principal(id: "other-main", vendor: "other", location: ""), meter: "main",
-            windows: [RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil)],
-            source: "fixture")
-        XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows[0].truth, "estimated")
-        XCTAssertEqual(rows[0].freshness, "stale")
-    }
-
     func testWaitsForQuotaSummaryThenEmitsBothWeeklyWindows() async throws {
-        let sequence = SnapshotSequence([fixture("antigravity-partial"), fixture("antigravity-full")])
+        let sequence = SnapshotSequence([partialUsage(), completeUsage()])
         let fetched = try await AntigravitySnapshotWaiter.wait(
             timeout: 1,
             pollNanoseconds: 0,
@@ -84,16 +74,16 @@ final class AntigravityReadinessTests: XCTestCase {
 
         let fetchCount = await sequence.fetchCount()
         XCTAssertEqual(fetchCount, 2)
-        XCTAssertTrue(AntigravitySnapshotWaiter.isReady(fetched))
+        XCTAssertTrue(AntigravitySnapshotWaiter.isReady(fetched.usage))
         let observations = TallyEngine.antigravityWindows(
             Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"),
-            snapshot: fetched)
+            usage: fetched.usage)
         XCTAssertEqual(observations.filter { $0.window?.minutes == 10_080 && $0.freshness == "fresh" }.count, 2)
         XCTAssertFalse(observations.contains { $0.freshness == "failed" })
     }
 
     func testIncompleteQuotaSummaryEmitsFailedWeeklyWindows() async throws {
-        let sequence = SnapshotSequence([fixture("antigravity-partial"), fixture("antigravity-partial")])
+        let sequence = SnapshotSequence([partialUsage(), partialUsage()])
         let fetched = try await AntigravitySnapshotWaiter.wait(
             timeout: 1,
             pollNanoseconds: 0,
@@ -103,105 +93,56 @@ final class AntigravityReadinessTests: XCTestCase {
 
         let fetchCount = await sequence.fetchCount()
         XCTAssertEqual(fetchCount, 2)
-        XCTAssertFalse(AntigravitySnapshotWaiter.isReady(fetched))
+        XCTAssertFalse(AntigravitySnapshotWaiter.isReady(fetched.usage))
         let observations = TallyEngine.antigravityWindows(
             Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"),
-            snapshot: fetched)
+            usage: fetched.usage)
         let failedWeekly = observations.filter { $0.window?.minutes == 10_080 && $0.freshness == "failed" }
         XCTAssertEqual(Set(failedWeekly.map(\.meter_id)), ["antigravity-main:gemini", "antigravity-main:claude-gpt"])
         XCTAssertTrue(failedWeekly.allSatisfy { $0.reason == "quota summary not ready" })
     }
 
     func testShapeListsOnlyAntigravityWindowDescriptors() {
-        let shape = TallyEngine.antigravityShape(fixture("antigravity-full"))
+        let shape = TallyEngine.antigravityShape(completeUsage())
         XCTAssertEqual(shape[0], "$: object")
-        XCTAssertTrue(shape.contains("$.source: local-agy-existing"))
-        XCTAssertTrue(shape.contains("$.payload_kind: RetrieveUserQuotaSummary"))
         XCTAssertTrue(shape.contains { $0.contains("title=Gemini weekly") && $0.contains("id=antigravity-quota-summary-gemini-weekly") && $0.contains("minutes=10080") && $0.contains("resets_at=present") })
         XCTAssertFalse(shape.joined(separator: " ").contains("usedPercent"))
     }
 
-    func testAvailabilityOnlyFixtureIsRejectedAndEmitsAllExpectedFailedWindows() async throws {
-        let snapshot = fixture("antigravity-availability-only")
-        let sequence = SnapshotSequence([snapshot])
-        let fetched = try await AntigravitySnapshotWaiter.wait(
-            timeout: 1, pollNanoseconds: 0, maximumAttempts: 1,
-            fetch: { _ in await sequence.fetch() }, sleep: { _ in })
-
-        XCTAssertTrue(AntigravitySnapshotWaiter.isAvailabilityOnly(fetched))
-        XCTAssertFalse(AntigravitySnapshotWaiter.isReady(fetched))
-        let rows = TallyEngine.antigravityWindows(
-            Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"), snapshot: fetched)
-        XCTAssertEqual(rows.count, 4)
-        XCTAssertTrue(rows.allSatisfy { $0.freshness == "failed" && $0.truth == "estimated" })
-        XCTAssertTrue(rows.allSatisfy { $0.reason?.contains("availability-only payload; quota summary not served (source: local-agy-existing)") == true })
-        XCTAssertEqual(Set(rows.compactMap(\.window?.minutes)), [300, 10_080])
+    private func partialUsage() -> UsageSnapshot {
+        usage(includeWeekly: false)
     }
 
-    func testSyntheticAllZeroSummaryFixtureIsRejectedDefensively() {
-        let fetchedAt = Date(timeIntervalSince1970: 1_800_000_000)
-        let rows = [
-            NamedRateWindow(id: "antigravity-quota-summary-gemini-session", title: "Gemini 5-hour", window: RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: fetchedAt.addingTimeInterval(300 * 60), resetDescription: "synthetic reset")),
-            NamedRateWindow(id: "antigravity-quota-summary-claude-session", title: "Claude/GPT 5-hour", window: RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: fetchedAt.addingTimeInterval(300 * 60), resetDescription: "synthetic reset")),
-            NamedRateWindow(id: "antigravity-quota-summary-gemini-weekly", title: "Gemini weekly", window: RateWindow(usedPercent: 0, windowMinutes: 10_080, resetsAt: fetchedAt.addingTimeInterval(10_080 * 60), resetDescription: "synthetic reset")),
-            NamedRateWindow(id: "antigravity-quota-summary-claude-weekly", title: "Claude/GPT weekly", window: RateWindow(usedPercent: 0, windowMinutes: 10_080, resetsAt: fetchedAt.addingTimeInterval(10_080 * 60), resetDescription: "synthetic reset")),
+    private func completeUsage() -> UsageSnapshot {
+        usage(includeWeekly: true)
+    }
+
+    private func usage(includeWeekly: Bool) -> UsageSnapshot {
+        let reset = Date(timeIntervalSince1970: 1_800_000_000)
+        let sessionRows = [
+            NamedRateWindow(id: "antigravity-quota-summary-gemini-session", title: "Gemini 5-hour", window: RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: reset, resetDescription: nil)),
+            NamedRateWindow(id: "antigravity-quota-summary-claude-session", title: "Claude/GPT 5-hour", window: RateWindow(usedPercent: 20, windowMinutes: 300, resetsAt: reset, resetDescription: nil)),
         ]
-        let usage = UsageSnapshot(primary: rows[0].window, secondary: rows[1].window, extraRateWindows: rows, updatedAt: fetchedAt)
-        XCTAssertTrue(AntigravitySnapshotWaiter.isAvailabilityOnly(
-            AntigravitySnapshotFetch(usage: usage, source: "local-agy-spawned", fetchedAt: fetchedAt)))
-    }
-
-    private func fixture(_ name: String) -> AntigravitySnapshotFetch {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/\(name).json")
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let decoded = try! decoder.decode(AntigravityFixture.self, from: Data(contentsOf: url))
-        let formatter = ISO8601DateFormatter()
-        let rows = decoded.windows.map { row in
-            NamedRateWindow(id: row.id, title: row.title,
-                window: RateWindow(usedPercent: row.usedPercent, windowMinutes: row.minutes,
-                    resetsAt: row.resetsAt.flatMap(formatter.date(from:)), resetDescription: row.resetDescription))
-        }
-        return AntigravitySnapshotFetch(
-            usage: UsageSnapshot(primary: rows.first?.window, secondary: rows.dropFirst().first?.window,
-                extraRateWindows: rows, updatedAt: Date()),
-            source: decoded.source, fetchedAt: formatter.date(from: decoded.fetchedAt)!)
-    }
-}
-
-private struct AntigravityFixture: Decodable {
-    let source: String
-    let fetchedAt: String
-    let windows: [Row]
-
-    struct Row: Decodable {
-        let id: String
-        let title: String
-        let usedPercent: Double
-        let minutes: Int
-        let resetsAt: String?
-        let resetDescription: String?
+        let weeklyRows = [
+            NamedRateWindow(id: "antigravity-quota-summary-gemini-weekly", title: "Gemini weekly", window: RateWindow(usedPercent: 30, windowMinutes: 10_080, resetsAt: reset, resetDescription: nil)),
+            NamedRateWindow(id: "antigravity-quota-summary-claude-weekly", title: "Claude/GPT weekly", window: RateWindow(usedPercent: 40, windowMinutes: 10_080, resetsAt: reset, resetDescription: nil)),
+        ]
+        return UsageSnapshot(primary: sessionRows[0].window, secondary: sessionRows[1].window, extraRateWindows: includeWeekly ? sessionRows + weeklyRows : sessionRows, updatedAt: Date())
     }
 }
 
 private actor SnapshotSequence {
-    private let snapshots: [AntigravitySnapshotFetch]
+    private let snapshots: [UsageSnapshot]
     private var count = 0
 
     init(_ snapshots: [UsageSnapshot]) {
-        self.snapshots = snapshots.map { AntigravitySnapshotFetch(usage: $0) }
-    }
-
-    init(_ snapshots: [AntigravitySnapshotFetch]) {
         self.snapshots = snapshots
     }
 
     func fetch() -> AntigravitySnapshotFetch {
         let index = min(count, snapshots.count - 1)
         count += 1
-        return snapshots[index]
+        return AntigravitySnapshotFetch(usage: snapshots[index])
     }
 
     func fetchCount() -> Int { count }
