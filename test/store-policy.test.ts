@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { canConsume, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
 import { TallyStore } from "../src/store.js";
 import { formatMeters } from "../src/cli.js";
+import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -76,6 +77,34 @@ describe("SQLite observations and event detector", () => {
       store.insert(observation({ meter_id: "claude-main:fable", window: null, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at: "2026-09-03T12:00:00Z" }));
       store.insert(observation({ meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "not_enforced", reason: "no scoped limit in response", fetched_at: "2026-09-03T12:01:00Z" }));
       expect(store.latestPerWindow("claude-main:fable")).toEqual([expect.objectContaining({ freshness: "not_enforced", reason: "no scoped limit in response" })]);
+    } finally { store.close(); }
+  });
+
+  it("normalizes availability-only batches, fails closed, and records recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tally-store-placeholder-")); temporary.push(root);
+    const store = await TallyStore.open(join(root, ".tally"));
+    const fetchedAt = "2026-09-03T19:38:37Z";
+    const fiveHour = observation({
+      principal_id: "antigravity", meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+      quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, fetched_at: fetchedAt, observed_at: fetchedAt, resets_at: "2026-09-04T00:38:37Z",
+    });
+    const weekly = { ...fiveHour, window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const }, resets_at: "2026-09-10T19:38:37Z" };
+    try {
+      store.insertAll([fiveHour, weekly]);
+      const failed = store.latestPerWindow("antigravity:gemini");
+      expect(failed).toEqual(expect.arrayContaining([
+        expect.objectContaining({ freshness: "failed", truth: "estimated", reason: AVAILABILITY_ONLY_REASON }),
+      ]));
+      expect(formatMeters(failed, defaultPolicy)[0]).toContain("antigravity:gemini  5h UNKNOWN (availability-only payload; quota summary not served) | wk UNKNOWN (availability-only payload; quota summary not served)");
+      expect(canConsume(["antigravity:gemini"], new Map([["antigravity:gemini", failed]]), defaultPolicy, false, new Date(fetchedAt))).toMatchObject({ allowed: false, state: "UNKNOWN" });
+      expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "source_failed", origin: "inferred", confidence: 0.8, reason: AVAILABILITY_ONLY_REASON }),
+      ]));
+
+      store.insertAll([{ ...fiveHour, fetched_at: "2026-09-03T19:39:37Z", observed_at: "2026-09-03T19:39:37Z", quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" }, resets_at: "2026-09-03T23:10:00Z" }]);
+      expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "source_recovered", origin: "inferred", confidence: 0.8 }),
+      ]));
     } finally { store.close(); }
   });
 });

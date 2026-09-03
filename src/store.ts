@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { tallyHome } from "./paths.js";
 import type { EventKind, Observation, StoredObservation, TallyEvent } from "./types.js";
+import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
 
 interface Database {
   exec(sql: string): void;
@@ -63,7 +64,7 @@ function observationFromRow(row: Row): StoredObservation {
 }
 
 function eventFromRow(row: Row): TallyEvent {
-  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as TallyEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id) };
+  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as TallyEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason) };
 }
 
 export class TallyStore {
@@ -98,7 +99,7 @@ export class TallyStore {
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY, kind TEXT NOT NULL, origin TEXT NOT NULL, confidence REAL NOT NULL,
         evidence_observation_ids TEXT NOT NULL, created_at TEXT NOT NULL, corrected_by TEXT,
-        meter_id TEXT, principal_id TEXT
+        meter_id TEXT, principal_id TEXT, reason TEXT
       );
       CREATE INDEX IF NOT EXISTS events_created_at ON events(created_at);
       CREATE TABLE IF NOT EXISTS audit (
@@ -106,6 +107,10 @@ export class TallyStore {
         outcome TEXT NOT NULL, at TEXT NOT NULL
       );
     `);
+    // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
+    // NOT EXISTS, so retain a narrow compatibility migration.
+    try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
+    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
   }
 
   insert(observation: Observation): StoredObservation {
@@ -118,11 +123,11 @@ export class TallyStore {
       observation.adapter_version, observation.upstream_schema_version, observation.reason ?? null, json(observation.metadata));
     const stored: StoredObservation = { ...observation, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
-    else if (stored.freshness === "failed") this.addEvent("source_failed", "vendor_reported", 1, [stored.id], stored);
+    else if (stored.freshness === "failed") this.addSourceFailedEvent([stored.id], stored);
     return stored;
   }
 
-  insertAll(observations: Observation[]): StoredObservation[] { return observations.map((observation) => this.insert(observation)); }
+  insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
 
   private previous(observation: Observation): StoredObservation | undefined {
     const window = observation.window ? JSON.stringify(observation.window) : null;
@@ -131,17 +136,25 @@ export class TallyStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  private addEvent(kind: EventKind, origin: TallyEvent["origin"], confidence: number, evidence: number[], current: StoredObservation): void {
+  private addEvent(kind: EventKind, origin: TallyEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null): void {
     const created = current.fetched_at;
     const id = `${kind}:${current.id}`;
-    this.db.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id) VALUES (?,?,?,?,?,?,?,?,?)")
-      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id);
+    this.db.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason);
+  }
+
+  private addSourceFailedEvent(evidence: number[], current: StoredObservation): void {
+    const availabilityOnly = current.reason === AVAILABILITY_ONLY_REASON;
+    this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null);
   }
 
   private detectEvents(previous: StoredObservation, current: StoredObservation): void {
     const evidence = [previous.id, current.id];
-    if (previous.freshness === "failed" && current.freshness !== "failed") this.addEvent("source_recovered", "vendor_reported", 1, evidence, current);
-    if (previous.freshness !== "failed" && current.freshness === "failed") this.addEvent("source_failed", "vendor_reported", 1, evidence, current);
+    if (previous.freshness === "failed" && current.freshness !== "failed") {
+      const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
+      this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
+    }
+    if (previous.freshness !== "failed" && current.freshness === "failed") this.addSourceFailedEvent(evidence, current);
     const oldUsed = previous.quantity?.used;
     const newUsed = current.quantity?.used;
     const resetAdvanced = Boolean(previous.resets_at && current.resets_at && new Date(current.resets_at).getTime() > new Date(previous.resets_at).getTime());

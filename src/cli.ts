@@ -180,7 +180,7 @@ async function observe(argv: string[]): Promise<number> {
   const policy = await readPolicy();
   if (argv.includes("--json")) console.log(JSON.stringify(observations));
   else { for (const line of formatMeters(observations, policy)) console.log(line); for (const failure of failures) console.log(failure); }
-  if (threshold !== undefined && observations.some((item) => item.freshness !== "not_enforced" && item.quantity && item.quantity.used >= threshold)) return 2;
+  if (threshold !== undefined && observations.some((item) => item.freshness !== "not_enforced" && (item.freshness !== "fresh" || Boolean(item.quantity && item.quantity.used >= threshold)))) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
 
