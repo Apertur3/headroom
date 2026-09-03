@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { tallyHome } from "../../paths.js";
 import { redact } from "../../security.js";
-import type { Account, Observation } from "../../types.js";
+import type { Observation, ProviderAccount } from "../../types.js";
 import { readEngineLock } from "../codexbar/install.js";
 
 const execFileAsync = promisify(execFile);
@@ -22,7 +22,7 @@ export async function nativeEnginePath(): Promise<string | undefined> {
   return undefined;
 }
 
-export async function runNativeEngine(enginePath: string, accounts: Account[]): Promise<Observation[]> {
+export async function runNativeEngine(enginePath: string, accounts: ProviderAccount[]): Promise<Observation[]> {
   const directory = await mkdtemp(join(tmpdir(), "tally-principals-"));
   const principals = join(directory, "principals.json");
   try {

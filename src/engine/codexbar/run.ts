@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { Account } from "../../types.js";
+import type { ProviderAccount } from "../../types.js";
 import { redact } from "../../security.js";
 
 const execFileAsync = promisify(execFile);
@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile);
 export interface EngineResult { payload: unknown; stderr: string }
 
 /** Runs only an engine path returned by verifiedEnginePath(), never an ambient executable. */
-export async function runCodexBar(enginePath: string, account: Account): Promise<EngineResult> {
+export async function runCodexBar(enginePath: string, account: ProviderAccount): Promise<EngineResult> {
   const env = { ...process.env };
   delete env.CODEX_HOME;
   delete env.CLAUDE_CONFIG_DIR;

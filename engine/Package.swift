@@ -15,5 +15,9 @@ let package = Package(
         .executableTarget(
             name: "tally-engine",
             dependencies: [.product(name: "CodexBarCore", package: "codexbar")],
-            path: "Sources/TallyEngine")
+            path: "Sources/TallyEngine"),
+        .testTarget(
+            name: "TallyEngineTests",
+            dependencies: ["tally-engine"],
+            path: "Tests/TallyEngineTests")
     ])

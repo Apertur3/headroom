@@ -5,9 +5,6 @@ import Foundation
 import FoundationNetworking
 #endif
 
-let engineVersion = "0.1.0"
-let upstreamVersion = "v0.56.4"
-
 struct Principal: Decodable {
     let id: String
     let vendor: String
@@ -46,6 +43,9 @@ struct Observation: Codable {
 
 @main
 struct TallyEngine {
+    static let engineVersion = "0.1.0"
+    static let upstreamVersion = "v0.56.4"
+
     static func main() async {
         guard CommandLine.arguments.count == 4,
               CommandLine.arguments[1] == "observe",
@@ -65,6 +65,9 @@ struct TallyEngine {
                 meters: ["unknown"],
                 error: error)
         }
+        // The Core owns its spawned `agy` process. Always reset that session before this
+        // one-shot engine exits; user/IDE-owned processes are never part of that session.
+        await ProviderCLISessionLifecycle.shutdownPersistentSessions()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
         let output = (try? encoder.encode(observations)) ?? Data("[]".utf8)
@@ -91,34 +94,15 @@ struct TallyEngine {
         return output
     }
 
-    // The record load is intentionally non-refreshing. It opens CodexBarCore's profile-aware
-    // Keychain path on macOS, then the OAuth-only fetcher uses that in-memory record.
     static func claude(_ principal: Principal) async throws -> [Observation] {
-        var environment = ProcessInfo.processInfo.environment
-        environment[ClaudeConfigPaths.configDirectoryEnvironmentKey] = principal.location
-        environment[ClaudeConfigPaths.secureStorageDirectoryEnvironmentKey] = principal.location
-        // CodexBarCore makes this an explicit, durable user-consent gate; setting it here is the
-        // Tally CLI's requested opt-in, never a bypass of the macOS ACL prompt.
-        UserDefaults(suiteName: "com.steipete.codexbar")?.set(
-            true, forKey: ClaudeOAuthDirectKeychainReadConsent.userDefaultsKey)
-        let record = try ClaudeOAuthCredentialsStore.loadRecord(
-            environment: environment,
-            allowKeychainPrompt: true,
-            respectKeychainPromptCooldown: false,
-            allowClaudeKeychainRepairWithoutPrompt: false)
-        guard !record.credentials.isExpired else { throw EngineError.expiredCredential }
-        let fetcher = ClaudeUsageFetcher(
-            browserDetection: BrowserDetection(), environment: environment, runtime: .app,
-            dataSource: .oauth, oauthSafeCredentialSourcesOnly: true)
-        let snapshot = try await ProviderInteractionContext.$current.withValue(.userInitiated) {
-            try await fetcher.loadLatestUsage()
-        }
-        var observations = windows(principal, meter: "all", windows: [snapshot.primary, snapshot.secondary], source: "engine:native:claude")
-        for extra in snapshot.extraRateWindows {
-            let name = extra.id.lowercased() + " " + extra.title.lowercased()
-            if name.contains("fable") { observations += windows(principal, meter: "fable", windows: [extra.window], source: "engine:native:claude") }
-            if name.contains("routine") { observations += windows(principal, meter: "routines", windows: [extra.window], source: "engine:native:claude") }
-        }
+        let credentials = try await ClaudeKeychainReader.load(configDirectory: principal.location)
+        guard !credentials.isExpired else { throw EngineError.expiredCredential }
+        // ClaudeOAuthUsageFetcher is internal to CodexBarCore at v0.56.4. This mirrors its
+        // OAuth-only endpoint and headers, while retaining the access token in memory only.
+        let snapshot = try await ClaudeOAuthUsageReader.fetch(accessToken: credentials.accessToken)
+        var observations = claudeWindows(principal, meter: "all", windows: [snapshot.fiveHour, snapshot.sevenDay])
+        observations += claudeWindows(principal, meter: "fable", windows: [snapshot.fable])
+        observations += claudeWindows(principal, meter: "routines", windows: [snapshot.routines])
         guard !observations.isEmpty else { throw EngineError.noUsage }
         return observations
     }
@@ -149,6 +133,17 @@ struct TallyEngine {
         return observations
     }
 
+    static func claudeWindows(_ principal: Principal, meter: String, windows: [ClaudeUsageWindow?]) -> [Observation] {
+        windows.compactMap { value in
+            guard let value else { return nil }
+            return observation(
+                principal, meter: meter,
+                quantity: Quantity(used: value.percent, limit: 100, remaining: max(0, 100 - value.percent), unit: "percent"),
+                reset: value.resetsAt, observed: Date(), source: "engine:native:claude",
+                window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.minutes, enforcement: "hard"))
+        }
+    }
+
     static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String) -> [Observation] {
         windows.compactMap { value in
             guard let value, !value.isSyntheticPlaceholder else { return nil }
@@ -157,12 +152,12 @@ struct TallyEngine {
     }
 
     static func observation(_ principal: Principal, meter: String, quantity: Quantity, reset: Date?, observed: Date, source: String, window: Window?) -> Observation {
-        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: engineVersion, upstream_schema_version: upstreamVersion, reason: nil)
+        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil)
     }
 
     static func failed(principal: Principal, meters: [String], error: Error) -> [Observation] {
         let now = iso(Date())!
-        return meters.map { meter in Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: nil, quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: "engine:native", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: engineVersion, upstream_schema_version: upstreamVersion, reason: redact(error.localizedDescription)) }
+        return meters.map { meter in Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: nil, quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: "engine:native", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: redact(error.localizedDescription)) }
     }
 
     static func meterNames(for vendor: String) -> [String] {
@@ -188,6 +183,6 @@ struct TallyEngine {
     }
 }
 
-enum EngineError: LocalizedError { case unsupportedVendor, expiredCredential, noUsage
-    var errorDescription: String? { switch self { case .unsupportedVendor: "unsupported vendor"; case .expiredCredential: "credential expired; refresh it with the vendor CLI"; case .noUsage: "provider returned no quota windows" } }
+enum EngineError: LocalizedError { case unsupportedVendor, expiredCredential, noUsage, claudeUsageUnavailable
+    var errorDescription: String? { switch self { case .unsupportedVendor: "unsupported vendor"; case .expiredCredential: "expired, run claude to refresh"; case .noUsage: "provider returned no quota windows"; case .claudeUsageUnavailable: "Claude OAuth usage unavailable" } }
 }
