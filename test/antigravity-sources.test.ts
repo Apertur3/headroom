@@ -1,8 +1,14 @@
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
-import { AgyKeepaliveSupervisor } from "../src/antigravity-keepalive.js";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
 import { selectAntigravitySource } from "../src/collector.js";
 import type { Observation } from "../src/types.js";
+
+const temporary: string[] = [];
+afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 function row(meter: "gemini" | "claude-gpt", minutes: 300 | 10_080, source: string, freshness: Observation["freshness"] = "fresh"): Observation {
   return {
@@ -24,6 +30,17 @@ describe("Antigravity source order", () => {
 });
 
 describe("agy keepalive", () => {
+  it("uses registry agy_path before the service-safe local and PATH candidates", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-")); temporary.push(root);
+    const local = join(root, ".local", "bin");
+    await writeFile(join(root, "registry-agy"), "", { mode: 0o700 });
+    await mkdir(local, { recursive: true });
+    await writeFile(join(local, "agy"), "", { mode: 0o700 });
+    await chmod(join(local, "agy"), 0o700);
+    expect(resolveAgyBinary(join(root, "registry-agy"), root, "/missing", "darwin")).toBe(join(root, "registry-agy"));
+    expect(resolveAgyBinary(undefined, root, "/missing", "darwin")).toBe(join(local, "agy"));
+  });
+
   it("starts a fake binary beneath script's PTY and terminates only its owned process", () => {
     const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
     const spawn = vi.fn(() => child) as never;

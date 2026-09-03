@@ -11,10 +11,22 @@ import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
 
-export interface PollResult { observations: Observation[]; failures: string[]; }
+export interface PollResult {
+  observations: Observation[];
+  failures: string[];
+  antigravityLocal?: Record<string, AntigravityLocalRead>;
+}
 export interface PollOptions {
   /** Set only by the daemon while it owns a warmed `agy` PTY. */
   daemonOwnsAntigravity?: boolean;
+  /** Remote quota failures are backed off independently from the warm local probe. */
+  skipRemoteAntigravity?: boolean;
+}
+
+export interface AntigravityLocalRead {
+  outcome: "fresh" | "failed" | "empty" | "error";
+  payload_kind: "quota_summary" | "placeholder" | "none" | "error";
+  at: string;
 }
 
 const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
@@ -48,19 +60,31 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // probe is called exclusively by the daemon after it has started `agy`.
   const antigravityAccounts = providerAccounts.filter((account) => account.vendor === "antigravity");
   let localAntigravity = new Map<string, Observation[]>();
+  const antigravityLocal: Record<string, AntigravityLocalRead> = {};
   const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && account.vendor !== "claude" && (account.adapter === "engine" || account.adapter === "native"));
   const native = process.platform === "win32" ? undefined : await nativeEnginePath();
   if (options.daemonOwnsAntigravity && native && antigravityAccounts.length) {
     try {
       const local = await runNativeEngine(native, antigravityAccounts);
       localAntigravity = new Map(antigravityAccounts.map((account) => [account.name, local.filter((row) => row.principal_id === account.name)]));
-    } catch (error) { failures.push(`native Antigravity local source failed: ${safeError(error)}`); }
+      for (const account of antigravityAccounts) {
+        const rows = localAntigravity.get(account.name) ?? [];
+        const complete = selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0;
+        antigravityLocal[account.name] = { outcome: complete ? "fresh" : rows.length ? "failed" : "empty", payload_kind: complete ? "quota_summary" : rows.length ? "placeholder" : "none", at: new Date().toISOString() };
+      }
+    } catch (error) {
+      failures.push(`native Antigravity local source failed: ${safeError(error)}`);
+      for (const account of antigravityAccounts) antigravityLocal[account.name] = { outcome: "error", payload_kind: "error", at: new Date().toISOString() };
+    }
   }
   for (const account of antigravityAccounts) {
     const local = localAntigravity.get(account.name) ?? [];
     // Do not spend a remote request after a complete local quota summary. Cold
     // local replies contain failed placeholder rows and therefore fall through.
     if (selectAntigravitySource(local, [], account.name) === local && local.length) {
+      observations.push(...local);
+    } else if (options.skipRemoteAntigravity) {
+      // A remote failure must never suppress the next daemon-owned warm read.
       observations.push(...local);
     } else {
       const remote = await observeAntigravity(account);
@@ -89,5 +113,5 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   observations.push(...await Promise.all(localAccounts.map(observeLocal)));
   // This is the shared boundary for native and fallback engines. Keep this
   // defensive normalization here as adapters may be added outside this module.
-  return { observations: normalizeObservations(observations), failures };
+  return { observations: normalizeObservations(observations), failures, ...(Object.keys(antigravityLocal).length ? { antigravityLocal } : {}) };
 }
