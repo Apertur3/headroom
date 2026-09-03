@@ -266,13 +266,14 @@ export class HeadroomStore {
     return lease;
   }
 
-  endLease(id: string, owner?: string, force = false, now = new Date()): Lease {
+  endLease(id: string, owner: string, force = false, now = new Date()): Lease {
+    if (!owner.trim()) throw new Error("owner is required");
     this.expireLeases(now);
     const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
     if (!row) throw new Error("lease not found");
     const lease = leaseFromRow(row);
     if (lease.ended_at) return lease;
-    if (owner && owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
+    if (owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
     const ended = { ...lease, ended_at: now.toISOString(), ended_reason: "ended" };
     this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ?").run(ended.ended_at, ended.ended_reason, id);
     this.addLeaseEvent("lease_ended", ended);

@@ -18,7 +18,7 @@ version="$(node -p 'require("./package.json").version')"
 asset="headroom-engine-${version}-${target}.tar.gz"
 out="dist/release-engine"
 binary="engine/.build/release/headroom-engine"
-keychain_binary="engine/.build/release/headroom-keychain"
+probe_binary="engine/.build/release/headroom-claude-probe"
 
 npm run engine:build
 
@@ -26,9 +26,9 @@ npm run engine:build
 # identity. Local builds use ad-hoc signing only; this script never chooses a
 # real identity itself.
 codesign --force --sign "${HEADROOM_CODESIGN_IDENTITY:--}" "$binary"
-codesign --force --sign "${HEADROOM_CODESIGN_IDENTITY:--}" "$keychain_binary"
+codesign --force --sign "${HEADROOM_CODESIGN_IDENTITY:--}" "$probe_binary"
 
 mkdir -p "$out"
-tar -C "$(dirname "$binary")" -czf "$out/$asset" "$(basename "$binary")" "$(basename "$keychain_binary")"
+tar -C "$(dirname "$binary")" -czf "$out/$asset" "$(basename "$binary")" "$(basename "$probe_binary")"
 shasum -a 256 "$out/$asset"
 echo "created $out/$asset"

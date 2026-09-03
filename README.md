@@ -50,6 +50,7 @@ use `node dist/cli.js` where the commands below say `npx headroomd`.
 
 ```sh
 npx headroomd engine install     # pin and verify the sensing engine
+npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
 npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity
 npx headroomd                    # one line per meter
 npx headroomd install-service    # launchd, systemd user unit, or Windows Task Scheduler
@@ -66,7 +67,10 @@ Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your 
 
 ## Security
 
-No secret touches disk or output. Tokens are read at call time from the macOS Keychain or the
+No secret touches disk or output. On macOS the signed `headroom-claude-probe` reads the Claude
+Keychain token and makes the usage request itself, so the token never enters Node or stdout. Run
+`headroom keychain grant` once and choose **Always Allow**; an updated probe binary prompts once
+again. Tokens are otherwise read at call time from the Keychain or the
 vendor's own credential file and dropped after the request. The daemon listens on a 0600 local
 socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry, the engine
 is pinned and checksum verified, and every query lands in an audit log. Details in [SECURITY.md](SECURITY.md).

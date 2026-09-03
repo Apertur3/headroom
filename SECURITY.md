@@ -12,14 +12,17 @@ cookies, which unlock paid subscriptions.
    config files (CodexBar's `tokenAccounts` path is deliberately not used).
 2. **No secret in output.** Logs, crash dumps, JSON output and history redact tokens, cookies,
    Authorization headers and, by default, email addresses.
-3. **Local-only surface.** The daemon listens on a mode-0600 Unix socket on macOS and Linux, or
-   a per-user named pipe on Windows whose ACL is restricted to the current process user. Headroom
-   has no TCP listener.
+3. **Local-only surface.** The daemon listens on a mode-0600 Unix socket on macOS and Linux. On
+   Windows Node cannot supply an explicit pipe DACL through its public API, so a random per-daemon
+   session token is stored mode 0600 under `HEADROOM_HOME`; clients present it on every request and
+   verify the HMAC-signed health response. Headroom has no TCP listener.
 4. **Polite polling.** Vendor polls are rate-limited and jittered so Headroom never triggers a
    lockout or a bot-defense challenge; a 401/403/429 backs off exponentially and is surfaced,
    never retried in a tight loop.
-5. **Verified engine.** The CodexBarCLI binary is pinned by version and SHA-256 and downloaded
-   over HTTPS from the upstream release; a mismatch aborts.
+5. **Verified engine.** Every downloaded engine and every executable below `HEADROOM_HOME` is
+   canonicalized, ownership/permission checked, and pinned by SHA-256 before execution. There is
+   no trust-on-first-use: `headroom engine install --pin` only prints a candidate hash for a human
+   to review and commit to the lock file.
 6. **No debug surfaces in release.** No debug endpoints, no source maps, no verbose stack traces
    to clients.
 7. **Audit log.** Every query to the daemon and every vendor poll is logged with caller, time and
@@ -27,11 +30,14 @@ cookies, which unlock paid subscriptions.
 8. **Dependencies pinned and audited.** Lockfile committed, `npm audit` in CI, minimal dependency
    set.
 9. **No telemetry.** Headroom phones home to nothing.
-10. **Keychain ACL identity.** On macOS, Claude credentials are read by the signed
-    `headroom-keychain` helper. Choose “Always Allow” for that helper in a Keychain
-    prompt, never for the shared `security` command. If the helper is unavailable,
-    Headroom prints a warning before using the weaker fallback.
-11. **Outbound allowlist.** Credential-backed requests only target
+10. **Keychain ACL identity.** On macOS, `headroom-claude-probe` reads the Keychain item and
+    performs the Anthropic request itself. It prints only bounded usage JSON; tokens, refresh
+    tokens, and email never cross to Node. Run `headroom keychain grant` once interactively and
+    choose “Always Allow” for this probe. An updated probe binary is a new ACL identity and asks
+    once more. There is no `security` fallback.
+11. **Bounded vendor input.** Credential-backed responses are limited to 1 MiB, JSON depth 32,
+    arrays of 10,000 items, and strings of 64 KiB.
+12. **Outbound allowlist.** Credential-backed requests only target
     `api.anthropic.com`, `chatgpt.com`, and configured local base URLs. Proxy
     environment variables are ignored unless a `proxy` value is explicitly set in
     `policy.toml`.

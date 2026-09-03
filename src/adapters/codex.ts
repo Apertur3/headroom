@@ -2,6 +2,7 @@ import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { credentialPath, vendorHome } from "../paths.js";
 import { allowedOutbound, redact } from "../security.js";
+import { vendorJson } from "../limits.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
@@ -182,7 +183,7 @@ export async function codexResponseShape(account: ProviderAccount, dependencies:
   ]);
   if (!usage.ok) throw new ProviderHTTPError(usage.status, "Codex");
   if (!credits.ok) throw new ProviderHTTPError(credits.status, "Codex credits");
-  return { usage: shape(await usage.json()), usage_headers: headerShape(usage), reset_credits: shape(await credits.json()), reset_credits_headers: headerShape(credits) };
+  return { usage: shape(await vendorJson(usage)), usage_headers: headerShape(usage), reset_credits: shape(await vendorJson(credits)), reset_credits_headers: headerShape(credits) };
 }
 function headers(token: string, accountId: string | undefined, credit = false): HeadersInit { return { Authorization: `Bearer ${token}`, "User-Agent": "CodexBar", Accept: "application/json", ...(accountId ? { [credit ? "ChatGPT-Account-ID" : "ChatGPT-Account-Id"]: accountId } : {}), ...(credit ? { "OpenAI-Beta": "codex-1", originator: "Codex Desktop" } : {}) }; }
 export async function observeCodex(account: ProviderAccount, dependencies: CodexDependencies = {}): Promise<Observation[]> {
@@ -198,11 +199,11 @@ export async function observeCodex(account: ProviderAccount, dependencies: Codex
     ]);
     if (!usageResponse.ok) throw new ProviderHTTPError(usageResponse.status, "Codex");
     if (!creditResponse.ok) throw new ProviderHTTPError(creditResponse.status, "Codex credits");
-    const endpoint = observationsFromCodexUsage(await usageResponse.json(), await creditResponse.json(), account, now);
+    const endpoint = observationsFromCodexUsage(await vendorJson(usageResponse), await vendorJson(creditResponse), account, now);
     const events = await (dependencies.readRateLimitEvents ?? readCodexRateLimitEvents)(resolve(account.location || vendorHome("codex")));
     return mergeSessionFallback(endpoint, observationsFromCodexRateLimitEvents(events, account, now));
   } catch (error) {
-    const reason = error instanceof ProviderHTTPError ? error.message : error instanceof Error && /auth unavailable|auth invalid|unsafe permissions/.test(error.message) ? `no credentials for this config dir; ${codexLoginCommand(account)}` : "Codex usage unavailable";
+    const reason = error instanceof ProviderHTTPError ? error.message : error instanceof Error && error.message.startsWith("vendor response") ? error.message : error instanceof Error && /auth unavailable|auth invalid|unsafe permissions/.test(error.message) ? `no credentials for this config dir; ${codexLoginCommand(account)}` : "Codex usage unavailable";
     return failed(account, reason, timestamp);
   }
 }

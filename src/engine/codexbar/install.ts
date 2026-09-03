@@ -61,10 +61,6 @@ export async function readEngineLock(path = lockPath): Promise<EngineLock> {
   return JSON.parse(await fs.readFile(path, "utf8")) as EngineLock;
 }
 
-async function writeEngineLock(lock: EngineLock, path = lockPath): Promise<void> {
-  await fs.writeFile(path, `${JSON.stringify(lock, null, 2)}\n`, "utf8");
-}
-
 async function releaseAssets(lock: EngineLock): Promise<GitHubAsset[]> {
   const response = await fetch(`https://api.github.com/repos/${lock.repository}/releases/tags/${lock.tag}`, {
     headers: { Accept: "application/vnd.github+json", "User-Agent": "headroomq" },
@@ -78,28 +74,22 @@ async function releaseAssets(lock: EngineLock): Promise<GitHubAsset[]> {
 function installRoot(tag: string): string { return join(headroomHome(), "engine", tag); }
 function markerPath(tag: string): string { return join(installRoot(tag), ".headroom-engine.json"); }
 
-export async function installEngine(): Promise<{ tag: string; path: string; sha256: string; firstPin: boolean }> {
+export async function installEngine(options: { pin?: boolean } = {}): Promise<{ tag: string; path?: string; sha256: string; firstPin: boolean }> {
   const lock = await readEngineLock();
   const wanted = platformAssetName(lock.tag);
+  const locked = lock.assets[wanted];
+  if (!locked?.sha256 && !options.pin) throw new Error(`Engine asset ${wanted} has no SHA-256 pin; refuse download. Run headroom engine install --pin to print a hash for review and commit.`);
   const upstreamAssets = await releaseAssets(lock);
   const upstream = upstreamAssets.find((asset) => asset.name === wanted);
   if (!upstream) throw new Error(`Pinned release ${lock.tag} has no ${wanted}; assets: ${upstreamAssets.map((a) => a.name).join(", ")}`);
-
-  // Retain the API-confirmed release inventory even if a later download fails.
-  lock.releaseAssets = upstreamAssets.map((asset) => asset.name).sort();
-  await writeEngineLock(lock);
 
   const response = await fetch(upstream.browser_download_url, { headers: { "User-Agent": "headroomq" } });
   if (!response.ok) throw new Error(`Engine download failed: HTTP ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   const sha256 = createHash("sha256").update(bytes).digest("hex");
-  const locked = lock.assets[wanted];
   const firstPin = !locked?.sha256;
   if (locked?.sha256 && locked.sha256 !== sha256) throw new Error(`SHA-256 mismatch for ${wanted}`);
-
-  // A first pin is intentionally explicit in the returned result/report; later installs fail closed.
-  lock.assets[wanted] = { name: wanted, sha256, url: upstream.browser_download_url };
-  await writeEngineLock(lock);
+  if (firstPin) return { tag: lock.tag, sha256, firstPin: true };
 
   const root = installRoot(lock.tag);
   const staging = `${root}.staging-${process.pid}`;
@@ -159,7 +149,8 @@ export async function installNativeEngine(): Promise<{ installed: true; tag: str
     const binary = join(staging, lock.native.binary);
     await fs.access(binary);
     await fs.chmod(binary, 0o700);
-    await fs.writeFile(join(staging, ".headroom-native-engine.json"), JSON.stringify({ tag: lock.native.tag, asset: asset.name, sha256 }), { mode: 0o600 });
+    const binarySha256 = await sha256File(binary);
+    await fs.writeFile(join(staging, ".headroom-native-engine.json"), JSON.stringify({ tag: lock.native.tag, asset: asset.name, sha256, binarySha256 }), { mode: 0o600 });
     await fs.mkdir(dirname(root), { recursive: true, mode: 0o700 });
     await fs.rm(root, { recursive: true, force: true });
     await fs.rename(staging, root);
