@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { readConsumes, readPolicy } from "./config.js";
+import { pathToFileURL } from "node:url";
 import { engineStatus, installEngine } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, TallyDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { canConsume, paceState, type CanDecision } from "./policy.js";
+import { canConsume, paceDecision, type CanDecision } from "./policy.js";
 import { accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { installService, uninstallService } from "./service.js";
@@ -37,9 +38,9 @@ function label(observation: Observation): string {
   return minutes ? `${minutes}m` : "-";
 }
 
-function formatWindow(observation: Observation, state: PaceState): string {
-  if (state === "NOT_ENFORCED") return `${label(observation)} n/a`;
-  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN${observation.reason ? ` (${observation.reason})` : ""}`;
+function formatWindow(observation: Observation, state: PaceState, reason: string): string {
+  if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
+  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})`;
   return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
 }
 
@@ -57,13 +58,23 @@ function age(observation: Observation): string {
   return milliseconds < 60_000 ? "<1m" : `${Math.floor(milliseconds / 60_000)}m`;
 }
 
-function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>): string[] {
+function windowOrder(observation: Observation): number {
+  const minutes = observation.window?.minutes;
+  if (minutes === 300) return 0;
+  if (minutes === 10_080) return 1;
+  return 2;
+}
+
+export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>): string[] {
   const meters = new Map<string, Observation[]>();
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
-    const ordered = [...windows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
+    const ordered = [...windows].sort((a, b) => windowOrder(a) - windowOrder(b) || (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
     const freshness = ordered.every((item) => item.freshness === "fresh") ? "fresh" : ordered.some((item) => item.freshness === "failed") ? "failed" : ordered.some((item) => item.freshness === "stale") ? "stale" : "not enforced";
-    return `${meter}  ${ordered.map((item) => `${formatWindow(item, paceState(item, policy))}${item.reason ? ` (${item.reason})` : ""}`).join(" | ")}  (${freshness} ${age(ordered[0])})`;
+    return `${meter}  ${ordered.map((item) => {
+      const decision = paceDecision(item, policy);
+      return formatWindow(item, decision.state, decision.reason);
+    }).join(" | ")}  (${freshness} ${age(ordered[0])})`;
   });
 }
 
@@ -111,7 +122,7 @@ async function can(argv: string[]): Promise<number> {
   directReadNotice();
   const [policy, store] = await Promise.all([readPolicy(), TallyStore.open()]);
   try {
-    const latest = new Map(meters.map((meter) => [meter, store.latest(meter)]));
+    const latest = new Map(meters.map((meter) => [meter, store.latestPerWindow(meter)]));
     const decision = canConsume(meters, latest, policy, argv.includes("--allow-unknown"));
     store.audit("cli", "can", action, decision.allowed ? "yes" : "no");
     printCan(decision, argv.includes("--json"));
@@ -129,16 +140,27 @@ async function observe(argv: string[]): Promise<number> {
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
   const request = await requestDaemon("status");
   const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
-  const { observations, failures, direct } = daemonObservations ? { observations: daemonObservations.filter((item) => !principal || item.principal_id === principal), failures: [], direct: false } : { ...(await pollAccounts(principal)), direct: true };
+  let observations: Observation[];
+  let failures: string[];
+  const direct = daemonObservations === undefined;
+  if (daemonObservations) {
+    observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    failures = [];
+  } else {
+    const polled = await pollAccounts(principal);
+    failures = polled.failures;
+    const store = await TallyStore.open();
+    try {
+      store.insertAll(polled.observations);
+      observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
+    } finally { store.close(); }
+  }
   if (direct) directReadNotice();
   const policy = await readPolicy();
-  if (direct) {
-    const store = await TallyStore.open();
-    try { store.insertAll(observations); store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok"); } finally { store.close(); }
-  }
   if (argv.includes("--json")) console.log(JSON.stringify(observations));
   else { for (const line of formatMeters(observations, policy)) console.log(line); for (const failure of failures) console.log(failure); }
-  if (threshold !== undefined && observations.some((item) => item.freshness === "fresh" && item.quantity && item.quantity.used >= threshold)) return 2;
+  if (threshold !== undefined && observations.some((item) => item.freshness !== "not_enforced" && item.quantity && item.quantity.used >= threshold)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
 
@@ -187,4 +209,6 @@ async function main(argv: string[]): Promise<number> {
   return observe(argv);
 }
 
-main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`tally error: ${safeError(error)}`); process.exitCode = 1; });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`tally error: ${safeError(error)}`); process.exitCode = 1; });
+}

@@ -162,15 +162,43 @@ export class TallyStore {
     return this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(meterId, since).map(observationFromRow);
   }
 
+  /**
+   * The observations table is an append-only history. Current status must have
+   * one row per meter and duration, chosen by the vendor fetch timestamp (not
+   * insertion order). A duration is the user-visible window identity: a 5h
+   * rolling and a 5h fixed window are still the same current 5h allowance.
+   */
+  latestPerWindow(meterId?: string): StoredObservation[] {
+    const filter = meterId === undefined ? "" : "WHERE meter_id = ?";
+    return this.db.prepare(`WITH ranked AS (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
+        ORDER BY fetched_at DESC, id DESC
+      ) AS row_number
+      FROM observations ${filter}
+    ) SELECT current.* FROM ranked AS current
+      WHERE current.row_number = 1
+        -- A transport/auth failure has no vendor window. It replaces an older
+        -- successful read for the whole meter; an older failure must not add a
+        -- spurious '-' window beside a newer vendor response.
+        AND NOT EXISTS (
+          SELECT 1 FROM observations AS peer
+          WHERE peer.meter_id = current.meter_id
+            AND (
+              (current.freshness = 'failed' AND peer.freshness <> 'failed')
+              OR (current.freshness <> 'failed' AND peer.freshness = 'failed')
+            )
+            AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
+        )
+      ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)
+      .all(...(meterId === undefined ? [] : [meterId]))
+      .map(observationFromRow);
+  }
+
+  /** Compatibility helper for callers that explicitly need one newest row. */
   latest(meterId: string): StoredObservation | undefined {
     const row = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId);
     return row ? observationFromRow(row) : undefined;
-  }
-
-  latestAll(): StoredObservation[] {
-    return this.db.prepare(`SELECT * FROM observations WHERE id IN (
-      SELECT MAX(id) FROM observations GROUP BY meter_id, window_json
-    ) ORDER BY meter_id ASC, id ASC`).all().map(observationFromRow);
   }
 
   events(since: string): TallyEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }

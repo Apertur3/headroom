@@ -96,7 +96,7 @@ export class TallyDaemon {
       switch (request.method) {
         case "status":
           await this.poll(undefined, false);
-          result = this.store.latestAll();
+          result = this.store.latestPerWindow();
           break;
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -113,7 +113,7 @@ export class TallyDaemon {
           const meters = (await readConsumes())[action];
           if (!meters) return rpcError(request.id, -32602, `Unknown action class: ${action || "(missing)"}`);
           const policy = await readPolicy();
-          result = canConsume(meters, new Map(meters.map((meter) => [meter, this.store.latest(meter)])), policy, params.allow_unknown === true);
+          result = canConsume(meters, new Map(meters.map((meter) => [meter, this.store.latestPerWindow(meter)])), policy, params.allow_unknown === true);
           break;
         }
         case "refresh": {
