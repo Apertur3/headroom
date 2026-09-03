@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -27,6 +27,20 @@ describe("brand identity", () => {
     try {
       await mkdir(retired, { recursive: true });
       expect(await migrateLegacyHome({ platform: "darwin", home: root, env: {} })).toBe(true);
+      expect(await migrateLegacyHome({ platform: "darwin", home: root, env: {} })).toBe(false);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("moves the prior engine cache when the new home was created first", async () => {
+    const root = join(tmpdir(), `headroom-engine-migration-${Date.now()}-${Math.random()}`);
+    const retired = join(root, [".", "ta", "lly"].join(""));
+    const current = join(root, ".headroom");
+    try {
+      await mkdir(join(retired, "engine", "v0.56.4"), { recursive: true });
+      await writeFile(join(retired, "engine", "v0.56.4", "codexbar"), "pinned engine");
+      await mkdir(current, { recursive: true });
+      expect(await migrateLegacyHome({ platform: "darwin", home: root, env: {} })).toBe(true);
+      expect(await readFile(join(current, "engine", "v0.56.4", "codexbar"), "utf8")).toBe("pinned engine");
       expect(await migrateLegacyHome({ platform: "darwin", home: root, env: {} })).toBe(false);
     } finally { await rm(root, { recursive: true, force: true }); }
   });

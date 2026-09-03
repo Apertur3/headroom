@@ -23,8 +23,10 @@ UNKNOWN never counts as capacity.
 </picture>
 
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
-token from the Keychain or credentials file, the Codex token from its auth file, the Antigravity
-token from the agy CLI. Each call goes straight to the vendor's usage endpoint and the token is
+token from the Keychain or credentials file, the Codex token from its auth file, and Antigravity
+from the daemon-kept `agy` session. The daemon's warm `agy` source is the primary Antigravity
+reader; its Google OAuth quota endpoint is a fallback only for accounts whose Gemini Code Assist
+tier is still served. Each call goes straight to the vendor's usage endpoint and the token is
 dropped afterwards. The endpoint contracts were learned from
 [CodexBar](https://github.com/steipete/codexbar) (MIT) by Peter Steinberger; an optional engine
 links its library for providers Headroom does not cover natively.
@@ -80,6 +82,8 @@ is pinned and checksum verified, and every query lands in an audit log. Details 
 Pre-alpha. Verified daily on one machine with two Claude config dirs, one Codex home, one
 Antigravity account and two local inference boxes. Vendor endpoints are private and change
 without notice; Headroom pins, records fixtures, backs off on 401, 403 and 429, and prints UNKNOWN
-instead of a stale number.
+instead of a stale number. Google can reject the remote Antigravity fallback for unsupported
+Gemini Code Assist tiers (for example `UNSUPPORTED_CLIENT`); keep the daemon running so its warm
+`agy` source remains available.
 
 MIT. Third party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

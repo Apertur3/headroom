@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
-import { formatMeters, thresholdReport } from "../src/cli.js";
+import { endedLeaseMessage, formatMeters, thresholdReport } from "../src/cli.js";
 import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
 import type { Observation } from "../src/types.js";
 
@@ -51,7 +51,6 @@ describe("SQLite observations and event detector", () => {
       const events = store.events("2026-09-03T00:00:00Z");
       expect(events).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "reset_seen", origin: "inferred", confidence: 0.5 }),
-        expect.objectContaining({ kind: "reset_seen", origin: "inferred", confidence: 0.9 }),
         expect.objectContaining({ kind: "free_reset_used", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "free_reset_granted", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "credits_changed", origin: "vendor_reported" }),
@@ -59,6 +58,26 @@ describe("SQLite observations and event detector", () => {
         expect.objectContaining({ kind: "source_recovered" }),
       ]));
       expect(store.history("codex-main:main", "2026-09-03T00:00:00Z")).toHaveLength(5);
+    } finally { store.close(); }
+  });
+
+  it("never infers a reset from an advancing rolling timestamp or a zero-use window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-rolling-reset-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const rolling = (used: number, fetched_at: string, resets_at: string) => observation({
+        window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, fetched_at, observed_at: fetched_at, resets_at,
+      });
+      store.insert(rolling(0, "2026-09-03T21:00:00Z", "2026-09-04T02:00:00Z"));
+      store.insert(rolling(0, "2026-09-03T21:05:00Z", "2026-09-04T02:05:00Z"));
+      store.insert(rolling(26, "2026-09-03T21:10:00Z", "2026-09-04T02:10:00Z"));
+      store.insert(rolling(26, "2026-09-03T21:15:00Z", "2026-09-04T02:15:00Z"));
+      expect(store.events("2026-09-03T21:00:00Z").filter((event) => event.kind === "reset_seen")).toHaveLength(0);
+
+      store.insert(observation({ freshness: "failed", quantity: null, window: { kind: "rolling", minutes: 300, enforcement: "hard" }, fetched_at: "2026-09-03T21:20:00Z" }));
+      store.insert(rolling(5, "2026-09-03T21:25:00Z", "2026-09-04T02:25:00Z"));
+      const recoveryEvents = store.events("2026-09-03T21:00:00Z").filter((event) => event.created_at === "2026-09-03T21:25:00Z");
+      expect(recoveryEvents).toEqual([expect.objectContaining({ kind: "source_recovered" })]);
     } finally { store.close(); }
   });
 
@@ -209,7 +228,10 @@ describe("leases", () => {
       store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
       expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z"))[0]).toMatchObject({ id: started.id, spent_percent: 10, ended_at: null });
       expect(() => store.endLease(started.id, "other", false, new Date("2026-09-03T12:01:00Z"))).toThrow("--force");
-      expect(store.endLease(started.id, "other", true, new Date("2026-09-03T12:01:00Z")).ended_reason).toBe("ended");
+      const ended = store.endLease(started.id, "other", true, new Date("2026-09-03T12:01:00Z"));
+      expect(ended.ended_reason).toBe("ended");
+      expect(store.endLease(started.id, "cadence", false, new Date("2026-09-03T12:02:00Z"))).toMatchObject({ id: started.id, owner: "cadence", ended_reason: "ended" });
+      expect(endedLeaseMessage(ended)).toBe(`ended ${started.id} (owner cadence)`);
       const expiring = store.startLease("cadence", "codex-main:main", null, 1, null, new Date("2026-09-03T13:00:00Z"));
       expect(store.leases(undefined, false, new Date("2026-09-03T13:00:01Z")).find((item) => item.id === expiring.id)).toMatchObject({ ended_reason: "expired" });
       expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "lease_started" }), expect.objectContaining({ kind: "lease_ended" })]));

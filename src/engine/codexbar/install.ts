@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { headroomHome } from "../../paths.js";
+import { headroomHome, migrateLegacyHome } from "../../paths.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -75,7 +75,15 @@ function installRoot(tag: string): string { return join(headroomHome(), "engine"
 function markerPath(tag: string): string { return join(installRoot(tag), ".headroom-engine.json"); }
 
 export async function installEngine(options: { pin?: boolean } = {}): Promise<{ tag: string; path?: string; sha256: string; firstPin: boolean }> {
+  // The prior home can coexist with a newly-created ~/.headroom.
+  // Reconcile its engine cache before deciding a network download is needed.
+  await migrateLegacyHome();
   const lock = await readEngineLock();
+  try {
+    const path = await verifiedEnginePath();
+    const marker = JSON.parse(await fs.readFile(markerPath(lock.tag), "utf8")) as { sha256: string };
+    return { tag: lock.tag, path, sha256: marker.sha256, firstPin: false };
+  } catch { /* no verified local upstream engine */ }
   const wanted = platformAssetName(lock.tag);
   const locked = lock.assets[wanted];
   if (!locked?.sha256 && !options.pin) throw new Error(`Engine asset ${wanted} has no SHA-256 pin; refuse download. Run headroom engine install --pin to print a hash for review and commit.`);

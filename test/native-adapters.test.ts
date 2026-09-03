@@ -77,6 +77,16 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(await requests[0].text()).toBe("{}");
   });
 
+  it("preserves a redacted Google Code Assist refusal reason", async () => {
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at,
+      credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "UNSUPPORTED_CLIENT", message: "Gemini Code Assist for individuals is no longer supported for person@example.com; Bearer eyJ.not-a-token" } }), { status: 403 }),
+    });
+    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "HTTP 403 UNSUPPORTED_CLIENT: Gemini Code Assist for individuals is no longer supported for [REDACTED]@example.com; [REDACTED]" })]));
+  });
+
   it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {
     const quota = await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8");
     const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 }))).mockResolvedValueOnce(new Response(quota));
