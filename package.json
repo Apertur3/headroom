@@ -1,12 +1,43 @@
 {
   "name": "keeptally",
   "version": "0.1.0",
-  "private": true,
-  "description": "Local quota readings for AI subscriptions",
+  "description": "Your agents know their budget: live quota, resets and pace states for every AI subscription and account, over CLI, daemon and MCP.",
+  "keywords": [
+    "claude",
+    "codex",
+    "gemini",
+    "antigravity",
+    "quota",
+    "rate-limit",
+    "usage",
+    "mcp",
+    "agents",
+    "cli"
+  ],
+  "homepage": "https://github.com/Apertur3/keeptally#readme",
+  "bugs": {
+    "url": "https://github.com/Apertur3/keeptally/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Apertur3/keeptally.git"
+  },
+  "license": "MIT",
+  "author": "the maintainer Hermans",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "files": ["dist", "engine.lock.json", "README.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"],
-  "bin": { "tally": "dist/cli.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "tally": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "engine.lock.json",
+    "README.md",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
@@ -18,5 +49,6 @@
     "@types/node": "20.19.43",
     "typescript": "5.9.3",
     "vitest": "2.1.9"
-  }
+  },
+  "private": true
 }
