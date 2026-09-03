@@ -5,6 +5,7 @@ import { normalizeObservations, observationsFromReading } from "./engine/observa
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { observeClaude } from "./adapters/claude.js";
 import { observeCodex } from "./adapters/codex.js";
+import { observeAntigravity } from "./adapters/antigravity.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
@@ -19,9 +20,9 @@ export async function pollAccounts(principal?: string): Promise<PollResult> {
   const localAccounts = accounts.filter(isLocalAccount);
   const observations: Observation[] = [];
   const failures: string[] = [];
-  const tsAccounts = providerAccounts.filter((account) => account.adapter === "native-ts" && (account.vendor === "claude" || account.vendor === "codex"));
+  const tsAccounts = providerAccounts.filter((account) => account.adapter === "native-ts" && (account.vendor === "claude" || account.vendor === "codex" || account.vendor === "antigravity"));
   for (const account of tsAccounts) {
-    const result = account.vendor === "claude" ? await observeClaude(account) : await observeCodex(account);
+    const result = account.vendor === "claude" ? await observeClaude(account) : account.vendor === "codex" ? await observeCodex(account) : await observeAntigravity(account);
     observations.push(...result);
     const protectedFailure = result.find((item) => item.freshness === "failed" && /\(401|403|429\)/.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);

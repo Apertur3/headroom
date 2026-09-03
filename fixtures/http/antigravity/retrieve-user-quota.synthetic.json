@@ -1,0 +1,8 @@
+{
+  "buckets": [
+    { "modelId": "gemini-5-hour", "remainingFraction": 0.76, "resetTime": "2026-09-03T22:26:36Z" },
+    { "modelId": "gemini-weekly", "remainingFraction": 0.34, "resetTime": "2026-09-10T17:26:36Z" },
+    { "modelId": "claude-gpt-5-hour", "remainingFraction": 0.81, "resetTime": "2026-09-03T22:26:36Z" },
+    { "modelId": "claude-gpt-weekly", "remainingFraction": 0.42, "resetTime": "2026-09-10T17:26:36Z" }
+  ]
+}
