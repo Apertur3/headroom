@@ -184,8 +184,8 @@ struct TallyEngine {
         // OAuth-only endpoint and headers, while retaining the access token in memory only.
         let snapshot = try await ClaudeOAuthUsageReader.fetch(accessToken: credentials.accessToken)
         var observations = claudeWindows(principal, meter: "all", windows: [snapshot.fiveHour, snapshot.sevenDay])
-        observations += claudeWindows(principal, meter: "fable", windows: [snapshot.fable])
-        observations += claudeWindows(principal, meter: "routines", windows: [snapshot.routines])
+        observations += claudeScopedWindows(principal, meter: "fable", window: snapshot.fable)
+        observations += claudeScopedWindows(principal, meter: "routines", window: snapshot.routines)
         guard !observations.isEmpty else { throw EngineError.noUsage }
         return observations
     }
@@ -240,6 +240,15 @@ struct TallyEngine {
                 reset: value.resetsAt, observed: Date(), source: "engine:native:claude",
                 window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.minutes, enforcement: "hard"))
         }
+    }
+
+    /// Scoped meters are an allowance only when the response names one. Its
+    /// absence is a successful vendor response, never a per-meter read error.
+    static func claudeScopedWindows(_ principal: Principal, meter: String, window: ClaudeUsageWindow?) -> [Observation] {
+        guard let window else {
+            return [notEnforcedWindow(principal, meter: meter, minutes: 10_080, source: "engine:native:claude", reason: "no scoped limit in response")]
+        }
+        return claudeWindows(principal, meter: meter, windows: [window])
     }
 
     static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil) -> [Observation] {

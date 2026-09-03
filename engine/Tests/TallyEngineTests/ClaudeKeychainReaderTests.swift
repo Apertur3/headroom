@@ -46,4 +46,17 @@ final class ClaudeKeychainReaderTests: XCTestCase {
         XCTAssertTrue(observations.contains { $0.meter_id == "claude-main:fable" && $0.freshness == "fresh" })
         XCTAssertTrue(observations.contains { $0.meter_id == "claude-main:routines" && $0.freshness == "not_enforced" })
     }
+
+    func testAbsentScopedLimitEmitsOneNotEnforcedWindow() throws {
+        let response = """
+        {"five_hour": {"utilization": 12}, "seven_day": {"utilization": 28}}
+        """
+        let snapshot = try ClaudeOAuthUsageReader.parse(Data(response.utf8))
+        let principal = Principal(id: "claude-main", vendor: "claude", location: "/tmp/.claude")
+        let observations = TallyEngine.claudeScopedWindows(principal, meter: "fable", window: snapshot.fable)
+        XCTAssertEqual(observations.count, 1)
+        XCTAssertEqual(observations.first?.meter_id, "claude-main:fable")
+        XCTAssertEqual(observations.first?.freshness, "not_enforced")
+        XCTAssertEqual(observations.first?.reason, "no scoped limit in response")
+    }
 }

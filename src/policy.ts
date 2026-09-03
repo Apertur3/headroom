@@ -60,15 +60,42 @@ export function paceDecision(observation: Observation | undefined, policy = defa
 
 export function paceState(observation: Observation, policy = defaultPolicy, now = new Date()): PaceState { return paceDecision(observation, policy, now).state; }
 
-const severity: Record<PaceState, number> = { NOT_ENFORCED: -1, HARVEST: 0, NORMAL: 1, CONSERVE: 2, FREEZE: 3, UNKNOWN: 4 };
+const severity: Record<PaceState, number> = { NOT_ENFORCED: -1, HARVEST: 0, NORMAL: 1, CONSERVE: 2, UNKNOWN: 3, FREEZE: 4 };
 
 /** Fail closed over every meter consumed by an action. */
 export interface MeterPaceDecision { meter: string; state: PaceState; reason: string; }
 export interface CanDecision { allowed: boolean; meter: string; state: PaceState; reason: string; meters: MeterPaceDecision[]; }
 
-export function canConsume(meters: string[], observations: Map<string, Observation | undefined>, policy = defaultPolicy, allowUnknown = false, now = new Date()): CanDecision {
+function windowLabel(observation: Observation): string {
+  const minutes = observation.window?.minutes;
+  if (minutes === 300) return "5h";
+  if (minutes === 10_080) return "wk";
+  if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
+  return minutes ? `${minutes}m` : "-";
+}
+
+function windowValue(observation: Observation, state: PaceState): string {
+  return state === "NOT_ENFORCED" ? "n/a" : observation.quantity ? `${Math.round(observation.quantity.used)}%` : "UNKNOWN";
+}
+
+function meterDecision(observations: Observation | Observation[] | undefined, policy: Policy, now: Date): Omit<MeterPaceDecision, "meter"> {
+  const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
+  const enforced = windows
+    .map((observation) => ({ observation, ...paceDecision(observation, policy, now) }))
+    .filter((window) => window.state !== "NOT_ENFORCED");
+  if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced" };
+  const deciding = enforced.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
+  return {
+    state: deciding.state,
+    reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}`,
+  };
+}
+
+/** Fail closed over every enforced window of every meter consumed by an action. */
+export function canConsume(meters: string[], observations: Map<string, Observation | Observation[] | undefined>, policy = defaultPolicy, allowUnknown = false, now = new Date()): CanDecision {
   if (!meters.length) throw new Error("An action must consume at least one meter");
-  const states = meters.map((meter) => ({ meter, ...paceDecision(observations.get(meter), policy, now) }));
+  const states = meters.map((meter) => ({ meter, ...meterDecision(observations.get(meter), policy, now) }));
   const limiting = states.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
-  return { allowed: !states.some((item) => item.state === "FREEZE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
+  return { allowed: !states.some((item) => item.state === "FREEZE" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
 }

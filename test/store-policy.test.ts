@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canConsume, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
 import { TallyStore } from "../src/store.js";
+import { formatMeters } from "../src/cli.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -53,6 +54,30 @@ describe("SQLite observations and event detector", () => {
       expect(store.history("codex-main:main", "2026-09-03T00:00:00Z")).toHaveLength(5);
     } finally { store.close(); }
   });
+
+  it("returns only the latest fetched observation for each meter window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tally-store-latest-")); temporary.push(root);
+    const store = await TallyStore.open(join(root, ".tally"));
+    try {
+      store.insert(observation({ fetched_at: "2026-09-03T12:00:00Z", quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
+      store.insert(observation({ fetched_at: "2026-09-03T12:02:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
+      // Arrival order can differ from the upstream fetch order; history keeps it,
+      // whereas current status must not let it replace the 12:02 reading.
+      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 30, limit: 100, remaining: 70, unit: "percent" } }));
+      expect(store.history("codex-main:main", "2026-09-03T00:00:00Z")).toHaveLength(3);
+      expect(store.latestPerWindow()).toEqual([expect.objectContaining({ meter_id: "codex-main:main", fetched_at: "2026-09-03T12:02:00Z", quantity: expect.objectContaining({ used: 20 }) })]);
+    } finally { store.close(); }
+  });
+
+  it("does not display an older failed read beside a newer scoped window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tally-store-failure-")); temporary.push(root);
+    const store = await TallyStore.open(join(root, ".tally"));
+    try {
+      store.insert(observation({ meter_id: "claude-main:fable", window: null, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at: "2026-09-03T12:00:00Z" }));
+      store.insert(observation({ meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "not_enforced", reason: "no scoped limit in response", fetched_at: "2026-09-03T12:01:00Z" }));
+      expect(store.latestPerWindow("claude-main:fable")).toEqual([expect.objectContaining({ freshness: "not_enforced", reason: "no scoped limit in response" })]);
+    } finally { store.close(); }
+  });
 });
 
 describe("pace and consumes", () => {
@@ -70,7 +95,7 @@ describe("pace and consumes", () => {
     expect(paceState(frozen, policy, now)).toBe("FREEZE");
     expect(paceState(paced(10, { freshness: "stale" }), policy, now)).toBe("UNKNOWN");
     const parent = paced(10, { meter_id: "claude-main:all" });
-    expect(canConsume([parent.meter_id, frozen.meter_id], new Map([[parent.meter_id, parent], [frozen.meter_id, frozen]]), policy, false, now)).toMatchObject({ allowed: false, meter: "claude-main:fable", state: "FREEZE", reason: "reserve reached", meters: [expect.objectContaining({ meter: "claude-main:all" }), expect.objectContaining({ meter: "claude-main:fable", state: "FREEZE" })] });
+    expect(canConsume([parent.meter_id, frozen.meter_id], new Map([[parent.meter_id, parent], [frozen.meter_id, frozen]]), policy, false, now)).toMatchObject({ allowed: false, meter: "claude-main:fable", state: "FREEZE", reason: "100m 95% FREEZE", meters: [expect.objectContaining({ meter: "claude-main:all" }), expect.objectContaining({ meter: "claude-main:fable", state: "FREEZE" })] });
   });
 
   it("holds pace at NORMAL for the early grace period unless frozen", () => {
@@ -79,5 +104,23 @@ describe("pace and consumes", () => {
     expect(paceDecision(early, policy, now)).toEqual({ state: "NORMAL", reason: "grace period" });
     expect(paceState(later, policy, now)).toBe("CONSERVE");
     expect(paceState(paced(95, { resets_at: "2026-09-03T13:35:00Z" }), policy, now)).toBe("FREEZE");
+  });
+
+  it("blocks on an enforced weekly window even if the 5h window is not enforced", () => {
+    const fiveHour = paced(0, { window: { kind: "rolling", minutes: 300, enforcement: "hard" }, freshness: "not_enforced", quantity: null, resets_at: null });
+    const weekly = paced(17, { window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, resets_at: "2026-09-10T12:00:00Z" });
+    const decision = canConsume([weekly.meter_id], new Map([[weekly.meter_id, [fiveHour, weekly]]]), { ...policy, pace_grace_fraction: 0 }, false, now);
+    expect(decision).toMatchObject({ allowed: false, state: "CONSERVE", reason: "wk 17% CONSERVE", meters: [expect.objectContaining({ state: "CONSERVE", reason: "wk 17% CONSERVE" })] });
+  });
+
+  it("formats each latest window once, with reasons only once", () => {
+    const now = new Date();
+    const failed = observation({ meter_id: "claude-main:fable", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at: now.toISOString() });
+    const absent = observation({ meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "not_enforced", reason: "no scoped limit in response", fetched_at: now.toISOString() });
+    expect(formatMeters([failed, absent], defaultPolicy)).toMatchInlineSnapshot(`
+      [
+        "claude-main:fable  5h UNKNOWN (Claude OAuth usage unavailable) | wk n/a (no scoped limit in response)  (failed <1m)",
+      ]
+    `);
   });
 });
