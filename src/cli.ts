@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { readPolicy, readRouting } from "./config.js";
 import { pathToFileURL } from "node:url";
+import { appendDaemonLog, tailDaemonLog } from "./logs.js";
+import { doctor } from "./doctor.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
@@ -313,11 +315,20 @@ function directReadNotice(): void { process.stderr.write("(direct read, no daemo
 async function daemon(): Promise<number> {
   const instance = await HeadroomDaemon.create();
   await instance.start();
-  console.log(`headroom daemon listening on ${socketPath()}`);
+  await appendDaemonLog(`daemon started; listening on ${socketPath()}`);
   await new Promise<void>((resolve) => {
-    const stop = () => { void instance.stop().finally(resolve); };
+    const stop = () => { void instance.stop().then(() => appendDaemonLog("daemon stopped")).finally(resolve); };
     process.once("SIGINT", stop); process.once("SIGTERM", stop);
   });
+  return 0;
+}
+
+async function logs(argv: string[]): Promise<number> {
+  if (argv.length > 2 || (argv[0] && argv[0] !== "--tail")) throw new Error("Usage: headroom logs [--tail 50]");
+  const requested = argv[0] === "--tail" ? Number(argv[1]) : 50;
+  if (!Number.isSafeInteger(requested) || requested < 1 || requested > 10_000) throw new Error("--tail must be a whole number from 1 through 10000");
+  const output = await tailDaemonLog(requested);
+  if (output) console.log(output);
   return 0;
 }
 
@@ -346,6 +357,8 @@ async function main(argv: string[]): Promise<number> {
   }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
+  if (argv[0] === "doctor") return doctor();
+  if (argv[0] === "logs") return logs(argv.slice(1));
   if (argv[0] === "daemon") return daemon();
   if (argv[0] === "keychain") return keychain(argv.slice(1));
   if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }

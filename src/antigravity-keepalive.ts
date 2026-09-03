@@ -28,6 +28,7 @@ export class AgyKeepaliveSupervisor {
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
+  get pid(): number | undefined { return this.running ? this.child?.pid : undefined; }
 
   start(): void {
     this.stopping = false;

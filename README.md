@@ -24,9 +24,9 @@ UNKNOWN never counts as capacity.
 
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
 token from the Keychain or credentials file, the Codex token from its auth file, and Antigravity
-from the daemon-kept `agy` session. The daemon's warm `agy` source is the primary Antigravity
-reader; its Google OAuth quota endpoint is a fallback only for accounts whose Gemini Code Assist
-tier is still served. Each call goes straight to the vendor's usage endpoint and the token is
+from the daemon-kept `agy` session. The daemon keeps an `agy` pseudo-terminal alive so local
+Antigravity quota summaries stay warm. The older remote Google OAuth path is deprecated and only
+remains as a compatibility fallback for accounts whose Gemini Code Assist tier still serves it. Each call goes straight to the vendor's usage endpoint and the token is
 dropped afterwards. The endpoint contracts were learned from
 [CodexBar](https://github.com/steipete/codexbar) (MIT) by Peter Steinberger; an optional engine
 links its library for providers Headroom does not cover natively.
@@ -52,10 +52,11 @@ use `node dist/cli.js` where the commands below say `npx headroomd`.
 
 ```sh
 npx headroomd engine install     # pin and verify the sensing engine
-npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
 npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity
+npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
 npx headroomd                    # one line per meter
 npx headroomd install-service    # launchd, systemd user unit, or Windows Task Scheduler
+npx headroomd doctor             # one-line installation and daemon diagnostics
 ```
 
 Register the MCP server in each Claude Code profile:
