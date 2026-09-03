@@ -1,0 +1,12 @@
+# Each entry names one credential location. Tally never stores credentials here.
+[[accounts]]
+name = "codex-main"
+vendor = "codex"
+location = "~/.codex"
+adapter = "codexbar"
+
+[[accounts]]
+name = "claude-main"
+vendor = "claude"
+location = "~/.claude"
+adapter = "pending"

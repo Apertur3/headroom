@@ -13,4 +13,4 @@ Status: pre-alpha, being built in slices. See `docs/spec.md`.
 - Tokens are never written to disk or logs. See `SECURITY.md`.
 - Ships an orchestrator skill: capability routing stays yours, Tally only filters by budget.
 
-Package name: `tallyq` (npm). Brand: Tally.
+Package name: `keeptally` (npm). Brand: Tally.

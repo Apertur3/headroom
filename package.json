@@ -1,0 +1,19 @@
+{
+  "name": "keeptally",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local quota readings for AI subscriptions",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "bin": { "tally": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "5.9.3",
+    "vitest": "2.1.9"
+  }
+}
