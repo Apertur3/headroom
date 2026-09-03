@@ -1,0 +1,37 @@
+{
+  "_fixture_status": "placeholder: replace with a redacted live tally-engine run",
+  "observations": [
+    {
+      "principal_id": "codex-main",
+      "meter_id": "codex-main:main",
+      "window": { "kind": "fixed", "minutes": 300, "enforcement": "hard" },
+      "quantity": { "used": 12, "limit": 100, "remaining": 88, "unit": "percent" },
+      "resets_at": "2026-09-03T17:23:00Z",
+      "observed_at": "2026-09-03T13:24:00Z",
+      "fetched_at": "2026-09-03T13:24:00Z",
+      "source": "engine:native:codex",
+      "truth": "official",
+      "freshness": "fresh",
+      "confidence": 1,
+      "adapter_version": "0.1.0",
+      "upstream_schema_version": "v0.56.4",
+      "reason": null
+    },
+    {
+      "principal_id": "codex-main",
+      "meter_id": "codex-main:spark",
+      "window": { "kind": "fixed", "minutes": 300, "enforcement": "hard" },
+      "quantity": { "used": 8, "limit": 100, "remaining": 92, "unit": "percent" },
+      "resets_at": "2026-09-03T17:23:00Z",
+      "observed_at": "2026-09-03T13:24:00Z",
+      "fetched_at": "2026-09-03T13:24:00Z",
+      "source": "engine:native:codex",
+      "truth": "official",
+      "freshness": "fresh",
+      "confidence": 1,
+      "adapter_version": "0.1.0",
+      "upstream_schema_version": "v0.56.4",
+      "reason": null
+    }
+  ]
+}

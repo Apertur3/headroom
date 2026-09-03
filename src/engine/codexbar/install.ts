@@ -14,6 +14,7 @@ const lockPath = join(repoRoot, "engine.lock.json");
 export interface LockedAsset { name: string; sha256?: string; url?: string }
 export interface EngineLock {
   tag: string;
+  native?: { tag: string; binary: string };
   repository: string;
   releaseAssets: string[];
   assets: Record<string, LockedAsset>;

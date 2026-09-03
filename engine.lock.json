@@ -1,5 +1,9 @@
 {
   "tag": "v0.56.4",
+  "native": {
+    "tag": "v0.56.4",
+    "binary": "tally-engine"
+  },
   "repository": "steipete/CodexBar",
   "releaseAssets": [
     "CodexBar-macos-universal-0.56.4.dSYM.zip",

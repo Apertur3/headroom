@@ -2,9 +2,11 @@
 import { adaptCodexPayload } from "./engine/codexbar/adapt.js";
 import { engineStatus, installEngine, verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
+import { observationsFromReading } from "./engine/observation.js";
+import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { safeError } from "./security.js";
-import type { Reading } from "./types.js";
+import type { Observation } from "./types.js";
 
 function formatReset(value: string | null | undefined): string {
   if (!value) return "?";
@@ -15,15 +17,9 @@ function formatReset(value: string | null | undefined): string {
   return date.toDateString() === now.toDateString() ? time : `${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)} ${time}`;
 }
 
-function formatReading(reading: Reading): string {
-  const five = reading.windows.five_hour;
-  const weekly = reading.windows.weekly;
-  const pieces = [
-    five ? `5h ${five.used_percent}% ↻${formatReset(five.resets_at)}` : "5h —",
-    weekly ? `wk ${weekly.used_percent}% ↻${formatReset(weekly.resets_at)}` : "wk —",
-    `free resets ${reading.extras.free_resets_available ?? 0}`,
-  ];
-  return `${reading.account}/${reading.pool}  ${pieces.join(" | ")}`;
+function formatObservation(observation: Observation): string {
+  const amount = observation.quantity ? `${observation.quantity.used}% ↻${formatReset(observation.resets_at)}` : "UNKNOWN";
+  return `${observation.meter_id}  ${amount} (${observation.freshness}; ${observation.source})${observation.reason ? `: ${observation.reason}` : ""}`;
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -33,9 +29,10 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (argv[0] === "engine" && argv[1] === "status") {
-    const status = await engineStatus();
-    console.log(`engine ${status.tag} ${status.present ? "present" : "absent"} ${status.path}`);
-    return status.present ? 0 : 1;
+    const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]);
+    console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.tally/engine/native/tally-engine (or engine/.build/release/tally-engine)"}`);
+    console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`);
+    return native || upstream.present ? 0 : 1;
   }
   if (argv[0] === "accounts" && argv[1] === "discover") {
     const accounts = await discoverAccounts();
@@ -46,23 +43,31 @@ async function main(argv: string[]): Promise<number> {
   if (argv.some((arg) => arg !== "--json")) throw new Error("Usage: tally [--json] | tally engine <install|status> | tally accounts discover");
   const json = argv.includes("--json");
   const accounts = await readAccounts();
-  const readings: Reading[] = [];
+  const observations: Observation[] = [];
   const failures: string[] = [];
+  const native = await nativeEnginePath();
+  if (native) {
+    try {
+      observations.push(...await runNativeEngine(native, accounts));
+    } catch (error) {
+      failures.push(`native engine source failed: ${safeError(error)}`);
+    }
+  }
   let engine: string | undefined;
-  for (const account of accounts) {
-    if (account.adapter === "pending") { failures.push(`${account.name} source failed: adapter pending`); continue; }
+  for (const account of native ? [] : accounts) {
+    if (account.adapter === "pending" || account.vendor !== "codex") { failures.push(`${account.name} source failed: native engine unavailable`); continue; }
     try {
       engine ??= await verifiedEnginePath();
       const result = await runCodexBar(engine, account);
-      readings.push(...adaptCodexPayload(result.payload, account.name));
+      observations.push(...adaptCodexPayload(result.payload, account.name).flatMap(observationsFromReading));
     } catch (error) { failures.push(`${account.name} source failed: ${safeError(error)}`); }
   }
-  if (json) console.log(JSON.stringify(readings));
+  if (json) console.log(JSON.stringify(observations));
   else {
-    for (const reading of readings) console.log(formatReading(reading));
+    for (const observation of observations) console.log(formatObservation(observation));
     for (const failure of failures) console.log(failure);
   }
-  if (failures.length) return readings.length ? 3 : 1;
+  if (failures.length) return observations.length ? 3 : 1;
   return 0;
 }
 
