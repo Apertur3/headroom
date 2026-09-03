@@ -4,9 +4,11 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { claudeResponseShape, claudeServiceName, observationsFromClaudeUsage, observeClaude } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
+import { observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential } from "../src/adapters/antigravity.js";
 
 const claude = { name: "claude-main", vendor: "claude", location: "/Users/test/.claude", adapter: "native-ts" } as const;
 const codex = { name: "codex-main", vendor: "codex", location: "/Users/test/.codex", adapter: "native-ts" } as const;
+const antigravity = { name: "antigravity", vendor: "antigravity", location: "/Users/test/.gemini/antigravity-cli", adapter: "native-ts" } as const;
 const at = new Date("2026-09-03T17:26:36Z");
 
 describe("native TypeScript adapter conformance (synthetic until recorder capture)", () => {
@@ -30,6 +32,51 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect.objectContaining({ meter_id: "codex-main:spark", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 8 }) }),
       expect.objectContaining({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-08T17:23:00Z" }),
     ]));
+  });
+
+  it("maps verified Antigravity quota buckets to the two 5-hour and weekly meters", async () => {
+    const body = JSON.parse(await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8"));
+    const rows = observationsFromAntigravityQuota(body, antigravity, at);
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 24, limit: 100, remaining: 76, unit: "percent" }, source: "native:antigravity" }),
+      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 66, limit: 100, remaining: 34, unit: "percent" } }),
+      expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 19, limit: 100, remaining: 81, unit: "percent" } }),
+      expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 58, limit: 100, remaining: 42, unit: "percent" } }),
+    ]));
+  });
+
+  it("normalizes a synthetic-reset quota snapshot with the shared placeholder rule", () => {
+    const at = new Date("2026-09-03T17:26:36Z");
+    const rows = observationsFromAntigravityQuota({ buckets: [
+      { modelId: "gemini-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
+      { modelId: "gemini-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
+      { modelId: "claude-gpt-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
+      { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
+    ] }, antigravity, at);
+    expect(rows.filter((row) => row.meter_id === "antigravity:gemini")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ freshness: "failed", reason: "availability-only payload; quota summary not served" }),
+    ]));
+  });
+
+  it("rejects an availability-only Antigravity answer and calls quota before models", async () => {
+    const available = await readFile(new URL("../fixtures/http/antigravity/fetch-available-models.synthetic.json", import.meta.url), "utf8");
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] }))).mockResolvedValueOnce(new Response(available));
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at,
+      credentialPaths: () => ["agy-token"],
+      readFile: async () => JSON.stringify({ token: { access_token: "not-a-secret", expiry: "2026-09-03T18:26:36Z" } }),
+      fetch,
+    });
+    expect(rows).toHaveLength(4);
+    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "quota endpoint returned availability only", quantity: null })]));
+    const requests = fetch.mock.calls.map(([request]) => request as Request);
+    expect(requests.map((request) => request.url)).toEqual([
+      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+      "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    ]);
+    expect(requests[0].headers.get("User-Agent")).toBe("antigravity");
+    expect(requests[0].headers.get("x-goog-api-client")).toBeNull();
+    expect(await requests[0].text()).toBe("{}");
   });
 
   it("always emits a main weekly row so a missing vendor field replaces prior data", () => {
@@ -85,7 +132,8 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const rejectedFetch = async () => { throw new Error(secret); };
     const claudeRows = await observeClaude(claude, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: secret, expiresAt: at.getTime() + 60_000 } }), fetch: rejectedFetch });
     const codexRows = await observeCodex(codex, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: secret, expires_at: at.getTime() + 60_000 } }), fetch: rejectedFetch });
-    const output = JSON.stringify([claudeRows, codexRows, log.mock.calls]);
+    const antigravityRows = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["agy-token"], readFile: async () => JSON.stringify({ token: { access_token: secret, expiry: "2026-09-03T18:26:36Z" } }), fetch: rejectedFetch });
+    const output = JSON.stringify([claudeRows, codexRows, antigravityRows, log.mock.calls]);
     expect(output).not.toContain(secret);
     expect(output).not.toContain("Bearer");
     log.mockRestore();
@@ -102,9 +150,15 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const missingClaude = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => { throw new Error("missing"); } });
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const expiredCodex = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() - 1 } }) });
+    const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["agy-token"], readFile: async () => JSON.stringify({ token: { access_token: "token", expiry: "2026-09-03T17:26:35Z" } }) });
     expect(expiredClaude[0].reason).toBe("token expired; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
     expect(missingClaude[0].reason).toBe("no credentials in Keychain for this config dir; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
     expect(expiredCodex[0].reason).toBe("token expired; run: CODEX_HOME=/Users/test/.codex2 codex login");
+    expect(expiredAntigravity[0].reason).toBe("token expired; run: agy");
+  });
+
+  it("accepts Gemini CLI's top-level JSON token as the fallback credential format", () => {
+    expect(parseAntigravityCredential(JSON.stringify({ access_token: "token", expiry_date: at.getTime() + 60_000 }), at)).toMatchObject({ token: "token", expired: false });
   });
 
   it("reports response paths and value kinds without response values", async () => {

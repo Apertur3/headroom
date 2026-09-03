@@ -1,0 +1,6 @@
+{
+  "models": {
+    "gemini-2.5-pro": { "displayName": "Gemini 2.5 Pro", "quotaInfo": { "remainingFraction": 1 } },
+    "claude-sonnet": { "displayName": "Claude Sonnet", "quotaInfo": { "remainingFraction": 1 } }
+  }
+}
