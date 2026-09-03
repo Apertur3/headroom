@@ -25,7 +25,7 @@ desktop apps or single-account CLIs. Tally owns the second and third and keeps t
 | Window | A rolling bucket inside a pool: `five_hour`, `weekly`, or vendor-specific. Carries `used_percent`, `resets_at`, `window_minutes`. |
 | Reading | One sample of one pool at one time, with `source` = `engine:codexbar` or `native:claude` and `truth` = `official` or `estimated`. |
 | Event | Derived from consecutive readings: `reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `source_failed`. |
-| Local pool | Self-hosted inference (vLLM, llama.cpp, Ollama) as a pool with no quota but finite capacity. State `UP`, `BUSY`, `DOWN` instead of percent; carries model id, running and waiting request counts from `/metrics` when available, and endpoint latency. Zero-cost capacity the orchestrator should harvest first for fungible work. |
+| Local pool | Self-hosted inference (vLLM, llama.cpp, Ollama) as a pool with no quota but finite capacity. State `UP`, `BUSY`, `DOWN` instead of percent; carries model id, running and waiting request counts from `/metrics` when available, and endpoint latency. Cost model is `marginal` (energy per hour), unlike subscriptions which are `sunk` (expire at reset). Routing preference is a policy toggle, default `fallback`. |
 | Pace state | Per window: HARVEST (>10 pts under the straight-line burn), NORMAL, CONSERVE (>10 pts over), FREEZE (past the freeze reserve, overrides all). Ported from the fleet pace machine. |
 
 ## Architecture
@@ -54,6 +54,7 @@ statusline ─┘        │              └── adapters are pure: (account)
   time via `security find-generic-password -w`, calls the usage endpoint, drops the token.
   Linux: `~/.claude*/.credentials.json`.
 - **Local adapter.** `native:local` probes an OpenAI-compatible base URL: `/v1/models` for liveness and model id, vLLM `/metrics` (`vllm:num_requests_running`, `vllm:num_requests_waiting`) for load, llama.cpp `/health`. Configured in `accounts.toml` as `kind = "local"` with `base_url`, optional `wake` command (e.g. `ssh gateway wake-workstation`) that Tally reports but never runs on its own. Owner fleet: gpu-box vLLM 10.0.0.20:8000, workstation vLLM :8000 and llama.cpp :8012 (VM .160).
+- **Cost model and local preference.** Every pool carries `cost = "sunk" | "marginal"`. Policy key `local_preference` in `routing.toml`: `fallback` (default: local pools are offered only when every eligible subscription pool for the task class is CONSERVE or FREEZE), `prefer` (local first for fungible work, for users with cheap power or idle hardware), `never`. Optional `energy_cost_per_hour` per local pool is shown in output, never used for automatic decisions.
 - **Antigravity.** Through the engine; CodexBar reads the `agy` CLI's local HTTPS server.
   Open question: headless `agy` server mode. Slice 4 answers it.
 - **Daemon.** Unix socket `~/.tally/tally.sock` (0600), JSON-RPC. Started by `tally daemon` or
