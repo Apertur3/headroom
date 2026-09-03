@@ -1,4 +1,4 @@
-# Copy to ~/.tally/routing.toml. An action may consume several overlapping meters.
+# Copy to ~/.headroom/routing.toml. An action may consume several overlapping meters.
 local_preference = "fallback" # fallback | prefer | never
 [consumes]
 claude-fable = ["claude-main:all", "claude-main:fable"]

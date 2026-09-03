@@ -2,13 +2,13 @@
   "tag": "v0.56.4",
   "native": {
     "tag": "v0.1.0",
-    "repository": "Apertur3/keeptally",
-    "binary": "tally-engine",
+    "repository": "Apertur3/headroom",
+    "binary": "headroom-engine",
     "assets": {
-      "macos-arm64": { "name": "tally-engine-0.1.0-macos-arm64.tar.gz", "sha256": null, "unpinned": true },
-      "macos-x86_64": { "name": "tally-engine-0.1.0-macos-x86_64.tar.gz", "sha256": null, "unpinned": true },
-      "linux-x86_64": { "name": "tally-engine-0.1.0-linux-x86_64.tar.gz", "sha256": null, "unpinned": true },
-      "linux-aarch64": { "name": "tally-engine-0.1.0-linux-aarch64.tar.gz", "sha256": null, "unpinned": true }
+      "macos-arm64": { "name": "headroom-engine-0.1.0-macos-arm64.tar.gz", "sha256": null, "unpinned": true },
+      "macos-x86_64": { "name": "headroom-engine-0.1.0-macos-x86_64.tar.gz", "sha256": null, "unpinned": true },
+      "linux-x86_64": { "name": "headroom-engine-0.1.0-linux-x86_64.tar.gz", "sha256": null, "unpinned": true },
+      "linux-aarch64": { "name": "headroom-engine-0.1.0-linux-aarch64.tar.gz", "sha256": null, "unpinned": true }
     }
   },
   "repository": "steipete/CodexBar",

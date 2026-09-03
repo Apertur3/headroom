@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for taking a look. Tally is pre-alpha and moves quickly; small, focused pull requests
+Thanks for taking a look. Headroom is pre-alpha and moves quickly; small, focused pull requests
 land fastest.
 
 ## Ground rules
@@ -22,7 +22,7 @@ npm test
 npm run engine:build   # optional, macOS or Linux with a Swift toolchain
 ```
 
-Run `tally` against your own accounts before opening a pull request and paste the redacted
+Run `headroom` against your own accounts before opening a pull request and paste the redacted
 output in the description.
 
 ## Reporting a security issue

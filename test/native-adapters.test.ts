@@ -47,7 +47,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
   });
 
   it("falls back to the most recent recorded session rate-limit event and marks old evidence stale", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-codex-log-"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-codex-log-"));
     try {
       await mkdir(join(root, "sessions"));
       await writeFile(join(root, "sessions", "rollout.jsonl"), await readFile(new URL("../fixtures/codex/session-rate-limit.real.redacted.jsonl", import.meta.url), "utf8"));
@@ -72,6 +72,11 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       fetch: vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(usage))).mockResolvedValueOnce(new Response("{}")),
     });
     expect(rows).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", source: "native:codex:session-log", truth: "official", quantity: expect.objectContaining({ used: 100 }), freshness: "fresh" }));
+  });
+
+  it("derives a session reset from its event timestamp and remaining seconds", () => {
+    const rows = observationsFromCodexRateLimitEvents([{ timestamp: "2026-09-03T15:00:00Z", primary: { used_percent: 40, window_minutes: 300, resets_in_seconds: 600 } }], codex, new Date("2026-09-03T15:01:00Z"));
+    expect(rows).toContainEqual(expect.objectContaining({ resets_at: "2026-09-03T15:10:00.000Z", window: expect.objectContaining({ minutes: 300 }) }));
   });
 
   it("does not leak a token from auth.json or Keychain JSON through rows, errors, or logs", async () => {

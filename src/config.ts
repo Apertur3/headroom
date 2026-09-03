@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tallyHome } from "./paths.js";
+import { headroomHome } from "./paths.js";
 import { defaultPolicy, parsePolicy, type Policy } from "./policy.js";
 
 async function optionalText(path: string): Promise<string | undefined> {
@@ -8,14 +8,14 @@ async function optionalText(path: string): Promise<string | undefined> {
 }
 
 export async function readPolicy(): Promise<Policy> {
-  const text = await optionalText(join(tallyHome(), "policy.toml"));
+  const text = await optionalText(join(headroomHome(), "policy.toml"));
   return text === undefined ? defaultPolicy : parsePolicy(text);
 }
 
 export type LocalPreference = "fallback" | "prefer" | "never";
 export interface Routing { consumes: Record<string, string[]>; local_preference: LocalPreference; }
 
-/** Parse Tally's deliberately small routing surface without accepting arbitrary
+/** Parse Headroom's deliberately small routing surface without accepting arbitrary
  * TOML features into a security-sensitive local config. */
 export function parseRouting(text: string): Routing {
   const consumes: Record<string, string[]> = {};
@@ -45,7 +45,7 @@ export async function readConsumes(): Promise<Record<string, string[]>> {
 }
 
 export async function readRouting(): Promise<Routing> {
-  const path = process.env.TALLY_ROUTING ?? join(tallyHome(), "routing.toml");
+  const path = process.env.HEADROOM_ROUTING ?? join(headroomHome(), "routing.toml");
   const text = await optionalText(path);
   return text === undefined ? { consumes: {}, local_preference: "fallback" } : parseRouting(text);
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 #if os(macOS)
 import Darwin
@@ -81,27 +82,18 @@ enum ClaudeKeychainReader {
 
     #if os(macOS)
     private static func readKeychain(configDirectory: String) async throws -> Data {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-a", NSUserName(), "-s", serviceName(configDirectory: configDirectory), "-w"]
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe() // Never retain or emit Keychain diagnostics.
-        do { try process.run() } catch { throw ReaderError.unavailable }
-
-        let deadline = Date().addingTimeInterval(2)
-        while process.isRunning && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 25_000_000)
-        }
-        if process.isRunning {
-            process.terminate()
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
-            throw ReaderError.unavailable
-        }
-        guard process.terminationStatus == 0 else { throw ReaderError.unavailable }
-        return stdout.fileHandleForReading.readDataToEndOfFile()
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: NSUserName(),
+            kSecAttrService: serviceName(configDirectory: configDirectory),
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data
+        else { throw ReaderError.unavailable }
+        return data
     }
     #endif
 

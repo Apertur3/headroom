@@ -15,18 +15,20 @@ case "$(uname -m)" in
 esac
 
 version="$(node -p 'require("./package.json").version')"
-asset="tally-engine-${version}-${target}.tar.gz"
+asset="headroom-engine-${version}-${target}.tar.gz"
 out="dist/release-engine"
-binary="engine/.build/release/tally-engine"
+binary="engine/.build/release/headroom-engine"
+keychain_binary="engine/.build/release/headroom-keychain"
 
 npm run engine:build
 
-# Release hook: a CI secret may set TALLY_CODESIGN_IDENTITY to an approved
+# Release hook: a CI secret may set HEADROOM_CODESIGN_IDENTITY to an approved
 # identity. Local builds use ad-hoc signing only; this script never chooses a
 # real identity itself.
-codesign --force --sign "${TALLY_CODESIGN_IDENTITY:--}" "$binary"
+codesign --force --sign "${HEADROOM_CODESIGN_IDENTITY:--}" "$binary"
+codesign --force --sign "${HEADROOM_CODESIGN_IDENTITY:--}" "$keychain_binary"
 
 mkdir -p "$out"
-tar -C "$(dirname "$binary")" -czf "$out/$asset" "$(basename "$binary")"
+tar -C "$(dirname "$binary")" -czf "$out/$asset" "$(basename "$binary")" "$(basename "$keychain_binary")"
 shasum -a 256 "$out/$asset"
 echo "created $out/$asset"

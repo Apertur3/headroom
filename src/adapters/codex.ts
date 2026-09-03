@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { credentialPath, vendorHome } from "../paths.js";
-import { redact } from "../security.js";
+import { allowedOutbound, redact } from "../security.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
@@ -56,7 +56,7 @@ function rate(account: ProviderAccount, meter: string, raw: unknown, fallback: n
   if (!object(raw)) return undefined;
   const used = number(raw.used_percent); if (used === undefined) return undefined;
   const minutes = Math.floor((number(raw.limit_window_seconds) ?? (number(raw.window_minutes) ?? fallback) * 60) / 60) || fallback;
-  const reset = date(raw.reset_at ?? raw.resets_at);
+  const reset = date(raw.reset_at ?? raw.resets_at) ?? (() => { const seconds = number(raw.resets_in_seconds); return seconds === undefined ? null : new Date(Date.parse(now) + seconds * 1000).toISOString(); })();
   const value = Math.min(100, Math.max(0, used));
   return { ...base(account, meter, now, source), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: reset, freshness };
 }
@@ -94,7 +94,13 @@ function rateLimitEventsFromText(text: string): CodexRateLimitEvent[] {
       const timestamp = string(event.timestamp);
       if (!timestamp || !Number.isFinite(Date.parse(timestamp))) continue;
       const limits = event.payload.rate_limits;
-      output.push({ timestamp, primary: limits.primary, secondary: limits.secondary });
+      const sessionWindow = (raw: unknown): unknown => {
+        if (!object(raw)) return raw;
+        const seconds = number(raw.resets_in_seconds);
+        if (seconds === undefined || raw.reset_at !== undefined || raw.resets_at !== undefined) return raw;
+        return { ...raw, resets_at: Math.floor(Date.parse(timestamp) / 1000) + seconds };
+      };
+      output.push({ timestamp, primary: sessionWindow(limits.primary), secondary: sessionWindow(limits.secondary) });
     } catch { /* A partial session line is not a rate-limit event. */ }
   }
   return output;
@@ -115,12 +121,14 @@ async function rateLimitLogFiles(directory: string): Promise<string[]> {
 
 /** Reads only structured rate-limit events; prompt and response text is ignored. */
 export async function readCodexRateLimitEvents(home: string): Promise<CodexRateLimitEvent[]> {
-  const files = (await Promise.all([rateLimitLogFiles(join(home, "sessions")), rateLimitLogFiles(join(home, "logs"))])).flat();
+  const candidates = await rateLimitLogFiles(join(home, "sessions"));
+  const files = (await Promise.all(candidates.map(async (path) => {
+    try { const info = await lstat(path); return info.isFile() && !info.isSymbolicLink() ? { path, mtime: info.mtimeMs } : undefined; }
+    catch { return undefined; }
+  }))).filter((item): item is { path: string; mtime: number } => Boolean(item)).sort((a, b) => b.mtime - a.mtime).slice(0, 20).map((item) => item.path);
   const output: CodexRateLimitEvent[] = [];
   for (const path of files) {
     try {
-      const stat = await lstat(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) continue;
       output.push(...rateLimitEventsFromText(await readFile(path, "utf8")));
     } catch { /* A rotated or unreadable log cannot make a fresh endpoint fail. */ }
   }
@@ -169,8 +177,8 @@ export async function codexResponseShape(account: ProviderAccount, dependencies:
   if (credential.expired) throw new Error(`token expired; ${codexLoginCommand(account)}`);
   const doFetch = dependencies.fetch ?? fetch;
   const [usage, credits] = await Promise.all([
-    doFetch(new Request("https://chatgpt.com/backend-api/wham/usage", { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
-    doFetch(new Request("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+    doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/usage").toString(), { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+    doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits").toString(), { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
   ]);
   if (!usage.ok) throw new ProviderHTTPError(usage.status, "Codex");
   if (!credits.ok) throw new ProviderHTTPError(credits.status, "Codex credits");
@@ -185,8 +193,8 @@ export async function observeCodex(account: ProviderAccount, dependencies: Codex
     if (credential.expired) return failed(account, `token expired; ${codexLoginCommand(account)}`, timestamp);
     const doFetch = dependencies.fetch ?? fetch;
     const [usageResponse, creditResponse] = await Promise.all([
-      doFetch(new Request("https://chatgpt.com/backend-api/wham/usage", { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
-      doFetch(new Request("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+      doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/usage").toString(), { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+      doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits").toString(), { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
     ]);
     if (!usageResponse.ok) throw new ProviderHTTPError(usageResponse.status, "Codex");
     if (!creditResponse.ok) throw new ProviderHTTPError(creditResponse.status, "Codex credits");

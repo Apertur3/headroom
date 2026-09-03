@@ -4,19 +4,20 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { tallyHome } from "../../paths.js";
-import { redact } from "../../security.js";
+import { headroomHome } from "../../paths.js";
+import { readPolicy } from "../../config.js";
+import { outboundEnvironment, redact } from "../../security.js";
 import type { Observation, ProviderAccount } from "../../types.js";
 import { readEngineLock } from "../codexbar/install.js";
 import { normalizeObservations } from "../observation.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const devBinary = join(repoRoot, "engine", ".build", "release", "tally-engine");
+const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine");
 
 export async function nativeEnginePath(): Promise<string | undefined> {
   const lock = await readEngineLock();
-  const installedBinary = join(tallyHome(), "engine", "native", lock.native?.binary ?? "tally-engine");
+  const installedBinary = join(headroomHome(), "engine", "native", lock.native?.binary ?? "headroom-engine");
   for (const path of [installedBinary, devBinary]) {
     try { await access(path); return path; } catch { /* try next */ }
   }
@@ -24,13 +25,14 @@ export async function nativeEnginePath(): Promise<string | undefined> {
 }
 
 export async function runNativeEngine(enginePath: string, accounts: ProviderAccount[]): Promise<Observation[]> {
-  const directory = await mkdtemp(join(tmpdir(), "tally-principals-"));
+  const directory = await mkdtemp(join(tmpdir(), "headroom-principals-"));
   const principals = join(directory, "principals.json");
   try {
     await writeFile(principals, JSON.stringify(accounts.map(({ name, vendor, location }) => ({ id: name, vendor, location }))), { mode: 0o600 });
     await chmod(principals, 0o600);
     try {
-      const { stdout } = await execFileAsync(enginePath, ["observe", "--principals", principals], { timeout: 90_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
+      const { proxy } = await readPolicy();
+      const { stdout } = await execFileAsync(enginePath, ["observe", "--principals", principals], { timeout: 90_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" }) });
       return parseObservations(stdout);
     } catch (error: unknown) {
       const result = error as { stdout?: string; stderr?: string; message?: string };
