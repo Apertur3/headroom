@@ -60,7 +60,8 @@ export interface Observation {
   fetched_at: string;
   source: string;
   truth: Truth;
-  freshness: "fresh" | "stale" | "failed";
+  /** `not_enforced` is a vendor-confirmed absent limit, not an unknown read. */
+  freshness: "fresh" | "stale" | "failed" | "not_enforced";
   confidence: number;
   adapter_version: string;
   upstream_schema_version: string;
@@ -72,7 +73,7 @@ export interface Observation {
   };
 }
 
-export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN";
+export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED";
 
 export interface StoredObservation extends Observation {
   id: number;

@@ -26,6 +26,8 @@ states and freshness. Capability routing stays yours, in `~/.tally/routing.toml`
    you may override, and when you do, say why in the dispatch note so Tally's audit log has it.
 7. **UNKNOWN is not capacity.** A stale or failed meter blocks `can` unless you pass
    `--allow-unknown` on purpose. Do not assume a failed read means room.
+   A displayed `n/a` is different: the vendor confirms that window is not enforced, so Tally
+   ignores it for `can` and thresholds.
 
 ## Commands
 

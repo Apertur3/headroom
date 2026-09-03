@@ -14,3 +14,21 @@ Status: pre-alpha, being built in slices. See `docs/spec.md`.
 - Ships an orchestrator skill: capability routing stays yours, Tally only filters by budget.
 
 Package name: `keeptally` (npm). Brand: Tally.
+
+## Daemon and agent access
+
+Start the local daemon with `tally daemon`; it owns `~/.tally/tally.db` and serves
+private JSON-RPC on `~/.tally/tally.sock`. Without it, the CLI performs a one-shot
+direct read and marks that output `(direct read, no daemon)`.
+
+Add the MCP server to each Claude profile:
+
+```sh
+claude mcp add tally -- npx keeptally mcp
+CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add tally -- npx keeptally mcp
+```
+
+Codex and agy agents call the same CLI directly: `tally can <action-class>` before
+dispatching, `tally --json` for current meters, and `tally events --since 24h` for changes.
+Use `tally install-service` to write (but not load) the launchd/systemd user service; it prints
+the exact `launchctl` or `systemctl` command to run yourself.

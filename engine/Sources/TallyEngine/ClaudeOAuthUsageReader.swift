@@ -21,6 +21,16 @@ struct ClaudeUsageSnapshot: Sendable {
 /// It intentionally has no refresh path and emits no response body in errors.
 enum ClaudeOAuthUsageReader {
     static func fetch(accessToken: String) async throws -> ClaudeUsageSnapshot {
+        try parse(await response(accessToken: accessToken))
+    }
+
+    /// Debug-only structural view. It deliberately reports keys and JSON kinds,
+    /// never account data, quota values, headers, or credentials.
+    static func shape(accessToken: String) async throws -> [String] {
+        skeleton(try JSONSerialization.jsonObject(with: await response(accessToken: accessToken)))
+    }
+
+    private static func response(accessToken: String) async throws -> Data {
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/usage") else {
             throw EngineError.claudeUsageUnavailable
         }
@@ -35,12 +45,27 @@ enum ClaudeOAuthUsageReader {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw EngineError.claudeUsageUnavailable }
-            return try parse(data)
+            return data
         } catch is EngineError {
             throw EngineError.claudeUsageUnavailable
         } catch {
             throw EngineError.claudeUsageUnavailable
         }
+    }
+
+    private static func skeleton(_ value: Any, path: String = "$") -> [String] {
+        if let object = value as? [String: Any] {
+            return ["\(path): object"] + object.keys.sorted().flatMap { key in skeleton(object[key] as Any, path: "\(path).\(key)") }
+        }
+        if let array = value as? [Any] {
+            let itemShapes = array.prefix(3).flatMap { skeleton($0, path: "\(path)[]") }
+            return ["\(path): array[\(array.count)]"] + Array(Set(itemShapes)).sorted()
+        }
+        if value is NSNull { return ["\(path): null"] }
+        if value is Bool { return ["\(path): bool"] }
+        if value is NSNumber { return ["\(path): number"] }
+        if value is String { return ["\(path): string"] }
+        return ["\(path): unknown"]
     }
 
     static func parse(_ data: Data) throws -> ClaudeUsageSnapshot {

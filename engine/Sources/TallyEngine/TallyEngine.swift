@@ -47,39 +47,58 @@ struct ObservationMetadata: Codable {
     let free_resets_available: Int?
 }
 
+struct ResponseShape: Codable {
+    let principal_id: String
+    let vendor: String
+    let shape: [String]
+    let error: String?
+}
+
 @main
 struct TallyEngine {
     static let engineVersion = "0.1.0"
     static let upstreamVersion = "v0.56.4"
 
     static func main() async {
-        guard CommandLine.arguments.count == 4,
-              CommandLine.arguments[1] == "observe",
-              CommandLine.arguments[2] == "--principals"
+        let arguments = CommandLine.arguments
+        let principalFlag = arguments.firstIndex(of: "--principals")
+        let shapeMode = arguments.contains("--shape")
+        guard (arguments.count == 4 || arguments.count == 5),
+              arguments[1] == "observe",
+              let principalFlag,
+              principalFlag + 1 < arguments.count
         else {
-            FileHandle.standardError.write(Data("Usage: tally-engine observe --principals <path-to-json>\n".utf8))
+            FileHandle.standardError.write(Data("Usage: tally-engine observe --principals <path-to-json> [--shape]\n".utf8))
             exit(2)
         }
 
-        let observations: [Observation]
+        let principals: [Principal]
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]))
-            observations = await observe(try JSONDecoder().decode([Principal].self, from: data))
+            let data = try Data(contentsOf: URL(fileURLWithPath: arguments[principalFlag + 1]))
+            principals = try JSONDecoder().decode([Principal].self, from: data)
         } catch {
-            observations = failed(
-                principal: Principal(id: "invalid-input", vendor: "unknown", location: ""),
-                meters: ["unknown"],
-                error: error)
+            let observations = failed(principal: Principal(id: "invalid-input", vendor: "unknown", location: ""), meters: ["unknown"], error: error)
+            emit(observations)
+            exit(3)
         }
+        if shapeMode {
+            emit(await observeShapes(principals))
+            exit(0)
+        }
+        let observations = await observe(principals)
         // The Core owns its spawned `agy` process. Always reset that session before this
         // one-shot engine exits; user/IDE-owned processes are never part of that session.
         await ProviderCLISessionLifecycle.shutdownPersistentSessions()
+        emit(observations)
+        exit(observations.contains { $0.freshness == "fresh" } ? 0 : 3)
+    }
+
+    static func emit<T: Encodable>(_ value: T) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
-        let output = (try? encoder.encode(observations)) ?? Data("[]".utf8)
+        let output = (try? encoder.encode(value)) ?? Data("[]".utf8)
         FileHandle.standardOutput.write(output)
         FileHandle.standardOutput.write(Data("\n".utf8))
-        exit(observations.contains { $0.freshness == "fresh" } ? 0 : 3)
     }
 
     static func observe(_ principals: [Principal]) async -> [Observation] {
@@ -98,6 +117,64 @@ struct TallyEngine {
             }
         }
         return output
+    }
+
+    static func observeShapes(_ principals: [Principal]) async -> [ResponseShape] {
+        var output: [ResponseShape] = []
+        for rawPrincipal in principals {
+            let principal = safePrincipal(rawPrincipal)
+            do {
+                switch principal.vendor {
+                case "claude":
+                    let credentials = try await ClaudeKeychainReader.load(configDirectory: principal.location)
+                    guard !credentials.isExpired else { throw EngineError.expiredCredential }
+                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: try await ClaudeOAuthUsageReader.shape(accessToken: credentials.accessToken), error: nil))
+                case "codex":
+                    var environment = ProcessInfo.processInfo.environment
+                    environment["CODEX_HOME"] = principal.location
+                    let snapshot = try await UsageFetcher(environment: environment).loadLatestCLIAccountSnapshot()
+                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: codexShape(snapshot), error: nil))
+                case "antigravity":
+                    let status = try await AntigravityStatusProbe().fetch()
+                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: antigravityShape(status), error: nil))
+                default: throw EngineError.unsupportedVendor
+                }
+            } catch {
+                output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: [], error: redact(error.localizedDescription)))
+            }
+        }
+        return output
+    }
+
+    /// CodexBarCore does not retain raw payloads. This remains structural and derives
+    /// presence/nullness only from its parsed vendor response, so no values leak.
+    static func codexShape(_ snapshot: CodexCLIAccountSnapshot) -> [String] {
+        var shape = ["$: object", "$.usage: \(snapshot.usage == nil ? "null" : "object")"]
+        if let usage = snapshot.usage {
+            shape += ["$.usage.primary: \(usage.primary == nil ? "null" : "object")", "$.usage.secondary: \(usage.secondary == nil ? "null" : "object")", "$.usage.extraRateWindows: array[\(usage.extraRateWindows?.count ?? 0)]"]
+        }
+        return shape
+    }
+
+    static func antigravityShape(_ status: AntigravityStatusSnapshot) -> [String] {
+        // The Core exposes a typed snapshot; serialize only its public field topology.
+        let mirror = Mirror(reflecting: status)
+        return ["$: object"] + mirror.children.compactMap { child in child.label.map { "$.\($0): \(shapeKind(child.value))" } }.sorted()
+    }
+
+    static func shapeKind(_ value: Any) -> String {
+        let mirror = Mirror(reflecting: value)
+        switch mirror.displayStyle {
+        case .collection: return "array[\(mirror.children.count)]"
+        case .dictionary: return "object"
+        case .optional: return mirror.children.isEmpty ? "null" : shapeKind(mirror.children.first!.value)
+        case .struct, .class: return "object"
+        default:
+            if value is Bool { return "bool" }
+            if value is String { return "string" }
+            if value is any BinaryInteger || value is any BinaryFloatingPoint { return "number" }
+            return "unknown"
+        }
     }
 
     static func claude(_ principal: Principal) async throws -> [Observation] {
@@ -120,10 +197,9 @@ struct TallyEngine {
         let metadata = ObservationMetadata(plan: snapshot.usage?.identity?.loginMethod, free_resets_available: snapshot.usage?.codexResetCredits?.availableCount)
         var observations = windows(principal, meter: "main", windows: [snapshot.usage?.primary, snapshot.usage?.secondary], source: "engine:native:codex", metadata: metadata)
         // OpenAI currently returns a null primary/5-hour window for some accounts.
-        // Preserve that vendor fact as a failed datum: omitting it would make a
-        // consumer mistake an unknown hard cap for available capacity.
+        // This is a vendor-confirmed absence of enforcement, distinct from a failed read.
         if snapshot.usage?.primary == nil {
-            observations.append(failedWindow(principal, meter: "main", minutes: 300, source: "engine:native:codex", reason: "vendor returned no 5-hour window", metadata: metadata))
+            observations.append(notEnforcedWindow(principal, meter: "main", minutes: 300, source: "engine:native:codex", reason: "vendor returned no 5-hour window", metadata: metadata))
         }
         for extra in snapshot.usage?.extraRateWindows ?? [] where extra.title.localizedCaseInsensitiveContains("spark") {
             observations += windows(principal, meter: "spark", windows: [extra.window], source: "engine:native:codex", metadata: metadata)
@@ -173,9 +249,9 @@ struct TallyEngine {
         Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil, metadata: metadata)
     }
 
-    static func failedWindow(_ principal: Principal, meter: String, minutes: Int, source: String, reason: String, metadata: ObservationMetadata? = nil) -> Observation {
+    static func notEnforcedWindow(_ principal: Principal, meter: String, minutes: Int, source: String, reason: String, metadata: ObservationMetadata? = nil) -> Observation {
         let now = iso(Date())!
-        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "rolling", minutes: minutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "official", freshness: "failed", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: reason, metadata: metadata)
+        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "rolling", minutes: minutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "official", freshness: "not_enforced", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: reason, metadata: metadata)
     }
 
     static func failed(principal: Principal, meters: [String], error: Error) -> [Observation] {

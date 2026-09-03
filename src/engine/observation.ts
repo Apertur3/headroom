@@ -24,7 +24,7 @@ export function observationsFromReading(reading: Reading): Observation[] {
       principal_id: reading.account, meter_id: `${reading.account}:${reading.pool}`,
       window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null,
       observed_at: reading.sampled_at, fetched_at: reading.sampled_at, source: reading.source, truth: reading.truth,
-      freshness: "failed", confidence: 1, adapter_version: "fallback", upstream_schema_version: "v0.56.4",
+      freshness: "not_enforced", confidence: 1, adapter_version: "fallback", upstream_schema_version: "v0.56.4",
       reason: "vendor returned no 5-hour window", metadata: { plan: reading.plan, free_resets_available: reading.extras.free_resets_available },
     });
   }
