@@ -5,9 +5,11 @@ import FoundationNetworking
 #endif
 
 struct ClaudeUsageWindow: Sendable {
-    let percent: Double
+    let percent: Double?
     let resetsAt: Date?
     let minutes: Int?
+    /// False is a vendor-confirmed inactive scoped allowance, not a failed read.
+    let isEnforced: Bool
 }
 
 struct ClaudeUsageSnapshot: Sendable {
@@ -24,8 +26,9 @@ enum ClaudeOAuthUsageReader {
         try parse(await response(accessToken: accessToken))
     }
 
-    /// Debug-only structural view. It deliberately reports keys and JSON kinds,
-    /// never account data, quota values, headers, or credentials.
+    /// Debug-only structural view. It reports keys/kinds plus a tiny allowlist
+    /// of enum-like limit descriptors; quota values, headers and credentials
+    /// are never included.
     static func shape(accessToken: String) async throws -> [String] {
         skeleton(try JSONSerialization.jsonObject(with: await response(accessToken: accessToken)))
     }
@@ -62,16 +65,27 @@ enum ClaudeOAuthUsageReader {
             return ["\(path): array[\(array.count)]"] + Array(Set(itemShapes)).sorted()
         }
         if value is NSNull { return ["\(path): null"] }
-        if value is Bool { return ["\(path): bool"] }
+        if let value = value as? Bool { return [shapeLine(path, kind: "bool", value: value ? "true" : "false")] }
         if value is NSNumber { return ["\(path): number"] }
-        if value is String { return ["\(path): string"] }
+        if let value = value as? String { return [shapeLine(path, kind: "string", value: value)] }
         return ["\(path): unknown"]
+    }
+
+    private static func shapeLine(_ path: String, kind: String, value: String) -> String {
+        let allowed = ["$.limits[].kind", "$.limits[].group", "$.limits[].severity", "$.limits[].is_active", "$.limits[].scope.model.display_name", "$.limits[].scope.surface"]
+        guard allowed.contains(path) else { return "\(path): \(kind)" }
+        // Allowed values are non-secret descriptors. Escape controls so a remote
+        // response cannot forge extra diagnostic lines.
+        let escaped = value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r")
+        return "\(path): \(kind) = \(escaped)"
     }
 
     static func parse(_ data: Data) throws -> ClaudeUsageSnapshot {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw EngineError.claudeUsageUnavailable
         }
+        // `five_hour.utilization` and `seven_day.utilization` are the primary
+        // all-meter fields. `percent` is retained only for older responses.
         let fiveHour = window(root["five_hour"], minutes: 300)
         let sevenDay = window(root["seven_day"], minutes: 10_080)
         var fable: ClaudeUsageWindow?
@@ -83,7 +97,7 @@ enum ClaudeOAuthUsageReader {
             if lower.contains("routine") || lower.contains("cowork") { routines = routines ?? window(value, minutes: 10_080) }
         }
         if let limits = root["limits"] as? [[String: Any]] {
-            for limit in limits where limit["kind"] as? String == "weekly_scoped" && limit["is_active"] as? Bool != false {
+            for limit in limits where (limit["kind"] as? String)?.lowercased().contains("scoped") == true {
                 guard let scoped = scopedWindow(limit) else { continue }
                 // The OAuth response identifies Fable as scope.model.display_name. Other
                 // active weekly-scoped limits are the routines/Cowork allowance. Do not
@@ -92,8 +106,8 @@ enum ClaudeOAuthUsageReader {
                 let scope = limit["scope"] as? [String: Any]
                 let model = scope?["model"] as? [String: Any]
                 let name = (model?["display_name"] as? String ?? model?["name"] as? String ?? "").lowercased()
-                if name.contains("fable") { fable = scoped }
-                else { routines = scoped }
+                if name.contains("fable") { fable = preferred(fable, scoped) }
+                else { routines = preferred(routines, scoped) }
             }
         }
         return ClaudeUsageSnapshot(fiveHour: fiveHour, sevenDay: sevenDay, fable: fable, routines: routines)
@@ -103,13 +117,21 @@ enum ClaudeOAuthUsageReader {
         guard let object = value as? [String: Any] else { return nil }
         let raw = (object["utilization"] as? NSNumber)?.doubleValue ?? (object["percent"] as? NSNumber)?.doubleValue
         guard let percent = raw, percent.isFinite else { return nil }
-        return ClaudeUsageWindow(percent: min(100, max(0, percent)), resetsAt: date(object["resets_at"]), minutes: minutes)
+        return ClaudeUsageWindow(percent: min(100, max(0, percent)), resetsAt: date(object["resets_at"]), minutes: minutes, isEnforced: true)
     }
 
     private static func scopedWindow(_ value: [String: Any]) -> ClaudeUsageWindow? {
+        let active = (value["is_active"] as? Bool) != false
+        if !active { return ClaudeUsageWindow(percent: nil, resetsAt: date(value["resets_at"]), minutes: 10_080, isEnforced: false) }
         let raw = (value["utilization"] as? NSNumber)?.doubleValue ?? (value["percent"] as? NSNumber)?.doubleValue
         guard let percent = raw, percent.isFinite else { return nil }
-        return ClaudeUsageWindow(percent: min(100, max(0, percent)), resetsAt: date(value["resets_at"]), minutes: 10_080)
+        return ClaudeUsageWindow(percent: min(100, max(0, percent)), resetsAt: date(value["resets_at"]), minutes: 10_080, isEnforced: true)
+    }
+
+    /// A positive/current scope wins over a duplicate inactive legacy entry.
+    private static func preferred(_ existing: ClaudeUsageWindow?, _ candidate: ClaudeUsageWindow) -> ClaudeUsageWindow {
+        guard let existing else { return candidate }
+        return candidate.isEnforced || !existing.isEnforced ? candidate : existing
     }
 
     private static func date(_ value: Any?) -> Date? {
