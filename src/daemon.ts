@@ -4,7 +4,8 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
-import { pollAccounts, type PollResult } from "./collector.js";
+import { pollAccounts, type PollOptions, type PollResult } from "./collector.js";
+import { AgyKeepaliveSupervisor } from "./antigravity-keepalive.js";
 import { headroomHome } from "./paths.js";
 import { canRouteWithLeases } from "./policy.js";
 import { accountsPath, readAccounts } from "./registry.js";
@@ -12,7 +13,7 @@ import { isLocalAccount, type Account, type Observation } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 
 type Json = Record<string, unknown>;
-export type Poller = (principal?: string) => Promise<PollResult>;
+export type Poller = (principal?: string, options?: PollOptions) => Promise<PollResult>;
 
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : join(home, "headroom.sock");
@@ -59,12 +60,13 @@ export class HeadroomDaemon {
   private schedulingStarted = false;
   private stopping = false;
   private sessionToken: string | undefined;
+  private keepalive: AgyKeepaliveSupervisor | undefined;
 
-  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller) {}
+  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, keepalive?: AgyKeepaliveSupervisor) { this.keepalive = keepalive; }
 
-  static async create(options: { home?: string; path?: string; poller?: Poller } = {}): Promise<HeadroomDaemon> {
+  static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
-    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts);
+    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, options.keepalive);
   }
 
   async start(): Promise<void> {
@@ -74,6 +76,12 @@ export class HeadroomDaemon {
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
+    const policy = await readPolicy();
+    const accounts = await this.currentAccounts();
+    if (policy.antigravity_keepalive && process.platform !== "win32" && accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+      this.keepalive ??= new AgyKeepaliveSupervisor();
+      this.keepalive.start();
+    }
     await this.schedulePrincipals();
     this.schedulingStarted = true;
   }
@@ -82,6 +90,7 @@ export class HeadroomDaemon {
     this.stopping = true;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
+    this.keepalive?.stop();
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
     if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }
@@ -220,7 +229,7 @@ export class HeadroomDaemon {
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now) return { observations: [], failures: [] };
     const current = this.inFlight.get(key);
     if (current) return current;
-    const task = this.poller(principal).then((result) => {
+    const task = this.poller(principal, { daemonOwnsAntigravity: this.keepalive?.running === true }).then((result) => {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
