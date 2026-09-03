@@ -41,11 +41,14 @@ the request path.
 
 ## Install
 
+Not on npm yet. Until the first release, clone the repo, run `npm install && npm run build`, and
+use `node dist/cli.js` where the commands below say `npx keeptally`.
+
 ```sh
 npx keeptally engine install     # pin and verify the sensing engine
 npx keeptally accounts discover  # find ~/.claude*, ~/.codex*, Antigravity
 npx keeptally                    # one line per meter
-npx keeptally install-service    # launchd or systemd unit for the daemon
+npx keeptally install-service    # launchd, systemd user unit, or Windows Task Scheduler
 ```
 
 Register the MCP server in each Claude Code profile:
@@ -60,9 +63,9 @@ Codex and Gemini agents call the CLI. Copy `skills/tally/SKILL.md` into your ski
 ## Security
 
 No secret touches disk or output. Tokens are read at call time from the macOS Keychain or the
-vendor's own credential file and dropped after the request. The daemon listens on a local socket
-with mode 0600, there is no telemetry, the engine is pinned and checksum verified, and every
-query lands in an audit log. Details in [SECURITY.md](SECURITY.md).
+vendor's own credential file and dropped after the request. The daemon listens on a 0600 local
+socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry, the engine
+is pinned and checksum verified, and every query lands in an audit log. Details in [SECURITY.md](SECURITY.md).
 
 ## Status
 
