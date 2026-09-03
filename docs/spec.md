@@ -22,7 +22,7 @@ apps or single-account CLIs. Tally owns the second and third and keeps the first
 |---|---|
 | Principal | One credential location: `{vendor, location}`. Claude = a config dir, Codex = a `CODEX_HOME`, Antigravity = the Google login behind `agy`, local = a base URL. Stable id, e.g. `claude-main`. |
 | Meter | One vendor-enforced limit on a principal, stable id `principal:meter`. Claude Max: `all`, `fable`, `routines`. Antigravity: `gemini`, `claude-gpt`. Codex: `main`, `spark`, `credits`. Local: `capacity`. |
-| Window | A bucket inside a meter: `kind = rolling | fixed`, `minutes`, `enforcement = hard | soft`. |
+| Window | A bucket inside a meter: `kind = rolling | fixed | count`, `minutes`, `enforcement = hard | soft`. Credit counts have no duration, are informational, and do not constrain `can`. |
 | Observation | One sample of one window: typed quantity (`used`, `limit`, `remaining`, `unit = percent | tokens | requests | credits`), nullable `resets_at`, `observed_at` (vendor time if given) and `fetched_at`, `source`, `truth = official | estimated`, `freshness = fresh | stale | failed | not_enforced`, `confidence 0..1`, `adapter_version`, `upstream_schema_version`. `not_enforced` is a vendor-confirmed absent cap (printed `n/a`), not an unknown read. Never a whole "reading" with mixed provenance; each datum carries its own. |
 | Consumes | An action class maps to the set of meters it draws from. A Fable call on `claude-main` consumes `claude-main:all` and `claude-main:fable`. `tally can` checks every consumed meter; one frozen meter freezes the action. |
 | Event | Separate record with id, kind (`reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`, `source_recovered`), `origin = vendor_reported | inferred`, `confidence`, evidence (observation ids), and later corrections. Never embedded in observations. |
@@ -65,8 +65,11 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   reports and never runs. State `UP | BUSY | DOWN`, model id, vLLM queue depth.
 - **Registry.** `~/.tally/accounts.toml`, auto-discovered from `~/.claude*`, `~/.codex*`,
   `~/.gemini`, confirmed by the user. Committed example in `examples/`.
-- **Daemon.** Unix socket `~/.tally/tally.sock`, JSON-RPC. `tally install-service` writes a
-  launchd or systemd unit. Without a daemon the CLI does a one-shot read and says so.
+- **Daemon.** Unix socket `~/.tally/tally.sock` on macOS and Linux, or named pipe
+  `\\.\pipe\keeptally-<username>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
+  named pipes use the current process token's default DACL, which Node does not expose for further
+  restriction. `tally install-service` writes a launchd agent, systemd user unit, or Task Scheduler
+  XML. Without a daemon the CLI and MCP server do a direct read and mark the result `source: "direct"`.
 
 ## Security (see SECURITY.md; additions from review)
 

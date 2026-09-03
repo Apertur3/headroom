@@ -39,8 +39,12 @@ describe("SQLite observations and event detector", () => {
     const root = await mkdtemp(join(tmpdir(), "tally-store-")); temporary.push(root);
     const store = await TallyStore.open(join(root, ".tally"));
     try {
-      store.insert(observation({ quantity: { used: 80, limit: 100, remaining: 20, unit: "percent" }, metadata: { free_resets_available: 1 } }));
-      store.insert(observation({ quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, metadata: { free_resets_available: 0 } }));
+      const credit = (remaining: number) => observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining, unit: "credits" } });
+      store.insert(credit(1));
+      store.insert(credit(0));
+      store.insert(credit(2));
+      store.insert(observation({ quantity: { used: 80, limit: 100, remaining: 20, unit: "percent" } }));
+      store.insert(observation({ quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
       store.insert(observation({ quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: "2026-09-03T15:00:00Z", metadata: { free_resets_available: 0 } }));
       store.insert(observation({ freshness: "failed", quantity: null, reason: "fixture outage" }));
       store.insert(observation({ quantity: { used: 11, limit: 100, remaining: 89, unit: "percent" }, metadata: { free_resets_available: 0 } }));
@@ -49,6 +53,8 @@ describe("SQLite observations and event detector", () => {
         expect.objectContaining({ kind: "reset_seen", origin: "inferred", confidence: 0.5 }),
         expect.objectContaining({ kind: "reset_seen", origin: "inferred", confidence: 0.9 }),
         expect.objectContaining({ kind: "free_reset_used", origin: "vendor_reported" }),
+        expect.objectContaining({ kind: "free_reset_granted", origin: "vendor_reported" }),
+        expect.objectContaining({ kind: "credits_changed", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "source_failed" }),
         expect.objectContaining({ kind: "source_recovered" }),
       ]));
@@ -151,6 +157,12 @@ describe("pace and consumes", () => {
         "claude-main:fable  5h UNKNOWN (Claude OAuth usage unavailable) | wk n/a (no scoped limit in response)  (failed <1m)",
       ]
     `);
+  });
+
+  it("renders credit counts as availability and excludes them from can decisions", () => {
+    const credit = observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-21T12:00:00Z", fetched_at: new Date().toISOString() });
+    expect(formatMeters([credit], defaultPolicy)[0]).toContain("credits 1 available (expires Sep 21)");
+    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy)).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
   });
 
   it("labels a multi-window meter fresh when any enforced window is fresh", () => {
