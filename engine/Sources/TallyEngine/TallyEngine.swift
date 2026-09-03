@@ -39,6 +39,12 @@ struct Observation: Codable {
     let adapter_version: String
     let upstream_schema_version: String
     let reason: String?
+    let metadata: ObservationMetadata?
+}
+
+struct ObservationMetadata: Codable {
+    let plan: String?
+    let free_resets_available: Int?
 }
 
 @main
@@ -111,21 +117,33 @@ struct TallyEngine {
         var environment = ProcessInfo.processInfo.environment
         environment["CODEX_HOME"] = principal.location
         let snapshot = try await UsageFetcher(environment: environment).loadLatestCLIAccountSnapshot()
-        var observations = windows(principal, meter: "main", windows: [snapshot.usage?.primary, snapshot.usage?.secondary], source: "engine:native:codex")
+        let metadata = ObservationMetadata(plan: snapshot.usage?.identity?.loginMethod, free_resets_available: snapshot.usage?.codexResetCredits?.availableCount)
+        var observations = windows(principal, meter: "main", windows: [snapshot.usage?.primary, snapshot.usage?.secondary], source: "engine:native:codex", metadata: metadata)
+        // OpenAI currently returns a null primary/5-hour window for some accounts.
+        // Preserve that vendor fact as a failed datum: omitting it would make a
+        // consumer mistake an unknown hard cap for available capacity.
+        if snapshot.usage?.primary == nil {
+            observations.append(failedWindow(principal, meter: "main", minutes: 300, source: "engine:native:codex", reason: "vendor returned no 5-hour window", metadata: metadata))
+        }
         for extra in snapshot.usage?.extraRateWindows ?? [] where extra.title.localizedCaseInsensitiveContains("spark") {
-            observations += windows(principal, meter: "spark", windows: [extra.window], source: "engine:native:codex")
+            observations += windows(principal, meter: "spark", windows: [extra.window], source: "engine:native:codex", metadata: metadata)
         }
         if let credit = snapshot.credits?.codexCreditLimit {
-            observations.append(observation(principal, meter: "credits", quantity: Quantity(used: credit.used, limit: credit.limit, remaining: credit.remaining, unit: "credits"), reset: credit.resetsAt, observed: credit.updatedAt, source: "engine:native:codex", window: nil))
+            observations.append(observation(principal, meter: "credits", quantity: Quantity(used: credit.used, limit: credit.limit, remaining: credit.remaining, unit: "credits"), reset: credit.resetsAt, observed: credit.updatedAt, source: "engine:native:codex", window: nil, metadata: metadata))
         }
         guard !observations.isEmpty else { throw EngineError.noUsage }
         return observations
     }
 
     static func antigravity(_ principal: Principal) async throws -> [Observation] {
-        // `location` is an agy executable/path hint for the supervisor in a later slice. The core
-        // probe deliberately discovers the signed-in local app/agy server instead of reading OAuth files.
-        let status = try await AntigravityStatusProbe().fetch()
+        // Prefer a user-owned app/IDE server. If none exists, boot agy under a
+        // PTY and wait for a listening local port before asking the Core to read it.
+        let status: AntigravityStatusSnapshot
+        do {
+            status = try await AntigravityStatusProbe().fetch()
+        } catch AntigravityStatusProbeError.notRunning {
+            status = try await AgyBootstrap.fetch(binaryHint: principal.location)
+        }
         let usage = try status.toUsageSnapshot()
         let observations = windows(principal, meter: "gemini", windows: [usage.primary], source: "engine:native:antigravity")
             + windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: "engine:native:antigravity")
@@ -144,20 +162,25 @@ struct TallyEngine {
         }
     }
 
-    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String) -> [Observation] {
+    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil) -> [Observation] {
         windows.compactMap { value in
             guard let value, !value.isSyntheticPlaceholder else { return nil }
-            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.windowMinutes, enforcement: "hard"))
+            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.windowMinutes, enforcement: "hard"), metadata: metadata)
         }
     }
 
-    static func observation(_ principal: Principal, meter: String, quantity: Quantity, reset: Date?, observed: Date, source: String, window: Window?) -> Observation {
-        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil)
+    static func observation(_ principal: Principal, meter: String, quantity: Quantity, reset: Date?, observed: Date, source: String, window: Window?, metadata: ObservationMetadata? = nil) -> Observation {
+        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil, metadata: metadata)
+    }
+
+    static func failedWindow(_ principal: Principal, meter: String, minutes: Int, source: String, reason: String, metadata: ObservationMetadata? = nil) -> Observation {
+        let now = iso(Date())!
+        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "rolling", minutes: minutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "official", freshness: "failed", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: reason, metadata: metadata)
     }
 
     static func failed(principal: Principal, meters: [String], error: Error) -> [Observation] {
         let now = iso(Date())!
-        return meters.map { meter in Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: nil, quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: "engine:native", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: redact(error.localizedDescription)) }
+        return meters.map { meter in Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: nil, quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: "engine:native", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: redact(error.localizedDescription), metadata: nil) }
     }
 
     static func meterNames(for vendor: String) -> [String] {

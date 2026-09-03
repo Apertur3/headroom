@@ -65,4 +65,29 @@ export interface Observation {
   adapter_version: string;
   upstream_schema_version: string;
   reason?: string | null;
+  /** Non-secret vendor facts used only for change detection. */
+  metadata?: {
+    plan?: string | null;
+    free_resets_available?: number | null;
+  };
+}
+
+export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN";
+
+export interface StoredObservation extends Observation {
+  id: number;
+}
+
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered";
+
+export interface TallyEvent {
+  id: string;
+  kind: EventKind;
+  origin: "vendor_reported" | "inferred";
+  confidence: number;
+  evidence_observation_ids: number[];
+  created_at: string;
+  corrected_by: string | null;
+  meter_id: string | null;
+  principal_id: string | null;
 }
