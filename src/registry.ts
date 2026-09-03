@@ -25,7 +25,7 @@ export async function discoverAccounts(home = homedir()): Promise<Account[]> {
       name: `${vendor}-${primary ? "main" : ordinal}`,
       vendor,
       location: join(home, directory),
-      adapter: vendor === "codex" ? "codexbar" : "pending",
+      adapter: "native",
     };
   });
 }
@@ -53,6 +53,6 @@ export async function readAccounts(): Promise<Account[]> {
 }
 
 function validate(value: Partial<Account>): Account {
-  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
+  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
   return value as Account;
 }

@@ -29,7 +29,25 @@ export interface Reading {
 
 export interface Account {
   name: string;
-  vendor: "codex" | "claude";
+  vendor: "codex" | "claude" | "antigravity";
   location: string;
-  adapter: "codexbar" | "pending";
+  adapter: "codexbar" | "native" | "pending";
+}
+
+/** v0.2 observation emitted by tally-engine and normalized from the fallback engine. */
+export interface Observation {
+  principal_id: string;
+  meter_id: string;
+  window: { kind: "rolling" | "fixed"; minutes: number | null; enforcement: "hard" | "soft" } | null;
+  quantity: { used: number; limit: number; remaining: number; unit: "percent" | "tokens" | "requests" | "credits" } | null;
+  resets_at: string | null;
+  observed_at: string;
+  fetched_at: string;
+  source: string;
+  truth: Truth;
+  freshness: "fresh" | "stale" | "failed";
+  confidence: number;
+  adapter_version: string;
+  upstream_schema_version: string;
+  reason?: string | null;
 }

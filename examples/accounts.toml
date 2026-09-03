@@ -3,10 +3,10 @@
 name = "codex-main"
 vendor = "codex"
 location = "~/.codex"
-adapter = "codexbar"
+adapter = "native"
 
 [[accounts]]
 name = "claude-main"
 vendor = "claude"
 location = "~/.claude"
-adapter = "pending"
+adapter = "native"
