@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { normalizeObservations } from "../engine/observation.js";
 import { allowedOutbound, redact } from "../security.js";
+import { vendorJson } from "../limits.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
@@ -155,7 +156,7 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const fetcher = dependencies.fetch ?? fetch;
     const quota = await post(fetcher, RETRIEVE_USER_QUOTA, credentials);
     if (quota.ok) {
-      const body: unknown = await quota.json();
+      const body: unknown = await vendorJson(quota);
       if (buckets(body).some((bucket) => bucket.remaining !== undefined)) return observationsFromAntigravityQuota(body, account, now);
     } else if (quota.status !== 403) {
       throw new ProviderHTTPError(quota.status, "Antigravity quota");
@@ -163,13 +164,13 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     // Availability proves only that the account can use models. It must never become a zero-use quota reading.
     const availability = await post(fetcher, FETCH_AVAILABLE_MODELS, credentials);
     if (!availability.ok) throw new ProviderHTTPError(availability.status, "Antigravity models");
-    await availability.json();
+    await vendorJson(availability);
     return failed(account, "quota endpoint returned availability only", timestamp);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     if (message === "expired") return failed(account, "token expired; run: agy", timestamp);
     if (message === "unavailable" || message === "invalid") return failed(account, "no credentials; run: agy", timestamp);
-    const reason = error instanceof ProviderHTTPError ? error.message : "Antigravity usage unavailable";
+    const reason = error instanceof ProviderHTTPError ? error.message : message.startsWith("vendor response") ? message : "Antigravity usage unavailable";
     return failed(account, reason, timestamp);
   }
 }

@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
-import { access, lstat, readFile } from "node:fs/promises";
-import { homedir, userInfo } from "node:os";
+import { lstat, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { allowedOutbound, redact } from "../security.js";
+import { assertVendorResponseLimits, vendorJson } from "../limits.js";
 import { credentialPath } from "../paths.js";
-import { headroomHome } from "../paths.js";
+import { executablePath } from "../paths.js";
+import { nativeEnginePath } from "../engine/native/run.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,7 +30,9 @@ export interface ClaudeDependencies {
   now?: () => Date;
   fetch?: typeof fetch;
   readFile?: (path: string, encoding: BufferEncoding) => Promise<string>;
+  /** Test seam only. Production macOS reads credentials exclusively in the probe. */
   keychain?: (service: string) => Promise<string>;
+  probe?: (configDir: string) => Promise<string>;
 }
 
 export function claudeServiceName(configDir: string, home = homedir()): string {
@@ -44,23 +48,39 @@ async function readCredentialFile(path: string): Promise<string> {
   return readFile(path, "utf8");
 }
 
-async function keychainPayload(service: string): Promise<string> {
+export class ClaudeProbeError extends Error {
+  constructor(readonly kind: "missing" | "denied" | "timeout" | "unavailable", message: string) { super(message); }
+}
+
+async function claudeProbe(configDir: string): Promise<string> {
   const helper = await keychainHelper();
+  if (!helper) throw new ClaudeProbeError("unavailable", "Claude probe not built; run npm run engine:build");
   try {
-    if (!helper) {
-      process.stderr.write("warning: headroom-keychain is unavailable; falling back to security with weaker Keychain protection\n");
-      const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-a", userInfo().username, "-s", service, "-w"], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true });
-      return stdout;
-    }
-    const { stdout } = await execFileAsync(helper, [service], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
+    const { stdout } = await execFileAsync(helper, ["--config-dir", resolve(configDir)], { timeout: TIMEOUT_MS + 2_000, maxBuffer: 1024 * 1024 + 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
+    const value: unknown = JSON.parse(stdout);
+    assertVendorResponseLimits(value);
     return stdout;
-  } catch { throw new Error("no credentials in Keychain"); }
+  } catch (error: unknown) {
+    const result = error as { stderr?: string; code?: number | string };
+    const stderr = result.stderr ?? "";
+    if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied; run: headroom keychain grant");
+    if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access denied; run: headroom keychain grant");
+    if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; run: claude`);
+    if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
+    throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
+  }
+}
+
+/** Interactive CLI entry point; its sole prompt is owned by the signed probe. */
+export async function grantClaudeKeychainAccess(configDir: string): Promise<void> {
+  await claudeProbe(configDir);
 }
 
 async function keychainHelper(): Promise<string | undefined> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  const candidates = [join(headroomHome(), "engine", "native", "headroom-keychain"), join(root, "engine", ".build", "release", "headroom-keychain")];
-  for (const candidate of candidates) try { await access(candidate); return candidate; } catch { /* next candidate */ }
+  const native = await nativeEnginePath();
+  const candidates = [native ? join(dirname(native), "headroom-claude-probe") : "", join(root, "engine", ".build", "release", "headroom-claude-probe")];
+  for (const candidate of candidates) try { return await executablePath(candidate, { repoRoot: root, development: true }); } catch { /* next candidate */ }
   return undefined;
 }
 
@@ -145,10 +165,11 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
 export async function claudeResponseShape(account: ProviderAccount, dependencies: ClaudeDependencies = {}): Promise<Array<{ path: string; kind: string }>> {
   const now = dependencies.now?.() ?? new Date();
   const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
+  if (darwin && !dependencies.keychain) return shape(JSON.parse(await (dependencies.probe ?? claudeProbe)(account.location)));
   let payload: string;
   try {
     payload = darwin
-      ? await (dependencies.keychain ?? keychainPayload)(claudeServiceName(account.location))
+      ? await dependencies.keychain!(claudeServiceName(account.location))
       : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
   } catch { throw new Error(`${darwin ? "no credentials in Keychain for this config dir" : "no credentials for this config dir"}; ${claudeCommand(account)}`); }
   let credential: Credential;
@@ -157,7 +178,7 @@ export async function claudeResponseShape(account: ProviderAccount, dependencies
   if (credential.expired) throw new Error(`token expired; ${claudeCommand(account)}`);
   const response = await (dependencies.fetch ?? fetch)(new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
   if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
-  return shape(await response.json());
+  return shape(await vendorJson(response));
 }
 
 export async function observeClaude(account: ProviderAccount, dependencies: ClaudeDependencies = {}): Promise<Observation[]> {
@@ -166,8 +187,9 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
   const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
   let credentialLoaded = false;
   try {
+    if (darwin && !dependencies.keychain) return observationsFromClaudeUsage(JSON.parse(await (dependencies.probe ?? claudeProbe)(account.location)), account, now);
     const payload = darwin
-      ? await (dependencies.keychain ?? keychainPayload)(claudeServiceName(account.location))
+      ? await dependencies.keychain!(claudeServiceName(account.location))
       : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
     credentialLoaded = true;
     const credential = parseClaudeCredential(payload, now);
@@ -175,10 +197,13 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     const request = new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
     const response = await (dependencies.fetch ?? fetch)(request);
     if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
-    return observationsFromClaudeUsage(await response.json(), account, now);
+    return observationsFromClaudeUsage(await vendorJson(response), account, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const reason = error instanceof ProviderHTTPError ? error.message
+      : error instanceof ClaudeProbeError && error.message.startsWith("token expired") ? `token expired; ${claudeCommand(account)}`
+      : error instanceof ClaudeProbeError ? error.message
+      : error instanceof Error && error.message.startsWith("vendor response") ? error.message
       : darwin && !credentialLoaded ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
       : /no credentials in Keychain/.test(message) ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
         : /credentials unavailable|credentials invalid|unsafe permissions/.test(message) ? `no credentials for this config dir; ${claudeCommand(account)}`

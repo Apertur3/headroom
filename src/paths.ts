@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
-import { lstat, rename } from "node:fs/promises";
-import { join, win32 } from "node:path";
+import { lstat, realpath, rename } from "node:fs/promises";
+import { join, relative, resolve, win32 } from "node:path";
 
 export interface PathOptions {
   platform?: NodeJS.Platform;
@@ -46,6 +46,20 @@ export function expandHome(value: string): string {
   if (value === "~") return homedir();
   if (value.startsWith("~/")) return join(homedir(), value.slice(2));
   return value;
+}
+
+/** Refuse symlinks, foreign-owned, or group/world-writable executables. */
+export async function executablePath(path: string, options: { repoRoot?: string; development?: boolean } = {}): Promise<string> {
+  const canonical = await realpath(path);
+  const stat = await lstat(canonical);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Refusing unsafe executable path");
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing executable owned by another user");
+  if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) throw new Error("Refusing group or world writable executable");
+  if (options.development && options.repoRoot) {
+    const repo = await realpath(options.repoRoot);
+    if (relative(repo, canonical).startsWith("..")) throw new Error("Refusing development executable outside repository");
+  }
+  return canonical;
 }
 
 export type VendorHome = "claude" | "codex" | "gemini";
