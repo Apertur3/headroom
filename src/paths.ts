@@ -29,8 +29,24 @@ export async function migrateLegacyHome(options: PathOptions = {}): Promise<bool
   if (env.HEADROOM_HOME || platform === "win32") return false;
   const legacy = joinForPlatform(platform, home, [".", "ta", "lly"].join(""));
   const current = headroomHome({ platform, env, home });
-  try { await lstat(current); return false; }
-  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  try {
+    const currentStat = await lstat(current);
+    if (!currentStat.isDirectory() || currentStat.isSymbolicLink()) return false;
+    // Earlier migration runs could create ~/.headroom before moving the old
+    // engine cache. Move that verified-cache directory independently instead
+    // of making engine install re-download an already pinned binary.
+    const legacyEngine = join(legacy, "engine");
+    const currentEngine = join(current, "engine");
+    try {
+      const oldEngine = await lstat(legacyEngine);
+      if (!oldEngine.isDirectory() || oldEngine.isSymbolicLink()) return false;
+    } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try { await lstat(currentEngine); return false; }
+    catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    try { await rename(legacyEngine, currentEngine); return true; }
+    catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    return false;
+  } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   try {
     const stat = await lstat(legacy);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return false;

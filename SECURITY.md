@@ -38,9 +38,13 @@ cookies, which unlock paid subscriptions.
 11. **Bounded vendor input.** Credential-backed responses are limited to 1 MiB, JSON depth 32,
     arrays of 10,000 items, and strings of 64 KiB.
 12. **Outbound allowlist.** Credential-backed requests only target
-    `api.anthropic.com`, `chatgpt.com`, and configured local base URLs. Proxy
-    environment variables are ignored unless a `proxy` value is explicitly set in
-    `policy.toml`.
+    `api.anthropic.com`, `chatgpt.com`, the Google OAuth/Code Assist hosts, and
+    configured local base URLs. Proxy environment variables are ignored unless a
+    `proxy` value is explicitly set in `policy.toml`.
+13. **Antigravity source eligibility.** The daemon-kept `agy` session is the primary
+    Antigravity source. The remote Google OAuth fallback is only available to accounts
+    whose Gemini Code Assist tier is still served; a vendor refusal includes its HTTP
+    status and redacted reason code/message, but never the OAuth token or email address.
 
 ## Out of scope
 

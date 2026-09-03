@@ -204,6 +204,8 @@ function printLeases(items: Lease[]): void {
   for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
 }
 
+export function endedLeaseMessage(lease: Lease): string { return `ended ${lease.id} (owner ${lease.owner})`; }
+
 async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
     const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note");
@@ -218,9 +220,15 @@ async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "end") {
     const id = argv[1]; const owner = option(argv, "--owner"); if (!id) throw new Error("Usage: headroom lease end <id> [--owner <name>] [--force]");
     if (!owner) throw new Error("Usage: headroom lease end <id> --owner <name> [--force]");
-    const params = { id, owner, force: argv.includes("--force") }; const request = await requestDaemon("lease_end", params);
-    if (request !== undefined) { console.log((unwrapRpc(request) as Lease).id); return 0; }
-    directReadNotice(); const store = await HeadroomStore.open(); try { const ended = store.endLease(id, owner, params.force); store.audit("cli", params.force && ended.owner !== owner ? "lease_force_end" : "lease_end", params.force && ended.owner !== owner ? `${owner}->${ended.owner}` : ended.meter_id, "ok"); console.log(ended.id); return 0; } finally { store.close(); }
+    try {
+      const params = { id, owner, force: argv.includes("--force") }; const request = await requestDaemon("lease_end", params);
+      if (request !== undefined) { console.log(endedLeaseMessage(unwrapRpc(request) as Lease)); return 0; }
+      directReadNotice(); const store = await HeadroomStore.open(); try { const ended = store.endLease(id, owner, params.force); store.audit("cli", params.force && ended.owner !== owner ? "lease_force_end" : "lease_end", params.force && ended.owner !== owner ? `${owner}->${ended.owner}` : ended.meter_id, "ok"); console.log(endedLeaseMessage(ended)); return 0; } finally { store.close(); }
+    } catch (error) {
+      // An owner mismatch is an expected refusal, not an opaque CLI failure.
+      console.error(safeError(error));
+      return 1;
+    }
   }
   if (argv[0] === "list") {
     const request = await requestDaemon("leases");

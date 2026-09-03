@@ -107,7 +107,6 @@ struct HeadroomEngine {
             let principal = safePrincipal(rawPrincipal)
             do {
                 switch principal.vendor {
-                case "claude": output += try await claude(principal)
                 case "codex": output += try await codex(principal)
                 case "antigravity": output += try await antigravity(principal)
                 default: throw EngineError.unsupportedVendor
@@ -125,10 +124,6 @@ struct HeadroomEngine {
             let principal = safePrincipal(rawPrincipal)
             do {
                 switch principal.vendor {
-                case "claude":
-                    let credentials = try await ClaudeKeychainReader.load(configDirectory: principal.location)
-                    guard !credentials.isExpired else { throw EngineError.expiredCredential }
-                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: try await ClaudeOAuthUsageReader.shape(accessToken: credentials.accessToken), error: nil))
                 case "codex":
                     var environment = ProcessInfo.processInfo.environment
                     environment["CODEX_HOME"] = principal.location
@@ -189,19 +184,6 @@ struct HeadroomEngine {
             if value is any BinaryInteger || value is any BinaryFloatingPoint { return "number" }
             return "unknown"
         }
-    }
-
-    static func claude(_ principal: Principal) async throws -> [Observation] {
-        let credentials = try await ClaudeKeychainReader.load(configDirectory: principal.location)
-        guard !credentials.isExpired else { throw EngineError.expiredCredential }
-        // ClaudeOAuthUsageFetcher is internal to CodexBarCore at v0.56.4. This mirrors its
-        // OAuth-only endpoint and headers, while retaining the access token in memory only.
-        let snapshot = try await ClaudeOAuthUsageReader.fetch(accessToken: credentials.accessToken)
-        var observations = claudeWindows(principal, meter: "all", windows: [snapshot.fiveHour, snapshot.sevenDay])
-        observations += claudeScopedWindows(principal, meter: "fable", window: snapshot.fable)
-        observations += claudeScopedWindows(principal, meter: "routines", window: snapshot.routines)
-        guard !observations.isEmpty else { throw EngineError.noUsage }
-        return observations
     }
 
     static func codex(_ principal: Principal) async throws -> [Observation] {
@@ -278,30 +260,6 @@ struct HeadroomEngine {
         return output
     }
 
-    static func claudeWindows(_ principal: Principal, meter: String, windows: [ClaudeUsageWindow?]) -> [Observation] {
-        windows.compactMap { value in
-            guard let value else { return nil }
-            if !value.isEnforced {
-                return notEnforcedWindow(principal, meter: meter, minutes: value.minutes ?? 10_080, source: "engine:native:claude", reason: "vendor marks scoped limit inactive")
-            }
-            guard let percent = value.percent else { return nil }
-            return observation(
-                principal, meter: meter,
-                quantity: Quantity(used: percent, limit: 100, remaining: max(0, 100 - percent), unit: "percent"),
-                reset: value.resetsAt, observed: Date(), source: "engine:native:claude",
-                window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.minutes, enforcement: "hard"))
-        }
-    }
-
-    /// Scoped meters are an allowance only when the response names one. Its
-    /// absence is a successful vendor response, never a per-meter read error.
-    static func claudeScopedWindows(_ principal: Principal, meter: String, window: ClaudeUsageWindow?) -> [Observation] {
-        guard let window else {
-            return [notEnforcedWindow(principal, meter: meter, minutes: 10_080, source: "engine:native:claude", reason: "no scoped limit in response")]
-        }
-        return claudeWindows(principal, meter: meter, windows: [window])
-    }
-
     static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil) -> [Observation] {
         windows.compactMap { value in
             guard let value, !value.isSyntheticPlaceholder else { return nil }
@@ -329,7 +287,7 @@ struct HeadroomEngine {
     }
 
     static func meterNames(for vendor: String) -> [String] {
-        switch vendor { case "claude": ["all", "fable", "routines"]; case "codex": ["main", "spark", "credits"]; case "antigravity": ["gemini", "claude-gpt"]; default: ["unknown"] }
+        switch vendor { case "codex": ["main", "spark", "credits"]; case "antigravity": ["gemini", "claude-gpt"]; default: ["unknown"] }
     }
 
     static func safePrincipal(_ principal: Principal) -> Principal {
@@ -351,6 +309,6 @@ struct HeadroomEngine {
     }
 }
 
-enum EngineError: LocalizedError { case unsupportedVendor, expiredCredential, noUsage, claudeUsageUnavailable
-    var errorDescription: String? { switch self { case .unsupportedVendor: "unsupported vendor"; case .expiredCredential: "expired, run claude to refresh"; case .noUsage: "provider returned no quota windows"; case .claudeUsageUnavailable: "Claude OAuth usage unavailable" } }
+enum EngineError: LocalizedError { case unsupportedVendor, noUsage
+    var errorDescription: String? { switch self { case .unsupportedVendor: "unsupported vendor"; case .noUsage: "provider returned no quota windows" } }
 }
