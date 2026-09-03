@@ -12,10 +12,10 @@ describe("account discovery", () => {
     await Promise.all([mkdir(join(root, ".codex")), mkdir(join(root, ".codex-work")), mkdir(join(root, ".claude"))]);
     const accounts = await discoverAccounts(root, { PATH: "" });
     expect(accounts).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "codex-main", vendor: "codex", adapter: "native" }),
-      expect.objectContaining({ name: "claude-main", vendor: "claude", adapter: "native" }),
+      expect.objectContaining({ name: "codex-main", vendor: "codex", adapter: "native-ts" }),
+      expect.objectContaining({ name: "claude-main", vendor: "claude", adapter: "native-ts" }),
     ]));
-    expect(accountsToml(accounts)).toContain('adapter = "native"');
+    expect(accountsToml(accounts)).toContain('adapter = "native-ts"');
   });
 
   it("discovers Antigravity from its Gemini installation and renders local rows", async () => {
@@ -23,7 +23,7 @@ describe("account discovery", () => {
     await mkdir(join(root, ".gemini"));
     await mkdir(join(root, ".gemini", "antigravity-cli"));
     const accounts = await discoverAccounts(root, { PATH: "" });
-    expect(accounts).toContainEqual(expect.objectContaining({ name: "antigravity", vendor: "antigravity", adapter: "native" }));
+    expect(accounts).toContainEqual(expect.objectContaining({ name: "antigravity", vendor: "antigravity", adapter: "engine" }));
     expect(accountsToml([{ name: "gpu-box", kind: "local", base_url: "http://10.0.0.20:8000", adapter: "native" }])).toContain('adapter = "native"');
   });
 });

@@ -31,7 +31,8 @@ export interface ProviderAccount {
   name: string;
   vendor: "codex" | "claude" | "antigravity";
   location: string;
-  adapter: "codexbar" | "native" | "pending";
+  /** `native-ts` is credential-local TypeScript; `engine` is the optional Swift engine. */
+  adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
 }
 
 /** A local pool is declared now; its probe adapter lands in slice 5. */

@@ -38,12 +38,12 @@ export async function discoverAccounts(home = homedir(), environment = process.e
       name: `${vendor}-${primary ? "main" : ordinal}`,
       vendor,
       location: join(home, directory),
-      adapter: "native",
+      adapter: "native-ts",
     };
   });
   const antigravityCLI = join(home, ".gemini", "antigravity-cli");
   if (await exists(antigravityCLI) || await agyOnPath(environment.PATH)) {
-    accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "native" });
+    accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "engine" });
   }
   return accounts;
 }
@@ -75,6 +75,9 @@ function validate(value: Record<string, string>): Account {
     if (!value.name || !value.base_url || (value.adapter && value.adapter !== "native")) throw new Error("Invalid local account entry in accounts.toml");
     return { name: value.name, kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "native" } satisfies LocalAccount;
   }
-  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
-  return { name: value.name, vendor: value.vendor, location: value.location, adapter: value.adapter } as ProviderAccount;
+  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "native-ts" && value.adapter !== "engine" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
+  // `native` was the old Swift-first spelling. Preserve existing configs while
+  // making the new registry default unambiguous.
+  const adapter = value.adapter === "native" ? (value.vendor === "antigravity" ? "engine" : "native-ts") : value.adapter;
+  return { name: value.name, vendor: value.vendor, location: value.location, adapter } as ProviderAccount;
 }
