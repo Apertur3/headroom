@@ -16,10 +16,10 @@ let package = Package(
             name: "headroom-engine",
             dependencies: [.product(name: "CodexBarCore", package: "codexbar")],
             path: "Sources/HeadroomEngine",
-            linkerSettings: [.linkedFramework("Security")]),
+            linkerSettings: []),
         .executableTarget(
             name: "headroom-claude-probe",
-            path: "Sources/HeadroomKeychain",
+            path: "Sources/HeadroomClaudeProbe",
             linkerSettings: [.linkedFramework("Security")]),
         .testTarget(
             name: "HeadroomEngineTests",

@@ -35,7 +35,9 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   const localAccounts = accounts.filter(isLocalAccount);
   const observations: Observation[] = [];
   const failures: string[] = [];
-  const tsAccounts = providerAccounts.filter((account) => account.adapter === "native-ts" && (account.vendor === "claude" || account.vendor === "codex"));
+  // Claude always stays in the TypeScript adapter: on macOS it delegates the
+  // credential read and request to the separately-granted Claude probe.
+  const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
   for (const account of tsAccounts) {
     const result = account.vendor === "claude" ? await observeClaude(account) : await observeCodex(account);
     observations.push(...result);
@@ -46,7 +48,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // probe is called exclusively by the daemon after it has started `agy`.
   const antigravityAccounts = providerAccounts.filter((account) => account.vendor === "antigravity");
   let localAntigravity = new Map<string, Observation[]>();
-  const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && (account.adapter === "engine" || account.adapter === "native"));
+  const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && account.vendor !== "claude" && (account.adapter === "engine" || account.adapter === "native"));
   const native = process.platform === "win32" ? undefined : await nativeEnginePath();
   if (options.daemonOwnsAntigravity && native && antigravityAccounts.length) {
     try {

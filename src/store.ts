@@ -128,11 +128,41 @@ export class HeadroomStore {
         observation_id INTEGER NOT NULL, amount_percent REAL NOT NULL, estimated INTEGER NOT NULL, at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS lease_spend_lease ON lease_spend(lease_id);
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+      );
     `);
     // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
     // NOT EXISTS, so retain a narrow compatibility migration.
     try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
     catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
+    this.removeFalseResetSeenEvents();
+  }
+
+  /** Remove the transient reset labels caused by rolling zero-use windows whose
+   * provider-derived reset timestamp advances on every poll. This deliberately
+   * inspects its event evidence rather than trusting the old event confidence. */
+  private removeFalseResetSeenEvents(): void {
+    const migration = "2026-09-03-reset-seen-usage-drop";
+    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    const since = "2026-09-03T21:00:00.000Z";
+    const candidates = this.db.prepare("SELECT * FROM events WHERE kind = 'reset_seen' AND origin = 'inferred' AND created_at >= ?").all(since);
+    let removed = 0;
+    for (const row of candidates) {
+      const event = eventFromRow(row);
+      const evidence = event.evidence_observation_ids.map((id) => this.db.prepare("SELECT * FROM observations WHERE id = ?").get(id)).filter((item): item is Row => Boolean(item)).map(observationFromRow);
+      const previous = evidence[0];
+      const current = evidence[1];
+      const usageDropped = previous?.freshness === "fresh" && current?.freshness === "fresh"
+        && previous.quantity?.used !== undefined && current.quantity?.used !== undefined
+        && previous.quantity.used > 0 && (current.quantity.used === 0 || current.quantity.used < previous.quantity.used * 0.5);
+      if (usageDropped) continue;
+      this.db.prepare("DELETE FROM events WHERE id = ?").run(event.id);
+      this.audit("migration", "remove_false_reset_seen", event.meter_id, `${event.id}: no usage drop`);
+      removed += 1;
+    }
+    this.audit("migration", "remove_false_reset_seen_summary", null, `removed ${removed} inferred reset_seen events since ${since}`);
+    this.db.prepare("INSERT INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
   }
 
   insert(observation: Observation): StoredObservation {
@@ -173,18 +203,24 @@ export class HeadroomStore {
 
   private detectEvents(previous: StoredObservation, current: StoredObservation): void {
     const evidence = [previous.id, current.id];
-    if (previous.freshness === "failed" && current.freshness !== "failed") {
-      const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
-      this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
+    if (previous.freshness === "failed") {
+      if (current.freshness === "fresh") {
+        const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
+        this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
+      }
+      return;
     }
-    if (previous.freshness !== "failed" && current.freshness === "failed") this.addSourceFailedEvent(evidence, current);
+    if (current.freshness === "failed") {
+      this.addSourceFailedEvent(evidence, current);
+      return;
+    }
     const oldUsed = previous.quantity?.used;
     const newUsed = current.quantity?.used;
     const bothFresh = previous.freshness === "fresh" && current.freshness === "fresh";
-    const resetAdvanced = bothFresh && Boolean(previous.resets_at && current.resets_at && new Date(current.resets_at).getTime() > new Date(previous.resets_at).getTime());
-    const beforeOldReset = previous.resets_at ? new Date(current.fetched_at).getTime() < new Date(previous.resets_at).getTime() : true;
-    const dropped = oldUsed !== undefined && newUsed !== undefined && oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5) && beforeOldReset;
-    if (bothFresh && (resetAdvanced || dropped)) this.addEvent("reset_seen", "inferred", previous.freshness === "stale" ? 0.3 : resetAdvanced ? 0.9 : 0.5, evidence, current);
+    // Rolling windows may synthesize `resets_at` as now + duration on every
+    // fetch. A timestamp change is therefore never reset evidence on its own.
+    const dropped = oldUsed !== undefined && newUsed !== undefined && oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5);
+    if (bothFresh && dropped) this.addEvent("reset_seen", "inferred", 0.5, evidence, current);
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {

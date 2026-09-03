@@ -4,7 +4,6 @@ import { dirname, join } from "node:path";
 import { normalizeObservations } from "../engine/observation.js";
 import { allowedOutbound, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
-import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const TIMEOUT_MS = 10_000;
@@ -22,6 +21,10 @@ type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): value is ObjectValue => typeof value === "object" && value !== null && !Array.isArray(value);
 const string = (value: unknown): string | undefined => typeof value === "string" && value.trim() ? value.trim() : undefined;
 const number = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+class AntigravityHTTPError extends Error {
+  constructor(readonly status: number, detail?: string) { super(`HTTP ${status}${detail ? ` ${detail}` : ""}`); }
+}
 
 export interface GeminiOAuthClient { clientId: string; clientSecret: string; }
 export interface AntigravityDependencies {
@@ -79,6 +82,25 @@ function requestBody(projectId?: string): string { return JSON.stringify(project
 function requestHeaders(token: string): HeadersInit { return { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity" }; }
 
 function field(value: ObjectValue, ...names: string[]): unknown { for (const name of names) if (name in value) return value[name]; return undefined; }
+
+/** Google sometimes sends a useful Code Assist reason in an error envelope.
+ * Preserve that operator-facing diagnostic while applying the normal secret and
+ * email redaction before it can become an observation or event. */
+function vendorErrorDetail(value: unknown): string | undefined {
+  const root = object(value) && object(value.error) ? value.error : value;
+  if (!object(root)) return undefined;
+  const reasonCode = string(field(root, "reasonCode", "reason_code"))
+    ?? (Array.isArray(root.details) ? root.details.flatMap((item) => object(item) ? [string(field(item, "reasonCode", "reason_code"))] : []).find(Boolean) : undefined);
+  const message = string(root.message);
+  if (!reasonCode && !message) return undefined;
+  return redact(`${reasonCode ?? ""}${reasonCode && message ? ": " : ""}${message ?? ""}`).slice(0, 512);
+}
+
+async function antigravityHTTPError(response: Response): Promise<AntigravityHTTPError> {
+  let detail: string | undefined;
+  try { detail = vendorErrorDetail(await vendorJson(response)); } catch { /* status remains useful when a proxy sends malformed HTML */ }
+  return new AntigravityHTTPError(response.status, detail);
+}
 function reset(value: unknown): string | null {
   if (typeof value === "string" && Number.isFinite(Date.parse(value))) return new Date(value).toISOString();
   const epoch = number(value);
@@ -188,7 +210,7 @@ async function refresh(fetcher: typeof fetch, credentials: Credential, resolveCl
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: formBody({ client_id: client.clientId, client_secret: client.clientSecret, refresh_token: credentials.refreshToken, grant_type: "refresh_token" }), signal: AbortSignal.timeout(TIMEOUT_MS),
   }));
-  if (!response.ok) throw new ProviderHTTPError(response.status, "Google OAuth refresh");
+  if (!response.ok) throw await antigravityHTTPError(response);
   const body: unknown = await vendorJson(response);
   if (!object(body) || !string(body.access_token)) throw new Error("Google OAuth refresh returned no access token");
   return { ...credentials, token: string(body.access_token)!, expired: false };
@@ -206,7 +228,7 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const stored = await credential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureRead, now);
     const credentials = await refresh(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient);
     const quota = await post(fetcher, credentials);
-    if (!quota.ok) throw new ProviderHTTPError(quota.status, "Antigravity quota");
+    if (!quota.ok) throw await antigravityHTTPError(quota);
     const body: unknown = await vendorJson(quota);
     if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) return failed(account, "quota endpoint returned availability only", timestamp);
     return observationsFromAntigravityQuota(body, account, now);
@@ -214,7 +236,7 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const message = error instanceof Error ? error.message : "";
     if (message === "expired") return failed(account, "token expired; run: gemini", timestamp);
     if (message === "unavailable" || message === "invalid") return failed(account, "no Gemini CLI OAuth credentials; run: gemini", timestamp);
-    const reason = error instanceof ProviderHTTPError ? error.message : message.startsWith("vendor response") ? message : "Antigravity usage unavailable";
+    const reason = error instanceof AntigravityHTTPError ? error.message : message.startsWith("vendor response") ? message : "Antigravity usage unavailable";
     return failed(account, reason, timestamp);
   }
 }
