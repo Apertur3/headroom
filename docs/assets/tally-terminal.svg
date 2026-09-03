@@ -8,5 +8,5 @@
   <text x="24" y="174" fill="#e6edf3">antigravity:gemini  <tspan fill="#9aa4b2">wk</tspan> 84% <tspan fill="#9aa4b2">↻Sep 8 23:11</tspan> <tspan fill="#f0883e">CONSERVE</tspan></text>
   <text x="24" y="200" fill="#e6edf3">gpu-box:capacity      <tspan fill="#3fb950">UP</tspan> <tspan fill="#9aa4b2">model=local-27b running=0 waiting=0</tspan></text>
   <text x="24" y="244" fill="#9aa4b2">$ <tspan fill="#e6edf3">tally can gemini-bulk</tspan></text>
-  <text x="24" y="270" fill="#f85149">NO</tspan> <tspan fill="#e6edf3">antigravity:gemini CONSERVE</tspan> <tspan fill="#9aa4b2">(wk 84% CONSERVE)</tspan></text>
+  <text x="24" y="270" fill="#f85149">NO <tspan fill="#e6edf3">antigravity:gemini CONSERVE</tspan> <tspan fill="#9aa4b2">(wk 84% CONSERVE)</tspan></text>
 </svg>
