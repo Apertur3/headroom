@@ -1,6 +1,6 @@
 import { lstat, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
+import { credentialPath, vendorHome } from "../paths.js";
 import { redact } from "../security.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
@@ -58,7 +58,8 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   const output: Observation[] = [];
   const primary = rate(account, "main", rateLimit.primary_window, 300, now);
   output.push(primary ? tagged(primary) : tagged({ ...base(account, "main", now), window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor returned no 5-hour window" }));
-  const weekly = rate(account, "main", rateLimit.secondary_window, 10_080, now); if (weekly) output.push(tagged(weekly));
+  const weekly = rate(account, "main", rateLimit.secondary_window, 10_080, now);
+  output.push(tagged(weekly ?? { ...base(account, "main", now), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no weekly window" }));
   if (Array.isArray(usage.additional_rate_limits)) for (const entry of usage.additional_rate_limits) {
     if (!object(entry) || !String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") || !object(entry.rate_limit)) continue;
     const five = rate(account, "spark", entry.rate_limit.primary_window, 300, now); const week = rate(account, "spark", entry.rate_limit.secondary_window, 10_080, now);
@@ -67,7 +68,7 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   if (object(credits) && number(credits.available_count) !== undefined) {
     const available = number(credits.available_count)!;
     const expiries = (Array.isArray(credits.credits) ? credits.credits : []).flatMap((credit) => object(credit) && string(credit.status) === "available" && typeof credit.expires_at === "string" ? [credit.expires_at] : []).sort();
-    output.push(tagged({ ...base(account, "credits", now), window: null, quantity: { used: 0, limit: available, remaining: available, unit: "credits" }, resets_at: expiries[0] ?? null, freshness: "fresh" }));
+    output.push(tagged({ ...base(account, "credits", now), window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiries[0] ?? null, freshness: "fresh" }));
   }
   return output;
 }
@@ -75,7 +76,7 @@ function headers(token: string, accountId: string | undefined, credit = false): 
 export async function observeCodex(account: ProviderAccount, dependencies: CodexDependencies = {}): Promise<Observation[]> {
   const now = dependencies.now?.() ?? new Date(); const timestamp = now.toISOString();
   try {
-    const path = join(resolve(account.location || join(homedir(), ".codex")), "auth.json");
+    const path = credentialPath("codex", resolve(account.location || vendorHome("codex")));
     const credential = parseCodexCredential(await (dependencies.readFile ?? secureRead)(path, "utf8"), now);
     if (credential.expired) return failed(account, "expired, run codex login", timestamp);
     const doFetch = dependencies.fetch ?? fetch;

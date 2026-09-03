@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { tallyHome } from "./paths.js";
@@ -26,7 +26,7 @@ export async function safeTallyDirectory(home = tallyHome()): Promise<string> {
   const stat = await lstat(requested);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing unsafe ~/.tally directory");
   if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing ~/.tally owned by another user");
-  if ((stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.tally with group or world permissions");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.tally with group or world permissions");
   // lstat above proves the Tally-owned leaf is not a link. realpath still
   // canonicalizes system aliases such as /var → /private/var on macOS.
   return realpath(requested);
@@ -40,7 +40,7 @@ async function safeDatabasePath(home?: string): Promise<string> {
       const stat = await lstat(candidate);
       if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Refusing unsafe Tally database file");
       if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing Tally database owned by another user");
-      if ((stat.mode & 0o077) !== 0) throw new Error("Refusing Tally database with group or world permissions");
+      if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing Tally database with group or world permissions");
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -72,6 +72,11 @@ export class TallyStore {
 
   static async open(home?: string): Promise<TallyStore> {
     const path = await safeDatabasePath(home);
+    // DatabaseSync creates a missing file with the process umask. Pre-create it
+    // with an explicit mode so concurrent direct readers cannot observe a 0644
+    // database between creation and the chmod below.
+    const descriptor = await open(path, "a", 0o600);
+    await descriptor.close();
     const db = new DatabaseSync(path);
     const store = new TallyStore(db);
     // Direct CLI reads may briefly overlap the daemon. WAL permits readers with
@@ -79,7 +84,7 @@ export class TallyStore {
     // rather than an immediate "database is locked" failure.
     db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
     store.migrate();
-    for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+    if (process.platform !== "win32") for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
       try { await chmod(candidate, 0o600); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     return store;
@@ -161,14 +166,14 @@ export class TallyStore {
     const beforeOldReset = previous.resets_at ? new Date(current.fetched_at).getTime() < new Date(previous.resets_at).getTime() : true;
     const dropped = oldUsed !== undefined && newUsed !== undefined && oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5) && beforeOldReset;
     if (resetAdvanced || dropped) this.addEvent("reset_seen", "inferred", previous.freshness === "stale" ? 0.3 : resetAdvanced ? 0.9 : 0.5, evidence, current);
-    const previousFree = previous.metadata?.free_resets_available;
-    const currentFree = current.metadata?.free_resets_available;
-    if (previousFree !== undefined && previousFree !== null && currentFree !== undefined && currentFree !== null) {
-      if (currentFree > previousFree) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
-      if (currentFree < previousFree) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current);
+    const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
+    const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
+    if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
+      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
+      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current);
+      if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.addEvent("plan_changed", "vendor_reported", 1, evidence, current);
-    if (current.meter_id.endsWith(":credits") && oldUsed !== undefined && newUsed !== undefined && oldUsed !== newUsed) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
   }
 
   history(meterId: string, since: string): StoredObservation[] {

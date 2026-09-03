@@ -74,6 +74,14 @@ describe("MCP JSON-RPC", () => {
     });
     expect(response).toMatchObject({ result: { structuredContent: [expect.objectContaining({ meter_id: "codex-main:main" })] } });
   });
+
+  it("uses a direct marked result when the daemon is absent", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async () => undefined, async (method) => {
+      expect(method).toBe("status");
+      return { source: "direct", observations: [fixture()], failures: [] };
+    });
+    expect(response).toMatchObject({ result: { structuredContent: { source: "direct", observations: [expect.objectContaining({ meter_id: "codex-main:main" })] } } });
+  });
 });
 
 describe("not enforced windows", () => {

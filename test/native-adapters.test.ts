@@ -26,8 +26,13 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect.objectContaining({ meter_id: "codex-main:main", freshness: "not_enforced", window: { kind: "rolling", minutes: 300, enforcement: "hard" } }),
       expect.objectContaining({ meter_id: "codex-main:main", window: expect.objectContaining({ minutes: 10_080 }), quantity: expect.objectContaining({ unit: "percent", used: 16 }), source: "native:codex" }),
       expect.objectContaining({ meter_id: "codex-main:spark", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 8 }) }),
-      expect.objectContaining({ meter_id: "codex-main:credits", quantity: { used: 0, limit: 1, remaining: 1, unit: "credits" }, resets_at: "2026-09-08T17:23:00Z" }),
+      expect.objectContaining({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-08T17:23:00Z" }),
     ]));
+  });
+
+  it("always emits a main weekly row so a missing vendor field replaces prior data", () => {
+    const rows = observationsFromCodexUsage({ rate_limit: { primary_window: { used_percent: 12, limit_window_seconds: 18_000, reset_at: 1_788_802_800 } } }, {}, codex, at);
+    expect(rows).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "failed", reason: "vendor returned no weekly window" }));
   });
 
   it("does not leak a token from auth.json or Keychain JSON through rows, errors, or logs", async () => {
