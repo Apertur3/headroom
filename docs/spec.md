@@ -1,109 +1,112 @@
-# Tally spec v0.1 (2026-09-03)
+# Tally spec v0.2 (2026-09-03, after review)
+
+Brand Tally. Package and repo `keeptally`. Command `tally`.
 
 ## Problem
 
 Anyone running agents across several AI subscriptions needs three answers at decision time:
-how much capacity is left per account and pool, when it comes back, and what to do about it.
-Existing tools (CodexBar, ccusage, claude-monitor, agentburn) answer only the first, and as
-desktop apps or single-account CLIs. Tally owns the second and third and keeps the first pluggable.
+how much capacity is left per account and meter, when it comes back, and what to do about it.
+Existing tools (CodexBar, ccusage, claude-monitor, agentburn) answer only the first, as desktop
+apps or single-account CLIs. Tally owns the second and third and keeps the first pluggable.
 
 ## Non-goals
 
-- Not a menu-bar meter. CodexBar owns that niche; Tally builds on it and aims to be listed in its
-  ecosystem.
+- Not a menu-bar meter (CodexBar owns that; Tally builds on it and aims for its ecosystem list).
 - Not a proxy or load balancer. Tally never sits in the request path.
-- Not a capability router. Which model is good at what is the user's opinion, kept in
-  `routing.toml`; Tally only filters by budget.
-- No UI until the CLI is truthful for two weeks.
+- Not a capability router. Which model is good at what is the user's opinion in `routing.toml`.
+- No UI, no TCP listener, no telemetry in v1.
 
 ## Concepts
 
 | Term | Meaning |
 |---|---|
-| Account | One credential location: `{vendor, location}`. Claude = a config dir (`~/.claude`, `~/.claude2`), Codex = a `CODEX_HOME`, Antigravity = a Google login reachable via `agy`. |
-| Pool | One meter family inside an account. Claude Max has `all`, `fable`, `routines`; Antigravity has `gemini` and `claude-gpt`; Codex has `main` and `spark`. Readings are keyed by pool. |
-| Window | A rolling bucket inside a pool: `five_hour`, `weekly`, or vendor-specific. Carries `used_percent`, `resets_at`, `window_minutes`. |
-| Reading | One sample of one pool at one time, with `source` = `engine:codexbar` or `native:claude` and `truth` = `official` or `estimated`. |
-| Event | Derived from consecutive readings: `reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `source_failed`. |
-| Local pool | Self-hosted inference (vLLM, llama.cpp, Ollama) as a pool with no quota but finite capacity. State `UP`, `BUSY`, `DOWN` instead of percent; carries model id, running and waiting request counts from `/metrics` when available, and endpoint latency. Cost model is `marginal` (energy per hour), unlike subscriptions which are `sunk` (expire at reset). Routing preference is a policy toggle, default `fallback`. |
-| Pace state | Per window: HARVEST (>10 pts under the straight-line burn), NORMAL, CONSERVE (>10 pts over), FREEZE (past the freeze reserve, overrides all). Ported from the fleet pace machine. |
+| Principal | One credential location: `{vendor, location}`. Claude = a config dir, Codex = a `CODEX_HOME`, Antigravity = the Google login behind `agy`, local = a base URL. Stable id, e.g. `claude-main`. |
+| Meter | One vendor-enforced limit on a principal, stable id `principal:meter`. Claude Max: `all`, `fable`, `routines`. Antigravity: `gemini`, `claude-gpt`. Codex: `main`, `spark`, `credits`. Local: `capacity`. |
+| Window | A bucket inside a meter: `kind = rolling | fixed`, `minutes`, `enforcement = hard | soft`. |
+| Observation | One sample of one window: typed quantity (`used`, `limit`, `remaining`, `unit = percent | tokens | requests | credits`), nullable `resets_at`, `observed_at` (vendor time if given) and `fetched_at`, `source`, `truth = official | estimated`, `freshness = fresh | stale | failed`, `confidence 0..1`, `adapter_version`, `upstream_schema_version`. Never a whole "reading" with mixed provenance; each datum carries its own. |
+| Consumes | An action class maps to the set of meters it draws from. A Fable call on `claude-main` consumes `claude-main:all` and `claude-main:fable`. `tally can` checks every consumed meter; one frozen meter freezes the action. |
+| Event | Separate record with id, kind (`reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`, `source_recovered`), `origin = vendor_reported | inferred`, `confidence`, evidence (observation ids), and later corrections. Never embedded in observations. |
+| Pace state | Per window: HARVEST (>10 pts under straight-line burn), NORMAL, CONSERVE (>10 pts over), FREEZE (past freeze reserve, overrides all), UNKNOWN (stale or failed). Ported from the fleet pace machine. |
+| Cost model | `sunk` (subscriptions, capacity expires at reset) or `marginal` (local inference, energy per hour). |
+
+## Fail-closed semantics
+
+Unknown is never capacity. A stale or failed window is `UNKNOWN`, printed as such on every
+surface, and `tally can` answers NO for it unless `--allow-unknown` is passed. Staleness
+threshold per meter, default 15 minutes. Inferred events carry confidence and are labelled
+inferred; a drop from 82% to 7% during backoff is `reset_seen` with low confidence, not a fact.
 
 ## Architecture
 
 ```
-tally CLI ──┐                       ┌── engine: CodexBarCLI (pinned, SHA-256, child process per account, env CODEX_HOME / CLAUDE_CONFIG_DIR)
-tally MCP ──┼─ Unix socket ─ daemon ┼── native adapter: Claude (Keychain per config dir → usage endpoint)
-statusline ─┘        │              └── adapters are pure: (account) → readings[]
-                     ├── store: SQLite (readings, events, audit) under ~/.tally/, 0600
-                     ├── scheduler: per-account poll interval, jitter, backoff on 401/403/429
-                     └── policy: pace states, thresholds, routing filter
+tally CLI ──┐                     ┌── engine: tally-engine (Swift, links CodexBarCore pinned to a tag; Keychain enabled; emits observations)
+tally MCP ──┼─ Unix socket ─ daemon ┼── fallback engine: upstream CodexBarCLI binary (pinned, SHA-256) via schema adapter
+statusline ─┘        │            ├── native:local adapter (OpenAI-compatible /v1/models, vLLM /metrics, llama.cpp /health)
+                     ├── store: SQLite under ~/.tally/ (observations, events, audit), 0600, canonicalized paths
+                     ├── scheduler: per-principal interval, jitter, coalescing, exponential backoff on 401/403/429
+                     └── policy: pace states, consumes graph, routing filter, thresholds
 ```
 
-- **Engine.** `tally engine install` downloads the CodexBarCLI tarball for the platform from the
-  pinned upstream release, verifies SHA-256, unpacks to `~/.tally/engine/<version>/`. The pin
-  lives in `engine.lock.json`. `tally engine update` bumps it after the schema adapter's fixture
-  tests pass against the new version's output. Upstream drift breaks a test, not a user.
-- **Schema adapter.** `src/engine/codexbar/adapt.ts` maps CodexBar's per-provider JSON
-  (`usage.primary/secondary/extraRateWindows/codexResetCredits/...`) into readings. Recorded,
-  redacted fixtures per provider and version in `fixtures/codexbar/`.
-- **Native Claude adapter.** Claude Code on macOS stores OAuth credentials in the Keychain under
-  service `Claude Code-credentials` for the default dir and `Claude Code-credentials-<hash>` for
-  a `CLAUDE_CONFIG_DIR`; CodexBarCLI cannot read those without a prompt, so multi-account Claude
-  needs this adapter. Hash derivation and endpoint contract: lift from Orca's
-  `claude-fetcher.ts` and `docs/claude-scoped-oauth-usage-limits.md`. Reads the item at call
-  time via `security find-generic-password -w`, calls the usage endpoint, drops the token.
-  Linux: `~/.claude*/.credentials.json`.
-- **Local adapter.** `native:local` probes an OpenAI-compatible base URL: `/v1/models` for liveness and model id, vLLM `/metrics` (`vllm:num_requests_running`, `vllm:num_requests_waiting`) for load, llama.cpp `/health`. Configured in `accounts.toml` as `kind = "local"` with `base_url`, optional `wake` command (e.g. `ssh gateway wake-workstation`) that Tally reports but never runs on its own. Owner fleet: gpu-box vLLM 10.0.0.20:8000, workstation vLLM :8000 and llama.cpp :8012 (VM .160).
-- **Cost model and local preference.** Every pool carries `cost = "sunk" | "marginal"`. Policy key `local_preference` in `routing.toml`: `fallback` (default: local pools are offered only when every eligible subscription pool for the task class is CONSERVE or FREEZE), `prefer` (local first for fungible work, for users with cheap power or idle hardware), `never`. Optional `energy_cost_per_hour` per local pool is shown in output, never used for automatic decisions.
-- **Antigravity.** Through the engine; CodexBar reads the `agy` CLI's local HTTPS server.
-  Open question: headless `agy` server mode. Slice 4 answers it.
-- **Daemon.** Unix socket `~/.tally/tally.sock` (0600), JSON-RPC. Started by `tally daemon` or
-  launchd/systemd unit generated by `tally install-service`. CLI and MCP are thin clients; if no
-  daemon is running the CLI falls back to a one-shot direct read and says so.
-- **Registry.** `~/.tally/accounts.toml`, auto-discovered on first run from `~/.claude*`,
-  `~/.codex*`, `~/.gemini`, confirmed by the user. Committed example in `examples/`.
+- **Engine (primary).** `CodexBarCore` is an MIT SwiftPM library building on macOS 14+ and
+  Linux. `engine/` holds `tally-engine`, a thin Swift CLI that depends on it at a pinned tag,
+  enables Keychain reads for every Claude config dir (the upstream CLI disables them), loops over
+  principals in-process, and prints observations in Tally's schema. Prebuilt macOS and Linux
+  binaries ship in Tally's releases; the TypeScript side downloads, checksum-verifies, and, when
+  upstream publishes attestations, signature-verifies them. Updating = bump the tag, rebuild,
+  run conformance fixtures. Upstream drift breaks a test, not a user.
+- **Engine (fallback).** Slice 2's runner for the upstream CodexBarCLI stays as a fallback and as
+  the conformance oracle.
+- **Antigravity.** `agy` has no server mode but bootstraps its local HTTPS server when started
+  under a pseudo-terminal (`script -q /dev/null agy`), verified 2026-09-03 with real numbers.
+  The daemon supervises a hidden `agy` only while polling, then stops it; cold start ~20s.
+- **Local pools.** `kind = "local"` principals with `base_url`, optional `wake` command that Tally
+  reports and never runs. State `UP | BUSY | DOWN`, model id, vLLM queue depth.
+- **Registry.** `~/.tally/accounts.toml`, auto-discovered from `~/.claude*`, `~/.codex*`,
+  `~/.gemini`, confirmed by the user. Committed example in `examples/`.
+- **Daemon.** Unix socket `~/.tally/tally.sock`, JSON-RPC. `tally install-service` writes a
+  launchd or systemd unit. Without a daemon the CLI does a one-shot read and says so.
 
-## Reading schema (JSON, one per pool)
+## Security (see SECURITY.md; additions from review)
 
-```json
-{
-  "account": "claude-main", "vendor": "claude", "pool": "all",
-  "plan": "Claude Max 20x", "source": "native:claude", "truth": "official",
-  "sampled_at": "2026-09-03T13:24:00Z",
-  "windows": {
-    "five_hour": {"used_percent": 3, "resets_at": "2026-09-03T15:10:00Z", "window_minutes": 300, "pace": "HARVEST"},
-    "weekly":    {"used_percent": 61, "resets_at": "2026-09-06T12:00:00Z", "window_minutes": 10080, "pace": "CONSERVE"}
-  },
-  "extras": {"free_resets_available": 0, "credits_remaining": null},
-  "last_event": {"kind": "reset_seen", "at": "2026-09-03T05:10:00Z", "window": "five_hour"}
-}
-```
+- Same-UID code (npm packages, editor extensions, other agents) is inside the trust boundary of
+  a 0600 socket. Mitigation: request coalescing and per-principal poll rate limits so no caller
+  can force credential-backed polls or trigger vendor defenses; audit log records callers.
+- Canonicalize and `lstat` every path under `~/.tally/`, config dirs and credential files;
+  reject symlinks and unsafe parent ownership or mode before use.
+- Engine runs with a minimal environment (only the variables it needs), bounded stderr capture,
+  allowlist logging; canary-secret tests assert no leakage through stderr, exceptions or JSON.
+- Checksum proves reproducibility, not trust: pins are bumped only by an explicit human update;
+  release attestations verified when upstream provides them.
+- No TCP listener in v1. Removed until a real need exists.
 
 ## Surfaces
 
-- `tally` — one line per pool: `claude-main/all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE`.
-- `tally --json`, `tally --account X`, `tally --threshold N` (exit 2 if any window ≥ N),
-  `tally events --since 24h`, `tally can <account> <expected_percent>` (exit 0/2 with reason).
-- `tally mcp` — stdio MCP server exposing `quota_status`, `quota_can`, `quota_events`.
-  Registered in every Claude profile; Codex and agy agents call the CLI. Local pools appear in every surface with state instead of percent.
-- `skills/tally/SKILL.md` + `AGENTS.md` snippet: decide the pool by capability first, ask Tally
-  if it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
-  work, never spawn into FREEZE, log overrides with a reason.
+- `tally` — one line per meter, freshness always visible:
+  `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
+- `tally --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
+  `tally events --since 24h`, `tally can <principal> <action-class> [--allow-unknown]`.
+- `tally mcp` — stdio MCP: `quota_status`, `quota_can`, `quota_events`.
+- `skills/tally/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Tally if
+  it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
+  work, `local_preference = fallback | prefer | never` (default fallback), never spawn into
+  FREEZE, log overrides with a reason.
+- Adapter SDK: an adapter is a pure function `(principal) → observations[]` plus a conformance
+  fixture directory; third parties add vendors without touching the core.
 
 ## Slices and acceptance
 
 | # | Slice | Accepted when |
 |---|---|---|
-| 2 | Engine runner + Codex adapter + fixtures | `tally` prints Codex main and spark pools matching `codex` status view; free-reset count present |
-| 3 | Native Claude adapter | `claude-main` and `claude2` rows; main matches the app's Usage screen within a few percent, twice on two days |
-| 4 | Antigravity spike | Gemini + claude-gpt pools, or a documented no with fallback |
-| 5 | Store, events, pace | A fired Codex free reset yields `free_reset_used` and `reset_seen` |
-| 6 | Daemon + MCP + threshold | `quota_status` answers from a fresh Claude Code session in both profiles; `--threshold 90` exits 2 |
-| 7 | Routing, skill, README, public | Owner approves README; repo flipped public |
+| 2 | Upstream engine runner + Codex adapter + fixtures | DONE 2026-09-03: Codex main and spark match CodexBar; SHA pinned |
+| 3 | `tally-engine` on CodexBarCore with Keychain | `claude-main` and `claude-2` rows; main matches the app's Usage screen within a few percent, twice on two days; Codex and Antigravity rows from the same engine |
+| 4 | Antigravity headless | DONE as spike 2026-09-03; supervision lands with the daemon |
+| 5 | Store, observations, events, pace, consumes graph | A fired Codex free reset yields `free_reset_used`; stale meters print UNKNOWN |
+| 6 | Daemon + MCP + `can` + threshold | `quota_status` answers from a fresh Claude Code session in both profiles; `--threshold 90` exits 2 |
+| 7 | Routing, skill, adapter SDK docs, README, public | `npx keeptally` gives truthful lines in under two minutes on a clean machine; owner approves README |
 
 ## Risks
 
-1. Vendor drift and bot walls on private endpoints. Mitigation: engine pin + fixtures, `truth`
-   flag, backoff, clear "source failed" rows instead of stale numbers.
-2. Concurrent token refresh corrupting credential files or invalidating sessions. Mitigation:
-   Tally never refreshes tokens itself; it only reads and lets the vendor CLI own refresh.
+1. Vendor drift and bot walls on private endpoints. Mitigation: pinned engine + conformance
+   fixtures, per-datum freshness and truth, backoff, UNKNOWN instead of stale numbers.
+2. Concurrent token refresh corrupting credential files. Mitigation: Tally never refreshes
+   tokens; the vendor CLI owns refresh. Open: CodexBarCore may refresh on its own; audit in slice 3.
