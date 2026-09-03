@@ -40,6 +40,12 @@ function label(observation: Observation): string {
 }
 
 function formatWindow(observation: Observation, state: PaceState, reason: string): string {
+  if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
+    const available = observation.quantity.remaining ?? 0;
+    const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
+    const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)})` : "";
+    return `credits ${available} available${expiry}`;
+  }
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})`;
   return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
@@ -228,7 +234,11 @@ async function main(argv: string[]): Promise<number> {
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`); return 0;
   }
-  if (argv[0] === "uninstall-service") { const result = await uninstallService(); console.log(`removed ${result.path}\nTo unload it: ${result.command}`); return 0; }
+  if (argv[0] === "uninstall-service") {
+    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: tally uninstall-service [--dry-run]");
+    const result = await uninstallService(process.platform, undefined, argv[1] === "--dry-run");
+    console.log(`${result.dryRun ? "would remove" : "removed"} ${result.path}\nTo unload it: ${result.command}`); return 0;
+  }
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));

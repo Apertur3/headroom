@@ -1,4 +1,11 @@
-import { rpc, socketPath } from "./daemon.js";
+import { daemonRequest, socketPath } from "./daemon.js";
+import { pollAccounts } from "./collector.js";
+import { readPolicy, readRouting } from "./config.js";
+import { observeLocal } from "./engine/local.js";
+import { canRoute } from "./policy.js";
+import { readAccounts } from "./registry.js";
+import { TallyStore } from "./store.js";
+import { isLocalAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 const tools = [
@@ -24,7 +31,58 @@ export function serveMcp(): void {
   });
 }
 
-export async function handleMcp(line: string, call = (method: string, params: Record<string, unknown>) => rpc(socketPath(), method, params)): Promise<Record<string, unknown> | undefined> {
+type DirectResult = Record<string, unknown>;
+
+async function directStatus(): Promise<DirectResult> {
+  const polled = await pollAccounts();
+  const store = await TallyStore.open();
+  try {
+    store.insertAll(polled.observations);
+    store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
+    return { source: "direct", observations: store.latestPerWindow(), failures: polled.failures };
+  } finally { store.close(); }
+}
+
+async function directCan(action: string, allowUnknown: boolean): Promise<DirectResult> {
+  const routing = await readRouting();
+  const meters = routing.consumes[action];
+  if (!meters) throw new Error(`Unknown action class: ${action || "(missing)"}`);
+  const [policy, accounts, store] = await Promise.all([readPolicy(), readAccounts(), TallyStore.open()]);
+  try {
+    const localAccounts = accounts.filter(isLocalAccount);
+    store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
+    const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+    const allMeters = [...new Set([...meters, ...localMeters])];
+    const decision = canRoute(meters, localMeters, new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)])), routing.local_preference, policy, allowUnknown);
+    store.audit("mcp", "can", action, decision.allowed ? "yes" : "no");
+    return { source: "direct", decision };
+  } finally { store.close(); }
+}
+
+async function directEvents(since: unknown): Promise<DirectResult> {
+  const value = typeof since === "string" ? since : new Date(Date.now() - 86_400_000).toISOString();
+  const store = await TallyStore.open();
+  try {
+    const events = store.events(value);
+    store.audit("mcp", "events", null, "ok");
+    return { source: "direct", events };
+  } finally { store.close(); }
+}
+
+async function directResult(method: string, arguments_: Record<string, unknown>): Promise<DirectResult> {
+  if (method === "status") return directStatus();
+  if (method === "can") return directCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true);
+  return directEvents(arguments_.since);
+}
+
+async function daemonCall(method: string, params: Record<string, unknown>): Promise<unknown | undefined> {
+  const request = await daemonRequest(socketPath(), method, params);
+  if (request.status === "available") return request.result;
+  if (request.status === "unresponsive") throw new Error("Tally daemon socket is present but health did not respond within 2s");
+  return undefined;
+}
+
+export async function handleMcp(line: string, call = daemonCall, fallback = directResult): Promise<Record<string, unknown> | undefined> {
   let request: Request;
   try { request = JSON.parse(line) as Request; } catch { return failure(null, -32700, "Parse error"); }
   if (request.jsonrpc !== "2.0" || typeof request.method !== "string") return failure(request.id, -32600, "Invalid Request");
@@ -40,6 +98,6 @@ export async function handleMcp(line: string, call = (method: string, params: Re
   const method = name === "quota_status" ? "status" : name === "quota_can" ? "can" : name === "quota_events" ? "events" : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
   const result = await call(method, method === "can" ? { action_class: arguments_.action_class, allow_unknown: arguments_.allow_unknown === true } : method === "events" ? { since: arguments_.since } : {});
-  if (result === undefined) return failure(request.id, -32000, "Tally daemon unavailable; run `tally daemon`");
-  return response(request.id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result });
+  const resolved = result === undefined ? await fallback(method, arguments_) : result;
+  return response(request.id, { content: [{ type: "text", text: JSON.stringify(resolved) }], structuredContent: resolved });
 }

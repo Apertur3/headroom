@@ -1,5 +1,6 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, unlink } from "node:fs/promises";
+import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
 import { pollAccounts, type PollResult } from "./collector.js";
@@ -12,7 +13,9 @@ import { safeTallyDirectory, TallyStore } from "./store.js";
 type Json = Record<string, unknown>;
 export type Poller = (principal?: string) => Promise<PollResult>;
 
-export function socketPath(home = tallyHome()): string { return join(home, "tally.sock"); }
+export function socketPath(home = tallyHome(), platform = process.platform, username = userInfo().username): string {
+  return platform === "win32" ? `\\\\.\\pipe\\keeptally-${username}` : join(home, "tally.sock");
+}
 
 function rpcResult(id: unknown, result: unknown): Json { return { jsonrpc: "2.0", id: id ?? null, result }; }
 function rpcError(id: unknown, code: number, message: string): Json { return { jsonrpc: "2.0", id: id ?? null, error: { code, message } }; }
@@ -44,7 +47,7 @@ export class TallyDaemon {
     await this.prepareSocket();
     this.server = createServer((socket) => this.handleSocket(socket));
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
-    await chmod(this.path, 0o600);
+    if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
     await this.schedulePrincipals();
   }
@@ -55,10 +58,18 @@ export class TallyDaemon {
     this.schedulers.clear();
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
-    try { await unlink(this.path); } catch { /* already gone */ }
+    if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }
   }
 
   private async prepareSocket(): Promise<void> {
+    if (process.platform === "win32") {
+      // Windows named pipes receive the process token's default DACL. Node's
+      // net API does not expose a security descriptor to tighten it further.
+      const daemon = await daemonRequest(this.path, "health");
+      if (daemon.status === "available") throw new Error("Tally daemon is already running");
+      if (daemon.status === "unresponsive") throw new Error("Tally daemon pipe is present but health did not respond within 2s");
+      return;
+    }
     try {
       const stat = await lstat(this.path);
       if (stat.isSymbolicLink() || !stat.isSocket()) throw new Error("Refusing unsafe tally socket");
@@ -193,6 +204,7 @@ export class TallyDaemon {
 }
 
 async function socketExists(path: string): Promise<boolean> {
+  if (process.platform === "win32") return false;
   try { return (await lstat(path)).isSocket(); }
   catch { return false; }
 }

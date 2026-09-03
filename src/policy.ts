@@ -41,6 +41,7 @@ export function paceDecision(observation: Observation | undefined, policy = defa
     if (state === "BUSY") return { state, reason: `local pool busy${observation.metadata?.waiting ? `; waiting ${observation.metadata.waiting}` : ""}` };
     return { state: "DOWN", reason: observation.reason ?? "local pool down" };
   }
+  if (observation.window?.kind === "count") return { state: "NORMAL", reason: "availability count" };
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };
   if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
@@ -93,6 +94,7 @@ function windowValue(observation: Observation, state: PaceState): string {
 function meterDecision(observations: Observation | Observation[] | undefined, policy: Policy, now: Date): Omit<MeterPaceDecision, "meter"> {
   const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
   const enforced = windows
+    .filter((observation) => observation.window?.kind !== "count")
     .map((observation) => ({ observation, ...paceDecision(observation, policy, now) }))
     .filter((window) => window.state !== "NOT_ENFORCED");
   if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced" };

@@ -66,5 +66,14 @@ export function observationsFromReading(reading: Reading): Observation[] {
       reason: "vendor returned no 5-hour window", metadata: { plan: reading.plan, free_resets_available: reading.extras.free_resets_available },
     });
   }
+  if (reading.pool === "main" && !reading.windows.weekly) {
+    observations.push({
+      principal_id: reading.account, meter_id: `${reading.account}:${reading.pool}`,
+      window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null,
+      observed_at: reading.sampled_at, fetched_at: reading.sampled_at, source: reading.source, truth: "estimated",
+      freshness: "failed", confidence: 0, adapter_version: "fallback", upstream_schema_version: "v0.56.4",
+      reason: "vendor returned no weekly window", metadata: { plan: reading.plan, free_resets_available: reading.extras.free_resets_available },
+    });
+  }
   return normalizeObservations(observations);
 }

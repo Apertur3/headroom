@@ -54,7 +54,7 @@ export function isLocalAccount(account: Account): account is LocalAccount {
 export interface Observation {
   principal_id: string;
   meter_id: string;
-  window: { kind: "rolling" | "fixed" | "state"; minutes: number | null; enforcement: "hard" | "soft" } | null;
+  window: { kind: "rolling" | "fixed" | "count" | "state"; minutes: number | null; enforcement: "hard" | "soft" } | null;
   quantity: { used: number; limit: number | null; remaining: number | null; unit: "percent" | "tokens" | "requests" | "credits" } | null;
   resets_at: string | null;
   observed_at: string;

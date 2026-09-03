@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { redact } from "../security.js";
+import { credentialPath } from "../paths.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -118,7 +119,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
   try {
     const payload = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin")
       ? await (dependencies.keychain ?? keychainPayload)(claudeServiceName(account.location))
-      : await (dependencies.readFile ?? readCredentialFile)(resolve(account.location, ".credentials.json"), "utf8");
+      : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
     const credential = parseClaudeCredential(payload, now);
     if (credential.expired) return failed(account, "expired, run claude to refresh", timestamp);
     const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });

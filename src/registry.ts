@@ -2,7 +2,7 @@ import { constants, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
-import { expandHome, tallyHome } from "./paths.js";
+import { expandHome, tallyHome, vendorHome } from "./paths.js";
 
 export function accountsPath(): string { return join(tallyHome(), "accounts.toml"); }
 
@@ -19,7 +19,7 @@ async function exists(path: string): Promise<boolean> {
 }
 
 async function agyOnPath(pathValue: string | undefined): Promise<boolean> {
-  const candidates = (pathValue ?? "").split(":").filter((directory) => directory && directory !== ".");
+  const candidates = (pathValue ?? "").split(process.platform === "win32" ? ";" : ":").filter((directory) => directory && directory !== ".");
   return (await Promise.all(candidates.map(async (directory) => {
     try { await fs.access(join(directory, "agy"), constants.X_OK); return true; } catch { return false; }
   }))).some(Boolean);
@@ -41,7 +41,7 @@ export async function discoverAccounts(home = homedir(), environment = process.e
       adapter: "native-ts",
     };
   });
-  const antigravityCLI = join(home, ".gemini", "antigravity-cli");
+  const antigravityCLI = join(vendorHome("gemini", { home }), "antigravity-cli");
   if (await exists(antigravityCLI) || await agyOnPath(environment.PATH)) {
     accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "engine" });
   }

@@ -12,8 +12,10 @@ cookies, which unlock paid subscriptions.
    config files (CodexBar's `tokenAccounts` path is deliberately not used).
 2. **No secret in output.** Logs, crash dumps, JSON output and history redact tokens, cookies,
    Authorization headers and, by default, email addresses.
-3. **Local-only surface.** The daemon listens on a Unix socket with mode 0600. TCP is opt-in,
-   loopback only, and requires a bearer token stored in the Keychain.
+3. **Local-only surface.** The daemon listens on a mode-0600 Unix socket on macOS and Linux, or
+   a per-user named pipe on Windows. Windows named pipes inherit the current process token's
+   default DACL; Node does not expose a security descriptor for further restriction. Tally has no
+   TCP listener.
 4. **Polite polling.** Vendor polls are rate-limited and jittered so Tally never triggers a
    lockout or a bot-defense challenge; a 401/403/429 backs off exponentially and is surfaced,
    never retried in a tight loop.
