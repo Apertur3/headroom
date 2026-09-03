@@ -244,14 +244,15 @@ struct HeadroomEngine {
                     return try AntigravitySnapshotFetch(status: status)
                 })
         } catch AntigravityStatusProbeError.notRunning {
-            // The bootstrap keeps its own process alive for the longer 45 s
-            // data-readiness window and never manages a user-owned process.
-            return try await AgyBootstrap.fetch(binaryHint: principal.location)
+            // The TypeScript daemon owns the one long-lived agy PTY. A direct
+            // engine invocation must not create a competing cold session: the
+            // CLI one-shot uses the remote OAuth source instead.
+            throw AntigravityStatusProbeError.notRunning
         }
     }
 
     static func antigravityWindows(_ principal: Principal, usage: UsageSnapshot) -> [Observation] {
-        let source = "engine:native:antigravity"
+        let source = "local:antigravity:warm"
         let summaryWindows = AntigravitySnapshotWaiter.summaryWindows(in: usage)
         var output: [Observation] = []
 

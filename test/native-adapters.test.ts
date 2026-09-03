@@ -38,7 +38,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const body = JSON.parse(await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8"));
     const rows = observationsFromAntigravityQuota(body, antigravity, at);
     expect(rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 24, limit: 100, remaining: 76, unit: "percent" }, source: "native:antigravity" }),
+      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 24, limit: 100, remaining: 76, unit: "percent" }, source: "remote:antigravity" }),
       expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 66, limit: 100, remaining: 34, unit: "percent" } }),
       expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 19, limit: 100, remaining: 81, unit: "percent" } }),
       expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 58, limit: 100, remaining: 42, unit: "percent" } }),
@@ -58,13 +58,12 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]));
   });
 
-  it("rejects an availability-only Antigravity answer and calls quota before models", async () => {
-    const available = await readFile(new URL("../fixtures/http/antigravity/fetch-available-models.synthetic.json", import.meta.url), "utf8");
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] }))).mockResolvedValueOnce(new Response(available));
+  it("rejects an availability-only Antigravity quota answer without treating model availability as quota", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
     const rows = await observeAntigravity(antigravity, {
       now: () => at,
-      credentialPaths: () => ["agy-token"],
-      readFile: async () => JSON.stringify({ token: { access_token: "not-a-secret", expiry: "2026-09-03T18:26:36Z" } }),
+      credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
       fetch,
     });
     expect(rows).toHaveLength(4);
@@ -72,11 +71,25 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const requests = fetch.mock.calls.map(([request]) => request as Request);
     expect(requests.map((request) => request.url)).toEqual([
       "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-      "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
     ]);
     expect(requests[0].headers.get("User-Agent")).toBe("antigravity");
     expect(requests[0].headers.get("x-goog-api-client")).toBeNull();
     expect(await requests[0].text()).toBe("{}");
+  });
+
+  it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {
+    const quota = await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8");
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 }))).mockResolvedValueOnce(new Response(quota));
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "old-access", refresh_token: "refresh-only", expiry_date: at.getTime() - 1 }),
+      oauthClient: async () => ({ clientId: "test-client.apps.googleusercontent.com", clientSecret: "test-client-secret" }), fetch,
+    });
+    expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
+    const requests = fetch.mock.calls.map(([request]) => request as Request);
+    expect(requests.map((request) => request.url)).toEqual(["https://oauth2.googleapis.com/token", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"]);
+    expect(await requests[0].text()).toContain("grant_type=refresh_token");
+    expect(requests[1].headers.get("Authorization")).toBe("Bearer new-access");
   });
 
   it("always emits a main weekly row so a missing vendor field replaces prior data", () => {
@@ -132,7 +145,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const rejectedFetch = async () => { throw new Error(secret); };
     const claudeRows = await observeClaude(claude, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: secret, expiresAt: at.getTime() + 60_000 } }), fetch: rejectedFetch });
     const codexRows = await observeCodex(codex, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: secret, expires_at: at.getTime() + 60_000 } }), fetch: rejectedFetch });
-    const antigravityRows = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["agy-token"], readFile: async () => JSON.stringify({ token: { access_token: secret, expiry: "2026-09-03T18:26:36Z" } }), fetch: rejectedFetch });
+    const antigravityRows = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: secret, expiry_date: "2026-09-03T18:26:36Z" }), fetch: rejectedFetch });
     const output = JSON.stringify([claudeRows, codexRows, antigravityRows, log.mock.calls]);
     expect(output).not.toContain(secret);
     expect(output).not.toContain("Bearer");
@@ -150,15 +163,19 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const missingClaude = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => { throw new Error("missing"); } });
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const expiredCodex = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() - 1 } }) });
-    const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["agy-token"], readFile: async () => JSON.stringify({ token: { access_token: "token", expiry: "2026-09-03T17:26:35Z" } }) });
+    const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: "token", expiry_date: "2026-09-03T17:26:35Z" }) });
     expect(expiredClaude[0].reason).toBe("token expired; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
     expect(missingClaude[0].reason).toBe("no credentials in Keychain for this config dir; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
     expect(expiredCodex[0].reason).toBe("token expired; run: CODEX_HOME=/Users/test/.codex2 codex login");
-    expect(expiredAntigravity[0].reason).toBe("token expired; run: agy");
+    expect(expiredAntigravity[0].reason).toBe("token expired; run: gemini");
   });
 
   it("accepts Gemini CLI's top-level JSON token as the fallback credential format", () => {
     expect(parseAntigravityCredential(JSON.stringify({ access_token: "token", expiry_date: at.getTime() + 60_000 }), at)).toMatchObject({ token: "token", expired: false });
+  });
+
+  it("does not mistake agy's session token record for Google OAuth", () => {
+    expect(() => parseAntigravityCredential(JSON.stringify({ auth_method: "oauth", token: "not-google-oauth" }), at)).toThrow("Gemini CLI OAuth credentials invalid");
   });
 
   it("reports response paths and value kinds without response values", async () => {
