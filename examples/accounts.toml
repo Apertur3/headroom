@@ -10,3 +10,29 @@ name = "claude-main"
 vendor = "claude"
 location = "~/.claude"
 adapter = "native"
+
+[[accounts]]
+name = "claude-2"
+vendor = "claude"
+location = "~/.claude2"
+adapter = "native"
+
+[[accounts]]
+name = "antigravity"
+vendor = "antigravity"
+location = "~/.gemini/antigravity-cli"
+adapter = "native"
+
+# Local adapter lands in slice 5. Tally reports this as UNKNOWN until then.
+# [[accounts]]
+# name = "gpu-box-vllm"
+# kind = "local"
+# base_url = "http://10.0.0.20:8000"
+# adapter = "pending"
+#
+# [[accounts]]
+# name = "workstation"
+# kind = "local"
+# base_url = "http://10.0.0.9:8000"
+# wake = "ssh gateway wake-workstation"
+# adapter = "pending"

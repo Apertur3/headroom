@@ -1,0 +1,74 @@
+[
+ {
+  "upstream_schema_version": "v0.56.4",
+  "confidence": 1,
+  "quantity": {
+   "unit": "percent",
+   "remaining": 84,
+   "used": 16,
+   "limit": 100
+  },
+  "source": "engine:native:codex",
+  "window": {
+   "enforcement": "hard",
+   "kind": "fixed",
+   "minutes": 10080
+  },
+  "adapter_version": "0.1.0",
+  "freshness": "fresh",
+  "fetched_at": "2026-09-03T17:26:36Z",
+  "principal_id": "codex-main",
+  "meter_id": "codex-main:main",
+  "observed_at": "2026-09-03T17:26:36Z",
+  "resets_at": "2026-09-10T13:08:17Z",
+  "truth": "official"
+ },
+ {
+  "truth": "official",
+  "freshness": "fresh",
+  "adapter_version": "0.1.0",
+  "confidence": 1,
+  "observed_at": "2026-09-03T17:26:36Z",
+  "window": {
+   "enforcement": "hard",
+   "kind": "fixed",
+   "minutes": 10080
+  },
+  "meter_id": "antigravity:gemini",
+  "fetched_at": "2026-09-03T17:26:36Z",
+  "source": "engine:native:antigravity",
+  "quantity": {
+   "unit": "percent",
+   "remaining": 15.532426999999998,
+   "used": 84.467573,
+   "limit": 100
+  },
+  "upstream_schema_version": "v0.56.4",
+  "resets_at": "2026-09-08T21:11:39Z",
+  "principal_id": "antigravity"
+ },
+ {
+  "truth": "official",
+  "freshness": "fresh",
+  "adapter_version": "0.1.0",
+  "confidence": 1,
+  "observed_at": "2026-09-03T17:26:36Z",
+  "window": {
+   "enforcement": "hard",
+   "kind": "fixed",
+   "minutes": 300
+  },
+  "meter_id": "antigravity:claude-gpt",
+  "fetched_at": "2026-09-03T17:26:36Z",
+  "source": "engine:native:antigravity",
+  "quantity": {
+   "unit": "percent",
+   "remaining": 100,
+   "used": 0,
+   "limit": 100
+  },
+  "upstream_schema_version": "v0.56.4",
+  "resets_at": "2026-09-03T22:26:36Z",
+  "principal_id": "antigravity"
+ }
+]

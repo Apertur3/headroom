@@ -27,11 +27,26 @@ export interface Reading {
   };
 }
 
-export interface Account {
+export interface ProviderAccount {
   name: string;
   vendor: "codex" | "claude" | "antigravity";
   location: string;
   adapter: "codexbar" | "native" | "pending";
+}
+
+/** A local pool is declared now; its probe adapter lands in slice 5. */
+export interface LocalAccount {
+  name: string;
+  kind: "local";
+  base_url: string;
+  wake?: string;
+  adapter: "pending";
+}
+
+export type Account = ProviderAccount | LocalAccount;
+
+export function isLocalAccount(account: Account): account is LocalAccount {
+  return "kind" in account && account.kind === "local";
 }
 
 /** v0.2 observation emitted by tally-engine and normalized from the fallback engine. */
