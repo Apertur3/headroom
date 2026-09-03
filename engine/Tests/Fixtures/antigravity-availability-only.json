@@ -1,0 +1,8 @@
+{
+  "source": "local-agy-existing",
+  "fetched_at": "2026-09-03T21:00:00Z",
+  "windows": [
+    {"id": "availability-gemini", "title": "Gemini 5-hour", "used_percent": 0, "minutes": 300, "resets_at": null, "reset_description": null},
+    {"id": "availability-claude", "title": "Claude/GPT weekly", "used_percent": 0, "minutes": 10080, "resets_at": null, "reset_description": null}
+  ]
+}
