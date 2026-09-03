@@ -46,10 +46,23 @@ async function keychainPayload(service: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-a", userInfo().username, "-s", service, "-w"], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true });
     return stdout;
-  } catch { throw new Error("OAuth credentials unavailable"); }
+  } catch { throw new Error("no credentials in Keychain"); }
 }
 
 interface Credential { token: string; expired: boolean; }
+
+function claudeCommand(account: ProviderAccount): string {
+  const directory = resolve(account.location);
+  return directory === resolve(homedir(), ".claude") ? "run: claude" : `run: CLAUDE_CONFIG_DIR=${directory} claude`;
+}
+
+function shape(value: unknown, path = "$"): Array<{ path: string; kind: string }> {
+  const kind = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
+  const output = [{ path, kind }];
+  if (isObject(value)) for (const [key, child] of Object.entries(value)) output.push(...shape(child, `${path}.${key}`));
+  else if (Array.isArray(value) && value[0] !== undefined) output.push(...shape(value[0], `${path}[]`));
+  return output;
+}
 export function parseClaudeCredential(payload: string, now = new Date()): Credential {
   try {
     const root: unknown = JSON.parse(payload);
@@ -113,20 +126,48 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
   return output;
 }
 
+/** Returns response key paths and value kinds without retaining response values. */
+export async function claudeResponseShape(account: ProviderAccount, dependencies: ClaudeDependencies = {}): Promise<Array<{ path: string; kind: string }>> {
+  const now = dependencies.now?.() ?? new Date();
+  const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
+  let payload: string;
+  try {
+    payload = darwin
+      ? await (dependencies.keychain ?? keychainPayload)(claudeServiceName(account.location))
+      : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
+  } catch { throw new Error(`${darwin ? "no credentials in Keychain for this config dir" : "no credentials for this config dir"}; ${claudeCommand(account)}`); }
+  let credential: Credential;
+  try { credential = parseClaudeCredential(payload, now); }
+  catch { throw new Error(`credentials invalid; ${claudeCommand(account)}`); }
+  if (credential.expired) throw new Error(`token expired; ${claudeCommand(account)}`);
+  const response = await (dependencies.fetch ?? fetch)(new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+  if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
+  return shape(await response.json());
+}
+
 export async function observeClaude(account: ProviderAccount, dependencies: ClaudeDependencies = {}): Promise<Observation[]> {
   const now = dependencies.now?.() ?? new Date();
   const timestamp = now.toISOString();
+  const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
+  let credentialLoaded = false;
   try {
-    const payload = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin")
+    const payload = darwin
       ? await (dependencies.keychain ?? keychainPayload)(claudeServiceName(account.location))
       : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
+    credentialLoaded = true;
     const credential = parseClaudeCredential(payload, now);
-    if (credential.expired) return failed(account, "expired, run claude to refresh", timestamp);
+    if (credential.expired) return failed(account, `token expired; ${claudeCommand(account)}`, timestamp);
     const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
     const response = await (dependencies.fetch ?? fetch)(request);
     if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
     return observationsFromClaudeUsage(await response.json(), account, now);
   } catch (error) {
-    return failed(account, error instanceof ProviderHTTPError ? error.message : "Claude usage unavailable", timestamp);
+    const message = error instanceof Error ? error.message : "";
+    const reason = error instanceof ProviderHTTPError ? error.message
+      : darwin && !credentialLoaded ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
+      : /no credentials in Keychain/.test(message) ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
+        : /credentials unavailable|credentials invalid|unsafe permissions/.test(message) ? `no credentials for this config dir; ${claudeCommand(account)}`
+          : "Claude usage unavailable";
+    return failed(account, reason, timestamp);
   }
 }

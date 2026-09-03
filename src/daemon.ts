@@ -1,13 +1,13 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { chmod, lstat, unlink } from "node:fs/promises";
+import { chmod, lstat, stat, unlink } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
 import { pollAccounts, type PollResult } from "./collector.js";
 import { tallyHome } from "./paths.js";
 import { canRoute } from "./policy.js";
-import { readAccounts } from "./registry.js";
-import { isLocalAccount } from "./types.js";
+import { accountsPath, readAccounts } from "./registry.js";
+import { isLocalAccount, type Account, type Observation } from "./types.js";
 import { safeTallyDirectory, TallyStore } from "./store.js";
 
 type Json = Record<string, unknown>;
@@ -34,6 +34,9 @@ export class TallyDaemon {
   private readonly lastPoll = new Map<string, number>();
   private readonly backoff = new Map<string, { failures: number; until: number }>();
   private readonly schedulers = new Map<string, NodeJS.Timeout>();
+  private accounts: Account[] = [];
+  private accountsMtime: number | undefined;
+  private schedulingStarted = false;
   private stopping = false;
 
   private constructor(private readonly store: TallyStore, private readonly path: string, private readonly poller: Poller) {}
@@ -50,6 +53,7 @@ export class TallyDaemon {
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
     await this.schedulePrincipals();
+    this.schedulingStarted = true;
   }
 
   async stop(): Promise<void> {
@@ -108,7 +112,7 @@ export class TallyDaemon {
       switch (request.method) {
         case "status":
           await this.poll(undefined, false);
-          result = this.store.latestPerWindow();
+          result = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
           break;
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -127,7 +131,7 @@ export class TallyDaemon {
           if (!meters) return rpcError(request.id, -32602, `Unknown action class: ${action || "(missing)"}`);
           await this.poll(undefined, false);
           const policy = await readPolicy();
-          const localMeters = (await readAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+          const localMeters = (await this.currentAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
           result = canRoute(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true);
           break;
@@ -135,6 +139,16 @@ export class TallyDaemon {
         case "refresh": {
           const principal = typeof params.principal === "string" ? params.principal : undefined;
           result = await this.poll(principal, true); break;
+        }
+        case "reset_seen": {
+          const candidates = Array.isArray(params.windows) ? params.windows : [];
+          const windows: Array<Pick<Observation, "meter_id" | "window" | "resets_at">> = candidates.flatMap((item) => {
+            if (!item || typeof item !== "object") return [];
+            const candidate = item as { meter_id?: unknown; minutes?: unknown; resets_at?: unknown };
+            if (typeof candidate.meter_id !== "string" || (typeof candidate.minutes !== "number" && candidate.minutes !== null)) return [];
+            return [{ meter_id: candidate.meter_id, window: candidate.minutes === null ? null : { kind: "rolling", minutes: candidate.minutes, enforcement: "hard" }, resets_at: typeof candidate.resets_at === "string" ? candidate.resets_at : null }];
+          });
+          result = Object.fromEntries(this.store.resetSeenFor(windows)); break;
         }
         case "health": result = { socket: this.path, in_flight: this.inFlight.size, backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })) }; break;
         default: return rpcError(request.id, -32601, "Method not found");
@@ -156,9 +170,9 @@ export class TallyDaemon {
     if (blocked && blocked.until > now) return { rate_limited: true };
     if (!forced && principal === undefined) {
       try {
-        const accounts = await readAccounts();
+        const accounts = await this.currentAccounts();
         if (accounts.length && accounts.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
-      } catch { /* a later collection pass returns the useful configuration error */ }
+      } catch { /* A collection pass returns the useful configuration error. */ }
     }
     if (forced && (this.lastPoll.get(key) ?? 0) + interval > now) return { rate_limited: true };
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now) return { observations: [], failures: [] };
@@ -183,7 +197,7 @@ export class TallyDaemon {
     if (this.stopping) return;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
-    try { for (const account of await readAccounts()) this.schedulePrincipal(account.name); }
+    try { for (const account of await this.currentAccounts()) this.schedulePrincipal(account.name); }
     catch { this.schedulePrincipal("all"); }
   }
 
@@ -199,7 +213,29 @@ export class TallyDaemon {
   }
 
   private installReloadHandlers(): void {
-    process.on("SIGHUP", () => { this.lastPoll.clear(); this.backoff.clear(); void this.schedulePrincipals(); });
+    process.on("SIGHUP", () => { this.lastPoll.clear(); this.backoff.clear(); this.accountsMtime = undefined; void this.schedulePrincipals(); });
+  }
+
+  /** Reloads principal scheduling when accounts.toml changes without a restart. */
+  private async currentAccounts(): Promise<Account[]> {
+    let mtime: number;
+    try { mtime = (await stat(accountsPath())).mtimeMs; }
+    catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { this.accounts = []; this.accountsMtime = undefined; return this.accounts; } throw error; }
+    if (this.accountsMtime === mtime) return this.accounts;
+    const accounts = await readAccounts();
+    const prior = new Set(this.accounts.map((account) => account.name));
+    const next = new Set(accounts.map((account) => account.name));
+    this.accounts = accounts;
+    this.accountsMtime = mtime;
+    for (const name of prior) if (!next.has(name)) {
+      const timer = this.schedulers.get(name);
+      if (timer) clearTimeout(timer);
+      this.schedulers.delete(name);
+      this.lastPoll.delete(name);
+      this.backoff.delete(name);
+    }
+    if (this.schedulingStarted) for (const account of accounts) if (!prior.has(account.name)) void this.schedulePrincipal(account.name);
+    return this.accounts;
   }
 }
 
