@@ -12,13 +12,20 @@ export async function readPolicy(): Promise<Policy> {
   return text === undefined ? defaultPolicy : parsePolicy(text);
 }
 
-/** Parse the only TOML construct routing needs: [consumes] string arrays. */
-export function parseConsumes(text: string): Record<string, string[]> {
+export type LocalPreference = "fallback" | "prefer" | "never";
+export interface Routing { consumes: Record<string, string[]>; local_preference: LocalPreference; }
+
+/** Parse Tally's deliberately small routing surface without accepting arbitrary
+ * TOML features into a security-sensitive local config. */
+export function parseRouting(text: string): Routing {
   const consumes: Record<string, string[]> = {};
+  let localPreference: LocalPreference = "fallback";
   let inConsumes = false;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     if (!line) continue;
+    const preference = /^local_preference\s*=\s*"(fallback|prefer|never)"\s*$/.exec(line);
+    if (preference) { localPreference = preference[1] as LocalPreference; continue; }
     if (/^\[consumes\]$/.test(line)) { inConsumes = true; continue; }
     if (/^\[.*\]$/.test(line)) { inConsumes = false; continue; }
     if (!inConsumes) continue;
@@ -28,11 +35,17 @@ export function parseConsumes(text: string): Record<string, string[]> {
     if (!meters.length) throw new Error(`Consumes entry ${match[1]} has no meters`);
     consumes[match[1]] = meters;
   }
-  return consumes;
+  return { consumes, local_preference: localPreference };
 }
 
+export function parseConsumes(text: string): Record<string, string[]> { return parseRouting(text).consumes; }
+
 export async function readConsumes(): Promise<Record<string, string[]>> {
+  return (await readRouting()).consumes;
+}
+
+export async function readRouting(): Promise<Routing> {
   const path = process.env.TALLY_ROUTING ?? join(tallyHome(), "routing.toml");
   const text = await optionalText(path);
-  return text === undefined ? {} : parseConsumes(text);
+  return text === undefined ? { consumes: {}, local_preference: "fallback" } : parseRouting(text);
 }

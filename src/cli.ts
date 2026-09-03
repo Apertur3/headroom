@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-import { readConsumes, readPolicy } from "./config.js";
+import { readPolicy, readRouting } from "./config.js";
 import { pathToFileURL } from "node:url";
-import { engineStatus, installEngine } from "./engine/codexbar/install.js";
+import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
+import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, TallyDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { canConsume, paceDecision, type CanDecision } from "./policy.js";
-import { accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { canRoute, paceDecision, type CanDecision } from "./policy.js";
+import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { TallyStore } from "./store.js";
-import { type Observation, type PaceState } from "./types.js";
+import { isLocalAccount, type Observation, type PaceState } from "./types.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -44,6 +45,16 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
 }
 
+function formatLocal(observation: Observation): string {
+  const state = observation.metadata?.state ?? "DOWN";
+  if (state === "DOWN") {
+    const wake = observation.reason?.match(/(?:^|; )wake: (.+)$/)?.[1];
+    return wake ? `${observation.meter_id}  DOWN (wake: ${wake})` : `${observation.meter_id}  DOWN (${observation.reason ?? "down"})`;
+  }
+  const model = observation.metadata?.model_ids?.[0] ?? "unknown";
+  return `${observation.meter_id}  ${state} model=${model} running=${observation.metadata?.running ?? observation.quantity?.used ?? 0} waiting=${observation.metadata?.waiting ?? 0}`;
+}
+
 /** Only fall back to SQLite when no daemon socket exists. A socket which cannot
  * answer health is an operational problem, not permission to race its writer. */
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
@@ -70,7 +81,9 @@ export function formatMeters(observations: Observation[], policy: Awaited<Return
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
     const ordered = [...windows].sort((a, b) => windowOrder(a) - windowOrder(b) || (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
-    const freshness = ordered.every((item) => item.freshness === "fresh") ? "fresh" : ordered.some((item) => item.freshness === "failed") ? "failed" : ordered.some((item) => item.freshness === "stale") ? "stale" : "not enforced";
+    if (ordered.length === 1 && ordered[0].window?.kind === "state") return formatLocal(ordered[0]);
+    const enforced = ordered.filter((item) => item.freshness !== "not_enforced");
+    const freshness = !enforced.length ? "not enforced" : enforced.some((item) => item.freshness === "fresh") ? "fresh" : enforced.some((item) => item.freshness === "failed") ? "failed" : "stale";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy);
       return formatWindow(item, decision.state, decision.reason);
@@ -111,7 +124,8 @@ async function events(argv: string[]): Promise<number> {
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
   if (!action) throw new Error("Usage: tally can <action-class> [--allow-unknown] [--json]");
-  const meters = (await readConsumes())[action];
+  const routing = await readRouting();
+  const meters = routing.consumes[action];
   if (!meters) throw new Error(`Unknown action class: ${action}`);
   const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown") });
   if (request !== undefined) {
@@ -122,8 +136,14 @@ async function can(argv: string[]): Promise<number> {
   directReadNotice();
   const [policy, store] = await Promise.all([readPolicy(), TallyStore.open()]);
   try {
-    const latest = new Map(meters.map((meter) => [meter, store.latestPerWindow(meter)]));
-    const decision = canConsume(meters, latest, policy, argv.includes("--allow-unknown"));
+    const localAccounts = (await readAccounts()).filter(isLocalAccount);
+    // With no daemon, `can` is also a direct read: refresh local state rather
+    // than deciding a routing preference from an old queue-depth sample.
+    store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
+    const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+    const allMeters = [...new Set([...meters, ...localMeters])];
+    const latest = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+    const decision = canRoute(meters, localMeters, latest, routing.local_preference, policy, argv.includes("--allow-unknown"));
     store.audit("cli", "can", action, decision.allowed ? "yes" : "no");
     printCan(decision, argv.includes("--json"));
     return decision.allowed ? 0 : 2;
@@ -192,7 +212,13 @@ async function daemon(): Promise<number> {
 }
 
 async function main(argv: string[]): Promise<number> {
-  if (argv[0] === "engine" && argv[1] === "install") { const result = await installEngine(); console.log(`engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256}${result.firstPin ? "; first pin recorded" : ""})`); return 0; }
+  if (argv[0] === "engine" && argv[1] === "install") {
+    const native = await installNativeEngine();
+    if (native.installed) { console.log(`native engine ${native.tag} installed at ${native.path} (sha256 ${native.sha256})`); return 0; }
+    console.log(`${native.hint} Falling back to the pinned upstream engine.`);
+    const result = await installEngine();
+    console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256}${result.firstPin ? "; first pin recorded" : ""})`); return 0;
+  }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.tally/engine/native/tally-engine (or engine/.build/release/tally-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
   if (argv[0] === "daemon") return daemon();

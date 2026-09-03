@@ -123,4 +123,11 @@ describe("pace and consumes", () => {
       ]
     `);
   });
+
+  it("labels a multi-window meter fresh when any enforced window is fresh", () => {
+    const fresh = observation({ meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, fetched_at: new Date().toISOString() });
+    const absent = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "not_enforced", quantity: null, fetched_at: new Date().toISOString() });
+    expect(formatMeters([fresh, absent], defaultPolicy)[0]).toContain("(fresh <1m)");
+    expect(formatMeters([absent], defaultPolicy)[0]).toContain("(not enforced <1m)");
+  });
 });

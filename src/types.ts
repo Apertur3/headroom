@@ -40,7 +40,7 @@ export interface LocalAccount {
   kind: "local";
   base_url: string;
   wake?: string;
-  adapter: "pending";
+  adapter: "native";
 }
 
 export type Account = ProviderAccount | LocalAccount;
@@ -53,8 +53,8 @@ export function isLocalAccount(account: Account): account is LocalAccount {
 export interface Observation {
   principal_id: string;
   meter_id: string;
-  window: { kind: "rolling" | "fixed"; minutes: number | null; enforcement: "hard" | "soft" } | null;
-  quantity: { used: number; limit: number; remaining: number; unit: "percent" | "tokens" | "requests" | "credits" } | null;
+  window: { kind: "rolling" | "fixed" | "state"; minutes: number | null; enforcement: "hard" | "soft" } | null;
+  quantity: { used: number; limit: number | null; remaining: number | null; unit: "percent" | "tokens" | "requests" | "credits" } | null;
   resets_at: string | null;
   observed_at: string;
   fetched_at: string;
@@ -70,10 +70,16 @@ export interface Observation {
   metadata?: {
     plan?: string | null;
     free_resets_available?: number | null;
+    /** Local-pool facts. They deliberately contain no credentials or prompts. */
+    state?: "UP" | "BUSY" | "DOWN";
+    model_ids?: string[];
+    running?: number;
+    waiting?: number;
+    cost_model?: "sunk" | "marginal";
   };
 }
 
-export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED";
+export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED" | "UP" | "BUSY" | "DOWN";
 
 export interface StoredObservation extends Observation {
   id: number;

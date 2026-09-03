@@ -3,6 +3,7 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
+import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
@@ -29,11 +30,6 @@ export async function pollAccounts(principal?: string): Promise<PollResult> {
       observations.push(...adaptCodexPayload((await runCodexBar(engine, account)).payload, account.name).flatMap(observationsFromReading));
     } catch (error) { failures.push(`${account.name} source failed: ${safeError(error)}`); }
   }
-  const now = new Date().toISOString();
-  for (const account of localAccounts) observations.push({
-    principal_id: account.name, meter_id: `${account.name}:capacity`, window: null, quantity: null,
-    resets_at: null, observed_at: now, fetched_at: now, source: "engine:local", truth: "estimated",
-    freshness: "failed", confidence: 0, adapter_version: "pending", upstream_schema_version: "pending", reason: "adapter pending",
-  });
+  observations.push(...await Promise.all(localAccounts.map(observeLocal)));
   return { observations, failures };
 }

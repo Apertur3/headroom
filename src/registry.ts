@@ -10,7 +10,7 @@ function quoted(value: string): string { return JSON.stringify(value); }
 
 export function accountsToml(accounts: Account[]): string {
   return accounts.map((account) => isLocalAccount(account)
-    ? ["[[accounts]]", `name = ${quoted(account.name)}`, 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "pending"', ""].join("\n")
+    ? ["[[accounts]]", `name = ${quoted(account.name)}`, 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "native"', ""].join("\n")
     : ["[[accounts]]", `name = ${quoted(account.name)}`, `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ""].join("\n")).join("\n");
 }
 
@@ -72,8 +72,8 @@ export async function readAccounts(): Promise<Account[]> {
 
 function validate(value: Record<string, string>): Account {
   if (value.kind === "local") {
-    if (!value.name || !value.base_url || (value.adapter && value.adapter !== "pending")) throw new Error("Invalid local account entry in accounts.toml");
-    return { name: value.name, kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "pending" } satisfies LocalAccount;
+    if (!value.name || !value.base_url || (value.adapter && value.adapter !== "native")) throw new Error("Invalid local account entry in accounts.toml");
+    return { name: value.name, kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "native" } satisfies LocalAccount;
   }
   if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
   return { name: value.name, vendor: value.vendor, location: value.location, adapter: value.adapter } as ProviderAccount;
