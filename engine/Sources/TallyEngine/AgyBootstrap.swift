@@ -8,7 +8,7 @@ enum AgyBootstrap {
     private static let attempts = 60
     private static let pollNanoseconds: UInt64 = 500_000_000
 
-    static func fetch(binaryHint: String) async throws -> AntigravityStatusSnapshot {
+    static func fetch(binaryHint: String) async throws -> AntigravitySnapshotFetch {
         let binary = FileManager.default.isExecutableFile(atPath: binaryHint) ? binaryHint : "agy"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
@@ -27,9 +27,16 @@ enum AgyBootstrap {
             guard process.isRunning else { throw EngineError.noUsage }
             let ports = agyListeningPorts(rootPID: process.processIdentifier)
             if !ports.isEmpty {
-                // Port readiness is separate from API readiness; the Core owns
-                // the short request retry and protocol parsing after this point.
-                return try await AntigravityStatusProbe(timeout: 8).fetchFromPorts(ports)
+                // A listening socket only proves that `agy` has bound a port. It
+                // can still serve GetUserStatus's two five-hour rows before its
+                // quota summary has populated the two weekly rows.
+                return try await AntigravitySnapshotWaiter.wait(
+                    timeout: 45,
+                    pollNanoseconds: 1_500_000_000,
+                    fetch: { remaining in
+                        let status = try await AntigravityStatusProbe(timeout: min(8, remaining)).fetchFromPorts(ports)
+                        return try AntigravitySnapshotFetch(status: status)
+                    })
             }
             try await Task.sleep(nanoseconds: pollNanoseconds)
         }
@@ -74,5 +81,82 @@ enum AgyBootstrap {
             pending += children
         }
         return result
+    }
+}
+
+/// Treat quota-summary cadence coverage as readiness. CodexBarCore's probe is
+/// intentionally allowed to return a parseable fallback status while a fresh
+/// `agy` is initializing, so this layer retains that useful snapshot but waits
+/// for the richer per-group weekly summary before presenting it as complete.
+struct AntigravitySnapshotFetch: Sendable {
+    let usage: UsageSnapshot
+
+    init(status: AntigravityStatusSnapshot) throws {
+        self.usage = try status.toUsageSnapshot()
+    }
+
+    init(usage: UsageSnapshot) {
+        self.usage = usage
+    }
+}
+
+enum AntigravitySnapshotWaiter {
+    static let weeklyMinutes = 10_080
+    static let expectedMeters: Set<String> = ["gemini", "claude-gpt"]
+
+    static func wait(
+        timeout: TimeInterval,
+        pollNanoseconds: UInt64,
+        maximumAttempts: Int? = nil,
+        fetch: @escaping (TimeInterval) async throws -> AntigravitySnapshotFetch,
+        sleep: @escaping (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }) async throws -> AntigravitySnapshotFetch
+    {
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastSnapshot: AntigravitySnapshotFetch?
+        var lastError: Error?
+        var attempts = 0
+
+        while Date() <= deadline, maximumAttempts.map({ attempts < $0 }) ?? true {
+            attempts += 1
+            do {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { break }
+                let snapshot = try await fetch(remaining)
+                lastSnapshot = snapshot
+                if isReady(snapshot.usage) {
+                    return snapshot
+                }
+            } catch {
+                lastError = error
+            }
+
+            guard Date() < deadline,
+                  maximumAttempts.map({ attempts < $0 }) ?? true
+            else { break }
+            try await sleep(pollNanoseconds)
+        }
+
+        if let lastSnapshot { return lastSnapshot }
+        throw lastError ?? EngineError.noUsage
+    }
+
+    static func isReady(_ usage: UsageSnapshot) -> Bool {
+        let weeklyMeters = Set(summaryWindows(in: usage)
+            .filter { $0.window.windowMinutes == weeklyMinutes }
+            .compactMap { meter(for: $0) })
+        return weeklyMeters.isSuperset(of: expectedMeters)
+    }
+
+    static func summaryWindows(in usage: UsageSnapshot) -> [NamedRateWindow] {
+        (usage.extraRateWindows ?? []).filter {
+            AntigravityStatusSnapshot.isQuotaSummaryWindowID($0.id)
+        }
+    }
+
+    static func meter(for window: NamedRateWindow) -> String? {
+        let title = window.title.lowercased()
+        if title.contains("gemini") { return "gemini" }
+        if title.contains("claude") || title.contains("gpt") { return "claude-gpt" }
+        return nil
     }
 }

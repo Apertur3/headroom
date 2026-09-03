@@ -135,8 +135,8 @@ struct TallyEngine {
                     let snapshot = try await UsageFetcher(environment: environment).loadLatestCLIAccountSnapshot()
                     output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: codexShape(snapshot), error: nil))
                 case "antigravity":
-                    let status = try await AntigravityStatusProbe().fetch()
-                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: antigravityShape(status), error: nil))
+                    let snapshot = try await antigravitySnapshot(principal)
+                    output.append(ResponseShape(principal_id: principal.id, vendor: principal.vendor, shape: antigravityShape(snapshot.usage), error: nil))
                 default: throw EngineError.unsupportedVendor
                 }
             } catch {
@@ -156,10 +156,24 @@ struct TallyEngine {
         return shape
     }
 
-    static func antigravityShape(_ status: AntigravityStatusSnapshot) -> [String] {
-        // The Core exposes a typed snapshot; serialize only its public field topology.
-        let mirror = Mirror(reflecting: status)
-        return ["$: object"] + mirror.children.compactMap { child in child.label.map { "$.\($0): \(shapeKind(child.value))" } }.sorted()
+    /// Structural diagnostics for the normalized snapshot, deliberately omitting
+    /// quota values and reset timestamps. The named quota-summary windows are
+    /// the exact rows received by the engine, unlike the primary/secondary UI
+    /// representatives which can collapse multiple cadences into one bar.
+    static func antigravityShape(_ usage: UsageSnapshot) -> [String] {
+        let named = AntigravitySnapshotWaiter.summaryWindows(in: usage)
+        let windows: [(title: String, id: String, window: RateWindow)] = if named.isEmpty {
+            [("Gemini", "none", usage.primary), ("Claude/GPT", "none", usage.secondary)]
+                .compactMap { title, id, window in window.map { (title, id, $0) } }
+        } else {
+            named.map { ($0.title, $0.id, $0.window) }
+        }
+        return ["$: object", "$.windows: array[\(windows.count)]"]
+            + windows.enumerated().map { index, row in
+                let minutes = row.window.windowMinutes.map(String.init) ?? "null"
+                let reset = row.window.resetsAt == nil ? "absent" : "present"
+                return "$.windows[\(index)]: title=\(row.title), id=\(row.id), minutes=\(minutes), resets_at=\(reset)"
+            }
     }
 
     static func shapeKind(_ value: Any) -> String {
@@ -212,19 +226,55 @@ struct TallyEngine {
     }
 
     static func antigravity(_ principal: Principal) async throws -> [Observation] {
-        // Prefer a user-owned app/IDE server. If none exists, boot agy under a
-        // PTY and wait for a listening local port before asking the Core to read it.
-        let status: AntigravityStatusSnapshot
-        do {
-            status = try await AntigravityStatusProbe().fetch()
-        } catch AntigravityStatusProbeError.notRunning {
-            status = try await AgyBootstrap.fetch(binaryHint: principal.location)
-        }
-        let usage = try status.toUsageSnapshot()
-        let observations = windows(principal, meter: "gemini", windows: [usage.primary], source: "engine:native:antigravity")
-            + windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: "engine:native:antigravity")
+        let snapshot = try await antigravitySnapshot(principal)
+        let observations = antigravityWindows(principal, usage: snapshot.usage)
         guard !observations.isEmpty else { throw EngineError.noUsage }
         return observations
+    }
+
+    static func antigravitySnapshot(_ principal: Principal) async throws -> AntigravitySnapshotFetch {
+        do {
+            // This is a user-owned local server (app, IDE, or `agy`). It is
+            // already reachable, but its quota summary can still be warming.
+            return try await AntigravitySnapshotWaiter.wait(
+                timeout: 15,
+                pollNanoseconds: 1_500_000_000,
+                fetch: { remaining in
+                    let status = try await AntigravityStatusProbe(timeout: min(8, remaining)).fetch()
+                    return try AntigravitySnapshotFetch(status: status)
+                })
+        } catch AntigravityStatusProbeError.notRunning {
+            // The bootstrap keeps its own process alive for the longer 45 s
+            // data-readiness window and never manages a user-owned process.
+            return try await AgyBootstrap.fetch(binaryHint: principal.location)
+        }
+    }
+
+    static func antigravityWindows(_ principal: Principal, usage: UsageSnapshot) -> [Observation] {
+        let source = "engine:native:antigravity"
+        let summaryWindows = AntigravitySnapshotWaiter.summaryWindows(in: usage)
+        var output: [Observation] = []
+
+        if summaryWindows.isEmpty {
+            output += windows(principal, meter: "gemini", windows: [usage.primary], source: source)
+            output += windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: source)
+        } else {
+            for named in summaryWindows where named.usageKnown {
+                guard let meter = AntigravitySnapshotWaiter.meter(for: named) else { continue }
+                output += windows(principal, meter: meter, windows: [named.window], source: source)
+            }
+        }
+
+        // A partial status payload must not allow an old weekly observation to
+        // masquerade as current. Emit the missing per-group weekly lane as a
+        // failed observation so Tally's fail-closed status becomes UNKNOWN.
+        let presentWeeklyMeters = Set(summaryWindows
+            .filter { $0.window.windowMinutes == AntigravitySnapshotWaiter.weeklyMinutes && $0.usageKnown }
+            .compactMap(AntigravitySnapshotWaiter.meter(for:)))
+        for meter in AntigravitySnapshotWaiter.expectedMeters.sorted() where !presentWeeklyMeters.contains(meter) {
+            output.append(failedWeeklyWindow(principal, meter: meter, source: source))
+        }
+        return output
     }
 
     static func claudeWindows(_ principal: Principal, meter: String, windows: [ClaudeUsageWindow?]) -> [Observation] {
@@ -265,6 +315,11 @@ struct TallyEngine {
     static func notEnforcedWindow(_ principal: Principal, meter: String, minutes: Int, source: String, reason: String, metadata: ObservationMetadata? = nil) -> Observation {
         let now = iso(Date())!
         return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "rolling", minutes: minutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "official", freshness: "not_enforced", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: reason, metadata: metadata)
+    }
+
+    static func failedWeeklyWindow(_ principal: Principal, meter: String, source: String) -> Observation {
+        let now = iso(Date())!
+        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "fixed", minutes: AntigravitySnapshotWaiter.weeklyMinutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: "quota summary not ready", metadata: nil)
     }
 
     static func failed(principal: Principal, meters: [String], error: Error) -> [Observation] {
