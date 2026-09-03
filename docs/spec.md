@@ -83,11 +83,11 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 
 ## Surfaces
 
-- `tally` — one line per meter, freshness always visible:
+- `tally` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `tally --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
   `tally events --since 24h`, `tally can <principal> <action-class> [--allow-unknown]`.
-- `tally mcp` — stdio MCP: `quota_status`, `quota_can`, `quota_events`.
+- `tally mcp` : stdio MCP: `quota_status`, `quota_can`, `quota_events`.
 - `skills/tally/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Tally if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into
