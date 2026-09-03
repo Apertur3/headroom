@@ -72,8 +72,14 @@ describe("local routing preference", () => {
 
   it("considers fallback local capacity only after every subscription meter is conserving", () => {
     const observations = new Map([["codex:main", subscription()], ["gpu-box:capacity", localUp()]]);
-    expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "fallback", { ...defaultPolicy, pace_grace_fraction: 0 }, false, now)).toMatchObject({ allowed: true, meter: "gpu-box:capacity", state: "UP", local_preference: "fallback", local_meter_considered: true });
+    expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "fallback", { ...defaultPolicy, pace_grace_fraction: 0 }, false, now)).toMatchObject({ allowed: true, meter: "gpu-box:capacity", state: "UP", reason: "UP, model unknown, 0 running", local_preference: "fallback", local_meter_considered: true });
     expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "never", { ...defaultPolicy, pace_grace_fraction: 0 }, false, now)).toMatchObject({ allowed: false, local_preference: "never", local_meter_considered: false });
     expect(parseRouting('local_preference = "prefer"\n[consumes]\nbuild = ["codex:main"]')).toEqual({ local_preference: "prefer", consumes: { build: ["codex:main"] } });
+  });
+
+  it("does not treat UNKNOWN subscriptions as a local fallback budget signal", () => {
+    const unknown = { ...subscription(), freshness: "failed" as const, quantity: null };
+    const observations = new Map([["codex:main", unknown], ["gpu-box:capacity", localUp()]]);
+    expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "fallback", defaultPolicy, false, now)).toMatchObject({ allowed: false, meter: "codex:main", state: "UNKNOWN", local_meter_considered: false });
   });
 });

@@ -4,6 +4,8 @@ import { pathToFileURL } from "node:url";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
+import { claudeResponseShape } from "./adapters/claude.js";
+import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, TallyDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
@@ -12,7 +14,7 @@ import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts }
 import { safeError } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { TallyStore } from "./store.js";
-import { isLocalAccount, type Observation, type PaceState } from "./types.js";
+import { isLocalAccount, type Observation, type PaceState, type TallyEvent } from "./types.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -39,7 +41,9 @@ function label(observation: Observation): string {
   return minutes ? `${minutes}m` : "-";
 }
 
-function formatWindow(observation: Observation, state: PaceState, reason: string): string {
+function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
+
+function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string): string {
   if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
     const available = observation.quantity.remaining ?? 0;
     const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
@@ -47,8 +51,8 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     return `credits ${available} available${expiry}`;
   }
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
-  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})`;
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
+  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -82,7 +86,25 @@ function windowOrder(observation: Observation): number {
   return 2;
 }
 
-export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>): string[] {
+export interface ThresholdWindow {
+  meter_id: string;
+  window_minutes: number | null;
+  used_percent: number | null;
+  crossed: boolean;
+  blocking: boolean;
+  freshness: Observation["freshness"];
+}
+
+export function thresholdReport(observations: Observation[], threshold: number): ThresholdWindow[] {
+  return observations.map((item) => {
+    const used = item.quantity?.unit === "percent" ? item.quantity.used : null;
+    const crossed = item.freshness !== "not_enforced" && used !== null && used >= threshold;
+    const blocking = item.freshness !== "not_enforced" && (item.freshness !== "fresh" || crossed);
+    return { meter_id: item.meter_id, window_minutes: item.window?.minutes ?? null, used_percent: used, crossed, blocking, freshness: item.freshness };
+  });
+}
+
+export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>()): string[] {
   const meters = new Map<string, Observation[]>();
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
@@ -92,7 +114,7 @@ export function formatMeters(observations: Observation[], policy: Awaited<Return
     const freshness = !enforced.length ? "not enforced" : enforced.some((item) => item.freshness === "fresh") ? "fresh" : enforced.some((item) => item.freshness === "failed") ? "failed" : "stale";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy);
-      return formatWindow(item, decision.state, decision.reason);
+      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)));
     }).join(" | ")}  (${freshness} ${age(ordered[0])})`;
   });
 }
@@ -116,15 +138,23 @@ async function history(argv: string[]): Promise<number> {
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
   const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
+  if (request !== undefined) { printEvents(unwrapRpc(request) as TallyEvent[]); return 0; }
   directReadNotice();
   const store = await TallyStore.open();
   try {
     const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
     store.audit("cli", "events", null, "ok");
-    console.log(JSON.stringify(items));
+    printEvents(items);
     return 0;
   } finally { store.close(); }
+}
+
+function printEvents(items: TallyEvent[]): void {
+  for (const item of items) {
+    const subject = item.meter_id ?? item.principal_id ?? "-";
+    const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}` : item.kind;
+    console.log(`${subject}  ${event} (${item.origin}, ${Math.round(item.confidence * 100)}%)`);
+  }
 }
 
 async function can(argv: string[]): Promise<number> {
@@ -168,6 +198,7 @@ async function observe(argv: string[]): Promise<number> {
   const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
   let observations: Observation[];
   let failures: string[];
+  let resetSeen = new Map<string, string>();
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
     observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
@@ -179,15 +210,31 @@ async function observe(argv: string[]): Promise<number> {
     try {
       store.insertAll(polled.observations);
       observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      resetSeen = store.resetSeenFor(observations);
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
+  if (!direct) {
+    const resetEvents = unwrapRpc(await requestDaemon("reset_seen", { windows: observations.map((item) => ({ meter_id: item.meter_id, minutes: item.window?.minutes, resets_at: item.resets_at })) })) as Record<string, string>;
+    resetSeen = new Map(Object.entries(resetEvents));
+  }
   if (direct) directReadNotice();
   const policy = await readPolicy();
-  if (argv.includes("--json")) console.log(JSON.stringify(observations));
-  else { for (const line of formatMeters(observations, policy)) console.log(line); for (const failure of failures) console.log(failure); }
-  if (threshold !== undefined && observations.some((item) => item.freshness !== "not_enforced" && (item.freshness !== "fresh" || Boolean(item.quantity && item.quantity.used >= threshold)))) return 2;
+  const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
+  if (argv.includes("--json")) console.log(JSON.stringify(thresholdRows === undefined ? observations : { observations, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }));
+  else { for (const line of formatMeters(observations, policy, resetSeen)) console.log(line); for (const failure of failures) console.log(failure); }
+  if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
+}
+
+async function responseShape(argv: string[]): Promise<number> {
+  if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: tally --principal <id> --shape");
+  const account = (await readAccounts()).find((item) => item.name === argv[1]);
+  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  const responses = account.vendor === "codex" ? await codexResponseShape(account) : account.vendor === "claude" ? { usage: await claudeResponseShape(account) } : undefined;
+  if (!responses) throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  console.log(JSON.stringify({ principal_id: account.name, vendor: account.vendor, responses }));
+  return 0;
 }
 
 function unwrapRpc(value: unknown): unknown {
@@ -242,6 +289,7 @@ async function main(argv: string[]): Promise<number> {
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
+  if (argv.includes("--shape")) return responseShape(argv);
   return observe(argv);
 }
 

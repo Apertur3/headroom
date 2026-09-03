@@ -1,0 +1,15 @@
+{
+  "plan_type": "redacted",
+  "rate_limit": {
+    "primary": {
+      "used_percent": 42,
+      "window_minutes": 300,
+      "resets_at": 1788802800
+    },
+    "secondary": {
+      "used_percent": 23,
+      "window_minutes": 10080,
+      "resets_at": 1789407600
+    }
+  }
+}
