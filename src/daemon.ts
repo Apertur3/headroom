@@ -4,17 +4,17 @@ import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
 import { pollAccounts, type PollResult } from "./collector.js";
-import { tallyHome } from "./paths.js";
-import { canRoute } from "./policy.js";
+import { headroomHome } from "./paths.js";
+import { canRouteWithLeases } from "./policy.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation } from "./types.js";
-import { safeTallyDirectory, TallyStore } from "./store.js";
+import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 
 type Json = Record<string, unknown>;
 export type Poller = (principal?: string) => Promise<PollResult>;
 
-export function socketPath(home = tallyHome(), platform = process.platform, username = userInfo().username): string {
-  return platform === "win32" ? `\\\\.\\pipe\\keeptally-${username}` : join(home, "tally.sock");
+export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
+  return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : join(home, "headroom.sock");
 }
 
 function rpcResult(id: unknown, result: unknown): Json { return { jsonrpc: "2.0", id: id ?? null, result }; }
@@ -28,7 +28,7 @@ function callerFrom(params: Json): string {
   return `pid:${pid};process:${processName}`;
 }
 
-export class TallyDaemon {
+export class HeadroomDaemon {
   private server: Server | undefined;
   private readonly inFlight = new Map<string, Promise<PollResult>>();
   private readonly lastPoll = new Map<string, number>();
@@ -39,11 +39,11 @@ export class TallyDaemon {
   private schedulingStarted = false;
   private stopping = false;
 
-  private constructor(private readonly store: TallyStore, private readonly path: string, private readonly poller: Poller) {}
+  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller) {}
 
-  static async create(options: { home?: string; path?: string; poller?: Poller } = {}): Promise<TallyDaemon> {
-    const home = await safeTallyDirectory(options.home);
-    return new TallyDaemon(await TallyStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts);
+  static async create(options: { home?: string; path?: string; poller?: Poller } = {}): Promise<HeadroomDaemon> {
+    const home = await safeHeadroomDirectory(options.home);
+    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts);
   }
 
   async start(): Promise<void> {
@@ -67,21 +67,20 @@ export class TallyDaemon {
 
   private async prepareSocket(): Promise<void> {
     if (process.platform === "win32") {
-      // Windows named pipes receive the process token's default DACL. Node's
-      // net API does not expose a security descriptor to tighten it further.
+      // Node creates the pipe with the current process token's current-user DACL.
       const daemon = await daemonRequest(this.path, "health");
-      if (daemon.status === "available") throw new Error("Tally daemon is already running");
-      if (daemon.status === "unresponsive") throw new Error("Tally daemon pipe is present but health did not respond within 2s");
+      if (daemon.status === "available") throw new Error("Headroom daemon is already running");
+      if (daemon.status === "unresponsive") throw new Error("Headroom daemon pipe is present but health did not respond within 2s");
       return;
     }
     try {
       const stat = await lstat(this.path);
-      if (stat.isSymbolicLink() || !stat.isSocket()) throw new Error("Refusing unsafe tally socket");
-      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing tally socket owned by another user");
-      if ((stat.mode & 0o077) !== 0) throw new Error("Refusing tally socket with group or world permissions");
+      if (stat.isSymbolicLink() || !stat.isSocket()) throw new Error("Refusing unsafe headroom socket");
+      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing headroom socket owned by another user");
+      if ((stat.mode & 0o077) !== 0) throw new Error("Refusing headroom socket with group or world permissions");
       const daemon = await daemonRequest(this.path, "health");
-      if (daemon.status === "available") throw new Error("Tally daemon is already running");
-      if (daemon.status === "unresponsive") throw new Error("Tally daemon socket is present but health did not respond within 2s");
+      if (daemon.status === "available") throw new Error("Headroom daemon is already running");
+      if (daemon.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
       await unlink(this.path); // a safe, inaccessible stale socket only
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -133,9 +132,21 @@ export class TallyDaemon {
           const policy = await readPolicy();
           const localMeters = (await this.currentAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
-          result = canRoute(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true);
+          result = canRouteWithLeases(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), typeof params.owner === "string" ? params.owner : undefined);
           break;
         }
+        case "lease_start": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const meter = typeof params.meter_id === "string" ? params.meter_id : "";
+          const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
+          const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
+          result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null); break;
+        }
+        case "lease_end": {
+          if (typeof params.id !== "string") return rpcError(request.id, -32602, "lease id is required");
+          result = this.store.endLease(params.id, typeof params.owner === "string" ? params.owner : undefined, params.force === true); break;
+        }
+        case "leases": result = this.store.leases(); break;
         case "refresh": {
           const principal = typeof params.principal === "string" ? params.principal : undefined;
           result = await this.poll(principal, true); break;
@@ -182,6 +193,7 @@ export class TallyDaemon {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
+      this.store.leases();
       const protectedFailure = result.failures.some((failure) => /\b(401|403|429)\b/.test(failure));
       if (protectedFailure) {
         const previous = this.backoff.get(key)?.failures ?? 0;
@@ -266,7 +278,7 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
     const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
-    socket.once("connect", () => socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, _caller: { pid: process.pid, process: process.argv[1] ?? "tally" } } })}\n`));
+    socket.once("connect", () => socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`));
     socket.on("data", (part: string) => { buffer += part; const newline = buffer.indexOf("\n"); if (newline >= 0) { try { const reply = JSON.parse(buffer.slice(0, newline)) as Json; done(reply.error ? reply : reply.result); } catch { done(undefined); } } });
     socket.once("error", () => done(undefined)); socket.once("timeout", () => done(undefined));
   });

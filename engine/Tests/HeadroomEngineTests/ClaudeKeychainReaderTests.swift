@@ -1,6 +1,6 @@
 import XCTest
 import CodexBarCore
-@testable import tally_engine
+@testable import headroom_engine
 
 final class ClaudeKeychainReaderTests: XCTestCase {
     func testCanaryCredentialIsNeverIncludedInFailureOutput() throws {
@@ -9,7 +9,7 @@ final class ClaudeKeychainReaderTests: XCTestCase {
         let credentials = try ClaudeKeychainReader.parse(Data(secret.utf8))
         XCTAssertEqual(credentials.accessToken, canary)
 
-        let output = try String(data: JSONEncoder().encode(TallyEngine.failed(
+        let output = try String(data: JSONEncoder().encode(HeadroomEngine.failed(
             principal: Principal(id: "claude-main", vendor: "claude", location: "/tmp/.claude"),
             meters: ["all"], error: EngineError.claudeUsageUnavailable)), encoding: .utf8)!
         XCTAssertFalse(output.contains(canary))
@@ -42,8 +42,8 @@ final class ClaudeKeychainReaderTests: XCTestCase {
         XCTAssertNil(snapshot.routines?.percent)
         XCTAssertFalse(snapshot.routines?.isEnforced ?? true)
         let principal = Principal(id: "claude-main", vendor: "claude", location: "/tmp/.claude")
-        let observations = TallyEngine.claudeWindows(principal, meter: "fable", windows: [snapshot.fable])
-            + TallyEngine.claudeWindows(principal, meter: "routines", windows: [snapshot.routines])
+        let observations = HeadroomEngine.claudeWindows(principal, meter: "fable", windows: [snapshot.fable])
+            + HeadroomEngine.claudeWindows(principal, meter: "routines", windows: [snapshot.routines])
         XCTAssertTrue(observations.contains { $0.meter_id == "claude-main:fable" && $0.freshness == "fresh" })
         XCTAssertTrue(observations.contains { $0.meter_id == "claude-main:routines" && $0.freshness == "not_enforced" })
     }
@@ -54,7 +54,7 @@ final class ClaudeKeychainReaderTests: XCTestCase {
         """
         let snapshot = try ClaudeOAuthUsageReader.parse(Data(response.utf8))
         let principal = Principal(id: "claude-main", vendor: "claude", location: "/tmp/.claude")
-        let observations = TallyEngine.claudeScopedWindows(principal, meter: "fable", window: snapshot.fable)
+        let observations = HeadroomEngine.claudeScopedWindows(principal, meter: "fable", window: snapshot.fable)
         XCTAssertEqual(observations.count, 1)
         XCTAssertEqual(observations.first?.meter_id, "claude-main:fable")
         XCTAssertEqual(observations.first?.freshness, "not_enforced")
@@ -75,7 +75,7 @@ final class AntigravityReadinessTests: XCTestCase {
         let fetchCount = await sequence.fetchCount()
         XCTAssertEqual(fetchCount, 2)
         XCTAssertTrue(AntigravitySnapshotWaiter.isReady(fetched.usage))
-        let observations = TallyEngine.antigravityWindows(
+        let observations = HeadroomEngine.antigravityWindows(
             Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"),
             usage: fetched.usage)
         XCTAssertEqual(observations.filter { $0.window?.minutes == 10_080 && $0.freshness == "fresh" }.count, 2)
@@ -94,7 +94,7 @@ final class AntigravityReadinessTests: XCTestCase {
         let fetchCount = await sequence.fetchCount()
         XCTAssertEqual(fetchCount, 2)
         XCTAssertFalse(AntigravitySnapshotWaiter.isReady(fetched.usage))
-        let observations = TallyEngine.antigravityWindows(
+        let observations = HeadroomEngine.antigravityWindows(
             Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"),
             usage: fetched.usage)
         let failedWeekly = observations.filter { $0.window?.minutes == 10_080 && $0.freshness == "failed" }
@@ -103,7 +103,7 @@ final class AntigravityReadinessTests: XCTestCase {
     }
 
     func testShapeListsOnlyAntigravityWindowDescriptors() {
-        let shape = TallyEngine.antigravityShape(completeUsage())
+        let shape = HeadroomEngine.antigravityShape(completeUsage())
         XCTAssertEqual(shape[0], "$: object")
         XCTAssertTrue(shape.contains { $0.contains("title=Gemini weekly") && $0.contains("id=antigravity-quota-summary-gemini-weekly") && $0.contains("minutes=10080") && $0.contains("resets_at=present") })
         XCTAssertFalse(shape.joined(separator: " ").contains("usedPercent"))

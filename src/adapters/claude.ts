@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
-import { lstat, readFile } from "node:fs/promises";
+import { access, lstat, readFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { redact } from "../security.js";
+import { allowedOutbound, redact } from "../security.js";
 import { credentialPath } from "../paths.js";
+import { headroomHome } from "../paths.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -43,10 +45,23 @@ async function readCredentialFile(path: string): Promise<string> {
 }
 
 async function keychainPayload(service: string): Promise<string> {
+  const helper = await keychainHelper();
   try {
-    const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-a", userInfo().username, "-s", service, "-w"], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true });
+    if (!helper) {
+      process.stderr.write("warning: headroom-keychain is unavailable; falling back to security with weaker Keychain protection\n");
+      const { stdout } = await execFileAsync("/usr/bin/security", ["find-generic-password", "-a", userInfo().username, "-s", service, "-w"], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true });
+      return stdout;
+    }
+    const { stdout } = await execFileAsync(helper, [service], { timeout: TIMEOUT_MS, maxBuffer: 1024 * 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
     return stdout;
   } catch { throw new Error("no credentials in Keychain"); }
+}
+
+async function keychainHelper(): Promise<string | undefined> {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const candidates = [join(headroomHome(), "engine", "native", "headroom-keychain"), join(root, "engine", ".build", "release", "headroom-keychain")];
+  for (const candidate of candidates) try { await access(candidate); return candidate; } catch { /* next candidate */ }
+  return undefined;
 }
 
 interface Credential { token: string; expired: boolean; }
@@ -140,7 +155,7 @@ export async function claudeResponseShape(account: ProviderAccount, dependencies
   try { credential = parseClaudeCredential(payload, now); }
   catch { throw new Error(`credentials invalid; ${claudeCommand(account)}`); }
   if (credential.expired) throw new Error(`token expired; ${claudeCommand(account)}`);
-  const response = await (dependencies.fetch ?? fetch)(new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+  const response = await (dependencies.fetch ?? fetch)(new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
   if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
   return shape(await response.json());
 }
@@ -157,7 +172,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     credentialLoaded = true;
     const credential = parseClaudeCredential(payload, now);
     if (credential.expired) return failed(account, `token expired; ${claudeCommand(account)}`, timestamp);
-    const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const request = new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
     const response = await (dependencies.fetch ?? fetch)(request);
     if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
     return observationsFromClaudeUsage(await response.json(), account, now);

@@ -7,14 +7,15 @@ import { nativeEnginePath } from "./engine/native/run.js";
 import { claudeResponseShape } from "./adapters/claude.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
-import { daemonRequest, socketPath, TallyDaemon } from "./daemon.js";
+import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { canRoute, paceDecision, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, paceDecision, type CanDecision } from "./policy.js";
 import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { migrateLegacyHome } from "./paths.js";
 import { safeError } from "./security.js";
 import { installService, uninstallService } from "./service.js";
-import { TallyStore } from "./store.js";
-import { isLocalAccount, type Observation, type PaceState, type TallyEvent } from "./types.js";
+import { HeadroomStore } from "./store.js";
+import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent } from "./types.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -70,7 +71,7 @@ function formatLocal(observation: Observation): string {
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
-  if (request.status === "unresponsive") throw new Error("Tally daemon socket is present but health did not respond within 2s");
+  if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
 }
 
@@ -104,7 +105,7 @@ export function thresholdReport(observations: Observation[], threshold: number):
   });
 }
 
-export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>()): string[] {
+export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>(), leases = new Map<string, Lease[]>()): string[] {
   const meters = new Map<string, Observation[]>();
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
@@ -112,21 +113,23 @@ export function formatMeters(observations: Observation[], policy: Awaited<Return
     if (ordered.length === 1 && ordered[0].window?.kind === "state") return formatLocal(ordered[0]);
     const enforced = ordered.filter((item) => item.freshness !== "not_enforced");
     const freshness = !enforced.length ? "not enforced" : enforced.some((item) => item.freshness === "fresh") ? "fresh" : enforced.some((item) => item.freshness === "failed") ? "failed" : "stale";
+    const active = leases.get(meter) ?? [];
+    const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy);
       return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)));
-    }).join(" | ")}  (${freshness} ${age(ordered[0])})`;
+    }).join(" | ")}  (${freshness} ${age(ordered[0])})${leaseLabel}`;
   });
 }
 
 async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
-  if (!meter) throw new Error("Usage: tally history <meter> [--since 24h]");
+  if (!meter) throw new Error("Usage: headroom history <meter> [--since 24h]");
   const at = argv.indexOf("--since");
   const request = await requestDaemon("history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
   if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
   directReadNotice();
-  const store = await TallyStore.open();
+  const store = await HeadroomStore.open();
   try {
     const items = store.history(meter, since(at >= 0 ? argv[at + 1] : undefined));
     store.audit("cli", "history", meter, "ok");
@@ -138,9 +141,9 @@ async function history(argv: string[]): Promise<number> {
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
   const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { printEvents(unwrapRpc(request) as TallyEvent[]); return 0; }
+  if (request !== undefined) { printEvents(unwrapRpc(request) as HeadroomEvent[]); return 0; }
   directReadNotice();
-  const store = await TallyStore.open();
+  const store = await HeadroomStore.open();
   try {
     const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
     store.audit("cli", "events", null, "ok");
@@ -149,7 +152,7 @@ async function events(argv: string[]): Promise<number> {
   } finally { store.close(); }
 }
 
-function printEvents(items: TallyEvent[]): void {
+function printEvents(items: HeadroomEvent[]): void {
   for (const item of items) {
     const subject = item.meter_id ?? item.principal_id ?? "-";
     const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}` : item.kind;
@@ -159,18 +162,21 @@ function printEvents(items: TallyEvent[]): void {
 
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
-  if (!action) throw new Error("Usage: tally can <action-class> [--allow-unknown] [--json]");
+  if (!action) throw new Error("Usage: headroom can <action-class> [--owner <name>] [--allow-unknown] [--json]");
+  const ownerAt = argv.indexOf("--owner");
+  const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
+  if (ownerAt >= 0 && !owner) throw new Error("--owner requires a name");
   const routing = await readRouting();
   const meters = routing.consumes[action];
   if (!meters) throw new Error(`Unknown action class: ${action}`);
-  const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown") });
+  const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
   if (request !== undefined) {
     const decision = unwrapRpc(request) as CanDecision;
     printCan(decision, argv.includes("--json"));
     return decision.allowed ? 0 : 2;
   }
   directReadNotice();
-  const [policy, store] = await Promise.all([readPolicy(), TallyStore.open()]);
+  const [policy, store] = await Promise.all([readPolicy(), HeadroomStore.open()]);
   try {
     const localAccounts = (await readAccounts()).filter(isLocalAccount);
     // With no daemon, `can` is also a direct read: refresh local state rather
@@ -179,16 +185,53 @@ async function can(argv: string[]): Promise<number> {
     const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
     const allMeters = [...new Set([...meters, ...localMeters])];
     const latest = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
-    const decision = canRoute(meters, localMeters, latest, routing.local_preference, policy, argv.includes("--allow-unknown"));
+    const decision = canRouteWithLeases(meters, localMeters, latest, routing.local_preference, policy, argv.includes("--allow-unknown"), store.leases(undefined, true), owner);
     store.audit("cli", "can", action, decision.allowed ? "yes" : "no");
     printCan(decision, argv.includes("--json"));
     return decision.allowed ? 0 : 2;
   } finally { store.close(); }
 }
 
+function ttl(value: string | undefined): number {
+  const match = /^(\d+)(m|h|d)$/.exec(value ?? "30m");
+  if (!match) throw new Error("--ttl must be like 30m, 2h, or 1d");
+  return Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "h" ? 3_600_000 : 86_400_000);
+}
+
+function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
+
+function printLeases(items: Lease[]): void {
+  for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
+}
+
+async function lease(argv: string[]): Promise<number> {
+  if (argv[0] === "start") {
+    const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note");
+    if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...]");
+    const expected = expect === undefined ? null : Number(expect);
+    if (expected !== null && (!Number.isFinite(expected) || expected < 0 || expected > 100)) throw new Error("--expect must be 0 through 100");
+    const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null };
+    const request = await requestDaemon("lease_start", params);
+    if (request !== undefined) { console.log((unwrapRpc(request) as Lease).id); return 0; }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const created = store.startLease(params.owner, params.meter_id, params.expected_percent, params.ttl_ms, params.note); store.audit("cli", "lease_start", meter, "ok"); console.log(created.id); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "end") {
+    const id = argv[1]; const owner = option(argv, "--owner"); if (!id) throw new Error("Usage: headroom lease end <id> [--owner <name>] [--force]");
+    const params = { id, owner, force: argv.includes("--force") }; const request = await requestDaemon("lease_end", params);
+    if (request !== undefined) { console.log((unwrapRpc(request) as Lease).id); return 0; }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const ended = store.endLease(id, owner, params.force); store.audit("cli", "lease_end", ended.meter_id, "ok"); console.log(ended.id); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "list") {
+    const request = await requestDaemon("leases");
+    if (request !== undefined) { printLeases(unwrapRpc(request) as Lease[]); return 0; }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); printLeases(items); return 0; } finally { store.close(); }
+  }
+  throw new Error("Usage: headroom lease <start|end|list>");
+}
+
 async function observe(argv: string[]): Promise<number> {
   const allowed = new Set(["--json", "--threshold", "--principal"]);
-  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: tally [--json] [--principal X] [--threshold N]"); if (argv[index] !== "--json") index += 1; }
+  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: headroom [--json] [--principal X] [--threshold N]"); if (argv[index] !== "--json") index += 1; }
   const thresholdIndex = argv.indexOf("--threshold");
   const threshold = thresholdIndex >= 0 ? Number(argv[thresholdIndex + 1]) : undefined;
   if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 100)) throw new Error("--threshold must be 0 through 100");
@@ -199,18 +242,22 @@ async function observe(argv: string[]): Promise<number> {
   let observations: Observation[];
   let failures: string[];
   let resetSeen = new Map<string, string>();
+  let leases: Lease[] = [];
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
     observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
     failures = [];
+    const leaseRequest = await requestDaemon("leases");
+    leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];
   } else {
     const polled = await pollAccounts(principal);
     failures = polled.failures;
-    const store = await TallyStore.open();
+    const store = await HeadroomStore.open();
     try {
       store.insertAll(polled.observations);
       observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       resetSeen = store.resetSeenFor(observations);
+      leases = store.leases(undefined, true);
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
@@ -221,14 +268,15 @@ async function observe(argv: string[]): Promise<number> {
   if (direct) directReadNotice();
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
-  if (argv.includes("--json")) console.log(JSON.stringify(thresholdRows === undefined ? observations : { observations, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }));
-  else { for (const line of formatMeters(observations, policy, resetSeen)) console.log(line); for (const failure of failures) console.log(failure); }
+  const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
+  if (argv.includes("--json")) console.log(JSON.stringify(thresholdRows === undefined ? { observations, leases } : { observations, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }));
+  else { for (const line of formatMeters(observations, policy, resetSeen, leaseMap)) console.log(line); for (const failure of failures) console.log(failure); }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
 
 async function responseShape(argv: string[]): Promise<number> {
-  if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: tally --principal <id> --shape");
+  if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
   if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
   const responses = account.vendor === "codex" ? await codexResponseShape(account) : account.vendor === "claude" ? { usage: await claudeResponseShape(account) } : undefined;
@@ -254,9 +302,9 @@ function printCan(decision: CanDecision, asJson: boolean): void {
 function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }
 
 async function daemon(): Promise<number> {
-  const instance = await TallyDaemon.create();
+  const instance = await HeadroomDaemon.create();
   await instance.start();
-  console.log(`tally daemon listening on ${socketPath()}`);
+  console.log(`headroom daemon listening on ${socketPath()}`);
   await new Promise<void>((resolve) => {
     const stop = () => { void instance.stop().finally(resolve); };
     process.once("SIGINT", stop); process.once("SIGTERM", stop);
@@ -265,6 +313,7 @@ async function daemon(): Promise<number> {
 }
 
 async function main(argv: string[]): Promise<number> {
+  if (await migrateLegacyHome()) console.log(["Moved ~/.", "ta", "lly", " to ~/.headroom."].join(""));
   if (argv[0] === "engine" && argv[1] === "install") {
     const native = await installNativeEngine();
     if (native.installed) { console.log(`native engine ${native.tag} installed at ${native.path} (sha256 ${native.sha256})`); return 0; }
@@ -272,27 +321,28 @@ async function main(argv: string[]): Promise<number> {
     const result = await installEngine();
     console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256}${result.firstPin ? "; first pin recorded" : ""})`); return 0;
   }
-  if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.tally/engine/native/tally-engine (or engine/.build/release/tally-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
+  if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
   if (argv[0] === "daemon") return daemon();
   if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }
   if (argv[0] === "install-service") {
-    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: tally install-service [--dry-run]");
+    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom install-service [--dry-run]");
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`); return 0;
   }
   if (argv[0] === "uninstall-service") {
-    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: tally uninstall-service [--dry-run]");
+    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom uninstall-service [--dry-run]");
     const result = await uninstallService(process.platform, undefined, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would remove" : "removed"} ${result.path}\nTo unload it: ${result.command}`); return 0;
   }
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
+  if (argv[0] === "lease") return lease(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
   if (argv.includes("--shape")) return responseShape(argv);
   return observe(argv);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`tally error: ${safeError(error)}`); process.exitCode = 1; });
+  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1; });
 }

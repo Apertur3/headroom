@@ -8,16 +8,21 @@ let codexBar: Package.Dependency = .package(
     path: "/private/tmp/claude-501/-Users-you/32cd283c-3538-4728-bb8e-5a7047cc2490/scratchpad/codexbar")
 
 let package = Package(
-    name: "TallyEngine",
+    name: "HeadroomEngine",
     platforms: [.macOS(.v14)],
     dependencies: [codexBar],
     targets: [
         .executableTarget(
-            name: "tally-engine",
+            name: "headroom-engine",
             dependencies: [.product(name: "CodexBarCore", package: "codexbar")],
-            path: "Sources/TallyEngine"),
+            path: "Sources/HeadroomEngine",
+            linkerSettings: [.linkedFramework("Security")]),
+        .executableTarget(
+            name: "headroom-keychain",
+            path: "Sources/HeadroomKeychain",
+            linkerSettings: [.linkedFramework("Security")]),
         .testTarget(
-            name: "TallyEngineTests",
-            dependencies: ["tally-engine"],
-            path: "Tests/TallyEngineTests")
+            name: "HeadroomEngineTests",
+            dependencies: ["headroom-engine"],
+            path: "Tests/HeadroomEngineTests")
     ])

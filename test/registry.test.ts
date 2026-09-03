@@ -8,7 +8,7 @@ describe("account discovery", () => {
   let root = "";
   afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
   it("finds Codex and Claude homes for the native engine", async () => {
-    root = await mkdtemp(join(tmpdir(), "tally-registry-"));
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-"));
     await Promise.all([mkdir(join(root, ".codex")), mkdir(join(root, ".codex-work")), mkdir(join(root, ".claude"))]);
     const accounts = await discoverAccounts(root, { PATH: "" });
     expect(accounts).toEqual(expect.arrayContaining([
@@ -19,7 +19,7 @@ describe("account discovery", () => {
   });
 
   it("discovers Antigravity from its Gemini installation and renders local rows", async () => {
-    root = await mkdtemp(join(tmpdir(), "tally-registry-"));
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-"));
     await mkdir(join(root, ".gemini"));
     await mkdir(join(root, ".gemini", "antigravity-cli"));
     const accounts = await discoverAccounts(root, { PATH: "" });

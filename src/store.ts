@@ -1,8 +1,9 @@
 import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
-import { tallyHome } from "./paths.js";
-import type { EventKind, Observation, StoredObservation, TallyEvent } from "./types.js";
+import { headroomHome, migrateLegacyHome } from "./paths.js";
+import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
 
 interface Database {
@@ -20,27 +21,28 @@ type Row = Record<string, unknown>;
 function number(value: unknown): number | null { return typeof value === "number" ? value : value === null ? null : Number(value); }
 function string(value: unknown): string | null { return typeof value === "string" ? value : null; }
 
-export async function safeTallyDirectory(home = tallyHome()): Promise<string> {
+export async function safeHeadroomDirectory(home = headroomHome()): Promise<string> {
+  if (home === headroomHome()) await migrateLegacyHome();
   const requested = resolve(home);
   await mkdir(requested, { recursive: true, mode: 0o700 });
   const stat = await lstat(requested);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing unsafe ~/.tally directory");
-  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing ~/.tally owned by another user");
-  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.tally with group or world permissions");
-  // lstat above proves the Tally-owned leaf is not a link. realpath still
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing unsafe ~/.headroom directory");
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing ~/.headroom owned by another user");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.headroom with group or world permissions");
+  // lstat above proves the Headroom-owned leaf is not a link. realpath still
   // canonicalizes system aliases such as /var → /private/var on macOS.
   return realpath(requested);
 }
 
 async function safeDatabasePath(home?: string): Promise<string> {
-  const directory = await safeTallyDirectory(home);
-  const path = join(directory, "tally.db");
+  const directory = await safeHeadroomDirectory(home);
+  const path = join(directory, "headroom.db");
   for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
     try {
       const stat = await lstat(candidate);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Refusing unsafe Tally database file");
-      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing Tally database owned by another user");
-      if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing Tally database with group or world permissions");
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Refusing unsafe Headroom database file");
+      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing Headroom database owned by another user");
+      if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing Headroom database with group or world permissions");
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -63,14 +65,18 @@ function observationFromRow(row: Row): StoredObservation {
   };
 }
 
-function eventFromRow(row: Row): TallyEvent {
-  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as TallyEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason) };
+function eventFromRow(row: Row): HeadroomEvent {
+  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason) };
 }
 
-export class TallyStore {
+function leaseFromRow(row: Row): Lease {
+  return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+}
+
+export class HeadroomStore {
   private constructor(private readonly db: Database) {}
 
-  static async open(home?: string): Promise<TallyStore> {
+  static async open(home?: string): Promise<HeadroomStore> {
     const path = await safeDatabasePath(home);
     // DatabaseSync creates a missing file with the process umask. Pre-create it
     // with an explicit mode so concurrent direct readers cannot observe a 0644
@@ -78,7 +84,7 @@ export class TallyStore {
     const descriptor = await open(path, "a", 0o600);
     await descriptor.close();
     const db = new DatabaseSync(path);
-    const store = new TallyStore(db);
+    const store = new HeadroomStore(db);
     // Direct CLI reads may briefly overlap the daemon. WAL permits readers with
     // its writer; the busy timeout turns a short writer handoff into a wait,
     // rather than an immediate "database is locked" failure.
@@ -111,6 +117,17 @@ export class TallyStore {
         id INTEGER PRIMARY KEY, caller TEXT NOT NULL, action TEXT NOT NULL, meter_or_principal TEXT,
         outcome TEXT NOT NULL, at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS leases (
+        id TEXT PRIMARY KEY, owner TEXT NOT NULL, meter_id TEXT NOT NULL,
+        expected_percent REAL, note TEXT, started_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+        ended_at TEXT, ended_reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS leases_active_meter ON leases(meter_id, ended_at, expires_at);
+      CREATE TABLE IF NOT EXISTS lease_spend (
+        id INTEGER PRIMARY KEY, lease_id TEXT NOT NULL, meter_id TEXT NOT NULL,
+        observation_id INTEGER NOT NULL, amount_percent REAL NOT NULL, estimated INTEGER NOT NULL, at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS lease_spend_lease ON lease_spend(lease_id);
     `);
     // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
     // NOT EXISTS, so retain a narrow compatibility migration.
@@ -129,6 +146,7 @@ export class TallyStore {
     const stored: StoredObservation = { ...observation, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.addSourceFailedEvent([stored.id], stored);
+    if (previous) this.attributeLeaseSpend(previous, stored);
     return stored;
   }
 
@@ -141,7 +159,7 @@ export class TallyStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  private addEvent(kind: EventKind, origin: TallyEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null): void {
+  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null): void {
     const created = current.fetched_at;
     const id = `${kind}:${current.id}`;
     this.db.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
@@ -162,10 +180,11 @@ export class TallyStore {
     if (previous.freshness !== "failed" && current.freshness === "failed") this.addSourceFailedEvent(evidence, current);
     const oldUsed = previous.quantity?.used;
     const newUsed = current.quantity?.used;
-    const resetAdvanced = Boolean(previous.resets_at && current.resets_at && new Date(current.resets_at).getTime() > new Date(previous.resets_at).getTime());
+    const bothFresh = previous.freshness === "fresh" && current.freshness === "fresh";
+    const resetAdvanced = bothFresh && Boolean(previous.resets_at && current.resets_at && new Date(current.resets_at).getTime() > new Date(previous.resets_at).getTime());
     const beforeOldReset = previous.resets_at ? new Date(current.fetched_at).getTime() < new Date(previous.resets_at).getTime() : true;
     const dropped = oldUsed !== undefined && newUsed !== undefined && oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5) && beforeOldReset;
-    if (resetAdvanced || dropped) this.addEvent("reset_seen", "inferred", previous.freshness === "stale" ? 0.3 : resetAdvanced ? 0.9 : 0.5, evidence, current);
+    if (bothFresh && (resetAdvanced || dropped)) this.addEvent("reset_seen", "inferred", previous.freshness === "stale" ? 0.3 : resetAdvanced ? 0.9 : 0.5, evidence, current);
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
@@ -219,7 +238,64 @@ export class TallyStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  events(since: string): TallyEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+  events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+
+  private expireLeases(now = new Date()): void {
+    const at = now.toISOString();
+    const expired = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.ended_at IS NULL AND l.expires_at <= ? GROUP BY l.id").all(at).map(leaseFromRow);
+    for (const lease of expired) {
+      this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = 'expired' WHERE id = ? AND ended_at IS NULL").run(at, lease.id);
+      this.addLeaseEvent("lease_ended", { ...lease, ended_at: at, ended_reason: "expired" });
+    }
+  }
+
+  private addLeaseEvent(kind: Extract<EventKind, "lease_started" | "lease_ended">, lease: Lease): void {
+    const at = lease.ended_at ?? lease.started_at;
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${lease.id}:${at}`, kind, "vendor_reported", 1, "[]", at, null, lease.meter_id, null, lease.ended_reason ?? lease.note);
+  }
+
+  startLease(owner: string, meterId: string, expectedPercent: number | null, ttlMs: number, note: string | null, now = new Date()): Lease {
+    if (!owner.trim() || !meterId.trim()) throw new Error("owner and meter are required");
+    if (expectedPercent !== null && (!Number.isFinite(expectedPercent) || expectedPercent < 0 || expectedPercent > 100)) throw new Error("expected percent must be 0 through 100");
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error("ttl must be positive");
+    this.expireLeases(now);
+    const lease: Lease = { id: randomUUID(), owner: owner.trim(), meter_id: meterId.trim(), expected_percent: expectedPercent, note, started_at: now.toISOString(), expires_at: new Date(now.getTime() + ttlMs).toISOString(), ended_at: null, ended_reason: null, spent_percent: 0 };
+    this.db.prepare("INSERT INTO leases (id,owner,meter_id,expected_percent,note,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.started_at, lease.expires_at, null, null);
+    this.addLeaseEvent("lease_started", lease);
+    return lease;
+  }
+
+  endLease(id: string, owner?: string, force = false, now = new Date()): Lease {
+    this.expireLeases(now);
+    const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
+    if (!row) throw new Error("lease not found");
+    const lease = leaseFromRow(row);
+    if (lease.ended_at) return lease;
+    if (owner && owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
+    const ended = { ...lease, ended_at: now.toISOString(), ended_reason: "ended" };
+    this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ?").run(ended.ended_at, ended.ended_reason, id);
+    this.addLeaseEvent("lease_ended", ended);
+    return ended;
+  }
+
+  leases(meterId?: string, activeOnly = false, now = new Date()): Lease[] {
+    this.expireLeases(now);
+    const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL" : ""].filter(Boolean).join(" AND ");
+    return this.db.prepare(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...(meterId ? [meterId] : [])).map(leaseFromRow);
+  }
+
+  private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {
+    if (previous.freshness !== "fresh" || current.freshness !== "fresh" || previous.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
+    const delta = current.quantity.used - previous.quantity.used;
+    if (!Number.isFinite(delta) || delta <= 0) return;
+    const leases = this.leases(current.meter_id, true, new Date(current.fetched_at)).filter((lease) => lease.started_at <= current.fetched_at && lease.expires_at > previous.fetched_at);
+    if (!leases.length) return;
+    const weights = leases.map((lease) => lease.expected_percent ?? 1);
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    if (total <= 0) return;
+    for (let index = 0; index < leases.length; index += 1) this.db.prepare("INSERT INTO lease_spend (lease_id,meter_id,observation_id,amount_percent,estimated,at) VALUES (?,?,?,?,?,?)").run(leases[index].id, current.meter_id, current.id, delta * weights[index] / total, 1, current.fetched_at);
+  }
 
   /** Latest reset evidence for each current meter/window, limited to that window. */
   resetSeenFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {

@@ -55,7 +55,7 @@ struct ResponseShape: Codable {
 }
 
 @main
-struct TallyEngine {
+struct HeadroomEngine {
     static let engineVersion = "0.1.0"
     static let upstreamVersion = "v0.56.4"
 
@@ -68,7 +68,7 @@ struct TallyEngine {
               let principalFlag,
               principalFlag + 1 < arguments.count
         else {
-            FileHandle.standardError.write(Data("Usage: tally-engine observe --principals <path-to-json> [--shape]\n".utf8))
+            FileHandle.standardError.write(Data("Usage: headroom-engine observe --principals <path-to-json> [--shape]\n".utf8))
             exit(2)
         }
 
@@ -267,7 +267,7 @@ struct TallyEngine {
 
         // A partial status payload must not allow an old weekly observation to
         // masquerade as current. Emit the missing per-group weekly lane as a
-        // failed observation so Tally's fail-closed status becomes UNKNOWN.
+        // failed observation so Headroom's fail-closed status becomes UNKNOWN.
         let presentWeeklyMeters = Set(summaryWindows
             .filter { $0.window.windowMinutes == AntigravitySnapshotWaiter.weeklyMinutes && $0.usageKnown }
             .compactMap(AntigravitySnapshotWaiter.meter(for:)))

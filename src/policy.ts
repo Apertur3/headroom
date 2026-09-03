@@ -1,4 +1,4 @@
-import type { Observation, PaceState } from "./types.js";
+import type { Lease, Observation, PaceState } from "./types.js";
 
 export interface Policy {
   freeze_reserve_pct: number;
@@ -6,15 +6,17 @@ export interface Policy {
   staleness_minutes: number;
   poll_interval_minutes: number;
   principal_intervals: Record<string, number>;
+  proxy?: string;
 }
 
 export const defaultPolicy: Policy = { freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {} };
 
-/** Minimal TOML scalar reader for Tally's deliberately small policy surface. */
+/** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
 export function parsePolicy(text: string): Policy {
   const values: Record<string, number> = {};
   const principalIntervals: Record<string, number> = {};
   let principal: string | undefined;
+  let proxy: string | undefined;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
@@ -22,6 +24,8 @@ export function parsePolicy(text: string): Policy {
     if (/^\[.*\]$/.test(line)) { principal = undefined; continue; }
     const interval = /^interval_minutes\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (principal && interval) { principalIntervals[principal] = Number(interval[1]); continue; }
+    const proxyMatch = /^proxy\s*=\s*"([^"\\]+)"\s*$/.exec(line);
+    if (proxyMatch) { try { const url = new URL(proxyMatch[1]); if (!/^https?:$/.test(url.protocol)) throw new Error("invalid"); proxy = url.toString(); continue; } catch { throw new Error("Invalid Headroom proxy"); } }
     const match = /^(freeze_reserve_pct|pace_grace_fraction|staleness_minutes|poll_interval_minutes)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (match) values[match[1]] = Number(match[2]);
   }
@@ -29,8 +33,8 @@ export function parsePolicy(text: string): Policy {
   const grace = values.pace_grace_fraction ?? defaultPolicy.pace_grace_fraction;
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
-  if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Tally policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals };
+  if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, ...(proxy ? { proxy } : {}) };
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
@@ -135,4 +139,44 @@ export function canRoute(
   // local service never blocks a subscription that can still serve the action.
   const decision = local.allowed ? local : subscriptions;
   return { ...decision, local_preference: localPreference, local_meter_considered: true };
+}
+
+/** Reserve active capacity claimed by other callers before evaluating pace. */
+export function canRouteWithLeases(
+  subscriptionMeters: string[], localMeters: string[], observations: Map<string, Observation | Observation[] | undefined>,
+  localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, leases: Lease[], owner?: string, now = new Date(),
+): CanDecision {
+  const reserved = new Map<string, { percent: number; owners: string[]; originals: Map<number | null, number> }>();
+  for (const lease of leases) {
+    if (lease.owner === owner || lease.expected_percent === null || lease.expected_percent <= 0) continue;
+    const current = reserved.get(lease.meter_id) ?? { percent: 0, owners: [] as string[], originals: new Map<number | null, number>() };
+    current.percent += lease.expected_percent;
+    if (!current.owners.includes(lease.owner)) current.owners.push(lease.owner);
+    reserved.set(lease.meter_id, current);
+  }
+  const adjusted = new Map<string, Observation | Observation[] | undefined>();
+  for (const [meter, rows] of observations) {
+    const claim = reserved.get(meter);
+    const apply = (row: Observation): Observation => {
+      if (!claim || row.quantity?.unit !== "percent") return row;
+      claim.originals.set(row.window?.minutes ?? null, row.quantity.used);
+      const used = Math.min(100, row.quantity.used + claim.percent);
+      return { ...row, quantity: { ...row.quantity, used, remaining: Math.max(0, (row.quantity.limit ?? 100) - used) } };
+    };
+    adjusted.set(meter, Array.isArray(rows) ? rows.map(apply) : rows ? apply(rows) : rows);
+  }
+  const decision = canRoute(subscriptionMeters, localMeters, adjusted, localPreference, policy, allowUnknown, now);
+  const explain = (item: MeterPaceDecision): MeterPaceDecision => {
+    const claim = reserved.get(item.meter);
+    if (!claim) return item;
+    const adjustedRows = adjusted.get(item.meter);
+    const rows = adjustedRows === undefined ? [] : Array.isArray(adjustedRows) ? adjustedRows : [adjustedRows];
+    const deciding = rows.map((row) => ({ row, state: paceDecision(row, policy, now).state })).sort((a, b) => severity[b.state] - severity[a.state])[0];
+    const original = deciding && claim.originals.get(deciding.row.window?.minutes ?? null);
+    if (original === undefined || !deciding) return item;
+    return { ...item, reason: `${windowLabel(deciding.row)} ${Math.round(original)}% + ${Math.round(claim.percent)}% leased by ${claim.owners.join(", ")} → ${deciding.state}` };
+  };
+  const meters = decision.meters.map(explain);
+  const limiting = meters.find((item) => item.meter === decision.meter) ?? explain({ meter: decision.meter, state: decision.state, reason: decision.reason });
+  return { ...decision, ...limiting, meters };
 }
