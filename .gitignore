@@ -1,0 +1,40 @@
+# --- secrets (never commit; the hook also blocks writing them) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.claude/settings.local.json
+
+# --- gbrain per-worktree pin (machine-local) ---
+.gbrain-source
+
+# --- dependencies / build ---
+node_modules/
+dist/
+build/
+.next/
+out/
+target/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.build/
+DerivedData/
+Pods/
+
+# --- model weights / large artifacts (don't index or commit) ---
+pretrained_models/
+models/
+*.gguf
+*.safetensors
+*.bin
+*.onnx
+*.pt
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+*.swp
