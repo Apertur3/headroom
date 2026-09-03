@@ -1,5 +1,5 @@
 {
-  "name": "keeptally",
+  "name": "headroomd",
   "version": "0.1.0",
   "description": "Your agents know their budget: live quota, resets and pace states for every AI subscription and account, over CLI, daemon and MCP.",
   "keywords": [
@@ -14,13 +14,13 @@
     "agents",
     "cli"
   ],
-  "homepage": "https://github.com/Apertur3/keeptally#readme",
+  "homepage": "https://github.com/Apertur3/headroom#readme",
   "bugs": {
-    "url": "https://github.com/Apertur3/keeptally/issues"
+    "url": "https://github.com/Apertur3/headroom/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Apertur3/keeptally.git"
+    "url": "git+https://github.com/Apertur3/headroom.git"
   },
   "license": "MIT",
   "author": "the maintainer Hermans",
@@ -29,7 +29,7 @@
     "node": ">=20"
   },
   "bin": {
-    "tally": "dist/cli.js"
+    "headroom": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -43,7 +43,7 @@
     "prepack": "npm run build",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "engine:build": "swift build -c release --package-path engine"
+    "engine:build": "bash scripts/build-engine.sh"
   },
   "devDependencies": {
     "@types/node": "20.19.43",

@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { daemonRequest, rpc, TallyDaemon } from "../src/daemon.js";
+import { daemonRequest, rpc, HeadroomDaemon } from "../src/daemon.js";
 import { handleMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import type { Observation } from "../src/types.js";
@@ -21,8 +21,8 @@ function fixture(): Observation {
 
 describe("daemon JSON-RPC", () => {
   it("uses a healthy fake daemon after its bounded health probe", async function () {
-    const root = await mkdtemp(join(tmpdir(), "tally-client-")); temporary.push(root);
-    const path = join(root, "tally.sock");
+    const root = await mkdtemp(join(tmpdir(), "headroom-client-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
     const methods: string[] = [];
     const server = createServer((socket) => {
       socket.setEncoding("utf8");
@@ -45,10 +45,10 @@ describe("daemon JSON-RPC", () => {
   });
 
   it("starts on a private temp socket and coalesces concurrent status polls", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-daemon-")); temporary.push(root);
-    const path = join(root, "tally.sock");
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
     let polls = 0;
-    const daemon = await TallyDaemon.create({ home: root, path, poller: async () => { polls += 1; await new Promise((resolve) => setTimeout(resolve, 15)); return { observations: [fixture()], failures: [] }; } });
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; await new Promise((resolve) => setTimeout(resolve, 15)); return { observations: [fixture()], failures: [] }; } });
     try { await daemon.start(); }
     catch (error: unknown) {
       // The hosted sandbox forbids AF_UNIX listen(2); local/macOS CI runs the
@@ -68,7 +68,7 @@ describe("daemon JSON-RPC", () => {
 describe("MCP JSON-RPC", () => {
   it("handles initialize, tools/list, and a fixture-backed quota_status call", async () => {
     expect(await handleMcp('{"jsonrpc":"2.0","id":1,"method":"initialize"}')).toMatchObject({ result: { capabilities: { tools: {} } } });
-    expect(await handleMcp('{"jsonrpc":"2.0","id":2,"method":"tools/list"}')).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "quota_status" })]) } });
+    expect(await handleMcp('{"jsonrpc":"2.0","id":2,"method":"tools/list"}')).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "quota_status" }), expect.objectContaining({ name: "quota_lease_start" }), expect.objectContaining({ name: "quota_lease_end" }), expect.objectContaining({ name: "quota_leases" })]) } });
     const response = await handleMcp('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async (method) => {
       expect(method).toBe("status"); return [fixture()];
     });

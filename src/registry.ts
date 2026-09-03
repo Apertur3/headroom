@@ -2,9 +2,9 @@ import { constants, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
-import { expandHome, tallyHome, vendorHome } from "./paths.js";
+import { expandHome, headroomHome, vendorHome } from "./paths.js";
 
-export function accountsPath(): string { return join(tallyHome(), "accounts.toml"); }
+export function accountsPath(): string { return join(headroomHome(), "accounts.toml"); }
 
 function quoted(value: string): string { return JSON.stringify(value); }
 
@@ -49,7 +49,7 @@ export async function discoverAccounts(home = homedir(), environment = process.e
 }
 
 export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void> {
-  await fs.mkdir(tallyHome(), { recursive: true, mode: 0o700 });
+  await fs.mkdir(headroomHome(), { recursive: true, mode: 0o700 });
   await fs.writeFile(accountsPath(), accountsToml(accounts), { mode: 0o600 });
   await fs.chmod(accountsPath(), 0o600);
 }

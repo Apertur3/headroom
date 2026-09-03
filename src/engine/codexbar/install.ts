@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { tallyHome } from "../../paths.js";
+import { headroomHome } from "../../paths.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -67,7 +67,7 @@ async function writeEngineLock(lock: EngineLock, path = lockPath): Promise<void>
 
 async function releaseAssets(lock: EngineLock): Promise<GitHubAsset[]> {
   const response = await fetch(`https://api.github.com/repos/${lock.repository}/releases/tags/${lock.tag}`, {
-    headers: { Accept: "application/vnd.github+json", "User-Agent": "tallyq" },
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "headroomq" },
   });
   if (!response.ok) throw new Error(`GitHub release lookup failed: HTTP ${response.status}`);
   const release = await response.json() as GitHubRelease;
@@ -75,8 +75,8 @@ async function releaseAssets(lock: EngineLock): Promise<GitHubAsset[]> {
   return release.assets;
 }
 
-function installRoot(tag: string): string { return join(tallyHome(), "engine", tag); }
-function markerPath(tag: string): string { return join(installRoot(tag), ".tally-engine.json"); }
+function installRoot(tag: string): string { return join(headroomHome(), "engine", tag); }
+function markerPath(tag: string): string { return join(installRoot(tag), ".headroom-engine.json"); }
 
 export async function installEngine(): Promise<{ tag: string; path: string; sha256: string; firstPin: boolean }> {
   const lock = await readEngineLock();
@@ -89,7 +89,7 @@ export async function installEngine(): Promise<{ tag: string; path: string; sha2
   lock.releaseAssets = upstreamAssets.map((asset) => asset.name).sort();
   await writeEngineLock(lock);
 
-  const response = await fetch(upstream.browser_download_url, { headers: { "User-Agent": "tallyq" } });
+  const response = await fetch(upstream.browser_download_url, { headers: { "User-Agent": "headroomq" } });
   if (!response.ok) throw new Error(`Engine download failed: HTTP ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -118,7 +118,7 @@ export async function installEngine(): Promise<{ tag: string; path: string; sha2
     const binary = await findEngineBinary(staging);
     await fs.chmod(binary, 0o700);
     const binarySha256 = await sha256File(binary);
-    await fs.writeFile(join(staging, ".tally-engine.json"), JSON.stringify({ tag: lock.tag, asset: wanted, sha256, binarySha256 }), { mode: 0o600 });
+    await fs.writeFile(join(staging, ".headroom-engine.json"), JSON.stringify({ tag: lock.tag, asset: wanted, sha256, binarySha256 }), { mode: 0o600 });
     await fs.mkdir(dirname(root), { recursive: true, mode: 0o700 });
     await fs.rm(root, { recursive: true, force: true });
     await fs.rename(staging, root);
@@ -129,7 +129,7 @@ export async function installEngine(): Promise<{ tag: string; path: string; sha2
   return { tag: lock.tag, path: await verifiedEnginePath(), sha256, firstPin };
 }
 
-/** Install Tally's own Swift engine only after its release archive is explicitly
+/** Install Headroom's own Swift engine only after its release archive is explicitly
  * pinned. An `unpinned` placeholder is a build/release todo, never permission
  * to fetch arbitrary release bytes. */
 export async function installNativeEngine(): Promise<{ installed: true; tag: string; path: string; sha256: string } | { installed: false; hint: string }> {
@@ -138,12 +138,12 @@ export async function installNativeEngine(): Promise<{ installed: true; tag: str
   const asset = nativePlatformAssetName(lock);
   if (!asset.sha256 || asset.unpinned) return { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
   const url = asset.url ?? `https://github.com/${lock.native.repository}/releases/download/${lock.native.tag}/${asset.name}`;
-  const response = await fetch(url, { headers: { "User-Agent": "tallyq" } });
+  const response = await fetch(url, { headers: { "User-Agent": "headroomq" } });
   if (!response.ok) throw new Error(`Native engine download failed: HTTP ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   if (sha256 !== asset.sha256) throw new Error(`SHA-256 mismatch for ${asset.name}`);
-  const root = join(tallyHome(), "engine", "native");
+  const root = join(headroomHome(), "engine", "native");
   const staging = `${root}.staging-${process.pid}`;
   await fs.rm(staging, { recursive: true, force: true });
   await fs.mkdir(staging, { recursive: true, mode: 0o700 });
@@ -159,7 +159,7 @@ export async function installNativeEngine(): Promise<{ installed: true; tag: str
     const binary = join(staging, lock.native.binary);
     await fs.access(binary);
     await fs.chmod(binary, 0o700);
-    await fs.writeFile(join(staging, ".tally-native-engine.json"), JSON.stringify({ tag: lock.native.tag, asset: asset.name, sha256 }), { mode: 0o600 });
+    await fs.writeFile(join(staging, ".headroom-native-engine.json"), JSON.stringify({ tag: lock.native.tag, asset: asset.name, sha256 }), { mode: 0o600 });
     await fs.mkdir(dirname(root), { recursive: true, mode: 0o700 });
     await fs.rm(root, { recursive: true, force: true });
     await fs.rename(staging, root);
@@ -182,10 +182,10 @@ export async function verifiedEnginePath(): Promise<string> {
   const lock = await readEngineLock();
   const marker = JSON.parse(await fs.readFile(markerPath(lock.tag), "utf8")) as { asset?: string; sha256?: string; binarySha256?: string };
   if (!marker.asset || !marker.sha256 || lock.assets[marker.asset]?.sha256 !== marker.sha256) {
-    throw new Error("Engine is absent or no longer matches engine.lock.json; run tally engine install");
+    throw new Error("Engine is absent or no longer matches engine.lock.json; run headroom engine install");
   }
   const binary = await findEngineBinary(installRoot(lock.tag));
-  if (!marker.binarySha256 || marker.binarySha256 !== await sha256File(binary)) throw new Error("Engine binary changed after verification; run tally engine install");
+  if (!marker.binarySha256 || marker.binarySha256 !== await sha256File(binary)) throw new Error("Engine binary changed after verification; run headroom engine install");
   return binary;
 }
 

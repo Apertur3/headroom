@@ -11,3 +11,18 @@ export function redact(value: string): string {
 export function safeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
 }
+
+/** Child processes never inherit ambient proxy routing. */
+export function outboundEnvironment(proxy?: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const output = { ...env };
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) delete output[key];
+  if (proxy) output.HTTPS_PROXY = proxy;
+  return output;
+}
+
+export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
+  const parsed = new URL(url);
+  if (parsed.hostname === "api.anthropic.com" || parsed.hostname === "chatgpt.com") return parsed;
+  if (localBaseUrls.some((base) => parsed.origin === new URL(base).origin)) return parsed;
+  throw new Error("Outbound host is not allowed");
+}

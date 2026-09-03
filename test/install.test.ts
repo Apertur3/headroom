@@ -7,9 +7,9 @@ describe("engine asset selection", () => {
     expect(platformAssetName("v0.56.4", "darwin", "x64")).toBe("CodexBarCLI-v0.56.4-macos-x86_64.tar.gz");
   });
 
-  it("keeps Tally native release assets explicitly unpinned until release signing is decided", async () => {
+  it("keeps Headroom native release assets explicitly unpinned until release signing is decided", async () => {
     const lock = await readEngineLock();
-    expect(nativePlatformAssetName(lock, "darwin", "arm64")).toEqual({ name: "tally-engine-0.1.0-macos-arm64.tar.gz", sha256: null, unpinned: true });
-    expect(nativePlatformAssetName(lock, "linux", "arm64")).toEqual({ name: "tally-engine-0.1.0-linux-aarch64.tar.gz", sha256: null, unpinned: true });
+    expect(nativePlatformAssetName(lock, "darwin", "arm64")).toEqual({ name: "headroom-engine-0.1.0-macos-arm64.tar.gz", sha256: null, unpinned: true });
+    expect(nativePlatformAssetName(lock, "linux", "arm64")).toEqual({ name: "headroom-engine-0.1.0-linux-aarch64.tar.gz", sha256: null, unpinned: true });
   });
 });

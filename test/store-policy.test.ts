@@ -2,8 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { canConsume, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
-import { TallyStore } from "../src/store.js";
+import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
+import { HeadroomStore } from "../src/store.js";
 import { formatMeters, thresholdReport } from "../src/cli.js";
 import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
 import type { Observation } from "../src/types.js";
@@ -23,9 +23,9 @@ function observation(overrides: Partial<Observation> = {}): Observation {
 
 describe("SQLite observations and event detector", () => {
   it("allows two live connections to share a WAL database", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-store-wal-")); temporary.push(root);
-    const home = join(root, ".tally");
-    const [first, second] = await Promise.all([TallyStore.open(home), TallyStore.open(home)]);
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-wal-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const [first, second] = await Promise.all([HeadroomStore.open(home), HeadroomStore.open(home)]);
     try {
       const db = (first as unknown as { db: { prepare(sql: string): { get(): Record<string, unknown> | undefined } } }).db;
       expect(db.prepare("PRAGMA busy_timeout").get()).toMatchObject({ timeout: 5000 });
@@ -36,8 +36,8 @@ describe("SQLite observations and event detector", () => {
   });
 
   it("records reset confidences, vendor reset use, and source recovery", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-store-")); temporary.push(root);
-    const store = await TallyStore.open(join(root, ".tally"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
       const credit = (remaining: number) => observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining, unit: "credits" } });
       store.insert(credit(1));
@@ -63,8 +63,8 @@ describe("SQLite observations and event detector", () => {
   });
 
   it("returns only the latest fetched observation for each meter window", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-store-latest-")); temporary.push(root);
-    const store = await TallyStore.open(join(root, ".tally"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-latest-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
       store.insert(observation({ fetched_at: "2026-09-03T12:00:00Z", quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
       store.insert(observation({ fetched_at: "2026-09-03T12:02:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
@@ -77,8 +77,8 @@ describe("SQLite observations and event detector", () => {
   });
 
   it("does not display an older failed read beside a newer scoped window", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-store-failure-")); temporary.push(root);
-    const store = await TallyStore.open(join(root, ".tally"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-failure-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
       store.insert(observation({ meter_id: "claude-main:fable", window: null, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at: "2026-09-03T12:00:00Z" }));
       store.insert(observation({ meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "not_enforced", reason: "no scoped limit in response", fetched_at: "2026-09-03T12:01:00Z" }));
@@ -87,8 +87,8 @@ describe("SQLite observations and event detector", () => {
   });
 
   it("normalizes availability-only batches, fails closed, and records recovery", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-store-placeholder-")); temporary.push(root);
-    const store = await TallyStore.open(join(root, ".tally"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-placeholder-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
     const fetchedAt = "2026-09-03T19:38:37Z";
     const fiveHour = observation({
       principal_id: "antigravity", meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 300, enforcement: "hard" },
@@ -184,8 +184,8 @@ describe("pace and consumes", () => {
   });
 
   it("shows reset evidence beside the matching current window", async () => {
-    const root = await mkdtemp(join(tmpdir(), "tally-reset-label-")); temporary.push(root);
-    const store = await TallyStore.open(join(root, ".tally"));
+    const root = await mkdtemp(join(tmpdir(), "headroom-reset-label-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
       const first = observation({ window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 80, limit: 100, remaining: 20, unit: "percent" }, resets_at: "2026-09-03T13:00:00Z" });
       const current = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z" };
@@ -195,6 +195,45 @@ describe("pace and consumes", () => {
       const seen = store.resetSeenFor(latest, new Date("2026-09-03T12:00:00Z"));
       expect(seen.get("codex-main:main:300")).toBe("2026-09-03T12:00:00.000Z");
       expect(formatMeters(latest, defaultPolicy, seen)[0]).toContain("reset seen");
+    } finally { store.close(); }
+  });
+});
+
+describe("leases", () => {
+  it("starts, attributes, expires, and ends leases with ownership checks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-lease-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const started = store.startLease("cadence", "codex-main:main", 20, 2 * 3_600_000, "fanout", new Date("2026-09-03T12:00:00Z"));
+      store.insert(observation({ fetched_at: "2026-09-03T12:00:00Z", quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
+      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
+      expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z"))[0]).toMatchObject({ id: started.id, spent_percent: 10, ended_at: null });
+      expect(() => store.endLease(started.id, "other", false, new Date("2026-09-03T12:01:00Z"))).toThrow("--force");
+      expect(store.endLease(started.id, "other", true, new Date("2026-09-03T12:01:00Z")).ended_reason).toBe("ended");
+      const expiring = store.startLease("cadence", "codex-main:main", null, 1, null, new Date("2026-09-03T13:00:00Z"));
+      expect(store.leases(undefined, false, new Date("2026-09-03T13:00:01Z")).find((item) => item.id === expiring.id)).toMatchObject({ ended_reason: "expired" });
+      expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "lease_started" }), expect.objectContaining({ kind: "lease_ended" })]));
+    } finally { store.close(); }
+  });
+
+  it("splits a meter delta by expected leases and makes a foreign claim conserve", () => {
+    const first = observation({ window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 68, limit: 100, remaining: 32, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z" });
+    const leases = [{ id: "a", owner: "cadence", meter_id: first.meter_id, expected_percent: 6, note: null, started_at: first.fetched_at, expires_at: "2026-09-04T12:00:00Z", ended_at: null, ended_reason: null, spent_percent: 0 }];
+    const decision = canRouteWithLeases([first.meter_id], [], new Map([[first.meter_id, [first]]]), "never", { ...defaultPolicy, pace_grace_fraction: 0 }, false, leases, "other", new Date(first.fetched_at));
+    expect(decision).toMatchObject({ allowed: false, state: "CONSERVE" });
+    expect(decision.reason).toBe("wk 68% + 6% leased by cadence → CONSERVE");
+  });
+
+  it("uses equal weights for unspecified expected shares", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-lease-split-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const at = new Date("2026-09-03T12:00:00Z");
+      store.startLease("one", "codex-main:main", null, 2 * 3_600_000, null, at);
+      store.startLease("two", "codex-main:main", null, 2 * 3_600_000, null, at);
+      store.insert(observation({ fetched_at: at.toISOString(), quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
+      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
+      expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z")).map((item) => item.spent_percent).sort()).toEqual([5, 5]);
     } finally { store.close(); }
   });
 });

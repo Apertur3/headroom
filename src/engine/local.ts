@@ -1,9 +1,11 @@
 import type { LocalAccount, Observation } from "../types.js";
+import { allowedOutbound } from "../security.js";
 
 const timeoutMs = 3_000;
 
 function endpoint(baseUrl: string, path: string): string {
-  return new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+  const value = new URL(path, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+  return allowedOutbound(value, [baseUrl]).toString();
 }
 
 async function get(baseUrl: string, path: string): Promise<Response> {
@@ -19,7 +21,7 @@ function modelIds(body: unknown): string[] {
 }
 
 /** Prometheus exposition is intentionally parsed narrowly: only these vLLM gauges
- * influence scheduling; all other metrics remain opaque to Tally. */
+ * influence scheduling; all other metrics remain opaque to Headroom. */
 export function vllmQueue(metrics: string): { running: number; waiting: number } | undefined {
   const value = (name: string): number | undefined => {
     const match = metrics.match(new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+([0-9]+(?:\\.[0-9]+)?)\\s*$`, "m"));

@@ -1,4 +1,4 @@
-# Each entry names one credential location. Tally never stores credentials here.
+# Each entry names one credential location. Headroom never stores credentials here.
 [[accounts]]
 name = "codex-main"
 vendor = "codex"

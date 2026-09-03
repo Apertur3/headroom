@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(mktemp -d "${TMPDIR:-/tmp}/tally-cold.XXXXXX")"
+root="$(mktemp -d "${TMPDIR:-/tmp}/headroom-cold.XXXXXX")"
 archive=""
 server_pid=""
 cleanup() {
@@ -31,11 +31,11 @@ if [[ ! -s "$root/port" ]]; then
   cat "$root/server.err" >&2; exit 1
 fi
 port="$(head -n1 "$root/port")"
-mkdir -p "$root/home/.tally" "$root/unpack"
-printf '[[accounts]]\nname = "fixture-local"\nkind = "local"\nbase_url = "http://127.0.0.1:%s"\nadapter = "native"\n' "$port" >"$root/home/.tally/accounts.toml"
+mkdir -p "$root/home/.headroom" "$root/unpack"
+printf '[[accounts]]\nname = "fixture-local"\nkind = "local"\nbase_url = "http://127.0.0.1:%s"\nadapter = "native"\n' "$port" >"$root/home/.headroom/accounts.toml"
 
 archive="$(npm pack --silent --cache "$root/npm-cache")"
 tar -xzf "$archive" -C "$root/unpack"
-output="$(HOME="$root/home" TALLY_HOME="$root/home/.tally" node "$root/unpack/package/dist/cli.js")"
+output="$(HEADROOM_HOME="$root/home/.headroom" node "$root/unpack/package/dist/cli.js")"
 [[ "$output" == *"fixture-local:capacity  UP model=local-27b running=0 waiting=0"* ]]
 echo "cold smoke passed"

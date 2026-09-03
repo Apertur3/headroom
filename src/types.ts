@@ -50,7 +50,7 @@ export function isLocalAccount(account: Account): account is LocalAccount {
   return "kind" in account && account.kind === "local";
 }
 
-/** v0.2 observation emitted by tally-engine and normalized from the fallback engine. */
+/** v0.2 observation emitted by headroom-engine and normalized from the fallback engine. */
 export interface Observation {
   principal_id: string;
   meter_id: string;
@@ -86,9 +86,22 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended";
 
-export interface TallyEvent {
+export interface Lease {
+  id: string;
+  owner: string;
+  meter_id: string;
+  expected_percent: number | null;
+  note: string | null;
+  started_at: string;
+  expires_at: string;
+  ended_at: string | null;
+  ended_reason: string | null;
+  spent_percent: number;
+}
+
+export interface HeadroomEvent {
   id: string;
   kind: EventKind;
   origin: "vendor_reported" | "inferred";

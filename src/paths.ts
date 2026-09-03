@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { lstat, rename } from "node:fs/promises";
 import { join, win32 } from "node:path";
 
 export interface PathOptions {
@@ -15,11 +16,30 @@ export function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): 
   return platform === "win32" ? win32.join(...parts) : join(...parts);
 }
 
-export function tallyHome(options: PathOptions = {}): string {
+export function headroomHome(options: PathOptions = {}): string {
   const { platform, env, home } = values(options);
-  if (env.TALLY_HOME) return env.TALLY_HOME;
-  if (platform === "win32") return joinForPlatform(platform, env.LOCALAPPDATA || joinForPlatform(platform, home, "AppData", "Local"), "keeptally");
-  return joinForPlatform(platform, home, ".tally");
+  if (env.HEADROOM_HOME) return env.HEADROOM_HOME;
+  if (platform === "win32") return joinForPlatform(platform, env.LOCALAPPDATA || joinForPlatform(platform, home, "AppData", "Local"), "headroom");
+  return joinForPlatform(platform, home, ".headroom");
+}
+
+/** Move the pre-rename state exactly once, before anything creates its new home. */
+export async function migrateLegacyHome(options: PathOptions = {}): Promise<boolean> {
+  const { platform, env, home } = values(options);
+  if (env.HEADROOM_HOME || platform === "win32") return false;
+  const legacy = joinForPlatform(platform, home, [".", "ta", "lly"].join(""));
+  const current = headroomHome({ platform, env, home });
+  try { await lstat(current); return false; }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  try {
+    const stat = await lstat(legacy);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+    await rename(legacy, current);
+    return true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export function expandHome(value: string): string {
