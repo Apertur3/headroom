@@ -22,7 +22,7 @@ export function outboundEnvironment(proxy?: string, env: NodeJS.ProcessEnv = pro
 
 export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
   const parsed = new URL(url);
-  if (parsed.hostname === "api.anthropic.com" || parsed.hostname === "chatgpt.com" || parsed.hostname === "cloudcode-pa.googleapis.com") return parsed;
+  if (parsed.hostname === "api.anthropic.com" || parsed.hostname === "chatgpt.com" || parsed.hostname === "cloudcode-pa.googleapis.com" || parsed.hostname === "oauth2.googleapis.com") return parsed;
   if (localBaseUrls.some((base) => parsed.origin === new URL(base).origin)) return parsed;
   throw new Error("Outbound host is not allowed");
 }

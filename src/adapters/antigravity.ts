@@ -1,6 +1,6 @@
-import { lstat, readFile } from "node:fs/promises";
+import { access, constants, lstat, readFile, realpath, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { normalizeObservations } from "../engine/observation.js";
 import { allowedOutbound, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
@@ -8,10 +8,10 @@ import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const TIMEOUT_MS = 10_000;
-const SOURCE = "native:antigravity";
+const SOURCE = "remote:antigravity";
 const BASE_URL = "https://cloudcode-pa.googleapis.com";
 const RETRIEVE_USER_QUOTA = `${BASE_URL}/v1internal:retrieveUserQuota`;
-const FETCH_AVAILABLE_MODELS = `${BASE_URL}/v1internal:fetchAvailableModels`;
+const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const METERS = ["gemini", "claude-gpt"] as const;
 const WINDOWS = [
   { name: "5h", minutes: 300, kind: "rolling" as const },
@@ -23,14 +23,17 @@ const object = (value: unknown): value is ObjectValue => typeof value === "objec
 const string = (value: unknown): string | undefined => typeof value === "string" && value.trim() ? value.trim() : undefined;
 const number = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
+export interface GeminiOAuthClient { clientId: string; clientSecret: string; }
 export interface AntigravityDependencies {
   now?: () => Date;
   fetch?: typeof fetch;
   readFile?: (path: string, encoding: BufferEncoding) => Promise<string>;
   credentialPaths?: () => string[];
+  /** Test seam and explicit override for Gemini CLI's bundled OAuth client. */
+  oauthClient?: () => Promise<GeminiOAuthClient | undefined>;
 }
 
-interface Credential { token: string; projectId?: string; expired: boolean; }
+interface Credential { token: string; refreshToken?: string; projectId?: string; expired: boolean; }
 
 async function secureRead(path: string): Promise<string> {
   const stat = await lstat(path);
@@ -39,30 +42,26 @@ async function secureRead(path: string): Promise<string> {
   return readFile(path, "utf8");
 }
 
-/** `agy` and Gemini CLI both persist JSON OAuth records; no protobuf/base64 format is used by these stores. */
+/** Reads Gemini CLI's Google OAuth JSON, never agy's `{ auth_method, token }` session file. */
 export function parseAntigravityCredential(payload: string, now = new Date()): Credential {
   try {
     const root: unknown = JSON.parse(payload);
     if (!object(root)) throw new Error("invalid");
-    // agy nests its token, while Gemini CLI writes the OAuth fields at the top level.
-    const tokenRecord = object(root.token) ? root.token : root;
-    const token = string(tokenRecord.access_token ?? tokenRecord.accessToken);
+    const token = string(root.access_token ?? root.accessToken);
     if (!token) throw new Error("invalid");
-    const expiry = tokenRecord.expiry ?? tokenRecord.expiry_date ?? tokenRecord.expiresAt ?? tokenRecord.expires_at;
+    const expiry = root.expiry_date ?? root.expiry ?? root.expiresAt ?? root.expires_at;
     const parsedExpiry = typeof expiry === "string" ? Date.parse(expiry) : number(expiry);
     const milliseconds = typeof parsedExpiry === "number" && parsedExpiry < 10_000_000_000 ? parsedExpiry * 1000 : parsedExpiry;
     return {
       token,
-      projectId: string(tokenRecord.project ?? tokenRecord.project_id ?? tokenRecord.projectId) ?? string(root.project ?? root.project_id ?? root.projectId),
+      refreshToken: string(root.refresh_token ?? root.refreshToken),
+      projectId: string(root.project ?? root.project_id ?? root.projectId),
       expired: typeof milliseconds === "number" && Number.isFinite(milliseconds) && now.getTime() >= milliseconds,
     };
-  } catch { throw new Error("Antigravity OAuth credentials invalid"); }
+  } catch { throw new Error("Gemini CLI OAuth credentials invalid"); }
 }
 
-function defaultCredentialPaths(): string[] {
-  const gemini = join(homedir(), ".gemini");
-  return [join(gemini, "antigravity-cli", "antigravity-oauth-token"), join(gemini, "oauth_creds.json")];
-}
+function defaultCredentialPaths(): string[] { return [join(homedir(), ".gemini", "oauth_creds.json")]; }
 
 function base(account: ProviderAccount, meter: string, now: string): Omit<Observation, "window" | "quantity" | "resets_at" | "freshness" | "reason"> {
   return { principal_id: account.name, meter_id: `${account.name}:${meter}`, observed_at: now, fetched_at: now, source: SOURCE, truth: "official", confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4" };
@@ -75,11 +74,9 @@ function failed(account: ProviderAccount, reason: string, now: string): Observat
   })));
 }
 
+/** The quota request is exactly `{ project?: string }`; Google's response buckets carry modelId, remainingFraction and resetTime. */
 function requestBody(projectId?: string): string { return JSON.stringify(projectId ? { project: projectId } : {}); }
-function requestHeaders(token: string): HeadersInit {
-  // These are the complete v0.56.4 remote-fetcher headers. It sends no x-goog-api-client header.
-  return { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity" };
-}
+function requestHeaders(token: string): HeadersInit { return { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity" }; }
 
 function field(value: ObjectValue, ...names: string[]): unknown { for (const name of names) if (name in value) return value[name]; return undefined; }
 function reset(value: unknown): string | null {
@@ -90,7 +87,6 @@ function reset(value: unknown): string | null {
 }
 
 interface QuotaBucket { meter?: typeof METERS[number]; minutes?: number; remaining?: number; resetsAt: string | null; }
-
 function bucketFrom(value: unknown): QuotaBucket | undefined {
   if (!object(value)) return undefined;
   const remainingObject = object(field(value, "remaining")) ? field(value, "remaining") as ObjectValue : undefined;
@@ -110,7 +106,7 @@ function buckets(body: unknown): QuotaBucket[] {
   return [...direct, ...grouped].flatMap((bucket) => { const parsed = bucketFrom(bucket); return parsed ? [parsed] : []; });
 }
 
-/** Maps verified `retrieveUserQuota` bucket fractions. `fetchAvailableModels` is deliberately not a capacity source. */
+/** Maps verified `retrieveUserQuota` bucket fractions. A response without remainingFraction is availability-only, never usage. */
 export function observationsFromAntigravityQuota(body: unknown, account: ProviderAccount, at = new Date()): Observation[] {
   const now = at.toISOString();
   const candidates = buckets(body);
@@ -131,45 +127,93 @@ export function observationsFromAntigravityQuota(body: unknown, account: Provide
 async function credential(paths: string[], reader: (path: string, encoding: BufferEncoding) => Promise<string>, now: Date): Promise<Credential> {
   let unavailable = true;
   for (const path of paths) {
-    try {
-      unavailable = false;
-      const candidate = parseAntigravityCredential(await reader(path, "utf8"), now);
-      if (candidate.expired) throw new Error("expired");
-      return candidate;
-    } catch (error) {
-      if (error instanceof Error && error.message === "expired") throw error;
-    }
+    try { unavailable = false; return parseAntigravityCredential(await reader(path, "utf8"), now); }
+    catch { /* another credential path may be valid */ }
   }
   if (unavailable) throw new Error("unavailable");
   throw new Error("invalid");
 }
 
-async function post(fetcher: typeof fetch, endpoint: string, credential: Credential): Promise<Response> {
-  return fetcher(new Request(allowedOutbound(endpoint).toString(), { method: "POST", headers: requestHeaders(credential.token), body: requestBody(credential.projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
+function formBody(values: Record<string, string>): string { return new URLSearchParams(values).toString(); }
+
+/** Finds the same Gemini CLI oauth2.js bundle locations documented by CodexBar, without persisting any extracted client data. */
+export async function discoverGeminiOAuthClient(): Promise<GeminiOAuthClient | undefined> {
+  const envClientId = string(process.env.GEMINI_OAUTH_CLIENT_ID);
+  const envClientSecret = string(process.env.GEMINI_OAUTH_CLIENT_SECRET);
+  if (envClientId && envClientSecret) return { clientId: envClientId, clientSecret: envClientSecret };
+  const candidates = new Set<string>();
+  const override = string(process.env.GEMINI_OAUTH2_JS_PATH);
+  if (override) candidates.add(override);
+  const binary = await geminiBinary();
+  if (binary) for (const root of parents(dirname(binary), 8)) {
+    candidates.add(join(root, "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    candidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    candidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    candidates.add(join(root, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    candidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    candidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+  }
+  for (const prefix of ["/opt/homebrew", "/usr/local"]) {
+    candidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    candidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    try { for (const version of await readdir(join(prefix, "Cellar", "gemini-cli"))) {
+      candidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+      candidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    } } catch { /* not a Homebrew installation */ }
+  }
+  for (const path of candidates) try {
+    const text = await readFile(path, "utf8");
+    const clientId = /[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com/.exec(text)?.[0];
+    const clientSecret = /GOCSPX-[A-Za-z0-9_-]{28}/.exec(text)?.[0];
+    if (clientId && clientSecret) return { clientId, clientSecret };
+  } catch { /* continue through the documented candidates */ }
+  return undefined;
+}
+
+async function geminiBinary(): Promise<string | undefined> {
+  for (const path of (process.env.PATH ?? "").split(":").filter(Boolean).map((directory) => join(directory, "gemini"))) try {
+    await access(path, constants.X_OK);
+    return await realpath(path);
+  } catch { /* continue */ }
+  return undefined;
+}
+function parents(path: string, count: number): string[] { const output: string[] = []; let current = path; for (let index = 0; index < count; index += 1) { output.push(current); const parent = dirname(current); if (parent === current) break; current = parent; } return output; }
+
+async function refresh(fetcher: typeof fetch, credentials: Credential, resolveClient: () => Promise<GeminiOAuthClient | undefined>): Promise<Credential> {
+  if (!credentials.expired) return credentials;
+  if (!credentials.refreshToken) throw new Error("expired");
+  const client = await resolveClient();
+  if (!client) throw new Error("Gemini CLI OAuth client unavailable");
+  const response = await fetcher(new Request(allowedOutbound(GOOGLE_TOKEN_ENDPOINT).toString(), {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: formBody({ client_id: client.clientId, client_secret: client.clientSecret, refresh_token: credentials.refreshToken, grant_type: "refresh_token" }), signal: AbortSignal.timeout(TIMEOUT_MS),
+  }));
+  if (!response.ok) throw new ProviderHTTPError(response.status, "Google OAuth refresh");
+  const body: unknown = await vendorJson(response);
+  if (!object(body) || !string(body.access_token)) throw new Error("Google OAuth refresh returned no access token");
+  return { ...credentials, token: string(body.access_token)!, expired: false };
+}
+
+async function post(fetcher: typeof fetch, credential: Credential): Promise<Response> {
+  return fetcher(new Request(allowedOutbound(RETRIEVE_USER_QUOTA).toString(), { method: "POST", headers: requestHeaders(credential.token), body: requestBody(credential.projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
 }
 
 export async function observeAntigravity(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Observation[]> {
   const now = dependencies.now?.() ?? new Date();
   const timestamp = now.toISOString();
   try {
-    const credentials = await credential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureRead, now);
     const fetcher = dependencies.fetch ?? fetch;
-    const quota = await post(fetcher, RETRIEVE_USER_QUOTA, credentials);
-    if (quota.ok) {
-      const body: unknown = await vendorJson(quota);
-      if (buckets(body).some((bucket) => bucket.remaining !== undefined)) return observationsFromAntigravityQuota(body, account, now);
-    } else if (quota.status !== 403) {
-      throw new ProviderHTTPError(quota.status, "Antigravity quota");
-    }
-    // Availability proves only that the account can use models. It must never become a zero-use quota reading.
-    const availability = await post(fetcher, FETCH_AVAILABLE_MODELS, credentials);
-    if (!availability.ok) throw new ProviderHTTPError(availability.status, "Antigravity models");
-    await vendorJson(availability);
-    return failed(account, "quota endpoint returned availability only", timestamp);
+    const stored = await credential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureRead, now);
+    const credentials = await refresh(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient);
+    const quota = await post(fetcher, credentials);
+    if (!quota.ok) throw new ProviderHTTPError(quota.status, "Antigravity quota");
+    const body: unknown = await vendorJson(quota);
+    if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) return failed(account, "quota endpoint returned availability only", timestamp);
+    return observationsFromAntigravityQuota(body, account, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    if (message === "expired") return failed(account, "token expired; run: agy", timestamp);
-    if (message === "unavailable" || message === "invalid") return failed(account, "no credentials; run: agy", timestamp);
+    if (message === "expired") return failed(account, "token expired; run: gemini", timestamp);
+    if (message === "unavailable" || message === "invalid") return failed(account, "no Gemini CLI OAuth credentials; run: gemini", timestamp);
     const reason = error instanceof ProviderHTTPError ? error.message : message.startsWith("vendor response") ? message : "Antigravity usage unavailable";
     return failed(account, reason, timestamp);
   }

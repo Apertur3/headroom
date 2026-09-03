@@ -6,10 +6,15 @@ export interface Policy {
   staleness_minutes: number;
   poll_interval_minutes: number;
   principal_intervals: Record<string, number>;
+  /** Keep one daemon-owned `agy` PTY alive for warm local Antigravity reads. */
+  antigravity_keepalive: boolean;
   proxy?: string;
 }
 
-export const defaultPolicy: Policy = { freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {} };
+export const defaultPolicy: Policy = {
+  freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {},
+  antigravity_keepalive: process.platform === "darwin" || process.platform === "linux",
+};
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
 export function parsePolicy(text: string): Policy {
@@ -17,6 +22,7 @@ export function parsePolicy(text: string): Policy {
   const principalIntervals: Record<string, number> = {};
   let principal: string | undefined;
   let proxy: string | undefined;
+  let antigravityKeepalive: boolean | undefined;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
@@ -26,6 +32,8 @@ export function parsePolicy(text: string): Policy {
     if (principal && interval) { principalIntervals[principal] = Number(interval[1]); continue; }
     const proxyMatch = /^proxy\s*=\s*"([^"\\]+)"\s*$/.exec(line);
     if (proxyMatch) { try { const url = new URL(proxyMatch[1]); if (!/^https?:$/.test(url.protocol)) throw new Error("invalid"); proxy = url.toString(); continue; } catch { throw new Error("Invalid Headroom proxy"); } }
+    const keepalive = /^antigravity_keepalive\s*=\s*(true|false)\s*$/.exec(line);
+    if (keepalive) { antigravityKeepalive = keepalive[1] === "true"; continue; }
     const match = /^(freeze_reserve_pct|pace_grace_fraction|staleness_minutes|poll_interval_minutes)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (match) values[match[1]] = Number(match[2]);
   }
@@ -34,7 +42,7 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultPolicy.antigravity_keepalive, ...(proxy ? { proxy } : {}) };
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
