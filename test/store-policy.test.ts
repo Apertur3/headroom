@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canConsume, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
 import { TallyStore } from "../src/store.js";
-import { formatMeters } from "../src/cli.js";
+import { formatMeters, thresholdReport } from "../src/cli.js";
 import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
 import type { Observation } from "../src/types.js";
 
@@ -170,5 +170,31 @@ describe("pace and consumes", () => {
     const absent = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "not_enforced", quantity: null, fetched_at: new Date().toISOString() });
     expect(formatMeters([fresh, absent], defaultPolicy)[0]).toContain("(fresh <1m)");
     expect(formatMeters([absent], defaultPolicy)[0]).toContain("(not enforced <1m)");
+  });
+
+  it("returns every window's threshold result and preserves fail-closed blocking", () => {
+    const fresh = observation({ meter_id: "codex-main:main", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 91, limit: 100, remaining: 9, unit: "percent" } });
+    const stale = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" }, freshness: "stale" });
+    const absent = observation({ meter_id: "codex-main:spark", quantity: null, freshness: "not_enforced" });
+    expect(thresholdReport([fresh, stale, absent], 90)).toEqual([
+      expect.objectContaining({ meter_id: "codex-main:main", window_minutes: 300, used_percent: 91, crossed: true, blocking: true }),
+      expect.objectContaining({ meter_id: "claude-main:all", window_minutes: 10_080, used_percent: 12, crossed: false, blocking: true }),
+      expect.objectContaining({ meter_id: "codex-main:spark", crossed: false, blocking: false, freshness: "not_enforced" }),
+    ]);
+  });
+
+  it("shows reset evidence beside the matching current window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tally-reset-label-")); temporary.push(root);
+    const store = await TallyStore.open(join(root, ".tally"));
+    try {
+      const first = observation({ window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 80, limit: 100, remaining: 20, unit: "percent" }, resets_at: "2026-09-03T13:00:00Z" });
+      const current = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z" };
+      store.insert(first);
+      store.insert(current);
+      const latest = store.latestPerWindow();
+      const seen = store.resetSeenFor(latest, new Date("2026-09-03T12:00:00Z"));
+      expect(seen.get("codex-main:main:300")).toBe("2026-09-03T12:00:00.000Z");
+      expect(formatMeters(latest, defaultPolicy, seen)[0]).toContain("reset seen");
+    } finally { store.close(); }
   });
 });

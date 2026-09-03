@@ -35,7 +35,7 @@ export interface ProviderAccount {
   adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
 }
 
-/** A local pool is declared now; its probe adapter lands in slice 5. */
+/** A local pool is a probed OpenAI-compatible capacity source. */
 export interface LocalAccount {
   name: string;
   kind: "local";

@@ -99,6 +99,11 @@ function meterDecision(observations: Observation | Observation[] | undefined, po
     .filter((window) => window.state !== "NOT_ENFORCED");
   if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced" };
   const deciding = enforced.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
+  if (deciding.state === "UP" || deciding.state === "BUSY" || deciding.state === "DOWN") {
+    const metadata = deciding.observation.metadata;
+    const model = metadata?.model_ids?.[0] ?? "unknown";
+    return { state: deciding.state, reason: `${deciding.state}, model ${model}, ${metadata?.running ?? deciding.observation.quantity?.used ?? 0} running` };
+  }
   return {
     state: deciding.state,
     reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}`,
@@ -114,15 +119,15 @@ export function canConsume(meters: string[], observations: Map<string, Observati
 }
 
 /** Select local capacity as an alternative route without weakening subscription
- * limits. `fallback` only opens local routing once all subscription meters are
- * conserving, frozen, or unknown. */
+ * limits. `fallback` only opens local routing once every subscription meter is
+ * conserving or frozen. */
 export function canRoute(
   subscriptionMeters: string[], localMeters: string[], observations: Map<string, Observation | Observation[] | undefined>,
   localPreference: "fallback" | "prefer" | "never", policy = defaultPolicy, allowUnknown = false, now = new Date(),
 ): CanDecision {
   const subscriptions = canConsume(subscriptionMeters, observations, policy, allowUnknown, now);
   const localAvailable = localMeters.length > 0;
-  const fallbackEligible = subscriptions.meters.length > 0 && subscriptions.meters.every((item) => item.state === "CONSERVE" || item.state === "FREEZE" || item.state === "UNKNOWN");
+  const fallbackEligible = subscriptions.meters.length > 0 && subscriptions.meters.every((item) => item.state === "CONSERVE" || item.state === "FREEZE");
   const consider = localAvailable && localPreference !== "never" && (localPreference === "prefer" || fallbackEligible);
   if (!consider) return { ...subscriptions, local_preference: localPreference, local_meter_considered: false };
   const local = canConsume(localMeters, observations, policy, allowUnknown, now);

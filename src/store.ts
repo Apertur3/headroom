@@ -221,6 +221,26 @@ export class TallyStore {
 
   events(since: string): TallyEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
 
+  /** Latest reset evidence for each current meter/window, limited to that window. */
+  resetSeenFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {
+    const output = new Map<string, string>();
+    for (const observation of observations) {
+      const minutes = observation.window?.minutes;
+      if (!minutes) continue;
+      const reset = observation.resets_at ? Date.parse(observation.resets_at) : Number.NaN;
+      const start = Number.isFinite(reset) ? reset - minutes * 60_000 : now.getTime() - minutes * 60_000;
+      const row = this.db.prepare(`SELECT e.created_at FROM events e
+        JOIN json_each(e.evidence_observation_ids) evidence
+        JOIN observations o ON o.id = evidence.value
+        WHERE e.kind = 'reset_seen' AND e.meter_id = ?
+          AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) = ?
+          AND e.created_at >= ? AND e.created_at <= ?
+        ORDER BY e.created_at DESC LIMIT 1`).get(observation.meter_id, minutes, new Date(start).toISOString(), now.toISOString());
+      if (row?.created_at && typeof row.created_at === "string") output.set(`${observation.meter_id}:${minutes}`, row.created_at);
+    }
+    return output;
+  }
+
   audit(caller: string, action: string, meterOrPrincipal: string | null, outcome: string): void {
     this.db.prepare("INSERT INTO audit (caller,action,meter_or_principal,outcome,at) VALUES (?,?,?,?,?)").run(caller, action, meterOrPrincipal, outcome, new Date().toISOString());
   }
