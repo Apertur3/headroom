@@ -10,10 +10,10 @@ import { isLocalAccount } from "./types.js";
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 const tools = [
   { name: "quota_status", description: "Return the latest quota windows for every Headroom meter.", inputSchema: { type: "object", properties: {} } },
-  { name: "quota_can", description: "Check whether an action class can consume all of its meters.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class"] } },
+  { name: "quota_can", description: "Check whether an action class can consume all of its meters.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
   { name: "quota_events", description: "Return Headroom events since an ISO timestamp or duration resolved by the caller.", inputSchema: { type: "object", properties: { since: { type: "string" } } } },
   { name: "quota_lease_start", description: "Reserve a meter for an orchestrator.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number" }, ttl_ms: { type: "number" }, note: { type: "string" } }, required: ["owner", "meter_id"] } },
-  { name: "quota_lease_end", description: "End a meter lease.", inputSchema: { type: "object", properties: { id: { type: "string" }, owner: { type: "string" }, force: { type: "boolean" } }, required: ["id"] } },
+  { name: "quota_lease_end", description: "End a meter lease. A different owner must set force.", inputSchema: { type: "object", properties: { id: { type: "string" }, owner: { type: "string" }, force: { type: "boolean" } }, required: ["id", "owner"] } },
   { name: "quota_leases", description: "List meter leases and estimated spend.", inputSchema: { type: "object", properties: {} } },
 ];
 
@@ -47,6 +47,7 @@ async function directStatus(): Promise<DirectResult> {
 }
 
 async function directCan(action: string, allowUnknown: boolean, owner?: string): Promise<DirectResult> {
+  if (!owner?.trim()) throw new Error("owner is required");
   const routing = await readRouting();
   const meters = routing.consumes[action];
   if (!meters) throw new Error(`Unknown action class: ${action || "(missing)"}`);
@@ -80,7 +81,7 @@ async function directLeaseStart(arguments_: Record<string, unknown>): Promise<Di
 
 async function directLeaseEnd(arguments_: Record<string, unknown>): Promise<DirectResult> {
   const store = await HeadroomStore.open();
-  try { return { source: "direct", lease: store.endLease(String(arguments_.id ?? ""), typeof arguments_.owner === "string" ? arguments_.owner : undefined, arguments_.force === true) }; }
+  try { return { source: "direct", lease: store.endLease(String(arguments_.id ?? ""), typeof arguments_.owner === "string" ? arguments_.owner : "", arguments_.force === true) }; }
   finally { store.close(); }
 }
 

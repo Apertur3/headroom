@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { headroomHome } from "../../paths.js";
+import { headroomHome, executablePath } from "../../paths.js";
+import { createHash } from "node:crypto";
 import { readPolicy } from "../../config.js";
 import { outboundEnvironment, redact } from "../../security.js";
 import type { Observation, ProviderAccount } from "../../types.js";
@@ -18,9 +19,12 @@ const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine
 export async function nativeEnginePath(): Promise<string | undefined> {
   const lock = await readEngineLock();
   const installedBinary = join(headroomHome(), "engine", "native", lock.native?.binary ?? "headroom-engine");
-  for (const path of [installedBinary, devBinary]) {
-    try { await access(path); return path; } catch { /* try next */ }
-  }
+  if (lock.native) try {
+    const marker = JSON.parse(await readFile(join(headroomHome(), "engine", "native", ".headroom-native-engine.json"), "utf8")) as { sha256?: string; binarySha256?: string; asset?: string };
+    const asset = nativeAssetForCurrentPlatform(lock);
+    if (marker.asset === asset.name && marker.sha256 === asset.sha256 && marker.binarySha256 && marker.binarySha256 === await hash(installedBinary)) return await executablePath(installedBinary);
+  } catch { /* use safe local development binary below */ }
+  try { return await executablePath(devBinary, { repoRoot, development: true }); } catch { /* absent or unsafe */ }
   return undefined;
 }
 
@@ -56,3 +60,10 @@ function isObservation(value: unknown): value is Observation {
   return typeof item.principal_id === "string" && typeof item.meter_id === "string"
     && typeof item.freshness === "string" && typeof item.source === "string";
 }
+
+function nativeAssetForCurrentPlatform(lock: Awaited<ReturnType<typeof readEngineLock>>) {
+  if (!lock.native) throw new Error("native engine is not pinned");
+  const target = process.platform === "darwin" ? process.arch === "arm64" ? "macos-arm64" : "macos-x86_64" : process.arch === "arm64" ? "linux-aarch64" : "linux-x86_64";
+  return lock.native.assets[target];
+}
+async function hash(path: string): Promise<string> { return createHash("sha256").update(await readFile(path)).digest("hex"); }

@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { claudeResponseShape } from "./adapters/claude.js";
+import { claudeResponseShape, grantClaudeKeychainAccess } from "./adapters/claude.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
@@ -162,10 +162,10 @@ function printEvents(items: HeadroomEvent[]): void {
 
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
-  if (!action) throw new Error("Usage: headroom can <action-class> [--owner <name>] [--allow-unknown] [--json]");
+  if (!action) throw new Error("Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--json]");
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  if (ownerAt >= 0 && !owner) throw new Error("--owner requires a name");
+  if (!owner) throw new Error("--owner is required");
   const routing = await readRouting();
   const meters = routing.consumes[action];
   if (!meters) throw new Error(`Unknown action class: ${action}`);
@@ -217,9 +217,10 @@ async function lease(argv: string[]): Promise<number> {
   }
   if (argv[0] === "end") {
     const id = argv[1]; const owner = option(argv, "--owner"); if (!id) throw new Error("Usage: headroom lease end <id> [--owner <name>] [--force]");
+    if (!owner) throw new Error("Usage: headroom lease end <id> --owner <name> [--force]");
     const params = { id, owner, force: argv.includes("--force") }; const request = await requestDaemon("lease_end", params);
     if (request !== undefined) { console.log((unwrapRpc(request) as Lease).id); return 0; }
-    directReadNotice(); const store = await HeadroomStore.open(); try { const ended = store.endLease(id, owner, params.force); store.audit("cli", "lease_end", ended.meter_id, "ok"); console.log(ended.id); return 0; } finally { store.close(); }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const ended = store.endLease(id, owner, params.force); store.audit("cli", params.force && ended.owner !== owner ? "lease_force_end" : "lease_end", params.force && ended.owner !== owner ? `${owner}->${ended.owner}` : ended.meter_id, "ok"); console.log(ended.id); return 0; } finally { store.close(); }
   }
   if (argv[0] === "list") {
     const request = await requestDaemon("leases");
@@ -312,18 +313,33 @@ async function daemon(): Promise<number> {
   return 0;
 }
 
+async function keychain(argv: string[]): Promise<number> {
+  if (argv[0] !== "grant" || argv.length > 3 || (argv[1] && argv[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>]");
+  const requested = option(argv, "--principal");
+  const accounts = (await readAccounts()).filter((item) => !isLocalAccount(item) && item.vendor === "claude");
+  const account = requested ? accounts.find((item) => item.name === requested) : accounts[0];
+  if (!account || !("location" in account)) throw new Error("No Claude principal found; run headroom accounts discover");
+  await grantClaudeKeychainAccess(account.location);
+  console.log(`Keychain access granted for ${account.name}`);
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   if (await migrateLegacyHome()) console.log(["Moved ~/.", "ta", "lly", " to ~/.headroom."].join(""));
   if (argv[0] === "engine" && argv[1] === "install") {
+    const pin = argv.includes("--pin");
+    if (argv.some((item) => item !== "engine" && item !== "install" && item !== "--pin")) throw new Error("Usage: headroom engine install [--pin]");
     const native = await installNativeEngine();
     if (native.installed) { console.log(`native engine ${native.tag} installed at ${native.path} (sha256 ${native.sha256})`); return 0; }
     console.log(`${native.hint} Falling back to the pinned upstream engine.`);
-    const result = await installEngine();
-    console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256}${result.firstPin ? "; first pin recorded" : ""})`); return 0;
+    const result = await installEngine({ pin });
+    if (result.firstPin) { console.log(`SHA-256 for ${result.tag}: ${result.sha256}\nAdd this hash to engine.lock.json and commit it; no engine was installed.`); return 0; }
+    console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256})`); return 0;
   }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
   if (argv[0] === "daemon") return daemon();
+  if (argv[0] === "keychain") return keychain(argv.slice(1));
   if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }
   if (argv[0] === "install-service") {
     if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom install-service [--dry-run]");

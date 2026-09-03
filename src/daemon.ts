@@ -1,5 +1,6 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { chmod, lstat, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, stat, unlink, readFile, writeFile } from "node:fs/promises";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
@@ -16,6 +17,25 @@ export type Poller = (principal?: string) => Promise<PollResult>;
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : join(home, "headroom.sock");
 }
+
+const SESSION_FILE = "pipe-session-token";
+async function sessionToken(home = headroomHome(), create = false): Promise<string | undefined> {
+  const path = join(home, SESSION_FILE);
+  try {
+    const token = (await readFile(path, "utf8")).trim();
+    if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("invalid");
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isFile() || (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw new Error("unsafe");
+    return token;
+  } catch (error: unknown) {
+    if (!create) return undefined;
+    const token = randomBytes(32).toString("hex");
+    await writeFile(path, `${token}\n`, { mode: 0o600, flag: "w" });
+    if (process.platform !== "win32") await chmod(path, 0o600);
+    return token;
+  }
+}
+function healthSignature(token: string): string { return createHmac("sha256", token).update("headroom-health-v1").digest("hex"); }
 
 function rpcResult(id: unknown, result: unknown): Json { return { jsonrpc: "2.0", id: id ?? null, result }; }
 function rpcError(id: unknown, code: number, message: string): Json { return { jsonrpc: "2.0", id: id ?? null, error: { code, message } }; }
@@ -38,6 +58,7 @@ export class HeadroomDaemon {
   private accountsMtime: number | undefined;
   private schedulingStarted = false;
   private stopping = false;
+  private sessionToken: string | undefined;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller) {}
 
@@ -47,6 +68,7 @@ export class HeadroomDaemon {
   }
 
   async start(): Promise<void> {
+    if (process.platform === "win32") this.sessionToken = await sessionToken(this.path.includes("\\pipe\\") ? headroomHome() : this.path, true);
     await this.prepareSocket();
     this.server = createServer((socket) => this.handleSocket(socket));
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
@@ -105,6 +127,11 @@ export class HeadroomDaemon {
     try { request = JSON.parse(line) as Json; } catch { return rpcError(null, -32700, "Parse error"); }
     if (request.jsonrpc !== "2.0" || typeof request.method !== "string") return rpcError(request.id, -32600, "Invalid Request");
     const params = request.params && typeof request.params === "object" ? request.params as Json : {};
+    if (process.platform === "win32" && request.method !== "health") {
+      const received = typeof params._session_token === "string" ? params._session_token : "";
+      const expected = this.sessionToken ?? "";
+      if (!expected || received.length !== expected.length || !timingSafeEqual(Buffer.from(received), Buffer.from(expected))) return rpcError(request.id, -32001, "Unauthorized pipe client");
+    }
     const caller = callerFrom(params);
     try {
       let result: unknown;
@@ -125,6 +152,7 @@ export class HeadroomDaemon {
         }
         case "can": {
           const action = typeof params.action_class === "string" ? params.action_class : "";
+          if (typeof params.owner !== "string" || !params.owner.trim()) return rpcError(request.id, -32602, "owner is required");
           const routing = await readRouting();
           const meters = routing.consumes[action];
           if (!meters) return rpcError(request.id, -32602, `Unknown action class: ${action || "(missing)"}`);
@@ -132,7 +160,7 @@ export class HeadroomDaemon {
           const policy = await readPolicy();
           const localMeters = (await this.currentAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
-          result = canRouteWithLeases(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), typeof params.owner === "string" ? params.owner : undefined);
+          result = canRouteWithLeases(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), params.owner);
           break;
         }
         case "lease_start": {
@@ -144,7 +172,10 @@ export class HeadroomDaemon {
         }
         case "lease_end": {
           if (typeof params.id !== "string") return rpcError(request.id, -32602, "lease id is required");
-          result = this.store.endLease(params.id, typeof params.owner === "string" ? params.owner : undefined, params.force === true); break;
+          if (typeof params.owner !== "string" || !params.owner.trim()) return rpcError(request.id, -32602, "owner is required");
+          result = this.store.endLease(params.id, params.owner, params.force === true);
+          if (params.force === true && (result as { owner: string }).owner !== params.owner) this.store.audit(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}`, "ok");
+          break;
         }
         case "leases": result = this.store.leases(); break;
         case "refresh": {
@@ -161,7 +192,7 @@ export class HeadroomDaemon {
           });
           result = Object.fromEntries(this.store.resetSeenFor(windows)); break;
         }
-        case "health": result = { socket: this.path, in_flight: this.inFlight.size, backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })) }; break;
+        case "health": result = { socket: this.path, in_flight: this.inFlight.size, backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })), ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}) }; break;
         default: return rpcError(request.id, -32601, "Method not found");
       }
       this.store.audit(caller, request.method, typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null, "ok");
@@ -194,8 +225,14 @@ export class HeadroomDaemon {
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
       this.store.leases();
+      for (const principalId of new Set(result.observations.map((item) => item.principal_id))) {
+        if (result.observations.some((item) => item.principal_id === principalId && item.source === "native:claude")) this.store.audit("daemon", "claude_probe", principalId, "called");
+      }
+      const keychainDenied = result.observations.some((item) => item.freshness === "failed" && item.reason === "Keychain access denied; run: headroom keychain grant");
       const protectedFailure = result.failures.some((failure) => /\b(401|403|429)\b/.test(failure));
-      if (protectedFailure) {
+      if (keychainDenied) {
+        this.backoff.set(key, { failures: 1, until: Date.now() + 3_600_000 });
+      } else if (protectedFailure) {
         const previous = this.backoff.get(key)?.failures ?? 0;
         this.backoff.set(key, { failures: previous + 1, until: Date.now() + Math.min(3_600_000, 60_000 * 2 ** previous) });
       } else this.backoff.delete(key);
@@ -268,6 +305,11 @@ export async function daemonRequest(path: string, method: string, params: Json =
 > {
   const health = await rpc(path, "health", {}, healthTimeoutMs);
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
+  if (process.platform === "win32") {
+    const token = await sessionToken();
+    const signature = health && typeof health === "object" ? (health as Json).signature : undefined;
+    if (!token || typeof signature !== "string" || signature !== healthSignature(token)) return { status: "unresponsive" };
+  }
   const result = await rpc(path, method, params, 30_000);
   return result === undefined ? { status: "unresponsive" } : { status: "available", result };
 }
@@ -278,7 +320,12 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
     const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
-    socket.once("connect", () => socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`));
+    socket.once("connect", () => {
+      void (async () => {
+        const token = process.platform === "win32" ? await sessionToken() : undefined;
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(token ? { _session_token: token } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
+      })().catch(() => done(undefined));
+    });
     socket.on("data", (part: string) => { buffer += part; const newline = buffer.indexOf("\n"); if (newline >= 0) { try { const reply = JSON.parse(buffer.slice(0, newline)) as Json; done(reply.error ? reply : reply.result); } catch { done(undefined); } } });
     socket.once("error", () => done(undefined)); socket.once("timeout", () => done(undefined));
   });

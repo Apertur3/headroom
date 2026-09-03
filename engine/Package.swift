@@ -18,7 +18,7 @@ let package = Package(
             path: "Sources/HeadroomEngine",
             linkerSettings: [.linkedFramework("Security")]),
         .executableTarget(
-            name: "headroom-keychain",
+            name: "headroom-claude-probe",
             path: "Sources/HeadroomKeychain",
             linkerSettings: [.linkedFramework("Security")]),
         .testTarget(
