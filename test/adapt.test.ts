@@ -26,8 +26,8 @@ describe("CodexBar Codex adapter", () => {
     expect(JSON.stringify(readings)).not.toContain("not-retained");
   });
 
-  it("keeps an upstream-null 5-hour Codex cap as a failed window", () => {
+  it("keeps an upstream-null 5-hour Codex cap as a non-enforced window", () => {
     const readings = adaptCodexPayload({ provider: "codex", source: "oauth", usage: { loginMethod: "pro", primary: null, secondary: { usedPercent: 3, resetsAt: "2026-09-10T15:08:00Z", windowMinutes: 10080 } } }, "codex-main", "2026-09-03T13:24:00Z");
-    expect(observationsFromReading(readings[0])).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", freshness: "failed", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, reason: "vendor returned no 5-hour window" }));
+    expect(observationsFromReading(readings[0])).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", freshness: "not_enforced", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, reason: "vendor returned no 5-hour window" }));
   });
 });

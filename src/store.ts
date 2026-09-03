@@ -19,7 +19,7 @@ type Row = Record<string, unknown>;
 function number(value: unknown): number | null { return typeof value === "number" ? value : value === null ? null : Number(value); }
 function string(value: unknown): string | null { return typeof value === "string" ? value : null; }
 
-async function safeTallyDirectory(home = tallyHome()): Promise<string> {
+export async function safeTallyDirectory(home = tallyHome()): Promise<string> {
   const requested = resolve(home);
   await mkdir(requested, { recursive: true, mode: 0o700 });
   const stat = await lstat(requested);
@@ -162,6 +162,12 @@ export class TallyStore {
   latest(meterId: string): StoredObservation | undefined {
     const row = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId);
     return row ? observationFromRow(row) : undefined;
+  }
+
+  latestAll(): StoredObservation[] {
+    return this.db.prepare(`SELECT * FROM observations WHERE id IN (
+      SELECT MAX(id) FROM observations GROUP BY meter_id, window_json
+    ) ORDER BY meter_id ASC, id ASC`).all().map(observationFromRow);
   }
 
   events(since: string): TallyEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }

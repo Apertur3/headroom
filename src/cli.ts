@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 import { readConsumes, readPolicy } from "./config.js";
-import { adaptCodexPayload } from "./engine/codexbar/adapt.js";
-import { engineStatus, installEngine, verifiedEnginePath } from "./engine/codexbar/install.js";
-import { runCodexBar } from "./engine/codexbar/run.js";
-import { observationsFromReading } from "./engine/observation.js";
-import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
+import { engineStatus, installEngine } from "./engine/codexbar/install.js";
+import { nativeEnginePath } from "./engine/native/run.js";
+import { pollAccounts } from "./collector.js";
+import { rpc, socketPath, TallyDaemon } from "./daemon.js";
+import { serveMcp } from "./mcp.js";
 import { canConsume, paceState } from "./policy.js";
-import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { safeError } from "./security.js";
+import { installService, uninstallService } from "./service.js";
 import { TallyStore } from "./store.js";
-import { isLocalAccount, type Observation, type PaceState, type ProviderAccount } from "./types.js";
+import { type Observation, type PaceState } from "./types.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -37,6 +38,7 @@ function label(observation: Observation): string {
 }
 
 function formatWindow(observation: Observation, state: PaceState): string {
+  if (state === "NOT_ENFORCED") return `${label(observation)} n/a`;
   if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN${observation.reason ? ` (${observation.reason})` : ""}`;
   return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}`;
 }
@@ -51,7 +53,7 @@ function formatMeters(observations: Observation[], policy: Awaited<ReturnType<ty
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
     const ordered = [...windows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
-    const freshness = ordered.every((item) => item.freshness === "fresh") ? "fresh" : ordered.some((item) => item.freshness === "failed") ? "failed" : "stale";
+    const freshness = ordered.every((item) => item.freshness === "fresh") ? "fresh" : ordered.some((item) => item.freshness === "failed") ? "failed" : ordered.some((item) => item.freshness === "stale") ? "stale" : "not enforced";
     return `${meter}  ${ordered.map((item) => formatWindow(item, paceState(item, policy))).join(" | ")}  (${freshness} ${age(ordered[0])})`;
   });
 }
@@ -60,6 +62,9 @@ async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: tally history <meter> [--since 24h]");
   const at = argv.indexOf("--since");
+  const request = await rpc(socketPath(), "history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
+  if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
+  directReadNotice();
   const store = await TallyStore.open();
   try {
     const items = store.history(meter, since(at >= 0 ? argv[at + 1] : undefined));
@@ -71,6 +76,9 @@ async function history(argv: string[]): Promise<number> {
 
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
+  const request = await rpc(socketPath(), "events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
+  if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
+  directReadNotice();
   const store = await TallyStore.open();
   try {
     const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
@@ -84,7 +92,14 @@ async function can(argv: string[]): Promise<number> {
   const action = argv[0];
   if (!action) throw new Error("Usage: tally can <action-class> [--allow-unknown]");
   const meters = (await readConsumes())[action];
-  if (!meters) throw new Error(`No consumes mapping for ${action}`);
+  if (!meters) throw new Error(`Unknown action class: ${action}`);
+  const request = await rpc(socketPath(), "can", { action_class: action, allow_unknown: argv.includes("--allow-unknown") });
+  if (request !== undefined) {
+    const decision = unwrapRpc(request) as { allowed: boolean; meter: string; state: PaceState };
+    console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state}`);
+    return decision.allowed ? 0 : 2;
+  }
+  directReadNotice();
   const [policy, store] = await Promise.all([readPolicy(), TallyStore.open()]);
   try {
     const latest = new Map(meters.map((meter) => [meter, store.latest(meter)]));
@@ -103,33 +118,54 @@ async function observe(argv: string[]): Promise<number> {
   if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 100)) throw new Error("--threshold must be 0 through 100");
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
-  const accounts = (await readAccounts()).filter((account) => !principal || account.name === principal);
-  const providerAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account));
-  const localAccounts = accounts.filter(isLocalAccount);
-  const observations: Observation[] = [];
-  const failures: string[] = [];
-  const native = await nativeEnginePath();
-  if (native) { try { observations.push(...await runNativeEngine(native, providerAccounts)); } catch (error) { failures.push(`native engine source failed: ${safeError(error)}`); } }
-  let engine: string | undefined;
-  for (const account of native ? [] : providerAccounts) {
-    if (account.adapter === "pending" || account.vendor !== "codex") { failures.push(`${account.name} source failed: native engine unavailable`); continue; }
-    try { engine ??= await verifiedEnginePath(); observations.push(...adaptCodexPayload((await runCodexBar(engine, account)).payload, account.name).flatMap(observationsFromReading)); }
-    catch (error) { failures.push(`${account.name} source failed: ${safeError(error)}`); }
+  const request = await rpc(socketPath(), "status");
+  const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
+  const { observations, failures, direct } = daemonObservations ? { observations: daemonObservations.filter((item) => !principal || item.principal_id === principal), failures: [], direct: false } : { ...(await pollAccounts(principal)), direct: true };
+  if (direct) directReadNotice();
+  const policy = await readPolicy();
+  if (direct) {
+    const store = await TallyStore.open();
+    try { store.insertAll(observations); store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok"); } finally { store.close(); }
   }
-  const now = new Date().toISOString();
-  for (const account of localAccounts) observations.push({ principal_id: account.name, meter_id: `${account.name}:capacity`, window: null, quantity: null, resets_at: null, observed_at: now, fetched_at: now, source: "engine:local", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: "pending", upstream_schema_version: "pending", reason: "adapter pending" });
-  const [policy, store] = await Promise.all([readPolicy(), TallyStore.open()]);
-  try { store.insertAll(observations); store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok"); } finally { store.close(); }
   if (argv.includes("--json")) console.log(JSON.stringify(observations));
   else { for (const line of formatMeters(observations, policy)) console.log(line); for (const failure of failures) console.log(failure); }
   if (threshold !== undefined && observations.some((item) => item.freshness === "fresh" && item.quantity && item.quantity.used >= threshold)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
 
+function unwrapRpc(value: unknown): unknown {
+  if (value && typeof value === "object" && "error" in value) {
+    const error = (value as { error?: { message?: unknown } }).error;
+    throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
+  }
+  return value;
+}
+
+function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }
+
+async function daemon(): Promise<number> {
+  const instance = await TallyDaemon.create();
+  await instance.start();
+  console.log(`tally daemon listening on ${socketPath()}`);
+  await new Promise<void>((resolve) => {
+    const stop = () => { void instance.stop().finally(resolve); };
+    process.once("SIGINT", stop); process.once("SIGTERM", stop);
+  });
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   if (argv[0] === "engine" && argv[1] === "install") { const result = await installEngine(); console.log(`engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256}${result.firstPin ? "; first pin recorded" : ""})`); return 0; }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.tally/engine/native/tally-engine (or engine/.build/release/tally-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
+  if (argv[0] === "daemon") return daemon();
+  if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }
+  if (argv[0] === "install-service") {
+    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: tally install-service [--dry-run]");
+    const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
+    console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`); return 0;
+  }
+  if (argv[0] === "uninstall-service") { const result = await uninstallService(); console.log(`removed ${result.path}\nTo unload it: ${result.command}`); return 0; }
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
