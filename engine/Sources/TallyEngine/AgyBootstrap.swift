@@ -9,18 +9,6 @@ enum AgyBootstrap {
     private static let pollNanoseconds: UInt64 = 500_000_000
 
     static func fetch(binaryHint: String) async throws -> AntigravitySnapshotFetch {
-        // Do not use the Core's broad `fetch()` here. That probe is deliberately
-        // willing to attach to an app or IDE language server and accept its
-        // GetUserStatus fallback. Tally needs the `agy` local quota-summary
-        // endpoint specifically; an already-warm user-owned `agy` is preferable
-        // to a second cold process as well.
-        let existingPIDs = existingAgyPIDs()
-        if !existingPIDs.isEmpty {
-            return try await AntigravitySnapshotWaiter.wait(
-                timeout: 15,
-                pollNanoseconds: 1_500_000_000,
-                fetch: { _ in try await fetchFromExistingAgy(pids: existingPIDs) })
-        }
         let binary = FileManager.default.isExecutableFile(atPath: binaryHint) ? binaryHint : "agy"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/script")
@@ -47,48 +35,12 @@ enum AgyBootstrap {
                     pollNanoseconds: 1_500_000_000,
                     fetch: { remaining in
                         let status = try await AntigravityStatusProbe(timeout: min(8, remaining)).fetchFromPorts(ports)
-                        return try AntigravitySnapshotFetch(status: status, source: "local-agy-spawned")
+                        return try AntigravitySnapshotFetch(status: status)
                     })
             }
             try await Task.sleep(nanoseconds: pollNanoseconds)
         }
         throw EngineError.noUsage
-    }
-
-    private static func existingAgyPIDs() -> [Int32] {
-        let ps = Process()
-        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-ax", "-o", "pid=,command="]
-        let output = Pipe()
-        ps.standardOutput = output
-        ps.standardError = Pipe()
-        do { try ps.run(); ps.waitUntilExit() } catch { return [] }
-        guard ps.terminationStatus == 0,
-              let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
-        else { return [] }
-
-        return text.split(whereSeparator: \.isNewline).compactMap { line -> Int32? in
-            let fields = line.split(maxSplits: 1, whereSeparator: \ .isWhitespace)
-            guard fields.count == 2,
-                  fields[1].range(of: #"(^|/)agy(?:\s|$)|antigravity[-_]cli"#, options: .regularExpression) != nil
-            else { return nil }
-            return Int32(fields[0])
-        }
-    }
-
-    private static func fetchFromExistingAgy(pids: [Int32]) async throws -> AntigravitySnapshotFetch {
-        var lastError: Error?
-        for pid in pids {
-            let ports = agyListeningPorts(rootPID: pid)
-            guard !ports.isEmpty else { continue }
-            do {
-                let status = try await AntigravityStatusProbe(timeout: 2).fetchFromPorts(ports)
-                return try AntigravitySnapshotFetch(status: status, source: "local-agy-existing")
-            } catch {
-                lastError = error
-            }
-        }
-        throw lastError ?? EngineError.noUsage
     }
 
     private static func agyListeningPorts(rootPID: Int32) -> [Int] {
@@ -138,40 +90,19 @@ enum AgyBootstrap {
 /// for the richer per-group weekly summary before presenting it as complete.
 struct AntigravitySnapshotFetch: Sendable {
     let usage: UsageSnapshot
-    let source: String
-    let fetchedAt: Date
-    let payloadKind: PayloadKind
 
-    enum PayloadKind: String, Sendable {
-        /// CodexBarCore marks rows parsed from RetrieveUserQuotaSummary with
-        /// this public quota-summary ID prefix.
-        case retrieveUserQuotaSummary = "RetrieveUserQuotaSummary"
-        /// GetUserStatus/GetCommandModelConfigs and OAuth's fetchAvailableModels
-        /// normalize into ordinary model windows, never summary-window IDs.
-        case availabilityOrFallback = "availability-or-fallback"
-    }
-
-    init(status: AntigravityStatusSnapshot, source: String) throws {
+    init(status: AntigravityStatusSnapshot) throws {
         self.usage = try status.toUsageSnapshot()
-        self.source = source
-        self.fetchedAt = Date()
-        self.payloadKind = AntigravitySnapshotWaiter.summaryWindows(in: self.usage).isEmpty
-            ? .availabilityOrFallback : .retrieveUserQuotaSummary
     }
 
-    init(usage: UsageSnapshot, source: String = "fixture", fetchedAt: Date = Date()) {
+    init(usage: UsageSnapshot) {
         self.usage = usage
-        self.source = source
-        self.fetchedAt = fetchedAt
-        self.payloadKind = AntigravitySnapshotWaiter.summaryWindows(in: usage).isEmpty
-            ? .availabilityOrFallback : .retrieveUserQuotaSummary
     }
 }
 
 enum AntigravitySnapshotWaiter {
     static let weeklyMinutes = 10_080
     static let expectedMeters: Set<String> = ["gemini", "claude-gpt"]
-    static let expectedMinutes: Set<Int> = [300, weeklyMinutes]
 
     static func wait(
         timeout: TimeInterval,
@@ -192,7 +123,7 @@ enum AntigravitySnapshotWaiter {
                 guard remaining > 0 else { break }
                 let snapshot = try await fetch(remaining)
                 lastSnapshot = snapshot
-                if isReady(snapshot) {
+                if isReady(snapshot.usage) {
                     return snapshot
                 }
             } catch {
@@ -210,50 +141,10 @@ enum AntigravitySnapshotWaiter {
     }
 
     static func isReady(_ usage: UsageSnapshot) -> Bool {
-        let lanes = Set(summaryWindows(in: usage).compactMap { row -> String? in
-            guard row.usageKnown,
-                  let meter = meter(for: row),
-                  let minutes = row.window.windowMinutes,
-                  expectedMinutes.contains(minutes)
-            else { return nil }
-            return "\(meter):\(minutes)"
-        })
-        let expected = Set(expectedMeters.flatMap { meter in
-            expectedMinutes.map { "\(meter):\($0)" }
-        })
-        return lanes.isSuperset(of: expected)
-    }
-
-    static func isReady(_ snapshot: AntigravitySnapshotFetch) -> Bool {
-        !isAvailabilityOnly(snapshot) && isReady(snapshot.usage)
-    }
-
-    /// CodexBarCore normalizes its true local summary into named rows whose IDs
-    /// use `isQuotaSummaryWindowID`. Everything else is an availability/model
-    /// fallback, including OAuth fetchAvailableModels. The second check catches
-    /// a known placeholder that synthesizes resets at fetch+window duration.
-    static func isAvailabilityOnly(_ snapshot: AntigravitySnapshotFetch) -> Bool {
-        if snapshot.payloadKind == .availabilityOrFallback { return true }
-        let windows = allWindows(in: snapshot.usage)
-        guard !windows.isEmpty else { return true }
-        if windows.allSatisfy({ $0.resetsAt == nil }) { return true }
-        if windows.allSatisfy({ $0.usedPercent == 0 && resetDescriptionIsEmpty($0) }) { return true }
-        return windows.allSatisfy { window in
-            guard let minutes = window.windowMinutes, let reset = window.resetsAt,
-                  window.usedPercent == 0 else { return false }
-            return abs(reset.timeIntervalSince(snapshot.fetchedAt.addingTimeInterval(TimeInterval(minutes * 60)))) <= 90
-        }
-    }
-
-    static func allWindows(in usage: UsageSnapshot) -> [RateWindow] {
-        let named = summaryWindows(in: usage).map(\.window)
-        return named.isEmpty
-            ? [usage.primary, usage.secondary, usage.tertiary].compactMap(\.self)
-            : named
-    }
-
-    static func resetDescriptionIsEmpty(_ window: RateWindow) -> Bool {
-        window.resetDescription?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+        let weeklyMeters = Set(summaryWindows(in: usage)
+            .filter { $0.window.windowMinutes == weeklyMinutes }
+            .compactMap { meter(for: $0) })
+        return weeklyMeters.isSuperset(of: expectedMeters)
     }
 
     static func summaryWindows(in usage: UsageSnapshot) -> [NamedRateWindow] {
