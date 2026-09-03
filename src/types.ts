@@ -97,4 +97,5 @@ export interface TallyEvent {
   corrected_by: string | null;
   meter_id: string | null;
   principal_id: string | null;
+  reason: string | null;
 }

@@ -1,7 +1,7 @@
 import { adaptCodexPayload } from "./engine/codexbar/adapt.js";
 import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
-import { observationsFromReading } from "./engine/observation.js";
+import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
@@ -31,5 +31,7 @@ export async function pollAccounts(principal?: string): Promise<PollResult> {
     } catch (error) { failures.push(`${account.name} source failed: ${safeError(error)}`); }
   }
   observations.push(...await Promise.all(localAccounts.map(observeLocal)));
-  return { observations, failures };
+  // This is the shared boundary for native and fallback engines. Keep this
+  // defensive normalization here as adapters may be added outside this module.
+  return { observations: normalizeObservations(observations), failures };
 }

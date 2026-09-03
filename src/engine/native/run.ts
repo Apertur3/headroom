@@ -8,6 +8,7 @@ import { tallyHome } from "../../paths.js";
 import { redact } from "../../security.js";
 import type { Observation, ProviderAccount } from "../../types.js";
 import { readEngineLock } from "../codexbar/install.js";
+import { normalizeObservations } from "../observation.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -44,7 +45,7 @@ export async function runNativeEngine(enginePath: string, accounts: ProviderAcco
 export function parseObservations(text: string): Observation[] {
   const value: unknown = JSON.parse(text);
   if (!Array.isArray(value) || !value.every(isObservation)) throw new Error("Native engine returned invalid observation JSON");
-  return value;
+  return normalizeObservations(value);
 }
 
 function isObservation(value: unknown): value is Observation {

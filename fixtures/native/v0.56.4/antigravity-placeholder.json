@@ -1,0 +1,32 @@
+[
+  {
+    "upstream_schema_version": "v0.56.4",
+    "confidence": 1,
+    "quantity": { "unit": "percent", "remaining": 100, "used": 0, "limit": 100 },
+    "source": "engine:native:antigravity",
+    "window": { "enforcement": "hard", "kind": "fixed", "minutes": 300 },
+    "adapter_version": "0.1.0",
+    "freshness": "fresh",
+    "fetched_at": "2026-09-03T19:38:37Z",
+    "principal_id": "antigravity",
+    "meter_id": "antigravity:gemini",
+    "observed_at": "2026-09-03T19:38:37Z",
+    "resets_at": "2026-09-04T00:38:37Z",
+    "truth": "official"
+  },
+  {
+    "upstream_schema_version": "v0.56.4",
+    "confidence": 1,
+    "quantity": { "unit": "percent", "remaining": 100, "used": 0, "limit": 100 },
+    "source": "engine:native:antigravity",
+    "window": { "enforcement": "hard", "kind": "fixed", "minutes": 10080 },
+    "adapter_version": "0.1.0",
+    "freshness": "fresh",
+    "fetched_at": "2026-09-03T19:38:37Z",
+    "principal_id": "antigravity",
+    "meter_id": "antigravity:gemini",
+    "observed_at": "2026-09-03T19:38:37Z",
+    "resets_at": "2026-09-10T19:38:37Z",
+    "truth": "official"
+  }
+]
