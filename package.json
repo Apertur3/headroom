@@ -1,6 +1,6 @@
 {
   "name": "headroomd",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.1",
   "description": "Your agents know their budget: live quota, resets and pace states for every AI subscription and account, over CLI, daemon and MCP.",
   "keywords": [
     "claude",
@@ -26,29 +26,37 @@
   "author": "the maintainer Hermans",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0 <23.0.0 || >=23.4.0"
   },
   "bin": {
-    "headroom": "dist/cli.js"
+    "headroom": "bin/headroom.js"
   },
   "files": [
     "dist",
+    "bin",
     "engine.lock.json",
     "README.md",
+    "LICENSE",
     "SECURITY.md",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md",
+    "examples",
+    "skills",
+    "docs/*.md",
+    "docs/assets/*.svg"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "engine:build": "bash scripts/build-engine.sh"
+    "engine:build": "bash scripts/build-engine.sh",
+    "smoke-cold": "bash scripts/smoke-cold.sh",
+    "release:check": "bash scripts/release-check.sh"
   },
   "devDependencies": {
     "@types/node": "20.19.43",
     "typescript": "5.9.3",
     "vitest": "2.1.9"
-  },
-  "private": true
+  }
 }

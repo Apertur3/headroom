@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+      - run: bash scripts/smoke-cold.sh
+
+  tarball:
+    name: build npm tarball
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      filename: ${{ steps.pack.outputs.filename }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Resolve release version
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          tag_version="${tag#v}"
+          pkg_version="$(node -p 'require("./package.json").version')"
+          if [[ "$tag_version" != "$pkg_version" ]]; then
+            echo "::error::Tag $tag does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "version=$pkg_version" >> "$GITHUB_OUTPUT"
+      - name: npm pack
+        id: pack
+        run: |
+          mkdir -p dist-release
+          filename="$(npm pack --silent --pack-destination dist-release)"
+          echo "filename=$filename" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: dist-release/*.tgz
+          retention-days: 14
+
+  release:
+    name: create GitHub release
+    needs: tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-tarball
+          path: dist-release
+      - name: Extract changelog section
+        id: changelog
+        env:
+          VERSION: ${{ needs.tarball.outputs.version }}
+        run: |
+          notes_file="$(mktemp)"
+          # Prefer an exact "## [VERSION]" section; fall back to "## [Unreleased]"
+          # for a release cut straight from the pending log. Plain substring
+          # matching (index()) avoids regex-escaping the version string.
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1; next }
+            found { if ($0 ~ /^## \[/) exit; print }
+          ' CHANGELOG.md > "$notes_file"
+          if [[ ! -s "$notes_file" ]]; then
+            awk '
+              index($0, "## [Unreleased]") == 1 { found = 1; next }
+              found { if ($0 ~ /^## \[/) exit; print }
+            ' CHANGELOG.md > "$notes_file"
+          fi
+          if [[ ! -s "$notes_file" ]]; then
+            echo "::error::No CHANGELOG.md section found for version $VERSION (looked for '## [$VERSION]', fell back to '## [Unreleased]'). Add a changelog entry before tagging."
+            exit 1
+          fi
+          echo "path=$notes_file" >> "$GITHUB_OUTPUT"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.tarball.outputs.version }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          prerelease_flag=()
+          [[ "$VERSION" == *-* ]] && prerelease_flag=(--prerelease)
+          gh release create "$tag" \
+            --title "v$VERSION" \
+            --notes-file "${{ steps.changelog.outputs.path }}" \
+            "${prerelease_flag[@]}" \
+            dist-release/*.tgz
+
+  publish:
+    name: publish to npm
+    needs: [tarball, release]
+    runs-on: ubuntu-latest
+    env:
+      # A step-level `if: secrets.X != ''` is unreliable (secrets aren't a
+      # valid context there); mirror it into env once at job level instead.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Skip notice
+        if: ${{ env.NPM_TOKEN == '' }}
+        run: echo "::notice title=npm publish skipped::NPM_TOKEN is not configured; the GitHub release was created but nothing was published to npm."
+      - uses: actions/checkout@v4
+        if: ${{ env.NPM_TOKEN != '' }}
+      - uses: actions/setup-node@v4
+        if: ${{ env.NPM_TOKEN != '' }}
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        if: ${{ env.NPM_TOKEN != '' }}
+        with:
+          name: npm-tarball
+          path: dist-release
+      - name: npm publish
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
+          VERSION: ${{ needs.tarball.outputs.version }}
+        run: |
+          tarball="$(ls dist-release/*.tgz)"
+          tag="latest"
+          [[ "$VERSION" == *-* ]] && tag="beta"
+          npm publish "$tarball" --provenance --access public --tag "$tag"
