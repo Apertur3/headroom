@@ -108,7 +108,7 @@ export class HeadroomStore {
     // its writer; the busy timeout turns a short writer handoff into a wait,
     // rather than an immediate "database is locked" failure.
     db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
-    store.migrate();
+    await store.migrate(resolve(path, ".."));
     const legacy = await legacyDatabasePath(resolve(path, ".."));
     if (legacy) await store.mergePriorDatabase(legacy, resolve(path, ".."));
     if (process.platform !== "win32") for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
@@ -143,7 +143,7 @@ export class HeadroomStore {
     await appendDaemonLog(`migration: merged ${["ta", "lly.db"].join("")} observations=${legacyCount} into headroom.db observations=${currentCount}; removed legacy database`, home);
   }
 
-  private migrate(): void {
+  private async migrate(home: string): Promise<void> {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY, principal_id TEXT NOT NULL, meter_id TEXT NOT NULL,
@@ -182,6 +182,7 @@ export class HeadroomStore {
     try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
     catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
     this.removeFalseResetSeenEvents();
+    await this.backfillResetEvents(home);
   }
 
   /** Remove the transient reset labels caused by rolling zero-use windows whose
@@ -210,6 +211,40 @@ export class HeadroomStore {
     this.db.prepare("INSERT INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
   }
 
+  /** Re-evaluate the last 7 days of observations per meter and window with the
+   * current baseline and classification rules, so a principal that failed
+   * across a real reset or a free reset still gets its event, even though the
+   * original poll-time comparison only ever looked at the immediately prior
+   * row. Also deletes reset evidence wrongly attributed to local pools, which
+   * have no vendor reset schedule and must never carry reset events. Runs once. */
+  private async backfillResetEvents(home: string): Promise<void> {
+    const migration = "2026-09-04-reset-detection-backfill";
+    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    const localEvents = this.db.prepare(`SELECT DISTINCT e.id AS id FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.kind IN ('reset_seen', 'free_reset_used') AND json_extract(o.window_json, '$.kind') = 'state'`).all();
+    for (const row of localEvents) this.db.prepare("DELETE FROM events WHERE id = ?").run(String(row.id));
+
+    const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    const rows = this.db.prepare("SELECT * FROM observations WHERE freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(since);
+    const beforeCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
+    for (const row of rows) {
+      const current = observationFromRow(row);
+      const baseline = this.freshBaseline(current);
+      if (baseline) this.classifyUsageDrop(baseline, current);
+    }
+    const afterCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
+    const summary = `reset detection backfill: reprocessed ${rows.length} fresh observations since ${since}; removed ${localEvents.length} local-pool reset events; inserted ${afterCount - beforeCount} reset events`;
+    this.audit("migration", "backfill_reset_events", null, summary);
+    // Record completion before the only await in this method: two stores can
+    // open the same database concurrently, and nothing may yield between the
+    // "not yet run" check above and marking it run, or both would redo it and
+    // the second commit would collide on the schema_migrations primary key.
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
+    await appendDaemonLog(summary, home);
+  }
+
   insert(observation: Observation): StoredObservation {
     const previous = this.previous(observation);
     const result = this.db.prepare(`INSERT INTO observations
@@ -221,6 +256,10 @@ export class HeadroomStore {
     const stored: StoredObservation = { ...observation, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.addSourceFailedEvent([stored.id], stored);
+    // The first reading ever stored under this exact meter id has no immediate
+    // previous row, even though the legacy doubled-principal form of the same
+    // meter does; the baseline lookup below checks that form on its own.
+    else if (stored.freshness === "fresh") { const baseline = this.freshBaseline(stored); if (baseline) this.classifyUsageDrop(baseline, stored); }
     if (previous) this.attributeLeaseSpend(previous, stored);
     return stored;
   }
@@ -237,7 +276,9 @@ export class HeadroomStore {
   private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null): void {
     const created = current.fetched_at;
     const id = `${kind}:${current.id}`;
-    this.db.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
+    // OR IGNORE keeps the reset-detection backfill idempotent: replaying it
+    // over already-classified observations must not error on a repeat id.
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason);
   }
 
@@ -246,26 +287,75 @@ export class HeadroomStore {
     this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null);
   }
 
+  /** The comparison baseline for a fresh observation is the most recent FRESH
+   * observation of the same meter and window within 7 days, skipping any
+   * failed or not_enforced rows in between (a principal parked mid-outage
+   * must still be compared against its last real reading once it recovers).
+   * Also accepts the legacy `<principal>:<principal>:<meter>` meter id an
+   * earlier engine emitted, so older history still counts as a baseline. */
+  private freshBaseline(current: StoredObservation): StoredObservation | undefined {
+    const window = current.window ? JSON.stringify(current.window) : null;
+    const since = new Date(Date.parse(current.fetched_at) - 7 * 86_400_000).toISOString();
+    const lookup = (meterId: string): Row | undefined => this.db.prepare(`SELECT * FROM observations
+      WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
+        AND freshness = 'fresh' AND id < ? AND fetched_at >= ?
+      ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(meterId, window, window, current.id, since);
+    const row = lookup(current.meter_id) ?? lookup(`${current.principal_id}:${current.meter_id}`);
+    return row ? observationFromRow(row) : undefined;
+  }
+
+  /** Classify a usage drop of more than 50%, or non-zero to zero, against its
+   * fresh baseline. Local pools (window kind `state`) and credit counts (kind
+   * `count`, handled by the vendor-reported credits path below) never carry
+   * reset evidence. A window's reset timestamp normally moves forward by
+   * about as much real time as passed between the two readings (a rolling
+   * window recomputes it as fetch time plus duration on every poll); a jump
+   * bigger than that elapsed time is a real reset, while a timestamp that
+   * held still even though usage already fell is a free reset fired ahead of
+   * the scheduled one. A baseline older than 24h lowers confidence, since the
+   * gap could hide more than one reset. */
+  private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation): void {
+    if (current.window?.kind === "state" || current.window?.kind === "count") return;
+    if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
+    const oldUsed = baseline.quantity.used;
+    const newUsed = current.quantity.used;
+    if (!(oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5))) return;
+    const previousReset = baseline.resets_at ? Date.parse(baseline.resets_at) : Number.NaN;
+    const currentReset = current.resets_at ? Date.parse(current.resets_at) : Number.NaN;
+    if (!Number.isFinite(previousReset) || !Number.isFinite(currentReset)) return;
+    const elapsedMs = Date.parse(current.fetched_at) - Date.parse(baseline.fetched_at);
+    const resetDeltaMs = currentReset - previousReset;
+    const toleranceMs = 60_000;
+    const resetsAdvanced = resetDeltaMs > elapsedMs + toleranceMs;
+    const resetsUnchanged = Math.abs(resetDeltaMs) <= toleranceMs;
+    const beforeScheduledReset = resetsUnchanged && Date.parse(current.fetched_at) < previousReset;
+    if (!resetsAdvanced && !beforeScheduledReset) return;
+    const evidence = [baseline.id, current.id];
+    const stale = elapsedMs > 24 * 3_600_000;
+    const staleHours = Math.floor(elapsedMs / 3_600_000);
+    const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
+    if (resetsAdvanced) this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null));
+    else this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
+  }
+
   private detectEvents(previous: StoredObservation, current: StoredObservation): void {
     const evidence = [previous.id, current.id];
     if (previous.freshness === "failed") {
-      if (current.freshness === "fresh") {
-        const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
-        this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
-      }
+      if (current.freshness !== "fresh") return; // still down, or recovered into an unenforced/stale read
+      const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
+      this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
+      const baseline = this.freshBaseline(current);
+      if (baseline) this.classifyUsageDrop(baseline, current);
       return;
     }
     if (current.freshness === "failed") {
       this.addSourceFailedEvent(evidence, current);
       return;
     }
-    const oldUsed = previous.quantity?.used;
-    const newUsed = current.quantity?.used;
-    const bothFresh = previous.freshness === "fresh" && current.freshness === "fresh";
-    // Rolling windows may synthesize `resets_at` as now + duration on every
-    // fetch. A timestamp change is therefore never reset evidence on its own.
-    const dropped = oldUsed !== undefined && newUsed !== undefined && oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5);
-    if (bothFresh && dropped) this.addEvent("reset_seen", "inferred", 0.5, evidence, current);
+    if (current.freshness === "fresh") {
+      const baseline = this.freshBaseline(current);
+      if (baseline) this.classifyUsageDrop(baseline, current);
+    }
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
@@ -382,19 +472,32 @@ export class HeadroomStore {
 
   /** Latest reset evidence for each current meter/window, limited to that window. */
   resetSeenFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {
+    return this.eventEvidenceFor("reset_seen", observations, now);
+  }
+
+  /** Latest free-reset evidence for each current meter/window, limited to that window. */
+  freeResetUsedFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {
+    return this.eventEvidenceFor("free_reset_used", observations, now);
+  }
+
+  private eventEvidenceFor(kind: "reset_seen" | "free_reset_used", observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now: Date): Map<string, string> {
     const output = new Map<string, string>();
     for (const observation of observations) {
       const minutes = observation.window?.minutes;
       if (!minutes) continue;
       const reset = observation.resets_at ? Date.parse(observation.resets_at) : Number.NaN;
       const start = Number.isFinite(reset) ? reset - minutes * 60_000 : now.getTime() - minutes * 60_000;
+      // julianday() rather than a plain string range: an event's created_at is
+      // an observation's fetched_at verbatim, which is not guaranteed to carry
+      // milliseconds, and ISO timestamps only sort lexicographically when every
+      // value shares the same precision.
       const row = this.db.prepare(`SELECT e.created_at FROM events e
         JOIN json_each(e.evidence_observation_ids) evidence
         JOIN observations o ON o.id = evidence.value
-        WHERE e.kind = 'reset_seen' AND e.meter_id = ?
+        WHERE e.kind = ? AND e.meter_id = ?
           AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) = ?
-          AND e.created_at >= ? AND e.created_at <= ?
-        ORDER BY e.created_at DESC LIMIT 1`).get(observation.meter_id, minutes, new Date(start).toISOString(), now.toISOString());
+          AND julianday(e.created_at) >= julianday(?) AND julianday(e.created_at) <= julianday(?)
+        ORDER BY e.created_at DESC LIMIT 1`).get(kind, observation.meter_id, minutes, new Date(start).toISOString(), now.toISOString());
       if (row?.created_at && typeof row.created_at === "string") output.set(`${observation.meter_id}:${minutes}`, row.created_at);
     }
     return output;

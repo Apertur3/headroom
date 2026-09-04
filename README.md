@@ -51,12 +51,11 @@ Not on npm yet. Until the first release, clone the repo, run `npm install && npm
 use `node dist/cli.js` where the commands below say `npx headroomd`.
 
 ```sh
-npx headroomd engine install     # pin and verify the sensing engine
 npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity
+npx headroomd doctor             # one-line installation and daemon diagnostics
 npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
 npx headroomd                    # one line per meter
 npx headroomd install-service    # launchd, systemd user unit, or Windows Task Scheduler
-npx headroomd doctor             # one-line installation and daemon diagnostics
 ```
 
 Register the MCP server in each Claude Code profile:
@@ -67,6 +66,14 @@ CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
 ```
 
 Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your skills directory.
+Full walkthrough, including what each step grants and why: [docs/quickstart.md](docs/quickstart.md).
+
+## Documentation
+
+- [docs/quickstart.md](docs/quickstart.md): clone to first truthful line, macOS, Linux and Windows
+- [docs/concepts.md](docs/concepts.md): principal, meter, window, observation, pace states, leases, events
+- [docs/mcp-and-agents.md](docs/mcp-and-agents.md): the MCP tools, example calls, and how an orchestrator should use them
+- [docs/vendors.md](docs/vendors.md): what Headroom reads per vendor, and its known live limitations
 
 ## Security
 
@@ -80,11 +87,11 @@ is pinned and checksum verified, and every query lands in an audit log. Details 
 
 ## Status
 
-Pre-alpha. Verified daily on one machine with two Claude config dirs, one Codex home, one
-Antigravity account and two local inference boxes. Vendor endpoints are private and change
-without notice; Headroom pins, records fixtures, backs off on 401, 403 and 429, and prints UNKNOWN
-instead of a stale number. Google can reject the remote Antigravity fallback for unsupported
-Gemini Code Assist tiers (for example `UNSUPPORTED_CLIENT`); keep the daemon running so its warm
-`agy` source remains available.
+Beta. Verified daily on one macOS machine with two Claude config dirs, one Codex home, one
+Antigravity account and two local inference boxes; Linux and Windows are verified through CI, not
+yet by hand. Vendor endpoints are private and change without notice; Headroom pins, records
+fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Google can
+reject the remote Antigravity fallback for unsupported Gemini Code Assist tiers (for example
+`UNSUPPORTED_CLIENT`); keep the daemon running so its warm `agy` source remains available.
 
 MIT. Third party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

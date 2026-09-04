@@ -46,16 +46,17 @@ function label(observation: Observation): string {
 
 function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
 
-function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string): string {
+function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string): string {
   if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
     const available = observation.quantity.remaining ?? 0;
     const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
     const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)})` : "";
     return `credits ${available} available${expiry}`;
   }
+  const evidence = `${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed)}` : ""}`;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
-  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}`;
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}`;
+  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}${evidence}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -107,7 +108,7 @@ export function thresholdReport(observations: Observation[], threshold: number):
   });
 }
 
-export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>(), leases = new Map<string, Lease[]>()): string[] {
+export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>(), leases = new Map<string, Lease[]>(), freeResetUsed = new Map<string, string>()): string[] {
   const meters = new Map<string, Observation[]>();
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
@@ -119,7 +120,7 @@ export function formatMeters(observations: Observation[], policy: Awaited<Return
     const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy);
-      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)));
+      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)));
     }).join(" | ")}  (${freshness} ${age(ordered[0])})${leaseLabel}`;
   });
 }
@@ -142,22 +143,33 @@ async function history(argv: string[]): Promise<number> {
 
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
+  const table = argv.includes("--table");
   const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { printEvents(unwrapRpc(request) as HeadroomEvent[]); return 0; }
+  if (request !== undefined) { printEventsOutput(unwrapRpc(request) as HeadroomEvent[], table); return 0; }
   directReadNotice();
   const store = await HeadroomStore.open();
   try {
     const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
     store.audit("cli", "events", null, "ok");
-    printEvents(items);
+    printEventsOutput(items, table);
     return 0;
   } finally { store.close(); }
+}
+
+/** The default output is always a JSON array, empty allowed, so a scripted
+ * caller never has to special-case a quiet period. --table is the only path
+ * to the human-readable rendering. */
+export function printEventsOutput(items: HeadroomEvent[], table: boolean): void {
+  if (!table) { console.log(JSON.stringify(items)); return; }
+  printEvents(items);
 }
 
 function printEvents(items: HeadroomEvent[]): void {
   for (const item of items) {
     const subject = item.meter_id ?? item.principal_id ?? "-";
-    const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}` : item.kind;
+    const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}`
+      : item.kind === "free_reset_used" ? `free reset used ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
+      : item.kind;
     console.log(`${subject}  ${event} (${item.origin}, ${Math.round(item.confidence * 100)}%)`);
   }
 }
@@ -253,6 +265,7 @@ async function observe(argv: string[]): Promise<number> {
   let observations: Observation[];
   let failures: string[];
   let resetSeen = new Map<string, string>();
+  let freeResetUsed = new Map<string, string>();
   let leases: Lease[] = [];
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
@@ -268,20 +281,24 @@ async function observe(argv: string[]): Promise<number> {
       store.insertAll(polled.observations);
       observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       resetSeen = store.resetSeenFor(observations);
+      freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
   if (!direct) {
-    const resetEvents = unwrapRpc(await requestDaemon("reset_seen", { windows: observations.map((item) => ({ meter_id: item.meter_id, minutes: item.window?.minutes, resets_at: item.resets_at })) })) as Record<string, string>;
+    const windows = observations.map((item) => ({ meter_id: item.meter_id, minutes: item.window?.minutes, resets_at: item.resets_at }));
+    const resetEvents = unwrapRpc(await requestDaemon("reset_seen", { windows })) as Record<string, string>;
     resetSeen = new Map(Object.entries(resetEvents));
+    const freeResetEvents = unwrapRpc(await requestDaemon("free_reset_used", { windows })) as Record<string, string>;
+    freeResetUsed = new Map(Object.entries(freeResetEvents));
   }
   if (direct) directReadNotice();
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
   if (argv.includes("--json")) console.log(JSON.stringify(thresholdRows === undefined ? { observations, leases } : { observations, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }));
-  else { for (const line of formatMeters(observations, policy, resetSeen, leaseMap)) console.log(line); for (const failure of failures) console.log(failure); }
+  else { for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line); for (const failure of failures) console.log(failure); }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
