@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
+import { agyLoginStateFromLog, AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
 import { selectAntigravitySource } from "../src/collector.js";
 import type { Observation } from "../src/types.js";
 
@@ -47,6 +47,10 @@ describe("agy keepalive", () => {
     const supervisor = new AgyKeepaliveSupervisor({ binary: "/tmp/fake agy", platform: "darwin", spawn });
     supervisor.start();
     expect(spawn).toHaveBeenCalledWith("/usr/bin/script", ["-q", "/dev/null", "/tmp/fake agy"], expect.objectContaining({ stdio: "ignore" }));
+    const environment = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
+    expect(environment.HEADROOM_ROUTING).toBeUndefined();
+    expect(environment.HTTP_PROXY).toBeUndefined();
+    expect(environment.PATH).toBe(process.env.PATH);
     expect(supervisor.running).toBe(true);
     supervisor.stop();
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
@@ -69,5 +73,25 @@ describe("agy keepalive", () => {
       supervisor.stop();
       vi.useRealTimers();
     }
+  });
+
+  it("reads login state from the newest fake agy log without inspecting credentials", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-log-")); temporary.push(root);
+    const old = join(root, "cli-old.log");
+    const newest = join(root, "cli-new.log");
+    await writeFile(join(root, "fake-agy"), "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(old, "applyAuthResult authMethod=consumer\n");
+    await writeFile(newest, "error getting token source: You are not logged into Antigravity\n");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await writeFile(newest, "error getting token source: You are not logged into Antigravity\n");
+    await expect(agyLoginStateFromLog(root)).resolves.toBe("not_logged_in");
+    const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
+    const supervisor = new AgyKeepaliveSupervisor({ binary: join(root, "fake-agy"), platform: "darwin", spawn: vi.fn(() => child) as never, logDirectory: root, logPollIntervalMs: 5, logWatchMs: 100 });
+    try {
+      supervisor.start();
+      await vi.waitFor(() => expect(supervisor.loginState).toBe("not_logged_in"));
+      await writeFile(newest, "applyAuthResult authMethod=consumer\n");
+      await vi.waitFor(() => expect(supervisor.loginState).toBe("logged_in"));
+    } finally { supervisor.stop(); }
   });
 });

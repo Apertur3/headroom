@@ -97,7 +97,7 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   if (daemon.status === "available") {
     output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
     output.push(check("OK", "daemon health", "responding", "no action needed"));
-    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
+    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
     const antigravity = accounts.find((account) => !isLocalAccount(account) && account.vendor === "antigravity");
     const keepalive = health.keepalive;
     if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
@@ -106,7 +106,10 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       const local = antigravity ? keepalive.local_reads?.[antigravity.name] : undefined;
       const uptime = keepalive.uptime_ms === undefined || keepalive.uptime_ms === null ? "?" : `${Math.floor(keepalive.uptime_ms / 1000)}s`;
       const read = local ? `; local ${local.outcome ?? "unknown"} (${local.payload_kind ?? "unknown"})` : "; local read not recorded yet";
-      output.push(check("OK", "Antigravity keepalive", `agy supervisor process ${keepalive.pid} running ${uptime}${read}`, "no action needed"));
+      const state = keepalive.login_state === "logged_in" ? "logged in" : keepalive.login_state === "not_logged_in" ? "not logged in" : "login state pending";
+      const level: DoctorLevel = keepalive.login_state === "not_logged_in" ? "WARN" : "OK";
+      const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : "no action needed";
+      output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
     }
     else output.push(check("FAIL", "Antigravity keepalive", "agy process is not running", "set antigravity_keepalive = true and restart headroom service"));
   } else {
