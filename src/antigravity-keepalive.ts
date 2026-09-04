@@ -159,4 +159,6 @@ export class AgyKeepaliveSupervisor {
   }
 }
 
-function shellQuote(value: string): string { return `'${value.replace(/'/g, "'\\\"'\\\"'")}'`; }
+/** POSIX single-quote escaping: end the quoted string, emit a literal quote
+ * via a backslash outside of any quoting, then resume the quoted string. */
+function shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }

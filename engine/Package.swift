@@ -1,11 +1,17 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-let codexBarTag = "v0.56.4"
-// Offline development uses the unpacked, pinned checkout. Release builds change only this
-// line to: .package(url: "https://github.com/steipete/codexbar", exact: codexBarTag)
-let codexBar: Package.Dependency = .package(
-    path: "/private/tmp/claude-501/-Users-you/32cd283c-3538-4728-bb8e-5a7047cc2490/scratchpad/codexbar")
+// Pinned to the same release as engine.lock.json's CodexBarCLI assets, so the
+// Swift engine and the downloaded CLI stay on one upstream version. This is a
+// real network dependency: building this package fetches source from GitHub.
+//
+// Pinned by commit (the exact commit the "v0.56.4" tag points to) rather than
+// `exact: "0.56.4"`: CodexBar itself depends on an unstable (revision-pinned)
+// package, and SwiftPM refuses to resolve a stable-version dependency (exact/
+// from) whose own dependency graph contains an unstable one. A revision pin
+// is treated as unstable too, so resolution succeeds; it is exactly as fixed
+// a reference as a tag.
+let codexBar: Package.Dependency = .package(url: "https://github.com/steipete/codexbar", revision: "fb9d295304af2873803b317ac1e3adb07b414083")
 
 let package = Package(
     name: "HeadroomEngine",
@@ -23,6 +29,10 @@ let package = Package(
             linkerSettings: [.linkedFramework("Security")]),
         .testTarget(
             name: "HeadroomEngineTests",
-            dependencies: ["headroom-engine"],
-            path: "Tests/HeadroomEngineTests")
+            dependencies: ["headroom-engine", .product(name: "CodexBarCore", package: "codexbar")],
+            path: "Tests/HeadroomEngineTests"),
+        .testTarget(
+            name: "HeadroomClaudeProbeTests",
+            dependencies: ["headroom-claude-probe"],
+            path: "Tests/HeadroomClaudeProbeTests")
     ])

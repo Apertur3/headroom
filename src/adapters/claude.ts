@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { allowedOutbound, redact } from "../security.js";
+import { outboundFetch, redact } from "../security.js";
 import { assertVendorResponseLimits, vendorJson } from "../limits.js";
 import { credentialPath } from "../paths.js";
 import { executablePath } from "../paths.js";
@@ -176,7 +176,7 @@ export async function claudeResponseShape(account: ProviderAccount, dependencies
   try { credential = parseClaudeCredential(payload, now); }
   catch { throw new Error(`credentials invalid; ${claudeCommand(account)}`); }
   if (credential.expired) throw new Error(`token expired; ${claudeCommand(account)}`);
-  const response = await (dependencies.fetch ?? fetch)(new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+  const response = await outboundFetch(dependencies.fetch ?? fetch, new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
   if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
   return shape(await vendorJson(response));
 }
@@ -194,8 +194,8 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     credentialLoaded = true;
     const credential = parseClaudeCredential(payload, now);
     if (credential.expired) return failed(account, `token expired; ${claudeCommand(account)}`, timestamp);
-    const request = new Request(allowedOutbound("https://api.anthropic.com/api/oauth/usage").toString(), { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
-    const response = await (dependencies.fetch ?? fetch)(request);
+    const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const response = await outboundFetch(dependencies.fetch ?? fetch, request);
     if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
     return observationsFromClaudeUsage(await vendorJson(response), account, now);
   } catch (error) {

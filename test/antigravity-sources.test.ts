@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -55,6 +56,27 @@ describe("agy keepalive", () => {
     supervisor.stop();
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(supervisor.running).toBe(false);
+  });
+
+  it("quotes a quote and a semicolon so the Linux script -qefc command cannot break out", () => {
+    const malicious = "echo pwned; touch /tmp/headroom-shellquote-poc; exit 3'; echo also-pwned #";
+    const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
+    const spawn = vi.fn(() => child) as never;
+    const supervisor = new AgyKeepaliveSupervisor({ binary: malicious, platform: "linux", spawn });
+    supervisor.start();
+    const args = (spawn.mock.calls[0] as unknown as [string, string[], unknown])[1];
+    expect(args[0]).toBe("-qefc");
+    const quoted = args[1];
+    expect(quoted).not.toBe(malicious);
+    // `script -qefc <command>` on Linux hands <command> to a shell verbatim.
+    // Feeding the quoted token through a real shell here proves the embedded
+    // quote and semicolons stay literal instead of ending the quoted string
+    // and starting a second, attacker-controlled command.
+    let exitCode = 0;
+    try { execFileSync("/bin/sh", ["-c", quoted], { stdio: "pipe" }); }
+    catch (error) { exitCode = (error as { status?: number }).status ?? -1; }
+    expect(exitCode).not.toBe(3); // exit 3 would mean the injected "exit 3" ran on its own
+    supervisor.stop();
   });
 
   it("restarts after its owned PTY exits with bounded backoff", () => {

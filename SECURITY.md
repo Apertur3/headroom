@@ -45,6 +45,22 @@ cookies, which unlock paid subscriptions.
     Antigravity source. The remote Google OAuth fallback is only available to accounts
     whose Gemini Code Assist tier is still served; a vendor refusal includes its HTTP
     status and redacted reason code/message, but never the OAuth token or email address.
+14. **Lease ownership is cooperative, not authenticated.** A lease's `owner` is a
+    client-supplied string, not a credential. Node's `net` module exposes no peer
+    credentials API (no `SO_PEERCRED`/`LOCAL_PEERCRED` equivalent) for a Unix domain
+    socket connection, so the daemon cannot cryptographically bind a lease to the
+    process that started it. Given rule 3's threat model (single-user machine, mode-0600
+    socket), the practical guarantee is: only processes running as the same OS user can
+    reach the socket at all, and every call already carries the caller's self-reported
+    pid and `argv[1]` (see `callerFrom` in `src/daemon.ts`), recorded in the audit row
+    beside the lease owner and meter. The MCP stdio server strengthens this further,
+    since it serves exactly one client per process: a lease started without an explicit
+    `owner` is bound to `<client name>#<session id>`, a session id assigned once per
+    `initialize` call, and `force`-ending another owner's lease over MCP requires
+    `confirm_force: true` plus a non-empty `reason` string, both audited. None of this
+    stops a misbehaving process running as the same user from claiming any owner string
+    it likes; it stops accidental cross-orchestrator lease collisions, which is the
+    threat that actually occurs in practice.
 
 ## Out of scope
 

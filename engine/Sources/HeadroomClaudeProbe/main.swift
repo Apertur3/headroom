@@ -6,6 +6,33 @@ import CryptoKit
 import FoundationNetworking
 #endif
 
+/// The only host this probe will ever hand the bearer token to, and the only
+/// host a successful response is trusted to have come from.
+let anthropicUsageHost = "api.anthropic.com"
+
+/// True only when `url`'s host is exactly `api.anthropic.com`. Used both to
+/// build the request and, after the fact, to check where the response
+/// actually came from once redirects are refused.
+func isAnthropicUsageHost(_ url: URL?) -> Bool {
+    url?.host == anthropicUsageHost
+}
+
+/// A value containing an email address must never reach stdout, regardless of
+/// which JSON key it sits under.
+func containsEmailAddress(_ value: String) -> Bool {
+    value.range(of: #"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"#, options: .regularExpression) != nil
+}
+
+/// Cancels every HTTP redirect. `URLSession.shared` follows redirects and
+/// re-sends the Authorization header to whatever host issued the 3xx; a
+/// nil completion here refuses the redirect and the original task fails
+/// or resolves to the non-redirected response instead.
+final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 /// Reads the Keychain credential and uses it in this process only. Stdout is
 /// strictly the bounded, secret-free usage JSON response.
 @main
@@ -25,7 +52,7 @@ struct HeadroomClaudeProbe {
             fail("HEADROOM_PROBE_NO_CREDENTIALS", 1)
         }
         guard let token = token(credentialData) else { fail("HEADROOM_PROBE_NO_CREDENTIALS", 1) }
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        var request = URLRequest(url: URL(string: "https://\(anthropicUsageHost)/api/oauth/usage")!)
         request.httpMethod = "GET"; request.timeoutInterval = 10
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -34,12 +61,18 @@ struct HeadroomClaudeProbe {
         request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
         let wait = DispatchSemaphore(value: 0)
         let resultBox = ResultBox()
-        URLSession.shared.dataTask(with: request) { data, response, _ in
-            resultBox.status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let session = URLSession(configuration: .ephemeral, delegate: RedirectRefusingDelegate(), delegateQueue: nil)
+        session.dataTask(with: request) { data, response, _ in
+            let http = response as? HTTPURLResponse
+            resultBox.status = http?.statusCode ?? 0
+            resultBox.finalURL = http?.url
             resultBox.ok = resultBox.status == 200
             resultBox.data = data; wait.signal()
         }.resume()
         guard wait.wait(timeout: .now() + 12) == .success else { fail("HEADROOM_PROBE_TIMEOUT", 4) }
+        // A refused redirect still resolves the task with whatever response the
+        // last hop returned; verify the host before trusting anything else about it.
+        guard isAnthropicUsageHost(resultBox.finalURL) else { fail("HEADROOM_PROBE_BAD_HOST", 5) }
         if resultBox.status == 401 { fail("HEADROOM_PROBE_EXPIRED", 1) }
         guard resultBox.ok, let data = resultBox.data, data.count <= 1_048_576, safeUsageJSON(data) else { fail("HEADROOM_PROBE_USAGE_FAILED", 1) }
         FileHandle.standardOutput.write(data)
@@ -50,13 +83,16 @@ struct HeadroomClaudeProbe {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let oauth = root["claudeAiOauth"] as? [String: Any], let token = oauth["accessToken"] as? String, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return token
     }
-    private static func safeUsageJSON(_ data: Data) -> Bool {
+    static func safeUsageJSON(_ data: Data) -> Bool {
         guard let root = try? JSONSerialization.jsonObject(with: data) else { return false }
         return check(root, depth: 0)
     }
-    private static func check(_ value: Any, depth: Int) -> Bool {
+    static func check(_ value: Any, depth: Int) -> Bool {
         guard depth <= 32 else { return false }
-        if let string = value as? String { return string.lengthOfBytes(using: .utf8) <= 65_536 }
+        if let string = value as? String {
+            guard string.lengthOfBytes(using: .utf8) <= 65_536 else { return false }
+            return !containsEmailAddress(string)
+        }
         if let array = value as? [Any] { return array.count <= 10_000 && array.allSatisfy { check($0, depth: depth + 1) } }
         if let object = value as? [String: Any] {
             return object.allSatisfy { key, item in
@@ -78,4 +114,5 @@ private final class ResultBox: @unchecked Sendable {
     var data: Data?
     var ok = false
     var status = 0
+    var finalURL: URL?
 }
