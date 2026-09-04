@@ -1,8 +1,8 @@
 import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
-import { headroomHome, migrateLegacyHome } from "./paths.js";
+import { dirname, join, resolve } from "node:path";
+import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
@@ -25,6 +25,7 @@ function string(value: unknown): string | null { return typeof value === "string
 export async function safeHeadroomDirectory(home = headroomHome()): Promise<string> {
   if (home === headroomHome()) await migrateLegacyHome();
   const requested = resolve(home);
+  await assertSafeAncestry(dirname(requested));
   await mkdir(requested, { recursive: true, mode: 0o700 });
   const stat = await lstat(requested);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing unsafe ~/.headroom directory");
@@ -85,7 +86,7 @@ function observationFromRow(row: Row): StoredObservation {
 }
 
 function eventFromRow(row: Row): HeadroomEvent {
-  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason) };
+  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at) };
 }
 
 function leaseFromRow(row: Row): Lease {
@@ -181,8 +182,44 @@ export class HeadroomStore {
     // NOT EXISTS, so retain a narrow compatibility migration.
     try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
     catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
+    try { this.db.exec("ALTER TABLE events ADD COLUMN last_seen_at TEXT"); }
+    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
     this.removeFalseResetSeenEvents();
     await this.backfillResetEvents(home);
+    await this.collapseDuplicateSourceFailedEvents(home);
+  }
+
+  /**
+   * A principal that stays down produced one new source_failed event per poll
+   * (16 in 24h for two failing principals, observed live). detectEvents now
+   * updates last_seen_at on the open event instead of inserting a new one
+   * while a failure continues; this one-time pass repairs history written
+   * before that fix by collapsing consecutive source_failed events for the
+   * same meter (not separated by a source_recovered) into the first one,
+   * carrying its last_seen_at forward to the last duplicate's timestamp.
+   */
+  private async collapseDuplicateSourceFailedEvents(home: string): Promise<void> {
+    const migration = "2026-09-05-collapse-source-failed-duplicates";
+    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    const rows = this.db.prepare("SELECT * FROM events WHERE kind IN ('source_failed', 'source_recovered') ORDER BY meter_id ASC, created_at ASC, id ASC").all();
+    const openByMeter = new Map<string, Row>();
+    let collapsed = 0;
+    for (const row of rows) {
+      const meterId = String(row.meter_id);
+      if (row.kind === "source_recovered") { openByMeter.delete(meterId); continue; }
+      const open = openByMeter.get(meterId);
+      if (open) {
+        this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(String(row.created_at), String(open.id));
+        this.db.prepare("DELETE FROM events WHERE id = ?").run(String(row.id));
+        collapsed += 1;
+      } else {
+        openByMeter.set(meterId, row);
+      }
+    }
+    const summary = `collapsed ${collapsed} duplicate source_failed events across ${rows.length} candidates`;
+    this.audit("migration", "collapse_source_failed_duplicates", null, summary);
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
+    await appendDaemonLog(summary, home);
   }
 
   /** Remove the transient reset labels caused by rolling zero-use windows whose
@@ -255,7 +292,7 @@ export class HeadroomStore {
       observation.adapter_version, observation.upstream_schema_version, observation.reason ?? null, json(observation.metadata));
     const stored: StoredObservation = { ...observation, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
-    else if (stored.freshness === "failed") this.addSourceFailedEvent([stored.id], stored);
+    else if (stored.freshness === "failed") this.recordFailure([stored.id], stored);
     // The first reading ever stored under this exact meter id has no immediate
     // previous row, even though the legacy doubled-principal form of the same
     // meter does; the baseline lookup below checks that form on its own.
@@ -273,18 +310,31 @@ export class HeadroomStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null): void {
+  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null): void {
     const created = current.fetched_at;
     const id = `${kind}:${current.id}`;
     // OR IGNORE keeps the reset-detection backfill idempotent: replaying it
     // over already-classified observations must not error on a repeat id.
-    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
-      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason);
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason, lastSeenAt);
   }
 
   private addSourceFailedEvent(evidence: number[], current: StoredObservation): void {
     const availabilityOnly = current.reason === AVAILABILITY_ONLY_REASON;
-    this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null);
+    this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null, current.fetched_at);
+  }
+
+  /** Emit source_failed only on the transition into failure (or when nothing
+   * is open yet); while a principal stays failed, advance last_seen_at on
+   * the still-open event instead of inserting a new one every poll. */
+  private recordFailure(evidence: number[], current: StoredObservation): void {
+    const open = this.db.prepare(`SELECT * FROM events WHERE meter_id = ? AND kind IN ('source_failed', 'source_recovered')
+      ORDER BY created_at DESC, id DESC LIMIT 1`).get(current.meter_id);
+    if (open && open.kind === "source_failed") {
+      this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(current.fetched_at, String(open.id));
+      return;
+    }
+    this.addSourceFailedEvent(evidence, current);
   }
 
   /** The comparison baseline for a fresh observation is the most recent FRESH
@@ -340,16 +390,16 @@ export class HeadroomStore {
 
   private detectEvents(previous: StoredObservation, current: StoredObservation): void {
     const evidence = [previous.id, current.id];
+    if (current.freshness === "failed") {
+      this.recordFailure(evidence, current);
+      return;
+    }
     if (previous.freshness === "failed") {
-      if (current.freshness !== "fresh") return; // still down, or recovered into an unenforced/stale read
+      if (current.freshness !== "fresh") return; // recovered into an unenforced/stale read, not a real recovery
       const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
       this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
       const baseline = this.freshBaseline(current);
       if (baseline) this.classifyUsageDrop(baseline, current);
-      return;
-    }
-    if (current.freshness === "failed") {
-      this.addSourceFailedEvent(evidence, current);
       return;
     }
     if (current.freshness === "fresh") {

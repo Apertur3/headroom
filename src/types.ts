@@ -116,4 +116,8 @@ export interface HeadroomEvent {
   meter_id: string | null;
   principal_id: string | null;
   reason: string | null;
+  /** For an open source_failed event, the most recent poll that still found
+   * the same failure; updated in place instead of appending a new event
+   * while a principal stays down. Null for every other event kind. */
+  last_seen_at: string | null;
 }

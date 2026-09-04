@@ -2,7 +2,7 @@ import { access, constants, lstat, readFile, realpath, readdir } from "node:fs/p
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { normalizeObservations } from "../engine/observation.js";
-import { allowedOutbound, redact } from "../security.js";
+import { outboundFetch, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
@@ -206,7 +206,7 @@ async function refresh(fetcher: typeof fetch, credentials: Credential, resolveCl
   if (!credentials.refreshToken) throw new Error("expired");
   const client = await resolveClient();
   if (!client) throw new Error("Gemini CLI OAuth client unavailable");
-  const response = await fetcher(new Request(allowedOutbound(GOOGLE_TOKEN_ENDPOINT).toString(), {
+  const response = await outboundFetch(fetcher, new Request(GOOGLE_TOKEN_ENDPOINT, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: formBody({ client_id: client.clientId, client_secret: client.clientSecret, refresh_token: credentials.refreshToken, grant_type: "refresh_token" }), signal: AbortSignal.timeout(TIMEOUT_MS),
   }));
@@ -217,7 +217,7 @@ async function refresh(fetcher: typeof fetch, credentials: Credential, resolveCl
 }
 
 async function post(fetcher: typeof fetch, credential: Credential): Promise<Response> {
-  return fetcher(new Request(allowedOutbound(RETRIEVE_USER_QUOTA).toString(), { method: "POST", headers: requestHeaders(credential.token), body: requestBody(credential.projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
+  return outboundFetch(fetcher, new Request(RETRIEVE_USER_QUOTA, { method: "POST", headers: requestHeaders(credential.token), body: requestBody(credential.projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
 }
 
 export async function observeAntigravity(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Observation[]> {

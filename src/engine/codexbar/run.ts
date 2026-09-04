@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ProviderAccount } from "../../types.js";
-import { redact } from "../../security.js";
+import { readPolicy } from "../../config.js";
+import { outboundEnvironment, redact } from "../../security.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -9,9 +10,8 @@ export interface EngineResult { payload: unknown; stderr: string }
 
 /** Runs only an engine path returned by verifiedEnginePath(), never an ambient executable. */
 export async function runCodexBar(enginePath: string, account: ProviderAccount): Promise<EngineResult> {
-  const env = { ...process.env };
-  delete env.CODEX_HOME;
-  delete env.CLAUDE_CONFIG_DIR;
+  const { proxy } = await readPolicy();
+  const env = outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" });
   if (account.vendor === "codex") env.CODEX_HOME = account.location;
   else env.CLAUDE_CONFIG_DIR = account.location;
   try {

@@ -19,11 +19,18 @@ export function assertVendorResponseLimits(value: unknown, depth = 0): void {
 }
 
 export async function vendorJson(response: Response): Promise<unknown> {
+  const text = await vendorText(response);
+  const value: unknown = JSON.parse(text);
+  assertVendorResponseLimits(value);
+  return value;
+}
+
+/** Same 1 MiB cap as vendorJson, for a vendor response that is not JSON (e.g.
+ * a Prometheus text exposition from a local pool's /metrics). */
+export async function vendorText(response: Response): Promise<string> {
   const length = Number(response.headers.get("content-length"));
   if (Number.isFinite(length) && length > VENDOR_RESPONSE_MAX_BYTES) throw new Error("vendor response exceeds 1 MiB limit");
   const text = await response.text();
   if (Buffer.byteLength(text, "utf8") > VENDOR_RESPONSE_MAX_BYTES) throw new Error("vendor response exceeds 1 MiB limit");
-  const value: unknown = JSON.parse(text);
-  assertVendorResponseLimits(value);
-  return value;
+  return text;
 }

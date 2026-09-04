@@ -12,7 +12,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const lockPath = join(repoRoot, "engine.lock.json");
 
 export interface LockedAsset { name: string; sha256?: string; url?: string }
-export interface NativeLockedAsset { name: string; sha256?: string | null; unpinned?: boolean; url?: string }
+export interface NativeLockedAsset { name: string; sha256?: string | null; status?: "unpinned" | "pinned"; comment?: string; url?: string }
 export interface EngineLock {
   tag: string;
   native?: { tag: string; repository: string; binary: string; assets: Record<string, NativeLockedAsset> };
@@ -134,7 +134,7 @@ export async function installNativeEngine(): Promise<{ installed: true; tag: str
   const lock = await readEngineLock();
   if (!lock.native) return { installed: false, hint: "Native engine is not configured; build locally with npm run engine:build." };
   const asset = nativePlatformAssetName(lock);
-  if (!asset.sha256 || asset.unpinned) return { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
+  if (!asset.sha256 || asset.status === "unpinned") return { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
   const url = asset.url ?? `https://github.com/${lock.native.repository}/releases/download/${lock.native.tag}/${asset.name}`;
   const response = await fetch(url, { headers: { "User-Agent": "headroomq" } });
   if (!response.ok) throw new Error(`Native engine download failed: HTTP ${response.status}`);

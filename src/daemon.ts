@@ -7,14 +7,21 @@ import { readPolicy, readRouting } from "./config.js";
 import { pollAccounts, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
-import { headroomHome } from "./paths.js";
+import { executablePath, headroomHome } from "./paths.js";
 import { canRouteWithLeases } from "./policy.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
+import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 
 type Json = Record<string, unknown>;
 export type Poller = (principal?: string, options?: PollOptions) => Promise<PollResult>;
+
+/** A local, single-user daemon still bounds what any one connection can hold
+ * in memory and how many can be open at once, rather than trusting every
+ * caller on the machine to behave. */
+const MAX_CONNECTION_BUFFER_BYTES = 64 * 1024;
+const MAX_CONCURRENT_CONNECTIONS = 64;
 
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : join(home, "headroom.sock");
@@ -73,6 +80,7 @@ export class HeadroomDaemon {
   private sessionToken: string | undefined;
   private keepalive: AgyKeepaliveSupervisor | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
+  private connectionCount = 0;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive?: AgyKeepaliveSupervisor) { this.keepalive = keepalive; }
 
@@ -82,9 +90,16 @@ export class HeadroomDaemon {
   }
 
   async start(): Promise<void> {
+    // Before any fetch can happen: an operator's shell proxy must never
+    // silently carry a credentialed vendor request unless policy.toml opts in.
+    const startupPolicy = await readPolicy();
+    stripAmbientProxyEnvironment(startupPolicy.proxy);
     if (process.platform === "win32") this.sessionToken = await sessionToken(this.path.includes("\\pipe\\") ? headroomHome() : this.path, true);
     await this.prepareSocket();
     this.server = createServer((socket) => this.handleSocket(socket));
+    // A restrictive umask means the OS never briefly creates the socket file
+    // group- or world-connectable between listen() and the chmod below.
+    if (process.platform !== "win32") process.umask(0o077);
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
@@ -92,8 +107,16 @@ export class HeadroomDaemon {
     const accounts = await this.currentAccounts();
     const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity");
     if (policy.antigravity_keepalive && process.platform !== "win32" && antigravity) {
-      this.keepalive ??= new AgyKeepaliveSupervisor({ binary: resolveAgyBinary(antigravity.agy_path) });
-      this.keepalive.start();
+      // agy_path is a value from accounts.toml; verify ownership, mode, and
+      // that it isn't a symlink before ever spawning it, the same bar every
+      // other executable Headroom runs must clear.
+      try {
+        const binary = await executablePath(resolveAgyBinary(antigravity.agy_path));
+        this.keepalive ??= new AgyKeepaliveSupervisor({ binary });
+        this.keepalive.start();
+      } catch (error) {
+        void appendDaemonLog(`antigravity keepalive not started: ${safeError(error)}`, this.home);
+      }
     }
     await this.schedulePrincipals();
     this.schedulingStarted = true;
@@ -132,10 +155,16 @@ export class HeadroomDaemon {
   }
 
   private handleSocket(socket: Socket): void {
+    if (this.connectionCount >= MAX_CONCURRENT_CONNECTIONS) { socket.destroy(); return; }
+    this.connectionCount += 1;
+    let closed = false;
+    const closeOnce = () => { if (closed) return; closed = true; this.connectionCount -= 1; };
+    socket.once("close", closeOnce);
     socket.setEncoding("utf8");
     let buffer = "";
     socket.on("data", (part: string) => {
       buffer += part;
+      if (Buffer.byteLength(buffer, "utf8") > MAX_CONNECTION_BUFFER_BYTES) { socket.destroy(); return; }
       let newline: number;
       while ((newline = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
@@ -196,7 +225,10 @@ export class HeadroomDaemon {
           if (typeof params.id !== "string") return rpcError(request.id, -32602, "lease id is required");
           if (typeof params.owner !== "string" || !params.owner.trim()) return rpcError(request.id, -32602, "owner is required");
           result = this.store.endLease(params.id, params.owner, params.force === true);
-          if (params.force === true && (result as { owner: string }).owner !== params.owner) this.store.audit(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}`, "ok");
+          if (params.force === true && (result as { owner: string }).owner !== params.owner) {
+            const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim().slice(0, 200) : "(no reason given)";
+            this.store.audit(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}:${params.id} reason=${reason}`, "ok");
+          }
           break;
         }
         case "leases": result = this.store.leases(undefined, true); break;
@@ -225,7 +257,13 @@ export class HeadroomDaemon {
         }; break;
         default: return rpcError(request.id, -32601, "Method not found");
       }
-      this.store.audit(caller, request.method, typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null, "ok");
+      // For a lease call the audit row also names the owner and meter, since
+      // `caller` alone (the peer pid/argv[1] the client reports at every
+      // request, see callerFrom) does not identify which lease was touched.
+      const auditSubject = request.method === "lease_start" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.meter_id === "string" ? params.meter_id : "?"}`
+        : request.method === "lease_end" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.id === "string" ? params.id : "?"}`
+        : typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null;
+      this.store.audit(caller, request.method, auditSubject, "ok");
       return rpcResult(request.id, result);
     } catch (error) {
       this.store.audit(caller, request.method, null, "error");

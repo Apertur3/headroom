@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { lstat, realpath, rename } from "node:fs/promises";
-import { join, relative, resolve, win32 } from "node:path";
+import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 
 export interface PathOptions {
   platform?: NodeJS.Platform;
@@ -76,6 +76,55 @@ export async function executablePath(path: string, options: { repoRoot?: string;
     if (relative(repo, canonical).startsWith("..")) throw new Error("Refusing development executable outside repository");
   }
   return canonical;
+}
+
+/**
+ * Refuse a HEADROOM_HOME whose parent chain contains a directory owned by
+ * neither root nor the current user, so a co-tenant on a shared machine
+ * cannot plant a symlink somewhere above ~/.headroom to redirect Headroom's
+ * state directory or its Unix socket into a location they control.
+ *
+ * `realpath()` on the nearest already-existing ancestor resolves an ordinary,
+ * root-owned system symlink (macOS's `/var` -> `/private/var` is one) the
+ * same way the OS would; the walk below then checks ownership of that
+ * resolved chain's own segments, which by construction are no longer
+ * symlinks themselves. Components that do not exist yet are left for the
+ * caller's own `mkdir` to create with an explicit, safe mode.
+ */
+export interface AncestryOptions {
+  platform?: NodeJS.Platform;
+  /** Test seam only; production always reads the real process uid. */
+  uid?: number;
+  lstat?: typeof lstat;
+  realpath?: typeof realpath;
+}
+
+export async function assertSafeAncestry(target: string, options: AncestryOptions = {}): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (options.uid === undefined && typeof process.getuid !== "function") return; // no meaningful uid model (Windows)
+  const uid = options.uid ?? process.getuid!();
+  const doLstat = options.lstat ?? lstat;
+  const doRealpath = options.realpath ?? realpath;
+  let probe = resolve(target);
+  let base: string | undefined;
+  for (;;) {
+    try { await doLstat(probe); base = probe; break; }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(probe);
+      if (parent === probe) break; // reached the filesystem root without finding an existing component
+      probe = parent;
+    }
+  }
+  if (base === undefined) return;
+  const canonicalBase = await doRealpath(base);
+  const segments = canonicalBase.split(sep).filter(Boolean);
+  let current = platform === "win32" ? "" : sep;
+  for (const segment of segments) {
+    current = current === sep ? `${sep}${segment}` : join(current, segment);
+    const info = await doLstat(current);
+    if (info.uid !== uid && info.uid !== 0) throw new Error(`Refusing unsafe HEADROOM_HOME: ${current} is owned by another user`);
+  }
 }
 
 export type VendorHome = "claude" | "codex" | "gemini";
