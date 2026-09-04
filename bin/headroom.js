@@ -4,6 +4,7 @@
 // older than the version that ships that built-in unflagged. This file is
 // hand-written, not compiled from src/, so it stays tiny and dependency-free.
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -52,4 +53,20 @@ function main() {
   process.exit(result.status ?? (result.signal ? 1 : 0));
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+/**
+ * `import.meta.url` is always the canonical (symlink-resolved) URL of this
+ * file; `process.argv[1]` is the raw path the caller passed. On macOS these
+ * diverge whenever invocation crosses a system alias (`/var` ->
+ * `/private/var`, `/tmp` -> `/private/tmp`) -- e.g. any global npm prefix or
+ * accounts/home directory under a default TMPDIR. A plain string compare
+ * then always fails, main() never runs, and `headroom` silently exits 0 with
+ * no output at all. Resolving argv[1] through the same realpath before
+ * comparing matches what import.meta.url already went through.
+ */
+export function isMainModule(metaUrl, argv1) {
+  if (!argv1) return false;
+  try { return metaUrl === pathToFileURL(realpathSync(argv1)).href; }
+  catch { return false; }
+}
+
+if (isMainModule(import.meta.url, process.argv[1])) main();

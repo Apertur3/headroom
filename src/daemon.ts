@@ -315,9 +315,11 @@ export class HeadroomDaemon {
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
-      for (const principalId of new Set(result.observations.map((item) => item.principal_id))) {
-        if (result.observations.some((item) => item.principal_id === principalId && item.source === "native:claude")) this.store.audit("daemon", "claude_probe", principalId, "called");
-      }
+      // A gate-blocked skip renders the exact same failed observation reason
+      // as a real denial on purpose (see PollResult.claudeProbeOutcomes), so
+      // the audit outcome comes from the collector's own record of what it
+      // did, never from inspecting the observations after the fact.
+      for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) this.store.audit("daemon", "claude_probe", principalId, outcome);
       // A Claude Keychain denial/timeout no longer gets a timed backoff: the
       // grant gate (set above, and by the collector on this very denial)
       // already stops the next poll from retrying until the operator runs

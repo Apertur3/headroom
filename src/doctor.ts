@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { claudeServiceName } from "./adapters/claude.js";
+import { claudeServiceName, syncClaudeGrantState } from "./adapters/claude.js";
 import { readPolicy, readRouting } from "./config.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
@@ -11,7 +11,7 @@ import { daemonLogPath } from "./logs.js";
 import { credentialPath, headroomHome } from "./paths.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Account } from "./types.js";
+import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
@@ -34,14 +34,26 @@ export async function doctorFileStatus(path: string): Promise<FileStatus> {
   } catch (error: unknown) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe"; }
 }
 
-async function credentialCheck(account: Account): Promise<DoctorCheck> {
+async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} credential`, "local adapter has no credential", "no action needed");
   if (account.vendor === "claude" && process.platform === "darwin") {
+    // A principal already marked grant-needed must never touch the Keychain
+    // item again here: the keychainGrantCheck below already reports the same
+    // FAIL, and probing anyway is exactly the extra Keychain touch the
+    // marker exists to prevent until the operator runs `keychain grant`.
+    if (grantsNeeded.has(account.name)) {
+      store?.audit("doctor", "claude_probe", account.name, "skipped: grant needed");
+      return check("FAIL", `principal ${account.name} credential`, "Keychain grant needed; probe skipped", `headroom keychain grant --principal ${account.name}`);
+    }
     try {
       // Do not pass -w: doctor verifies Keychain metadata without ever reading a token.
       await execFileAsync("security", ["find-generic-password", "-s", claudeServiceName(account.location)]);
+      store?.audit("doctor", "claude_probe", account.name, "called");
       return check("OK", `principal ${account.name} credential`, "Claude Keychain item present", "no action needed");
-    } catch { return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`); }
+    } catch {
+      store?.audit("doctor", "claude_probe", account.name, "called");
+      return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`);
+    }
   }
   const path = credentialPath(account.vendor, account.vendor === "antigravity" ? undefined : account.location);
   return (await doctorFileStatus(path)) === "present"
@@ -96,27 +108,37 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   const output: DoctorCheck[] = [];
   const { check: homeResult, store } = await homeCheck(home);
   output.push(homeResult);
-  let grantsNeeded = new Map<string, string>();
-  if (store) {
-    try { grantsNeeded = new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])); }
-    finally { store.close(); }
-  }
-  let keepaliveEnabled = process.platform === "darwin" || process.platform === "linux";
-  try { keepaliveEnabled = (await readPolicy()).antigravity_keepalive; } catch { /* The policy check below reports the parse error. */ }
-  let accounts: Account[] = [];
   try {
-    accounts = await readAccounts();
-    output.push(check(accounts.length ? "OK" : "WARN", "principals", accounts.length ? `${accounts.length} configured (${accountsPath()})` : "no principals configured", accounts.length ? "no action needed" : "headroom accounts discover"));
-  } catch (error) {
-    output.push(check("FAIL", "principals", error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT" ? `missing ${accountsPath()}` : "accounts.toml is invalid", "headroom accounts discover"));
-  }
-  for (const account of accounts) {
-    output.push(await credentialCheck(account));
-    const grant = keychainGrantCheck(account, grantsNeeded);
-    if (grant) output.push(grant);
-    output.push(adapterCheck(account));
-  }
+    let keepaliveEnabled = process.platform === "darwin" || process.platform === "linux";
+    try { keepaliveEnabled = (await readPolicy()).antigravity_keepalive; } catch { /* The policy check below reports the parse error. */ }
+    let accounts: Account[] = [];
+    try {
+      accounts = await readAccounts();
+      output.push(check(accounts.length ? "OK" : "WARN", "principals", accounts.length ? `${accounts.length} configured (${accountsPath()})` : "no principals configured", accounts.length ? "no action needed" : "headroom accounts discover"));
+    } catch (error) {
+      output.push(check("FAIL", "principals", error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT" ? `missing ${accountsPath()}` : "accounts.toml is invalid", "headroom accounts discover"));
+    }
+    // Runs even when `headroom doctor` is the very first command ever
+    // invoked (no prior daemon poll or CLI observe()), so a fresh install or
+    // a freshly rebuilt probe binary is caught here too, before credentialCheck
+    // below ever touches the Keychain.
+    if (store) {
+      const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
+      await syncClaudeGrantState(store, claudeIds);
+    }
+    const grantsNeeded = store ? new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])) : new Map<string, string>();
+    for (const account of accounts) {
+      output.push(await credentialCheck(account, grantsNeeded, store));
+      const grant = keychainGrantCheck(account, grantsNeeded);
+      if (grant) output.push(grant);
+      output.push(adapterCheck(account));
+    }
+    await doctorChecksTail(output, home, accounts, keepaliveEnabled);
+  } finally { store?.close(); }
+  return output;
+}
 
+async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: Account[], keepaliveEnabled: boolean): Promise<void> {
   const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]);
   output.push(upstream.present
     ? check("OK", "engine upstream hash", `${upstream.tag} verified (${upstream.path})`, "no action needed")
@@ -160,7 +182,6 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
     : logStatus === "missing"
       ? check("WARN", "daemon log", `not written yet (${daemonLogPath(home)})`, "headroom install-service")
       : check("WARN", "daemon log", `unsafe log file (${daemonLogPath(home)})`, "fix ownership or writable permissions"));
-  return output;
 }
 
 export async function doctor(): Promise<number> {

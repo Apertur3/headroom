@@ -595,4 +595,21 @@ describe("Keychain grant marker lifecycle", () => {
       expect(store.probeBinaryHash()).toBe("hash-b");
     } finally { store.close(); }
   });
+
+  it("tracks the last probe binary hash that actually proved itself, independently of the last-seen hash", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-granted-hash-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      expect(store.probeGrantedHash()).toBeUndefined();
+      store.setProbeGrantedHash("hash-a");
+      expect(store.probeGrantedHash()).toBe("hash-a");
+      // Independent of the last-seen hash: a rebuild can move probeBinaryHash
+      // forward well before the new binary proves itself under a grant or a
+      // successful poll.
+      store.setProbeBinaryHash("hash-b");
+      expect(store.probeGrantedHash()).toBe("hash-a");
+      store.setProbeGrantedHash("hash-b");
+      expect(store.probeGrantedHash()).toBe("hash-b");
+    } finally { store.close(); }
+  });
 });
