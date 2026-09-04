@@ -6,7 +6,7 @@ import { doctor } from "./doctor.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { claudeResponseShape, grantClaudeKeychainAccess } from "./adapters/claude.js";
+import { claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, syncClaudeGrantState } from "./adapters/claude.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
@@ -17,7 +17,7 @@ import { migrateLegacyHome } from "./paths.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent } from "./types.js";
+import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount } from "./types.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -274,10 +274,13 @@ async function observe(argv: string[]): Promise<number> {
     const leaseRequest = await requestDaemon("leases");
     leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];
   } else {
-    const polled = await pollAccounts(principal);
-    failures = polled.failures;
     const store = await HeadroomStore.open();
     try {
+      const accounts = await readAccounts();
+      const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude" && (!principal || account.name === principal)).map((account) => account.name);
+      await syncClaudeGrantState(store, claudeIds);
+      const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store) });
+      failures = polled.failures;
       store.insertAll(polled.observations);
       observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       resetSeen = store.resetSeenFor(observations);
@@ -349,14 +352,25 @@ async function logs(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** With no --principal this grants every Claude principal in the registry: one
+ * Keychain dialog per principal, one printed confirmation line each. A grant
+ * always clears that principal's keychain_grant_needed marker (set by a prior
+ * denial/timeout, or by a probe binary rebuild), so the daemon resumes
+ * probing it on its next poll. */
 async function keychain(argv: string[]): Promise<number> {
   if (argv[0] !== "grant" || argv.length > 3 || (argv[1] && argv[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>]");
   const requested = option(argv, "--principal");
-  const accounts = (await readAccounts()).filter((item) => !isLocalAccount(item) && item.vendor === "claude");
-  const account = requested ? accounts.find((item) => item.name === requested) : accounts[0];
-  if (!account || !("location" in account)) throw new Error("No Claude principal found; run headroom accounts discover");
-  await grantClaudeKeychainAccess(account.location);
-  console.log(`Keychain access granted for ${account.name}`);
+  const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
+  const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
+  if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
+  const store = await HeadroomStore.open();
+  try {
+    for (const account of targets) {
+      await grantClaudeKeychainAccess(account.location);
+      store.clearKeychainGrantNeeded(account.name);
+      console.log(`Keychain access granted for ${account.name}`);
+    }
+  } finally { store.close(); }
   return 0;
 }
 

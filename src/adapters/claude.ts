@@ -52,6 +52,14 @@ export class ClaudeProbeError extends Error {
   constructor(readonly kind: "missing" | "denied" | "timeout" | "unavailable", message: string) { super(message); }
 }
 
+/** The single wording for "this principal cannot be probed again until the
+ * operator runs the grant command", shared by the daemon's synthetic
+ * failure, the collector's gate, and doctor's FAIL line, so all three stay
+ * in sync by construction rather than by convention. */
+export function claudeGrantNeededReason(principalId: string): string {
+  return `Keychain grant needed; run: headroom keychain grant --principal ${principalId}`;
+}
+
 async function claudeProbe(configDir: string): Promise<string> {
   const helper = await keychainHelper();
   if (!helper) throw new ClaudeProbeError("unavailable", "Claude probe not built; run npm run engine:build");
@@ -63,8 +71,8 @@ async function claudeProbe(configDir: string): Promise<string> {
   } catch (error: unknown) {
     const result = error as { stderr?: string; code?: number | string };
     const stderr = result.stderr ?? "";
-    if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied; run: headroom keychain grant");
-    if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access denied; run: headroom keychain grant");
+    if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied");
+    if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access timed out");
     if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; run: claude`);
     if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
     throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
@@ -82,6 +90,59 @@ async function keychainHelper(): Promise<string | undefined> {
   const candidates = [native ? join(dirname(native), "headroom-claude-probe") : "", join(root, "engine", ".build", "release", "headroom-claude-probe")];
   for (const candidate of candidates) try { return await executablePath(candidate, { repoRoot: root, development: true }); } catch { /* next candidate */ }
   return undefined;
+}
+
+/** sha256 of the resolved Claude probe binary, or undefined when none is
+ * built/installed. Used only to detect a rebuild (see syncClaudeGrantState). */
+export async function probeBinaryHash(): Promise<string | undefined> {
+  const helper = await keychainHelper();
+  if (!helper) return undefined;
+  return createHash("sha256").update(await readFile(helper)).digest("hex");
+}
+
+export interface ClaudeGrantStore {
+  keychainGrantNeeded(principalId: string): boolean;
+  setKeychainGrantNeeded(principalId: string, reason: string): void;
+  probeBinaryHash(): string | undefined;
+  setProbeBinaryHash(hash: string): void;
+}
+
+/** Gate consulted by the collector before every Claude probe attempt. */
+export interface ClaudeGrantGate {
+  needsGrant(principalId: string): boolean;
+  markGrantNeeded(principalId: string, reason: string): void;
+}
+
+export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
+  return {
+    needsGrant: (id) => store.keychainGrantNeeded(id),
+    markGrantNeeded: (id, reason) => store.setKeychainGrantNeeded(id, reason),
+  };
+}
+
+/**
+ * Compares the probe binary's current hash against the one last recorded in
+ * the store. A change from a previously-recorded hash (a rebuild, e.g. after
+ * `npm run engine:build`) marks every given Claude principal as needing a
+ * fresh grant, so the daemon's next poll skips the probe (via the gate above)
+ * instead of popping one Keychain dialog per principal per poll; the operator
+ * then sees exactly one dialog per principal, only when they run
+ * `headroom keychain grant`. The first-ever hash recorded is not a rebuild.
+ */
+export async function syncClaudeGrantState(
+  store: ClaudeGrantStore,
+  claudePrincipalIds: string[],
+  dependencies: { platform?: NodeJS.Platform; hash?: () => Promise<string | undefined> } = {},
+): Promise<boolean> {
+  const platform = dependencies.platform ?? process.platform;
+  if (platform !== "darwin" || !claudePrincipalIds.length) return false;
+  const hash = await (dependencies.hash ?? probeBinaryHash)();
+  if (!hash) return false;
+  const previous = store.probeBinaryHash();
+  store.setProbeBinaryHash(hash);
+  if (previous === undefined || previous === hash) return false;
+  for (const id of claudePrincipalIds) store.setKeychainGrantNeeded(id, "probe binary rebuilt");
+  return true;
 }
 
 interface Credential { token: string; expired: boolean; }
@@ -115,6 +176,12 @@ function base(account: ProviderAccount, meter: string, now: string): Omit<Observ
 
 function failed(account: ProviderAccount, reason: string, now: string): Observation[] {
   return ["all", "fable", "routines"].map((meter) => ({ ...base(account, meter, now), window: null, quantity: null, resets_at: null, freshness: "failed" as const, truth: "estimated" as const, confidence: 0, reason: redact(reason) }));
+}
+
+/** Synthetic failed observations for a principal the grant gate is blocking,
+ * built without ever attempting the probe (and so never popping a dialog). */
+export function claudeGrantNeededObservations(account: ProviderAccount, now = new Date()): Observation[] {
+  return failed(account, claudeGrantNeededReason(account.name), now.toISOString());
 }
 
 function window(account: ProviderAccount, meter: string, raw: unknown, minutes: number, now: string): Observation | undefined {
@@ -202,6 +269,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     const message = error instanceof Error ? error.message : "";
     const reason = error instanceof ProviderHTTPError ? error.message
       : error instanceof ClaudeProbeError && error.message.startsWith("token expired") ? `token expired; ${claudeCommand(account)}`
+      : error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout") ? claudeGrantNeededReason(account.name)
       : error instanceof ClaudeProbeError ? error.message
       : error instanceof Error && error.message.startsWith("vendor response") ? error.message
       : darwin && !credentialLoaded ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`

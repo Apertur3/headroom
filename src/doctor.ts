@@ -10,10 +10,11 @@ import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
 import { credentialPath, headroomHome } from "./paths.js";
 import { accountsPath, readAccounts } from "./registry.js";
+import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account } from "./types.js";
 
 const execFileAsync = promisify(execFile);
-export type DoctorLevel = "OK" | "WARN" | "FAIL";
+export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
 export interface DoctorCheck { level: DoctorLevel; check: string; detail: string; fix: string; }
 
 function check(level: DoctorLevel, name: string, detail: string, fix: string): DoctorCheck { return { level, check: name, detail, fix }; }
@@ -48,6 +49,28 @@ async function credentialCheck(account: Account): Promise<DoctorCheck> {
     : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, account.vendor === "antigravity" ? "run: gemini" : `run: ${account.vendor}`);
 }
 
+/** Opening the store creates ~/.headroom at 0700 on a fresh machine (the same
+ * mkdir every other Headroom entry point uses) and, on an existing home with
+ * group/world permissions, surfaces the same refusal every other command
+ * hits -- as an actionable FAIL instead of a crash with no doctor coverage. */
+export async function homeCheck(home: string): Promise<{ check: DoctorCheck; store: HeadroomStore | undefined }> {
+  try {
+    const store = await HeadroomStore.open(home);
+    return { check: check("OK", "home directory", home, "no action needed"), store };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unsafe Headroom home directory";
+    const fix = /group or world permissions/.test(message) ? "chmod 700 ~/.headroom" : `fix ownership or permissions on ${home}`;
+    return { check: check("FAIL", "home directory", message, fix), store: undefined };
+  }
+}
+
+export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, string>): DoctorCheck | undefined {
+  if (isLocalAccount(account) || account.vendor !== "claude") return undefined;
+  const reason = grantsNeeded.get(account.name);
+  if (reason === undefined) return undefined;
+  return check("FAIL", `principal ${account.name} keychain grant`, `Keychain grant needed; run: headroom keychain grant --principal ${account.name}`, `headroom keychain grant --principal ${account.name}`);
+}
+
 function adapterCheck(account: Account): DoctorCheck {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} adapter`, "native local adapter selected", "no action needed");
   const level: DoctorLevel = account.adapter === "pending" ? "FAIL" : account.adapter === "codexbar" ? "WARN" : "OK";
@@ -71,6 +94,13 @@ async function configCheck(name: "policy" | "routing", path: string): Promise<Do
 export async function doctorChecks(): Promise<DoctorCheck[]> {
   const home = headroomHome();
   const output: DoctorCheck[] = [];
+  const { check: homeResult, store } = await homeCheck(home);
+  output.push(homeResult);
+  let grantsNeeded = new Map<string, string>();
+  if (store) {
+    try { grantsNeeded = new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])); }
+    finally { store.close(); }
+  }
   let keepaliveEnabled = process.platform === "darwin" || process.platform === "linux";
   try { keepaliveEnabled = (await readPolicy()).antigravity_keepalive; } catch { /* The policy check below reports the parse error. */ }
   let accounts: Account[] = [];
@@ -82,13 +112,15 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   }
   for (const account of accounts) {
     output.push(await credentialCheck(account));
+    const grant = keychainGrantCheck(account, grantsNeeded);
+    if (grant) output.push(grant);
     output.push(adapterCheck(account));
   }
 
   const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]);
   output.push(upstream.present
     ? check("OK", "engine upstream hash", `${upstream.tag} verified (${upstream.path})`, "no action needed")
-    : check("WARN", "engine upstream hash", `${upstream.tag} absent or hash mismatch`, "headroom engine install"));
+    : check("INFO", "engine upstream hash", `${upstream.tag} absent or hash mismatch; optional, needed only for providers without a native adapter`, "headroom engine install"));
   output.push(native
     ? check(native.includes(`${home}/engine/native/`) ? "OK" : "WARN", "engine native hash", native.includes(`${home}/engine/native/`) ? `verified (${native})` : `development binary (${native}) is not release-pinned`, native.includes(`${home}/engine/native/`) ? "no action needed" : "build a pinned native release or run headroom engine install")
     : check("WARN", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
