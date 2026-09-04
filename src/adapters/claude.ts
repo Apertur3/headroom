@@ -105,29 +105,47 @@ export interface ClaudeGrantStore {
   setKeychainGrantNeeded(principalId: string, reason: string): void;
   probeBinaryHash(): string | undefined;
   setProbeBinaryHash(hash: string): void;
+  /** The most recent probe binary hash that actually proved itself: either an
+   * explicit `headroom keychain grant` succeeded under it, or a poll got a
+   * real vendor response through it. Distinct from probeBinaryHash, which is
+   * only "the hash last seen", so a fresh install (no probeBinaryHash yet)
+   * can still be recognized as already-trusted after a restore/reinstall of
+   * the same binary. */
+  probeGrantedHash(): string | undefined;
+  setProbeGrantedHash(hash: string): void;
 }
 
 /** Gate consulted by the collector before every Claude probe attempt. */
 export interface ClaudeGrantGate {
   needsGrant(principalId: string): boolean;
   markGrantNeeded(principalId: string, reason: string): void;
+  /** Called once a probe attempt for the current binary hash actually
+   * returns a real vendor response, so that hash is recorded as known-good
+   * and never treated as an unproven first run again. */
+  markProbeSucceeded(): void;
 }
 
 export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
   return {
     needsGrant: (id) => store.keychainGrantNeeded(id),
     markGrantNeeded: (id, reason) => store.setKeychainGrantNeeded(id, reason),
+    markProbeSucceeded: () => { const hash = store.probeBinaryHash(); if (hash) store.setProbeGrantedHash(hash); },
   };
 }
 
 /**
  * Compares the probe binary's current hash against the one last recorded in
- * the store. A change from a previously-recorded hash (a rebuild, e.g. after
- * `npm run engine:build`) marks every given Claude principal as needing a
- * fresh grant, so the daemon's next poll skips the probe (via the gate above)
- * instead of popping one Keychain dialog per principal per poll; the operator
- * then sees exactly one dialog per principal, only when they run
- * `headroom keychain grant`. The first-ever hash recorded is not a rebuild.
+ * the store. Every given Claude principal is marked as needing a fresh grant
+ * whenever the current hash has not already proven itself (store.probeGrantedHash()):
+ * a rebuild (a hash change, e.g. after `npm run engine:build`) marks them, and
+ * so does a genuinely first-ever run (no probeBinaryHash recorded yet) with no
+ * prior successful grant or probe under this exact binary -- a fresh install
+ * or a freshly rebuilt probe must only ever pop its first Keychain dialog
+ * through `headroom keychain grant`, never from a background daemon poll.
+ * Once this exact hash has succeeded once (grantClaudeKeychainAccess or a
+ * successful poll both call ClaudeGrantGate.markProbeSucceeded), further syncs
+ * under the same hash -- including a store that lost its probeBinaryHash but
+ * kept probeGrantedHash, e.g. a restore -- are not marked again.
  */
 export async function syncClaudeGrantState(
   store: ClaudeGrantStore,
@@ -140,8 +158,10 @@ export async function syncClaudeGrantState(
   if (!hash) return false;
   const previous = store.probeBinaryHash();
   store.setProbeBinaryHash(hash);
-  if (previous === undefined || previous === hash) return false;
-  for (const id of claudePrincipalIds) store.setKeychainGrantNeeded(id, "probe binary rebuilt");
+  if (previous === hash) return false; // unchanged since the last sync; already resolved either way
+  if (store.probeGrantedHash() === hash) return false; // this exact binary already proved itself
+  const reason = previous === undefined ? "no successful probe recorded for this binary" : "probe binary rebuilt";
+  for (const id of claudePrincipalIds) store.setKeychainGrantNeeded(id, reason);
   return true;
 }
 

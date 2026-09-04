@@ -16,6 +16,14 @@ export interface PollResult {
   observations: Observation[];
   failures: string[];
   antigravityLocal?: Record<string, AntigravityLocalRead>;
+  /** Per Claude principal: whether this poll actually attempted the probe, or
+   * skipped it because a keychain_grants marker was already set. The
+   * observations alone cannot answer this after the fact -- a real denial and
+   * a gate-blocked skip render the identical failed reason on purpose -- so
+   * every caller (daemon, CLI, MCP) audits from this field instead of
+   * inferring an outcome from the observation source. Absent when no Claude
+   * principal was polled. */
+  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed">;
 }
 export interface PollOptions {
   /** Set only by the daemon while it owns a warmed `agy` PTY. */
@@ -58,14 +66,18 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // Claude always stays in the TypeScript adapter: on macOS it delegates the
   // credential read and request to the separately-granted Claude probe.
   const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
+  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed"> = {};
   for (const account of tsAccounts) {
     if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
       observations.push(...claudeGrantNeededObservations(account));
+      claudeProbeOutcomes[account.name] = "skipped: grant needed";
       continue;
     }
+    if (account.vendor === "claude") claudeProbeOutcomes[account.name] = "called";
     const result = account.vendor === "claude" ? await observeClaude(account) : await observeCodex(account);
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
+      if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();
       const denied = result.find((item) => item.freshness === "failed" && item.reason?.startsWith("Keychain grant needed;"));
       if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
     }
@@ -133,5 +145,5 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   observations.push(...await Promise.all(localAccounts.map(observeLocal)));
   // This is the shared boundary for native and fallback engines. Keep this
   // defensive normalization here as adapters may be added outside this module.
-  return { observations: normalizeObservations(observations), failures, ...(Object.keys(antigravityLocal).length ? { antigravityLocal } : {}) };
+  return { observations: normalizeObservations(observations), failures, ...(Object.keys(antigravityLocal).length ? { antigravityLocal } : {}), ...(Object.keys(claudeProbeOutcomes).length ? { claudeProbeOutcomes } : {}) };
 }

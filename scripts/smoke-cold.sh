@@ -104,62 +104,75 @@ printf '[[accounts]]\nname = "fixture-local"\nkind = "local"\nbase_url = "http:/
 export HOME="$user_home"
 export HEADROOM_HOME="$headroom_home"
 
+# run_headroom NAME [ARGS...] -- runs the installed binary with the given
+# args, capturing stdout and stderr separately (both into their own files
+# under $root, and into NAME_out/NAME_err for the fail() message) so a
+# failure shows its actual reason -- an empty inline string is otherwise
+# indistinguishable between "no output at all" (e.g. a silently-skipped entry
+# point) and "stderr wasn't captured", exactly the ambiguity that made this
+# cold-install path hard to diagnose. Also sets NAME_code.
+run_headroom() {
+  local name="$1" out_log="$root/$1.out.log" err_log="$root/$1.err.log"; shift
+  set +e
+  "$headroom_bin" "$@" >"$out_log" 2>"$err_log"
+  local code=$?
+  set -e
+  printf -v "${name}_code" '%s' "$code"
+  printf -v "${name}_out" '%s' "$(cat "$out_log")"
+  printf -v "${name}_err" '%s' "$(cat "$err_log")"
+}
+
 # --- step: headroom doctor --------------------------------------------------
 # A cold install with no daemon running legitimately reports FAIL checks (no
 # socket, no engine); doctor exits 1 in that case and 0 when everything is
 # healthy. Either is a real, non-crashing result -- anything else is a bug.
-set +e
-doctor_out="$("$headroom_bin" doctor 2>&1)"; doctor_code=$?
-set -e
+run_headroom doctor doctor
 if in_range "$doctor_code" 0 1; then
   pass "headroom doctor (exit $doctor_code)"
 else
-  fail "headroom doctor" "exit $doctor_code: $doctor_out"
+  fail "headroom doctor" "exit $doctor_code: stdout=[$doctor_out] stderr=[$doctor_err]"
 fi
 
 # --- step: headroom (bare) --------------------------------------------------
-set +e
-bare_out="$("$headroom_bin" 2>&1)"; bare_code=$?
-set -e
+run_headroom bare
 up_lines="$(printf '%s\n' "$bare_out" | grep -c "fixture-local:capacity  UP model=local-27b running=0 waiting=0" || true)"
 if [[ "$bare_code" -eq 0 && "$up_lines" -eq 1 ]]; then
   pass "headroom (one UP line)"
 else
-  fail "headroom" "exit $bare_code, UP lines=$up_lines: $bare_out"
+  fail "headroom" "exit $bare_code, UP lines=$up_lines: stdout=[$bare_out] stderr=[$bare_err]"
 fi
 
 # --- step: headroom --json --------------------------------------------------
-set +e
-json_out="$("$headroom_bin" --json 2>&1)"; json_code=$?
-set -e
+run_headroom json --json
 json_line="$(printf '%s\n' "$json_out" | tail -n1)"
 if [[ "$json_code" -eq 0 ]] && printf '%s' "$json_line" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' 2>/dev/null; then
   pass "headroom --json"
 else
-  fail "headroom --json" "exit $json_code: $json_out"
+  fail "headroom --json" "exit $json_code: stdout=[$json_out] stderr=[$json_err]"
 fi
 
 # --- step: headroom events --since 1h ---------------------------------------
-set +e
-events_out="$("$headroom_bin" events --since 1h 2>&1)"; events_code=$?
-set -e
+run_headroom events events --since 1h
 events_line="$(printf '%s\n' "$events_out" | tail -n1)"
 if [[ "$events_code" -eq 0 ]] && printf '%s' "$events_line" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"))' 2>/dev/null; then
   pass "headroom events --since 1h"
 else
-  fail "headroom events --since 1h" "exit $events_code: $events_out"
+  fail "headroom events --since 1h" "exit $events_code: stdout=[$events_out] stderr=[$events_err]"
 fi
 
 # --- step: headroom mcp, piped initialize + tools/list ----------------------
 mcp_request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke-cold","version":"0"}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 set +e
-mcp_out="$(printf '%s\n' "$mcp_request" | "$headroom_bin" mcp 2>&1)"; mcp_code=$?
+printf '%s\n' "$mcp_request" | "$headroom_bin" mcp >"$root/mcp.out.log" 2>"$root/mcp.err.log"
+mcp_code=$?
 set -e
+mcp_out="$(cat "$root/mcp.out.log")"
+mcp_err="$(cat "$root/mcp.err.log")"
 if [[ "$mcp_code" -eq 0 ]] && printf '%s' "$mcp_out" | grep -q '"protocolVersion"' && printf '%s' "$mcp_out" | grep -q '"tools"'; then
   pass "headroom mcp (initialize + tools/list)"
 else
-  fail "headroom mcp" "exit $mcp_code: $mcp_out"
+  fail "headroom mcp" "exit $mcp_code: stdout=[$mcp_out] stderr=[$mcp_err]"
 fi
 
 if [[ "$failures" -eq 0 ]]; then

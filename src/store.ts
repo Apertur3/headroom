@@ -605,4 +605,18 @@ export class HeadroomStore {
   setProbeBinaryHash(hash: string): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_binary_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
+
+  /** The most recent probe binary hash that actually proved itself: recorded
+   * after a successful `headroom keychain grant` or a poll that got a real
+   * vendor response through it. See syncClaudeGrantState for how this
+   * exempts a first-ever sync (no probeBinaryHash yet) from being treated as
+   * grant-needed when it is really the same already-trusted binary. */
+  probeGrantedHash(): string | undefined {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_granted_sha256'").get();
+    return row ? String(row.value) : undefined;
+  }
+
+  setProbeGrantedHash(hash: string): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
+  }
 }

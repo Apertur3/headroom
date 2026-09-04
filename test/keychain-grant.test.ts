@@ -1,11 +1,14 @@
 import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { pollAccounts } from "../src/collector.js";
+import { isMainModule as cliIsMainModule } from "../src/cli.js";
 import { doctorChecks, homeCheck, keychainGrantCheck } from "../src/doctor.js";
-import { supportsBuiltinSqlite, warningSuppressionFlag } from "../bin/headroom.js";
+import { HeadroomStore } from "../src/store.js";
+import { isMainModule, supportsBuiltinSqlite, warningSuppressionFlag } from "../bin/headroom.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -30,7 +33,7 @@ describe("collector gate for a Claude principal awaiting a Keychain grant", () =
       "",
     ].join("\n"), { mode: 0o600 });
     await withHeadroomHome(root, async () => {
-      const result = await pollAccounts(undefined, { claudeGrant: { needsGrant: () => true, markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); } } });
+      const result = await pollAccounts(undefined, { claudeGrant: { needsGrant: () => true, markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); }, markProbeSucceeded: () => { throw new Error("must not be called: the probe was never attempted"); } } });
       const claudeRows = result.observations.filter((item) => item.principal_id === "claude-main");
       expect(claudeRows).toHaveLength(3);
       expect(claudeRows.every((item) => item.freshness === "failed" && item.reason === claudeGrantNeededReason("claude-main"))).toBe(true);
@@ -87,6 +90,62 @@ describe("doctor home directory and keychain grant checks", () => {
     expect(keychainGrantCheck(codex, new Map([["codex-main", "irrelevant"]]))).toBeUndefined();
   });
 
+  it("accepts a 0755 HOME with a nested 0700 HEADROOM_HOME, the exact scripts/smoke-cold.sh shape", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-home-cold-")); temporary.push(root);
+    const userHome = join(root, "home");
+    const headroomHomePath = join(userHome, ".headroom");
+    await mkdir(userHome, { recursive: true, mode: 0o755 });
+    await chmod(userHome, 0o755); // belt and suspenders: mkdir's mode is umask-masked too
+    await mkdir(headroomHomePath, { recursive: true, mode: 0o700 });
+    const { check, store } = await homeCheck(headroomHomePath);
+    expect(check).toMatchObject({ level: "OK", check: "home directory", detail: headroomHomePath });
+    store?.close();
+  });
+
+  it("uses the resolved HEADROOM_HOME, never $HOME/.headroom, when HEADROOM_HOME points elsewhere", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-home-override-")); temporary.push(root);
+    const userHome = join(root, "home"); // $HOME/.headroom would resolve here -- and must never be touched
+    const actual = join(root, "elsewhere", ".headroom"); // HEADROOM_HOME points here instead
+    await mkdir(userHome, { recursive: true, mode: 0o755 });
+    await withHeadroomHome(actual, async () => {
+      const checks = await doctorChecks();
+      const home = checks.find((item) => item.check === "home directory");
+      expect(home).toMatchObject({ level: "OK", detail: actual });
+      await expect(lstat(join(userHome, ".headroom"))).rejects.toThrow(); // never created under $HOME
+    });
+  });
+
+  it("skips the Keychain probe for a gated Claude principal and audits the skip, not a call", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-gated-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await withHeadroomHome(home, async () => {
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "accounts.toml"), [
+        "[[accounts]]",
+        'name = "claude-main"',
+        'vendor = "claude"',
+        'location = "/nonexistent/.claude"',
+        'adapter = "native-ts"',
+        "",
+      ].join("\n"), { mode: 0o600 });
+      const seed = await HeadroomStore.open(home);
+      seed.setKeychainGrantNeeded("claude-main", "Keychain access denied");
+      seed.close();
+      const checks = await doctorChecks();
+      const credential = checks.find((item) => item.check === "principal claude-main credential");
+      // Distinct from the real "Claude Keychain item is unavailable" message
+      // credentialCheck's own security(1) call would otherwise produce; this
+      // text only appears on the gated, no-Keychain-touch path.
+      expect(credential).toMatchObject({ level: "FAIL", detail: "Keychain grant needed; probe skipped" });
+      const store = await HeadroomStore.open(home);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'claude_probe' AND caller = 'doctor'").all();
+        expect(rows).toEqual([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]);
+      } finally { store.close(); }
+    });
+  });
+
   it("reports the engine upstream hash as INFO (not WARN) on a fresh install, with the optional wording", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-doctor-engine-")); temporary.push(root);
     await withHeadroomHome(join(root, ".headroom"), async () => {
@@ -116,5 +175,32 @@ describe("bin/headroom.js launcher flags", () => {
     // Defensive fallback only; the launcher's own version gate never lets a
     // Node this old actually reach this call.
     expect(warningSuppressionFlag("18.0.0")).toBe("--no-warnings=ExperimentalWarning");
+  });
+
+  it("still recognizes itself as the entry module when invoked through a symlinked path", async () => {
+    // Regression for the packed-CLI "prints nothing, exit 0" bug: on macOS,
+    // TMPDIR (and any npm global prefix under it) crosses a system symlink
+    // (/var -> /private/var). import.meta.url is always the resolved, real
+    // path; a literal argv[1] string compare then never matches and main()
+    // silently never runs. isMainModule resolves argv[1] the same way first.
+    const root = await mkdtemp(join(tmpdir(), "headroom-mainmodule-")); temporary.push(root);
+    const real = join(root, "real");
+    await mkdir(real);
+    const target = join(real, "headroom.js");
+    await writeFile(target, "");
+    const link = join(root, "link");
+    const { symlink } = await import("node:fs/promises");
+    await symlink(real, link);
+    const throughSymlink = join(link, "headroom.js");
+    // import.meta.url is always the realpath-resolved URL, even for a target
+    // reached without any symlink in the literal argument (the mktemp root
+    // itself may sit under a symlinked TMPDIR, e.g. macOS's /var alias).
+    const { realpath } = await import("node:fs/promises");
+    const metaUrl = pathToFileURL(await realpath(target)).href;
+    expect(isMainModule(metaUrl, throughSymlink)).toBe(true);
+    expect(cliIsMainModule(metaUrl, throughSymlink)).toBe(true);
+    expect(isMainModule(metaUrl, undefined)).toBe(false);
+    expect(isMainModule(metaUrl, join(root, "nonexistent.js"))).toBe(false);
+    expect(isMainModule(metaUrl, join(root, "other.js"))).toBe(false);
   });
 });
