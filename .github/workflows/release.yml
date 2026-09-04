@@ -12,6 +12,7 @@ permissions:
 jobs:
   verify:
     name: verify (${{ matrix.os }})
+    if: github.repository == 'Apertur3/headroom' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -33,6 +34,7 @@ jobs:
   tarball:
     name: build npm tarball
     needs: verify
+    if: github.repository == 'Apertur3/headroom' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -71,6 +73,7 @@ jobs:
   release:
     name: create GitHub release
     needs: tarball
+    if: github.repository == 'Apertur3/headroom' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,6 +122,7 @@ jobs:
   publish:
     name: publish to npm
     needs: [tarball, release]
+    if: github.repository == 'Apertur3/headroom' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
       # A step-level `if: secrets.X != ''` is unreliable (secrets aren't a
