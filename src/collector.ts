@@ -10,6 +10,7 @@ import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
+import type { AgyLoginState } from "./antigravity-keepalive.js";
 
 export interface PollResult {
   observations: Observation[];
@@ -21,6 +22,8 @@ export interface PollOptions {
   daemonOwnsAntigravity?: boolean;
   /** Remote quota failures are backed off independently from the warm local probe. */
   skipRemoteAntigravity?: boolean;
+  /** Auth state sampled from the daemon-owned agy log, for actionable local failures. */
+  antigravityLoginState?: AgyLoginState;
 }
 
 export interface AntigravityLocalRead {
@@ -70,6 +73,10 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       for (const account of antigravityAccounts) {
         const rows = localAntigravity.get(account.name) ?? [];
         const complete = selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0;
+        if (!complete && options.antigravityLoginState && options.antigravityLoginState !== "unknown") {
+          const reason = options.antigravityLoginState === "not_logged_in" ? "agy not logged in (run: agy)" : "agy logged in; quota summary not ready";
+          localAntigravity.set(account.name, rows.map((row) => row.freshness === "failed" ? { ...row, reason } : row));
+        }
         antigravityLocal[account.name] = { outcome: complete ? "fresh" : rows.length ? "failed" : "empty", payload_kind: complete ? "quota_summary" : rows.length ? "placeholder" : "none", at: new Date().toISOString() };
       }
     } catch (error) {
