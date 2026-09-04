@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { readPolicy, readRouting } from "./config.js";
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
 import { doctor } from "./doctor.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, syncClaudeGrantState } from "./adapters/claude.js";
+import { claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
@@ -282,6 +283,7 @@ async function observe(argv: string[]): Promise<number> {
       const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store) });
       failures = polled.failures;
       store.insertAll(polled.observations);
+      for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
       observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
@@ -365,9 +367,13 @@ async function keychain(argv: string[]): Promise<number> {
   if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
   const store = await HeadroomStore.open();
   try {
+    const hash = process.platform === "darwin" ? await probeBinaryHash() : undefined;
     for (const account of targets) {
       await grantClaudeKeychainAccess(account.location);
       store.clearKeychainGrantNeeded(account.name);
+      // The binary that just proved itself under an operator-run grant must
+      // never be treated as an unproven first run again by a background poll.
+      if (hash) store.setProbeGrantedHash(hash);
       console.log(`Keychain access granted for ${account.name}`);
     }
   } finally { store.close(); }
@@ -415,6 +421,24 @@ async function main(argv: string[]): Promise<number> {
   return observe(argv);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * `import.meta.url` is the entry module's canonical (symlink-resolved) URL,
+ * always -- Node's ESM loader realpath()s it. `process.argv[1]` is the raw
+ * argument the caller passed and is left exactly as given. On macOS these
+ * differ whenever the invoking path crosses a system alias (`/var` ->
+ * `/private/var`, `/tmp` -> `/private/tmp`): a plain string comparison then
+ * always fails, this file's own main() never runs, and the CLI silently
+ * exits 0 with no output at all. Any global npm prefix or accounts/home
+ * directory rooted under a default TMPDIR hits this, not just tests --
+ * resolving process.argv[1] the same way import.meta.url already is fixes it
+ * for every caller, not just the common case.
+ */
+export function isMainModule(metaUrl: string, argv1: string | undefined): boolean {
+  if (!argv1) return false;
+  try { return metaUrl === pathToFileURL(realpathSync(argv1)).href; }
+  catch { return false; }
+}
+
+if (isMainModule(import.meta.url, process.argv[1])) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1; });
 }

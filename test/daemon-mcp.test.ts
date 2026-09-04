@@ -1,15 +1,24 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { daemonRequest, rpc, HeadroomDaemon } from "../src/daemon.js";
-import { handleMcp } from "../src/mcp.js";
+import { directStatus, handleMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
+import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+
+async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.HEADROOM_HOME;
+  process.env.HEADROOM_HOME = home;
+  try { return await run(); }
+  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+}
 
 function fixture(): Observation {
   return {
@@ -34,6 +43,44 @@ describe("daemon JSON-RPC", () => {
     expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
     expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "placeholder" });
     await daemon.stop();
+  });
+
+  it("never spawns the Claude probe in the poll path once a keychain grant marker exists for the principal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-grant-gate-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "claude-main"',
+      'vendor = "claude"',
+      'location = "/nonexistent/.claude"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const seed = await HeadroomStore.open(root);
+      seed.setKeychainGrantNeeded("claude-main", "Keychain access denied");
+      seed.close();
+      // The default (real) poller, not an injected fake: this exercises the
+      // actual collector gate end to end through the daemon's own poll path.
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+      const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<{ observations: Observation[] } | { rate_limited: true }> };
+      const result = await internal.poll(undefined, true);
+      const observations = (result as { observations: Observation[] }).observations;
+      const claudeRows = observations.filter((item) => item.principal_id === "claude-main");
+      expect(claudeRows).toHaveLength(3);
+      // Never "Claude probe not built" or any other message the real
+      // observeClaude()/claudeProbe() would produce: the gate short-circuits
+      // before the probe is ever attempted.
+      expect(claudeRows.every((item) => item.freshness === "failed" && item.reason === claudeGrantNeededReason("claude-main"))).toBe(true);
+      await daemon.stop();
+      const store = await HeadroomStore.open(root);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'claude_probe' AND caller = 'daemon'").all();
+        expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]));
+        expect(rows.some((row) => row.outcome === "called")).toBe(false);
+      } finally { store.close(); }
+    });
   });
 
   it("returns only active leases through the daemon status/MCP lease surface", async () => {
@@ -112,6 +159,34 @@ describe("MCP JSON-RPC", () => {
       return { source: "direct", observations: [fixture()], failures: [] };
     });
     expect(response).toMatchObject({ result: { structuredContent: { source: "direct", observations: [expect.objectContaining({ meter_id: "codex-main:main" })] } } });
+  });
+
+  it("never spawns the Claude probe from a direct (no-daemon) MCP status read once a keychain grant marker exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-grant-gate-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "claude-main"',
+      'vendor = "claude"',
+      'location = "/nonexistent/.claude"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const seed = await HeadroomStore.open(root);
+      seed.setKeychainGrantNeeded("claude-main", "Keychain access denied");
+      seed.close();
+      const result = await directStatus();
+      const claudeRows = (result.observations as Observation[]).filter((item) => item.principal_id === "claude-main");
+      expect(claudeRows).toHaveLength(3);
+      expect(claudeRows.every((item) => item.freshness === "failed" && item.reason === claudeGrantNeededReason("claude-main"))).toBe(true);
+      const store = await HeadroomStore.open(root);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'claude_probe' AND caller = 'mcp'").all();
+        expect(rows).toEqual([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]);
+      } finally { store.close(); }
+    });
   });
 });
 

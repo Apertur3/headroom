@@ -220,11 +220,14 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
 function fakeGrantStore() {
   const grants = new Map<string, string>();
   let hash: string | undefined;
+  let grantedHash: string | undefined;
   return {
     keychainGrantNeeded: (id: string) => grants.has(id),
     setKeychainGrantNeeded: (id: string, reason: string) => { grants.set(id, reason); },
     probeBinaryHash: () => hash,
     setProbeBinaryHash: (value: string) => { hash = value; },
+    probeGrantedHash: () => grantedHash,
+    setProbeGrantedHash: (value: string) => { grantedHash = value; },
     grants,
   };
 }
@@ -254,19 +257,50 @@ describe("Claude Keychain grant gate", () => {
     expect(store.grants.get("claude-main")).toBe("Keychain access denied");
   });
 
-  it("marks every Claude principal only when the probe binary hash actually changes", async () => {
+  it("marks every Claude principal on a first-ever sync, with no prior successful probe or grant", async () => {
     const store = fakeGrantStore();
-    // The first-ever hash recorded is a baseline, not a rebuild.
-    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
-    expect(store.grants.size).toBe(0);
+    // A fresh install (or a rebuilt probe) must only ever pop its first
+    // Keychain dialog through `headroom keychain grant`, never a background
+    // daemon poll -- so the very first sync, with nothing recorded yet, marks
+    // every given principal instead of trusting an unproven binary.
+    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(true);
+    expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
     expect(store.probeBinaryHash()).toBe("hash-a");
-    // The same hash again is still not a rebuild.
+  });
+
+  it("does not re-mark an unchanged hash, and does mark every principal again on a rebuild", async () => {
+    const store = fakeGrantStore();
+    await syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a" });
+    store.grants.clear(); // simulate the operator clearing it via `headroom keychain grant`
+    // The same hash again, with nothing else changed, is not re-marked.
     await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
     expect(store.grants.size).toBe(0);
     // A different hash is a rebuild: every given principal is marked, in one pass.
     await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-b" })).resolves.toBe(true);
     expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
     expect(store.probeBinaryHash()).toBe("hash-b");
+  });
+
+  it("does not mark a first-ever sync when this exact hash already succeeded once", async () => {
+    const store = fakeGrantStore();
+    // A successful `headroom keychain grant` (or a successful poll) recorded
+    // this hash as granted; probeBinaryHash itself may be absent (e.g. a
+    // restored store), but the sync must still recognize the binary.
+    store.setProbeGrantedHash("hash-a");
+    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
+    expect(store.grants.size).toBe(0);
+    // A different (rebuilt) binary is unproven even though some other hash was granted before.
+    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-b" })).resolves.toBe(true);
+    expect(store.grants.get("claude-main")).toBe("probe binary rebuilt");
+  });
+
+  it("records a successful grant or a successful probe as the granted hash", () => {
+    const store = fakeGrantStore();
+    store.setProbeBinaryHash("hash-a");
+    const gate = claudeGrantGate(store);
+    expect(store.probeGrantedHash()).toBeUndefined();
+    gate.markProbeSucceeded();
+    expect(store.probeGrantedHash()).toBe("hash-a");
   });
 
   it("skips rebuild detection off macOS, with no probe binary, or with no Claude principals", async () => {

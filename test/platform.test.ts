@@ -1,7 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { socketPath } from "../src/daemon.js";
-import { credentialPath, headroomHome, vendorHome } from "../src/paths.js";
+import { assertSafeAncestry, credentialPath, headroomHome, vendorHome } from "../src/paths.js";
 import { installService, serviceContents, servicePath, uninstallService, windowsTaskXml } from "../src/service.js";
+
+const temporary: string[] = [];
+afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 describe("cross-platform paths", () => {
   it("resolves Headroom and vendor locations for macOS, Linux, and Windows", () => {
@@ -18,6 +24,49 @@ describe("cross-platform paths", () => {
   it("uses a per-user named pipe on Windows", () => {
     expect(socketPath("ignored", "win32", "alice")).toBe("\\\\.\\pipe\\headroom-alice");
     expect(socketPath("/home/alice", "linux", "alice")).toBe("/home/alice/headroom.sock");
+  });
+});
+
+describe("HEADROOM_HOME ancestor safety", () => {
+  it("accepts an ordinary 0755 ancestor, like a real home directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-0755-")); temporary.push(root);
+    const home = join(root, "home");
+    await mkdir(home, { mode: 0o755 });
+    await chmod(home, 0o755);
+    await expect(assertSafeAncestry(join(home, ".headroom"))).resolves.toBeUndefined();
+  });
+
+  it("accepts a world-writable ancestor only when the sticky bit is set, like /tmp", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-sticky-")); temporary.push(root);
+    const sticky = join(root, "sticky");
+    await mkdir(sticky, { mode: 0o1777 });
+    await chmod(sticky, 0o1777);
+    await expect(assertSafeAncestry(join(sticky, ".headroom"))).resolves.toBeUndefined();
+  });
+
+  it("refuses a world-writable ancestor with no sticky bit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-worldwritable-")); temporary.push(root);
+    const loose = join(root, "loose");
+    await mkdir(loose, { mode: 0o777 });
+    await chmod(loose, 0o777); // belt and suspenders: mkdir's mode is umask-masked too
+    await expect(assertSafeAncestry(join(loose, ".headroom"))).rejects.toThrow("group or world writable without the sticky bit");
+  });
+
+  it("refuses an ancestor owned by another user", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-otheruser-")); temporary.push(root);
+    const home = join(root, "home");
+    await mkdir(home, { mode: 0o755 });
+    await expect(assertSafeAncestry(join(home, ".headroom"), { uid: (process.getuid?.() ?? 0) + 1 })).rejects.toThrow("is owned by another user");
+  });
+
+  it("resolves a real ancestor chain (root through mktemp) with no false refusal", async () => {
+    // A regression lock for the exact scripts/smoke-cold.sh shape: an ordinary
+    // 0755 $HOME whose ancestor chain may itself cross a system alias
+    // (macOS's /var -> /private/var under a default TMPDIR).
+    const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-real-")); temporary.push(root);
+    const home = join(root, "home");
+    await mkdir(home, { mode: 0o755 });
+    await expect(assertSafeAncestry(join(home, ".headroom"))).resolves.toBeUndefined();
   });
 });
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { pollAccounts } from "./collector.js";
 import { readPolicy, readRouting } from "./config.js";
@@ -6,7 +7,7 @@ import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases } from "./policy.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount } from "./types.js";
+import { isLocalAccount, type ProviderAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 const tools = [
@@ -54,11 +55,22 @@ export function serveMcp(): void {
 
 type DirectResult = Record<string, unknown>;
 
-async function directStatus(): Promise<DirectResult> {
-  const polled = await pollAccounts();
+/** Exported only for tests: the MCP client that skips the daemon and reads
+ * straight from the collector must gate the Claude probe exactly like the
+ * CLI's no-daemon fallback does. */
+export async function directStatus(): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try {
+    // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
+    // without this, an MCP client polling directly (no daemon running) would
+    // spawn the Claude probe on every call regardless of a keychain_grants
+    // marker, popping a fresh dialog instead of respecting it.
+    const accounts = await readAccounts();
+    const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
+    await syncClaudeGrantState(store, claudeIds);
+    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store) });
     store.insertAll(polled.observations);
+    for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);
     store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
     return { source: "direct", observations: store.latestPerWindow(), failures: polled.failures };
   } finally { store.close(); }

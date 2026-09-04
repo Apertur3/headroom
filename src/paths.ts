@@ -124,6 +124,17 @@ export async function assertSafeAncestry(target: string, options: AncestryOption
     current = current === sep ? `${sep}${segment}` : join(current, segment);
     const info = await doLstat(current);
     if (info.uid !== uid && info.uid !== 0) throw new Error(`Refusing unsafe HEADROOM_HOME: ${current} is owned by another user`);
+    // A parent may ordinarily be 0755 (a normal home directory) or root-owned
+    // (system directories like /Users or /home). It may also be group- or
+    // world-writable, but only with the sticky bit set (mode 1777, like
+    // /tmp): the sticky bit is exactly what stops one tenant from renaming or
+    // replacing another tenant's entries in a shared writable directory.
+    // Writable-without-sticky is the one shape that lets a co-tenant plant or
+    // swap a component before Headroom's home is created under it.
+    if (platform === "win32") continue;
+    const writableByOthers = (info.mode & 0o022) !== 0;
+    const sticky = (info.mode & 0o1000) !== 0;
+    if (writableByOthers && !sticky) throw new Error(`Refusing unsafe HEADROOM_HOME: ${current} is group or world writable without the sticky bit`);
   }
 }
 
