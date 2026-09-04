@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-09-05
+
 ### Added
 - Native adapters for Claude and Codex that read credentials at call time and never refresh tokens.
 - Optional Swift engine on CodexBarCore for Antigravity and additional providers.

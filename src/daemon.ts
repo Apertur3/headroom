@@ -41,6 +41,16 @@ function healthSignature(token: string): string { return createHmac("sha256", to
 
 function rpcResult(id: unknown, result: unknown): Json { return { jsonrpc: "2.0", id: id ?? null, result }; }
 function rpcError(id: unknown, code: number, message: string): Json { return { jsonrpc: "2.0", id: id ?? null, error: { code, message } }; }
+function parseResetWindows(value: unknown): Array<Pick<Observation, "meter_id" | "window" | "resets_at">> {
+  const candidates = Array.isArray(value) ? value : [];
+  return candidates.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as { meter_id?: unknown; minutes?: unknown; resets_at?: unknown };
+    if (typeof candidate.meter_id !== "string" || (typeof candidate.minutes !== "number" && candidate.minutes !== null)) return [];
+    return [{ meter_id: candidate.meter_id, window: candidate.minutes === null ? null : { kind: "rolling" as const, minutes: candidate.minutes, enforcement: "hard" as const }, resets_at: typeof candidate.resets_at === "string" ? candidate.resets_at : null }];
+  });
+}
+
 function callerFrom(params: Json): string {
   const caller = params._caller;
   if (!caller || typeof caller !== "object") return "peer:unavailable";
@@ -195,14 +205,10 @@ export class HeadroomDaemon {
           result = await this.poll(principal, true); break;
         }
         case "reset_seen": {
-          const candidates = Array.isArray(params.windows) ? params.windows : [];
-          const windows: Array<Pick<Observation, "meter_id" | "window" | "resets_at">> = candidates.flatMap((item) => {
-            if (!item || typeof item !== "object") return [];
-            const candidate = item as { meter_id?: unknown; minutes?: unknown; resets_at?: unknown };
-            if (typeof candidate.meter_id !== "string" || (typeof candidate.minutes !== "number" && candidate.minutes !== null)) return [];
-            return [{ meter_id: candidate.meter_id, window: candidate.minutes === null ? null : { kind: "rolling", minutes: candidate.minutes, enforcement: "hard" }, resets_at: typeof candidate.resets_at === "string" ? candidate.resets_at : null }];
-          });
-          result = Object.fromEntries(this.store.resetSeenFor(windows)); break;
+          result = Object.fromEntries(this.store.resetSeenFor(parseResetWindows(params.windows))); break;
+        }
+        case "free_reset_used": {
+          result = Object.fromEntries(this.store.freeResetUsedFor(parseResetWindows(params.windows))); break;
         }
         case "health": result = {
           socket: this.path,
