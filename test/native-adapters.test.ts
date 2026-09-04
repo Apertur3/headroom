@@ -2,7 +2,10 @@ import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { claudeResponseShape, claudeServiceName, observationsFromClaudeUsage, observeClaude } from "../src/adapters/claude.js";
+import {
+  ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
+  claudeResponseShape, claudeServiceName, observationsFromClaudeUsage, observeClaude, syncClaudeGrantState,
+} from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import { observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential } from "../src/adapters/antigravity.js";
 
@@ -211,5 +214,68 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(codexShape.usage).toContainEqual({ path: "$.rate_limit.primary.used_percent", kind: "number" });
     expect(claudeShape).toContainEqual({ path: "$.five_hour.utilization", kind: "number" });
     expect(JSON.stringify(codexShape)).not.toContain("73");
+  });
+});
+
+function fakeGrantStore() {
+  const grants = new Map<string, string>();
+  let hash: string | undefined;
+  return {
+    keychainGrantNeeded: (id: string) => grants.has(id),
+    setKeychainGrantNeeded: (id: string, reason: string) => { grants.set(id, reason); },
+    probeBinaryHash: () => hash,
+    setProbeBinaryHash: (value: string) => { hash = value; },
+    grants,
+  };
+}
+
+describe("Claude Keychain grant gate", () => {
+  it("maps a probe denial or timeout to the same actionable reason, without a raw Keychain message", async () => {
+    const denied = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("denied", "Keychain access denied"); } });
+    const timedOut = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("timeout", "Keychain access timed out"); } });
+    expect(denied[0].reason).toBe(claudeGrantNeededReason("claude-main"));
+    expect(timedOut[0].reason).toBe(claudeGrantNeededReason("claude-main"));
+    expect(denied.every((row) => row.freshness === "failed")).toBe(true);
+    expect(denied[0].reason).toBe("Keychain grant needed; run: headroom keychain grant --principal claude-main");
+  });
+
+  it("builds synthetic gate-blocked observations without ever attempting the probe", () => {
+    const rows = claudeGrantNeededObservations(claude, at);
+    expect(rows.map((row) => row.meter_id)).toEqual(["claude-main:all", "claude-main:fable", "claude-main:routines"]);
+    expect(rows.every((row) => row.freshness === "failed" && row.reason === claudeGrantNeededReason("claude-main"))).toBe(true);
+  });
+
+  it("wires a store into a needsGrant/markGrantNeeded gate", () => {
+    const store = fakeGrantStore();
+    const gate = claudeGrantGate(store);
+    expect(gate.needsGrant("claude-main")).toBe(false);
+    gate.markGrantNeeded("claude-main", "Keychain access denied");
+    expect(gate.needsGrant("claude-main")).toBe(true);
+    expect(store.grants.get("claude-main")).toBe("Keychain access denied");
+  });
+
+  it("marks every Claude principal only when the probe binary hash actually changes", async () => {
+    const store = fakeGrantStore();
+    // The first-ever hash recorded is a baseline, not a rebuild.
+    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
+    expect(store.grants.size).toBe(0);
+    expect(store.probeBinaryHash()).toBe("hash-a");
+    // The same hash again is still not a rebuild.
+    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
+    expect(store.grants.size).toBe(0);
+    // A different hash is a rebuild: every given principal is marked, in one pass.
+    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-b" })).resolves.toBe(true);
+    expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
+    expect(store.probeBinaryHash()).toBe("hash-b");
+  });
+
+  it("skips rebuild detection off macOS, with no probe binary, or with no Claude principals", async () => {
+    const store = fakeGrantStore();
+    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "linux", hash: async () => "hash-a" })).resolves.toBe(false);
+    expect(store.probeBinaryHash()).toBeUndefined();
+    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => undefined })).resolves.toBe(false);
+    expect(store.probeBinaryHash()).toBeUndefined();
+    await expect(syncClaudeGrantState(store, [], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
+    expect(store.probeBinaryHash()).toBeUndefined();
   });
 });

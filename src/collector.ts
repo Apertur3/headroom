@@ -3,7 +3,7 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
-import { observeClaude } from "./adapters/claude.js";
+import { claudeGrantNeededObservations, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { observeCodex } from "./adapters/codex.js";
 import { observeAntigravity } from "./adapters/antigravity.js";
 import { observeLocal } from "./engine/local.js";
@@ -24,6 +24,11 @@ export interface PollOptions {
   skipRemoteAntigravity?: boolean;
   /** Auth state sampled from the daemon-owned agy log, for actionable local failures. */
   antigravityLoginState?: AgyLoginState;
+  /** Consulted before every Claude probe attempt so a principal denied or
+   * timed out (or caught by a probe binary rebuild) is not retried until
+   * `headroom keychain grant` clears it. Absent for callers that do not
+   * track grant state (e.g. --shape diagnostics). */
+  claudeGrant?: ClaudeGrantGate;
 }
 
 export interface AntigravityLocalRead {
@@ -54,8 +59,16 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // credential read and request to the separately-granted Claude probe.
   const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
   for (const account of tsAccounts) {
+    if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
+      observations.push(...claudeGrantNeededObservations(account));
+      continue;
+    }
     const result = account.vendor === "claude" ? await observeClaude(account) : await observeCodex(account);
     observations.push(...result);
+    if (account.vendor === "claude" && options.claudeGrant) {
+      const denied = result.find((item) => item.freshness === "failed" && item.reason?.startsWith("Keychain grant needed;"));
+      if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
+    }
     const protectedFailure = result.find((item) => item.freshness === "failed" && /\(401|403|429\)/.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
   }

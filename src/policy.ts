@@ -121,6 +121,13 @@ function meterDecision(observations: Observation | Observation[] | undefined, po
     const model = metadata?.model_ids?.[0] ?? "unknown";
     return { state: deciding.state, reason: `${deciding.state}, model ${model}, ${metadata?.running ?? deciding.observation.quantity?.used ?? 0} running` };
   }
+  // A window with no percentage (a failed/stale/missing read) already carries
+  // its own explanation from paceDecision; repeating the bare state word after
+  // the literal string "UNKNOWN" (`wk UNKNOWN UNKNOWN`) said nothing twice and
+  // hid the actual reason. Every other state still gets the original
+  // `label value STATE` form, since there the trailing state word is the pace
+  // classification of a real percentage, not a duplicate of it.
+  if (deciding.state === "UNKNOWN") return { state: deciding.state, reason: `${windowLabel(deciding.observation)} UNKNOWN (${deciding.reason})` };
   return {
     state: deciding.state,
     reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}`,

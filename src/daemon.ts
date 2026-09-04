@@ -4,6 +4,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
+import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
 import { pollAccounts, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
@@ -289,12 +290,22 @@ export class HeadroomDaemon {
     }
     if (forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { rate_limited: true };
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
+    const accounts = await this.currentAccounts();
+    const claudePrincipalIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
+    // A rebuilt probe binary marks every Claude principal before the poll
+    // below ever runs, so the gate skips the probe call this cycle instead of
+    // popping a fresh Keychain dialog with the new binary. Idempotent, so two
+    // concurrent poll() calls racing here (before the inFlight check/set pair
+    // right below, which must stay await-free to keep coalescing them into
+    // one poller call) doing this twice is harmless.
+    await syncClaudeGrantState(this.store, claudePrincipalIds);
     const current = this.inFlight.get(key);
     if (current) return current;
     const task = this.poller(principal, {
       daemonOwnsAntigravity: this.keepalive?.running === true,
       skipRemoteAntigravity: warmOnly,
       antigravityLoginState: this.keepalive?.loginState ?? "unknown",
+      claudeGrant: claudeGrantGate(this.store),
     }).then((result) => {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
@@ -307,11 +318,13 @@ export class HeadroomDaemon {
       for (const principalId of new Set(result.observations.map((item) => item.principal_id))) {
         if (result.observations.some((item) => item.principal_id === principalId && item.source === "native:claude")) this.store.audit("daemon", "claude_probe", principalId, "called");
       }
-      const keychainDenied = result.observations.some((item) => item.freshness === "failed" && item.reason === "Keychain access denied; run: headroom keychain grant");
+      // A Claude Keychain denial/timeout no longer gets a timed backoff: the
+      // grant gate (set above, and by the collector on this very denial)
+      // already stops the next poll from retrying until the operator runs
+      // `headroom keychain grant`, which is a stronger and more honest signal
+      // than a fixed hour.
       const protectedFailure = result.failures.some((failure) => /\b(401|403|429)\b/.test(failure));
-      if (keychainDenied) {
-        this.backoff.set(key, { failures: 1, until: Date.now() + 3_600_000 });
-      } else if (protectedFailure) {
+      if (protectedFailure) {
         const previous = this.backoff.get(key)?.failures ?? 0;
         this.backoff.set(key, { failures: previous + 1, until: Date.now() + Math.min(3_600_000, 60_000 * 2 ** previous) });
       } else if (!warmOnly) this.backoff.delete(key);

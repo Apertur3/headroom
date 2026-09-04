@@ -30,7 +30,7 @@ export async function safeHeadroomDirectory(home = headroomHome()): Promise<stri
   const stat = await lstat(requested);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing unsafe ~/.headroom directory");
   if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing ~/.headroom owned by another user");
-  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.headroom with group or world permissions");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) throw new Error("Refusing ~/.headroom with group or world permissions; run: chmod 700 ~/.headroom");
   // lstat above proves the Headroom-owned leaf is not a link. realpath still
   // canonicalizes system aliases such as /var → /private/var on macOS.
   return realpath(requested);
@@ -176,6 +176,12 @@ export class HeadroomStore {
       CREATE INDEX IF NOT EXISTS lease_spend_lease ON lease_spend(lease_id);
       CREATE TABLE IF NOT EXISTS schema_migrations (
         id TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS keychain_grants (
+        principal_id TEXT PRIMARY KEY, reason TEXT NOT NULL, set_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS daemon_state (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
       );
     `);
     // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
@@ -555,5 +561,48 @@ export class HeadroomStore {
 
   audit(caller: string, action: string, meterOrPrincipal: string | null, outcome: string): void {
     this.db.prepare("INSERT INTO audit (caller,action,meter_or_principal,outcome,at) VALUES (?,?,?,?,?)").run(caller, action, meterOrPrincipal, outcome, new Date().toISOString());
+  }
+
+  /**
+   * A Claude principal whose Keychain probe was denied or timed out (or whose
+   * probe binary was rebuilt, see setProbeBinaryHash) is marked here so the
+   * daemon stops attempting that principal's probe -- which would otherwise
+   * pop a fresh macOS Keychain dialog on every poll -- until the operator
+   * explicitly runs `headroom keychain grant`, which clears the marker.
+   */
+  keychainGrantNeeded(principalId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM keychain_grants WHERE principal_id = ?").get(principalId) !== undefined;
+  }
+
+  keychainGrantReason(principalId: string): string | undefined {
+    const row = this.db.prepare("SELECT reason FROM keychain_grants WHERE principal_id = ?").get(principalId);
+    return row ? String(row.reason) : undefined;
+  }
+
+  setKeychainGrantNeeded(principalId: string, reason: string, now = new Date()): void {
+    this.db.prepare("INSERT INTO keychain_grants (principal_id, reason, set_at) VALUES (?,?,?) ON CONFLICT(principal_id) DO UPDATE SET reason = excluded.reason, set_at = excluded.set_at")
+      .run(principalId, reason, now.toISOString());
+  }
+
+  clearKeychainGrantNeeded(principalId: string): void {
+    this.db.prepare("DELETE FROM keychain_grants WHERE principal_id = ?").run(principalId);
+  }
+
+  keychainGrantsNeeded(): Array<{ principal_id: string; reason: string; set_at: string }> {
+    return this.db.prepare("SELECT * FROM keychain_grants ORDER BY principal_id ASC").all()
+      .map((row) => ({ principal_id: String(row.principal_id), reason: String(row.reason), set_at: String(row.set_at) }));
+  }
+
+  /** The Claude Keychain probe binary's last-known sha256, used to detect a
+   * rebuild (a new binary) so every Claude principal is marked as needing a
+   * fresh grant instead of the daemon silently re-probing with the new
+   * binary and popping one dialog per principal per poll. */
+  probeBinaryHash(): string | undefined {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_binary_sha256'").get();
+    return row ? String(row.value) : undefined;
+  }
+
+  setProbeBinaryHash(hash: string): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_binary_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
 }
