@@ -5,6 +5,14 @@ limitations that have actually shown up against live accounts. Endpoints and fil
 straight from the adapter source (`src/adapters/*.ts`); when something here looks wrong, that
 source is the tiebreaker, not this page.
 
+## Building the Swift engine
+
+`engine/Package.swift` pins `CodexBarCore` to `steipete/codexbar` at the same release tag as the
+CodexBarCLI assets in `engine.lock.json`. Building the Swift engine (`npm run engine:build`,
+`swift build --package-path engine`, `swift test --package-path engine`) therefore fetches that
+dependency's source from GitHub over the network; there is no vendored or offline copy. A build run
+without network access to GitHub fails at dependency resolution, not at compile time.
+
 ## Claude
 
 Headroom reads Claude Code's own OAuth access token and calls

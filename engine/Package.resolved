@@ -1,6 +1,14 @@
 {
-  "originHash" : "a6e805fb3efc76178564016a637a3c884b987fbee16dce729bcb9f952118c8dd",
+  "originHash" : "c3a459f8a25e53aba14e5416de1bae635538c7a158f0026110cccfa6677a9b33",
   "pins" : [
+    {
+      "identity" : "codexbar",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/steipete/codexbar",
+      "state" : {
+        "revision" : "fb9d295304af2873803b317ac1e3adb07b414083"
+      }
+    },
     {
       "identity" : "commander",
       "kind" : "remoteSourceControl",

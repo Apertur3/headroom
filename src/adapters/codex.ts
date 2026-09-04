@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { credentialPath, vendorHome } from "../paths.js";
-import { allowedOutbound, redact } from "../security.js";
+import { outboundFetch, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
@@ -178,8 +178,8 @@ export async function codexResponseShape(account: ProviderAccount, dependencies:
   if (credential.expired) throw new Error(`token expired; ${codexLoginCommand(account)}`);
   const doFetch = dependencies.fetch ?? fetch;
   const [usage, credits] = await Promise.all([
-    doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/usage").toString(), { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
-    doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits").toString(), { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+    outboundFetch(doFetch, new Request("https://chatgpt.com/backend-api/wham/usage", { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+    outboundFetch(doFetch, new Request("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
   ]);
   if (!usage.ok) throw new ProviderHTTPError(usage.status, "Codex");
   if (!credits.ok) throw new ProviderHTTPError(credits.status, "Codex credits");
@@ -194,8 +194,8 @@ export async function observeCodex(account: ProviderAccount, dependencies: Codex
     if (credential.expired) return failed(account, `token expired; ${codexLoginCommand(account)}`, timestamp);
     const doFetch = dependencies.fetch ?? fetch;
     const [usageResponse, creditResponse] = await Promise.all([
-      doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/usage").toString(), { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
-      doFetch(new Request(allowedOutbound("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits").toString(), { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+      outboundFetch(doFetch, new Request("https://chatgpt.com/backend-api/wham/usage", { headers: headers(credential.token, credential.accountId), signal: AbortSignal.timeout(TIMEOUT_MS) })),
+      outboundFetch(doFetch, new Request("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", { headers: headers(credential.token, credential.accountId, true), signal: AbortSignal.timeout(TIMEOUT_MS) })),
     ]);
     if (!usageResponse.ok) throw new ProviderHTTPError(usageResponse.status, "Codex");
     if (!creditResponse.ok) throw new ProviderHTTPError(creditResponse.status, "Codex credits");

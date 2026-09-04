@@ -84,7 +84,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
       fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "UNSUPPORTED_CLIENT", message: "Gemini Code Assist for individuals is no longer supported for person@example.com; Bearer eyJ.not-a-token" } }), { status: 403 }),
     });
-    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "HTTP 403 UNSUPPORTED_CLIENT: Gemini Code Assist for individuals is no longer supported for [REDACTED]@example.com; [REDACTED]" })]));
+    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "HTTP 403 UNSUPPORTED_CLIENT: Gemini Code Assist for individuals is no longer supported for [REDACTED]; [REDACTED]" })]));
   });
 
   it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {

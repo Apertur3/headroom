@@ -1,4 +1,5 @@
 import XCTest
+import CodexBarCore
 @testable import headroom_engine
 
 final class AntigravityReadinessTests: XCTestCase {

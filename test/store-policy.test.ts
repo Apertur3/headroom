@@ -212,6 +212,69 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("emits source_failed once for a run of failures and advances last_seen_at instead of duplicating the event", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-failure-run-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const window = { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const };
+      const failing = (fetched_at: string) => observation({ principal_id: "claude-main", meter_id: "claude-main:all", window, quantity: null, freshness: "failed", reason: "no credentials", fetched_at, observed_at: fetched_at });
+      store.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:all", window, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z", fetched_at: "2026-09-03T20:00:00Z", observed_at: "2026-09-03T20:00:00Z" }));
+      store.insert(failing("2026-09-03T20:05:00Z"));
+      store.insert(failing("2026-09-03T20:10:00Z"));
+      store.insert(failing("2026-09-03T20:15:00Z"));
+      const failedEvents = store.events("2026-09-03T00:00:00Z").filter((event) => event.kind === "source_failed" && event.meter_id === "claude-main:all");
+      expect(failedEvents).toHaveLength(1);
+      expect(failedEvents[0]).toMatchObject({ created_at: "2026-09-03T20:05:00Z", last_seen_at: "2026-09-03T20:15:00Z" });
+    } finally { store.close(); }
+  });
+
+  it("fires exactly one vendor_reported free_reset_granted event when Codex credits go from 0 to 1", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-credit-grant-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const credit = (remaining: number, fetched_at: string) => observation({
+        principal_id: "codex-main", meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" },
+        quantity: { used: 0, limit: null, remaining, unit: "credits" }, resets_at: "2026-10-04T00:00:00Z", fetched_at, observed_at: fetched_at,
+      });
+      // Live-observed shape: "credits 1 available (expires Oct 4)" appeared
+      // after a prior read of 0 available credits.
+      store.insert(credit(0, "2026-09-03T22:00:00Z"));
+      store.insert(credit(1, "2026-09-03T22:05:00Z"));
+      const granted = store.events("2026-09-03T00:00:00Z").filter((event) => event.kind === "free_reset_granted");
+      expect(granted).toHaveLength(1);
+      expect(granted[0]).toMatchObject({ origin: "vendor_reported", meter_id: "codex-main:credits" });
+    } finally { store.close(); }
+  });
+
+  it("collapses pre-existing duplicate source_failed events into the first one, once per database", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-collapse-failures-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: new (path: string) => { exec(sql: string): void; prepare(sql: string): { run(...params: unknown[]): unknown }; close(): void } };
+
+    const seed = await HeadroomStore.open(home);
+    const window = { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const };
+    seed.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:all", window, quantity: { used: 5, limit: 100, remaining: 95, unit: "percent" }, fetched_at: "2026-09-03T20:00:00Z", observed_at: "2026-09-03T20:00:00Z" }));
+    seed.close();
+
+    // Model a database written before the fix landed, when every failed poll
+    // inserted its own source_failed row for the same still-down meter.
+    const raw = new RawDatabase(join(home, "headroom.db"));
+    raw.exec("DELETE FROM schema_migrations WHERE id = '2026-09-05-collapse-source-failed-duplicates'");
+    for (const [id, createdAt] of [["source_failed:planted-1", "2026-09-03T20:05:00Z"], ["source_failed:planted-2", "2026-09-03T20:10:00Z"], ["source_failed:planted-3", "2026-09-03T20:15:00Z"]] as const) {
+      raw.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        .run(id, "source_failed", "vendor_reported", 1, "[]", createdAt, null, "claude-main:all", "claude-main", null, createdAt);
+    }
+    raw.close();
+
+    const reopened = await HeadroomStore.open(home);
+    try {
+      const failedEvents = reopened.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "source_failed" && event.meter_id === "claude-main:all");
+      expect(failedEvents).toHaveLength(1);
+      expect(failedEvents[0]).toMatchObject({ id: "source_failed:planted-1", created_at: "2026-09-03T20:05:00Z", last_seen_at: "2026-09-03T20:15:00Z" });
+      await expect(readFile(join(home, "logs", "daemon.log"), "utf8")).resolves.toContain("collapsed 2 duplicate source_failed events");
+    } finally { reopened.close(); }
+  });
+
   it("backfills a missing reset event across a failure gap and removes false local-pool reset events, once per database", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-backfill-")); temporary.push(root);
     const home = join(root, ".headroom");

@@ -1,5 +1,6 @@
 import type { LocalAccount, Observation } from "../types.js";
-import { allowedOutbound } from "../security.js";
+import { allowedOutbound, outboundFetch } from "../security.js";
+import { vendorJson, vendorText } from "../limits.js";
 
 const timeoutMs = 3_000;
 
@@ -9,7 +10,7 @@ function endpoint(baseUrl: string, path: string): string {
 }
 
 async function get(baseUrl: string, path: string): Promise<Response> {
-  return fetch(endpoint(baseUrl, path), { signal: AbortSignal.timeout(timeoutMs) });
+  return outboundFetch(fetch, new Request(endpoint(baseUrl, path), { signal: AbortSignal.timeout(timeoutMs) }), { localBaseUrls: [baseUrl] });
 }
 
 function modelIds(body: unknown): string[] {
@@ -49,9 +50,9 @@ export async function observeLocal(account: LocalAccount): Promise<Observation> 
   try {
     const modelsResponse = await get(account.base_url, "v1/models");
     if (!modelsResponse.ok) throw new Error(`models HTTP ${modelsResponse.status}`);
-    const models = modelIds(await modelsResponse.json());
+    const models = modelIds(await vendorJson(modelsResponse));
     const [metrics, health] = await Promise.all([
-      get(account.base_url, "metrics").then(async (response) => response.ok ? vllmQueue(await response.text()) : undefined).catch(() => undefined),
+      get(account.base_url, "metrics").then(async (response) => response.ok ? vllmQueue(await vendorText(response)) : undefined).catch(() => undefined),
       get(account.base_url, "health").then(() => undefined).catch(() => undefined),
     ]);
     const running = metrics?.running ?? 0;

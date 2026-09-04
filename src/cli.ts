@@ -14,7 +14,7 @@ import { serveMcp } from "./mcp.js";
 import { canRouteWithLeases, paceDecision, type CanDecision } from "./policy.js";
 import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
-import { safeError } from "./security.js";
+import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent } from "./types.js";
@@ -361,6 +361,10 @@ async function keychain(argv: string[]): Promise<number> {
 }
 
 async function main(argv: string[]): Promise<number> {
+  // Before any command can fetch a vendor endpoint: an operator's shell
+  // proxy must never silently carry a credentialed request unless
+  // policy.toml opts in.
+  stripAmbientProxyEnvironment((await readPolicy()).proxy);
   if (await migrateLegacyHome()) console.log(["Moved ~/.", "ta", "lly", " to ~/.headroom."].join(""));
   if (argv[0] === "engine" && argv[1] === "install") {
     const pin = argv.includes("--pin");
