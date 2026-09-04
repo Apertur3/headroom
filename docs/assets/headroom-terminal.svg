@@ -1,13 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="326" viewBox="0 0 900 326" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="14">
-  <rect width="900" height="326" rx="12" fill="#0f1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="14">
+  <rect width="900" height="300" rx="12" fill="#0f1117"/>
   <circle cx="22" cy="20" r="6" fill="#ff5f57"/><circle cx="42" cy="20" r="6" fill="#febc2e"/><circle cx="62" cy="20" r="6" fill="#28c840"/>
-  <text x="24" y="62" fill="#9aa4b2">$ <tspan fill="#e6edf3">headroom</tspan></text>
-<text x="24" y="96" fill="#e6edf3">antigravity:gemini  <tspan fill="#9aa4b2"> </tspan>5h <tspan fill="#d29922">UNKNOWN</tspan> (Gemini CLI OAuth client unavailable) | wk <tspan fill="#d29922">UNKNOWN</tspan> (Gemini CLI OAuth client unavailable)  (failed 2m)</text>
-<text x="24" y="122" fill="#e6edf3">claude-main:all     <tspan fill="#9aa4b2"> </tspan>5h 11% ↻03:20 <tspan fill="#3fb950">HARVEST</tspan> | wk 3% ↻Sep 6 14:00 <tspan fill="#3fb950">HARVEST</tspan>  (fresh 2m)</text>
-<text x="24" y="148" fill="#e6edf3">codex-main:credits  <tspan fill="#9aa4b2"> </tspan>credits 1 available (expires Oct 4)  (fresh 2m)</text>
-<text x="24" y="174" fill="#e6edf3">codex-main:main     <tspan fill="#9aa4b2"> </tspan>wk 81% ↻Sep 10 15:08 <tspan fill="#f0883e">CONSERVE</tspan>  (fresh 2m)</text>
-<text x="24" y="200" fill="#e6edf3">workstation:capacity      <tspan fill="#9aa4b2"> </tspan><tspan fill="#3fb950">UP</tspan> model=local-coder running=0 waiting=0</text>
-<text x="24" y="226" fill="#e6edf3">gpu-box:capacity      <tspan fill="#9aa4b2"> </tspan><tspan fill="#3fb950">UP</tspan> model=local-27b running=0 waiting=0</text>
-<text x="24" y="270" fill="#9aa4b2">$ <tspan fill="#e6edf3">headroom can gemini-bulk</tspan></text>
-<text x="24" y="296" fill="#e6edf3">NO antigravity:gemini <tspan fill="#d29922">UNKNOWN</tspan> (wk <tspan fill="#d29922">UNKNOWN</tspan> UNKNOWN)</text>
+<text x="24" y="62" fill="#9aa4b2">$ <tspan fill="#e6edf3">headroom</tspan></text>
+<text x="24" y="96" fill="#e6edf3">claude-main:all     5h 11% ↻03:27 <tspan fill="#3fb950">HARVEST</tspan> | wk 3% ↻Sep 8 12:57 <tspan fill="#3fb950">HARVEST</tspan>  (fresh &lt;1m)</text>
+<text x="24" y="122" fill="#e6edf3">codex-main:main     wk 81% ↻Sep 8 12:57 <tspan fill="#f0883e">CONSERVE</tspan>  (fresh &lt;1m)</text>
+<text x="24" y="148" fill="#e6edf3">codex-main:credits  credits 1 available (expires Oct 5)  (fresh &lt;1m)</text>
+<text x="24" y="174" fill="#e6edf3">workstation:capacity      <tspan fill="#3fb950">UP</tspan> model=local-coder running=0 waiting=0</text>
+<text x="24" y="200" fill="#e6edf3">gpu-box:capacity      <tspan fill="#3fb950">UP</tspan> model=local-27b running=0 waiting=0</text>
+<text x="24" y="244" fill="#9aa4b2">$ <tspan fill="#e6edf3">headroom can codex-build</tspan></text>
+<text x="24" y="270" fill="#e6edf3">NO codex-main:main <tspan fill="#f0883e">CONSERVE</tspan> (wk 81% <tspan fill="#f0883e">CONSERVE</tspan>)</text>
 </svg>

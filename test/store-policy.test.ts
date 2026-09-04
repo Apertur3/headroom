@@ -407,6 +407,16 @@ describe("pace and consumes", () => {
     expect(paceState(paced(95, { resets_at: "2026-09-03T13:35:00Z" }), policy, now)).toBe("FREEZE");
   });
 
+  it("formats an UNKNOWN window's can reason as 'wk UNKNOWN (reason)', not a duplicated state", () => {
+    // Regression for the bug where a window with no percentage rendered its
+    // own state twice, e.g. "wk UNKNOWN UNKNOWN", hiding the actual reason.
+    const failedWeekly = observation({ meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "failed", reason: "Gemini CLI OAuth client unavailable", fetched_at: now.toISOString() });
+    const decision = canConsume([failedWeekly.meter_id], new Map([[failedWeekly.meter_id, failedWeekly]]), policy, false, now);
+    expect(decision.state).toBe("UNKNOWN");
+    expect(decision.reason).toBe("wk UNKNOWN (Gemini CLI OAuth client unavailable)");
+    expect(decision.meters).toEqual([expect.objectContaining({ meter: failedWeekly.meter_id, state: "UNKNOWN", reason: "wk UNKNOWN (Gemini CLI OAuth client unavailable)" })]);
+  });
+
   it("blocks on an enforced weekly window even if the 5h window is not enforced", () => {
     const fiveHour = paced(0, { window: { kind: "rolling", minutes: 300, enforcement: "hard" }, freshness: "not_enforced", quantity: null, resets_at: null });
     const weekly = paced(17, { window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, resets_at: "2026-09-10T12:00:00Z" });
@@ -538,6 +548,51 @@ describe("leases", () => {
       store.insert(observation({ fetched_at: at.toISOString(), quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
       store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
       expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z")).map((item) => item.spent_percent).sort()).toEqual([5, 5]);
+    } finally { store.close(); }
+  });
+});
+
+describe("Keychain grant marker lifecycle", () => {
+  it("records, queries, and clears a per-principal keychain_grant_needed marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-keychain-grant-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      expect(store.keychainGrantNeeded("claude-main")).toBe(false);
+      expect(store.keychainGrantReason("claude-main")).toBeUndefined();
+      expect(store.keychainGrantsNeeded()).toEqual([]);
+
+      store.setKeychainGrantNeeded("claude-main", "Keychain access denied");
+      expect(store.keychainGrantNeeded("claude-main")).toBe(true);
+      expect(store.keychainGrantReason("claude-main")).toBe("Keychain access denied");
+      expect(store.keychainGrantsNeeded()).toEqual([expect.objectContaining({ principal_id: "claude-main", reason: "Keychain access denied" })]);
+
+      // A second marker for the same principal replaces the reason rather than duplicating the row.
+      store.setKeychainGrantNeeded("claude-main", "probe binary rebuilt");
+      expect(store.keychainGrantsNeeded()).toHaveLength(1);
+      expect(store.keychainGrantReason("claude-main")).toBe("probe binary rebuilt");
+
+      store.setKeychainGrantNeeded("claude-2", "Keychain access timed out");
+      expect(store.keychainGrantsNeeded().map((item) => item.principal_id).sort()).toEqual(["claude-2", "claude-main"]);
+
+      store.clearKeychainGrantNeeded("claude-main");
+      expect(store.keychainGrantNeeded("claude-main")).toBe(false);
+      expect(store.keychainGrantNeeded("claude-2")).toBe(true);
+
+      // Clearing an already-clear (or never-set) principal is a harmless no-op.
+      store.clearKeychainGrantNeeded("claude-main");
+      expect(store.keychainGrantNeeded("claude-main")).toBe(false);
+    } finally { store.close(); }
+  });
+
+  it("tracks the Claude probe binary's last-known hash for rebuild detection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-hash-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      expect(store.probeBinaryHash()).toBeUndefined();
+      store.setProbeBinaryHash("hash-a");
+      expect(store.probeBinaryHash()).toBe("hash-a");
+      store.setProbeBinaryHash("hash-b");
+      expect(store.probeBinaryHash()).toBe("hash-b");
     } finally { store.close(); }
   });
 });
