@@ -212,6 +212,7 @@ export class HeadroomDaemon {
             running: this.keepalive?.running === true,
             pid: this.keepalive?.pid ?? null,
             uptime_ms: this.keepalive?.uptimeMs ?? null,
+            login_state: this.keepalive?.loginState ?? "unknown",
             local_reads: Object.fromEntries(this.antigravityLocal),
           },
           ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}),
@@ -246,7 +247,11 @@ export class HeadroomDaemon {
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
     const current = this.inFlight.get(key);
     if (current) return current;
-    const task = this.poller(principal, { daemonOwnsAntigravity: this.keepalive?.running === true, skipRemoteAntigravity: warmOnly }).then((result) => {
+    const task = this.poller(principal, {
+      daemonOwnsAntigravity: this.keepalive?.running === true,
+      skipRemoteAntigravity: warmOnly,
+      antigravityLoginState: this.keepalive?.loginState ?? "unknown",
+    }).then((result) => {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
