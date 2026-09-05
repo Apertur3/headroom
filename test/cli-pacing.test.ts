@@ -327,7 +327,7 @@ describe("headroom fill", () => {
     await withHeadroomHome(home2, async () => {
       expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x"])).toBe(2);
     });
-  });
+  }, 20_000); // two seeded homes and two SQLite stores; a loaded Windows runner needs more than the 5s default
 
   it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)' and exits 0 instead of a generic error", async () => {
     const home = await seededHome();
