@@ -5,7 +5,7 @@ import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
 import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
-import { pollAccounts, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
+import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
 import { executablePath, headroomHome, joinForPlatform } from "./paths.js";
@@ -242,7 +242,13 @@ export class HeadroomDaemon {
           await this.poll(undefined, false);
           const now = new Date();
           const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
-          result = withResetsIn(withPaceInfo(observations, this.store.burnRateFor(observations, now), now));
+          // A principal currently sitting out a live vendor 429 backoff (see
+          // poll()'s own backoff bookkeeping) still serves whatever it last
+          // read, unchanged, except its reason: naming the real deadline this
+          // backoff actually lifts at beats repeating the original failure
+          // message, which only grows staler while the backoff runs.
+          const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
+          result = withResetsIn(withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now));
           break;
         }
         case "history": {

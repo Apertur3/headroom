@@ -1,4 +1,5 @@
-import { formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import { expandHome } from "./paths.js";
+import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 export interface Policy {
@@ -16,6 +17,14 @@ export interface Policy {
    * reserve/plan-line checks, and fill always offers the full remainder. */
   pacing: "even" | "none";
   proxy?: string;
+  /** Directories the statusline snapshot adapter scans for `<profile>.json`
+   * files (headroom's own `headroom statusline` output) and third-party
+   * shapes like an external collector's `state/<alias>.json`. Empty means the
+   * caller's own default (`<HEADROOM_HOME>/statusline`) applies -- kept
+   * empty here rather than resolved, since HEADROOM_HOME can change per call
+   * (HEADROOM_HOME env var, tests) and this module has no path helpers of
+   * its own. */
+  statusline_snapshot_dirs: string[];
 }
 
 /** Keep the local Antigravity reader warm by default wherever `script` is available. */
@@ -25,7 +34,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even",
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", statusline_snapshot_dirs: [],
 };
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
@@ -36,6 +45,7 @@ export function parsePolicy(text: string): Policy {
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
   let pacing: Policy["pacing"] | undefined;
+  let statuslineSnapshotDirs: string[] | undefined;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
@@ -49,6 +59,11 @@ export function parsePolicy(text: string): Policy {
     if (keepalive) { antigravityKeepalive = keepalive[1] === "true"; continue; }
     const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
     if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
+    const dirsMatch = /^statusline_snapshot_dirs\s*=\s*\[(.*)\]\s*$/.exec(line);
+    if (dirsMatch) {
+      statuslineSnapshotDirs = [...dirsMatch[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((item) => expandHome(JSON.parse(`"${item[1]}"`) as string));
+      continue;
+    }
     const match = /^(freeze_reserve_pct|pace_grace_fraction|staleness_minutes|poll_interval_minutes)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (match) values[match[1]] = Number(match[2]);
   }
@@ -57,7 +72,19 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, ...(proxy ? { proxy } : {}) };
+}
+
+/** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from
+ * when it was last fetched plus the daemon's own poll interval -- an
+ * estimate (the daemon jitters each cycle by up to 20%, and there may be no
+ * daemon running at all), but a useful one: an operator staring at a stale
+ * row wants to know roughly when to look again, not just that it's stale.
+ * Empty string when fetched is unparseable, so a genuinely invalid
+ * timestamp never prints a bogus clock time. */
+function nextPollHint(fetchedAtMs: number, policy: Policy): string {
+  if (!Number.isFinite(fetchedAtMs)) return "";
+  return `; next poll ~${formatClockTime(new Date(fetchedAtMs + policy.poll_interval_minutes * 60_000))}`;
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
@@ -70,12 +97,14 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   }
   if (observation.window?.kind === "count") return { state: "NORMAL", reason: "availability count" };
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
+  const parsedFetchedAt = new Date(observation.fetched_at).getTime();
+  if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(parsedFetchedAt, policy)}` };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };
   if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
-  const fetched = new Date(observation.fetched_at).getTime();
+  const fetched = parsedFetchedAt;
   if (!Number.isFinite(fetched)) return { state: "UNKNOWN", reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
-  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `stale ${ageMinutes}m` };
+  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `stale ${ageMinutes}m${nextPollHint(fetched, policy)}` };
   const used = observation.quantity.used;
   if (used >= 100 - policy.freeze_reserve_pct) return { state: "FREEZE", reason: "reserve reached" };
   const reset = observation.resets_at ? new Date(observation.resets_at).getTime() : Number.NaN;

@@ -37,6 +37,55 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]));
   });
 
+  it("never drops a scoped limit that carries a percent, even when the vendor flags it inactive (the Fable-scoped-weekly ask)", () => {
+    const body = {
+      five_hour: { utilization: 1, resets_at: "2026-09-04T00:00:00Z" },
+      seven_day: { utilization: 2, resets_at: "2026-09-09T00:00:00Z" },
+      limits: [{ kind: "weekly_scoped", is_active: false, percent: 92, resets_at: "2026-09-09T00:00:00Z", scope: { model: { display_name: "Fable" } } }],
+    };
+    const rows = observationsFromClaudeUsage(body, claude, at);
+    const fable = rows.find((row) => row.meter_id === "claude-main:fable");
+    expect(fable).toMatchObject({
+      freshness: "fresh", truth: "official",
+      quantity: { used: 92, limit: 100, remaining: 8, unit: "percent" },
+      window: expect.objectContaining({ enforcement: "soft" }),
+      reason: "vendor flags this limit inactive; shown because it carries a cap",
+      metadata: { vendor_active: false },
+    });
+  });
+
+  it("emits an active scoped limit as a normal hard-enforced window with no vendor_active metadata", () => {
+    const body = {
+      five_hour: { utilization: 1, resets_at: "2026-09-04T00:00:00Z" },
+      seven_day: { utilization: 2, resets_at: "2026-09-09T00:00:00Z" },
+      limits: [{ kind: "weekly_scoped", is_active: true, percent: 40, resets_at: "2026-09-09T00:00:00Z", scope: { model: { display_name: "Fable" } } }],
+    };
+    const fable = observationsFromClaudeUsage(body, claude, at).find((row) => row.meter_id === "claude-main:fable");
+    expect(fable).toMatchObject({ freshness: "fresh", quantity: { used: 40 }, window: expect.objectContaining({ enforcement: "hard" }) });
+    expect(fable?.reason).toBeUndefined();
+    expect(fable?.metadata).toBeUndefined();
+  });
+
+  it("reads every other model-scoped bucket the payload offers as its own claude-<principal>:<model-slug> meter", () => {
+    const body = {
+      five_hour: { utilization: 1, resets_at: "2026-09-04T00:00:00Z" },
+      seven_day: { utilization: 2, resets_at: "2026-09-09T00:00:00Z" },
+      limits: [
+        { kind: "weekly_scoped", is_active: true, percent: 21, resets_at: "2026-09-09T00:00:00Z", scope: { model: { display_name: "Sonnet 5" } } },
+        { kind: "weekly_scoped", is_active: true, percent: 9, resets_at: "2026-09-09T00:00:00Z", scope: { model: { display_name: "Opus" } } },
+        { kind: "weekly_scoped", is_active: true, percent: 5, resets_at: "2026-09-09T00:00:00Z", scope: { model: { display_name: "Routines" } } },
+      ],
+    };
+    const rows = observationsFromClaudeUsage(body, claude, at);
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meter_id: "claude-main:sonnet-5", quantity: expect.objectContaining({ used: 21 }) }),
+      expect.objectContaining({ meter_id: "claude-main:opus", quantity: expect.objectContaining({ used: 9 }) }),
+      expect.objectContaining({ meter_id: "claude-main:routines", quantity: expect.objectContaining({ used: 5 }) }),
+    ]));
+    // Routines by display name must not also spawn a claude-main:routines-named model bucket.
+    expect(rows.filter((row) => row.meter_id === "claude-main:routines")).toHaveLength(1);
+  });
+
   it("ports Codex main, Spark, and reset-credit windows with the native fixture units", async () => {
     const [usage, credits] = await Promise.all(["usage.synthetic.json", "rate-limit-reset-credits.synthetic.json"].map(async (name) => JSON.parse(await readFile(new URL(`../fixtures/http/codex/${name}`, import.meta.url), "utf8"))));
     const rows = observationsFromCodexUsage(usage, credits, codex, at);

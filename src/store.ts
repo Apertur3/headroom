@@ -842,6 +842,27 @@ export class HeadroomStore {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
 
+  /** The exact probe binary path this Headroom home has ever been granted
+   * under, set once by the first successful `headroom keychain grant` (or the
+   * first poll that got a real vendor response) and never changed after
+   * that on its own. A machine that has both a packaged install and a repo
+   * checkout (or two different global installs) can have more than one
+   * `headroom-claude-probe` candidate on disk at once; without this pin, the
+   * adapter's own resolution order (see claude.ts's keychainHelper) could
+   * silently start using a different one than the operator actually granted,
+   * which would look identical to a plain probe failure. Once pinned, every
+   * probe call uses exactly this path -- see claude.ts's claudeProbe -- and
+   * a resolvable-but-different candidate is reported (by doctor) rather than
+   * silently substituted. */
+  probePath(): string | undefined {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_path'").get();
+    return row ? String(row.value) : undefined;
+  }
+
+  setProbePath(path: string): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_path', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(path);
+  }
+
   /**
    * Shared backoff state for a poll path that has no daemon scheduler to
    * enforce it in memory (MCP's direct, no-daemon fallback: see mcp.ts's

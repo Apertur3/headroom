@@ -11,7 +11,7 @@ function quoted(value: string): string { return JSON.stringify(value); }
 export function accountsToml(accounts: Account[]): string {
   return accounts.map((account) => isLocalAccount(account)
     ? ["[[accounts]]", `name = ${quoted(account.name)}`, 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "native"', ""].join("\n")
-    : ["[[accounts]]", `name = ${quoted(account.name)}`, `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ""].join("\n")).join("\n");
+    : ["[[accounts]]", `name = ${quoted(account.name)}`, `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ...(account.alias ? [`alias = ${quoted(account.alias)}`] : []), ""].join("\n")).join("\n");
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -62,7 +62,7 @@ export async function readAccounts(): Promise<Account[]> {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     if (line === "[[accounts]]") { if (current) accounts.push(validate(current)); current = {}; continue; }
-    const match = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(line);
+    const match = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path|alias)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(line);
     if (!match || !current) throw new Error(`Invalid accounts.toml line: ${line}`);
     current[match[1]] = JSON.parse(`"${match[2]}"`) as string;
   }
@@ -79,5 +79,5 @@ function validate(value: Record<string, string>): Account {
   // `native` was the old Swift-first spelling. Preserve existing configs while
   // making the new registry default unambiguous.
   const adapter = value.adapter === "native" ? (value.vendor === "antigravity" ? "engine" : "native-ts") : value.adapter;
-  return { name: value.name, vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}) } as ProviderAccount;
+  return { name: value.name, vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}), ...(value.alias ? { alias: value.alias } : {}) } as ProviderAccount;
 }

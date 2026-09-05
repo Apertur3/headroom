@@ -86,7 +86,16 @@ struct HeadroomClaudeProbe {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let credentialData = result as? Data else {
-            if status == errSecAuthFailed || status == errSecUserCanceled { fail("HEADROOM_PROBE_KEYCHAIN_DENIED", 3) }
+            // errSecInteractionNotAllowed (a sandboxed or otherwise
+            // non-interactive process, unable to show the Keychain access
+            // dialog at all) and a cancelled interaction both mean "the
+            // dialog could not be shown here", distinct from errSecAuthFailed
+            // (a real ACL denial) and from every other status, including
+            // errSecItemNotFound, which stays "no credentials" -- a genuinely
+            // absent login needs a different fix (`claude` to log in) than a
+            // shell that cannot show a dialog for an item that already exists.
+            if status == errSecInteractionNotAllowed || status == errSecUserCanceled { fail("HEADROOM_PROBE_INTERACTION_NOT_ALLOWED", 3) }
+            if status == errSecAuthFailed { fail("HEADROOM_PROBE_KEYCHAIN_DENIED", 3) }
             fail("HEADROOM_PROBE_NO_CREDENTIALS", 1)
         }
         guard let token = token(credentialData) else { fail("HEADROOM_PROBE_NO_CREDENTIALS", 1) }

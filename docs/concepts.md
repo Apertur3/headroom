@@ -13,9 +13,11 @@ Example: `claude-2` is the principal for `~/.claude2`, named that way by
 
 ## Meter
 
-A meter is one vendor-enforced limit on a principal, addressed as `principal:meter`. Claude has
-three: `all`, `fable`, `routines`. Codex has `main`, `spark`, and an informational `credits`
-count. Antigravity has `gemini` and `claude-gpt`. A local pool has one, `capacity`.
+A meter is one vendor-enforced limit on a principal, addressed as `principal:meter`. Claude always
+has `all`, `fable`, and `routines`, plus one `<model-slug>` meter for every other model-scoped
+bucket the vendor's response happens to carry (e.g. `sonnet-5`). Codex has `main`, `spark`, and an
+informational `credits` count. Antigravity has `gemini` and `claude-gpt`. A local pool has one,
+`capacity`.
 
 Example: `codex-main:spark` is the Spark-specific limit on the `codex-main` principal, separate
 from `codex-main:main`.
@@ -115,6 +117,23 @@ same meter at once (several orchestrators, or several lanes under one orchestrat
 is split across them by their expected share, not measured per-request -- exactly right when one
 lease is the only one spending, an estimate with real uncertainty when several are running
 concurrently. The confidence band exists because of this, not despite it.
+
+## Per-model token share
+
+`headroom --principal X --models` is a different kind of estimate from the meters above: a vendor
+usage percentage (`claude-main:all`, `claude-main:fable`, ...) is never split by model in the
+response Claude's own `/usage` endpoint returns, so Headroom cannot report "38% of this window's
+usage was Fable." What it can do is read Claude Code's own local session logs
+(`<CLAUDE_CONFIG_DIR>/projects/**/*.jsonl`, the same files Claude Code itself writes on every
+turn) and sum each assistant turn's `input_tokens`/`output_tokens` by model, over the current 5h
+window (the stored `<principal>:all` meter's own window when known, otherwise a flat trailing 5
+hours). This is a **token share**, not a percent-of-limit: two models can burn very different
+numbers of vendor quota points per token, so a 60/40 token split is not a 60/40 quota split. It is
+always `estimated`, always local, and never a vendor call -- a best-effort answer to "which model
+burned most of this window," not a substitute for the meters themselves.
+
+Example: `claude-main model token share (estimated, local session logs, current 5h window from
+14:32)` followed by `claude-fable-5-1  62% (12,340 in / 45,210 out)`.
 
 ## Cost model and local_preference
 

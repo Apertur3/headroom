@@ -61,6 +61,15 @@ describe("doctor home directory and keychain grant checks", () => {
     const { check, store } = await homeCheck(home);
     expect(check).toMatchObject({ level: "OK", check: "home directory" });
     store?.close();
+    if (process.platform === "win32") {
+      // NTFS has no POSIX mode bits, and mkdir's `mode` option is a
+      // documented no-op on Windows, so there is nothing meaningful to
+      // assert about stat.mode here. doctor.ts's own Windows-specific "not
+      // applicable" wording (asserted instead) is the real behavior this
+      // platform can be held to.
+      expect(check.detail).toContain("not applicable on Windows");
+      return;
+    }
     const stat = await lstat(home);
     expect(stat.mode & 0o777).toBe(0o700);
   });
@@ -71,6 +80,16 @@ describe("doctor home directory and keychain grant checks", () => {
     await mkdir(home, { recursive: true, mode: 0o755 });
     await chmod(home, 0o755); // belt and suspenders: mkdir's mode is umask-masked too
     const { check, store } = await homeCheck(home);
+    if (process.platform === "win32") {
+      // Group/world-writable is a POSIX mode concept safeHeadroomDirectory()
+      // (store.ts) deliberately never checks on Windows -- there are no mode
+      // bits to have gone wrong, so opening the store here succeeds exactly
+      // like the fresh-home case above, with the same "not applicable" note.
+      expect(check.level).toBe("OK");
+      expect(check.detail).toContain("not applicable on Windows");
+      store?.close();
+      return;
+    }
     expect(check.level).toBe("FAIL");
     expect(check.detail).toContain("run: chmod 700 ~/.headroom");
     expect(check.fix).toBe("chmod 700 ~/.headroom");
@@ -85,7 +104,7 @@ describe("doctor home directory and keychain grant checks", () => {
     expect(keychainGrantCheck(claude, grants)).toMatchObject({
       level: "FAIL",
       check: "principal claude-main keychain grant",
-      detail: "Keychain grant needed; run: headroom keychain grant --principal claude-main",
+      detail: "Keychain grant needed; run this from your own terminal (macOS shows a Keychain dialog that cannot appear in a sandboxed or remote shell): headroom keychain grant --principal claude-main",
       fix: "headroom keychain grant --principal claude-main",
     });
     expect(keychainGrantCheck(codex, new Map([["codex-main", "irrelevant"]]))).toBeUndefined();
@@ -203,13 +222,23 @@ describe("bin/headroom.js launcher flags", () => {
     await writeFile(target, "");
     const link = join(root, "link");
     const { symlink } = await import("node:fs/promises");
-    await symlink(real, link);
+    // A directory symlink needs an elevated shell (or Developer Mode) on
+    // Windows; a junction resolves through realpath the same way and needs
+    // neither -- exactly the CI-safe substitute this regression's own
+    // "resolved path differs from the literal argument" scenario needs.
+    await symlink(real, link, process.platform === "win32" ? "junction" : undefined);
     const throughSymlink = join(link, "headroom.js");
     // import.meta.url is always the realpath-resolved URL, even for a target
     // reached without any symlink in the literal argument (the mktemp root
     // itself may sit under a symlinked TMPDIR, e.g. macOS's /var alias).
-    const { realpath } = await import("node:fs/promises");
-    const metaUrl = pathToFileURL(await realpath(target)).href;
+    // Built with the SYNC realpathSync -- the exact function isMainModule()
+    // itself calls -- rather than the async realpath: Node's async and sync
+    // realpath implementations have historically disagreed on Windows (8.3
+    // short-name expansion, drive-letter casing), which would fail this
+    // comparison for a reason that has nothing to do with the regression
+    // under test.
+    const { realpathSync } = await import("node:fs");
+    const metaUrl = pathToFileURL(realpathSync(target)).href;
     expect(isMainModule(metaUrl, throughSymlink)).toBe(true);
     expect(cliIsMainModule(metaUrl, throughSymlink)).toBe(true);
     expect(isMainModule(metaUrl, undefined)).toBe(false);
