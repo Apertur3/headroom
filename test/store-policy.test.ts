@@ -514,6 +514,20 @@ describe("pace and consumes", () => {
     expect(canConsume([parent.meter_id, frozen.meter_id], new Map([[parent.meter_id, parent], [frozen.meter_id, frozen]]), policy, false, now)).toMatchObject({ allowed: false, meter: "claude-main:fable", state: "FREEZE", reason: "100m 95% FREEZE, resets in 50m", meters: [expect.objectContaining({ meter: "claude-main:all" }), expect.objectContaining({ meter: "claude-main:fable", state: "FREEZE" })] });
   });
 
+  it("prints the next scheduled poll time (fetched_at + poll_interval_minutes) for a stale reading", () => {
+    const explicitlyStale = paced(10, { freshness: "stale", fetched_at: "2026-09-03T11:50:00Z" });
+    const withInterval = { ...policy, poll_interval_minutes: 5 };
+    const decision = paceDecision(explicitlyStale, withInterval, now);
+    expect(decision.state).toBe("UNKNOWN");
+    expect(decision.reason).toMatch(/^stale; next poll ~\d\d:\d\d$/);
+
+    // A freshness: "fresh" reading that has simply aged past staleness_minutes
+    // by wall clock, not just an adapter-flagged "stale" one, gets the same hint.
+    const agedByClock = paced(10, { freshness: "fresh", fetched_at: "2026-09-03T11:00:00Z" }); // 60 minutes old, staleness_minutes = 15
+    const agedDecision = paceDecision(agedByClock, withInterval, now);
+    expect(agedDecision.reason).toMatch(/^stale 60m; next poll ~\d\d:\d\d$/);
+  });
+
   it("holds pace at NORMAL for the early grace period unless frozen", () => {
     const early = paced(70, { resets_at: "2026-09-03T13:35:00Z" }); // 5% into a 100-minute window
     const later = paced(70, { resets_at: "2026-09-03T13:25:00Z" }); // 15% elapsed

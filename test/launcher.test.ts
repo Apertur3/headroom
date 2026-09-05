@@ -73,9 +73,24 @@ describe("launcher signal forwarding", () => {
   // launcher's own PID left a long-running child (most importantly the
   // daemon) orphaned, still holding the socket, because nothing forwarded
   // the signal to it. This spawns the real launcher against a fake
-  // dist/cli.js that reports which signal it received, then signals the
-  // launcher (never the fake child directly) and checks the fake child saw
-  // it and the launcher exited with the fake child's own exit code.
+  // dist/cli.js that reports which signal it received (and its own pid, so
+  // the Windows branch below can confirm it is really gone), then signals
+  // the launcher (never the fake child directly).
+  //
+  // POSIX: `launcher.kill("SIGTERM")` reaches the launcher's own
+  // `process.on("SIGTERM", ...)` handler, which calls forwardSignal() ->
+  // child.kill("SIGTERM") -- real signal delivery, asserted end-to-end.
+  //
+  // Windows has no such delivery to assert: Node's own docs say
+  // ChildProcess#kill() on Windows unconditionally terminates the target via
+  // TerminateProcess, without ever running its signal handlers, so an
+  // external `launcher.kill("SIGTERM")` here would never reach bin/headroom.js's
+  // own handler and this test would just hang. The behavior actually worth
+  // proving on Windows -- that forwardSignal()'s `taskkill /pid <pid> /T /F`
+  // really terminates the launcher's whole process tree, not just the
+  // launcher itself -- is exercised directly instead: call the real
+  // (unstubbed) forwardSignal against the live launcher pid and confirm the
+  // fake child, several process generations deep, is gone afterward.
   it("end-to-end: signaling the launcher process reaches its child, which is never orphaned", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-launcher-e2e-"));
     temporary.push(root);
@@ -86,19 +101,33 @@ describe("launcher signal forwarding", () => {
     await mkdir(distDir, { recursive: true });
     await writeFile(join(binDir, "headroom.js"), await readFile(new URL("../bin/headroom.js", import.meta.url), "utf8"));
     const receivedFile = join(root, "received-signal.txt");
+    const pidFile = join(root, "child-pid.txt");
     await writeFile(join(distDir, "cli.js"), [
       "import { writeFileSync } from \"node:fs\";",
       "const receivedFile = process.argv[2];",
+      "const pidFile = process.argv[3];",
+      "writeFileSync(pidFile, String(process.pid));",
       "process.on(\"SIGTERM\", () => { writeFileSync(receivedFile, \"SIGTERM\"); process.exit(7); });",
       "process.stdout.write(\"ready\\n\");",
       "setInterval(() => {}, 1000);",
     ].join("\n"));
 
-    const launcher = spawn(process.execPath, [join(binDir, "headroom.js"), receivedFile], { stdio: ["ignore", "pipe", "pipe"] });
+    const launcher = spawn(process.execPath, [join(binDir, "headroom.js"), receivedFile, pidFile], { stdio: ["ignore", "pipe", "pipe"] });
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("fake cli.js never reported ready")), 5000);
       launcher.stdout.on("data", (chunk: Buffer) => { if (chunk.toString().includes("ready")) { clearTimeout(timeout); resolve(); } });
     });
+
+    if (process.platform === "win32") {
+      const childPid = Number((await readFile(pidFile, "utf8")).trim());
+      forwardSignal(launcher, "SIGTERM", "win32"); // the real killTree default (spawnSync + taskkill), not a stub
+      await new Promise<void>((resolve) => launcher.on("exit", () => resolve()));
+      // process.kill(pid, 0) is a liveness probe on every platform, Windows
+      // included: it throws (ESRCH-equivalent) once the process is gone,
+      // which taskkill /T /F guarantees for the whole tree it just killed.
+      expect(() => process.kill(childPid, 0)).toThrow();
+      return;
+    }
 
     launcher.kill("SIGTERM"); // signals the LAUNCHER's own PID, exactly like an external `kill` or a service manager would
     const [code] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => launcher.on("exit", (code, signal) => resolve([code, signal])));

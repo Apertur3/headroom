@@ -14,8 +14,11 @@ describe("brand identity", () => {
   it("has no retired brand text outside the changelog", async () => {
     // No external binary (ripgrep is not guaranteed on CI runners, and this
     // must also pass on Windows without shell quoting or /dev/null): walk the
-    // files git actually tracks and grep them in Node instead.
-    const retired = new RegExp(`(${["ta", "lly"].join("")}|${["keep", "ta", "lly"].join("")})`, "i");
+    // files git actually tracks and grep them in Node instead. Word-boundary
+    // wrapped: an ordinary English adverb ending the same way the retired
+    // name is spelled must not false-positive as leftover brand text (it
+    // tripped this exact check on README.md's "experimentally").
+    const retired = new RegExp(`\\b(${["ta", "lly"].join("")}|${["keep", "ta", "lly"].join("")})\\b`, "i");
     const { stdout } = await execFileAsync("git", ["ls-files"], { cwd: repoRoot, maxBuffer: 16 * 1024 * 1024 });
     const files = stdout.split("\n").map((line) => line.trim()).filter((line) => line && line !== "CHANGELOG.md");
     const offenders: string[] = [];

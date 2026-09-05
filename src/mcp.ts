@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
 import { daemonRequest, socketPath } from "./daemon.js";
-import { pollAccounts, PROTECTED_STATUS_PATTERN } from "./collector.js";
+import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./collector.js";
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
-import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines } from "./orchestrator-reads.js";
+import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
 import { resetsIn, withResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
@@ -29,6 +29,7 @@ const tools = [
   { name: "quota_gate", description: "Pre-dispatch check: do these points fit the current window (and, with plan true, the plan line)? Under even pacing (the default), a 5h need is also checked against the caller's pro-rata line and a 10-minute burst check. needs is an array like [\"5h:15\", \"wk:3\"].", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number" }, owner: { type: "string" }, plan_share_percent: { type: "number" }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
   { name: "quota_fill", description: "How many more lanes fit before a 5h window's unspent points are lost at reset, and which routing.toml action classes fit the remaining points and minutes. Under even pacing (the default), only offers the full remainder in the last 45 minutes before reset; earlier than that it offers the caller's pro-rata allowance.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number" }, weekly_reserve_percent: { type: "number" }, owner: { type: "string" }, plan_share_percent: { type: "number" } }, required: ["meter"] } },
+  { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
 ];
 
 /**
@@ -115,7 +116,8 @@ export async function directStatus(): Promise<DirectResult> {
     const backoff = store.directPollBackoff();
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [] };
+      const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
+      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [] };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
       return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [] };
@@ -251,6 +253,23 @@ async function directPlan(meter: unknown, reservePercent: unknown): Promise<Dire
   try { const result = planFor(store, meter, reserve); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
 }
 
+async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: unknown): Promise<DirectResult> {
+  if (typeof actionClass !== "string" || !actionClass) throw new Error("action_class is required");
+  if (typeof owner !== "string" || !owner.trim()) throw new Error("owner is required");
+  const routing = await readRouting();
+  if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
+  const meters = routing.consumes[actionClass];
+  if (!meters) throw new Error(`Unknown action class: ${actionClass}`);
+  const [policy, accounts, store] = await Promise.all([readPolicy(), readAccounts(), HeadroomStore.open()]);
+  try {
+    const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+    if (unknownMeters.length) throw new Error(`Routing action class ${actionClass} names unknown meter(s): ${unknownMeters.join(", ")}`);
+    const result = routeFor(store, meters, accounts, policy, allowUnknown === true, new Date());
+    store.audit("mcp", "route", actionClass, result.principal ? "yes" : "no");
+    return { source: "direct", ...result };
+  } finally { store.close(); }
+}
+
 async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
@@ -311,6 +330,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class);
   if (method === "wait") return directWait(arguments_.meter);
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent);
+  if (method === "route") return directRoute(arguments_.action_class, arguments_.owner, arguments_.allow_unknown);
   return directEvents(arguments_.since);
 }
 
@@ -349,7 +369,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   const rawArguments = params.arguments && typeof params.arguments === "object" ? params.arguments as Record<string, unknown> : {};
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
-    quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill",
+    quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
@@ -370,11 +390,13 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent }
       : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent }
+      : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : {};
-    // quota_wait must never block: it always answers from the store directly
-    // (no vendor call, no daemon round trip that could itself take a while),
-    // so it deliberately skips the daemon `call` step every other tool takes.
-    const result = method === "wait" ? undefined : await call(method, params_);
+    // quota_wait must never block, and quota_route is a direct read only
+    // (see routeFor's own doc comment: an infrequent, deliberate call, not a
+    // hot path worth a daemon RPC case) -- both skip the daemon `call` step
+    // every other tool takes.
+    const result = method === "wait" || method === "route" ? undefined : await call(method, params_);
     const resolved = result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or

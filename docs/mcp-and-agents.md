@@ -230,6 +230,7 @@ For agents that call a shell instead of MCP, such as Codex or Gemini CLI session
 | `quota_lease_start` | `headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note "..."]` |
 | `quota_lease_end` | `headroom lease end <id> --owner <name> [--force]` |
 | `quota_leases` | `headroom lease list` |
+| `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match

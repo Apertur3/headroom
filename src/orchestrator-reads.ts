@@ -5,11 +5,15 @@
  * the CLI/MCP no-daemon fallbacks both call these, so the two paths can never
  * drift into computing a different answer for the same stored data.
  */
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateGate, evaluateProRataLine, fillClassFits, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
+import { canConsume, type Policy } from "./policy.js";
+import { withPaceInfo } from "./pace.js";
 import type { HeadroomStore } from "./store.js";
-import type { Observation, StoredObservation } from "./types.js";
+import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
 
 /** The enforced, fresh, percent-quantity window with the highest used% for a
  * meter -- an approximation of "the window that decided this", good enough
@@ -333,4 +337,81 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   const classes = fillClassFits(Math.max(0, remainingPercent), remainingMinutes, costs);
 
   return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis, window_used: windowUsed };
+}
+
+export interface RouteCandidate {
+  principal: string;
+  state: PaceState;
+  reason: string;
+  /** The remaining percent on this principal's own deciding (worst, per
+   * canConsume) meter within the action class -- null when that meter's
+   * usage is not a plain percentage (a local pool, an availability count) or
+   * unreadable at all. Only a candidate with a real number here is ever
+   * routable; a principal whose own state already fits but has nothing
+   * numeric to rank by is reported, never picked. */
+  remaining_percent: number | null;
+  window_minutes: number | null;
+}
+
+export interface RouteResult {
+  /** Null when no candidate both fits and has a rankable remaining percent. */
+  principal: string | null;
+  /** The exact environment variable(s) to launch that principal under, e.g.
+   * `{ CLAUDE_CONFIG_DIR: "/Users/you/.claude2" }`. Empty for the default
+   * profile of its vendor (nothing to override) or for a vendor `route`
+   * does not know a launch environment variable for. */
+  environment: Record<string, string>;
+  reason: string;
+  candidates: RouteCandidate[];
+}
+
+/** The one environment variable a caller needs to set to launch a CLI session
+ * against this specific principal, or an empty object when this account IS
+ * its vendor's default profile (nothing to override) or the vendor has no
+ * such variable (Antigravity, a local pool). */
+export function launchEnvironment(account: Account): Record<string, string> {
+  if (isLocalAccount(account)) return {};
+  const directory = resolve(account.location);
+  if (account.vendor === "claude") return directory === resolve(homedir(), ".claude") ? {} : { CLAUDE_CONFIG_DIR: account.location };
+  if (account.vendor === "codex") return directory === resolve(homedir(), ".codex") ? {} : { CODEX_HOME: account.location };
+  return {};
+}
+
+const routeFits = (state: PaceState, allowUnknown: boolean): boolean =>
+  state !== "FREEZE" && state !== "CONSERVE" && state !== "DOWN" && (state !== "UNKNOWN" || allowUnknown);
+
+/**
+ * Among the distinct principals named by `meters` (a routing.toml action
+ * class's own meter list, so already scoped to the vendor and principals the
+ * operator allowed for it), picks the one with the most remaining percent on
+ * its own tightest (deciding, worst-state) window, among principals that
+ * currently fit at all (not FREEZE/CONSERVE/DOWN, and not UNKNOWN unless
+ * allowUnknown) -- the live equivalent of the dogfooded "claude-main is at
+ * 90%, claude-2 is at 10%, launch the next lane under claude-2" call an
+ * orchestrator makes by hand today. Every candidate's own state and reason
+ * is still reported (not just the winner), so a caller can see why a
+ * principal was skipped.
+ */
+export function routeFor(store: HeadroomStore, meters: string[], accounts: Account[], policy: Policy, allowUnknown: boolean, now = new Date()): RouteResult {
+  const principals = [...new Set(meters.map((meter) => meter.slice(0, meter.indexOf(":") >= 0 ? meter.indexOf(":") : meter.length)))];
+  const candidates: RouteCandidate[] = principals.map((principal) => {
+    const principalMeters = meters.filter((meter) => meter.startsWith(`${principal}:`));
+    const observationMap = new Map(principalMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+    const rows = [...observationMap.values()].flat();
+    const burn = store.burnRateFor(rows, now);
+    const enriched = new Map([...observationMap].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+    const decision = canConsume(principalMeters, enriched, policy, allowUnknown, now);
+    const deciding = pickDecidingObservation(rows);
+    const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? Math.max(0, 100 - deciding.quantity.used) : null;
+    return { principal, state: decision.state, reason: decision.reason, remaining_percent: remaining, window_minutes: deciding?.window?.minutes ?? null };
+  });
+  const eligible = candidates.filter((item) => routeFits(item.state, allowUnknown) && item.remaining_percent !== null);
+  eligible.sort((a, b) => (b.remaining_percent as number) - (a.remaining_percent as number));
+  const winner = eligible[0];
+  if (!winner) return { principal: null, environment: {}, reason: candidates.length ? "no candidate fits" : "no principals for this class", candidates };
+  const account = accounts.find((item) => item.name === winner.principal);
+  return {
+    principal: winner.principal, environment: account ? launchEnvironment(account) : {},
+    reason: `${windowShortLabel(winner.window_minutes)} ${winner.remaining_percent!.toFixed(1)}% remaining`, candidates,
+  };
 }

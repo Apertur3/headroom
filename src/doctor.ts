@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { claudeServiceName, syncClaudeGrantState } from "./adapters/claude.js";
+import { claudeServiceName, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { readPolicy, readRouting } from "./config.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
@@ -12,6 +13,7 @@ import { credentialPath, headroomHome } from "./paths.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
+import { headroomVersion } from "./version.js";
 
 const execFileAsync = promisify(execFile);
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
@@ -68,7 +70,14 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
 export async function homeCheck(home: string): Promise<{ check: DoctorCheck; store: HeadroomStore | undefined }> {
   try {
     const store = await HeadroomStore.open(home);
-    return { check: check("OK", "home directory", home, "no action needed"), store };
+    // NTFS has no POSIX mode bits, and safeHeadroomDirectory() (store.ts)
+    // skips the group/world-writable check entirely on win32 for exactly
+    // that reason -- so a directory that opened successfully here has had no
+    // permission enforcement to speak of on Windows, unlike everywhere else.
+    // Say so plainly instead of reporting a bare OK that reads the same as a
+    // real POSIX pass.
+    const detail = process.platform === "win32" ? `${home} (group/world permission checks are not applicable on Windows; relying on NTFS ACLs)` : home;
+    return { check: check("OK", "home directory", detail, "no action needed"), store };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unsafe Headroom home directory";
     const fix = /group or world permissions/.test(message) ? "chmod 700 ~/.headroom" : `fix ownership or permissions on ${home}`;
@@ -80,7 +89,35 @@ export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, s
   if (isLocalAccount(account) || account.vendor !== "claude") return undefined;
   const reason = grantsNeeded.get(account.name);
   if (reason === undefined) return undefined;
-  return check("FAIL", `principal ${account.name} keychain grant`, `Keychain grant needed; run: headroom keychain grant --principal ${account.name}`, `headroom keychain grant --principal ${account.name}`);
+  return check("FAIL", `principal ${account.name} keychain grant`, `Keychain grant needed; run this from your own terminal (macOS shows a Keychain dialog that cannot appear in a sandboxed or remote shell): headroom keychain grant --principal ${account.name}`, `headroom keychain grant --principal ${account.name}`);
+}
+
+/**
+ * A machine that has both a packaged install and a repo checkout (or two
+ * different global installs) can have more than one `headroom-claude-probe`
+ * binary resolvable at once. Once a grant has pinned one (store.probePath()),
+ * claude.ts's own resolution always prefers it over any other candidate --
+ * this check exists only to say so out loud, naming both the granted binary
+ * and any other one that currently resolves but is deliberately not used,
+ * rather than leaving an operator to wonder why a probe rebuild had no
+ * effect. Undefined when there is nothing to report: no Claude principal
+ * configured, or (non-macOS) the probe concept does not apply.
+ */
+export async function probePinCheck(store: HeadroomStore, claudeIds: string[]): Promise<DoctorCheck | undefined> {
+  if (process.platform !== "darwin" || !claudeIds.length) return undefined;
+  const pinned = store.probePath();
+  if (!pinned) return check("INFO", "claude probe binary", "no probe granted yet for this Headroom home", "headroom keychain grant");
+  const resolvedWithPin = await resolveProbePath(pinned);
+  if (resolvedWithPin !== pinned) {
+    return check(resolvedWithPin ? "WARN" : "FAIL", "claude probe binary",
+      resolvedWithPin ? `granted binary is gone (${pinned}); currently falling back to ${resolvedWithPin} instead` : `granted binary is gone (${pinned}) and no other probe resolves`,
+      "headroom keychain grant");
+  }
+  const resolvedWithoutPin = await resolveProbePath();
+  if (resolvedWithoutPin && resolvedWithoutPin !== pinned) {
+    return check("INFO", "claude probe binary", `granted: ${pinned}; not granted (a second candidate exists but is not used): ${resolvedWithoutPin}`, "no action needed; run headroom keychain grant again only to switch to the other binary");
+  }
+  return check("OK", "claude probe binary", `granted: ${pinned}`, "no action needed");
 }
 
 export function adapterCheck(account: Account): DoctorCheck {
@@ -133,9 +170,11 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
     // invoked (no prior daemon poll or CLI observe()), so a fresh install or
     // a freshly rebuilt probe binary is caught here too, before credentialCheck
     // below ever touches the Keychain.
+    let probePin: DoctorCheck | undefined;
     if (store) {
       const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
       await syncClaudeGrantState(store, claudeIds);
+      probePin = await probePinCheck(store, claudeIds);
     }
     const grantsNeeded = store ? new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])) : new Map<string, string>();
     for (const account of accounts) {
@@ -144,6 +183,7 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       if (grant) output.push(grant);
       output.push(adapterCheck(account));
     }
+    if (probePin) output.push(probePin);
     await doctorChecksTail(output, home, accounts, keepaliveEnabled);
   } finally { store?.close(); }
   return output;
@@ -199,6 +239,50 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     : logStatus === "missing"
       ? check("WARN", "daemon log", `not written yet (${daemonLogPath(home)})`, "headroom install-service")
       : check("WARN", "daemon log", `unsafe log file (${daemonLogPath(home)})`, "fix ownership or writable permissions"));
+  const mcp = await mcpRegistrationCheck(accounts);
+  if (mcp) output.push(mcp);
+}
+
+/**
+ * Claude Code's own config file for a profile: `<home>/.claude.json` for the
+ * default `~/.claude` profile (a legacy sibling of the `.claude` directory,
+ * not inside it), or `<CLAUDE_CONFIG_DIR>/.claude.json` for any other
+ * profile. Verified against this machine's real files, not just the vendor's
+ * docs: `~/.claude/.claude.json` (inside the default directory) exists too,
+ * but is a different, older artifact with no `mcpServers` key -- only the
+ * path this function returns is the one Claude Code itself reads and writes
+ * MCP registrations to.
+ */
+export function claudeConfigJsonPath(location: string, home = homedir()): string {
+  const directory = resolve(location);
+  return directory === resolve(home, ".claude") ? join(home, ".claude.json") : join(directory, ".claude.json");
+}
+
+async function mcpRegisteredFor(location: string): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await readFile(claudeConfigJsonPath(location), "utf8")) as { mcpServers?: Record<string, unknown> };
+    return typeof parsed.mcpServers === "object" && parsed.mcpServers !== null && "headroom" in parsed.mcpServers;
+  } catch { return false; }
+}
+
+/**
+ * One line naming which configured Claude profiles have Headroom's MCP
+ * server registered (`claude mcp add headroom -- ...`) and which don't, read
+ * straight from each profile's own `.claude.json` -- never assumed from
+ * whether the current process happens to be running under the MCP server
+ * itself, since a session started before an install or a rename would not
+ * see a stdio tool registration it does not hold. Undefined (no check row at
+ * all) when there is no configured Claude principal to report on.
+ */
+export async function mcpRegistrationCheck(accounts: Account[]): Promise<DoctorCheck | undefined> {
+  const claudeAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude");
+  if (!claudeAccounts.length) return undefined;
+  const registered: string[] = [];
+  const unregistered: string[] = [];
+  for (const account of claudeAccounts) (await mcpRegisteredFor(account.location) ? registered : unregistered).push(account.name);
+  const detail = `registered for ${registered.length ? registered.join(", ") : "none"}${unregistered.length ? `; not registered for ${unregistered.join(", ")}` : ""}`;
+  const fix = unregistered.length ? "claude mcp add headroom -- npx headroomd mcp (CLAUDE_CONFIG_DIR=<dir> for a non-default profile)" : "no action needed";
+  return check(unregistered.length ? "INFO" : "OK", "mcp registration", detail, fix);
 }
 
 /**
@@ -230,6 +314,7 @@ export function nextSteps(platform: NodeJS.Platform = process.platform): string[
 }
 
 export async function doctor(): Promise<number> {
+  console.log(`Headroom ${await headroomVersion()}`);
   const checks = await doctorChecks();
   for (const item of checks) console.log(rendered(item));
   if (await isFreshInstall(checks)) {
