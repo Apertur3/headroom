@@ -186,6 +186,28 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(rows).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", source: "native:codex:session-log", truth: "official", quantity: expect.objectContaining({ used: 100 }), freshness: "fresh" }));
   });
 
+  it("never lets the session-log fallback override a weekly window the endpoint already provided", async () => {
+    // The exact live defect: an old session-log event (here also carrying a
+    // weekly reading) must not eclipse a perfectly good, fresher weekly
+    // reading from the live endpoint just because the endpoint is polled
+    // again later than the session log's own timestamp.
+    const session = [{ timestamp: "2026-09-03T07:31:04Z", primary: { used_percent: 100, window_minutes: 300, resets_at: 1788803040 }, secondary: { used_percent: 41, window_minutes: 10_080, resets_at: 1789407600 } }];
+    const usage = { rate_limit: { secondary: { used_percent: 83, window_minutes: 10_080, resets_at: 1789407600 } } };
+    const rows = await observeCodex(codex, {
+      now: () => at,
+      readFile: async () => JSON.stringify({ tokens: { access_token: "not-a-secret", expires_at: at.getTime() + 60_000 } }),
+      readRateLimitEvents: async () => session,
+      fetch: vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(usage))).mockResolvedValueOnce(new Response("{}")),
+    });
+    const weekly = rows.find((row) => row.meter_id === "codex-main:main" && row.window?.minutes === 10_080);
+    // The endpoint's own 83%, not the session log's stale 41%.
+    expect(weekly).toMatchObject({ source: "native:codex", freshness: "fresh", quantity: expect.objectContaining({ used: 83 }) });
+    expect(rows.some((row) => row.meter_id === "codex-main:main" && row.window?.minutes === 10_080 && row.source === "native:codex:session-log")).toBe(false);
+    // The 5h window still legitimately falls back to the session log, since
+    // the endpoint never reports one at all.
+    expect(rows).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", window: expect.objectContaining({ minutes: 300 }), source: "native:codex:session-log", quantity: expect.objectContaining({ used: 100 }) }));
+  });
+
   it("derives a session reset from its event timestamp and remaining seconds", () => {
     const rows = observationsFromCodexRateLimitEvents([{ timestamp: "2026-09-03T15:00:00Z", primary: { used_percent: 40, window_minutes: 300, resets_in_seconds: 600 } }], codex, new Date("2026-09-03T15:01:00Z"));
     expect(rows).toContainEqual(expect.objectContaining({ resets_at: "2026-09-03T15:10:00.000Z", window: expect.objectContaining({ minutes: 300 }) }));
