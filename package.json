@@ -23,7 +23,7 @@
     "url": "git+https://github.com/Apertur3/headroom.git"
   },
   "license": "MIT",
-  "author": "the maintainer Hermans",
+  "author": "Martijn Hermans",
   "type": "module",
   "engines": {
     "node": ">=22.13.0 <23.0.0 || >=23.4.0"
