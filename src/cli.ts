@@ -19,6 +19,7 @@ import { pollAccounts } from "./collector.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
+import { runSetup } from "./setup.js";
 import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
@@ -628,7 +629,7 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
   return 0;
 }
 
-async function observe(argv: string[]): Promise<number> {
+export async function observe(argv: string[]): Promise<number> {
   const allowed = new Set(["--json", "--threshold", "--principal", "--refresh", "--ttl", "--models"]);
   for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models]"); if (argv[index] !== "--json" && argv[index] !== "--refresh" && argv[index] !== "--models") index += 1; }
   const thresholdIndex = argv.indexOf("--threshold");
@@ -859,7 +860,7 @@ export function noKeychainItemMessage(directory: string): string {
  * always clears that principal's keychain_grant_needed marker (set by a prior
  * denial/timeout, or by a probe binary rebuild), so the daemon resumes
  * probing it on its next poll. */
-async function keychain(argv: string[]): Promise<number> {
+export async function keychain(argv: string[]): Promise<number> {
   if (argv[0] !== "grant" || argv.length > 3 || (argv[1] && argv[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>]");
   // Printed unconditionally, before ever touching the Keychain: an agent
   // shell running this command has no way to learn why a dialog it cannot
@@ -931,6 +932,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
   ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config"],
+  ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
   ["keychain grant", "macOS: grant the Claude probe Keychain access"],
   ["install-service", "Install the daemon as a launchd/systemd/Task Scheduler service"],
   ["uninstall-service", "Remove the installed daemon service"],
@@ -963,6 +965,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
   accounts: "Usage: headroom accounts discover",
   doctor: "Usage: headroom doctor",
+  setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
   "install-service": "Usage: headroom install-service [--dry-run]",
   "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
@@ -1021,6 +1024,7 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (argv[0] === "doctor") return doctor();
+  if (argv[0] === "setup") return runSetup(argv.slice(1));
   if (argv[0] === "logs") return logs(argv.slice(1));
   if (argv[0] === "daemon") return daemon();
   if (argv[0] === "keychain") return keychain(argv.slice(1));

@@ -42,9 +42,12 @@ Release candidates, if ever needed, use `-rc.N` the same way.
    `npm run release:check` is green.
 4. The release workflow verifies on ubuntu and macos (the CI workflow already covers windows on
    every push), builds the tarball on macos so it carries a real signed Claude probe, attaches it
-   to a GitHub release with the changelog section as the body, and publishes to npm with
-   `NPM_TOKEN` and npm provenance; the publish step is skipped, with a notice on the run, if
-   `NPM_TOKEN` isn't configured.
+   to a GitHub release with the changelog section as the body, and publishes to npm through
+   trusted publishing: npmjs.com trusts this repository's `release.yml` workflow directly, no
+   token exists anywhere, and every version carries provenance. If npm refuses the publish (the
+   trusted publisher is not configured, or the version already exists) the job prints a warning
+   instead of failing; re-run it after fixing the cause. Every version, beta or not, is published
+   under the `latest` dist-tag until a stable line exists.
 5. A published version is never changed; a mistake gets the next number.
 
 ## Deprecations
