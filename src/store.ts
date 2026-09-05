@@ -6,6 +6,10 @@ import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js"
 import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
+import { defaultPolicy, paceDecision } from "./policy.js";
+import type { BurnInfo } from "./pace.js";
+import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
+import { summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { redact } from "./security.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
@@ -101,7 +105,7 @@ function eventFromRow(row: Row): HeadroomEvent {
 }
 
 function leaseFromRow(row: Row): Lease {
-  return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+  return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
 }
 
 export class HeadroomStore {
@@ -200,6 +204,10 @@ export class HeadroomStore {
     try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
     catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
     try { this.db.exec("ALTER TABLE events ADD COLUMN last_seen_at TEXT"); }
+    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
+    // Existing databases predate per-class learned cost: leases had no
+    // action_class column to group lease_spend by.
+    try { this.db.exec("ALTER TABLE leases ADD COLUMN action_class TEXT"); }
     catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
     this.removeFalseResetSeenEvents();
     await this.backfillResetEvents(home);
@@ -324,6 +332,7 @@ export class HeadroomStore {
     // a windowless failure is only ever closed by this separate check.
     if (stored.freshness === "fresh") this.recoverWindowlessFailure(stored);
     if (previous) this.attributeLeaseSpend(previous, stored);
+    if (stored.freshness === "fresh") this.detectPaceProjection(stored);
     return stored;
   }
 
@@ -470,6 +479,108 @@ export class HeadroomStore {
     else this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
   }
 
+  /**
+   * Least-squares burn rate (percent per hour) and projected time to 100%
+   * used, per meter+window, from that window's fresh percent samples fetched
+   * within the last `lookbackMinutes` (60 by default -- `rate`'s own
+   * shorter or longer window reuses this with a different value). At least
+   * two samples are required; fewer returns nulls for that window. Keyed by
+   * `${meter_id}:${minutes}`, matching pace.ts's withPaceInfo().
+   */
+  burnRateFor(observations: Array<Pick<Observation, "meter_id" | "window">>, now = new Date(), lookbackMinutes = 60): Map<string, BurnInfo> {
+    const output = new Map<string, BurnInfo>();
+    const seen = new Set<string>();
+    const since = new Date(now.getTime() - lookbackMinutes * 60_000).toISOString();
+    for (const observation of observations) {
+      const minutes = observation.window?.minutes;
+      const kind = observation.window?.kind;
+      if (!minutes || kind === "state" || kind === "count") continue;
+      const key = `${observation.meter_id}:${minutes}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // julianday(), not a plain string range: fetched_at is not guaranteed to
+      // carry milliseconds (see eventEvidenceFor's identical comment above),
+      // and ISO timestamps only sort lexicographically when every value
+      // shares the same precision.
+      const rows = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND freshness = 'fresh' AND julianday(fetched_at) >= julianday(?) AND julianday(fetched_at) <= julianday(?) ORDER BY fetched_at ASC, id ASC")
+        .all(observation.meter_id, since, now.toISOString())
+        .map(observationFromRow)
+        .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent");
+      const samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
+      const burn = leastSquaresBurnPerHour(samples);
+      const currentUsed = samples.length ? samples[samples.length - 1].used : null;
+      output.set(key, { burn_percent_per_hour: burn, empty_in_seconds: burn !== null && currentUsed !== null ? emptyInSeconds(currentUsed, burn) : null });
+    }
+    return output;
+  }
+
+  /** The still-open pace_projection_conserve event for this meter+window
+   * within the last hour, so a window that stays in the same projected-stall
+   * CONSERVE across several polls gets one event per hour, not one per poll. */
+  private recentPaceProjectionEvent(meterId: string, minutes: number, before: string): boolean {
+    const since = new Date(Date.parse(before) - 3_600_000).toISOString();
+    const row = this.db.prepare(`SELECT e.id FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.kind = 'pace_projection_conserve' AND e.meter_id = ?
+        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) = ?
+        AND e.created_at >= ? AND e.created_at < ?
+      LIMIT 1`).get(meterId, minutes, since, before);
+    return Boolean(row);
+  }
+
+  /** Fires pace_projection_conserve the moment a fresh observation's own
+   * burn rate projects it running dry before its window resets -- the same
+   * rule paceDecision() uses to flip the window's live pace state, applied
+   * here with the default policy so this event fires independent of whatever
+   * custom policy.toml the caller has (still a fair signal: it says the
+   * straight-line rule alone would not yet have caught this). */
+  private detectPaceProjection(current: StoredObservation): void {
+    if (current.quantity?.unit !== "percent") return;
+    const minutes = current.window?.minutes;
+    const kind = current.window?.kind;
+    if (!minutes || kind === "state" || kind === "count") return;
+    const burn = this.burnRateFor([current], new Date(current.fetched_at)).get(`${current.meter_id}:${minutes}`);
+    if (!burn || burn.burn_percent_per_hour === null || burn.empty_in_seconds === null) return;
+    const enriched: StoredObservation = { ...current, burn_percent_per_hour: burn.burn_percent_per_hour, empty_in_seconds: burn.empty_in_seconds };
+    const decision = paceDecision(enriched, defaultPolicy, new Date(current.fetched_at));
+    if (decision.state !== "CONSERVE" || !decision.reason.startsWith("burning ")) return;
+    if (this.recentPaceProjectionEvent(current.meter_id, minutes, current.fetched_at)) return;
+    this.addEvent("pace_projection_conserve", "inferred", 0.7, [current.id], current, decision.reason);
+  }
+
+  /**
+   * Median, interquartile range and sample count of the per-lease total
+   * spent percent, grouped by the lease's action_class (set by `lease start
+   * --class` or `can --lease`). Every lease with that action_class counts as
+   * one sample, spent or not: a call that turned out free is still a real
+   * data point. Restricted to one class when given, otherwise every class
+   * that has at least one sample.
+   */
+  learnedCost(actionClass?: string): LearnedCost[] {
+    const filter = actionClass ? "WHERE l.action_class = ?" : "WHERE l.action_class IS NOT NULL";
+    const rows = this.db.prepare(`SELECT l.action_class AS action_class, COALESCE(SUM(s.amount_percent), 0) AS spent
+      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter} GROUP BY l.id`).all(...(actionClass ? [actionClass] : []));
+    const byClass = new Map<string, number[]>();
+    for (const row of rows) {
+      const key = String(row.action_class);
+      const list = byClass.get(key) ?? [];
+      list.push(Number(row.spent));
+      byClass.set(key, list);
+    }
+    return [...byClass.entries()].map(([key, spent]) => summarizeLearnedCost(key, spent)).filter((item): item is LearnedCost => item !== undefined).sort((a, b) => a.action_class.localeCompare(b.action_class));
+  }
+
+  /** The same median/IQR/count learned-cost summary, but grouped by meter
+   * instead of action_class: `fill`'s fallback lane cost when --lane-cost is
+   * omitted, from whatever leases (of any class) have run against that
+   * meter before. */
+  learnedCostForMeter(meterId: string): LearnedCost | undefined {
+    const rows = this.db.prepare(`SELECT l.id AS id, COALESCE(SUM(s.amount_percent), 0) AS spent
+      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.meter_id = ? GROUP BY l.id`).all(meterId);
+    return summarizeLearnedCost(meterId, rows.map((row) => Number(row.spent)));
+  }
+
   private detectEvents(previous: StoredObservation, current: StoredObservation): void {
     const evidence = [previous.id, current.id];
     if (current.freshness === "failed") {
@@ -566,13 +677,16 @@ export class HeadroomStore {
       .run(`${kind}:${lease.id}:${at}`, kind, "vendor_reported", 1, "[]", at, null, lease.meter_id, null, lease.ended_reason ?? lease.note);
   }
 
-  startLease(owner: string, meterId: string, expectedPercent: number | null, ttlMs: number, note: string | null, now = new Date()): Lease {
+  /** actionClass is appended last (not inserted before `now`) so every
+   * existing positional caller -- direct or through a test's fixed clock --
+   * keeps working unchanged and simply gets a null action_class. */
+  startLease(owner: string, meterId: string, expectedPercent: number | null, ttlMs: number, note: string | null, now = new Date(), actionClass: string | null = null): Lease {
     if (!owner.trim() || !meterId.trim()) throw new Error("owner and meter are required");
     if (expectedPercent !== null && (!Number.isFinite(expectedPercent) || expectedPercent < 0 || expectedPercent > 100)) throw new Error("expected percent must be 0 through 100");
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error("ttl must be positive");
     this.expireLeases(now);
-    const lease: Lease = { id: randomUUID(), owner: owner.trim(), meter_id: meterId.trim(), expected_percent: expectedPercent, note, started_at: now.toISOString(), expires_at: new Date(now.getTime() + ttlMs).toISOString(), ended_at: null, ended_reason: null, spent_percent: 0 };
-    this.db.prepare("INSERT INTO leases (id,owner,meter_id,expected_percent,note,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.started_at, lease.expires_at, null, null);
+    const lease: Lease = { id: randomUUID(), owner: owner.trim(), meter_id: meterId.trim(), expected_percent: expectedPercent, note, action_class: actionClass && actionClass.trim() ? actionClass.trim() : null, started_at: now.toISOString(), expires_at: new Date(now.getTime() + ttlMs).toISOString(), ended_at: null, ended_reason: null, spent_percent: 0 };
+    this.db.prepare("INSERT INTO leases (id,owner,meter_id,expected_percent,note,action_class,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.action_class, lease.started_at, lease.expires_at, null, null);
     this.addLeaseEvent("lease_started", lease);
     return lease;
   }

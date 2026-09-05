@@ -13,6 +13,12 @@ describe("policy defaults", () => {
     expect(defaultAntigravityKeepalive("linux")).toBe(true);
     expect(defaultAntigravityKeepalive("win32")).toBe(false);
   });
+
+  it("defaults pacing to even, and parses an explicit pacing = \"none\"", () => {
+    expect(parsePolicy("poll_interval_minutes = 5\n").pacing).toBe("even");
+    expect(parsePolicy('pacing = "even"\n').pacing).toBe("even");
+    expect(parsePolicy('pacing = "none"\n').pacing).toBe("none");
+  });
 });
 
 describe("seedExampleConfig", () => {
