@@ -150,6 +150,14 @@ resolve_identity() {
     printf '%s' "$HEADROOM_CODESIGN_IDENTITY"
     return
   fi
+  # A CI runner has no user whose Keychain grant needs to survive rebuilds,
+  # and its keychain search list may not even include the login keychain
+  # the identity would be created in. Sign ad-hoc there instead of creating
+  # an identity that codesign then cannot find.
+  if [[ -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ]]; then
+    printf -- '-'
+    return
+  fi
   if ! command -v openssl >/dev/null 2>&1; then
     echo "build-probe.sh: no openssl found; cannot create a stable local signing identity. Falling back to ad-hoc -- the next Keychain grant will not survive the next rebuild." >&2
     printf -- '-'
@@ -185,7 +193,13 @@ cp "$built" "$out_dir/headroom-claude-probe"
 chmod 0755 "$out_dir/headroom-claude-probe"
 
 identity="$(resolve_identity)"
-codesign --force --sign "$identity" "$out_dir/headroom-claude-probe"
+if [[ "$identity" != "-" ]] && ! codesign --force --sign "$identity" "$out_dir/headroom-claude-probe" 2>/dev/null; then
+  # The keychain lists the identity but codesign cannot use it (search list,
+  # locked keychain, missing partition grant). Ad-hoc keeps the build usable.
+  echo "build-probe.sh: codesign could not use '$identity'. Falling back to ad-hoc -- the next Keychain grant will not survive the next rebuild." >&2
+  identity="-"
+fi
+[[ "$identity" == "-" ]] && codesign --force --sign - "$out_dir/headroom-claude-probe"
 
 shasum -a 256 "$out_dir/headroom-claude-probe" | awk '{print $1}' > "$out_dir/SHA256"
 printf '%s' "$current_source_hash" > "$out_dir/SOURCE_SHA256"

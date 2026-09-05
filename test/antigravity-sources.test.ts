@@ -162,12 +162,17 @@ describe("agy keepalive", () => {
     await writeFile(newest, "error getting token source: You are not logged into Antigravity\n");
     await expect(agyLoginStateFromLog(root)).resolves.toBe("not_logged_in");
     const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
-    const supervisor = new AgyKeepaliveSupervisor({ binary: join(root, "fake-agy"), platform: "darwin", spawn: vi.fn(() => child) as never, logDirectory: root, logPollIntervalMs: 5, logWatchMs: 100 });
+    // logWatchMs bounds how long the supervisor keeps polling the log before
+    // giving up; it has to comfortably outlast this whole test's two waitFor
+    // steps on a loaded CI runner; a tight ~100ms budget (fine on a fast
+    // local machine) was expiring mid-test on slower ubuntu/windows runners,
+    // freezing loginState at "not_logged_in" and timing out the second wait.
+    const supervisor = new AgyKeepaliveSupervisor({ binary: join(root, "fake-agy"), platform: "darwin", spawn: vi.fn(() => child) as never, logDirectory: root, logPollIntervalMs: 5, logWatchMs: 10_000 });
     try {
       supervisor.start();
-      await vi.waitFor(() => expect(supervisor.loginState).toBe("not_logged_in"));
+      await vi.waitFor(() => expect(supervisor.loginState).toBe("not_logged_in"), { timeout: 5_000, interval: 10 });
       await writeFile(newest, "applyAuthResult authMethod=consumer\n");
-      await vi.waitFor(() => expect(supervisor.loginState).toBe("logged_in"));
+      await vi.waitFor(() => expect(supervisor.loginState).toBe("logged_in"), { timeout: 5_000, interval: 10 });
     } finally { supervisor.stop(); }
-  });
+  }, 15_000); // default 5s per-test timeout is too tight for two sequential 5s waitFor()s on a loaded CI runner
 });
