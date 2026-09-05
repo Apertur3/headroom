@@ -248,7 +248,7 @@ work and to treat UNKNOWN as no capacity, the same rule this file just described
 
 Headroom's paths, the daemon transport, and the service installer all have Windows
 implementations: `%LOCALAPPDATA%\headroom` (or `HEADROOM_HOME`) instead of `~/.headroom`, a named
-pipe (`\\.\pipe\headroom-<username>`) instead of a Unix socket, and a Task Scheduler XML instead of
+pipe (`\\.\pipe\headroom-<username>-<home digest>`) instead of a Unix socket, and a Task Scheduler XML instead of
 launchd or systemd. Claude and Codex read normally, straight from their credential files.
 
 Antigravity is not available on Windows yet. The daemon's warm `agy` keepalive needs a POSIX

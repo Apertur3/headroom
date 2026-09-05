@@ -22,7 +22,7 @@ describe("cross-platform paths", () => {
   });
 
   it("uses a per-user named pipe on Windows", () => {
-    expect(socketPath("ignored", "win32", "example")).toBe("\\\\.\\pipe\\headroom-example");
+    expect(socketPath("ignored", "win32", "example")).toMatch(/^\\\\\.\\pipe\\headroom-example-[0-9a-f]{8}$/);
     expect(socketPath("/home/example", "linux", "example")).toBe("/home/example/headroom.sock");
   });
 });
