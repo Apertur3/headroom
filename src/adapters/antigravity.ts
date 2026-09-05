@@ -11,10 +11,14 @@ const SOURCE = "remote:antigravity";
 const BASE_URL = "https://cloudcode-pa.googleapis.com";
 const RETRIEVE_USER_QUOTA = `${BASE_URL}/v1internal:retrieveUserQuota`;
 const LOAD_CODE_ASSIST = `${BASE_URL}/v1internal:loadCodeAssist`;
-const ONBOARD_USER = `${BASE_URL}/v1internal:onboardUser`;
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
-/** Same metadata CodexBar's Antigravity fetcher sends on every loadCodeAssist/onboardUser call. */
+/** Same metadata CodexBar's Antigravity fetcher sends on every loadCodeAssist call. */
 const CODE_ASSIST_METADATA = { ideType: "ANTIGRAVITY", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
+/** Astra F11: Headroom reads usage; it must never provision a remote Code
+ * Assist project or select a billing tier on the caller's behalf. When
+ * neither the stored credential nor loadCodeAssist names a project, this is
+ * the one reason surfaced -- never an onboardUser call. */
+const NO_PROJECT_REASON = "no Code Assist project; finish setup in the Gemini CLI";
 const METERS = ["gemini", "claude-gpt"] as const;
 const WINDOWS = [
   { name: "5h", minutes: 300, kind: "rolling" as const },
@@ -38,12 +42,6 @@ export interface AntigravityDependencies {
   credentialPaths?: () => string[];
   /** Test seam and explicit override for Gemini CLI's bundled OAuth client. */
   oauthClient?: () => Promise<GeminiOAuthClient | undefined>;
-  /** Onboarding project-id polling: how many times to re-check loadCodeAssist
-   * after onboardUser, and how long to wait between checks. Real onboarding
-   * needs a few seconds for Google's side to provision a project; tests
-   * override both to keep the suite fast. */
-  onboardPollAttempts?: number;
-  onboardPollDelayMs?: number;
 }
 
 interface Credential { token: string; refreshToken?: string; projectId?: string; expired: boolean; }
@@ -194,21 +192,45 @@ function extractOAuthClient(text: string): GeminiOAuthClient | undefined {
   return clientId && clientSecret ? { clientId, clientSecret } : undefined;
 }
 
+/** Astra F12: every candidate/chunk file this discovery reads is charged
+ * against one shared budget for the whole attempt, so a symlink farm, a
+ * PATH-derived ancestry with many siblings, or a huge/adversarial bundle can
+ * cost at most this much work before discovery gives up -- never the whole
+ * bundle, however large. */
+const OAUTH_SCAN_MAX_BYTES = 16 * 1024 * 1024;
+const OAUTH_SCAN_MAX_FILES = 200;
+interface OAuthScanBudget { bytesLeft: number; filesLeft: number; }
+
+/** Regular files only (lstat, never a symlink or other special file), and
+ * only while both the byte and file budget allow it. Returns undefined --
+ * treated as unavailable by every caller -- for anything else, including a
+ * single candidate too large to fit the remaining byte budget. */
+async function readBoundedCandidate(path: string, budget: OAuthScanBudget): Promise<string | undefined> {
+  if (budget.filesLeft <= 0 || budget.bytesLeft <= 0) return undefined;
+  let info;
+  try { info = await lstat(path); } catch { return undefined; }
+  if (!info.isFile() || info.size > budget.bytesLeft) return undefined;
+  budget.filesLeft -= 1;
+  budget.bytesLeft -= info.size;
+  try { return await readFile(path, "utf8"); } catch { return undefined; }
+}
+
 /** Last-resort fallback for a Homebrew-published gemini-cli install: its
  * `bundle/gemini.js` is only a ~5 KB bootstrap that dynamically imports the
  * real code from content-hashed sibling files (`bundle/chunk-<hash>.js`), so
  * none of the fixed candidate paths below ever match it. Scans every .js
  * file directly in the bundle directory (sorted, for a deterministic match)
- * until one contains the OAuth client. */
-async function scanDirectoryForOAuthClient(dir: string): Promise<GeminiOAuthClient | undefined> {
+ * until one contains the OAuth client, or until the shared scan budget runs out. */
+async function scanDirectoryForOAuthClient(dir: string, budget: OAuthScanBudget): Promise<GeminiOAuthClient | undefined> {
   let names: string[];
   try { names = (await readdir(dir)).filter((name) => name.endsWith(".js")).sort(); }
   catch { return undefined; }
   for (const name of names) {
-    try {
-      const found = extractOAuthClient(await readFile(join(dir, name), "utf8"));
-      if (found) return found;
-    } catch { /* an unreadable chunk never blocks the rest */ }
+    if (budget.filesLeft <= 0 || budget.bytesLeft <= 0) return undefined;
+    const text = await readBoundedCandidate(join(dir, name), budget);
+    if (text === undefined) continue;
+    const found = extractOAuthClient(text);
+    if (found) return found;
   }
   return undefined;
 }
@@ -221,12 +243,12 @@ export async function discoverGeminiOAuthClientDetail(): Promise<{ client: Gemin
   const envClientId = string(process.env.GEMINI_OAUTH_CLIENT_ID);
   const envClientSecret = string(process.env.GEMINI_OAUTH_CLIENT_SECRET);
   if (envClientId && envClientSecret) return { client: { clientId: envClientId, clientSecret: envClientSecret }, layout: "GEMINI_OAUTH_CLIENT_ID/SECRET environment override" };
+  const budget: OAuthScanBudget = { bytesLeft: OAUTH_SCAN_MAX_BYTES, filesLeft: OAUTH_SCAN_MAX_FILES };
   const override = string(process.env.GEMINI_OAUTH2_JS_PATH);
   if (override) {
-    try {
-      const found = extractOAuthClient(await readFile(override, "utf8"));
-      if (found) return { client: found, layout: `GEMINI_OAUTH2_JS_PATH (${override})` };
-    } catch { /* fall through to auto-discovery */ }
+    const text = await readBoundedCandidate(override, budget);
+    const found = text === undefined ? undefined : extractOAuthClient(text);
+    if (found) return { client: found, layout: `GEMINI_OAUTH2_JS_PATH (${override})` };
   }
   const fileCandidates = new Set<string>();
   const dirCandidates = new Set<string>();
@@ -252,12 +274,13 @@ export async function discoverGeminiOAuthClientDetail(): Promise<{ client: Gemin
       dirCandidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle"));
     } } catch { /* not a Homebrew installation */ }
   }
-  for (const path of fileCandidates) try {
-    const found = extractOAuthClient(await readFile(path, "utf8"));
+  for (const path of fileCandidates) {
+    const text = await readBoundedCandidate(path, budget);
+    const found = text === undefined ? undefined : extractOAuthClient(text);
     if (found) return { client: found, layout: path };
-  } catch { /* continue through the documented candidates */ }
+  }
   for (const dir of dirCandidates) {
-    const found = await scanDirectoryForOAuthClient(dir);
+    const found = await scanDirectoryForOAuthClient(dir, budget);
     if (found) return { client: found, layout: `${dir} (chunk scan)` };
   }
   return undefined;
@@ -294,8 +317,6 @@ async function refresh(fetcher: typeof fetch, credentials: Credential, resolveCl
   return { ...credentials, token: string(body.access_token)!, expired: false };
 }
 
-function sleep(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
 /** `loadCodeAssist`'s `cloudaicompanionProject` comes back either as a bare
  * project id string or as an object carrying `id`/`projectId` -- CodexBar's
  * own decoder (`ProjectReference`) accepts both, so this does too. */
@@ -320,28 +341,6 @@ function parseCodeAssist(body: unknown): CodeAssistParsed {
   return { projectId, tierId: string(currentTier?.id), tierName: string(currentTier?.name), reasonCode };
 }
 
-/** Which tier to onboard into, in the same preference order as CodexBar's
- * `pickOnboardTier`: the allowed tier flagged default, else the first
- * allowed tier, else the paid tier, else whatever tier is already current. */
-function pickOnboardTier(body: unknown): string | undefined {
-  if (!object(body)) return undefined;
-  const allowed = (Array.isArray(body.allowedTiers) ? body.allowedTiers : []).filter(object) as ObjectValue[];
-  const byDefault = string(allowed.find((tier) => tier.isDefault === true && string(tier.id))?.id);
-  if (byDefault) return byDefault;
-  const first = string(allowed.find((tier) => string(tier.id))?.id);
-  if (first) return first;
-  const paidTier = object(field(body, "paidTier")) ? string((field(body, "paidTier") as ObjectValue).id) : undefined;
-  if (paidTier) return paidTier;
-  const currentTier = object(field(body, "currentTier")) ? string((field(body, "currentTier") as ObjectValue).id) : undefined;
-  return currentTier;
-}
-
-function onboardProjectId(body: unknown): string | undefined {
-  if (!object(body)) return undefined;
-  return projectIdFrom(field(body, "cloudaicompanionProject"))
-    ?? (object(body.response) ? projectIdFrom(field(body.response as ObjectValue, "cloudaicompanionProject")) : undefined);
-}
-
 async function loadCodeAssist(fetcher: typeof fetch, token: string): Promise<unknown> {
   const response = await outboundFetch(fetcher, new Request(LOAD_CODE_ASSIST, {
     method: "POST", headers: requestHeaders(token), body: JSON.stringify({ metadata: CODE_ASSIST_METADATA }), signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -350,48 +349,17 @@ async function loadCodeAssist(fetcher: typeof fetch, token: string): Promise<unk
   return vendorJson(response);
 }
 
-async function onboardUser(fetcher: typeof fetch, token: string, tierId: string): Promise<unknown> {
-  const response = await outboundFetch(fetcher, new Request(ONBOARD_USER, {
-    method: "POST", headers: requestHeaders(token), body: JSON.stringify({ tierId, metadata: CODE_ASSIST_METADATA }), signal: AbortSignal.timeout(TIMEOUT_MS),
-  }));
-  if (!response.ok) throw await antigravityHTTPError(response);
-  return vendorJson(response);
-}
-
 /**
- * The project id `retrieveUserQuota` needs, resolved the same way CodexBar's
- * `resolveProjectID` does: a project id already on the stored credential
- * wins outright; otherwise `loadCodeAssist`'s own `cloudaicompanionProject`;
- * otherwise (a brand new Code Assist account) `onboardUser` into the best
- * available tier and poll `loadCodeAssist` a few times for the project it
- * provisions. Never persists anything -- the id is used for this one poll
- * and re-resolved next time, so a failed write can never leave a stale or
- * wrong project id on disk.
+ * The project id `retrieveUserQuota` needs: a project id already on the
+ * stored credential wins outright, otherwise `loadCodeAssist`'s own
+ * `cloudaicompanionProject`. Astra F11: Headroom never provisions a Code
+ * Assist project or picks a billing tier on the caller's behalf -- there is
+ * no `onboardUser` call anywhere in this adapter. When neither source names
+ * a project, the caller has not finished Code Assist setup in the vendor's
+ * own CLI and must be told so, not silently onboarded.
  */
-async function resolveProjectId(
-  fetcher: typeof fetch, token: string, storedProjectId: string | undefined, initial: unknown,
-  dependencies: AntigravityDependencies, trace?: { onboard?: unknown },
-): Promise<string | undefined> {
-  if (storedProjectId) return storedProjectId;
-  const fromInitial = parseCodeAssist(initial).projectId;
-  if (fromInitial) return fromInitial;
-  const tierId = pickOnboardTier(initial);
-  if (!tierId) return undefined;
-  try {
-    const onboardBody = await onboardUser(fetcher, token, tierId);
-    if (trace) trace.onboard = onboardBody;
-    const fromOnboard = onboardProjectId(onboardBody);
-    if (fromOnboard) return fromOnboard;
-  } catch { /* Onboarding is best-effort; the loadCodeAssist poll below is the real fallback. */ }
-  const attempts = dependencies.onboardPollAttempts ?? 5;
-  const delayMs = dependencies.onboardPollDelayMs ?? 2000;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    if (delayMs > 0) await sleep(delayMs);
-    const refreshed = await loadCodeAssist(fetcher, token);
-    const projectId = parseCodeAssist(refreshed).projectId;
-    if (projectId) return projectId;
-  }
-  return undefined;
+function resolveProjectId(storedProjectId: string | undefined, initial: unknown): string | undefined {
+  return storedProjectId ?? parseCodeAssist(initial).projectId;
 }
 
 async function post(fetcher: typeof fetch, token: string, projectId: string | undefined): Promise<Response> {
@@ -407,7 +375,8 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const credentials = await refresh(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient);
     const codeAssist = await loadCodeAssist(fetcher, credentials.token);
     const parsed = parseCodeAssist(codeAssist);
-    const projectId = await resolveProjectId(fetcher, credentials.token, credentials.projectId, codeAssist, dependencies);
+    const projectId = resolveProjectId(credentials.projectId, codeAssist);
+    if (!projectId) return failed(account, NO_PROJECT_REASON, timestamp);
     const quota = await post(fetcher, credentials.token, projectId);
     if (!quota.ok) throw await antigravityHTTPError(quota);
     const body: unknown = await vendorJson(quota);
@@ -437,11 +406,11 @@ function shape(value: unknown, path = "$"): Array<{ path: string; kind: string }
 
 /**
  * Returns response key paths and value kinds for every request the remote
- * sequence makes (loadCodeAssist, onboardUser only if it actually ran,
- * retrieveUserQuota), plus the tier id/name and any ineligible-tier
- * reasonCode `loadCodeAssist` reported -- so a maintainer can see why a tier
- * was denied without guessing at Google's response shape. Never retains
- * response values beyond their kind.
+ * sequence makes (loadCodeAssist, retrieveUserQuota), plus the tier id/name
+ * and any ineligible-tier reasonCode `loadCodeAssist` reported -- so a
+ * maintainer can see why a tier was denied without guessing at Google's
+ * response shape. Never retains response values beyond their kind, and never
+ * calls onboardUser: see resolveProjectId (Astra F11).
  */
 export async function antigravityResponseShape(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Record<string, unknown>> {
   const now = dependencies.now?.() ?? new Date();
@@ -454,12 +423,14 @@ export async function antigravityResponseShape(account: ProviderAccount, depende
   catch (error) { throw error instanceof Error && error.message === "expired" ? new Error("token expired; run: gemini") : error; }
   const codeAssist = await loadCodeAssist(fetcher, credentials.token);
   const parsed = parseCodeAssist(codeAssist);
-  const trace: { onboard?: unknown } = {};
-  const projectId = await resolveProjectId(fetcher, credentials.token, credentials.projectId, codeAssist, dependencies, trace);
+  const projectId = resolveProjectId(credentials.projectId, codeAssist);
   const result: Record<string, unknown> = {
     loadCodeAssist: { shape: shape(codeAssist), tier: parsed.tierId ?? parsed.tierName ?? null, reasonCode: parsed.reasonCode ?? null },
-    ...(trace.onboard !== undefined ? { onboardUser: { shape: shape(trace.onboard) } } : {}),
   };
+  if (!projectId) {
+    result.retrieveUserQuota = { error: NO_PROJECT_REASON };
+    return result;
+  }
   // A denied tier is exactly the case this diagnostic exists for: a
   // retrieveUserQuota failure (a 403 verified live against a free-tier
   // Antigravity account -- "The caller does not have permission", no

@@ -1,12 +1,31 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, open, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 type Spawn = (command: string, args: string[], options: { stdio: "ignore"; env: NodeJS.ProcessEnv }) => ChildProcess;
 
 export type AgyLoginState = "unknown" | "logged_in" | "not_logged_in";
+
+/** Astra F12: bytes read from the tail of agy's newest log per sample --
+ * enough to catch the auth-state markers even past rotation noise, small
+ * enough that a growing (or adversarial) log can never make this unbounded. */
+const LOG_TAIL_BYTES = 64 * 1024;
+
+/** Regular files only (lstat, never followed through a symlink), and never
+ * more than LOG_TAIL_BYTES read regardless of how large the log has grown. */
+async function readLogTail(path: string, maxBytes = LOG_TAIL_BYTES): Promise<string> {
+  const info = await lstat(path);
+  if (!info.isFile()) throw new Error("not a regular file");
+  const handle = await open(path, "r");
+  try {
+    const length = Math.min(info.size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    if (length > 0) await handle.read(buffer, 0, length, info.size - length);
+    return buffer.toString("utf8");
+  } finally { await handle.close(); }
+}
 
 export interface AgyKeepaliveOptions {
   binary?: string;
@@ -18,14 +37,24 @@ export interface AgyKeepaliveOptions {
   logWatchMs?: number;
 }
 
-/** Reads only auth-state markers, never credentials or quota values, from agy's newest log. */
+/** Reads only auth-state markers, never credentials or quota values, from
+ * agy's newest log -- a bounded tail of a verified regular file, never a
+ * symlink or other non-regular entry, and never the whole (possibly still
+ * growing) file. */
 export async function agyLoginStateFromLog(logDirectory = join(homedir(), ".gemini", "antigravity-cli", "log")): Promise<AgyLoginState> {
   try {
     const entries = await readdir(logDirectory);
-    const logs = await Promise.all(entries.filter((name) => /^cli-.*\.log$/.test(name)).map(async (name) => ({ path: join(logDirectory, name), modified: (await stat(join(logDirectory, name))).mtimeMs })));
+    const candidates = await Promise.all(entries.filter((name) => /^cli-.*\.log$/.test(name)).map(async (name) => {
+      const path = join(logDirectory, name);
+      try {
+        const info = await lstat(path);
+        return info.isFile() ? { path, modified: info.mtimeMs } : undefined;
+      } catch { return undefined; }
+    }));
+    const logs = candidates.filter((item): item is { path: string; modified: number } => item !== undefined);
     const newest = logs.sort((left, right) => right.modified - left.modified)[0];
     if (!newest) return "unknown";
-    const text = await readFile(newest.path, "utf8");
+    const text = await readLogTail(newest.path);
     if (/applyAuthResult.*authMethod=/.test(text)) return "logged_in";
     return text.includes("You are not logged into Antigravity") ? "not_logged_in" : "unknown";
   } catch { return "unknown"; }
@@ -66,6 +95,9 @@ export class AgyKeepaliveSupervisor {
   private loginWatchStartedAt: number | undefined;
   private notLoggedInSamples = 0;
   private _loginState: AgyLoginState = "unknown";
+  /** Astra F12: a sample already in flight skips the next tick instead of
+   * starting a second concurrent read of the same log file. */
+  private sampling = false;
 
   constructor(options: AgyKeepaliveOptions = {}) {
     this.binary = options.binary ?? resolveAgyBinary(process.env.ANTIGRAVITY_CLI_PATH);
@@ -128,8 +160,11 @@ export class AgyKeepaliveSupervisor {
     this.stopLoginWatch();
     this._loginState = "unknown";
     this.notLoggedInSamples = 0;
+    this.sampling = false;
     this.loginWatchStartedAt = Date.now();
     const inspect = () => {
+      if (this.sampling) return; // a sample is still in flight; skip this tick rather than overlap it
+      this.sampling = true;
       void agyLoginStateFromLog(this.logDirectory).then((state) => {
         if (!this.running || state === "unknown") return;
         if (state === "logged_in") { this._loginState = state; this.stopLoginWatch(); return; }
@@ -137,7 +172,7 @@ export class AgyKeepaliveSupervisor {
         // A single line can be startup noise; retain the negative result only
         // after it appears in consecutive samples from the newest agy log.
         if (this.notLoggedInSamples >= 2) this._loginState = state;
-      }).catch(() => { /* Log discovery is diagnostic-only. */ });
+      }).catch(() => { /* Log discovery is diagnostic-only. */ }).finally(() => { this.sampling = false; });
       if (this.loginWatchStartedAt !== undefined && Date.now() - this.loginWatchStartedAt >= this.logWatchMs) this.stopLoginWatch();
     };
     inspect();

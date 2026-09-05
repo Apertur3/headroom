@@ -81,7 +81,11 @@ describe("headroom cost", () => {
   it("prints the learned median/IQR/sample-count for a class, and reports plainly when there is none yet", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
-    store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
+    // learnedCost only trains on a lease once it has ended: end it
+    // immediately so this still reads back as one real zero-cost sample
+    // rather than an in-progress job with no observed spend yet.
+    const lease = store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
+    store.endLease(lease.id, "cadence");
     store.close();
     const { logs, restore } = captureLog();
     try {
@@ -499,9 +503,14 @@ describe("headroom can: learned cost and --lease", () => {
     // decision is evaluated against claude-main:all separately below.
     for (const [index, meterId] of ["claude-main:practice-1", "claude-main:practice-2"].entries()) {
       const startedAt = new Date(Date.now() + index * 1000);
-      store.startLease("cadence", meterId, null, HOUR, null, startedAt, "claude-fable");
+      const lease = store.startLease("cadence", meterId, null, HOUR, null, startedAt, "claude-fable");
       store.insert(fiveHour(0, startedAt.getTime() - Date.now(), 5 * HOUR, meterId));
       store.insert(fiveHour(4, startedAt.getTime() - Date.now() + 500, 5 * HOUR, meterId));
+      // learnedCost only trains on a lease once it has ended: without this,
+      // both freshly started leases below would count as unfinished jobs
+      // with no observed spend yet, not the two learned 4-point samples
+      // this test is asserting on.
+      store.endLease(lease.id, "cadence");
     }
     store.insert(fiveHour(10, 0, 5 * HOUR)); // claude-main:all: what `can` actually decides against
     store.close();
@@ -569,7 +578,8 @@ describe("MCP quota_cost / quota_rate / quota_plan / quota_gate / quota_wait (di
   it("quota_cost returns the learned summary", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
-    store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
+    const lease = store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
+    store.endLease(lease.id, "cadence");
     store.close();
     await withHeadroomHome(home, async () => {
       const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_cost","arguments":{"action_class":"review"}}}', noDaemon);

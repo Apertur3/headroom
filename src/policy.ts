@@ -138,6 +138,79 @@ export function paceDecision(observation: Observation | undefined, policy = defa
 
 export function paceState(observation: Observation, policy = defaultPolicy, now = new Date()): PaceState { return paceDecision(observation, policy, now).state; }
 
+export interface FreshnessOutcome {
+  ok: boolean;
+  /** Present when ok is false: the same reason paceDecision would use for
+   * this observation before it ever computes a pace state (a stale/failed
+   * freshness label, a missing window or quantity, an unparseable fetch
+   * time, or a fetch older than policy.staleness_minutes). */
+  reason: string;
+  /** True when the observation is a vendor-confirmed not_enforced window --
+   * ok is also true in that case, since a genuinely capless window is a
+   * usable reading, not an unknown one. */
+  notEnforced?: boolean;
+}
+
+/**
+ * The same freshness/age gate paceDecision applies before it ever computes a
+ * pace state, exposed standalone for orchestrator-reads.ts's rate/plan/gate/
+ * fill math: that code works over individual stored windows rather than
+ * feeding a whole observation straight into paceDecision, so it previously
+ * only checked for a wholly missing quantity and accepted a stale, failed,
+ * or long-unpolled reading's percentage as if it were current. staleMinutes
+ * is passed explicitly (rather than a full Policy) so a caller that already
+ * extracted the one number it needs, the same way it already does for
+ * freeze_reserve_pct, does not have to construct a Policy just to call this.
+ */
+export function freshnessGate(observation: Observation | undefined, staleMinutes: number, now: Date): FreshnessOutcome {
+  if (!observation) return { ok: false, reason: "no observation" };
+  if (observation.freshness === "not_enforced") return { ok: true, reason: "not enforced", notEnforced: true };
+  if (observation.freshness === "stale") return { ok: false, reason: observation.reason ?? "stale" };
+  if (observation.freshness !== "fresh") return { ok: false, reason: observation.reason ?? observation.freshness };
+  if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { ok: false, reason: observation.reason ?? "missing window or quantity" };
+  const fetched = new Date(observation.fetched_at).getTime();
+  if (!Number.isFinite(fetched)) return { ok: false, reason: "invalid fetch time" };
+  const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
+  if (now.getTime() - fetched > staleMinutes * 60_000) return { ok: false, reason: `stale ${ageMinutes}m` };
+  return { ok: true, reason: "fresh" };
+}
+
+/** The percent of a meter already reserved by every OTHER owner's active
+ * lease -- the same reservation canRouteWithLeases applies before scoring a
+ * `can` decision, exposed standalone so `route` can rank and gate its own
+ * candidates by the same adjusted capacity instead of a raw, unreserved
+ * reading. `owner` undefined (a caller that never learned its own identity)
+ * reserves against every active lease, which is the conservative direction. */
+export function otherOwnerReservedPercent(leases: Lease[], meterId: string, owner: string | undefined): { percent: number; owners: string[] } {
+  const owners: string[] = [];
+  let percent = 0;
+  for (const lease of leases) {
+    if (lease.meter_id !== meterId || lease.owner === owner || lease.expected_percent === null || lease.expected_percent <= 0) continue;
+    percent += lease.expected_percent;
+    if (!owners.includes(lease.owner)) owners.push(lease.owner);
+  }
+  return { percent, owners };
+}
+
+/** Applies otherOwnerReservedPercent to every percent-quantity row of an
+ * observations map, without mutating the input -- the same per-window
+ * adjustment canRouteWithLeases makes inline for `can`, exposed so a caller
+ * that isn't computing a full CanDecision (route's own candidate ranking)
+ * still sees the reserved capacity instead of the raw reading. */
+export function withOtherOwnerReservations<T extends Observation>(observations: Map<string, T | T[] | undefined>, leases: Lease[], owner: string | undefined): Map<string, T | T[] | undefined> {
+  const adjusted = new Map<string, T | T[] | undefined>();
+  for (const [meter, rows] of observations) {
+    const { percent } = otherOwnerReservedPercent(leases, meter, owner);
+    const apply = (row: T): T => {
+      if (percent <= 0 || row.quantity?.unit !== "percent") return row;
+      const used = Math.min(100, row.quantity.used + percent);
+      return { ...row, quantity: { ...row.quantity, used, remaining: Math.max(0, (row.quantity.limit ?? 100) - used) } };
+    };
+    adjusted.set(meter, Array.isArray(rows) ? rows.map(apply) : rows ? apply(rows) : rows);
+  }
+  return adjusted;
+}
+
 const severity: Record<PaceState, number> = { NOT_ENFORCED: -1, UP: 0, HARVEST: 0, BUSY: 1, NORMAL: 1, CONSERVE: 2, UNKNOWN: 3, DOWN: 4, FREEZE: 5 };
 
 /** Fail closed over every meter consumed by an action. */

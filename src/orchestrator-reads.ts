@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateGate, evaluateProRataLine, fillClassFits, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
-import { canConsume, type Policy } from "./policy.js";
+import { canConsume, defaultPolicy, freshnessGate, withOtherOwnerReservations, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import type { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
@@ -124,9 +124,15 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
 
 export type PlanOutcome = ({ meter: string } & PlanResult) | { meter: string; error: string };
 
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date()): PlanOutcome {
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes): PlanOutcome {
   const { short, long } = meterWindows(store, meter);
   if (!long || !long.resets_at) return { meter, error: meterUnknownReason(store, meter, `no weekly window for ${meter}`) };
+  // Fail closed on a stale, failed, or long-unpolled weekly reading exactly
+  // like gateFor/fillFor do: the plan line is computed straight from
+  // long.quantity.used, so an unusable reading there must never turn into a
+  // confident-looking plan.
+  const freshness = freshnessGate(long, staleMinutes, now);
+  if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
   return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, reservePercent, now) };
 }
@@ -143,6 +149,12 @@ export interface GateOptions {
   /** policy.toml's pacing: "even" (default) enforces the pro-rata line and
    * the burst check for a 5h need; "none" skips both. */
   pacing?: "even" | "none";
+  /** policy.toml's staleness_minutes: a window older than this (or one
+   * whose freshness itself is stale/failed) is treated as an unusable
+   * reading, the same rule paceDecision applies before scoring a pace
+   * state. Defaults to defaultPolicy's own value; a caller with the real
+   * policy loaded should pass its staleness_minutes here explicitly. */
+  staleness_minutes?: number;
 }
 
 export interface GateOutcome extends GateResult {
@@ -161,13 +173,48 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
   const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
+  const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
+  const need5h = needs.some((need) => need.window === "5h");
+  const needWk = needs.some((need) => need.window === "wk");
   let lastShort: StoredObservation | undefined;
   let lastResult: GateResult | undefined;
   for (const id of candidates) {
     const { short, long } = meterWindows(store, id);
-    if (!short && !long) continue; // a local pool or availability-only meter: nothing to gate
+    if (!short && !long) {
+      // A meter with zero readings of ANY kind is treated the same as a
+      // local pool or availability-only meter (nothing percent-based to
+      // gate): skip it silently. A meter that HAS been observed, just never
+      // as a percent window (every reading local/count-only) is the same
+      // legitimate skip. But a meter this action class explicitly consumes
+      // that has never produced a usable percent reading at all (a failed
+      // probe, a pending grant, a typo) is not "nothing to check" -- it must
+      // fail the whole gate closed, the same way a single explicit --meter
+      // target already does below, instead of silently being skipped while
+      // a different, populated meter in the same --class carries the
+      // answer.
+      const rawRows = store.latestPerWindow(id);
+      const localOrCountOnly = rawRows.length > 0 && rawRows.every((row) => row.window?.kind === "state" || row.window?.kind === "count");
+      if (localOrCountOnly) continue;
+      return { allowed: false, reason: meterUnknownReason(store, id, `no windowed reading for ${id}`), meters_checked: checked, unknown: true };
+    }
     checked.push(id);
     lastShort = short ?? lastShort;
+
+    // Fail closed on any window this gate actually consumes (a requested 5h
+    // or wk need, or the weekly reading usePlan folds into a 5h check) that
+    // is stale, failed, or older than the policy staleness threshold --
+    // the same rule paceDecision applies before computing a pace state. A
+    // vendor-confirmed not_enforced window is never rejected here;
+    // evaluateGate below already skips its need instead of failing it.
+    if (need5h && short) {
+      const freshness = freshnessGate(short, staleMinutes, now);
+      if (!freshness.ok) return { allowed: false, reason: `5h ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
+    }
+    if ((needWk || usePlan) && long) {
+      const freshness = freshnessGate(long, staleMinutes, now);
+      if (!freshness.ok) return { allowed: false, reason: `wk ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
+    }
+
     const usage = {
       used5h: short?.quantity?.used ?? null,
       usedWk: long?.quantity?.used ?? null,
@@ -241,6 +288,10 @@ export interface FillOptions {
   owner?: string;
   planSharePercent?: number;
   pacing?: "even" | "none";
+  /** Same as GateOptions.staleness_minutes: defaults to defaultPolicy's own
+   * value; a caller with the real policy loaded should pass its
+   * staleness_minutes here explicitly. */
+  staleness_minutes?: number;
 }
 
 const EVEN_PACING_FULL_BURST_MINUTES = 45;
@@ -278,10 +329,21 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   const enforced = enforcedPercentWindows(store, meter);
   if (!enforced.length) return { meter, error: meterUnknownReason(store, meter, `no enforced window for ${meter}`), no_enforced_window: true };
   const tight = enforced[0];
+  const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
+  // Fail closed on the tightest window's own freshness/age -- the same rule
+  // paceDecision applies before computing a pace state -- before spending
+  // any part of the lane math on it: a stale, failed, or long-unpolled
+  // reading must never look like real remaining capacity.
+  const tightFreshness = freshnessGate(tight, staleMinutes, now);
+  if (!tightFreshness.ok) return { meter, error: tightFreshness.reason };
   const isFiveHour = tight.window?.minutes === 300;
   // A genuine second (weekly) window, distinct from the tight one -- only
   // present when both are actually enforced.
   const wider = enforced.length > 1 ? enforced[enforced.length - 1] : undefined;
+  if (wider) {
+    const widerFreshness = freshnessGate(wider, staleMinutes, now);
+    if (!widerFreshness.ok) return { meter, error: widerFreshness.reason };
+  }
   const used5h = tight.quantity!.used;
   // With no distinct weekly window, the tight window IS the weekly boundary
   // too when it isn't the 5h one (Codex's main pool with 5h not enforced):
@@ -390,18 +452,26 @@ const routeFits = (state: PaceState, allowUnknown: boolean): boolean =>
  * 90%, claude-2 is at 10%, launch the next lane under claude-2" call an
  * orchestrator makes by hand today. Every candidate's own state and reason
  * is still reported (not just the winner), so a caller can see why a
- * principal was skipped.
+ * principal was skipped. `owner` (the caller's own identity, as `can` also
+ * requires) reserves every OTHER owner's active lease against these same
+ * meters before scoring and ranking each candidate -- without it, route
+ * could recommend a principal whose remaining capacity a different
+ * orchestrator has already reserved, while `can` correctly refuses the same
+ * job for that caller.
  */
-export function routeFor(store: HeadroomStore, meters: string[], accounts: Account[], policy: Policy, allowUnknown: boolean, now = new Date()): RouteResult {
+export function routeFor(store: HeadroomStore, meters: string[], accounts: Account[], policy: Policy, allowUnknown: boolean, now = new Date(), owner?: string): RouteResult {
   const principals = [...new Set(meters.map((meter) => meter.slice(0, meter.indexOf(":") >= 0 ? meter.indexOf(":") : meter.length)))];
+  const leases = store.leases(undefined, true, now);
   const candidates: RouteCandidate[] = principals.map((principal) => {
     const principalMeters = meters.filter((meter) => meter.startsWith(`${principal}:`));
     const observationMap = new Map(principalMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
     const rows = [...observationMap.values()].flat();
     const burn = store.burnRateFor(rows, now);
     const enriched = new Map([...observationMap].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
-    const decision = canConsume(principalMeters, enriched, policy, allowUnknown, now);
-    const deciding = pickDecidingObservation(rows);
+    const reserved = withOtherOwnerReservations(enriched, leases, owner);
+    const decision = canConsume(principalMeters, reserved, policy, allowUnknown, now);
+    const reservedRows = [...reserved.values()].flat() as Observation[];
+    const deciding = pickDecidingObservation(reservedRows.length ? reservedRows : rows);
     const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? Math.max(0, 100 - deciding.quantity.used) : null;
     return { principal, state: decision.state, reason: decision.reason, remaining_percent: remaining, window_minutes: deciding?.window?.minutes ?? null };
   });

@@ -48,10 +48,12 @@ function defaultRunClaudeMcpAdd(): Promise<number> {
   });
 }
 
-/** y/Y/Enter is yes; anything else skips the step. */
-function isYes(answer: string): boolean {
+/** Only an explicit y/Y/yes/Yes is yes; Enter (and anything else) matches the
+ * displayed `[y/N]` default and skips the step. Exported for tests: exercising
+ * this directly is far simpler than driving a real TTY through readline. */
+export function isYes(answer: string): boolean {
   const trimmed = answer.trim().toLowerCase();
-  return trimmed === "" || trimmed === "y" || trimmed === "yes";
+  return trimmed === "y" || trimmed === "yes";
 }
 
 async function confirm(options: SetupOptions, question: string): Promise<boolean> {
@@ -103,8 +105,15 @@ async function stepDiscoverAccounts(options: SetupOptions): Promise<boolean> {
   return true;
 }
 
-async function stepDoctor(): Promise<boolean> {
+async function stepDoctor(options: SetupOptions): Promise<boolean> {
   console.log("Step 2: run doctor");
+  if (options.planOnly) {
+    // doctor() opens (and so creates) the Headroom home database and, on
+    // macOS, looks up Keychain item metadata for each configured Claude
+    // principal. Describe it instead of running it in plan mode.
+    console.log("  (dry run) would run: headroom doctor (installation diagnostics; creates the Headroom home database if it does not exist yet, and on macOS looks up Keychain item metadata -- never the secret itself -- for each configured Claude principal)");
+    return true;
+  }
   try { await doctor(); }
   catch (error) { console.error(`  failed: ${safeError(error)}`); }
   return true;
@@ -120,6 +129,14 @@ async function stepKeychainGrant(options: SetupOptions, overrides: SetupOverride
     console.log("  skipped; not macOS");
     return true;
   }
+  if (options.planOnly) {
+    // doctorChecks() opens (and so creates) the Headroom home database and
+    // performs a Keychain metadata lookup per configured Claude principal --
+    // real reads a plan must never perform. Describe the step instead of
+    // running it; a dry run leaves an empty temporary home empty.
+    console.log("  (dry run) would run: headroom doctor to find configured Claude principals needing a Keychain grant, then headroom keychain grant --principal <name> for each one still missing it");
+    return true;
+  }
   const keychainGrant = overrides.keychainGrant ?? keychain;
   let checks: DoctorCheck[];
   try { checks = await doctorChecks(); }
@@ -132,10 +149,6 @@ async function stepKeychainGrant(options: SetupOptions, overrides: SetupOverride
   }
   console.log("  This opens one macOS Keychain access dialog per principal below. Answer it with Always Allow, or every future poll will prompt again.");
   const commands = names.map((name) => `headroom keychain grant --principal ${name}`);
-  if (options.planOnly) {
-    for (const command of commands) console.log(`  (dry run) would run: ${command}`);
-    return true;
-  }
   if (options.yes) {
     // The one step --yes never runs on its own: print what the user needs to run themselves.
     for (const command of commands) console.log(`  run this yourself: ${command}`);
@@ -209,8 +222,16 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
   return true;
 }
 
-async function stepFinalCheck(): Promise<boolean> {
+async function stepFinalCheck(options: SetupOptions): Promise<boolean> {
   console.log("Step 6: final check");
+  if (options.planOnly) {
+    // observe() (with no daemon running, the common case for a first-time
+    // plan) polls every configured principal directly, which can make a
+    // real, credential-backed vendor call. A plan must call no vendor.
+    console.log("  (dry run) would run: headroom doctor and headroom observe (installation diagnostics plus a live usage read, which can call configured vendors using their real credentials)");
+    console.log("Pace legend: HARVEST = spend it before it expires, NORMAL = proceed, CONSERVE = slow down, FREEZE = do not spawn, UNKNOWN = treat as no capacity.");
+    return true;
+  }
   try { await doctor(); await observe([]); }
   catch (error) {
     console.error(isAccountsMissingError(error) ? "  No accounts configured yet. Run: headroom accounts discover" : `  failed: ${safeError(error)}`);
@@ -241,11 +262,11 @@ export async function runSetup(argv: string[], overrides: SetupOverrides = {}): 
     if (planOnly) console.log("(nothing will change; showing the plan)");
     for (const step of [
       () => stepDiscoverAccounts(options),
-      () => stepDoctor(),
+      () => stepDoctor(options),
       () => stepKeychainGrant(options, overrides),
       () => stepInstallService(options),
       () => stepMcp(options, overrides),
-      () => stepFinalCheck(),
+      () => stepFinalCheck(options),
     ]) {
       console.log("");
       if (!(await step())) return 1;

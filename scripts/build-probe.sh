@@ -81,6 +81,21 @@ identity_exists() {
   security find-identity login.keychain-db 2>/dev/null | grep -q "\"$local_identity_name\""
 }
 
+# Overwrites a file with random bytes before unlinking it, so a plain `rm`
+# never leaves key material recoverable from the underlying disk blocks.
+# Astra F1: applied to the private key and the PKCS#12 bundle immediately
+# after `security import` consumes them -- neither is useful again after
+# that, and both are shredded regardless of HEADROOM_BUILD_PROBE_KEEP_WORKDIR.
+shred_file() {
+  local file="$1" size
+  [[ -f "$file" ]] || return 0
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+  if [[ -n "$size" && "$size" -gt 0 ]]; then
+    dd if=/dev/urandom of="$file" bs=1 count="$size" conv=notrunc >/dev/null 2>&1 || true
+  fi
+  rm -f "$file"
+}
+
 # Creates a self-signed, codeSigning-EKU certificate named "Headroom Local"
 # in the login keychain. Called at most once ever on a given machine:
 # subsequent runs find the existing identity via identity_exists() above.
@@ -90,14 +105,19 @@ identity_exists() {
 create_local_identity() {
   local workdir
   workdir="$(mktemp -d)"
+  # mktemp -d already creates this at mode 0700; chmod explicitly rather
+  # than rely on that alone, since the whole point is that no one else can
+  # read the private key this directory is about to hold.
+  chmod 700 "$workdir"
   if [[ -z "${HEADROOM_BUILD_PROBE_KEEP_WORKDIR:-}" ]]; then
     # shellcheck disable=SC2064
     trap "rm -rf '$workdir'" RETURN
   else
     # Test-only escape hatch (see test/build-probe-script.test.ts): leaves
-    # the generated ext.cnf/cert.pem/cert.p12 in place so a test can inspect
-    # the openssl config and certificate this function actually produces,
-    # without ever importing them into a keychain.
+    # ext.cnf and cert.pem (the openssl config and the public certificate,
+    # neither sensitive) in place for a test to inspect. The private key and
+    # the PKCS#12 bundle are shredded below regardless of this flag -- it
+    # must never be a way to keep key material on disk.
     echo "build-probe.sh: HEADROOM_BUILD_PROBE_KEEP_WORKDIR set; leaving $workdir in place for inspection." >&2
   fi
 
@@ -116,6 +136,15 @@ CONF
 
   openssl req -x509 -newkey rsa:2048 -keyout "$workdir/key.pem" -out "$workdir/cert.pem" \
     -days 36500 -nodes -config "$workdir/ext.cnf" -extensions v3_req >/dev/null 2>&1
+
+  # Astra F1: a random password generated fresh for this one run, held only
+  # in this shell variable -- it is passed to openssl/security via
+  # -passout/-P and never written to any file. The export and import below
+  # must agree on it (the same random value), unlike the former fixed
+  # "headroom" password shared by every build on every machine.
+  local p12_password
+  p12_password="$(openssl rand -hex 24)"
+
   # OpenSSL 3's default PKCS#12 encryption (AES-256 keys/certs, SHA-256 MAC)
   # is not something macOS's Security framework can import: `security
   # import` fails with "SecKeychainItemImport: MAC verification failed
@@ -126,18 +155,22 @@ CONF
   # doesn't recognize `-legacy` at all; the explicit legacy algorithm names
   # produce the same macOS-readable output there.
   if ! openssl pkcs12 -export -in "$workdir/cert.pem" -inkey "$workdir/key.pem" \
-      -out "$workdir/cert.p12" -passout pass:headroom -name "$local_identity_name" \
+      -out "$workdir/cert.p12" -passout "pass:$p12_password" -name "$local_identity_name" \
       -legacy >/dev/null 2>&1; then
     openssl pkcs12 -export -in "$workdir/cert.pem" -inkey "$workdir/key.pem" \
-      -out "$workdir/cert.p12" -passout pass:headroom -name "$local_identity_name" \
+      -out "$workdir/cert.p12" -passout "pass:$p12_password" -name "$local_identity_name" \
       -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES >/dev/null 2>&1
   fi
-  # -A (rather than a specific -T allowlist) grants every application access
-  # to the imported key without a per-app prompt, alongside the explicit
-  # codesign entry: codesign itself still needs the partition-list grant
-  # below to use the key non-interactively.
-  security import "$workdir/cert.p12" -k login.keychain-db -P headroom \
-    -T /usr/bin/codesign -A
+  # Astra F1: -T names exactly one application (codesign) allowed to use
+  # this key without a prompt; no -A, which would have granted every
+  # application silent access to it.
+  security import "$workdir/cert.p12" -k login.keychain-db -P "$p12_password" \
+    -T /usr/bin/codesign
+  # Astra F1: the private key and the PKCS#12 bundle are never needed again
+  # after this import -- shred both immediately, whether or not the import
+  # above actually succeeded, and regardless of HEADROOM_BUILD_PROBE_KEEP_WORKDIR.
+  shred_file "$workdir/key.pem"
+  shred_file "$workdir/cert.p12"
   # Grants codesign non-interactive use of the new key's partition; a known
   # macOS ACL quirk (since Sierra) that otherwise pops "codesign wants to use
   # your key... Always Allow" on every single sign. Best effort: absent on

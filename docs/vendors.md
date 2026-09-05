@@ -33,6 +33,20 @@ matched to a principal by an explicit `alias` field on that account in `accounts
 convention alias `"main"` means the default profile. Which directories are scanned is
 `policy.toml`'s `statusline_snapshot_dirs` (default: just `<HEADROOM_HOME>/statusline`).
 
+Every configured directory is trust-checked before it is ever scanned (safe ancestry, not a
+symlink, not foreign-owned or writable by group/other without the sticky bit); one that fails is
+skipped with a single line to stderr, never read. Each `.json` file within it is then read
+defensively: opened only after an `lstat` rejects a symlink or non-regular file, bounded to 64 KiB
+and 64 files per directory, and its JSON structure depth-bounded. A snapshot's `observed_at` is
+rejected outright (not merely marked stale) if it falls outside JavaScript's own `Date` range or
+more than five minutes in the future, so a bad or future-dated file can never win the
+newest-snapshot comparison or crash the reader; a malformed `resets_at` on an otherwise-valid
+bucket is dropped to "unknown reset" rather than aborting the snapshot. `headroom statusline`
+itself resolves the same safe Headroom home every other command uses before writing, verifies the
+`statusline` directory the same way (0700, refusing a symlink or foreign-owned directory), and
+writes each snapshot through a uniquely named temporary file renamed into place, refusing outright
+rather than following an existing symlink at the destination.
+
 The collector prefers a fresh snapshot over the probe outright -- for a Claude principal set up
 this way, Headroom never touches the Keychain at all, and a principal still waiting on
 `headroom keychain grant` reads normally anyway. A stale or missing snapshot falls back to the
@@ -99,12 +113,13 @@ fallback, used only when remote can't answer.
 The remote path reads Gemini CLI's Google OAuth credentials, refreshing the token first if it's
 expired, then follows the same sequence CodexBar's Antigravity provider does against
 `cloudcode-pa.googleapis.com`: `v1internal:loadCodeAssist` (metadata `ideType: "ANTIGRAVITY"`) for
-the account's current tier and project id; if there is no project id yet, `v1internal:onboardUser`
-into the best available tier (the tier flagged default among `allowedTiers`, else the first listed,
-else the paid tier, else whatever tier is already current), then a few `loadCodeAssist` polls for
-the project it provisions; finally `v1internal:retrieveUserQuota` with that project id. Never
-persists anything it learns (project id included) -- every poll re-resolves it, so a failed write
-can never leave a stale or wrong value on disk.
+the account's current tier and project id; finally `v1internal:retrieveUserQuota` with that project
+id. Headroom reads usage, it does not provision Code Assist accounts or pick a billing tier on the
+caller's behalf: there is no `onboardUser` call anywhere in this path. If neither the stored
+credential nor `loadCodeAssist` names a project, the read comes back `failed` with reason "no Code
+Assist project; finish setup in the Gemini CLI" rather than onboarding one. Never persists anything
+it learns (project id included) -- every poll re-resolves it, so a failed write can never leave a
+stale or wrong value on disk.
 
 Token refresh needs the Gemini CLI's own OAuth client id/secret, which Headroom never hardcodes:
 it checks `GEMINI_OAUTH_CLIENT_ID`/`GEMINI_OAUTH_CLIENT_SECRET`, then `GEMINI_OAUTH2_JS_PATH`, then
@@ -114,7 +129,10 @@ the installed Gemini CLI package (the `gemini` binary's real path, walked upward
 from content-hashed sibling files (`bundle/chunk-<hash>.js`), so on that layout none of the fixed
 candidate paths ever contain the client -- the last resort is a scan of every `.js` file directly
 in the bundle directory. `headroom doctor`'s "Antigravity OAuth client" check reports which layout
-actually matched (never the id/secret themselves).
+actually matched (never the id/secret themselves). Every file this discovery reads -- the fixed
+candidates, the environment override, and the chunk scan alike -- must be a regular file (never a
+symlink) and is charged against one shared 16 MiB / 200-file budget for the whole attempt; an
+oversized or otherwise unsafe bundle is treated as unavailable rather than read.
 
 Only when the daemon owns a warmed `agy` pseudo-terminal (started under `script -q /dev/null agy`
 on macOS and Linux only; never on Windows, and never merely because a principal is configured --
@@ -127,9 +145,9 @@ same file the Gemini CLI itself writes. There's no Keychain path for Antigravity
 Meters emitted: `<principal>:gemini` and `<principal>:claude-gpt`, each with a 5-hour and a weekly
 window, with `used` computed as `(1 - remainingFraction) * 100` from the vendor's quota buckets.
 `headroom --principal <name> --shape` prints the key/kind shape of every response the sequence
-made (`loadCodeAssist`, `onboardUser` only if it actually ran, `retrieveUserQuota`), plus
-`loadCodeAssist`'s own tier and any `ineligibleTiers[].reasonCode` it reported, so a denied tier is
-visible without guessing at Google's response shape.
+made (`loadCodeAssist`, `retrieveUserQuota`), plus `loadCodeAssist`'s own tier and any
+`ineligibleTiers[].reasonCode` it reported, so a denied tier is visible without guessing at
+Google's response shape.
 
 Keepalive is secondary: a poll's remote read is always tried first, and the daemon starts `agy`
 lazily -- only the first time a poll shows remote fell short (availability-only, a 403, or a

@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -39,11 +39,16 @@ function testSocketPath(root: string, label: string): string {
   return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
 }
 
+function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 function pipeAuthProof(token: string, nonce: string): string {
   return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");
 }
-function pipeServerProof(token: string, serverNonce: string, clientNonce: string): string {
-  return createHmac("sha256", token).update(`headroom-pipe-server-v1:${serverNonce}:${clientNonce}`).digest("hex");
+/** v2: bound to the exact request/reply bytes exchanged, not only the nonce
+ * pair -- see src/daemon.ts's own pipeServerProof. Unused directly in this
+ * file (the fake win32 daemon below computes its own), kept for parity with
+ * pipe-auth.test.ts and in case a future test here needs to verify one. */
+function pipeServerProof(token: string, serverNonce: string, clientNonce: string, requestHash: string, replyHash: string): string {
+  return createHmac("sha256", token).update(`headroom-pipe-server-v2:${serverNonce}:${clientNonce}:${requestHash}:${replyHash}`).digest("hex");
 }
 
 /**
@@ -54,15 +59,21 @@ function pipeServerProof(token: string, serverNonce: string, clientNonce: string
  * transport itself (test/pipe-auth.test.ts covers that), so on win32 they
  * authenticate the same way a real client would: force a known session
  * token onto the daemon, then sign a fresh nonce the same way rpc() does.
+ * handleLine() itself now returns the reply and its transcript-proof frame
+ * as two separate wire lines (src/daemon.ts's HandledLine) rather than one
+ * object; this helper parses the reply line back into the plain
+ * `{id, result, error}` shape every call site in this file already expects,
+ * so none of them need to know the wire format changed.
  */
 async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> {
-  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> };
-  if (process.platform !== "win32") return internal.handleLine(line);
+  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ replyLine: string; proofLine?: string; authenticated: boolean }> };
+  if (process.platform !== "win32") { const { replyLine } = await internal.handleLine(line); return JSON.parse(replyLine); }
   internal.sessionToken ??= randomBytes(32).toString("hex");
   const nonce = randomBytes(16).toString("hex");
   const request = JSON.parse(line) as { params?: Record<string, unknown> };
   const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
-  return internal.handleLine(JSON.stringify({ ...request, params }), nonce);
+  const { replyLine } = await internal.handleLine(JSON.stringify({ ...request, params }), nonce);
+  return JSON.parse(replyLine);
 }
 
 describe("daemon JSON-RPC", () => {
@@ -123,7 +134,7 @@ describe("daemon JSON-RPC", () => {
   it("returns only active leases through the daemon status/MCP lease surface", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-leases-")); temporary.push(root);
     const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-    const internal = daemon as unknown as { store: { startLease(owner: string, meter: string, expected: number | null, ttl: number, note: string | null, now: Date): { id: string }; endLease(id: string, owner: string, force: boolean, now: Date): unknown }; handleLine(line: string): Promise<{ result: unknown }> };
+    const internal = daemon as unknown as { store: { startLease(owner: string, meter: string, expected: number | null, ttl: number, note: string | null, now: Date): { id: string }; endLease(id: string, owner: string, force: boolean, now: Date): unknown } };
     const now = new Date();
     const active = internal.store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
     const ended = internal.store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
@@ -162,16 +173,21 @@ describe("daemon JSON-RPC", () => {
         socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
       }
       socket.on("data", (line: string) => {
+        const requestHash = sha256Hex(line);
         const request = JSON.parse(line) as { id: number; method: string; params?: { _proof?: string; _client_nonce?: string } };
         methods.push(request.method);
         if (process.platform === "win32" && request.method !== "health" && request.params?._proof !== pipeAuthProof(token, nonce!)) {
-          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32001, message: "Unauthorized pipe client" } })}\n`);
+          const replyLine = JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32001, message: "Unauthorized pipe client" } });
+          socket.write(`${replyLine}\n`);
+          if (request.params?._client_nonce) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "transcript_proof", params: { proof: pipeServerProof(token, nonce!, request.params._client_nonce, requestHash, sha256Hex(replyLine)) } })}\n`);
           return;
         }
         const result = request.method === "health" ? { ok: true } : request.method === "status" ? [fixture()] : { ok: true };
-        const reply: Record<string, unknown> = { jsonrpc: "2.0", id: request.id, result };
-        if (process.platform === "win32" && request.params?._client_nonce) reply.server_proof = pipeServerProof(token, nonce!, request.params._client_nonce);
-        socket.write(`${JSON.stringify(reply)}\n`);
+        const replyLine = JSON.stringify({ jsonrpc: "2.0", id: request.id, result });
+        socket.write(`${replyLine}\n`);
+        if (process.platform === "win32" && request.params?._client_nonce) {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "transcript_proof", params: { proof: pipeServerProof(token, nonce!, request.params._client_nonce, requestHash, sha256Hex(replyLine)) } })}\n`);
+        }
       });
     });
     try {
@@ -281,10 +297,9 @@ describe("malformed requests never crash the daemon or MCP loop", () => {
   it("returns a JSON-RPC error instead of throwing for null, a bare string, and a method-less object", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-malformed-")); temporary.push(root);
     const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-    const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number } }> };
     try {
       for (const line of ["null", '"just a string"', '{"jsonrpc":"2.0","id":1}', "42", "[1,2,3]"]) {
-        await expect(internal.handleLine(line)).resolves.toMatchObject({ error: { code: -32600 } });
+        await expect(authedHandleLine(daemon, line)).resolves.toMatchObject({ error: { code: -32600 } });
       }
     } finally { await daemon.stop(); }
   });
@@ -298,6 +313,45 @@ describe("malformed requests never crash the daemon or MCP loop", () => {
   it("converts a thrown MCP tool error into a JSON-RPC error instead of rejecting", async () => {
     const response = await handleMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"quota_can","arguments":{}}}', async () => { throw new Error("owner is required"); });
     expect(response).toMatchObject({ error: { code: -32000, message: "owner is required" } });
+  });
+});
+
+describe("MCP tool arguments are validated against their own schema before dispatch", () => {
+  const neverDispatch = async (): Promise<never> => { throw new Error("must not reach the daemon or the direct fallback"); };
+
+  it("rejects a needs array with a non-string member as a whole, instead of quietly checking only the valid one", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:1",7],"meter":"claude-main:all","owner":"cadence"}}}', neverDispatch);
+    expect(response).toMatchObject({ error: { code: -32602 } });
+    expect((response as { error: { message: string } }).error.message).toContain("needs");
+  });
+
+  it("rejects a negative reserve_percent the same way the CLI's --reserve does", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_plan","arguments":{"meter":"claude-main:all","reserve_percent":-1}}}', neverDispatch);
+    expect(response).toMatchObject({ error: { code: -32602 } });
+    expect((response as { error: { message: string } }).error.message).toContain("reserve_percent");
+  });
+
+  it("rejects a numeric meter_id instead of silently stringifying it", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_lease_start","arguments":{"meter_id":7}}}', neverDispatch);
+    expect(response).toMatchObject({ error: { code: -32602 } });
+    expect((response as { error: { message: string } }).error.message).toContain("meter_id");
+  });
+
+  it("rejects an argument name the tool never declared", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{"bogus":true}}}', neverDispatch);
+    expect(response).toMatchObject({ error: { code: -32602 } });
+    expect((response as { error: { message: string } }).error.message).toContain("bogus");
+  });
+
+  it("rejects a non-object arguments value instead of silently defaulting it to {}", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":[1,2,3]}}', neverDispatch);
+    expect(response).toMatchObject({ error: { code: -32602 } });
+    expect((response as { error: { message: string } }).error.message).toContain("plain object");
+  });
+
+  it("still lets a fully valid call through unchanged", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:1"],"meter":"claude-main:all","owner":"cadence","reserve_percent":10}}}', async (method) => { expect(method).toBe("gate"); return { allowed: true, reason: "fits", meters_checked: ["claude-main:all"] }; });
+    expect(response).toMatchObject({ result: { structuredContent: { allowed: true } } });
   });
 });
 
@@ -608,15 +662,22 @@ describe("plan/gate/fill round-trip through a real daemon socket for a meter who
     process.env.HEADROOM_HOME = root;
     try {
       const store = await HeadroomStore.open(root);
+      // The daemon's own "plan" handler always scores freshness against the
+      // real wall clock (it has no injected test clock), so these fixture
+      // rows are timestamped relative to actual now rather than a fixed
+      // historical string -- otherwise they would read as stale/long-
+      // unpolled no matter which real day the suite happens to run on.
+      const fetchedAt = new Date().toISOString();
+      const weeklyResetsAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
       store.insert({
         principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-        quantity: null, resets_at: null, observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture",
+        quantity: null, resets_at: null, observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture",
         truth: "official", freshness: "not_enforced", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
       });
       store.insert({
         principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
-        quantity: { used: 83, limit: 100, remaining: 17, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z",
-        observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture",
+        quantity: { used: 83, limit: 100, remaining: 17, unit: "percent" }, resets_at: weeklyResetsAt,
+        observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture",
         truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
       });
       store.close();

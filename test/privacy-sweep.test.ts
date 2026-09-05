@@ -19,7 +19,7 @@ async function checkFile(contents: string, opts: { denylist?: string } = {}): Pr
   const args = ["--check", target];
   if (opts.denylist) args.push("--denylist", opts.denylist);
   try {
-    const { stdout } = await execFileAsync("bash", [scriptPath, ...args], {
+    const { stdout, stderr } = await execFileAsync("bash", [scriptPath, ...args], {
       env: {
         ...process.env,
         // scripts/privacy-sweep.sh merges in an untracked local denylist
@@ -32,10 +32,10 @@ async function checkFile(contents: string, opts: { denylist?: string } = {}): Pr
         PRIVACY_DENYLIST: join(root, "no-such-local-denylist"),
       },
     });
-    return { code: 0, stdout };
+    return { code: 0, stdout: stdout + stderr };
   } catch (error: unknown) {
-    const result = error as { code?: number; stdout?: string };
-    return { code: result.code ?? 1, stdout: result.stdout ?? "" };
+    const result = error as { code?: number; stdout?: string; stderr?: string };
+    return { code: result.code ?? 1, stdout: (result.stdout ?? "") + (result.stderr ?? "") };
   }
 }
 
@@ -105,6 +105,54 @@ describe("scripts/privacy-sweep.sh --check", () => {
 
   it("passes a clean file", async () => {
     const { code } = await checkFile("nothing sensitive here at all\n");
+    expect(code).toBe(0);
+  });
+
+  it("Astra F13: fails, and never reports PASS, on a nonexistent --check input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-privacy-sweep-missing-"));
+    temporary.push(root);
+    const missing = join(root, "does-not-exist.txt");
+    try {
+      const { stdout } = await execFileAsync("bash", [scriptPath, "--check", missing], {
+        env: { ...process.env, PRIVACY_DENYLIST: join(root, "no-such-local-denylist") },
+      });
+      // A passing exit here would already be the bug; fail loudly if it happens.
+      expect(stdout).not.toContain("PASS");
+    } catch (error: unknown) {
+      const result = error as { code?: number; stdout?: string; stderr?: string };
+      expect(result.code).not.toBe(0);
+      expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).toContain("missing or unreadable");
+    }
+  });
+
+  it("Astra F13: fails on an invalid denylist regular expression instead of reporting no hits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-privacy-denylist-invalid-"));
+    temporary.push(root);
+    const denylistPath = join(root, "denylist.txt");
+    // An unbalanced group is a syntax error for extended regular expressions.
+    await writeFile(denylistPath, "unbalanced(group\n", "utf8");
+    const { code, stdout } = await checkFile("nothing sensitive here at all\n", { denylist: denylistPath });
+    expect(code).not.toBe(0);
+    expect(stdout).toContain("invalid denylist expression");
+  });
+
+  it("covers the full RFC 6598 CGNAT /10 block, not just the 100.64.x /16", async () => {
+    // Assembled at runtime, same trick as privateIps above: a literal
+    // contiguous CGNAT address in this file's own source would fail this
+    // repo's own tracked-file sweep.
+    const cgnatIps = [
+      ["100", "64", "0", "5"].join("."),
+      ["100", "90", "1", "1"].join("."),
+      ["100", "127", "255", "254"].join("."),
+    ];
+    for (const ip of cgnatIps) {
+      const { code, stdout } = await checkFile(`address ${ip} here\n`);
+      expect(code, `expected ${ip} to fail`).not.toBe(0);
+      expect(stdout).toContain("private IPv4 address");
+    }
+    // 100.128.x.x and above is outside RFC 6598 and must not be flagged.
+    const outsideCgnat = ["100", "128", "0", "1"].join(".");
+    const { code } = await checkFile(`address ${outsideCgnat} here\n`);
     expect(code).toBe(0);
   });
 });

@@ -240,6 +240,55 @@ describe("gateFor: a not-enforced window is skipped, not treated as unknown", ()
   });
 });
 
+describe("gateFor/fillFor: fail closed on a stale, failed, or long-unpolled reading (F5)", () => {
+  it("gate answers UNKNOWN once the reading is older than a tiny staleness threshold, even though the same numbers would otherwise fit", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T11:00:00Z", "2026-09-03T16:00:00Z")); // an hour old by `now` below
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = gateFor(store, [{ window: "5h", points: 5 }], "claude-main:all", 10, false, now, { staleness_minutes: 0.000001 });
+      expect(result.allowed).toBe(false);
+      expect(result.unknown).toBe(true);
+      expect(result.reason).toContain("claude-main:all");
+    } finally { store.close(); }
+  });
+
+  it("gate still passes the same reading once it is within the staleness threshold", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T12:00:00Z", "2026-09-03T17:00:00Z"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = gateFor(store, [{ window: "5h", points: 5 }], "claude-main:all", 10, false, now, { staleness_minutes: 15 });
+      expect(result.allowed).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it("fill answers UNKNOWN (an error result) once the reading is older than a tiny staleness threshold", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T11:00:00Z", "2026-09-03T16:00:00Z"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = await fillFor(store, "claude-main:all", 2, 10, now, { staleness_minutes: 0.000001 });
+      expect("error" in result).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it("gate fails the whole check when one meter in a multi-meter class has never been observed at all, instead of silently skipping it and passing on the populated one", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T12:00:00Z", "2026-09-03T17:00:00Z", "claude-main:all"));
+      // codex-main:main is a real member of this action class but has never
+      // produced any reading -- not a local pool, not an availability
+      // count, just genuinely unread.
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = gateFor(store, [{ window: "5h", points: 1 }], ["claude-main:all", "codex-main:main"], 10, false, now);
+      expect(result.allowed).toBe(false);
+      expect(result.unknown).toBe(true);
+      expect(result.reason).toContain("codex-main:main");
+    } finally { store.close(); }
+  });
+});
+
 describe("rate/plan/gate/fill surface a meter's own reason instead of a generic unknown", () => {
   it("rate prints the pending-grant reason for a meter with no window at all", async () => {
     const store = await open();

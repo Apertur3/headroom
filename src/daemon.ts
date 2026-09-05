@@ -8,7 +8,7 @@ import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
-import { executablePath, headroomHome, joinForPlatform } from "./paths.js";
+import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type Policy } from "./policy.js";
 import { withResetsIn } from "./resets.js";
 import { withPaceInfo } from "./pace.js";
@@ -22,11 +22,30 @@ import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 type Json = Record<string, unknown>;
 export type Poller = (principal?: string, options?: PollOptions) => Promise<PollResult>;
 
+/** What handleLine() actually hands back to the socket to write out: the
+ * reply line always; the transcript-proof line only when this connection is
+ * proving its identity (win32, once nonces are established); `authenticated`
+ * tells handleSocket() this call itself cleared the win32 proof check, so it
+ * can cancel the connection's handshake deadline. Kept as two separate wire
+ * lines rather than one object with the proof folded in, precisely so
+ * neither side ever needs to reconstruct "the reply bytes minus one field" --
+ * see pipeServerProof's and finish()'s own comments for why that would be
+ * ambiguous. */
+interface HandledLine { replyLine: string; proofLine?: string; authenticated: boolean; }
+
 /** A local, single-user daemon still bounds what any one connection can hold
  * in memory and how many can be open at once, rather than trusting every
  * caller on the machine to behave. */
 const MAX_CONNECTION_BUFFER_BYTES = 64 * 1024;
 const MAX_CONCURRENT_CONNECTIONS = 64;
+// Client-side bounds on a pipe reply (rpc(), below): a connection that never
+// authenticates can otherwise stream data forever and make this process
+// allocate without bound, or hold the promise open past any sane deadline
+// even though the inactivity timer keeps resetting on every byte it sends.
+const MAX_RPC_RESPONSE_BYTES = 256 * 1024;
+const RPC_ABSOLUTE_DEADLINE_MS = 10_000;
+
+function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   // joinForPlatform, not a bare join(): join() always uses the *host* OS's
@@ -34,9 +53,14 @@ export function socketPath(home = headroomHome(), platform = process.platform, u
   // (e.g. a "linux" home path on a real Windows host) with backslashes.
   // A named pipe has no directory, so the pipe name carries a digest of the
   // Headroom home: two homes for one Windows user (or two test daemons on
-  // one runner) get two pipes instead of fighting over one.
+  // one runner) get two pipes instead of fighting over one. The home is run
+  // through canonicalizeHomeForPipe first -- and only there -- so the
+  // daemon (which calls this with a realpath'd home) and a client (which
+  // calls it with the raw, un-resolved HEADROOM_HOME) always agree on one
+  // digest for one directory, whatever separator style or case either side
+  // happened to spell it with.
   if (platform === "win32") {
-    const homeDigest = createHash("sha256").update(home.replace(/[\\/]+$/, "").toLowerCase()).digest("hex").slice(0, 8);
+    const homeDigest = sha256Hex(canonicalizeHomeForPipe(home, platform)).slice(0, 8);
     return `\\\\.\\pipe\\headroom-${username}-${homeDigest}`;
   }
   return joinForPlatform(platform, home, "headroom.sock");
@@ -73,9 +97,19 @@ function pipeAuthProof(token: string, nonce: string): string { return createHmac
  * in plain text. Binding both the server's own per-connection nonce and the
  * client's freshly generated one means a reply captured on one connection
  * (for example a `health` reply, which needs no client proof to request)
- * can never be replayed on another connection -- the pair never repeats. */
-function pipeServerProof(token: string, serverNonce: string, clientNonce: string): string {
-  return createHmac("sha256", token).update(`headroom-pipe-server-v1:${serverNonce}:${clientNonce}`).digest("hex");
+ * can never be replayed on another connection -- the pair never repeats.
+ *
+ * v2 additionally binds the transcript itself: requestHash and replyHash are
+ * SHA-256 hex digests of the exact bytes the server received for the request
+ * line and is about to send for the reply line. v1 bound only the nonce pair,
+ * which is enough to stop replay across connections but not enough to stop a
+ * live relay that forwards a genuine nonce handshake and then substitutes the
+ * request it actually sends the real daemon, or the reply it hands back to
+ * the waiting client -- the nonce pair alone never changes when the payload
+ * does. Binding both hashes closes that gap: any substitution on either side
+ * changes a hash, and the proof no longer verifies. */
+function pipeServerProof(token: string, serverNonce: string, clientNonce: string, requestHash: string, replyHash: string): string {
+  return createHmac("sha256", token).update(`headroom-pipe-server-v2:${serverNonce}:${clientNonce}:${requestHash}:${replyHash}`).digest("hex");
 }
 
 /** Byte-length-safe constant-time string compare. Buffer.from(x).length is a
@@ -109,6 +143,22 @@ function callerFrom(params: Json): string {
   return `pid:${pid};process:${processName}`;
 }
 
+export interface ConnectionLimits {
+  /** Windows only: a pipe connection that has not completed the proof
+   * handshake -- any non-`health` request whose proof checks out -- within
+   * this many milliseconds is closed. POSIX authenticates a connection the
+   * instant it is accepted (the 0600 socket file already decided who could
+   * connect at all), so this never applies there. */
+  handshakeDeadlineMs: number;
+  /** Either platform: a connection with no complete request line for this
+   * long is closed; the timer resets each time one arrives. */
+  idleTimeoutMs: number;
+  /** Either platform: a connection is destroyed, rather than left to buffer
+   * writes without bound, once its own unwritten output exceeds this. */
+  maxPendingWriteBytes: number;
+}
+const DEFAULT_CONNECTION_LIMITS: ConnectionLimits = { handshakeDeadlineMs: 5_000, idleTimeoutMs: 30_000, maxPendingWriteBytes: 1024 * 1024 };
+
 export class HeadroomDaemon {
   private server: Server | undefined;
   private readonly inFlight = new Map<string, Promise<PollResult>>();
@@ -124,11 +174,11 @@ export class HeadroomDaemon {
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
 
-  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive?: AgyKeepaliveSupervisor) { this.keepalive = keepalive; }
+  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
 
-  static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor } = {}): Promise<HeadroomDaemon> {
+  static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor; connectionLimits?: Partial<ConnectionLimits> } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
-    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive);
+    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive, { ...DEFAULT_CONNECTION_LIMITS, ...options.connectionLimits });
   }
 
   async start(): Promise<void> {
@@ -220,35 +270,94 @@ export class HeadroomDaemon {
     if (this.connectionCount >= MAX_CONCURRENT_CONNECTIONS) { socket.destroy(); return; }
     this.connectionCount += 1;
     let closed = false;
-    const closeOnce = () => { if (closed) return; closed = true; this.connectionCount -= 1; };
+    let idleTimer: NodeJS.Timeout | undefined;
+    let handshakeTimer: NodeJS.Timeout | undefined;
+    const closeOnce = () => {
+      if (closed) return;
+      closed = true;
+      this.connectionCount -= 1;
+      if (idleTimer) clearTimeout(idleTimer);
+      if (handshakeTimer) clearTimeout(handshakeTimer);
+    };
     socket.once("close", closeOnce);
+    // A socket with no "error" listener turns a peer reset, or any other
+    // transport failure, into an uncaught exception that crashes the whole
+    // daemon process instead of costing just this one connection its slot.
+    socket.once("error", () => socket.destroy());
     socket.setEncoding("utf8");
     let buffer = "";
+    let processing = false;
+    const resetIdleTimer = (): void => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => socket.destroy(), this.connectionLimits.idleTimeoutMs);
+      idleTimer.unref?.();
+    };
+    resetIdleTimer();
+    // Windows only: POSIX has nothing to hand-shake -- the 0600 socket file
+    // already decided who could connect at all before accept() ever ran.
+    let authenticated = process.platform !== "win32";
+    if (!authenticated) {
+      handshakeTimer = setTimeout(() => { if (!authenticated) socket.destroy(); }, this.connectionLimits.handshakeDeadlineMs);
+      handshakeTimer.unref?.();
+    }
+    const safeWrite = (line: string): void => {
+      if (socket.destroyed) return;
+      // Bounded output: a client that stops reading its replies (or was
+      // never going to) must not let this connection's unwritten output grow
+      // without limit -- destroy it instead of buffering forever.
+      if (socket.writableLength > this.connectionLimits.maxPendingWriteBytes) { socket.destroy(); return; }
+      socket.write(line);
+    };
     // Windows only: a fresh random nonce per connection, sent before anything
     // else. The client proves it holds the session token by HMAC-ing this
     // nonce (see pipeAuthProof); the token itself is read from the local
     // 0600 token file, never placed on the wire.
     const nonce = process.platform === "win32" ? randomBytes(16).toString("hex") : undefined;
-    if (nonce) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
+    if (nonce) safeWrite(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
     socket.on("data", (part: string) => {
       buffer += part;
       if (Buffer.byteLength(buffer, "utf8") > MAX_CONNECTION_BUFFER_BYTES) { socket.destroy(); return; }
       let newline: number;
       while ((newline = buffer.indexOf("\n")) >= 0) {
+        // One request in flight per connection: every real client (rpc(),
+        // below) opens a fresh connection per request and never pipelines a
+        // second one onto it, so a further complete line arriving before the
+        // first has been answered is either a confused client or an attempt
+        // to pile up concurrent work on a single connection slot -- close
+        // rather than queue it.
+        if (processing) { socket.destroy(); return; }
         const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-        void this.handleLine(line, nonce).then((reply) => socket.write(`${JSON.stringify(reply)}\n`));
+        processing = true;
+        resetIdleTimer();
+        void this.handleLine(line, nonce).then(({ replyLine, proofLine, authenticated: provedThisCall }) => {
+          processing = false;
+          if (provedThisCall) { authenticated = true; if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = undefined; } }
+          safeWrite(`${replyLine}\n`);
+          if (proofLine) safeWrite(`${proofLine}\n`);
+        });
       }
     });
   }
 
-  private async handleLine(line: string, nonce?: string): Promise<Json> {
+  private async handleLine(line: string, nonce?: string): Promise<HandledLine> {
+    // Hashed unconditionally, from the exact bytes received, before any
+    // parsing: this becomes part of the win32 transcript proof below (see
+    // pipeServerProof's own comment), binding the *request* into the
+    // exchange so a relay that forwards a genuine handshake but substitutes
+    // the request text it actually sends the real daemon can never pass that
+    // daemon's honest reply off as an answer to a different request the
+    // waiting client believes it asked.
+    const requestHash = sha256Hex(line);
     let request: Json;
-    try { request = JSON.parse(line) as Json; } catch { return rpcError(null, -32700, "Parse error"); }
     // A malformed envelope (null, a bare string/number, an array, or an
     // object missing method) must produce a JSON-RPC error, never throw:
     // `request.jsonrpc` on a non-object `request` (e.g. the JSON literal
     // `null`) would otherwise throw here, escaping as an unhandled rejection
-    // since handleSocket's `.then()` below has no `.catch()`.
+    // since handleSocket's `.then()` below has no `.catch()`. A line that
+    // fails to parse at all has no client nonce to bind a proof to either,
+    // so it is returned as a plain, unproved reply line -- exactly like the
+    // "no client_nonce at all" case below.
+    try { request = JSON.parse(line) as Json; } catch { return { replyLine: JSON.stringify(rpcError(null, -32700, "Parse error")), authenticated: false }; }
     // Read defensively, ahead of the envelope-shape check below: even an
     // "Invalid Request" reply needs a server_proof, and the client's own
     // nonce (echoed back into every server_proof so a reply is bound to this
@@ -257,9 +366,23 @@ export class HeadroomDaemon {
     // whether the rest of the envelope turns out to be well-formed.
     const rawParams = request && typeof request === "object" && !Array.isArray(request) && request.params && typeof request.params === "object" ? request.params as Json : {};
     const clientNonce = process.platform === "win32" && typeof rawParams._client_nonce === "string" && /^[0-9a-f]{32}$/.test(rawParams._client_nonce) ? rawParams._client_nonce : undefined;
-    const finish = (reply: Json): Json => {
-      if (process.platform === "win32" && nonce && clientNonce && this.sessionToken) reply.server_proof = pipeServerProof(this.sessionToken, nonce, clientNonce);
-      return reply;
+    let authenticatedThisCall = false;
+    const finish = (reply: Json): HandledLine => {
+      if (process.platform === "win32" && nonce && clientNonce && this.sessionToken) {
+        const replyLine = JSON.stringify(reply);
+        const replyHash = sha256Hex(replyLine);
+        const proof = pipeServerProof(this.sessionToken, nonce, clientNonce, requestHash, replyHash);
+        // The proof travels on its own line, sent immediately after the
+        // reply line, so what the client hashes to verify it is exactly the
+        // bytes it already received for the reply -- never a value it has to
+        // reconstruct by parsing the reply, deleting a field, and
+        // re-serializing, which would depend on reproducing this object's
+        // exact key order. See F16 in docs/reports for why that
+        // reconstruction approach was rejected as ambiguous.
+        const proofLine = JSON.stringify({ jsonrpc: "2.0", method: "transcript_proof", params: { proof } });
+        return { replyLine, proofLine, authenticated: authenticatedThisCall };
+      }
+      return { replyLine: JSON.stringify(reply), authenticated: authenticatedThisCall };
     };
     if (!request || typeof request !== "object" || Array.isArray(request) || request.jsonrpc !== "2.0" || typeof request.method !== "string") {
       const id = request && typeof request === "object" && !Array.isArray(request) ? (request as Json).id : null;
@@ -269,7 +392,7 @@ export class HeadroomDaemon {
     const caller = callerFrom(params);
     // A rejected request is still audited before it returns: a caller
     // learning nothing about capacity does not mean the daemon saw nothing.
-    const reject = (code: number, message: string, subject: string | null = null): Json => {
+    const reject = (code: number, message: string, subject: string | null = null): HandledLine => {
       this.store.audit(caller, request.method as string, subject, "rejected");
       return finish(rpcError(request.id, code, message));
     };
@@ -277,6 +400,7 @@ export class HeadroomDaemon {
       const received = typeof params._proof === "string" ? params._proof : "";
       const expected = nonce && this.sessionToken ? pipeAuthProof(this.sessionToken, nonce) : "";
       if (!expected || !safeTimingEqual(received, expected)) return reject(-32001, "Unauthorized pipe client");
+      authenticatedThisCall = true;
     }
     try {
       let result: unknown;
@@ -368,7 +492,7 @@ export class HeadroomDaemon {
           if (!meter) return reject(-32602, "meter is required");
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -386,7 +510,7 @@ export class HeadroomDaemon {
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing }); break;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -396,7 +520,7 @@ export class HeadroomDaemon {
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
-          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing }); break;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); break;
         }
         case "health": result = {
           socket: this.path,
@@ -583,9 +707,9 @@ export async function daemonRequest(path: string, method: string, params: Json =
   | { status: "unresponsive" }
 > {
   // Mutual auth (win32 only) is verified entirely inside rpc() itself now: a
-  // reply -- health included -- whose server_proof does not check out comes
-  // back as `undefined`, indistinguishable here from no daemon answering at
-  // all. There is nothing left for daemonRequest to double-check.
+  // reply -- health included -- whose transcript proof does not check out
+  // comes back as `undefined`, indistinguishable here from no daemon
+  // answering at all. There is nothing left for daemonRequest to double-check.
   const health = await rpc(path, "health", {}, healthTimeoutMs);
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
   const result = await rpc(path, method, params, 30_000);
@@ -597,7 +721,11 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     const socket = createConnection(path);
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
+    let totalBytes = 0;
     let nonce: string | undefined; // the server's per-connection nonce
+    let sentLine: string | undefined; // the exact request-line bytes this connection sent
+    let replyLine: string | undefined; // the exact reply-line bytes received, pending its proof line
+    let replyValue: Json | undefined;
     const isWin32 = process.platform === "win32";
     // Generated once per connection and, on the wire, sent with the single
     // request this connection ever makes (see the loop below): it is the
@@ -606,7 +734,21 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     // never verifies here, even for a replayed `health` answer.
     const clientNonce = isWin32 ? randomBytes(16).toString("hex") : undefined;
     let token: string | undefined;
-    const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
+    let finished = false;
+    // An absolute deadline independent of the inactivity timer above: that
+    // timer resets on every byte received, so a connection that keeps
+    // trickling data -- never enough to go idle, never a complete answer --
+    // would otherwise never time out at all. This fires regardless of
+    // activity.
+    const absoluteDeadline = setTimeout(() => done(undefined), RPC_ABSOLUTE_DEADLINE_MS);
+    absoluteDeadline.unref?.();
+    const done = (value: unknown | undefined) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(absoluteDeadline);
+      socket.destroy();
+      resolve(value);
+    };
     const send = (): void => {
       void (async () => {
         // The session token is read locally from the 0600 token file and used
@@ -614,13 +756,20 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
         // the socket.
         if (isWin32) token = await sessionToken();
         const proof = isWin32 && nonce && token && method !== "health" ? pipeAuthProof(token, nonce) : undefined;
-        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), ...(clientNonce ? { _client_nonce: clientNonce } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
+        sentLine = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), ...(clientNonce ? { _client_nonce: clientNonce } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } });
+        socket.write(`${sentLine}\n`);
       })().catch(() => done(undefined));
     };
     // On Windows the server always sends a nonce notification first; wait for
     // it before sending anything. Elsewhere there is nothing to wait for.
     socket.once("connect", () => { if (!isWin32) send(); });
     socket.on("data", (part: string) => {
+      totalBytes += Buffer.byteLength(part, "utf8");
+      // Bounded response: without this, a pipe impostor holding an
+      // unauthenticated connection open could stream data forever and make
+      // this process allocate without bound -- the inactivity timer above
+      // never fires because it keeps resetting on every byte received.
+      if (totalBytes > MAX_RPC_RESPONSE_BYTES) { done(undefined); return; }
       buffer += part;
       let newline: number;
       while ((newline = buffer.indexOf("\n")) >= 0) {
@@ -629,20 +778,47 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
           try {
             const parsed = JSON.parse(line) as Json;
             const parsedParams = parsed.params && typeof parsed.params === "object" ? parsed.params as Json : undefined;
-            if (parsed.method === "nonce" && parsedParams && typeof parsedParams.nonce === "string") { nonce = parsedParams.nonce; send(); continue; }
+            const candidateNonce = typeof parsedParams?.nonce === "string" ? parsedParams.nonce : undefined;
+            // Exactly 32 lowercase hex characters, matching what a genuine
+            // daemon always generates (randomBytes(16).toString("hex")): a
+            // missing, malformed, or oversized value here is never a nonce
+            // worth computing a proof against.
+            if (parsed.method !== "nonce" || !candidateNonce || !/^[0-9a-f]{32}$/.test(candidateNonce)) { done(undefined); return; }
+            nonce = candidateNonce; send(); continue;
           } catch { done(undefined); return; }
         }
+        if (isWin32 && replyLine === undefined) {
+          // Stored verbatim, never re-serialized: the hash this client
+          // verifies below must be exactly what the server hashed on its
+          // side, which is the whole point of the proof traveling on its own
+          // line instead of being folded back into the reply object.
+          replyLine = line;
+          try { replyValue = JSON.parse(line) as Json; } catch { done(undefined); return; }
+          continue;
+        }
+        if (isWin32) {
+          // This line is the transcript-proof frame that follows the reply.
+          try {
+            const proofFrame = JSON.parse(line) as Json;
+            const proofParams = proofFrame.params && typeof proofFrame.params === "object" ? proofFrame.params as Json : undefined;
+            const proof = typeof proofParams?.proof === "string" ? proofParams.proof : "";
+            const requestHash = sentLine ? sha256Hex(sentLine) : "";
+            const replyHash = sha256Hex(replyLine!);
+            // The server's half of mutual auth: now bound to this exact
+            // request and reply, not only the nonce pair, so a relay that
+            // forwarded a genuine handshake but substituted the request it
+            // sent the real daemon, or the reply it hands back here, changes
+            // one of these hashes and never verifies -- treated exactly like
+            // no answer at all, whatever it claims.
+            const expected = token && nonce && clientNonce ? pipeServerProof(token, nonce, clientNonce, requestHash, replyHash) : undefined;
+            if (!expected || !safeTimingEqual(proof, expected)) { done(undefined); return; }
+          } catch { done(undefined); return; }
+          done(replyValue!.error ? replyValue : replyValue!.result);
+          return;
+        }
+        // POSIX: no nonce, no proof -- resolve on the first line, unchanged.
         try {
           const reply = JSON.parse(line) as Json;
-          if (isWin32) {
-            // The server's half of mutual auth: verified on every reply, not
-            // only health's, and treated exactly like no answer at all on
-            // failure -- a missing or wrong server_proof must never surface
-            // as a usable result, whatever it claims.
-            const expected = token && nonce && clientNonce ? pipeServerProof(token, nonce, clientNonce) : undefined;
-            const actual = typeof reply.server_proof === "string" ? reply.server_proof : "";
-            if (!expected || !safeTimingEqual(actual, expected)) { done(undefined); return; }
-          }
           done(reply.error ? reply : reply.result);
         } catch { done(undefined); }
         return;

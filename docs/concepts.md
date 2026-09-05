@@ -57,7 +57,11 @@ window looks identical to a placeholder from a single snapshot alone. `not_enfor
 the other three: it means the vendor confirmed there is no cap on this window at all, so it prints
 as `n/a` and never counts toward `can` or a threshold. Anything `stale` or `failed` becomes the
 pace state UNKNOWN everywhere Headroom shows it, and `headroom can` answers NO for it unless you
-pass `--allow-unknown`. UNKNOWN is never treated as capacity.
+pass `--allow-unknown`. UNKNOWN is never treated as capacity. `plan`, `gate`, and `fill` apply the
+same staleness threshold before doing any of their own math: a window that is stale, failed, or
+simply hasn't been polled in longer than `staleness_minutes` answers UNKNOWN by name (which window,
+on which meter) instead of computing a plan line, a gate decision, or a lane count from a number
+that might no longer be true.
 
 Example: a Codex account with no 5-hour window in the vendor's response and no recent session log
 shows `5h n/a`, not `5h 0%`.
@@ -108,8 +112,11 @@ or colder than the line that would land exactly on empty at reset.
 A lease can carry an `action_class` (set by `lease start --class` or by `can --lease`), and every
 percent point a lease's meter spends while it's the active reservation is attributed to that class.
 `headroom cost [<action-class>]` reports the median spent percent, its
-interquartile range, and the sample count -- one sample per lease, whether it ended up spending
-something or nothing. `can` uses this when the caller gives no `--expect`: it reports the learned
+interquartile range, and the sample count -- one sample per ENDED lease (finished normally, or
+expired), whether it ended up spending something or nothing. A lease still in progress is never
+counted: it has no observed spend yet, so treating it as a sample would let a batch of just-started
+jobs drag the median toward zero and inflate the sample count before any of them are actually done.
+`can` uses this when the caller gives no `--expect`: it reports the learned
 median as the expected cost, a sample-count confidence band (`none`/`low`/`medium`/`high`), and how
 many more calls of that cost would fit in the deciding meter's remaining percent before reset.
 `--lease` then reserves that expectation as a new lease under the same class, so the next `can` for
@@ -172,7 +179,10 @@ orchestrator asking `headroom can` at the same time sees that capacity as alread
 instead of double-booking it. A lease has an owner, a meter, an optional expected percent, a
 time-to-live after which it expires on its own, and an end time once the orchestrator is done.
 Passing `--owner` to `headroom can` excludes your own open leases from the reservation you're
-checking against, so you don't get blocked by your own claim.
+checking against, so you don't get blocked by your own claim. `headroom route` applies the same
+reservation: it takes `--owner` too, and reserves every OTHER owner's active lease against the
+candidates it scores and ranks, so it never recommends a principal whose remaining capacity a
+different orchestrator has already spoken for.
 
 Example: `headroom lease start --owner triage-bot --meter codex-main:main --expect 15 --ttl 30m`
 reserves 15 points of `codex-main:main` for 30 minutes.
@@ -184,7 +194,11 @@ reserve) evenly across the whole 5h windows left before the weekly reset, and re
 per-window share and the "plan line" -- the weekly percent-per-hour that would spend the reserved
 budget exactly by the reset. `headroom gate --need 5h:N [--need wk:N] --owner X` is the pre-dispatch
 check a caller runs before every lane: it fails closed the same way `can` does, and with `--plan`
-also requires a 5h request to fit under the plan line, not just under the reserve.
+also requires a 5h request to fit under the plan line, not just under the reserve. With `--class`
+resolving to several meters, every one of them must have a usable reading -- a meter the class
+genuinely consumes but that has never produced a windowed reading fails the whole gate UNKNOWN by
+name, rather than being silently skipped while a different, populated meter in the same class
+answers on its own.
 
 `policy.toml`'s `pacing` (`"even"`, the default, or `"none"`) controls two extra checks scoped to a
 5h `--need` and one owner. The pro-rata line is that owner's planned share of the window (from

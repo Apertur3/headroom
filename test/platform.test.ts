@@ -3,7 +3,7 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { socketPath } from "../src/daemon.js";
-import { assertSafeAncestry, credentialPath, headroomHome, vendorHome } from "../src/paths.js";
+import { assertSafeAncestry, canonicalizeHomeForPipe, credentialPath, headroomHome, vendorHome } from "../src/paths.js";
 import { installService, serviceContents, servicePath, uninstallService, windowsTaskXml } from "../src/service.js";
 
 const temporary: string[] = [];
@@ -24,6 +24,21 @@ describe("cross-platform paths", () => {
   it("uses a per-user named pipe on Windows", () => {
     expect(socketPath("ignored", "win32", "example")).toMatch(/^\\\\\.\\pipe\\headroom-example-[0-9a-f]{8}$/);
     expect(socketPath("/home/example", "linux", "example")).toBe("/home/example/headroom.sock");
+  });
+
+  // F16(b): socketPath()'s Windows branch hashes canonicalizeHomeForPipe()'s
+  // output, never the raw home -- this is the one function every pipe-name
+  // call site (the daemon's realpath'd home, a client's raw HEADROOM_HOME)
+  // must funnel through so both sides land on the same pipe.
+  it("canonicalizes a Windows home the same way regardless of separator style, case, or dot components", () => {
+    const canonical = canonicalizeHomeForPipe("C:\\Users\\example\\.headroom", "win32");
+    expect(canonicalizeHomeForPipe("c:\\users\\example\\.headroom\\", "win32")).toBe(canonical);
+    expect(canonicalizeHomeForPipe("C:/Users/example/.headroom", "win32")).toBe(canonical);
+    expect(canonicalizeHomeForPipe("C:\\Users\\example\\sub\\..\\.headroom", "win32")).toBe(canonical);
+  });
+
+  it("leaves a POSIX home's case alone but still resolves it", () => {
+    expect(canonicalizeHomeForPipe("/home/Example/sub/../.headroom", "linux")).toBe("/home/Example/.headroom");
   });
 });
 

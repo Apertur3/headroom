@@ -9,6 +9,13 @@ and `quota_route` always read directly, since neither has a daemon RPC case at a
 because it never blocks (it just reports the reset time), and `quota_route` because it's a
 deliberate, occasional call, not a hot path worth a daemon round trip.
 
+Every tool call is validated against its own declared schema before any dispatch, to the daemon or
+to the direct fallback: an argument of the wrong type, a number outside the bounds noted below (the
+same bounds the CLI's own flags enforce), or a name the tool never declared is refused with a JSON-
+RPC invalid-params error naming the argument, rather than being coerced, dropped, or ignored. A
+`needs` array (`quota_gate`) is rejected as a whole the moment one entry doesn't match `"5h:N"` /
+`"wk:N"`, rather than silently checking only the valid entries.
+
 ## Status tools
 
 ### `quota_status`
@@ -47,8 +54,8 @@ Behind a daemon, `structuredContent` is the raw observation array. Without one, 
 ### `quota_can`
 
 Arguments: `action_class` (string, required), `owner` (string, required), `allow_unknown`
-(boolean, optional), `expect_percent` (number, optional; overrides the learned cost for the "max
-more before reset" figure), `lease` (boolean, optional; reserves the deciding meter for the
+(boolean, optional), `expect_percent` (number, optional, 0-100; overrides the learned cost for the
+"max more before reset" figure), `lease` (boolean, optional; reserves the deciding meter for the
 expected or learned percent, same as `can --lease`).
 
 ```json
@@ -128,8 +135,8 @@ Arguments: `since` (string, optional; an ISO timestamp the caller resolves itsel
 
 Arguments: `meter_id` (string, required), `owner` (string, optional; defaults to
 `<client name>#<session id>` from the MCP session when omitted), `expected_percent` (number,
-optional), `ttl_ms` (number, optional; the CLI's own default is 30 minutes), `note` (string,
-optional), `action_class` (string, optional; attributes the lease's spend to a class for
+optional, 0-100), `ttl_ms` (number, optional, > 0; the CLI's own default is 30 minutes), `note`
+(string, optional), `action_class` (string, optional; attributes the lease's spend to a class for
 `quota_cost`, same as `lease start --class`).
 
 ```json
@@ -231,17 +238,22 @@ CLI: `headroom rate --meter M`.
 
 ### `quota_plan`
 
-`meter`, optional `reserve_percent`. Returns the weekly points available per remaining 5h window
-before the weekly reset, and the plan line (linear budget) to hold. CLI: `headroom plan`.
+`meter`, optional `reserve_percent` (0-100). Returns the weekly points available per remaining 5h
+window before the weekly reset, and the plan line (linear budget) to hold. Fails UNKNOWN if the
+weekly window's own reading is stale, failed, or older than `staleness_minutes`. CLI: `headroom
+plan`.
 
 ### `quota_gate`
 
-`needs` (array of `"5h:15"` / `"wk:3"` strings), optional `meter`, `plan`, `reserve_percent`,
-`owner`, `plan_share_percent`, `action_class` (adds a `lanes_remaining_for_class` figure from the
-learned cost for that class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
+`needs` (array of `"5h:15"` / `"wk:3"` strings; rejected as a whole if any entry does not match
+that shape), optional `meter`, `plan`, `reserve_percent` (0-100), `owner`, `plan_share_percent`
+(>= 0), `action_class` (adds a `lanes_remaining_for_class` figure from the learned cost for that
+class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
 the current window (and, with `plan`, the plan line); under even pacing a 5h need is also checked
 against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
-CLI: `headroom gate` (exit 2 when it does not fit).
+Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
+older than `staleness_minutes`, or if `meter` resolves to several meters and one of them has never
+produced a windowed reading at all. CLI: `headroom gate` (exit 2 when it does not fit).
 
 ### `quota_wait`
 
@@ -250,21 +262,26 @@ caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
 
 ### `quota_fill`
 
-`meter`, optional `lane_cost_percent`, `weekly_reserve_percent`, `owner`, `plan_share_percent`.
-How many more lanes fit before the 5h window's unspent points are lost at reset, and which
-`routing.toml` action classes still fit the remaining points and minutes. CLI: `headroom fill`.
+`meter`, optional `lane_cost_percent` (> 0), `weekly_reserve_percent` (0-100), `owner`,
+`plan_share_percent` (>= 0). How many more lanes fit before the 5h window's unspent points are
+lost at reset, and which `routing.toml` action classes still fit the remaining points and minutes.
+Fails UNKNOWN if the tightest enforced window (or the weekly one, when both are enforced) is stale,
+failed, or older than `staleness_minutes`. CLI: `headroom fill`.
 
 ### `quota_cost`
 
-Optional `action_class`. The learned cost per action class from leases: median spent percent,
-interquartile range and sample count. CLI: `headroom cost`.
+Optional `action_class`. The learned cost per action class from ENDED leases only (finished
+normally, or expired): median spent percent, interquartile range and sample count. An in-progress
+lease is never counted -- it has no observed spend yet. CLI: `headroom cost`.
 
 ### `quota_route`
 
 `action_class`, `owner`, optional `allow_unknown`. Among the principals the routing entry for
 that action class allows, picks the one with the most remaining headroom on its own tightest
-window, and returns its launch environment (for example `CLAUDE_CONFIG_DIR`). `null` when none
-fits; UNKNOWN rows never win unless `allow_unknown` is set. CLI: `headroom route`.
+window, and returns its launch environment (for example `CLAUDE_CONFIG_DIR`). `owner` reserves
+every OTHER owner's active lease against these same meters before scoring and ranking each
+candidate, the same reservation `quota_can` applies. `null` when none fits; UNKNOWN rows never win
+unless `allow_unknown` is set. CLI: `headroom route`.
 
 ## How an orchestrator should use them
 

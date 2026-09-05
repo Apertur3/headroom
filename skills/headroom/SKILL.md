@@ -61,7 +61,7 @@ first one that fails, showing its output:
 
 ## Leases
 
-Take a lease before fanning out work: `headroom lease start --owner <name> --meter <meter_id> --expect <percent> [--class <action-class>]`. Pass `--owner <name>` to `headroom can` so your own reservation is not counted twice, and end the lease when the work is done. Other orchestrators on this machine see active leases.
+Take a lease before fanning out work: `headroom lease start --owner <name> --meter <meter_id> --expect <percent> [--class <action-class>]`. Pass `--owner <name>` to `headroom can` (and to `headroom route --class <action-class> --owner <name>`, which reserves the same way) so your own reservation is not counted twice, and end the lease when the work is done. Other orchestrators on this machine see active leases.
 
 ## Pacing
 
