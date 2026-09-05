@@ -108,8 +108,13 @@ function windowValue(observation: Observation, state: PaceState): string {
   return state === "NOT_ENFORCED" ? "n/a" : observation.quantity ? `${Math.round(observation.quantity.used)}%` : "UNKNOWN";
 }
 
-function meterDecision(observations: Observation | Observation[] | undefined, policy: Policy, now: Date): Omit<MeterPaceDecision, "meter"> {
+function meterDecision(meter: string, observations: Observation | Observation[] | undefined, policy: Policy, now: Date): Omit<MeterPaceDecision, "meter"> {
   const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
+  // No reading at all (a fresh install, a misspelled routing meter, or an
+  // absent adapter) is UNKNOWN, never NOT_ENFORCED: NOT_ENFORCED is a
+  // vendor-confirmed absent limit, which requires an actual observation to
+  // confirm it. An empty set must fail closed like any other unknown state.
+  if (!windows.length) return { state: "UNKNOWN", reason: `no readings for ${meter}` };
   const enforced = windows
     .filter((observation) => observation.window?.kind !== "count")
     .map((observation) => ({ observation, ...paceDecision(observation, policy, now) }))
@@ -134,10 +139,19 @@ function meterDecision(observations: Observation | Observation[] | undefined, po
   };
 }
 
+/** A routing action class that names a meter whose principal is not any
+ * currently configured account is a configuration error, not a silent
+ * UNKNOWN: a misspelled meter or a stale routing.toml entry must be caught
+ * loudly rather than quietly blocking (or, worse, matching nothing and
+ * appearing to allow). Returns the offending meters, empty when all are known. */
+export function unknownMeterPrincipals(meters: string[], knownPrincipals: Set<string>): string[] {
+  return meters.filter((meter) => !knownPrincipals.has(meter.slice(0, meter.indexOf(":") >= 0 ? meter.indexOf(":") : meter.length)));
+}
+
 /** Fail closed over every enforced window of every meter consumed by an action. */
 export function canConsume(meters: string[], observations: Map<string, Observation | Observation[] | undefined>, policy = defaultPolicy, allowUnknown = false, now = new Date()): CanDecision {
   if (!meters.length) throw new Error("An action must consume at least one meter");
-  const states = meters.map((meter) => ({ meter, ...meterDecision(observations.get(meter), policy, now) }));
+  const states = meters.map((meter) => ({ meter, ...meterDecision(meter, observations.get(meter), policy, now) }));
   const limiting = states.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
   return { allowed: !states.some((item) => item.state === "FREEZE" || item.state === "DOWN" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
 }

@@ -17,6 +17,20 @@ describe("secret-safe outputs", () => {
     expect(redact("owner@private.example")).not.toContain("private.example");
   });
 
+  it("redacts an opaque bearer token that matches no known key prefix, not just the scheme word", () => {
+    // Regression: the Authorization pattern used to stop at the first space,
+    // leaving "Bearer" redacted but the actual (opaque, non sk-/eyJ/ya29./
+    // GOCSPX--shaped) token behind it untouched.
+    const output = redact("Authorization: Bearer a1b2c3d4e5f6opaquetoken owner@private.example");
+    expect(output).not.toContain("a1b2c3d4e5f6opaquetoken");
+    expect(output).not.toContain("Bearer");
+  });
+
+  it("redacts Cookie and Set-Cookie header values", () => {
+    expect(redact("Cookie: session=abc123; other=xyz")).not.toContain("abc123");
+    expect(redact("Set-Cookie: session=abc123; Path=/; HttpOnly")).not.toContain("abc123");
+  });
+
   it("redacts Google OAuth access and client-secret token prefixes", () => {
     const output = redact("access_token=ya29.synthetic-value client_secret=GOCSPX-synthetic-value");
     for (const forbidden of ["ya29.", "GOCSPX-"]) expect(output).not.toContain(forbidden);

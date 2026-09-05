@@ -52,7 +52,10 @@ suspicious_names="$(find "$pkg_dir" -type f \( \
 secret_pattern='(-----BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY-----|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})'
 email_pattern='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 
-content_hits="$(grep -rEnI "$secret_pattern|$email_pattern" "$pkg_dir" 2>/dev/null || true)"
+# file:line only -- never the matched line's content, which is the secret
+# (or email) itself. This is a CI log; a canary that leaks what it found
+# defeats its own purpose.
+content_hits="$(grep -rEnI "$secret_pattern|$email_pattern" "$pkg_dir" 2>/dev/null | sed -E 's/^([^:]+:[0-9]+):.*/\1: [REDACTED MATCH]/' || true)"
 
 if [[ -n "$suspicious_names" || -n "$content_hits" ]]; then
   echo "FAIL packed tarball canary scan"

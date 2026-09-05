@@ -74,6 +74,12 @@ async function claudeProbe(configDir: string): Promise<string> {
     if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied");
     if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access timed out");
     if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; run: claude`);
+    // Parenthesized status code, matching ProviderHTTPError's own format:
+    // collector.ts's and daemon.ts's shared backoff detection looks for this
+    // exact shape, so a probe-side 403/429 backs off the same way a direct
+    // fetch's would, instead of being silently discarded.
+    if (stderr.includes("HEADROOM_PROBE_FORBIDDEN")) throw new ClaudeProbeError("missing", "Claude usage request failed (403)");
+    if (stderr.includes("HEADROOM_PROBE_RATE_LIMITED")) throw new ClaudeProbeError("missing", "Claude usage request failed (429)");
     if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
     throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
   }

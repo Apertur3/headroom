@@ -8,6 +8,7 @@ import {
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import { observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential } from "../src/adapters/antigravity.js";
+import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
 
 const claude = { name: "claude-main", vendor: "claude", location: "/Users/test/.claude", adapter: "native-ts" } as const;
 const codex = { name: "codex-main", vendor: "codex", location: "/Users/test/.codex", adapter: "native-ts" } as const;
@@ -88,6 +89,28 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "UNSUPPORTED_CLIENT", message: "Gemini Code Assist for individuals is no longer supported for person@example.com; Bearer eyJ.not-a-token" } }), { status: 403 }),
     });
     expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "HTTP 403 UNSUPPORTED_CLIENT: Gemini Code Assist for individuals is no longer supported for [REDACTED]; [REDACTED]" })]));
+  });
+
+  it("recognizes a 429 Antigravity refusal as a protected status the same way a 401/403 one is", async () => {
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at,
+      credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "RATE_LIMITED", message: "too many requests" } }), { status: 429 }),
+    });
+    const failed = rows.find((row) => row.freshness === "failed");
+    expect(failed?.reason).toMatch(/^HTTP 429\b/);
+    // The exact bug this regresses: collector.ts's/daemon.ts's backoff
+    // detection previously only matched a parenthesized "(429)" (the shape
+    // ProviderHTTPError produces for Claude/Codex), never Google's own bare
+    // "HTTP 429" wording, so an Antigravity rate limit was silently retried.
+    expect(PROTECTED_STATUS_PATTERN.test(failed?.reason ?? "")).toBe(true);
+  });
+
+  it("still recognizes the parenthesized status format other vendor adapters use", () => {
+    expect(PROTECTED_STATUS_PATTERN.test("Claude usage request failed (401)")).toBe(true);
+    expect(PROTECTED_STATUS_PATTERN.test("Codex usage request failed (429)")).toBe(true);
+    expect(PROTECTED_STATUS_PATTERN.test("no credentials in Keychain for this config dir")).toBe(false);
   });
 
   it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {

@@ -1,7 +1,12 @@
 /** Redact values that may identify an account or authorize a provider request. */
 export function redact(value: string): string {
   return value
-    .replace(/Authorization\s*:\s*[^\s,;]+/gi, "[REDACTED]")
+    // [^\n,;]+ (not [^\s,;]+): a header value can contain spaces ("Bearer
+    // <opaque token>"); the prior pattern only ever consumed the scheme word
+    // ("Bearer") up to that space, leaving the actual opaque token -- one
+    // that doesn't happen to match sk-/eyJ/ya29./GOCSPX- below -- untouched.
+    .replace(/Authorization\s*:\s*[^\n,;]+/gi, "[REDACTED]")
+    .replace(/\b(?:Cookie|Set-Cookie)\s*:\s*[^\n]+/gi, "[REDACTED]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/=\-]+/gi, "[REDACTED]")
     .replace(/\bsk-[A-Za-z0-9._~+\/=\-]+/g, "[REDACTED]")
     .replace(/\beyJ[A-Za-z0-9._~+\/=\-]+/g, "[REDACTED]")

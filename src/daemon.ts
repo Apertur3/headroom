@@ -5,11 +5,11 @@ import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
 import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
-import { pollAccounts, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
+import { pollAccounts, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
 import { executablePath, headroomHome } from "./paths.js";
-import { canRouteWithLeases } from "./policy.js";
+import { canRouteWithLeases, unknownMeterPrincipals } from "./policy.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -46,6 +46,24 @@ async function sessionToken(home = headroomHome(), create = false): Promise<stri
   }
 }
 function healthSignature(token: string): string { return createHmac("sha256", token).update("headroom-health-v1").digest("hex"); }
+
+/** HMAC of a per-connection server nonce, keyed by the session token. The
+ * client proves it holds the token by sending this proof; the raw token
+ * itself never has to cross the pipe, so another local user who squats the
+ * predictable pipe name before the real daemon starts (and so gets a live
+ * connection from an unsuspecting client) learns nothing usable -- an HMAC
+ * output does not reveal its key. */
+function pipeAuthProof(token: string, nonce: string): string { return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex"); }
+
+/** Byte-length-safe constant-time string compare. Buffer.from(x).length is a
+ * byte count, not the string's UTF-16 length; comparing string.length before
+ * calling timingSafeEqual (the prior check) can pass while the byte buffers
+ * still differ in length, which throws instead of just failing closed. */
+function safeTimingEqual(a: string, b: string): boolean {
+  const bufferA = Buffer.from(a, "utf8");
+  const bufferB = Buffer.from(b, "utf8");
+  return bufferA.length === bufferB.length && bufferA.length > 0 && timingSafeEqual(bufferA, bufferB);
+}
 
 function rpcResult(id: unknown, result: unknown): Json { return { jsonrpc: "2.0", id: id ?? null, result }; }
 function rpcError(id: unknown, code: number, message: string): Json { return { jsonrpc: "2.0", id: id ?? null, error: { code, message } }; }
@@ -163,28 +181,48 @@ export class HeadroomDaemon {
     socket.once("close", closeOnce);
     socket.setEncoding("utf8");
     let buffer = "";
+    // Windows only: a fresh random nonce per connection, sent before anything
+    // else. The client proves it holds the session token by HMAC-ing this
+    // nonce (see pipeAuthProof); the token itself is read from the local
+    // 0600 token file, never placed on the wire.
+    const nonce = process.platform === "win32" ? randomBytes(16).toString("hex") : undefined;
+    if (nonce) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
     socket.on("data", (part: string) => {
       buffer += part;
       if (Buffer.byteLength(buffer, "utf8") > MAX_CONNECTION_BUFFER_BYTES) { socket.destroy(); return; }
       let newline: number;
       while ((newline = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-        void this.handleLine(line).then((reply) => socket.write(`${JSON.stringify(reply)}\n`));
+        void this.handleLine(line, nonce).then((reply) => socket.write(`${JSON.stringify(reply)}\n`));
       }
     });
   }
 
-  private async handleLine(line: string): Promise<Json> {
+  private async handleLine(line: string, nonce?: string): Promise<Json> {
     let request: Json;
     try { request = JSON.parse(line) as Json; } catch { return rpcError(null, -32700, "Parse error"); }
-    if (request.jsonrpc !== "2.0" || typeof request.method !== "string") return rpcError(request.id, -32600, "Invalid Request");
-    const params = request.params && typeof request.params === "object" ? request.params as Json : {};
-    if (process.platform === "win32" && request.method !== "health") {
-      const received = typeof params._session_token === "string" ? params._session_token : "";
-      const expected = this.sessionToken ?? "";
-      if (!expected || received.length !== expected.length || !timingSafeEqual(Buffer.from(received), Buffer.from(expected))) return rpcError(request.id, -32001, "Unauthorized pipe client");
+    // A malformed envelope (null, a bare string/number, an array, or an
+    // object missing method) must produce a JSON-RPC error, never throw:
+    // `request.jsonrpc` on a non-object `request` (e.g. the JSON literal
+    // `null`) would otherwise throw here, escaping as an unhandled rejection
+    // since handleSocket's `.then()` below has no `.catch()`.
+    if (!request || typeof request !== "object" || Array.isArray(request) || request.jsonrpc !== "2.0" || typeof request.method !== "string") {
+      const id = request && typeof request === "object" && !Array.isArray(request) ? (request as Json).id : null;
+      return rpcError(id, -32600, "Invalid Request");
     }
+    const params = request.params && typeof request.params === "object" ? request.params as Json : {};
     const caller = callerFrom(params);
+    // A rejected request is still audited before it returns: a caller
+    // learning nothing about capacity does not mean the daemon saw nothing.
+    const reject = (code: number, message: string, subject: string | null = null): Json => {
+      this.store.audit(caller, request.method as string, subject, "rejected");
+      return rpcError(request.id, code, message);
+    };
+    if (process.platform === "win32" && request.method !== "health") {
+      const received = typeof params._proof === "string" ? params._proof : "";
+      const expected = nonce && this.sessionToken ? pipeAuthProof(this.sessionToken, nonce) : "";
+      if (!expected || !safeTimingEqual(received, expected)) return reject(-32001, "Unauthorized pipe client");
+    }
     try {
       let result: unknown;
       switch (request.method) {
@@ -195,7 +233,7 @@ export class HeadroomDaemon {
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
-          if (!meter) return rpcError(request.id, -32602, "meter is required");
+          if (!meter) return reject(-32602, "meter is required");
           result = this.store.history(meter, since); break;
         }
         case "events": {
@@ -204,13 +242,17 @@ export class HeadroomDaemon {
         }
         case "can": {
           const action = typeof params.action_class === "string" ? params.action_class : "";
-          if (typeof params.owner !== "string" || !params.owner.trim()) return rpcError(request.id, -32602, "owner is required");
+          if (typeof params.owner !== "string" || !params.owner.trim()) return reject(-32602, "owner is required");
           const routing = await readRouting();
+          if (!routing.present) return reject(-32602, "No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
           const meters = routing.consumes[action];
-          if (!meters) return rpcError(request.id, -32602, `Unknown action class: ${action || "(missing)"}`);
+          if (!meters) return reject(-32602, `Unknown action class: ${action || "(missing)"}`, action || null);
+          const accounts = await this.currentAccounts();
+          const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+          if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
           await this.poll(undefined, false);
           const policy = await readPolicy();
-          const localMeters = (await this.currentAccounts()).filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+          const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
           result = canRouteWithLeases(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), params.owner);
           break;
@@ -223,8 +265,8 @@ export class HeadroomDaemon {
           result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null); break;
         }
         case "lease_end": {
-          if (typeof params.id !== "string") return rpcError(request.id, -32602, "lease id is required");
-          if (typeof params.owner !== "string" || !params.owner.trim()) return rpcError(request.id, -32602, "owner is required");
+          if (typeof params.id !== "string") return reject(-32602, "lease id is required");
+          if (typeof params.owner !== "string" || !params.owner.trim()) return reject(-32602, "owner is required");
           result = this.store.endLease(params.id, params.owner, params.force === true);
           if (params.force === true && (result as { owner: string }).owner !== params.owner) {
             const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim().slice(0, 200) : "(no reason given)";
@@ -256,7 +298,7 @@ export class HeadroomDaemon {
           },
           ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}),
         }; break;
-        default: return rpcError(request.id, -32601, "Method not found");
+        default: return reject(-32601, "Method not found");
       }
       // For a lease call the audit row also names the owner and meter, since
       // `caller` alone (the peer pid/argv[1] the client reports at every
@@ -268,7 +310,7 @@ export class HeadroomDaemon {
       return rpcResult(request.id, result);
     } catch (error) {
       this.store.audit(caller, request.method, null, "error");
-      return rpcError(request.id, -32000, error instanceof Error ? error.message : "Daemon error");
+      return rpcError(request.id, -32000, safeError(error));
     }
   }
 
@@ -320,12 +362,20 @@ export class HeadroomDaemon {
       // the audit outcome comes from the collector's own record of what it
       // did, never from inspecting the observations after the fact.
       for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) this.store.audit("daemon", "claude_probe", principalId, outcome);
+      // Every scheduled vendor poll is audited, not only Claude's (which
+      // already gets its own claude_probe row above): a non-Claude principal
+      // that failed to fetch must leave the same evidence trail.
+      for (const principalId of new Set(result.observations.map((item) => item.principal_id))) {
+        if (result.claudeProbeOutcomes && principalId in result.claudeProbeOutcomes) continue;
+        const failed = result.failures.some((failure) => failure.startsWith(`${principalId} source failed`));
+        this.store.audit("daemon", "poll", principalId, failed ? "failed" : "ok");
+      }
       // A Claude Keychain denial/timeout no longer gets a timed backoff: the
       // grant gate (set above, and by the collector on this very denial)
       // already stops the next poll from retrying until the operator runs
       // `headroom keychain grant`, which is a stronger and more honest signal
       // than a fixed hour.
-      const protectedFailure = result.failures.some((failure) => /\b(401|403|429)\b/.test(failure));
+      const protectedFailure = result.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
       if (protectedFailure) {
         const previous = this.backoff.get(key)?.failures ?? 0;
         this.backoff.set(key, { failures: previous + 1, until: Date.now() + Math.min(3_600_000, 60_000 * 2 ** previous) });
@@ -413,14 +463,38 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     const socket = createConnection(path);
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
+    let nonce: string | undefined;
+    const isWin32 = process.platform === "win32";
     const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
-    socket.once("connect", () => {
+    const send = (): void => {
       void (async () => {
-        const token = process.platform === "win32" ? await sessionToken() : undefined;
-        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(token ? { _session_token: token } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
+        // The session token is read locally from the 0600 token file and used
+        // only to compute an HMAC proof of the server's per-connection nonce;
+        // the token itself is never written to the socket.
+        const proof = isWin32 && nonce && method !== "health" ? pipeAuthProof((await sessionToken()) ?? "", nonce) : undefined;
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
       })().catch(() => done(undefined));
+    };
+    // On Windows the server always sends a nonce notification first; wait for
+    // it before sending anything. Elsewhere there is nothing to wait for.
+    socket.once("connect", () => { if (!isWin32) send(); });
+    socket.on("data", (part: string) => {
+      buffer += part;
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        if (isWin32 && nonce === undefined) {
+          try {
+            const parsed = JSON.parse(line) as Json;
+            const parsedParams = parsed.params && typeof parsed.params === "object" ? parsed.params as Json : undefined;
+            if (parsed.method === "nonce" && parsedParams && typeof parsedParams.nonce === "string") { nonce = parsedParams.nonce; send(); continue; }
+          } catch { done(undefined); return; }
+        }
+        try { const reply = JSON.parse(line) as Json; done(reply.error ? reply : reply.result); }
+        catch { done(undefined); }
+        return;
+      }
     });
-    socket.on("data", (part: string) => { buffer += part; const newline = buffer.indexOf("\n"); if (newline >= 0) { try { const reply = JSON.parse(buffer.slice(0, newline)) as Json; done(reply.error ? reply : reply.result); } catch { done(undefined); } } });
     socket.once("error", () => done(undefined)); socket.once("timeout", () => done(undefined));
   });
 }
