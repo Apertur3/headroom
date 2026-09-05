@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <rect width="1280" height="640" fill="#0d1117"/>
+  <g stroke="#e6edf3" stroke-width="22" stroke-linecap="round" fill="none" transform="translate(120,150) scale(3.4)">
+    <line x1="10" y1="12" x2="54" y2="12" stroke="#f0883e"/>
+    <line x1="18" y1="24" x2="18" y2="56"/>
+    <line x1="46" y1="24" x2="46" y2="56"/>
+    <line x1="18" y1="42" x2="46" y2="42"/>
+  </g>
+  <text x="380" y="300" fill="#e6edf3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="120" font-weight="600" letter-spacing="-2">headroom</text>
+  <text x="384" y="370" fill="#9da7b3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="40">Your agents know their budget.</text>
+  <text x="384" y="430" fill="#9da7b3" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="30">claude-main:all  5h 37% HARVEST | wk 17% ↻Sat 14:00</text>
+</svg>
