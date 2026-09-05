@@ -36,7 +36,18 @@ All notable changes to this project are documented here. The format follows
   a grant succeeded under (recorded per Headroom home) and always uses that one; `doctor` reports
   when a second, unused candidate binary exists instead of silently switching to it.
 
+- Antigravity reads Google's own quota endpoint first (token refresh, `loadCodeAssist`, onboarding
+  when the account has no project yet, `retrieveUserQuota`) with the Gemini CLI's stored OAuth
+  credentials, finds the OAuth client in a Homebrew-installed `gemini-cli` too, and starts the
+  local `agy` keepalive only when the remote path falls short. `--principal <name> --shape` shows
+  the response shapes, the account tier and a denial reason, so a free-tier 403 is diagnosable.
+- `scripts/public-audit.sh` runs in CI: tracked archives, commit identities, personal-data
+  patterns, process residue and an optional untracked denylist across files and history.
+
 ### Fixed
+- The local signing identity could not be imported on current macOS (PKCS12 MAC verification
+  failure) and an imported one was never recognized because the check filtered on a trust chain a
+  self-signed certificate never has; both fixed, so the identity is created once and reused.
 - `keychain grant` and `doctor` distinguish a Keychain dialog that cannot be shown from this shell
   (macOS `errSecInteractionNotAllowed` / a cancelled interaction) from a config directory with no
   Claude Code login at all -- the former no longer misreports as "no login".
