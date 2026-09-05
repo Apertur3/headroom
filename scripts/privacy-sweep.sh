@@ -143,6 +143,7 @@ scan_source_tree() {
   local rel pkgjson_rel="" files=()
   while IFS= read -r -d '' rel; do
     [[ "$rel" == ".privacy-denylist" ]] && continue
+    [[ "$rel" == "scripts/public-audit.sh" ]] && continue  # names the residue words it greps for
     is_license_file "$rel" && continue
     if is_package_json "$rel"; then pkgjson_rel="$rel"; continue; fi
     files=(${files[@]+"${files[@]}"} "$rel")
