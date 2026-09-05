@@ -2,8 +2,9 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { main } from "../src/cli.js";
+import { formatMeters, main } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
+import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -97,6 +98,26 @@ describe("headroom rate", () => {
   });
 });
 
+describe("status line pace segment formatting", () => {
+  it("shows a sub-1%/h rate with one decimal instead of rounding it away to 0", () => {
+    const observation: Observation = { ...fiveHour(10, 0, 5 * HOUR), burn_percent_per_hour: 0.05, sustainable_percent_per_hour: 0.2 } as Observation;
+    const [line] = formatMeters([observation], defaultPolicy);
+    expect(line).toContain("burn 0.1%/h, ok 0.2%/h");
+  });
+
+  it("omits the burn segment entirely (not 'burn 0%/h') when burn is null", () => {
+    const observation: Observation = { ...fiveHour(10, 0, 5 * HOUR), burn_percent_per_hour: null, sustainable_percent_per_hour: null } as Observation;
+    const [line] = formatMeters([observation], defaultPolicy);
+    expect(line).not.toContain("burn");
+  });
+
+  it("still rounds an ordinary whole-number rate the old way", () => {
+    const observation: Observation = { ...fiveHour(10, 0, 5 * HOUR), burn_percent_per_hour: 22.4, sustainable_percent_per_hour: 9.6 } as Observation;
+    const [line] = formatMeters([observation], defaultPolicy);
+    expect(line).toContain("burn 22%/h, ok 10%/h");
+  });
+});
+
 describe("headroom plan", () => {
   it("prints points per remaining 5h window and the plan line, in --json too", async () => {
     const home = await seededHome();
@@ -123,8 +144,15 @@ describe("headroom gate", () => {
     store.insert(fiveHour(80, 0, HOUR));
     store.close();
     await withHeadroomHome(home, async () => {
-      expect(await main(["gate", "--need", "5h:5", "--owner", "x"])).toBe(0);
-      expect(await main(["gate", "--need", "5h:15", "--owner", "x"])).toBe(2);
+      expect(await main(["gate", "--need", "5h:5", "--meter", "claude-main:all", "--owner", "x"])).toBe(0);
+      expect(await main(["gate", "--need", "5h:15", "--meter", "claude-main:all", "--owner", "x"])).toBe(2);
+    });
+  });
+
+  it("requires --meter or --class", async () => {
+    const home = await seededHome();
+    await withHeadroomHome(home, async () => {
+      await expect(main(["gate", "--need", "5h:5", "--owner", "x"])).rejects.toThrow("--meter <meter_id> | --class <action-class>");
     });
   });
 });
@@ -144,6 +172,16 @@ describe("headroom wait", () => {
     const home = await seededHome();
     await withHeadroomHome(home, async () => {
       expect(await main(["wait", "--meter", "claude-main:all", "--until-reset"])).toBe(1);
+    });
+  });
+
+  it("accepts a seconds --max like 5s (not just m/h/d)", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(10, -HOUR, -30 * 60_000)); // resets_at already in the past
+    store.close();
+    await withHeadroomHome(home, async () => {
+      expect(await main(["wait", "--meter", "claude-main:all", "--until-reset", "--max", "5s"])).toBe(0);
     });
   });
 

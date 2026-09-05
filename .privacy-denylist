@@ -1,0 +1,7 @@
+# scripts/privacy-sweep.sh: one regex per line, checked against every tracked
+# file and the packed npm tarball. A leading (?i) makes that one line
+# case-insensitive; a line starting with # is a comment.
+(?i)\bgpu-box\b
+(?i)\bgpu-box-2\b
+(?i)\bedge-box\b
+(?i)the maintainer
