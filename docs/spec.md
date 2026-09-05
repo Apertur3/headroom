@@ -66,7 +66,7 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - **Registry.** `~/.headroom/accounts.toml`, auto-discovered from `~/.claude*`, `~/.codex*`,
   `~/.gemini`, confirmed by the user. Committed example in `examples/`.
 - **Daemon.** Unix socket `~/.headroom/headroom.sock` on macOS and Linux, or named pipe
-  `\\.\pipe\headroom-<username>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
+  `\\.\pipe\headroom-<username>-<home digest>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
   named pipes use the current process token's default DACL, which Node does not expose for further
   restriction. `headroom install-service` writes a launchd agent, systemd user unit, or Task Scheduler
   XML. Without a daemon the CLI and MCP server do a direct read and mark the result `source: "direct"`.
