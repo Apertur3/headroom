@@ -64,7 +64,9 @@ async function fakeRepo(): Promise<{ root: string; log: string; env: NodeJS.Proc
   ].join("\n"), { mode: 0o755 });
   for (const bin of ["swift", "codesign", "security"]) await chmod(join(fakebin, bin), 0o755);
 
-  return { root, log, env: { ...process.env, PATH: `${fakebin}:${process.env.PATH ?? ""}` } };
+  // CI runners export CI/GITHUB_ACTIONS, which make the script sign ad-hoc
+  // without touching identities; these tests exercise the identity path.
+  return { root, log, env: { ...process.env, PATH: `${fakebin}:${process.env.PATH ?? ""}`, CI: "", GITHUB_ACTIONS: "" } };
 }
 
 async function run(root: string, env: NodeJS.ProcessEnv, extraEnv: NodeJS.ProcessEnv = {}): Promise<{ code: number; stdout: string; stderr: string }> {
