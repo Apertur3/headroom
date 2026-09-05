@@ -48,8 +48,20 @@ export interface GateUsage {
   usedWk: number | null;
   weeklyResetsAt: string | null;
   hoursPer5hWindow: number;
+  /** The vendor-confirmed freshness backing each window, when known. A
+   * `not_enforced` window has no cap at all -- its need is skipped rather
+   * than failed, so "usage unknown" stays reserved for a genuinely stale or
+   * failed read. */
+  freshness5h?: "fresh" | "stale" | "failed" | "not_enforced" | null;
+  freshnessWk?: "fresh" | "stale" | "failed" | "not_enforced" | null;
 }
-export interface GateResult { allowed: boolean; reason: string; }
+export interface GateResult {
+  allowed: boolean;
+  reason: string;
+  /** Present only when at least one need was skipped because its window is
+   * not enforced on this meter -- informational, never a refusal on its own. */
+  not_enforced?: Array<"5h" | "wk">;
+}
 
 /** Fail closed over every --need: the first one that does not fit stops the
  * check and names the reason. With usePlan, a 5h need must also fit under
@@ -57,7 +69,10 @@ export interface GateResult { allowed: boolean; reason: string; }
  * stricter bar than just staying under the freeze reserve. */
 export function evaluateGate(needs: GateNeed[], usage: GateUsage, reservePercent: number, usePlan: boolean, now = new Date()): GateResult {
   if (!needs.length) return { allowed: false, reason: "no --need given" };
+  const notEnforced: Array<"5h" | "wk"> = [];
   for (const need of needs) {
+    const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
+    if (freshness === "not_enforced") { notEnforced.push(need.window); continue; }
     const used = need.window === "5h" ? usage.used5h : usage.usedWk;
     if (used === null) return { allowed: false, reason: `${need.window} usage unknown` };
     const prospective = used + need.points;
@@ -73,7 +88,7 @@ export function evaluateGate(needs: GateNeed[], usage: GateUsage, reservePercent
       }
     }
   }
-  return { allowed: true, reason: "fits" };
+  return { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 }
 
 export interface FillResult {

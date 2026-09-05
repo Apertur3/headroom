@@ -33,6 +33,28 @@ function weekly(used: number, fetchedAt: string, resetsAt: string, meterId = "cl
   };
 }
 
+/** The exact shape Codex's adapter emits for its 5h window when the vendor
+ * confirms it is not enforced: a real window (so it is not simply "unread
+ * yet"), but no quantity to report. */
+function notEnforcedFiveHour(fetchedAt: string, meterId = "codex-main:main"): Observation {
+  return {
+    principal_id: "codex-main", meter_id: meterId, window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+    quantity: null, resets_at: null, observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official",
+    freshness: "not_enforced", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture", reason: "no 5-hour window from endpoint or session logs",
+  };
+}
+
+/** The shape a Claude adapter emits while a Keychain grant is pending: no
+ * window at all, just a failed observation carrying the operator-facing
+ * reason. */
+function grantBlocked(fetchedAt: string, meterId = "claude-main:all", reason = "Keychain grant needed; run: headroom keychain grant --principal claude-main"): Observation {
+  return {
+    principal_id: "claude-main", meter_id: meterId, window: null, quantity: null, resets_at: null,
+    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "estimated", freshness: "failed",
+    confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture", reason,
+  };
+}
+
 describe("rateLines", () => {
   it("reports every window of a given meter, unknown-burn windows included", async () => {
     const store = await open();
@@ -81,6 +103,18 @@ describe("planFor", () => {
       if ("error" in result) throw new Error("expected a plan, not an error");
       expect(result.hours_per_window).toBe(5);
       expect(result.remaining_5h_windows).toBe(5); // ceil(24/5)
+    } finally { store.close(); }
+  });
+
+  it("still finds the weekly window when the 5h one is vendor-confirmed not enforced (Codex's main pool)", async () => {
+    const store = await open();
+    try {
+      store.insert(notEnforcedFiveHour("2026-09-03T12:00:00Z"));
+      store.insert(weekly(83, "2026-09-03T12:00:00Z", "2026-09-10T12:00:00Z", "codex-main:main"));
+      const result = planFor(store, "codex-main:main", 10, new Date("2026-09-03T12:00:00Z"));
+      if ("error" in result) throw new Error("expected a plan, not an error");
+      expect(result.weekly_remaining_percent).toBe(17);
+      expect(result.hours_per_window).toBe(5); // the not_enforced row's own window duration, still meaningful
     } finally { store.close(); }
   });
 });
@@ -164,6 +198,123 @@ describe("gateFor: even pacing (pro-rata line + burst)", () => {
       const result = gateFor(store, [{ window: "5h", points: 1 }], "claude-main:all", 10, false, new Date("2026-09-03T12:00:01Z"), { actionClass: "review", pacing: "none" });
       expect(result.allowed).toBe(true);
       expect(result.lanes_remaining_for_class).not.toBeUndefined();
+    } finally { store.close(); }
+  });
+});
+
+describe("gateFor: a not-enforced window is skipped, not treated as unknown", () => {
+  it("evaluates a weekly need correctly even though the meter's 5h window is not enforced", async () => {
+    const store = await open();
+    try {
+      store.insert(notEnforcedFiveHour("2026-09-03T12:00:00Z"));
+      store.insert(weekly(83, "2026-09-03T12:00:00Z", "2026-09-10T12:00:00Z", "codex-main:main"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      // Previously usedWk resolved to null here (the not_enforced row stole
+      // the "short" slot), so this refused with "wk usage unknown" even
+      // though the weekly window is fresh at 83%.
+      expect(gateFor(store, [{ window: "wk", points: 3 }], "codex-main:main", 10, false, now)).toMatchObject({ allowed: true });
+      expect(gateFor(store, [{ window: "wk", points: 10 }], "codex-main:main", 10, false, now)).toMatchObject({ allowed: false, reason: expect.stringContaining("wk needs") });
+    } finally { store.close(); }
+  });
+
+  it("passes a 5h need trivially and names the not-enforced window, rather than failing with 'usage unknown'", async () => {
+    const store = await open();
+    try {
+      store.insert(notEnforcedFiveHour("2026-09-03T12:00:00Z"));
+      store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-10T12:00:00Z", "codex-main:main"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = gateFor(store, [{ window: "5h", points: 50 }], "codex-main:main", 10, false, now);
+      expect(result.allowed).toBe(true);
+      expect(result.reason).toContain("5h not enforced");
+      expect(result.reason).toContain("codex-main:main");
+    } finally { store.close(); }
+  });
+
+  it("still says 'usage unknown' for a genuinely stale or missing window, not a not_enforced one", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T12:00:00Z", "2026-09-03T17:00:00Z", "claude-main:all")); // no weekly window at all
+      const now = new Date("2026-09-03T12:00:00Z");
+      expect(gateFor(store, [{ window: "wk", points: 3 }], "claude-main:all", 10, false, now)).toMatchObject({ allowed: false, reason: "wk usage unknown" });
+    } finally { store.close(); }
+  });
+});
+
+describe("rate/plan/gate/fill surface a meter's own reason instead of a generic unknown", () => {
+  it("rate prints the pending-grant reason for a meter with no window at all", async () => {
+    const store = await open();
+    try {
+      store.insert(grantBlocked("2026-09-03T12:00:00Z"));
+      const lines = rateLines(store, "claude-main:all", 30, new Date("2026-09-03T12:00:01Z"));
+      expect(lines).toEqual([expect.objectContaining({ meter: "claude-main:all", reason: "Keychain grant needed; run: headroom keychain grant --principal claude-main" })]);
+    } finally { store.close(); }
+  });
+
+  it("plan reports the pending-grant reason instead of the generic 'no weekly window'", async () => {
+    const store = await open();
+    try {
+      store.insert(grantBlocked("2026-09-03T12:00:00Z"));
+      const result = planFor(store, "claude-main:all", 10, new Date("2026-09-03T12:00:01Z"));
+      expect(result).toMatchObject({ meter: "claude-main:all", error: "Keychain grant needed; run: headroom keychain grant --principal claude-main" });
+    } finally { store.close(); }
+  });
+
+  it("gate reports the pending-grant reason instead of the generic 'no windowed reading'", async () => {
+    const store = await open();
+    try {
+      store.insert(grantBlocked("2026-09-03T12:00:00Z"));
+      const result = gateFor(store, [{ window: "5h", points: 5 }], "claude-main:all", 10, false, new Date("2026-09-03T12:00:01Z"));
+      expect(result).toMatchObject({ allowed: false, reason: "Keychain grant needed; run: headroom keychain grant --principal claude-main" });
+    } finally { store.close(); }
+  });
+
+  it("fill reports the pending-grant reason and exits with the no-enforced-window flag", async () => {
+    const store = await open();
+    try {
+      store.insert(grantBlocked("2026-09-03T12:00:00Z"));
+      const result = await fillFor(store, "claude-main:all", 2, 10, new Date("2026-09-03T12:00:01Z"));
+      expect(result).toMatchObject({ meter: "claude-main:all", error: "Keychain grant needed; run: headroom keychain grant --principal claude-main", no_enforced_window: true });
+    } finally { store.close(); }
+  });
+});
+
+describe("fillFor: falls back to the tightest enforced window", () => {
+  it("uses the weekly window (and says so) when the 5h window is not enforced", async () => {
+    const store = await open();
+    try {
+      store.insert(notEnforcedFiveHour("2026-09-03T12:00:00Z"));
+      store.insert(weekly(90, "2026-09-03T12:00:00Z", "2026-09-10T12:00:00Z", "codex-main:main"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = await fillFor(store, "codex-main:main", 2, 10, now);
+      if ("error" in result) throw new Error("expected a fill result");
+      expect(result.window_used).toBe("wk");
+      expect(result.used_weekly_percent).toBe(90);
+      // Weekly used 90%, reserve 10% -> 0 weekly budget left, correctly
+      // binding even though the mislabeled-as-5h remaining (100-90-5=5) would
+      // otherwise have allowed 2 lanes at a 2%-per-lane cost.
+      expect(result.lanes?.lanes).toBe(0);
+    } finally { store.close(); }
+  });
+
+  it("exits with the no-enforced-window flag when nothing on the meter is enforced at all", async () => {
+    const store = await open();
+    try {
+      store.insert(notEnforcedFiveHour("2026-09-03T12:00:00Z"));
+      const now = new Date("2026-09-03T12:00:00Z");
+      const result = await fillFor(store, "codex-main:main", 2, 10, now);
+      expect(result).toMatchObject({ meter: "codex-main:main", no_enforced_window: true });
+    } finally { store.close(); }
+  });
+
+  it("keeps the old 5h-only behavior (weekly unknown, no separate cap) when the weekly window has simply never been read", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(10, "2026-09-03T13:00:00Z", "2026-09-03T18:00:00Z"));
+      const now = new Date("2026-09-03T13:00:00Z");
+      const result = await fillFor(store, "claude-main:all", 2, 10, now);
+      if ("error" in result) throw new Error("expected a fill result");
+      expect(result.window_used).toBe("5h");
+      expect(result.used_weekly_percent).toBe(0);
     } finally { store.close(); }
   });
 });

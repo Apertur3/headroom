@@ -13,6 +13,9 @@ step() { echo; echo "== $1 =="; }
 step "lint"
 npm run lint
 
+step "privacy sweep"
+bash scripts/privacy-sweep.sh
+
 step "test"
 npm test
 

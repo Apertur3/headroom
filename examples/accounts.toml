@@ -27,11 +27,11 @@ adapter = "engine"
 # [[accounts]]
 # name = "gpu-box-vllm"
 # kind = "local"
-# base_url = "http://10.0.0.20:8000"
+# base_url = "http://192.0.2.20:8000"
 # adapter = "native"
 
 # [[accounts]]
 # name = "workstation-vllm"
 # kind = "local"
-# base_url = "http://10.0.0.20:8000"
+# base_url = "http://192.0.2.20:8000"
 # adapter = "native"

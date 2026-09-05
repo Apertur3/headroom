@@ -6,22 +6,22 @@ import { outboundFetch, redact } from "../src/security.js";
 
 describe("secret-safe outputs", () => {
   it("redacts child-process diagnostics before they can become an output or log", () => {
-    const output = redact("Authorization: Bearer sk-synthetic-value eyJ.synthetic.payload owner@private.example");
-    for (const forbidden of ["Authorization", "Bearer", "sk-", "eyJ", "owner@private.example"]) expect(output).not.toContain(forbidden);
+    const output = redact("Authorization: Bearer sk-synthetic-value eyJ.synthetic.payload owner@example.com");
+    for (const forbidden of ["Authorization", "Bearer", "sk-", "eyJ", "owner@example.com"]) expect(output).not.toContain(forbidden);
   });
 
   it("masks an email address whole, including its domain", () => {
     // The prior pattern kept the domain (`[REDACTED]@example.com`); the
     // domain alone can still identify an account.
-    expect(redact("contact owner@private.example for help")).toBe("contact [REDACTED] for help");
-    expect(redact("owner@private.example")).not.toContain("private.example");
+    expect(redact("contact owner@example.com for help")).toBe("contact [REDACTED] for help");
+    expect(redact("owner@example.com")).not.toContain("example.com");
   });
 
   it("redacts an opaque bearer token that matches no known key prefix, not just the scheme word", () => {
     // Regression: the Authorization pattern used to stop at the first space,
     // leaving "Bearer" redacted but the actual (opaque, non sk-/eyJ/ya29./
     // GOCSPX--shaped) token behind it untouched.
-    const output = redact("Authorization: Bearer a1b2c3d4e5f6opaquetoken owner@private.example");
+    const output = redact("Authorization: Bearer a1b2c3d4e5f6opaquetoken owner@example.com");
     expect(output).not.toContain("a1b2c3d4e5f6opaquetoken");
     expect(output).not.toContain("Bearer");
   });

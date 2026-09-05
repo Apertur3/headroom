@@ -11,19 +11,19 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 
 describe("cross-platform paths", () => {
   it("resolves Headroom and vendor locations for macOS, Linux, and Windows", () => {
-    expect(headroomHome({ platform: "darwin", home: "/Users/alice", env: {} })).toBe("/Users/alice/.headroom");
-    expect(headroomHome({ platform: "linux", home: "/home/alice", env: {} })).toBe("/home/alice/.headroom");
-    expect(headroomHome({ platform: "win32", home: "C:\\Users\\alice", env: { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" } })).toBe("C:\\Users\\alice\\AppData\\Local\\headroom");
-    expect(headroomHome({ platform: "win32", home: "C:\\Users\\alice", env: { HEADROOM_HOME: "D:\\headroom" } })).toBe("D:\\headroom");
-    expect(vendorHome("codex", { platform: "win32", home: "C:\\Users\\alice", env: {} })).toBe("C:\\Users\\alice\\.codex");
-    expect(credentialPath("claude", undefined, { platform: "linux", home: "/home/alice", env: {} })).toBe("/home/alice/.claude/.credentials.json");
-    expect(credentialPath("codex", undefined, { platform: "win32", home: "C:\\Users\\alice", env: {} })).toBe("C:\\Users\\alice\\.codex\\auth.json");
-    expect(credentialPath("antigravity", undefined, { platform: "darwin", home: "/Users/alice", env: {} })).toBe("/Users/alice/.gemini/oauth_creds.json");
+    expect(headroomHome({ platform: "darwin", home: "/Users/example", env: {} })).toBe("/Users/example/.headroom");
+    expect(headroomHome({ platform: "linux", home: "/home/example", env: {} })).toBe("/home/example/.headroom");
+    expect(headroomHome({ platform: "win32", home: "C:\\Users\\example", env: { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" } })).toBe("C:\\Users\\example\\AppData\\Local\\headroom");
+    expect(headroomHome({ platform: "win32", home: "C:\\Users\\example", env: { HEADROOM_HOME: "D:\\headroom" } })).toBe("D:\\headroom");
+    expect(vendorHome("codex", { platform: "win32", home: "C:\\Users\\example", env: {} })).toBe("C:\\Users\\example\\.codex");
+    expect(credentialPath("claude", undefined, { platform: "linux", home: "/home/example", env: {} })).toBe("/home/example/.claude/.credentials.json");
+    expect(credentialPath("codex", undefined, { platform: "win32", home: "C:\\Users\\example", env: {} })).toBe("C:\\Users\\example\\.codex\\auth.json");
+    expect(credentialPath("antigravity", undefined, { platform: "darwin", home: "/Users/example", env: {} })).toBe("/Users/example/.gemini/oauth_creds.json");
   });
 
   it("uses a per-user named pipe on Windows", () => {
-    expect(socketPath("ignored", "win32", "alice")).toBe("\\\\.\\pipe\\headroom-alice");
-    expect(socketPath("/home/alice", "linux", "alice")).toBe("/home/alice/headroom.sock");
+    expect(socketPath("ignored", "win32", "example")).toBe("\\\\.\\pipe\\headroom-example");
+    expect(socketPath("/home/example", "linux", "example")).toBe("/home/example/headroom.sock");
   });
 });
 
@@ -72,41 +72,41 @@ describe("HEADROOM_HOME ancestor safety", () => {
 
 describe("service generators", () => {
   it("generates the expected Windows logon task and commands", async () => {
-    const xml = windowsTaskXml("C:\\Program Files\\headroom\\cli.js", "C:\\Program Files\\nodejs\\node.exe", "alice");
+    const xml = windowsTaskXml("C:\\Program Files\\headroom\\cli.js", "C:\\Program Files\\nodejs\\node.exe", "example");
     expect(xml).toContain("<LogonTrigger><Enabled>true</Enabled></LogonTrigger>");
     expect(xml).toContain("<Hidden>true</Hidden>");
-    expect(xml).toContain("<UserId>alice</UserId>");
-    expect(servicePath("win32", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).toBe("C:\\Users\\alice\\AppData\\Local\\headroom\\headroom-daemon.xml");
-    await expect(installService("cli.js", "win32", "C:\\Users\\alice", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }, "alice")).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Create /TN "Headroom Daemon" /XML "C:\\Users\\alice\\AppData\\Local\\headroom\\headroom-daemon.xml" /F' });
-    await expect(uninstallService("win32", "C:\\Users\\alice", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Delete /TN "Headroom Daemon" /F' });
-    expect(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).toContain('daemon.log');
-    expect(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" })).toContain('PATH=C:\\Users\\alice\\.local\\bin');
+    expect(xml).toContain("<UserId>example</UserId>");
+    expect(servicePath("win32", "C:\\Users\\example", { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" })).toBe("C:\\Users\\example\\AppData\\Local\\headroom\\headroom-daemon.xml");
+    await expect(installService("cli.js", "win32", "C:\\Users\\example", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" }, "example")).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Create /TN "Headroom Daemon" /XML "C:\\Users\\example\\AppData\\Local\\headroom\\headroom-daemon.xml" /F' });
+    await expect(uninstallService("win32", "C:\\Users\\example", true, { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" })).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Delete /TN "Headroom Daemon" /F' });
+    expect(serviceContents("cli.js", "win32", "node.exe", "example", "C:\\Users\\example", { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" })).toContain('daemon.log');
+    expect(serviceContents("cli.js", "win32", "node.exe", "example", "C:\\Users\\example", { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" })).toContain('PATH=C:\\Users\\example\\.local\\bin');
   });
 
   it("keeps a complete systemd user unit", async () => {
-    const result = await installService("/usr/bin/headroom", "linux", "/home/alice", "/usr/bin/node", true);
+    const result = await installService("/usr/bin/headroom", "linux", "/home/example", "/usr/bin/node", true);
     expect(result.command).toBe("systemctl --user enable --now headroom.service");
-    const unit = serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", "alice", "/home/alice");
+    const unit = serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", "example", "/home/example");
     expect(unit).toContain("WantedBy=default.target");
-    expect(unit).toContain("StandardOutput=append:/home/alice/.headroom/logs/daemon.log");
-    expect(unit).toContain('Environment="PATH=/home/alice/.local/bin:/opt/homebrew/bin');
-    const plist = serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", "alice", "/Users/alice");
-    expect(plist).toContain("<key>StandardOutPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
-    expect(plist).toContain("<key>StandardErrorPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
-    expect(plist).toContain("<key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/alice/.local/bin:/opt/homebrew/bin");
+    expect(unit).toContain("StandardOutput=append:/home/example/.headroom/logs/daemon.log");
+    expect(unit).toContain('Environment="PATH=/home/example/.local/bin:/opt/homebrew/bin');
+    const plist = serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", "example", "/Users/example");
+    expect(plist).toContain("<key>StandardOutPath</key><string>/Users/example/.headroom/logs/daemon.log</string>");
+    expect(plist).toContain("<key>StandardErrorPath</key><string>/Users/example/.headroom/logs/daemon.log</string>");
+    expect(plist).toContain("<key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/example/.local/bin:/opt/homebrew/bin");
   });
 
   it("a --dry-run install carries the full unit/plist/task text it would have written, on all three platforms", async () => {
-    const linux = await installService("/usr/bin/headroom", "linux", "/home/alice", "/usr/bin/node", true);
-    expect(linux.contents).toBe(serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", userInfo().username, "/home/alice"));
+    const linux = await installService("/usr/bin/headroom", "linux", "/home/example", "/usr/bin/node", true);
+    expect(linux.contents).toBe(serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", userInfo().username, "/home/example"));
     expect(linux.contents).toContain("[Unit]");
 
-    const darwin = await installService("/usr/bin/headroom", "darwin", "/Users/alice", "/usr/bin/node", true);
-    expect(darwin.contents).toBe(serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", userInfo().username, "/Users/alice"));
+    const darwin = await installService("/usr/bin/headroom", "darwin", "/Users/example", "/usr/bin/node", true);
+    expect(darwin.contents).toBe(serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", userInfo().username, "/Users/example"));
     expect(darwin.contents).toContain("<key>Label</key><string>com.headroom.daemon</string>");
 
-    const windows = await installService("cli.js", "win32", "C:\\Users\\alice", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }, "alice");
-    expect(windows.contents).toBe(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }));
+    const windows = await installService("cli.js", "win32", "C:\\Users\\example", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" }, "example");
+    expect(windows.contents).toBe(serviceContents("cli.js", "win32", "node.exe", "example", "C:\\Users\\example", { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" }));
     expect(windows.contents).toContain("<Task version=\"1.4\"");
 
     // A real (non-dry-run) install still returns the exact contents it wrote to disk.

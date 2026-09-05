@@ -52,16 +52,27 @@ function label(observation: Observation): string {
 
 function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
 
+/** A whole-percent rate reads cleanly at a glance ("22%/h"); rounding a rate
+ * under 1%/h the same way collapses it to a bare "0%/h" and reads as no
+ * activity at all, so those get one decimal instead ("0.1%/h"). Exactly
+ * zero still prints as a plain "0%/h" -- there's no precision to preserve. */
+function formatRatePercent(value: number): string {
+  const text = value !== 0 && Math.abs(value) < 1 ? value.toFixed(1) : String(Math.round(value));
+  return `${text}%/h`;
+}
+
 /** The short pace segment appended to a window's status line once its burn
  * rate is known: the live burn alongside the sustainable pace that would
  * exactly spend the remaining allowance by reset, so a glance says whether
- * the current rate is faster or slower than that line. */
+ * the current rate is faster or slower than that line. Omitted entirely
+ * (not "burn 0%/h") when burn itself is null -- fewer than two fresh
+ * samples in the lookback, nothing to report yet. */
 function paceSegment(observation: Observation): string {
   const burn = observation.burn_percent_per_hour;
   if (burn === null || burn === undefined) return "";
   const sustainable = observation.sustainable_percent_per_hour;
-  const sustainableText = sustainable === null || sustainable === undefined ? "?" : `${Math.round(sustainable)}%/h`;
-  return ` burn ${Math.round(burn)}%/h, ok ${sustainableText}`;
+  const sustainableText = sustainable === null || sustainable === undefined ? "?" : formatRatePercent(sustainable);
+  return ` burn ${formatRatePercent(burn)}, ok ${sustainableText}`;
 }
 
 function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string): string {
@@ -260,9 +271,10 @@ async function can(argv: string[]): Promise<number> {
 }
 
 function ttl(value: string | undefined, flag = "--ttl"): number {
-  const match = /^(\d+)(m|h|d)$/.exec(value ?? "30m");
-  if (!match) throw new Error(`${flag} must be like 30m, 2h, or 1d`);
-  return Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "h" ? 3_600_000 : 86_400_000);
+  const match = /^(\d+)(s|m|h|d)$/.exec(value ?? "30m");
+  if (!match) throw new Error(`${flag} must be like 5s, 30m, 2h, or 1d`);
+  const multiplier = match[2] === "s" ? 1000 : match[2] === "m" ? 60_000 : match[2] === "h" ? 3_600_000 : 86_400_000;
+  return Number(match[1]) * multiplier;
 }
 
 function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
@@ -351,11 +363,12 @@ async function rate(argv: string[]): Promise<number> {
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
   if (!lines.length) { console.log(meter ? `no readings for ${meter}` : "no readings"); return 0; }
   for (const line of lines) {
+    if (line.reason !== undefined) { console.log(`${line.meter}  ${line.reason}`); continue; }
     const windowLabel = line.window_minutes === 300 ? "5h" : line.window_minutes === 10_080 ? "wk" : line.window_minutes ? `${line.window_minutes}m` : "-";
     const usedText = line.used_percent === null ? "?" : `${Math.round(line.used_percent)}%`;
     if (line.burn_percent_per_hour === null) { console.log(`${line.meter}  ${windowLabel} ${usedText}  burn unknown (need 2+ fresh samples in the last ${minutes}m)`); continue; }
     const stall = line.empty_in_seconds === null ? "not projected to empty before reset" : `stall in ${formatResetsIn(line.empty_in_seconds)}`;
-    console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${Math.round(line.burn_percent_per_hour)}%/h, ${stall}`);
+    console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${formatRatePercent(line.burn_percent_per_hour)}, ${stall}`);
   }
   return 0;
 }
@@ -387,30 +400,43 @@ async function plan(argv: string[]): Promise<number> {
 async function gate(argv: string[]): Promise<number> {
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  if (!owner) throw new Error("Usage: headroom gate --need 5h:N [--need wk:N] [--meter M] [--plan] [--plan-share N] [--class <action-class>] --owner <name> [--json]");
+  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class>) --owner <name> [--plan] [--plan-share N] [--json]";
+  if (!owner) throw new Error(usage);
   const needs: GateNeed[] = [];
   for (let index = 0; index < argv.length; index += 1) if (argv[index] === "--need") needs.push(parseGateNeed(argv[index + 1] ?? ""));
   if (!needs.length) throw new Error("--need is required (5h:N or wk:N)");
   const meter = option(argv, "--meter");
+  const actionClass = option(argv, "--class");
+  // An omitted target used to fail closed silently over every known meter,
+  // which read as a plain "NO" against whichever meter happened to sort
+  // first rather than the one the caller actually meant.
+  if (!meter && !actionClass) throw new Error(usage);
+  let target: string | string[] | undefined = meter;
+  if (!meter && actionClass) {
+    const routing = await readRouting();
+    const meters = routing.consumes[actionClass];
+    if (!meters) throw new Error(`Unknown action class: ${actionClass}`);
+    target = meters;
+  }
   const usePlan = argv.includes("--plan");
   const planShareValue = option(argv, "--plan-share");
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
-  const actionClass = option(argv, "--class");
   const asJson = argv.includes("--json");
   const options = { owner, planSharePercent, actionClass };
-  const request = await requestDaemon("gate", { needs, meter, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
+  const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
   let result: Awaited<ReturnType<typeof gateFor>>;
   if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
   else {
     directReadNotice();
     const policy = await readPolicy();
     const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, meter, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing }); store.audit("cli", "gate", meter ?? null, result.allowed ? "yes" : "no"); } finally { store.close(); }
+    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
-  console.log(`${result.allowed ? "YES" : "NO"} ${meter ?? "(all meters)"} (${result.reason})${lanesRemaining}`);
+  const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
+  console.log(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}`);
   return result.allowed ? 0 : 2;
 }
 
@@ -463,10 +489,10 @@ async function fill(argv: string[]): Promise<number> {
     try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
-  if ("error" in result) { console.error(result.error); return 1; }
+  if ("error" in result) { console.error(result.error); return result.no_enforced_window ? 2 : 1; }
   const timeLeft = result.resets_in_seconds === null ? "?" : formatResetsIn(result.resets_in_seconds);
-  if (result.lanes) console.log(`${result.meter}  ${result.lanes.lanes} lanes, ${result.lanes.points_used.toFixed(1)}% used, time left ${timeLeft} (${result.lanes.reason})`);
-  else console.log(`${result.meter}  lanes unknown (${result.lanes_error}); time left ${timeLeft}`);
+  if (result.lanes) console.log(`${result.meter}  ${result.window_used} window  ${result.lanes.lanes} lanes, ${result.lanes.points_used.toFixed(1)}% used, time left ${timeLeft} (${result.lanes.reason})`);
+  else console.log(`${result.meter}  ${result.window_used} window  lanes unknown (${result.lanes_error}); time left ${timeLeft}`);
   for (const item of result.classes as FillClassFit[]) console.log(`  ${item.action_class}: ${item.percent} pts, ${item.duration_minutes} min, fits ${item.fits}x`);
   return result.lanes && result.lanes.lanes > 0 ? 0 : 2;
 }
@@ -538,8 +564,15 @@ async function responseShape(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** A genuine JSON-RPC error reply is the FULL envelope (`{jsonrpc, id,
+ * error}`) -- daemon.ts's rpc() only ever hands that whole object back on an
+ * error; on success it hands back just `reply.result`. A domain-level
+ * success result that happens to carry its own plain "error" field (e.g.
+ * plan's `{meter, error: "..."}`) never has a top-level `jsonrpc`, so
+ * checking for `error` alone used to mistake that domain shape for an RPC
+ * failure and discard its real message behind a generic fallback. */
 function unwrapRpc(value: unknown): unknown {
-  if (value && typeof value === "object" && "error" in value) {
+  if (value && typeof value === "object" && "jsonrpc" in value && "error" in value) {
     const error = (value as { error?: { message?: unknown } }).error;
     throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
   }
@@ -665,7 +698,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--minutes 30] [--window 10m] [--json]",
   plan: "Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]",
-  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] [--meter <meter_id>] [--plan] [--plan-share <N>] [--class <action-class>] --owner <name> [--json]",
+  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   accounts: "Usage: headroom accounts discover",
