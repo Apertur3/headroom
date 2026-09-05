@@ -7,8 +7,10 @@
 
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 
-One daemon reads the real meters of every account you own: Claude, Codex, Gemini through
-Antigravity, and any number of accounts per vendor. It keeps history, notices resets and free
+One daemon reads the real meters of every account you own: Claude and Codex today, any number of
+accounts per vendor, and local inference boxes. Google Antigravity is experimental: the adapter is
+in, but on our account its local server only serves an availability placeholder, so the rows read
+UNKNOWN rather than a fake 100%. It keeps history, notices resets and free
 reset grants, and turns the numbers into a go or no-go an orchestrator can act on.
 
 ![headroom output](docs/assets/headroom-terminal.svg)
