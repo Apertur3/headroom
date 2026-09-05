@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { daemonRequest, rpc, HeadroomDaemon } from "../src/daemon.js";
-import { directStatus, handleMcp } from "../src/mcp.js";
+import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
@@ -186,6 +186,151 @@ describe("MCP JSON-RPC", () => {
         const rows = db.prepare("SELECT * FROM audit WHERE action = 'claude_probe' AND caller = 'mcp'").all();
         expect(rows).toEqual([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]);
       } finally { store.close(); }
+    });
+  });
+});
+
+describe("malformed requests never crash the daemon or MCP loop", () => {
+  it("returns a JSON-RPC error instead of throwing for null, a bare string, and a method-less object", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-malformed-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+    const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number } }> };
+    try {
+      for (const line of ["null", '"just a string"', '{"jsonrpc":"2.0","id":1}', "42", "[1,2,3]"]) {
+        await expect(internal.handleLine(line)).resolves.toMatchObject({ error: { code: -32600 } });
+      }
+    } finally { await daemon.stop(); }
+  });
+
+  it("returns a JSON-RPC error for the MCP loop on the same malformed inputs", async () => {
+    for (const line of ["null", '"just a string"', '{"jsonrpc":"2.0","id":1}']) {
+      await expect(handleMcp(line)).resolves.toMatchObject({ error: { code: -32600 } });
+    }
+  });
+
+  it("converts a thrown MCP tool error into a JSON-RPC error instead of rejecting", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"quota_can","arguments":{}}}', async () => { throw new Error("owner is required"); });
+    expect(response).toMatchObject({ error: { code: -32000, message: "owner is required" } });
+  });
+});
+
+describe("can validates routing before ever answering", () => {
+  it("rejects an unknown action class, and audits the rejection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-can-unknown-action-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "routing.toml"), '[consumes]\nbuild = ["codex-main:main"]\n', { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
+      try {
+        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"typo-action","owner":"cadence"}}');
+        expect(reply.error).toMatchObject({ code: -32602 });
+        expect(reply.error?.message).toContain("Unknown action class");
+      } finally { await daemon.stop(); }
+      const store = await HeadroomStore.open(root);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'can' AND outcome = 'rejected'").all();
+        expect(rows.length).toBeGreaterThan(0);
+      } finally { store.close(); }
+    });
+  });
+
+  it("rejects can when no routing.toml is configured at all", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-can-no-routing-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
+      try {
+        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
+        expect(reply.error).toMatchObject({ code: -32602 });
+        expect(reply.error?.message).toContain("No routing.toml configured");
+      } finally { await daemon.stop(); }
+    });
+  });
+
+  it("rejects a routing action class that names a meter with no matching configured account", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-can-unknown-meter-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "routing.toml"), '[consumes]\nbuild = ["ghost-principal:main"]\n', { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
+      try {
+        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
+        expect(reply.error).toMatchObject({ code: -32602 });
+        expect(reply.error?.message).toContain("unknown meter");
+        expect(reply.error?.message).toContain("ghost-principal:main");
+      } finally { await daemon.stop(); }
+    });
+  });
+});
+
+describe("every scheduled vendor poll is audited, not only Claude's", () => {
+  it("writes a 'poll' audit row for a non-Claude principal polled by the daemon's scheduler", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-poll-audit-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), poller: async () => ({ observations: [fixture()], failures: [] }) });
+    const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
+    try {
+      await internal.poll(undefined, true);
+      const store = await HeadroomStore.open(root);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'poll' AND caller = 'daemon'").all();
+        expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ meter_or_principal: "codex-main", outcome: "ok" })]));
+      } finally { store.close(); }
+    } finally { await daemon.stop(); }
+  });
+
+  it("marks a poll audit row 'failed' when the collector reports a source failure for that principal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-poll-audit-failed-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({
+      home: root, path: join(root, "headroom.sock"),
+      poller: async () => ({ observations: [fixture()], failures: ["codex-main source failed: Codex usage request failed (429)"] }),
+    });
+    const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
+    try {
+      await internal.poll(undefined, true);
+      const store = await HeadroomStore.open(root);
+      try {
+        const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+        const rows = db.prepare("SELECT * FROM audit WHERE action = 'poll' AND caller = 'daemon'").all();
+        expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ meter_or_principal: "codex-main", outcome: "failed" })]));
+      } finally { store.close(); }
+    } finally { await daemon.stop(); }
+  });
+});
+
+describe("MCP stdio loop bounds its own input", () => {
+  it("drops an oversized unterminated line instead of growing its buffer without bound", () => {
+    serveMcp();
+    const written: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try {
+      process.stdin.emit("data", "x".repeat(70 * 1024)); // no newline: never resolves into a request
+    } finally { process.stdout.write = originalWrite; }
+    expect(written.some((line) => { try { return JSON.parse(line).error?.message === "Request line exceeds the maximum size"; } catch { return false; } })).toBe(true);
+  });
+});
+
+describe("MCP direct status shares a persisted backoff across calls", () => {
+  it("skips a fresh poll and returns cached observations within the same poll interval", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-backoff-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "poll_interval_minutes = 5\n", { mode: 0o600 });
+    // No accounts.toml at all: readAccounts() would throw ENOENT if a second
+    // poll were attempted, so a passing test proves the second directStatus()
+    // call took the cached-backoff path instead of polling again.
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      store.insert(fixture());
+      store.setDirectPollBackoff({ lastPollAt: Date.now(), until: 0, failures: 0 });
+      store.close();
+      const result = await directStatus();
+      expect(result.source).toBe("direct");
+      expect((result.observations as Observation[]).some((item) => item.meter_id === "codex-main:main")).toBe(true);
     });
   });
 });

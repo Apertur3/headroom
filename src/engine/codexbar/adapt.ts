@@ -43,7 +43,13 @@ export function adaptCodexPayload(payload: unknown, account: string, sampledAt =
   const usage = item.usage;
   if (!isObject(usage)) throw new Error("CodexBar Codex result did not contain usage");
 
-  const truth: Reading["truth"] = item.source === "oauth" || item.source === "web" ? "official" : "estimated";
+  // Always "estimated", regardless of the vendor's own source label: CodexBarCore
+  // performs its own authenticated HTTP request to a host read from the
+  // account's config.toml (chatgpt_base_url), outside Headroom's outbound
+  // allowlist and outboundFetch's redirect/origin checks. Headroom cannot
+  // enforce or verify that request, so it cannot vouch for the reading either.
+  // See SECURITY.md.
+  const truth: Reading["truth"] = "estimated";
   const creditData = creditsFrom(usage.codexResetCredits);
   const unmapped = [
     ...unknownKeys("payload", item, ["provider", "source", "usage", "version", "credits", "accountPlan", "error"]),

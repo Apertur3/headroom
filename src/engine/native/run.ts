@@ -22,7 +22,11 @@ export async function nativeEnginePath(): Promise<string | undefined> {
   if (lock.native) try {
     const marker = JSON.parse(await readFile(join(headroomHome(), "engine", "native", ".headroom-native-engine.json"), "utf8")) as { sha256?: string; binarySha256?: string; asset?: string };
     const asset = nativeAssetForCurrentPlatform(lock);
-    if (marker.asset === asset.name && marker.sha256 === asset.sha256 && marker.binarySha256 && marker.binarySha256 === await hash(installedBinary)) return await executablePath(installedBinary);
+    // asset.sha256 is null while the lock entry is "unpinned" (a build/release
+    // todo, never permission to trust a download). Requiring it truthy here,
+    // not only equal, refuses a tampered marker crafted to match a null
+    // asset.sha256 with its own null-ish sha256 field.
+    if (asset.sha256 && asset.status !== "unpinned" && marker.asset === asset.name && marker.sha256 === asset.sha256 && marker.binarySha256 && marker.binarySha256 === await hash(installedBinary)) return await executablePath(installedBinary);
   } catch { /* use safe local development binary below */ }
   try { return await executablePath(devBinary, { repoRoot, development: true }); } catch { /* absent or unsafe */ }
   return undefined;

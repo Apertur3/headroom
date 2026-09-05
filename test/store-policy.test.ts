@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState } from "../src/policy.js";
+import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { endedLeaseMessage, formatMeters, printEventsOutput, thresholdReport } from "../src/cli.js";
 import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
@@ -352,6 +352,51 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("keeps a failed 5h window visible beside a fresh weekly window of the same meter, instead of one hiding the other", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-cross-window-failure-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      store.insert(observation({
+        meter_id: "codex-main:main", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: null, freshness: "failed", reason: "no credentials", fetched_at: "2026-09-03T12:00:00Z",
+      }));
+      store.insert(observation({
+        meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z", fetched_at: "2026-09-03T12:01:00Z",
+      }));
+      const latest = store.latestPerWindow("codex-main:main");
+      expect(latest).toHaveLength(2);
+      expect(latest).toEqual(expect.arrayContaining([
+        expect.objectContaining({ freshness: "failed", window: expect.objectContaining({ minutes: 300 }) }),
+        expect.objectContaining({ freshness: "fresh", window: expect.objectContaining({ minutes: 10_080 }) }),
+      ]));
+      // A CONSERVE/UNKNOWN 5h window must still block the action, not be
+      // hidden by the weekly window's healthy state.
+      expect(canConsume(["codex-main:main"], new Map([["codex-main:main", latest]]), defaultPolicy, false, new Date("2026-09-03T12:01:00Z"))).toMatchObject({ allowed: false, state: "UNKNOWN" });
+    } finally { store.close(); }
+  });
+
+  it("emits a second source_failed after a real recovery closes a windowless outage, instead of extending the first", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-windowless-outage-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const windowless = (fetched_at: string) => observation({ meter_id: "claude-main:fable", window: null, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at });
+      const recovered = (fetched_at: string) => observation({
+        meter_id: "claude-main:fable", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 5, limit: 100, remaining: 95, unit: "percent" }, resets_at: "2026-09-03T18:00:00Z", fetched_at,
+      });
+      store.insert(windowless("2026-09-03T12:00:00Z")); // outage 1 begins
+      store.insert(recovered("2026-09-03T12:05:00Z")); // recovers with a real window
+      store.insert(windowless("2026-09-03T12:10:00Z")); // outage 2 begins
+      const events = store.events("2026-09-03T00:00:00Z").filter((event) => event.meter_id === "claude-main:fable");
+      expect(events.filter((event) => event.kind === "source_failed")).toHaveLength(2);
+      expect(events.filter((event) => event.kind === "source_recovered")).toHaveLength(1);
+      const failures = events.filter((event) => event.kind === "source_failed").sort((a, b) => a.created_at.localeCompare(b.created_at));
+      expect(failures[0]).toMatchObject({ created_at: "2026-09-03T12:00:00Z" });
+      expect(failures[1]).toMatchObject({ created_at: "2026-09-03T12:10:00Z" });
+    } finally { store.close(); }
+  });
+
   it("normalizes availability-only batches, fails closed, and records recovery", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-placeholder-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
@@ -433,6 +478,22 @@ describe("pace and consumes", () => {
         "claude-main:fable  5h UNKNOWN (Claude OAuth usage unavailable) | wk n/a (no scoped limit in response)  (failed <1m)",
       ]
     `);
+  });
+
+  it("treats an empty observation set for a consumed meter as UNKNOWN, not NOT_ENFORCED, and blocks with a named reason", () => {
+    const decision = canConsume(["codex-main:main"], new Map(), policy, false, now);
+    expect(decision).toMatchObject({ allowed: false, state: "UNKNOWN", reason: "no readings for codex-main:main" });
+    expect(decision.meters).toEqual([expect.objectContaining({ meter: "codex-main:main", state: "UNKNOWN", reason: "no readings for codex-main:main" })]);
+    // A meter present in the map but with an undefined value (never observed
+    // yet, distinct from an empty array) hits the same path.
+    expect(canConsume(["codex-main:main"], new Map([["codex-main:main", undefined]]), policy, false, now)).toMatchObject({ allowed: false, state: "UNKNOWN" });
+  });
+
+  it("flags a routing meter whose principal is not any known account, leaving known ones alone", () => {
+    const known = new Set(["codex-main", "claude-main"]);
+    expect(unknownMeterPrincipals(["codex-main:main", "claude-main:all"], known)).toEqual([]);
+    expect(unknownMeterPrincipals(["codex-mian:main"], known)).toEqual(["codex-mian:main"]);
+    expect(unknownMeterPrincipals(["codex-main:main", "typo-principal:main"], known)).toEqual(["typo-principal:main"]);
   });
 
   it("renders credit counts as availability and excludes them from can decisions", () => {
