@@ -308,6 +308,23 @@ export class HeadroomStore {
   }
 
   insert(observation: Observation): StoredObservation {
+    // A log-derived fallback (Codex's session-log rate-limit reader, tagged
+    // with a source ending in ":session-log") re-reads the same historical
+    // event on every poll until a new one is logged. Once the store already
+    // holds a reading at least as recent as that fixed, unchanging event for
+    // this exact window, appending it again teaches nothing new and would
+    // otherwise grow the table without bound -- worse, it plants a stale row
+    // whose old fetched_at a plain "most recent" reader could still trip on
+    // if a later poll's own fresh reading were ever missing.
+    if (observation.window?.minutes && observation.source.endsWith(":session-log")) {
+      const existingRow = this.db.prepare(
+        "SELECT * FROM observations WHERE meter_id = ? AND json_extract(window_json, '$.minutes') = ? ORDER BY fetched_at DESC, id DESC LIMIT 1",
+      ).get(observation.meter_id, observation.window.minutes);
+      if (existingRow) {
+        const existing = observationFromRow(existingRow);
+        if (Date.parse(existing.fetched_at) >= Date.parse(observation.fetched_at)) return existing;
+      }
+    }
     const previous = this.previous(observation);
     // Reasons and metadata come from vendor responses (or their diagnostics)
     // and are persisted; redact them the same way any other vendor-adjacent
@@ -616,15 +633,22 @@ export class HeadroomStore {
   /**
    * The observations table is an append-only history. Current status must have
    * one row per meter and duration, chosen by the vendor fetch timestamp (not
-   * insertion order). A duration is the user-visible window identity: a 5h
-   * rolling and a 5h fixed window are still the same current 5h allowance.
+   * insertion order), preferring a fresh reading over anything else at any
+   * fetched_at. A stale/failed/not_enforced source that keeps re-reporting
+   * the exact same old event on every poll (Codex's session-log rate-limit
+   * fallback re-reading an unchanged log file, for one) must never eclipse a
+   * later fresh reading just because it happens to get re-inserted after
+   * it -- and a fresh reading is only ever missing in favor of a non-fresh
+   * one when no fresh reading exists for that window at all. A duration is
+   * the user-visible window identity: a 5h rolling and a 5h fixed window are
+   * still the same current 5h allowance.
    */
   latestPerWindow(meterId?: string): StoredObservation[] {
     const filter = meterId === undefined ? "" : "WHERE meter_id = ?";
     return this.db.prepare(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
-        ORDER BY fetched_at DESC, id DESC
+        ORDER BY (CASE WHEN freshness = 'fresh' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current

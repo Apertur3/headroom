@@ -299,6 +299,68 @@ describe("live shape: codex-main:main with 5h not_enforced, weekly fresh (report
   });
 });
 
+describe("live shape: codex-main:main with no stored 5h row at all, alternating fresh/stale weekly", () => {
+  // The real live defect, confirmed against a copy of the maintainer's actual
+  // headroom.db: this account polls through the native Swift engine, which
+  // never stores a 5h row at all (not even a not_enforced placeholder) --
+  // only ~674 weekly rows exist, all window {kind:"fixed",minutes:10080}.
+  // A buggy source re-inserted the same old (07:31) stale weekly reading on
+  // every poll alongside the endpoint's own genuinely fresh one. Both
+  // defects together (a selection rule that could be led to a non-fresh row,
+  // and no stored 5h window at all leaving no genuine second window to
+  // resolve `long` against) made plan/gate/status miss the real 83% usage.
+  function seedAlternatingWeekly(store: HeadroomStore): void {
+    const weekly = (offsetMs: number, freshness: "fresh" | "stale", used: number, metadata?: Observation["metadata"]) => ({
+      principal_id: "codex-main", meter_id: "codex-main:main",
+      window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const },
+      quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" as const }, resets_at: at(5 * DAY + 8 * 60_000),
+      observed_at: at(offsetMs), fetched_at: at(offsetMs), source: freshness === "fresh" ? "native:codex" : "native:codex:session-log",
+      truth: "official" as const, freshness, confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4",
+      ...(metadata ? { metadata } : {}),
+    });
+    store.insert(weekly(-6 * HOUR, "fresh", 80));
+    store.insert(weekly(-5 * HOUR - 29 * 60_000, "stale", 83));
+    store.insert(weekly(0, "fresh", 83, { plan: "prolite", free_resets_available: 2 }));
+    store.insert(weekly(-5 * HOUR - 29 * 60_000, "stale", 83));
+  }
+
+  it("plan resolves the weekly window from the fresh reading, not the repeatedly re-inserted stale one", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedAlternatingWeekly(store);
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["plan", "--meter", "codex-main:main", "--until", "reset", "--reserve", "10", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    const result = JSON.parse(logs[0]);
+    expect(result).toMatchObject({ meter: "codex-main:main", weekly_remaining_percent: 17 });
+  });
+
+  it("gate evaluates the wk need against the real 83%, not 'wk usage unknown'", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedAlternatingWeekly(store);
+    store.close();
+    await withHeadroomHome(home, async () => {
+      expect(await main(["gate", "--meter", "codex-main:main", "--need", "wk:3", "--owner", "headroom"])).toBe(0);
+      expect(await main(["gate", "--meter", "codex-main:main", "--need", "wk:15", "--owner", "headroom"])).toBe(2);
+    });
+  });
+
+  it("status shows the fresh 83% weekly line, not UNKNOWN or a missing window", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedAlternatingWeekly(store);
+    const lines = formatMeters(store.latestPerWindow("codex-main:main"), defaultPolicy);
+    store.close();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("wk 83%");
+  });
+});
+
 describe("headroom can: learned cost and --lease", () => {
   it("reports the learned median as the expected cost with no --expect, and --lease records a new lease under the action class", async () => {
     const home = await seededHome();

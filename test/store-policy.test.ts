@@ -342,6 +342,76 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("prefers a fresh reading over a stale one for the same window, regardless of which fetched_at is numerically later", async () => {
+    // The live defect: Codex's session-log fallback keeps re-inserting the
+    // exact same old (07:31) event on every poll, alongside the endpoint's
+    // own genuinely fresh (13:13) weekly reading -- both landing in the same
+    // (meter, window) partition. A plain "latest fetched_at wins" rule
+    // happens to pick the fresh one here only because 13:13 > 07:31; the
+    // real requirement is that "fresh" always wins over "stale", independent
+    // of that coincidence.
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-fresh-over-stale-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const weekly = (fetchedAt: string, freshness: Observation["freshness"], used: number, metadata?: Observation["metadata"]) => observation({
+        meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: "2026-09-10T13:08:00Z",
+        fetched_at: fetchedAt, observed_at: fetchedAt, freshness, source: freshness === "fresh" ? "native:codex" : "fixture", ...(metadata ? { metadata } : {}),
+      });
+      // Several polls, each re-appending the same stale session-log-shaped
+      // reading alongside that poll's own fresh one -- exactly the alternate
+      // pattern seen in the real store, minus the source-level dedup guard
+      // (covered separately) so this test isolates the selection rule itself.
+      store.insert(weekly("2026-09-05T12:00:00Z", "fresh", 80));
+      store.insert(weekly("2026-09-05T07:31:04Z", "stale", 83));
+      store.insert(weekly("2026-09-05T13:13:51Z", "fresh", 83, { plan: "prolite", free_resets_available: 2 }));
+      store.insert(weekly("2026-09-05T07:31:04Z", "stale", 83));
+      const latest = store.latestPerWindow("codex-main:main");
+      expect(latest).toHaveLength(1);
+      expect(latest[0]).toMatchObject({ fetched_at: "2026-09-05T13:13:51Z", freshness: "fresh", quantity: { used: 83, limit: 100, remaining: 17, unit: "percent" } });
+    } finally { store.close(); }
+  });
+
+  it("falls back to the freshest non-fresh reading only when no fresh reading exists at all for that window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-no-fresh-yet-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      store.insert(observation({ freshness: "failed", quantity: null, fetched_at: "2026-09-03T12:00:00Z" }));
+      store.insert(observation({ freshness: "stale", fetched_at: "2026-09-03T12:05:00Z" }));
+      const latest = store.latestPerWindow("codex-main:main");
+      expect(latest).toHaveLength(1);
+      expect(latest[0]).toMatchObject({ freshness: "stale", fetched_at: "2026-09-03T12:05:00Z" });
+    } finally { store.close(); }
+  });
+
+  it("never re-appends a session-log observation once the store already holds a reading at least as recent for that window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-session-log-dedup-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const sessionLogWeekly = (fetchedAt: string, used: number) => observation({
+        meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: "2026-09-10T13:08:00Z",
+        fetched_at: fetchedAt, observed_at: fetchedAt, freshness: "stale", source: "native:codex:session-log",
+      });
+      const first = store.insert(sessionLogWeekly("2026-09-05T07:31:04Z", 41));
+      // Re-reading the same unchanged session log file on a later poll must
+      // not append a second identical (or older) row.
+      const second = store.insert(sessionLogWeekly("2026-09-05T07:31:04Z", 41));
+      expect(second.id).toBe(first.id);
+      expect(store.history("codex-main:main", "2000-01-01T00:00:00Z")).toHaveLength(1);
+      // A genuinely older session event (e.g. a rotated-in older log) is
+      // rejected the same way.
+      const older = store.insert(sessionLogWeekly("2026-09-05T06:00:00Z", 41));
+      expect(older.id).toBe(first.id);
+      expect(store.history("codex-main:main", "2000-01-01T00:00:00Z")).toHaveLength(1);
+      // A genuinely newer session event (a new Codex CLI session actually
+      // ran) is still recorded normally.
+      const newer = store.insert(sessionLogWeekly("2026-09-05T09:00:00Z", 41));
+      expect(newer.id).not.toBe(first.id);
+      expect(store.history("codex-main:main", "2000-01-01T00:00:00Z")).toHaveLength(2);
+    } finally { store.close(); }
+  });
+
   it("does not display an older failed read beside a newer scoped window", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-failure-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
