@@ -21,6 +21,21 @@ set -u
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Every temp file this script creates is appended here and removed on exit --
+# a single trap, since a later `trap ... EXIT` call would silently replace
+# (not add to) an earlier one.
+cleanup_files=""
+trap 'rm -f $cleanup_files' EXIT
+
+# Scan errors are recorded to a real file, not a shell variable: every check
+# below runs as the producer side of a `<( )` process substitution or a
+# `$( )` command substitution, both of which fork a subshell, so a plain
+# `errors=$((errors+1))` inside error_out() would silently vanish once that
+# subshell exits. A file survives the fork; its line count, read once at the
+# very end, is the real error count.
+error_log="$(mktemp)"
+cleanup_files="$cleanup_files $error_log"
+
 denylist_file="$repo_root/.privacy-denylist"
 check_path=""
 while [[ $# -gt 0 ]]; do
@@ -36,13 +51,16 @@ done
 local_denylist="${PRIVACY_DENYLIST:-$HOME/.config/headroom-privacy-denylist}"
 if [[ -f "$local_denylist" && -f "$denylist_file" ]]; then
   merged_denylist="$(mktemp)"
-  trap 'rm -f "$merged_denylist"' EXIT
+  cleanup_files="$cleanup_files $merged_denylist"
   cat "$denylist_file" "$local_denylist" > "$merged_denylist"
   denylist_file="$merged_denylist"
 fi
 
 EMAIL_PATTERN='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-IP_PATTERN='(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|100\.64\.[0-9]{1,3}\.[0-9]{1,3})([^0-9.]|$)'
+# RFC 6598 CGNAT is a /10 block: first octet 100, second octet anywhere from
+# 64 through 127 -- not just the /16 whose second octet is literally 64. The
+# second-octet alternation below spans that full 64-127 range.
+IP_PATTERN='(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3})([^0-9.]|$)'
 HOME_PATH_PATTERN='(/Users/|/home/)[A-Za-z0-9_.-]+'
 ALLOWED_PLACEHOLDER_NAMES='^(you|test|user|example)$'
 
@@ -53,26 +71,79 @@ hits=0
 # name is fine, since the denylist is itself public in the repo).
 flag() { echo "$1:$2: $3"; hits=$((hits + 1)); }
 
+# Records a hard scan error (never a "clean pass"). Appends to error_log
+# rather than incrementing a variable: every caller of this may be running
+# inside a `<( )`/`$( )` subshell (see error_log's own comment above), where
+# a variable write would be silently lost.
+error_out() { printf 'x' >> "$error_log"; echo "ERROR privacy-sweep: $1" >&2; }
+
+# Runs grep, printing matched lines exactly like a bare `grep` call. Exit
+# status 0 (matched) and 1 (no match) both mean grep ran cleanly and produce
+# no diagnostic; any other status -- a malformed regex, an unreadable file,
+# an argument list the OS refused, ... -- is a hard scan error rather than
+# silent "no hits".
+run_grep() {
+  local outfile errfile status
+  outfile="$(mktemp)"; errfile="$(mktemp)"
+  grep "$@" >"$outfile" 2>"$errfile"
+  status=$?
+  if [[ $status -gt 1 ]]; then
+    error_out "grep failed (exit $status) for: $*"
+    sed 's/^/  /' "$errfile" >&2
+  else
+    cat "$outfile"
+  fi
+  rm -f "$outfile" "$errfile"
+}
+
 is_license_file() { case "$1" in LICENSE|LICENSE.*|*/LICENSE|*/LICENSE.*) return 0 ;; *) return 1 ;; esac; }
 is_package_json() { case "$1" in package.json|*/package.json) return 0 ;; *) return 1 ;; esac; }
+
+# Validates every denylist expression exactly once (a dry match against
+# empty input) and returns the path to a filtered copy containing only the
+# expressions that compiled cleanly -- so one malformed pattern is reported
+# once, not once per file scanned, and never silently treated as "no hits".
+# Echoes "" (no filtered file) when there is no denylist to validate.
+prepare_denylist() {
+  local source="$1"
+  [[ -f "$source" && -r "$source" ]] || { printf ''; return 0; }
+  local filtered raw test_pattern status
+  filtered="$(mktemp)"
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    [[ -z "$raw" || "$raw" == \#* ]] && continue
+    test_pattern="$raw"
+    [[ "$test_pattern" == '(?i)'* ]] && test_pattern="${test_pattern#'(?i)'}"
+    printf '' | grep -qE -- "$test_pattern" 2>/dev/null
+    status=$?
+    if [[ $status -gt 1 ]]; then
+      error_out "invalid denylist expression, skipped: $raw"
+      continue
+    fi
+    echo "$raw" >> "$filtered"
+  done < "$source"
+  printf '%s' "$filtered"
+}
 
 # Runs every check against a single file, reporting hits under $2. Used only
 # for package.json's own filtered (author-stripped) temp copy -- one file, so
 # a plain per-check grep call is cheap and needs no path relabeling.
 scan_one_labeled_file() {
   local path="$1" label="$2" lineno match raw pattern grep_flags
-  [[ -f "$path" ]] || return 0
+  if [[ ! -f "$path" || ! -r "$path" ]]; then
+    error_out "$label is missing or unreadable"
+    return 1
+  fi
 
   while IFS=: read -r lineno match; do
     [[ -z "$lineno" ]] && continue
     case "$match" in *@*.example.com|*@example.com) continue ;; esac
     flag "$label" "$lineno" "email address other than example.com"
-  done < <(grep -noIE "$EMAIL_PATTERN" "$path" 2>/dev/null)
+  done < <(run_grep -noIE "$EMAIL_PATTERN" "$path")
 
   while IFS=: read -r lineno match; do
     [[ -z "$lineno" ]] && continue
-    flag "$label" "$lineno" "private IPv4 address (10.x / 192.168.x / 172.16-31.x / 100.64.x)"
-  done < <(grep -noIE "$IP_PATTERN" "$path" 2>/dev/null)
+    flag "$label" "$lineno" "private IPv4 address (10.x / 192.168.x / 172.16-31.x / 100.64-127.x CGNAT)"
+  done < <(run_grep -noIE "$IP_PATTERN" "$path")
 
   while IFS=: read -r lineno match; do
     [[ -z "$lineno" ]] && continue
@@ -80,9 +151,9 @@ scan_one_labeled_file() {
     if ! printf '%s' "$name" | grep -qiE "$ALLOWED_PLACEHOLDER_NAMES"; then
       flag "$label" "$lineno" "home path with a real username ($name)"
     fi
-  done < <(grep -noIE "$HOME_PATH_PATTERN" "$path" 2>/dev/null)
+  done < <(run_grep -noIE "$HOME_PATH_PATTERN" "$path")
 
-  [[ -f "$denylist_file" ]] || return 0
+  [[ -n "$validated_denylist" && -f "$validated_denylist" ]] || return 0
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     [[ -z "$raw" || "$raw" == \#* ]] && continue
     pattern="$raw"; grep_flags="-nIE"
@@ -90,8 +161,8 @@ scan_one_labeled_file() {
     while IFS=: read -r lineno _rest; do
       [[ -z "$lineno" ]] && continue
       flag "$label" "$lineno" "denylist match: $raw"
-    done < <(grep $grep_flags -- "$pattern" "$path" 2>/dev/null)
-  done < "$denylist_file"
+    done < <(run_grep $grep_flags -- "$pattern" "$path")
+  done < "$validated_denylist"
 }
 
 # Runs every check across a whole set of files (everything except LICENSE and
@@ -112,12 +183,12 @@ scan_files() {
     [[ -z "$path" ]] && continue
     case "$match" in *@*.example.com|*@example.com) continue ;; esac
     flag "$path" "$lineno" "email address other than example.com"
-  done < <(grep -nHoIE "$EMAIL_PATTERN" -- "${files[@]}" 2>/dev/null | sed -E "$relabel")
+  done < <(run_grep -nHoIE "$EMAIL_PATTERN" -- "${files[@]}" | sed -E "$relabel")
 
   while IFS=: read -r path lineno match; do
     [[ -z "$path" ]] && continue
-    flag "$path" "$lineno" "private IPv4 address (10.x / 192.168.x / 172.16-31.x / 100.64.x)"
-  done < <(grep -nHoIE "$IP_PATTERN" -- "${files[@]}" 2>/dev/null | sed -E "$relabel")
+    flag "$path" "$lineno" "private IPv4 address (10.x / 192.168.x / 172.16-31.x / 100.64-127.x CGNAT)"
+  done < <(run_grep -nHoIE "$IP_PATTERN" -- "${files[@]}" | sed -E "$relabel")
 
   while IFS=: read -r path lineno match; do
     [[ -z "$path" ]] && continue
@@ -125,9 +196,9 @@ scan_files() {
     if ! printf '%s' "$name" | grep -qiE "$ALLOWED_PLACEHOLDER_NAMES"; then
       flag "$path" "$lineno" "home path with a real username ($name)"
     fi
-  done < <(grep -nHoIE "$HOME_PATH_PATTERN" -- "${files[@]}" 2>/dev/null | sed -E "$relabel")
+  done < <(run_grep -nHoIE "$HOME_PATH_PATTERN" -- "${files[@]}" | sed -E "$relabel")
 
-  [[ -f "$denylist_file" ]] || return 0
+  [[ -n "$validated_denylist" && -f "$validated_denylist" ]] || return 0
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     [[ -z "$raw" || "$raw" == \#* ]] && continue
     pattern="$raw"; grep_flags="-nHIE"
@@ -135,8 +206,8 @@ scan_files() {
     while IFS=: read -r path lineno _rest; do
       [[ -z "$path" ]] && continue
       flag "$path" "$lineno" "denylist match: $raw"
-    done < <(grep $grep_flags -- "$pattern" "${files[@]}" 2>/dev/null | sed -E "$relabel")
-  done < "$denylist_file"
+    done < <(run_grep $grep_flags -- "$pattern" "${files[@]}" | sed -E "$relabel")
+  done < "$validated_denylist"
 }
 
 scan_source_tree() {
@@ -184,6 +255,9 @@ scan_packed_tarball() {
   rm -rf "$root"
 }
 
+validated_denylist="$(prepare_denylist "$denylist_file")"
+[[ -n "$validated_denylist" ]] && cleanup_files="$cleanup_files $validated_denylist"
+
 if [[ -n "$check_path" ]]; then
   scan_one_labeled_file "$check_path" "$check_path"
 else
@@ -191,9 +265,11 @@ else
   scan_packed_tarball
 fi
 
-if [[ "$hits" -gt 0 ]]; then
+errors=$(wc -c < "$error_log" | tr -d ' ')
+if [[ "$hits" -gt 0 || "$errors" -gt 0 ]]; then
   echo
-  echo "FAIL privacy sweep: $hits finding(s) above"
+  [[ "$hits" -gt 0 ]] && echo "FAIL privacy sweep: $hits finding(s) above"
+  [[ "$errors" -gt 0 ]] && echo "FAIL privacy sweep: $errors scan error(s) above (never treated as a clean pass)"
   exit 1
 fi
 if [[ -n "$check_path" ]]; then echo "PASS privacy sweep ($check_path clean)"

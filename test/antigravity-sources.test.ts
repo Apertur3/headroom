@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -175,4 +175,30 @@ describe("agy keepalive", () => {
       await vi.waitFor(() => expect(supervisor.loginState).toBe("logged_in"), { timeout: 5_000, interval: 10 });
     } finally { supervisor.stop(); }
   }, 15_000); // default 5s per-test timeout is too tight for two sequential 5s waitFor()s on a loaded CI runner
+
+  it("Astra F12: reads only a bounded tail of a growing log, never the whole file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-log-tail-")); temporary.push(root);
+    const path = join(root, "cli-big.log");
+    // A marker placed only in the first megabyte (well past the 64 KiB tail
+    // this function is allowed to read) must never be found.
+    const early = `applyAuthResult authMethod=consumer\n${"x".repeat(200_000)}`;
+    const late = `\n${"y".repeat(200_000)}\nerror getting token source: You are not logged into Antigravity\n`;
+    await writeFile(path, early + late);
+    // The "not logged in" marker sits in the tail and is found; the earlier
+    // "logged in" marker outside the tail is never seen, so the state comes
+    // back not_logged_in rather than logged_in.
+    await expect(agyLoginStateFromLog(root)).resolves.toBe("not_logged_in");
+  });
+
+  it("Astra F12: never follows a symlink in place of a real log file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-log-symlink-")); temporary.push(root);
+    const real = join(root, "elsewhere.log");
+    await writeFile(real, "applyAuthResult authMethod=consumer\n");
+    const link = join(root, "cli-link.log");
+    await symlink(real, link);
+    // The only candidate is a symlink; it must be rejected rather than
+    // followed, so no log is usable and the state stays unknown.
+    await expect(agyLoginStateFromLog(root)).resolves.toBe("unknown");
+  });
+
 });

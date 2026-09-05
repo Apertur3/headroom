@@ -16,21 +16,76 @@ import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type ProviderAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
-const tools = [
+
+interface JsonSchemaProperty { type?: string; items?: { type?: string; pattern?: string }; minimum?: number; maximum?: number; exclusiveMinimum?: number; }
+interface ToolDefinition { name: string; description: string; inputSchema: { type: "object"; properties: Record<string, JsonSchemaProperty>; required?: string[] }; }
+
+const tools: ToolDefinition[] = [
   { name: "quota_status", description: "Return the latest quota windows for every Headroom meter.", inputSchema: { type: "object", properties: {} } },
-  { name: "quota_can", description: "Check whether an action class can consume all of its meters. With no expect_percent, reports the learned cost and confidence for this action class; lease reserves the deciding meter for the learned (or given) expectation so the next call learns too.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" }, expect_percent: { type: "number" }, lease: { type: "boolean" } }, required: ["action_class", "owner"] } },
+  { name: "quota_can", description: "Check whether an action class can consume all of its meters. With no expect_percent, reports the learned cost and confidence for this action class; lease reserves the deciding meter for the learned (or given) expectation so the next call learns too.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" }, expect_percent: { type: "number", minimum: 0, maximum: 100 }, lease: { type: "boolean" } }, required: ["action_class", "owner"] } },
   { name: "quota_events", description: "Return Headroom events since an ISO timestamp or duration resolved by the caller.", inputSchema: { type: "object", properties: { since: { type: "string" } } } },
-  { name: "quota_lease_start", description: "Reserve a meter for an orchestrator. owner defaults to this MCP session's client name and session id when omitted.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number" }, ttl_ms: { type: "number" }, note: { type: "string" }, action_class: { type: "string" } }, required: ["meter_id"] } },
+  { name: "quota_lease_start", description: "Reserve a meter for an orchestrator. owner defaults to this MCP session's client name and session id when omitted.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number", minimum: 0, maximum: 100 }, ttl_ms: { type: "number", exclusiveMinimum: 0 }, note: { type: "string" }, action_class: { type: "string" } }, required: ["meter_id"] } },
   { name: "quota_lease_end", description: "End a meter lease. A different owner must set force plus confirm_force and a reason, both of which are audited.", inputSchema: { type: "object", properties: { id: { type: "string" }, owner: { type: "string" }, force: { type: "boolean" }, confirm_force: { type: "boolean" }, reason: { type: "string" } }, required: ["id", "owner"] } },
   { name: "quota_leases", description: "List meter leases and estimated spend.", inputSchema: { type: "object", properties: {} } },
   { name: "quota_cost", description: "Learned median, interquartile range and sample count of spent percent, per action class.", inputSchema: { type: "object", properties: { action_class: { type: "string" } } } },
-  { name: "quota_rate", description: "Burn in percent per hour over the last N minutes (default 30), and projected time to the window's limit.", inputSchema: { type: "object", properties: { meter: { type: "string" }, minutes: { type: "number" } } } },
-  { name: "quota_plan", description: "Weekly points available per remaining 5h window before reset, and the plan line (linear budget) to hold.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number" } }, required: ["meter"] } },
-  { name: "quota_gate", description: "Pre-dispatch check: do these points fit the current window (and, with plan true, the plan line)? Under even pacing (the default), a 5h need is also checked against the caller's pro-rata line and a 10-minute burst check. needs is an array like [\"5h:15\", \"wk:3\"].", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number" }, owner: { type: "string" }, plan_share_percent: { type: "number" }, action_class: { type: "string" } }, required: ["needs"] } },
+  { name: "quota_rate", description: "Burn in percent per hour over the last N minutes (default 30), and projected time to the window's limit.", inputSchema: { type: "object", properties: { meter: { type: "string" }, minutes: { type: "number", exclusiveMinimum: 0 } } } },
+  { name: "quota_plan", description: "Weekly points available per remaining 5h window before reset, and the plan line (linear budget) to hold.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 } }, required: ["meter"] } },
+  { name: "quota_gate", description: "Pre-dispatch check: do these points fit the current window (and, with plan true, the plan line)? Under even pacing (the default), a 5h need is also checked against the caller's pro-rata line and a 10-minute burst check. needs is an array like [\"5h:15\", \"wk:3\"].", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
-  { name: "quota_fill", description: "How many more lanes fit before a 5h window's unspent points are lost at reset, and which routing.toml action classes fit the remaining points and minutes. Under even pacing (the default), only offers the full remainder in the last 45 minutes before reset; earlier than that it offers the caller's pro-rata allowance.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number" }, weekly_reserve_percent: { type: "number" }, owner: { type: "string" }, plan_share_percent: { type: "number" } }, required: ["meter"] } },
+  { name: "quota_fill", description: "How many more lanes fit before a 5h window's unspent points are lost at reset, and which routing.toml action classes fit the remaining points and minutes. Under even pacing (the default), only offers the full remainder in the last 45 minutes before reset; earlier than that it offers the caller's pro-rata allowance.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 } }, required: ["meter"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
 ];
+
+/**
+ * One validation pass over a tool's raw arguments before anything is
+ * dispatched -- to the daemon or to the direct fallback -- so an argument
+ * that fails the tool's own advertised schema never reaches either path
+ * instead of being silently coerced or dropped there. Every declared
+ * property is enforced for type, finiteness and the same numeric bounds the
+ * CLI's own flag parsing uses; an argument key the tool does not declare is
+ * rejected outright; `needs` (quota_gate) is rejected as a whole array the
+ * moment any one member is not a valid "5h:N"/"wk:N" string, rather than
+ * silently dropping just the bad member and gating on whatever remains.
+ * Required-ness is deliberately NOT enforced here: that stays the
+ * responsibility of each tool's own handler (direct or daemon), which can
+ * report a more specific error (e.g. an auto-derived lease owner) than a
+ * blanket "X is required" would.
+ */
+function validateToolArguments(toolName: string, rawArguments: unknown): Record<string, unknown> {
+  const tool = tools.find((item) => item.name === toolName);
+  if (!tool) throw new Error(`unknown tool: ${toolName}`);
+  const properties = tool.inputSchema.properties;
+  if (rawArguments === undefined) return {};
+  if (typeof rawArguments !== "object" || rawArguments === null || Array.isArray(rawArguments)) throw new Error("arguments must be a plain object");
+  const args = rawArguments as Record<string, unknown>;
+  for (const key of Object.keys(args)) {
+    if (!(key in properties)) throw new Error(`unknown argument: ${key}`);
+  }
+  for (const [key, spec] of Object.entries(properties)) {
+    const value = args[key];
+    if (value === undefined) continue;
+    if (spec.type === "string") {
+      if (typeof value !== "string") throw new Error(`${key} must be a string`);
+    } else if (spec.type === "boolean") {
+      if (typeof value !== "boolean") throw new Error(`${key} must be a boolean`);
+    } else if (spec.type === "number") {
+      if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${key} must be a finite number`);
+      if (spec.minimum !== undefined && value < spec.minimum) throw new Error(`${key} must be at least ${spec.minimum}`);
+      if (spec.maximum !== undefined && value > spec.maximum) throw new Error(`${key} must be at most ${spec.maximum}`);
+      if (spec.exclusiveMinimum !== undefined && value <= spec.exclusiveMinimum) throw new Error(`${key} must be greater than ${spec.exclusiveMinimum}`);
+    } else if (spec.type === "array") {
+      if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
+      if (key === "needs") {
+        for (const item of value) {
+          if (typeof item !== "string" || !/^(5h|wk):[0-9]+(?:\.[0-9]+)?$/.test(item.trim())) throw new Error(`needs contains an invalid entry: ${JSON.stringify(item)} (use "5h:N" or "wk:N")`);
+        }
+      } else if (spec.items?.type === "string") {
+        for (const item of value) if (typeof item !== "string") throw new Error(`${key} must be an array of strings`);
+      }
+    }
+  }
+  return args;
+}
 
 /**
  * Lease ownership is a client-supplied string; binding it to something the
@@ -198,7 +253,8 @@ async function directLeaseStart(arguments_: Record<string, unknown>): Promise<Di
   try {
     const owner = String(arguments_.owner ?? "");
     const meterId = String(arguments_.meter_id ?? "");
-    const lease = store.startLease(owner, meterId, typeof arguments_.expected_percent === "number" ? arguments_.expected_percent : null, typeof arguments_.ttl_ms === "number" ? arguments_.ttl_ms : 30 * 60_000, typeof arguments_.note === "string" ? arguments_.note : null);
+    const actionClass = typeof arguments_.action_class === "string" && arguments_.action_class.trim() ? arguments_.action_class.trim() : null;
+    const lease = store.startLease(owner, meterId, typeof arguments_.expected_percent === "number" ? arguments_.expected_percent : null, typeof arguments_.ttl_ms === "number" ? arguments_.ttl_ms : 30 * 60_000, typeof arguments_.note === "string" ? arguments_.note : null, new Date(), actionClass);
     store.audit("mcp", "lease_start", `${owner}:${meterId}`, "ok");
     return { source: "direct", lease };
   } finally { store.close(); }
@@ -250,7 +306,7 @@ async function directPlan(meter: unknown, reservePercent: unknown): Promise<Dire
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
-  try { const result = planFor(store, meter, reserve); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
 }
 
 async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: unknown): Promise<DirectResult> {
@@ -264,7 +320,7 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
   try {
     const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
     if (unknownMeters.length) throw new Error(`Routing action class ${actionClass} names unknown meter(s): ${unknownMeters.join(", ")}`);
-    const result = routeFor(store, meters, accounts, policy, allowUnknown === true, new Date());
+    const result = routeFor(store, meters, accounts, policy, allowUnknown === true, new Date(), owner);
     store.audit("mcp", "route", actionClass, result.principal ? "yes" : "no");
     return { source: "direct", ...result };
   } finally { store.close(); }
@@ -282,6 +338,7 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
       planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined,
       actionClass: typeof actionClass === "string" ? actionClass : undefined,
       pacing: policy.pacing,
+      staleness_minutes: policy.staleness_minutes,
     });
     store.audit("mcp", "gate", typeof meter === "string" ? meter : null, result.allowed ? "yes" : "no");
     return { source: "direct", ...result };
@@ -295,7 +352,7 @@ async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReserv
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
   const store = await HeadroomStore.open();
   try {
-    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing });
+    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes });
     store.audit("mcp", "fill", meter, "ok");
     return { source: "direct", ...result };
   } finally { store.close(); }
@@ -366,13 +423,18 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   if (request.method !== "tools/call") return failure(request.id, -32601, "Method not found");
   const params = request.params ?? {};
   const name = params.name;
-  const rawArguments = params.arguments && typeof params.arguments === "object" ? params.arguments as Record<string, unknown> : {};
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
     quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
+  // Validated once, here, before any dispatch to the daemon or the direct
+  // fallback: neither path should ever see an argument that fails the
+  // tool's own advertised schema.
+  let rawArguments: Record<string, unknown>;
+  try { rawArguments = validateToolArguments(name as string, params.arguments); }
+  catch (error) { return failure(request.id, -32602, error instanceof Error ? error.message : "Invalid params"); }
   if (method === "lease_end" && rawArguments.force === true) {
     const reason = typeof rawArguments.reason === "string" ? rawArguments.reason.trim() : "";
     if (rawArguments.confirm_force !== true || !reason) return failure(request.id, -32602, "force requires confirm_force: true and a non-empty reason string, both of which are audited");

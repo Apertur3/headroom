@@ -1,10 +1,10 @@
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsPath } from "../src/registry.js";
-import { runSetup } from "../src/setup.js";
+import { isYes, runSetup } from "../src/setup.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -49,6 +49,12 @@ describe("headroom setup, non-interactive (vitest's own stdin is never a TTY)", 
     // Nothing changed: no accounts.toml, no policy/routing seed.
     expect(accountsExists).toBe(false);
     expect(await fileExists(join(headroomHome, "policy.toml"))).toBe(false);
+    // Astra F8: a plan must never open (and so create) the Headroom home
+    // database, perform a Keychain lookup, or poll a vendor -- the doctor
+    // and final-check steps must describe that work, not run it.
+    expect(await readdir(headroomHome)).toEqual([]);
+    expect(output).toContain("(dry run) would run: headroom doctor");
+    expect(output).toContain("(dry run) would run: headroom doctor and headroom observe");
   });
 });
 
@@ -74,6 +80,24 @@ describe("headroom setup --dry-run", () => {
     expect(output).toContain("Setup finished.");
     expect(accountsExists).toBe(false);
     expect(await fileExists(join(headroomHome, "Library", "LaunchAgents", "com.headroom.daemon.plist"))).toBe(false);
+    // Astra F8: an empty temporary home must stay empty after a dry run --
+    // no headroom.db, no logs/ directory, nothing at all.
+    expect(await readdir(headroomHome)).toEqual([]);
+  });
+});
+
+describe("headroom setup: empty-answer confirmation defaults to No (Astra F8)", () => {
+  it("treats Enter, blank, and anything but an explicit y/yes as No, matching the [y/N] prompt", () => {
+    expect(isYes("")).toBe(false);
+    expect(isYes("   ")).toBe(false);
+    expect(isYes("n")).toBe(false);
+    expect(isYes("no")).toBe(false);
+    expect(isYes("maybe")).toBe(false);
+    expect(isYes("y")).toBe(true);
+    expect(isYes("Y")).toBe(true);
+    expect(isYes("yes")).toBe(true);
+    expect(isYes("YES")).toBe(true);
+    expect(isYes("  y  ")).toBe(true);
   });
 });
 

@@ -1,7 +1,8 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { headroomHome } from "../paths.js";
+import { assertSafeReadableDirectory, exceedsJsonDepth, readBoundedRegularFile, safeError } from "../security.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 export const STATUSLINE_SOURCE = "native:claude-statusline";
@@ -16,9 +17,52 @@ export function statuslineSnapshotDirs(configuredDirs: string[], home = headroom
  * collector falls back to the probe (subject to its own grant gate) instead. */
 export const STATUSLINE_FRESH_MINUTES = 10;
 
+/** How far into the future an `observed_at` may sit before it is rejected
+ * outright rather than trusted -- ordinary clock skew between the machine
+ * that wrote a snapshot and this one, never a legitimate reading of "later
+ * than now". A snapshot older than this passes validation fine; freshness
+ * (STATUSLINE_FRESH_MINUTES above) is a separate, much stricter question of
+ * whether a *valid* snapshot is still current enough to trust unconditionally. */
+const CLOCK_SKEW_TOLERANCE_MINUTES = 5;
+
+/** JavaScript's own Date range: +/-100,000,000 days from the epoch, in
+ * seconds (this repo's own epoch unit throughout, matching Claude Code's
+ * `resets_at`). A finite number outside this range is not a date at all --
+ * `1e20` is the review's own example -- and must never reach `new Date()`,
+ * whose `toISOString()`/formatting throws "Invalid time value" for it. */
+const MAX_EPOCH_SECONDS = 8_640_000_000_000;
+
+/** Files scanned per configured snapshot directory, per poll: a bound, not a
+ * tuning knob -- a directory legitimately never holds more than one file per
+ * configured Claude principal. */
+const MAX_SNAPSHOT_FILES_PER_DIR = 64;
+
+/** JSON object/array nesting accepted from a snapshot file. Every field this
+ * module actually reads is at most two levels deep (`root.rate_limits.five_hour`,
+ * `root.extra.<key>`); this only needs to be generous enough not to reject a
+ * legitimate file while still refusing a pathologically nested one. */
+const MAX_SNAPSHOT_JSON_DEPTH = 16;
+
 type ObjectValue = Record<string, unknown>;
 const isObject = (value: unknown): value is ObjectValue => typeof value === "object" && value !== null && !Array.isArray(value);
 const finiteNumber = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+/** A finite number that also falls inside the range `new Date()` can
+ * represent -- necessary but not sufficient for "safe to format"; callers
+ * that also care about future-dated clock skew use validObservedAt below. */
+function validEpochSeconds(seconds: number): boolean {
+  return Number.isFinite(seconds) && Math.abs(seconds) <= MAX_EPOCH_SECONDS;
+}
+
+/** An `observed_at` this module will trust: a valid epoch that is not more
+ * than a few minutes ahead of `now`. Rejecting a future timestamp here --
+ * rather than merely flagging it -- is what stops it from permanently
+ * winning `latestStatuslineSnapshot`'s newest-wins comparison and suppressing
+ * a real reading forever. */
+function validObservedAt(seconds: number, now: Date): boolean {
+  if (!validEpochSeconds(seconds)) return false;
+  return seconds <= now.getTime() / 1000 + CLOCK_SKEW_TOLERANCE_MINUTES * 60;
+}
 
 /**
  * profile = basename(CLAUDE_CONFIG_DIR), or "default" for the default
@@ -72,21 +116,37 @@ function readBucket(value: unknown): StatuslineBucket | undefined {
   // existing on-disk shape uses `used_pct`. Never guess a fourth.
   const used = finiteNumber(value.used_percent) ?? finiteNumber(value.used_percentage) ?? finiteNumber(value.used_pct) ?? finiteNumber(value.percent);
   if (used === undefined) return undefined;
-  const resets = finiteNumber(value.resets_at);
+  // A malformed reset (the review's own `1e20` example) never invalidates the
+  // whole bucket -- the used-percent reading is still real and useful -- but
+  // it must not reach epochToIso/formatBucketTime as if it were a real date,
+  // so it is validated before acceptance and dropped to "no reset known"
+  // (the same documented fallback a bucket with no resets_at at all gets)
+  // rather than accepted verbatim.
+  const rawResets = finiteNumber(value.resets_at);
+  const resets = rawResets !== undefined && validEpochSeconds(rawResets) ? rawResets : null;
   const active = typeof value.is_active === "boolean" ? value.is_active : undefined;
-  return { used_percent: Math.min(100, Math.max(0, used)), resets_at: resets ?? null, ...(active === undefined ? {} : { is_active: active }) };
+  return { used_percent: Math.min(100, Math.max(0, used)), resets_at: resets, ...(active === undefined ? {} : { is_active: active }) };
 }
 
 /** Parses either shape this adapter accepts: headroom's own `<profile>.json`
  * (a `profile` key, optional `extra`) or an external collector's `state/<alias>.json`
  * (a top-level `alias` key, epoch `observed_at`, no `extra`). Returns
  * undefined for anything unparseable or missing every bucket. */
-export function parseStatuslineSnapshot(raw: string): StatuslineSnapshot | undefined {
+export function parseStatuslineSnapshot(raw: string, now: Date = new Date()): StatuslineSnapshot | undefined {
   let root: unknown;
   try { root = JSON.parse(raw); } catch { return undefined; }
   if (!isObject(root)) return undefined;
+  // Rejected before any field is even read: a document nested deeper than
+  // any real payload this module produces or consumes needs is treated the
+  // same as unparseable JSON, not walked.
+  if (exceedsJsonDepth(root, MAX_SNAPSHOT_JSON_DEPTH)) return undefined;
   const observedAt = finiteNumber(root.observed_at);
-  if (observedAt === undefined) return undefined;
+  // A future-dated or out-of-Date-range observed_at is rejected here, at the
+  // earliest possible point, rather than merely marked stale: a future
+  // timestamp would otherwise always win latestStatuslineSnapshot's
+  // newest-wins comparison and suppress a real reading indefinitely, and an
+  // out-of-range one would crash formatting far downstream instead.
+  if (observedAt === undefined || !validObservedAt(observedAt, now)) return undefined;
   const fiveHour = readBucket(root.five_hour) ?? null;
   const sevenDay = readBucket(root.seven_day) ?? null;
   const extra: Record<string, StatuslineBucket> = {};
@@ -127,19 +187,33 @@ export function snapshotFromStatuslinePayload(payload: unknown, profile: string,
   return { profile, observed_at: Math.floor(observedAt.getTime() / 1000), five_hour: fiveHour, seven_day: sevenDay, extra };
 }
 
-/** Every readable snapshot file directly under `dir` (non-recursive), best
- * effort: a missing directory or an unreadable/unparseable file is skipped,
- * never thrown -- this is a convenience source, not the source of truth. */
-async function readSnapshotDirectory(dir: string): Promise<Array<{ file: string; snapshot: StatuslineSnapshot }>> {
+/**
+ * Every readable, trusted snapshot file directly under `dir` (non-recursive),
+ * best effort: a missing directory is silently skipped (this is a
+ * convenience source, not the source of truth, and most configured
+ * principals don't use it), but a directory that exists and fails the trust
+ * checks below is skipped with exactly one audit line to stderr instead of
+ * being read at all -- it is never opened, symlinks and all. Every file
+ * within a trusted directory is still read defensively (lstat'd, size-bound,
+ * JSON-depth-bound): the directory being safe says nothing about a single
+ * file dropped or replaced inside it after the fact.
+ */
+async function readSnapshotDirectory(dir: string, now: Date): Promise<Array<{ file: string; snapshot: StatuslineSnapshot }>> {
+  try { await assertSafeReadableDirectory(dir); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; // not configured, nothing to say
+    console.error(`headroom: skipping unsafe statusline directory ${dir}: ${safeError(error)}`);
+    return [];
+  }
   let entries: string[];
-  try { entries = (await readdir(dir)).filter((name) => name.endsWith(".json")); }
+  try { entries = (await readdir(dir)).filter((name) => name.endsWith(".json")).slice(0, MAX_SNAPSHOT_FILES_PER_DIR); }
   catch { return []; }
   const results: Array<{ file: string; snapshot: StatuslineSnapshot }> = [];
   for (const name of entries) {
     try {
-      const snapshot = parseStatuslineSnapshot(await readFile(join(dir, name), "utf8"));
+      const snapshot = parseStatuslineSnapshot(await readBoundedRegularFile(join(dir, name)), now);
       if (snapshot) results.push({ file: name, snapshot });
-    } catch { /* unreadable file: skip it, not fatal */ }
+    } catch { /* unsafe or unparseable file: skip it, not fatal */ }
   }
   return results;
 }
@@ -162,8 +236,20 @@ function matchAccount(snapshot: StatuslineSnapshot, accounts: ProviderAccount[])
   return accounts.find((account) => statuslineProfile(account.location) === snapshot.alias);
 }
 
+/** Never throws: readBucket above already refuses an out-of-range resets_at
+ * before it reaches a bucket, but this stays defensive in its own right so a
+ * conversion failure here contains itself instead of aborting the caller. */
 function epochToIso(seconds: number | null): string | null {
-  return seconds === null ? null : new Date(seconds * 1000).toISOString();
+  if (seconds === null || !validEpochSeconds(seconds)) return null;
+  try { return new Date(seconds * 1000).toISOString(); } catch { return null; }
+}
+
+/** Same containment as epochToIso, for an observed_at that (by construction,
+ * via validObservedAt above) should always already be valid by the time it
+ * gets here -- kept defensive rather than trusting that invariant blindly. */
+function safeObservedAtIso(seconds: number, fallback: Date): string {
+  if (!validEpochSeconds(seconds)) return fallback.toISOString();
+  try { return new Date(seconds * 1000).toISOString(); } catch { return fallback.toISOString(); }
 }
 
 function bucketObservation(principal: string, meter: string, bucket: StatuslineBucket, minutes: number, observedAtIso: string, fetchedAtIso: string, freshness: "fresh" | "stale"): Observation {
@@ -185,7 +271,7 @@ function bucketObservation(principal: string, meter: string, bucket: StatuslineB
  * is when Headroom itself read the file, separate from when Claude Code
  * rendered the statusline that produced it. */
 export function observationsFromStatuslineSnapshot(snapshot: StatuslineSnapshot, principal: string, fetchedAt: Date, freshMinutes = STATUSLINE_FRESH_MINUTES): Observation[] {
-  const observedAtIso = new Date(snapshot.observed_at * 1000).toISOString();
+  const observedAtIso = safeObservedAtIso(snapshot.observed_at, fetchedAt);
   const ageMinutes = (fetchedAt.getTime() - snapshot.observed_at * 1000) / 60_000;
   const freshness: "fresh" | "stale" = ageMinutes <= freshMinutes ? "fresh" : "stale";
   const fetchedAtIso = fetchedAt.toISOString();
@@ -208,12 +294,15 @@ export function observationsFromStatuslineSnapshot(snapshot: StatuslineSnapshot,
  * then falls through to the probe unconditionally. A snapshot older than
  * `freshMinutes` is still returned (so a caller can report a specific age
  * instead of a bare "no reading"), just flagged `freshness: "stale"` by
- * observationsFromStatuslineSnapshot above.
+ * observationsFromStatuslineSnapshot above. `now` (defaulting to the real
+ * current time) is also the clock-skew reference for rejecting a future-dated
+ * `observed_at` -- see parseStatuslineSnapshot -- so a future timestamp can
+ * never win this comparison and permanently shadow a real reading.
  */
-export async function latestStatuslineSnapshot(dirs: string[], account: ProviderAccount, accounts: ProviderAccount[]): Promise<StatuslineSnapshot | undefined> {
+export async function latestStatuslineSnapshot(dirs: string[], account: ProviderAccount, accounts: ProviderAccount[], now: Date = new Date()): Promise<StatuslineSnapshot | undefined> {
   let best: StatuslineSnapshot | undefined;
   for (const dir of dirs) {
-    for (const { snapshot } of await readSnapshotDirectory(dir)) {
+    for (const { snapshot } of await readSnapshotDirectory(dir, now)) {
       if (matchAccount(snapshot, accounts)?.name !== account.name) continue;
       if (!best || snapshot.observed_at > best.observed_at) best = snapshot;
     }
@@ -226,20 +315,28 @@ export async function latestStatuslineSnapshot(dirs: string[], account: Provider
  * and "a snapshot exists but is stale" alike, since the collector treats
  * both the same way (fall through to the probe). */
 export async function freshStatuslineSnapshot(dirs: string[], account: ProviderAccount, accounts: ProviderAccount[], now: Date, freshMinutes = STATUSLINE_FRESH_MINUTES): Promise<StatuslineSnapshot | undefined> {
-  const snapshot = await latestStatuslineSnapshot(dirs, account, accounts);
+  const snapshot = await latestStatuslineSnapshot(dirs, account, accounts, now);
   if (!snapshot) return undefined;
   const ageMinutes = (now.getTime() - snapshot.observed_at * 1000) / 60_000;
   return ageMinutes <= freshMinutes ? snapshot : undefined;
 }
 
 /** HH:MM for a reset today, "<weekday> HH:MM" otherwise -- local time,
- * matching cli.ts's own same-day-vs-not split for reset timestamps. */
+ * matching cli.ts's own same-day-vs-not split for reset timestamps. The
+ * documented fallback ("?") for an unknown reset also covers a malformed one
+ * (the review's own `1e20` example): readBucket already refuses such a
+ * resets_at before it reaches a bucket, but this stays defensive in its own
+ * right, since this is also the one place that must never throw on the way
+ * to `headroom statusline`'s printed line -- an uncaught "Invalid time
+ * value" here would blank the user's prompt bar entirely. */
 function formatBucketTime(resetsAtSeconds: number | null, now: Date): string {
-  if (resetsAtSeconds === null) return "?";
-  const date = new Date(resetsAtSeconds * 1000);
-  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
-  if (date.toDateString() === now.toDateString()) return time;
-  return `${new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date)} ${time}`;
+  if (resetsAtSeconds === null || !validEpochSeconds(resetsAtSeconds)) return "?";
+  try {
+    const date = new Date(resetsAtSeconds * 1000);
+    const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+    if (date.toDateString() === now.toDateString()) return time;
+    return `${new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(date)} ${time}`;
+  } catch { return "?"; }
 }
 
 /**

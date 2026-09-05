@@ -162,11 +162,42 @@ jobs:
         with:
           name: npm-tarball
           path: dist-release
+      - name: Validate the dispatched tag
+        # Astra F9: inputs.tag is an unrestricted workflow_dispatch string. It
+        # must never be interpolated directly into a `run:` script (double
+        # quotes do not stop command substitution) -- pass it through env and
+        # check it against the release-tag grammar before anything uses it.
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Dispatched tag '$RELEASE_TAG' does not match the expected vX.Y.Z[-PRERELEASE] grammar"
+            exit 1
+          fi
       - name: Tarball from the existing release
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "${{ inputs.tag }}" --pattern '*.tgz' --dir dist-release
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release download "$RELEASE_TAG" --pattern '*.tgz' --dir dist-release
+      - name: Verify the downloaded tarball's version matches the dispatched tag
+        # A validated tag grammar alone does not guarantee the release asset
+        # for that tag actually carries a matching package.json -- refuse a
+        # mismatch rather than publish whatever gh happened to download.
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          tarball="$(ls dist-release/*.tgz)"
+          tar -xOzf "$tarball" package/package.json > tarball-package.json
+          tarball_version="$(node -p 'require("./tarball-package.json").version')"
+          expected_version="${RELEASE_TAG#v}"
+          rm -f tarball-package.json
+          if [[ "$tarball_version" != "$expected_version" ]]; then
+            echo "::error::Downloaded tarball package.json version ($tarball_version) does not match dispatched tag $RELEASE_TAG"
+            exit 1
+          fi
       - name: npm publish
         id: publish
         continue-on-error: true

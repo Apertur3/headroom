@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatStatuslineBar, freshStatuslineSnapshot, latestStatuslineSnapshot, observationsFromStatuslineSnapshot,
   parseStatuslineSnapshot, snapshotFromStatuslinePayload, statuslineProfile, statuslineSnapshotDirs,
@@ -176,6 +176,60 @@ describe("latestStatuslineSnapshot / freshStatuslineSnapshot", () => {
     await writeFile(join(dirB, "default.json"), JSON.stringify({ profile: "default", observed_at: 200, five_hour: { used_percent: 2, resets_at: null }, seven_day: null, extra: {} }));
     const snapshot = await latestStatuslineSnapshot([dirA, dirB], claudeMain, [claudeMain]);
     expect(snapshot?.observed_at).toBe(200);
+  });
+});
+
+describe("filesystem trust boundary for external snapshot directories and timestamps", () => {
+  it("skips a symlinked snapshot file instead of following it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-symlink-")); temporary.push(dir);
+    const outside = await mkdtemp(join(tmpdir(), "headroom-statusline-symlink-target-")); temporary.push(outside);
+    const target = join(outside, "real.json");
+    await writeFile(target, JSON.stringify({ profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 99, resets_at: null }, seven_day: null, extra: {} }));
+    await symlink(target, join(dir, "default.json"));
+    await expect(latestStatuslineSnapshot([dir], claudeMain, [claudeMain])).resolves.toBeUndefined();
+  });
+
+  it("skips an oversized snapshot file instead of reading it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-oversize-")); temporary.push(dir);
+    const padding = "x".repeat(70 * 1024); // over the 64 KiB bound
+    await writeFile(join(dir, "default.json"), JSON.stringify({ profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 1, resets_at: null }, seven_day: null, extra: {}, padding }));
+    await expect(latestStatuslineSnapshot([dir], claudeMain, [claudeMain])).resolves.toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("skips a directory writable by group or other, with one audit line, never reading it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-foreign-")); temporary.push(dir);
+    await writeFile(join(dir, "default.json"), JSON.stringify({ profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 1, resets_at: null }, seven_day: null, extra: {} }));
+    await chmod(dir, 0o777); // world writable, no sticky bit
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(latestStatuslineSnapshot([dir], claudeMain, [claudeMain])).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toContain("skipping unsafe statusline directory");
+    } finally { errorSpy.mockRestore(); await chmod(dir, 0o700); }
+  });
+
+  it("ignores a future-dated observed_at instead of letting it win newest-snapshot selection forever", async () => {
+    const dirA = await mkdtemp(join(tmpdir(), "headroom-statusline-future-a-")); temporary.push(dirA);
+    const dirB = await mkdtemp(join(tmpdir(), "headroom-statusline-future-b-")); temporary.push(dirB);
+    const farFuture = Math.floor(Date.now() / 1000) + 3600 * 24 * 365; // a year ahead, well past clock-skew tolerance
+    await writeFile(join(dirA, "default.json"), JSON.stringify({ profile: "default", observed_at: farFuture, five_hour: { used_percent: 99, resets_at: null }, seven_day: null, extra: {} }));
+    await writeFile(join(dirB, "default.json"), JSON.stringify({ profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 12, resets_at: null }, seven_day: null, extra: {} }));
+    const snapshot = await latestStatuslineSnapshot([dirA, dirB], claudeMain, [claudeMain]);
+    expect(snapshot?.five_hour?.used_percent).toBe(12);
+  });
+
+  it("drops a malformed resets_at (1e20) instead of aborting the whole snapshot", () => {
+    const raw = JSON.stringify({ profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 10, resets_at: 1e20 }, seven_day: null, extra: {} });
+    const snapshot = parseStatuslineSnapshot(raw);
+    expect(snapshot?.five_hour).toEqual({ used_percent: 10, resets_at: null });
+  });
+
+  it("formatStatuslineBar renders the documented '?' fallback for a resets_at that bypassed parsing, instead of throwing", () => {
+    // Bypasses readBucket's own validation on purpose, to prove the renderer
+    // itself is also defensive rather than relying solely on the parser.
+    const snapshot = { profile: "default", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 37, resets_at: 1e20 }, seven_day: null, extra: {} };
+    expect(() => formatStatuslineBar(snapshot)).not.toThrow();
+    expect(formatStatuslineBar(snapshot)).toContain("↻?");
   });
 });
 

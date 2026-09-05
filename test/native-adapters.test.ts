@@ -134,8 +134,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
   });
 
   it("rejects an availability-only Antigravity quota answer without treating model availability as quota", async () => {
-    // No project on the credential and no allowedTiers on loadCodeAssist:
-    // resolveProjectId gives up without ever attempting onboardUser, so
+    // A project already on the stored credential resolves immediately, so
     // exactly two requests go out (loadCodeAssist, then retrieveUserQuota).
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({})))
@@ -143,7 +142,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const rows = await observeAntigravity(antigravity, {
       now: () => at,
       credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z", project: "stored-project" }),
       fetch,
     });
     expect(rows).toHaveLength(4);
@@ -155,7 +154,29 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]);
     expect(requests[1].headers.get("User-Agent")).toBe("antigravity");
     expect(requests[1].headers.get("x-goog-api-client")).toBeNull();
-    expect(await requests[1].text()).toBe("{}");
+    expect(await requests[1].text()).toBe(JSON.stringify({ project: "stored-project" }));
+  });
+
+  it("Astra F11: returns UNKNOWN with a finish-setup reason, and never calls onboardUser, when no Code Assist project can be resolved", async () => {
+    // No project on the stored credential and no cloudaicompanionProject on
+    // loadCodeAssist's response: the account has real allowedTiers, which
+    // used to be enough to trigger an automatic onboardUser POST. That call
+    // must never happen -- only loadCodeAssist is fetched.
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      currentTier: { id: "legacy-tier" },
+      allowedTiers: [{ id: "free-tier", isDefault: false }, { id: "standard-tier", isDefault: true }],
+    })));
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at,
+      credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch,
+    });
+    expect(rows).toHaveLength(4);
+    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "no Code Assist project; finish setup in the Gemini CLI", quantity: null })]));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const requests = fetch.mock.calls.map(([request]) => request as Request);
+    expect(requests.map((request) => request.url)).toEqual(["https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"]);
   });
 
   it("preserves a redacted Google Code Assist refusal reason", async () => {
@@ -213,12 +234,12 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(await requests[2].text()).toBe(JSON.stringify({ project: "stored-project" }));
   });
 
-  it("loadCodeAssist without a project onboards into the best tier and uses onboardUser's own project id", async () => {
+  it("resolves the project from loadCodeAssist's own cloudaicompanionProject, never from an onboardUser call", async () => {
     const loadCodeAssist = {
+      cloudaicompanionProject: { id: "already-provisioned-project" },
       currentTier: { id: "legacy-tier", name: "Legacy" },
       allowedTiers: [{ id: "free-tier", isDefault: false }, { id: "standard-tier", isDefault: true }],
     };
-    const onboarded = { response: { cloudaicompanionProject: { id: "onboarded-project" } } };
     const quota = { buckets: [
       { modelId: "gemini-5-hour", remainingFraction: 0.5, resetTime: "2026-09-03T22:26:36Z" },
       { modelId: "gemini-weekly", remainingFraction: 0.5, resetTime: "2026-09-10T17:26:36Z" },
@@ -227,7 +248,6 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ] };
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(onboarded)))
       .mockResolvedValueOnce(new Response(JSON.stringify(quota)));
     const rows = await observeAntigravity(antigravity, {
       now: () => at, credentialPaths: () => ["gemini-oauth"],
@@ -236,20 +256,16 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     });
     expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
     const requests = fetch.mock.calls.map(([request]) => request as Request);
+    // Exactly two requests: allowedTiers being present (a real onboarding
+    // signal in the old code) must never trigger a third, onboardUser, call.
     expect(requests.map((request) => request.url)).toEqual([
       "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-      "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
       "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
     ]);
-    // The tier flagged isDefault wins over the first-listed one.
-    expect(JSON.parse(await requests[1].text())).toMatchObject({ tierId: "standard-tier" });
-    expect(await requests[2].text()).toBe(JSON.stringify({ project: "onboarded-project" }));
+    expect(await requests[1].text()).toBe(JSON.stringify({ project: "already-provisioned-project" }));
   });
 
-  it("--shape reports loadCodeAssist's tier/reasonCode and every response's key shape, including onboardUser only when it actually ran", async () => {
-    // A project id already on loadCodeAssist's own response resolves
-    // immediately (see resolveProjectId), so onboarding is never attempted
-    // even though ineligibleTiers/currentTier are both present here too.
+  it("--shape reports loadCodeAssist's tier/reasonCode and every response's key shape", async () => {
     const loadCodeAssist = { cloudaicompanionProject: "already-resolved", currentTier: { id: "legacy-tier" }, ineligibleTiers: [{ id: "free-tier", reasonCode: "UNSUPPORTED_CLIENT" }] };
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
@@ -260,7 +276,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       fetch,
     });
     expect(shape).toMatchObject({ loadCodeAssist: { tier: "legacy-tier", reasonCode: "UNSUPPORTED_CLIENT" } });
-    expect(shape.onboardUser).toBeUndefined(); // a resolvable tier from currentTier alone never needs onboarding
+    expect(shape.onboardUser).toBeUndefined(); // Astra F11: onboardUser does not exist anywhere in this adapter
     expect((shape.loadCodeAssist as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.currentTier.id", kind: "string" }]));
     expect((shape.retrieveUserQuota as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.buckets", kind: "array" }]));
   });
@@ -276,7 +292,20 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       fetch,
     });
     expect(shape).toMatchObject({ loadCodeAssist: { tier: "free-tier", reasonCode: null }, retrieveUserQuota: { error: "HTTP 403 The caller does not have permission" } });
-    expect(shape.onboardUser).toBeUndefined(); // cloudaicompanionProject resolved the project; no onboarding needed
+    expect(shape.onboardUser).toBeUndefined();
+  });
+
+  it("--shape reports the finish-setup reason, and issues no retrieveUserQuota request, when no project can be resolved (Astra F11)", async () => {
+    const loadCodeAssist = { currentTier: { id: "legacy-tier" }, allowedTiers: [{ id: "standard-tier", isDefault: true }] };
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)));
+    const shape = await antigravityResponseShape(antigravity, {
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch,
+    });
+    expect(shape).toMatchObject({ retrieveUserQuota: { error: "no Code Assist project; finish setup in the Gemini CLI" } });
+    expect(shape.onboardUser).toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("extracts the Gemini CLI OAuth client from GEMINI_OAUTH2_JS_PATH, preferring the named OAUTH_CLIENT_ID/SECRET constants", async () => {
@@ -337,6 +366,66 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       const detail = await discoverGeminiOAuthClientDetail();
       expect(detail?.client).toEqual({ clientId: oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345"), clientSecret: oauthSecret("abcdefghijklmnopqrstuvwxyz01") });
       expect(detail?.layout).toContain("chunk scan");
+    } finally {
+      if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
+      if (previous.override !== undefined) process.env.GEMINI_OAUTH2_JS_PATH = previous.override;
+      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
+      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("Astra F12: GEMINI_OAUTH2_JS_PATH pointing at a symlink is treated as unavailable, never followed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-oauth2-symlink-"));
+    const real = join(root, "real-oauth2.js");
+    await writeFile(real, [
+      `const OAUTH_CLIENT_ID = '${oauthId("681255809395", "realid")}';`,
+      `const OAUTH_CLIENT_SECRET = '${oauthSecret("realsecret1234567890abcd")}';`,
+    ].join("\n"));
+    const link = join(root, "oauth2-link.js");
+    await symlink(real, link);
+    const previous = { path: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET, envPath: process.env.PATH };
+    delete process.env.GEMINI_OAUTH_CLIENT_ID;
+    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
+    process.env.GEMINI_OAUTH2_JS_PATH = link;
+    process.env.PATH = ""; // no real gemini binary on PATH to fall back to
+    try {
+      const detail = await discoverGeminiOAuthClientDetail();
+      expect(detail?.layout).not.toContain("GEMINI_OAUTH2_JS_PATH");
+    } finally {
+      if (previous.path === undefined) delete process.env.GEMINI_OAUTH2_JS_PATH; else process.env.GEMINI_OAUTH2_JS_PATH = previous.path;
+      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
+      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
+      if (previous.envPath === undefined) delete process.env.PATH; else process.env.PATH = previous.envPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("Astra F12: a chunk scan never reads past its 200-file budget", async () => {
+    // 201 tiny chunk files, sorted so the one carrying the real OAuth client
+    // sorts last -- past the 200-file budget scanDirectoryForOAuthClient is
+    // allowed to spend, so it must never be reached.
+    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-chunk-budget-"));
+    const versionDir = join(root, "Cellar", "gemini-cli", "0.0.0-test", "libexec", "lib", "node_modules", "@google", "gemini-cli");
+    const bundleDir = join(versionDir, "bundle");
+    await mkdir(bundleDir, { recursive: true });
+    await mkdir(join(root, "bin"), { recursive: true });
+    await writeFile(join(bundleDir, "gemini.js"), "#!/usr/bin/env node\n// bootstrap only, imports chunk-*.js at runtime\n");
+    await chmod(join(bundleDir, "gemini.js"), 0o755);
+    for (let index = 0; index < 200; index += 1) await writeFile(join(bundleDir, `chunk-${String(index).padStart(4, "0")}.js`), `// padding chunk ${index}\n`);
+    await writeFile(join(bundleDir, "chunk-9999-real.js"), [
+      `var OAUTH_CLIENT_ID = "${oauthId("681255809395", "shouldnotbefound")}";`,
+      `var OAUTH_CLIENT_SECRET = "${oauthSecret("shouldnotbefound0123456789ab")}";`,
+    ].join("\n"));
+    await symlink(join(bundleDir, "gemini.js"), join(root, "bin", "gemini"));
+    const previous = { path: process.env.PATH, override: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
+    delete process.env.GEMINI_OAUTH2_JS_PATH;
+    delete process.env.GEMINI_OAUTH_CLIENT_ID;
+    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
+    process.env.PATH = `${join(root, "bin")}${delimiter}`;
+    try {
+      const detail = await discoverGeminiOAuthClientDetail();
+      expect(detail?.client.clientId).not.toBe(oauthId("681255809395", "shouldnotbefound"));
     } finally {
       if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
       if (previous.override !== undefined) process.env.GEMINI_OAUTH2_JS_PATH = previous.override;
