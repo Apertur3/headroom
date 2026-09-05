@@ -108,7 +108,7 @@ describe("scripts/privacy-sweep.sh --check", () => {
     expect(code).toBe(0);
   });
 
-  it("Astra F13: fails, and never reports PASS, on a nonexistent --check input", async () => {
+  it("fails, and never reports PASS, on a nonexistent --check input", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-privacy-sweep-missing-"));
     temporary.push(root);
     const missing = join(root, "does-not-exist.txt");
@@ -125,7 +125,7 @@ describe("scripts/privacy-sweep.sh --check", () => {
     }
   });
 
-  it("Astra F13: fails on an invalid denylist regular expression instead of reporting no hits", async () => {
+  it("fails on an invalid denylist regular expression instead of reporting no hits", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-privacy-denylist-invalid-"));
     temporary.push(root);
     const denylistPath = join(root, "denylist.txt");

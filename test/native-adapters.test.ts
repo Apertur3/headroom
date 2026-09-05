@@ -157,7 +157,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(await requests[1].text()).toBe(JSON.stringify({ project: "stored-project" }));
   });
 
-  it("Astra F11: returns UNKNOWN with a finish-setup reason, and never calls onboardUser, when no Code Assist project can be resolved", async () => {
+  it("returns UNKNOWN with a finish-setup reason, and never calls onboardUser, when no Code Assist project can be resolved", async () => {
     // No project on the stored credential and no cloudaicompanionProject on
     // loadCodeAssist's response: the account has real allowedTiers, which
     // used to be enough to trigger an automatic onboardUser POST. That call
@@ -276,7 +276,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       fetch,
     });
     expect(shape).toMatchObject({ loadCodeAssist: { tier: "legacy-tier", reasonCode: "UNSUPPORTED_CLIENT" } });
-    expect(shape.onboardUser).toBeUndefined(); // Astra F11: onboardUser does not exist anywhere in this adapter
+    expect(shape.onboardUser).toBeUndefined(); // onboardUser does not exist anywhere in this adapter
     expect((shape.loadCodeAssist as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.currentTier.id", kind: "string" }]));
     expect((shape.retrieveUserQuota as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.buckets", kind: "array" }]));
   });
@@ -295,7 +295,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(shape.onboardUser).toBeUndefined();
   });
 
-  it("--shape reports the finish-setup reason, and issues no retrieveUserQuota request, when no project can be resolved (Astra F11)", async () => {
+  it("--shape reports the finish-setup reason, and issues no retrieveUserQuota request, when no project can be resolved", async () => {
     const loadCodeAssist = { currentTier: { id: "legacy-tier" }, allowedTiers: [{ id: "standard-tier", isDefault: true }] };
     const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)));
     const shape = await antigravityResponseShape(antigravity, {
@@ -375,7 +375,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     }
   });
 
-  it("Astra F12: GEMINI_OAUTH2_JS_PATH pointing at a symlink is treated as unavailable, never followed", async () => {
+  it("GEMINI_OAUTH2_JS_PATH pointing at a symlink is treated as unavailable, never followed", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-gemini-oauth2-symlink-"));
     const real = join(root, "real-oauth2.js");
     await writeFile(real, [
@@ -391,7 +391,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     process.env.PATH = ""; // no real gemini binary on PATH to fall back to
     try {
       const detail = await discoverGeminiOAuthClientDetail();
-      expect(detail?.layout).not.toContain("GEMINI_OAUTH2_JS_PATH");
+      expect(detail?.layout ?? "").not.toContain("GEMINI_OAUTH2_JS_PATH");
     } finally {
       if (previous.path === undefined) delete process.env.GEMINI_OAUTH2_JS_PATH; else process.env.GEMINI_OAUTH2_JS_PATH = previous.path;
       if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
@@ -401,7 +401,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     }
   });
 
-  it("Astra F12: a chunk scan never reads past its 200-file budget", async () => {
+  it("a chunk scan never reads past its 200-file budget", async () => {
     // 201 tiny chunk files, sorted so the one carrying the real OAuth client
     // sorts last -- past the 200-file budget scanDirectoryForOAuthClient is
     // allowed to spend, so it must never be reached.

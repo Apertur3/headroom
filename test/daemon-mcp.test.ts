@@ -70,7 +70,11 @@ async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{
   if (process.platform !== "win32") { const { replyLine } = await internal.handleLine(line); return JSON.parse(replyLine); }
   internal.sessionToken ??= randomBytes(32).toString("hex");
   const nonce = randomBytes(16).toString("hex");
-  const request = JSON.parse(line) as { params?: Record<string, unknown> };
+  // A malformed line (null, a number, an array, invalid JSON) is passed through
+  // unchanged so the test exercises the daemon's own rejection of it.
+  let request: { params?: Record<string, unknown> } | null = null;
+  try { const parsed: unknown = JSON.parse(line); request = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as { params?: Record<string, unknown> } : null; } catch { request = null; }
+  if (!request) { const { replyLine } = await internal.handleLine(line, nonce); return JSON.parse(replyLine); }
   const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
   const { replyLine } = await internal.handleLine(JSON.stringify({ ...request, params }), nonce);
   return JSON.parse(replyLine);
@@ -146,7 +150,7 @@ describe("daemon JSON-RPC", () => {
     } finally { await daemon.stop(); }
   });
 
-  it("uses a healthy fake daemon after its bounded health probe", async function () {
+  it.skipIf(process.platform === "win32")("uses a healthy fake daemon after its bounded health probe (the Windows pipe protocol is covered in pipe-auth.test.ts)", async function () {
     const root = await mkdtemp(join(tmpdir(), "headroom-client-")); temporary.push(root);
     const path = testSocketPath(root, "headroom");
     const methods: string[] = [];

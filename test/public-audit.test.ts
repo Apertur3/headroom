@@ -60,7 +60,7 @@ describe("scripts/public-audit.sh", () => {
     expect(output).toContain("PASS");
   });
 
-  it("Astra F13: fails, rather than silently omitting data, on a tracked file it cannot read", async () => {
+  it.skipIf(process.platform === "win32")("fails, rather than silently omitting data, on a tracked file it cannot read (POSIX mode bits)", async () => {
     const root = await initRepo();
     const target = join(root, "secretish.txt");
     await writeFile(target, "hello world\n");
@@ -73,7 +73,7 @@ describe("scripts/public-audit.sh", () => {
     } finally { await chmod(target, 0o644); }
   });
 
-  it("Astra F13: fails on an invalid denylist regular expression instead of reporting no hits", async () => {
+  it("fails on an invalid denylist regular expression instead of reporting no hits", async () => {
     const root = await initRepo();
     await writeFile(join(root, "clean.txt"), "nothing sensitive here\n");
     await commitAll(root);
@@ -84,7 +84,7 @@ describe("scripts/public-audit.sh", () => {
     expect(output).toContain("invalid denylist expression");
   });
 
-  it("Astra F13: scans a tracked filename containing a space via NUL-delimited git ls-files/xargs", async () => {
+  it("scans a tracked filename containing a space via NUL-delimited git ls-files/xargs", async () => {
     const root = await initRepo();
     const denylistPath = join(root, "denylist.txt");
     await writeFile(denylistPath, "needle-pattern-marker\n", "utf8");
