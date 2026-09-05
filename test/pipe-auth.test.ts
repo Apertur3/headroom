@@ -288,7 +288,7 @@ describe("Windows pipe mutual authentication: the client verifies the server too
   });
 });
 
-describe("POSIX pipe path is unchanged", () => {
+describe.skipIf(process.platform === "win32")("POSIX pipe path is unchanged", () => {
   it("never exchanges a nonce or a proof of any kind outside win32", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-pipe-auth-posix-")); temporary.push(root);
     const path = join(root, "posix.sock");
