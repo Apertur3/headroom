@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -7,8 +7,17 @@ import {
   claudeResponseShape, claudeServiceName, observationsFromClaudeUsage, observeClaude, syncClaudeGrantState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
-import { observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential } from "../src/adapters/antigravity.js";
+import {
+  antigravityResponseShape, discoverGeminiOAuthClient, discoverGeminiOAuthClientDetail,
+  observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential,
+} from "../src/adapters/antigravity.js";
 import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
+
+// OAuth-client-shaped fixture values are assembled at runtime so that no
+// secret-shaped literal ever sits in the repository or its history.
+const OAUTH_HOST = ["apps", "googleusercontent", "com"].join(".");
+const oauthId = (prefix: string, tag: string): string => `${prefix}-${tag}.${OAUTH_HOST}`;
+const oauthSecret = (tail: string): string => ["GOCSPX", tail].join("-");
 
 const claude = { name: "claude-main", vendor: "claude", location: "/Users/test/.claude", adapter: "native-ts" } as const;
 const codex = { name: "codex-main", vendor: "codex", location: "/Users/test/.codex", adapter: "native-ts" } as const;
@@ -122,7 +131,12 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
   });
 
   it("rejects an availability-only Antigravity quota answer without treating model availability as quota", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
+    // No project on the credential and no allowedTiers on loadCodeAssist:
+    // resolveProjectId gives up without ever attempting onboardUser, so
+    // exactly two requests go out (loadCodeAssist, then retrieveUserQuota).
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
     const rows = await observeAntigravity(antigravity, {
       now: () => at,
       credentialPaths: () => ["gemini-oauth"],
@@ -133,11 +147,12 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "quota endpoint returned availability only", quantity: null })]));
     const requests = fetch.mock.calls.map(([request]) => request as Request);
     expect(requests.map((request) => request.url)).toEqual([
+      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
       "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
     ]);
-    expect(requests[0].headers.get("User-Agent")).toBe("antigravity");
-    expect(requests[0].headers.get("x-goog-api-client")).toBeNull();
-    expect(await requests[0].text()).toBe("{}");
+    expect(requests[1].headers.get("User-Agent")).toBe("antigravity");
+    expect(requests[1].headers.get("x-goog-api-client")).toBeNull();
+    expect(await requests[1].text()).toBe("{}");
   });
 
   it("preserves a redacted Google Code Assist refusal reason", async () => {
@@ -174,7 +189,10 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
 
   it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {
     const quota = await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8");
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 }))).mockResolvedValueOnce(new Response(quota));
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ cloudaicompanionProject: "stored-project" })))
+      .mockResolvedValueOnce(new Response(quota));
     const rows = await observeAntigravity(antigravity, {
       now: () => at, credentialPaths: () => ["gemini-oauth"],
       readFile: async () => JSON.stringify({ access_token: "old-access", refresh_token: "refresh-only", expiry_date: at.getTime() - 1 }),
@@ -182,9 +200,144 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     });
     expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
     const requests = fetch.mock.calls.map(([request]) => request as Request);
-    expect(requests.map((request) => request.url)).toEqual(["https://oauth2.googleapis.com/token", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"]);
+    expect(requests.map((request) => request.url)).toEqual([
+      "https://oauth2.googleapis.com/token",
+      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+    ]);
     expect(await requests[0].text()).toContain("grant_type=refresh_token");
-    expect(requests[1].headers.get("Authorization")).toBe("Bearer new-access");
+    expect(requests[2].headers.get("Authorization")).toBe("Bearer new-access");
+    expect(await requests[2].text()).toBe(JSON.stringify({ project: "stored-project" }));
+  });
+
+  it("loadCodeAssist without a project onboards into the best tier and uses onboardUser's own project id", async () => {
+    const loadCodeAssist = {
+      currentTier: { id: "legacy-tier", name: "Legacy" },
+      allowedTiers: [{ id: "free-tier", isDefault: false }, { id: "standard-tier", isDefault: true }],
+    };
+    const onboarded = { response: { cloudaicompanionProject: { id: "onboarded-project" } } };
+    const quota = { buckets: [
+      { modelId: "gemini-5-hour", remainingFraction: 0.5, resetTime: "2026-09-03T22:26:36Z" },
+      { modelId: "gemini-weekly", remainingFraction: 0.5, resetTime: "2026-09-10T17:26:36Z" },
+      { modelId: "claude-gpt-5-hour", remainingFraction: 0.5, resetTime: "2026-09-03T22:26:36Z" },
+      { modelId: "claude-gpt-weekly", remainingFraction: 0.5, resetTime: "2026-09-10T17:26:36Z" },
+    ] };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(onboarded)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(quota)));
+    const rows = await observeAntigravity(antigravity, {
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch,
+    });
+    expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
+    const requests = fetch.mock.calls.map(([request]) => request as Request);
+    expect(requests.map((request) => request.url)).toEqual([
+      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+      "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+    ]);
+    // The tier flagged isDefault wins over the first-listed one.
+    expect(JSON.parse(await requests[1].text())).toMatchObject({ tierId: "standard-tier" });
+    expect(await requests[2].text()).toBe(JSON.stringify({ project: "onboarded-project" }));
+  });
+
+  it("--shape reports loadCodeAssist's tier/reasonCode and every response's key shape, including onboardUser only when it actually ran", async () => {
+    // A project id already on loadCodeAssist's own response resolves
+    // immediately (see resolveProjectId), so onboarding is never attempted
+    // even though ineligibleTiers/currentTier are both present here too.
+    const loadCodeAssist = { cloudaicompanionProject: "already-resolved", currentTier: { id: "legacy-tier" }, ineligibleTiers: [{ id: "free-tier", reasonCode: "UNSUPPORTED_CLIENT" }] };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
+    const shape = await antigravityResponseShape(antigravity, {
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch,
+    });
+    expect(shape).toMatchObject({ loadCodeAssist: { tier: "legacy-tier", reasonCode: "UNSUPPORTED_CLIENT" } });
+    expect(shape.onboardUser).toBeUndefined(); // a resolvable tier from currentTier alone never needs onboarding
+    expect((shape.loadCodeAssist as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.currentTier.id", kind: "string" }]));
+    expect((shape.retrieveUserQuota as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.buckets", kind: "array" }]));
+  });
+
+  it("--shape still reports loadCodeAssist's tier/reasonCode when retrieveUserQuota itself is denied (verified live against a real free-tier Antigravity account)", async () => {
+    const loadCodeAssist = { cloudaicompanionProject: "aicode-consumers", currentTier: { id: "free-tier", name: "Antigravity" }, allowedTiers: [{ id: "free-tier", isDefault: true }, { id: "standard-tier" }] };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 403, message: "The caller does not have permission", status: "PERMISSION_DENIED" } }), { status: 403 }));
+    const shape = await antigravityResponseShape(antigravity, {
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
+      fetch,
+    });
+    expect(shape).toMatchObject({ loadCodeAssist: { tier: "free-tier", reasonCode: null }, retrieveUserQuota: { error: "HTTP 403 The caller does not have permission" } });
+    expect(shape.onboardUser).toBeUndefined(); // cloudaicompanionProject resolved the project; no onboarding needed
+  });
+
+  it("extracts the Gemini CLI OAuth client from GEMINI_OAUTH2_JS_PATH, preferring the named OAUTH_CLIENT_ID/SECRET constants", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-oauth2-"));
+    const file = join(root, "oauth2.js");
+    // Padded with unrelated googleusercontent.com/GOCSPX-shaped noise the
+    // named-constant regex must skip past in favor of the actual assignment.
+    await writeFile(file, [
+      `// unrelated: ${oauthId("111111111111", "noise")}`,
+      `const OAUTH_CLIENT_ID = '${oauthId("681255809395", "realid")}';`,
+      `const OAUTH_CLIENT_SECRET = '${oauthSecret("realsecret1234567890abcd")}';`,
+    ].join("\n"));
+    const previous = { path: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
+    delete process.env.GEMINI_OAUTH_CLIENT_ID;
+    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
+    process.env.GEMINI_OAUTH2_JS_PATH = file;
+    try {
+      const detail = await discoverGeminiOAuthClientDetail();
+      expect(detail).toEqual({ client: { clientId: oauthId("681255809395", "realid"), clientSecret: oauthSecret("realsecret1234567890abcd") }, layout: `GEMINI_OAUTH2_JS_PATH (${file})` });
+      await expect(discoverGeminiOAuthClient()).resolves.toEqual(detail!.client);
+    } finally {
+      if (previous.path === undefined) delete process.env.GEMINI_OAUTH2_JS_PATH; else process.env.GEMINI_OAUTH2_JS_PATH = previous.path;
+      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
+      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to scanning bundle/chunk-*.js when gemini's own PATH binary symlinks straight into a bootstrap bundle/gemini.js that doesn't carry the client itself", async () => {
+    // Reproduces the real Homebrew gemini-cli layout on this machine: `gemini`
+    // on PATH resolves (via realpath) directly into `bundle/gemini.js`, a tiny
+    // bootstrap that dynamically imports the real code from content-hashed
+    // sibling files -- none of the fixed oauth2.js/bundle/gemini.js candidate
+    // paths ever contain the client on that layout, only a scan of every .js
+    // file in the bundle directory finds it.
+    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-bundle-"));
+    const versionDir = join(root, "Cellar", "gemini-cli", "0.0.0-test", "libexec", "lib", "node_modules", "@google", "gemini-cli");
+    const bundleDir = join(versionDir, "bundle");
+    await mkdir(bundleDir, { recursive: true });
+    await mkdir(join(root, "bin"), { recursive: true });
+    await writeFile(join(bundleDir, "gemini.js"), "#!/usr/bin/env node\n// bootstrap only, imports chunk-*.js at runtime\n");
+    await chmod(join(bundleDir, "gemini.js"), 0o755);
+    await writeFile(join(bundleDir, "chunk-ABCDEFGH.js"), [
+      `var unrelatedClientElsewhere = '${oauthId("999999999999", "other")}';`,
+      `var OAUTH_CLIENT_ID = "${oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345")}";`,
+      `var OAUTH_CLIENT_SECRET = "${oauthSecret("abcdefghijklmnopqrstuvwxyz01")}";`,
+    ].join("\n"));
+    await symlink(join(bundleDir, "gemini.js"), join(root, "bin", "gemini"));
+    const previous = { path: process.env.PATH, override: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
+    delete process.env.GEMINI_OAUTH2_JS_PATH;
+    delete process.env.GEMINI_OAUTH_CLIENT_ID;
+    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
+    process.env.PATH = `${join(root, "bin")}:${previous.path ?? ""}`;
+    try {
+      const detail = await discoverGeminiOAuthClientDetail();
+      expect(detail?.client).toEqual({ clientId: oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345"), clientSecret: oauthSecret("abcdefghijklmnopqrstuvwxyz01") });
+      expect(detail?.layout).toContain("chunk scan");
+    } finally {
+      if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
+      if (previous.override !== undefined) process.env.GEMINI_OAUTH2_JS_PATH = previous.override;
+      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
+      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("always emits a main weekly row so a missing vendor field replaces prior data", () => {

@@ -19,6 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
+      - run: bash scripts/public-audit.sh
       - run: npm run lint
       - run: bash scripts/privacy-sweep.sh
       - run: npm test

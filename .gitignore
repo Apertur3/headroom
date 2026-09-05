@@ -38,3 +38,4 @@ models/
 .DS_Store
 .idea/
 *.swp
+*.tgz

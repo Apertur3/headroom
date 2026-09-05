@@ -12,7 +12,7 @@ All notable changes to this project are documented here. The format follows
 - `headroom statusline`: a zero-auth Claude source. Register it as Claude Code's own `statusLine`
   command and Headroom reads the same JSON Claude Code already renders every prompt instead of
   ever touching the Keychain, with `--chain` to keep an existing statusLine command's own output.
-  Also reads the an external collector collector's existing `state/<alias>.json` shape, configurable via
+  Also reads an existing collector's `state/<alias>.json` shape, configurable via
   `policy.toml`'s `statusline_snapshot_dirs`.
 - `headroom route --class <action-class> --owner X`: picks the principal with the most remaining
   headroom in the tightest window among the routing entry's allowed principals of one vendor, and

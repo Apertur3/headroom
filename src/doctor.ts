@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { claudeServiceName, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { readPolicy, readRouting } from "./config.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
@@ -198,6 +199,18 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     ? check(native.includes(`${home}/engine/native/`) ? "OK" : "INFO", "engine native hash", native.includes(`${home}/engine/native/`) ? `verified (${native})` : `development binary (${native}) is not release-pinned`, native.includes(`${home}/engine/native/`) ? "no action needed" : "build a pinned native release or run headroom engine install")
     : check("INFO", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
 
+  if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+    // Best-effort and never blocking: env overrides always resolve
+    // instantly, and the real Homebrew/npm-global candidate paths are a
+    // bounded, local filesystem walk. Never reads or logs the client id or
+    // secret themselves, only which layout matched.
+    let detail: Awaited<ReturnType<typeof discoverGeminiOAuthClientDetail>>;
+    try { detail = await discoverGeminiOAuthClientDetail(); } catch { detail = undefined; }
+    output.push(detail
+      ? check("OK", "Antigravity OAuth client", `resolved via ${detail.layout}`, "no action needed")
+      : check("WARN", "Antigravity OAuth client", "could not locate the Gemini CLI's bundled OAuth client", "install the Gemini CLI, or set GEMINI_OAUTH_CLIENT_ID/GEMINI_OAUTH_CLIENT_SECRET"));
+  }
+
   const daemon = await daemonRequest(socketPath(), "health");
   if (daemon.status === "available") {
     output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
@@ -216,7 +229,11 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : "no action needed";
       output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
     }
-    else output.push(check("FAIL", "Antigravity keepalive", "agy process is not running", "set antigravity_keepalive = true and restart headroom service"));
+    // Not a FAIL: keepalive is secondary now that the remote quota endpoint
+    // can answer directly (see the Antigravity OAuth client check above) --
+    // the daemon starts agy lazily, only once a poll shows remote fell
+    // short, so "not running yet" is the common, healthy state.
+    else output.push(check("OK", "Antigravity keepalive", "agy is not running; the remote quota endpoint is the primary source", "run: agy (only needed if remote returns availability-only or a 403)"));
   } else {
     // A missing daemon never blocks reading a configured principal -- every
     // CLI/MCP entry point falls back to a direct read -- so it is a WARN, not

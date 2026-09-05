@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agyLoginStateFromLog, AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
 import { noDaemonObservations } from "../src/adapters/antigravity.js";
-import { pollAccounts, selectAntigravitySource } from "../src/collector.js";
+import { antigravityFallbackNote, pollAccounts, selectAntigravitySource } from "../src/collector.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -28,6 +28,24 @@ describe("Antigravity source order", () => {
     expect(selectAntigravitySource(warm, remote, "antigravity")).toBe(warm);
     const cold = [...warm.slice(0, 2), row("claude-gpt", 10_080, "local:antigravity:warm", "failed")];
     expect(selectAntigravitySource(cold, remote, "antigravity")).toBe(remote);
+  });
+});
+
+describe("Antigravity fallback reason: names both outcomes, remote and local", () => {
+  it("names 'agy keepalive not running' when the daemon never owns Antigravity at all", () => {
+    expect(antigravityFallbackNote(false, [], "unknown")).toBe("agy keepalive not running");
+    expect(antigravityFallbackNote(false, [], "not_logged_in")).toBe("agy keepalive not running");
+  });
+
+  it("names an unavailable warm read when the daemon owns it but produced nothing", () => {
+    expect(antigravityFallbackNote(true, [], "unknown")).toBe("agy warm read unavailable");
+  });
+
+  it("names agy's own login state ahead of a generic 'not ready' once rows exist", () => {
+    const rows = [row("gemini", 300, "local:antigravity:warm", "failed")];
+    expect(antigravityFallbackNote(true, rows, "not_logged_in")).toBe("agy not logged in");
+    expect(antigravityFallbackNote(true, rows, "logged_in")).toBe("agy quota summary not ready");
+    expect(antigravityFallbackNote(true, rows, "unknown")).toBe("agy quota summary not ready");
   });
 });
 

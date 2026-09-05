@@ -71,7 +71,14 @@ fi
 local_identity_name="Headroom Local"
 
 identity_exists() {
-  security find-identity -v -p codesigning login.keychain-db 2>/dev/null | grep -q "\"$local_identity_name\""
+  # Deliberately not `-p codesigning`: that policy filters to identities
+  # macOS's trust evaluation considers valid, and a fresh self-signed
+  # certificate is never trusted by default (CSSMERR_TP_NOT_TRUSTED) even
+  # though `codesign --sign` itself works fine with it -- codesign only
+  # needs a matching private key and certificate, not a trust chain. The
+  # bare (no -p) listing still requires a private key, so this can't match
+  # a certificate-only entry with no signing key behind it.
+  security find-identity login.keychain-db 2>/dev/null | grep -q "\"$local_identity_name\""
 }
 
 # Creates a self-signed, codeSigning-EKU certificate named "Headroom Local"
@@ -83,8 +90,16 @@ identity_exists() {
 create_local_identity() {
   local workdir
   workdir="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$workdir'" RETURN
+  if [[ -z "${HEADROOM_BUILD_PROBE_KEEP_WORKDIR:-}" ]]; then
+    # shellcheck disable=SC2064
+    trap "rm -rf '$workdir'" RETURN
+  else
+    # Test-only escape hatch (see test/build-probe-script.test.ts): leaves
+    # the generated ext.cnf/cert.pem/cert.p12 in place so a test can inspect
+    # the openssl config and certificate this function actually produces,
+    # without ever importing them into a keychain.
+    echo "build-probe.sh: HEADROOM_BUILD_PROBE_KEEP_WORKDIR set; leaving $workdir in place for inspection." >&2
+  fi
 
   cat > "$workdir/ext.cnf" <<CONF
 [req]
@@ -101,10 +116,28 @@ CONF
 
   openssl req -x509 -newkey rsa:2048 -keyout "$workdir/key.pem" -out "$workdir/cert.pem" \
     -days 36500 -nodes -config "$workdir/ext.cnf" -extensions v3_req >/dev/null 2>&1
-  openssl pkcs12 -export -in "$workdir/cert.pem" -inkey "$workdir/key.pem" \
-    -out "$workdir/cert.p12" -passout pass:headroom -name "$local_identity_name" >/dev/null 2>&1
+  # OpenSSL 3's default PKCS#12 encryption (AES-256 keys/certs, SHA-256 MAC)
+  # is not something macOS's Security framework can import: `security
+  # import` fails with "SecKeychainItemImport: MAC verification failed
+  # during PKCS12 import (wrong password?)" even though the passphrase is
+  # right, because it never gets far enough to check it. `-legacy` switches
+  # back to the RC2/3DES + SHA-1 encryption macOS expects. An OpenSSL build
+  # without the legacy provider (older OpenSSL, or a 3.x built without it)
+  # doesn't recognize `-legacy` at all; the explicit legacy algorithm names
+  # produce the same macOS-readable output there.
+  if ! openssl pkcs12 -export -in "$workdir/cert.pem" -inkey "$workdir/key.pem" \
+      -out "$workdir/cert.p12" -passout pass:headroom -name "$local_identity_name" \
+      -legacy >/dev/null 2>&1; then
+    openssl pkcs12 -export -in "$workdir/cert.pem" -inkey "$workdir/key.pem" \
+      -out "$workdir/cert.p12" -passout pass:headroom -name "$local_identity_name" \
+      -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES >/dev/null 2>&1
+  fi
+  # -A (rather than a specific -T allowlist) grants every application access
+  # to the imported key without a per-app prompt, alongside the explicit
+  # codesign entry: codesign itself still needs the partition-list grant
+  # below to use the key non-interactively.
   security import "$workdir/cert.p12" -k login.keychain-db -P headroom \
-    -T /usr/bin/codesign -T /usr/bin/security
+    -T /usr/bin/codesign -A
   # Grants codesign non-interactive use of the new key's partition; a known
   # macOS ACL quirk (since Sierra) that otherwise pops "codesign wants to use
   # your key... Always Allow" on every single sign. Best effort: absent on
