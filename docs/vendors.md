@@ -140,18 +140,26 @@ returned availability only; agy keepalive not running" or "...; agy quota summar
 
 Known limitations, verified live:
 
-- Google's remote quota endpoint is deprecated for the free Gemini Code Assist tier. A response
-  with no `remainingFraction` on any bucket is availability-only, not usage, and Headroom reports
-  every window `failed` with reason "quota endpoint returned availability only" rather than
-  showing it as 0% used.
-- The daemon-kept local `agy` read can produce the same kind of placeholder. Headroom compares
-  each window's reset time to its fetch time and its own duration; if two or more windows show
-  zero or unknown usage with a reset that lands within 90 seconds of "fetch time plus window
-  length," it treats the whole snapshot as manufactured and marks it `failed`, the same as the
-  remote placeholder. Headroom refuses to show either kind of placeholder as real capacity.
+- Google's remote quota endpoint answers 403 for the free Gemini Code Assist tier, or otherwise
+  returns a response with no `remainingFraction` on any bucket. Either is availability-only, not
+  usage, and Headroom reports every window `failed` with reason "quota endpoint returned
+  availability only" rather than showing it as 0% used -- there is no number to show.
+- The daemon-kept local `agy` read can report a window that looks the same shape as that
+  availability response: zero or unknown usage with a reset that lands within 90 seconds of
+  "fetch time plus window length" (`detectPlaceholder` in `src/engine/observation.ts`). Per the
+  repository owner's decision, Headroom no longer discards this as a heuristic false positive --
+  a genuinely idle rolling window is shaped exactly the same way, and Google's own Antigravity app
+  shows the vendor's own 100% in that case. The reading is shown as-is (freshness, quantity and
+  reset all vendor-reported), downgraded to `truth: "estimated"` at half confidence with reason
+  "vendor reports an idle window; reset equals fetch time plus window length, so this may be a
+  placeholder"; `headroom` status appends `(idle, unverified)` to the line. It is only escalated to
+  a real `failed` reading when the store's own history contradicts it: a fresh reading for the
+  same meter and window, within the last 2 hours, already showed real usage whose reset has not
+  happened yet -- a vendor cannot legitimately go idle without a reset in between, so that reading
+  is demoted with reason "idle reading contradicts the previous fresh reading (N% used, reset not
+  yet due)".
 - Windows has no daemon-kept `agy` and no native engine path for it, so an Antigravity principal
-  on Windows is remote-only, and inherits the free-tier deprecation above without a local
-  fallback.
+  on Windows is remote-only, and inherits the free-tier 403 above without a local fallback.
 
 ## Local pools (vLLM, llama.cpp)
 

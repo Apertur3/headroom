@@ -1,9 +1,13 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes six tools, defined in `src/mcp.ts`: three read status, three manage
-leases. Every tool tries the daemon first, over its local socket or named pipe, and falls back to
-a direct poll (marked `"source": "direct"` in the result) if no daemon is running.
+SDK dependency. It exposes thirteen tools, defined in `src/mcp.ts`: three read status, three manage
+leases, six pace a window, one routes an action class to an account. Every tool but `quota_wait`
+and `quota_route` tries the daemon first, over its local socket or named pipe, and falls back to
+a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`
+and `quota_route` always read directly, since neither has a daemon RPC case at all -- `quota_wait`
+because it never blocks (it just reports the reset time), and `quota_route` because it's a
+deliberate, occasional call, not a hot path worth a daemon round trip.
 
 ## Status tools
 
@@ -43,7 +47,9 @@ Behind a daemon, `structuredContent` is the raw observation array. Without one, 
 ### `quota_can`
 
 Arguments: `action_class` (string, required), `owner` (string, required), `allow_unknown`
-(boolean, optional).
+(boolean, optional), `expect_percent` (number, optional; overrides the learned cost for the "max
+more before reset" figure), `lease` (boolean, optional; reserves the deciding meter for the
+expected or learned percent, same as `can --lease`).
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"quota_can","arguments":{"action_class":"claude-fable","owner":"triage-bot"}}}
@@ -63,14 +69,28 @@ Arguments: `action_class` (string, required), `owner` (string, required), `allow
       "meters": [
         { "meter": "claude-main:all", "state": "HARVEST", "reason": "5h 3% HARVEST" },
         { "meter": "claude-main:fable", "state": "NORMAL", "reason": "wk 42% NORMAL" }
-      ]
+      ],
+      "cost": {
+        "action_class": "claude-fable",
+        "expected_percent": 4.2,
+        "source": "learned",
+        "confidence": "medium",
+        "sample_count": 6,
+        "median_percent": 4.2,
+        "iqr_low": 3.1,
+        "iqr_high": 5.0,
+        "max_more_before_reset": 23
+      },
+      "leased_id": null
     }
   }
 }
 ```
 
 `owner` is required. It's how Headroom excludes your own open leases from the reservation check,
-so calling `quota_can` doesn't get blocked by a lease you started yourself.
+so calling `quota_can` doesn't get blocked by a lease you started yourself. `cost` is always
+present (its fields are `null` with no learned or given expectation yet); `leased_id` is the new
+lease's id when `lease: true` was passed and the call was allowed, otherwise `null`.
 
 ### `quota_events`
 
@@ -106,9 +126,11 @@ Arguments: `since` (string, optional; an ISO timestamp the caller resolves itsel
 
 ### `quota_lease_start`
 
-Arguments: `owner` (string, required), `meter_id` (string, required), `expected_percent` (number,
+Arguments: `meter_id` (string, required), `owner` (string, optional; defaults to
+`<client name>#<session id>` from the MCP session when omitted), `expected_percent` (number,
 optional), `ttl_ms` (number, optional; the CLI's own default is 30 minutes), `note` (string,
-optional).
+optional), `action_class` (string, optional; attributes the lease's spend to a class for
+`quota_cost`, same as `lease start --class`).
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_lease_start","arguments":{"owner":"triage-bot","meter_id":"codex-main:main","expected_percent":15,"ttl_ms":1800000}}}
@@ -138,9 +160,10 @@ optional).
 
 ### `quota_lease_end`
 
-Arguments: `id` (string, required), `owner` (string, required), `force` (boolean, optional).
-Ending a lease with a different `owner` than the one that started it is refused unless `force` is
-`true`.
+Arguments: `id` (string, required), `owner` (string, required), `force` (boolean, optional),
+`confirm_force` (boolean, optional), `reason` (string, optional). Ending a lease with a different
+`owner` than the one that started it is refused unless `force` is `true`; setting `force` also
+requires `confirm_force: true` plus a non-empty `reason`, both of which are audited.
 
 ```json
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"quota_lease_end","arguments":{"id":"a1b2c3d4","owner":"triage-bot"}}}
@@ -194,6 +217,55 @@ No arguments. Lists active and recently ended leases with their estimated spend.
 }
 ```
 
+## Pacing and routing tools
+
+Every one of these takes a `meter` id (for example `codex-main:main`) unless noted, and answers
+from the same store the CLI uses. Percentages are whole vendor percents; times are ISO 8601.
+
+### `quota_rate`
+
+`meter`, optional `minutes` (default 30). Returns the burn in percent per hour over that period,
+the sustainable pace to reach the reset with nothing to spare, and the projected time at which
+the window would hit its limit at the current burn (`null` when the burn is zero or unknown).
+CLI: `headroom rate --meter M`.
+
+### `quota_plan`
+
+`meter`, optional `reserve_percent`. Returns the weekly points available per remaining 5h window
+before the weekly reset, and the plan line (linear budget) to hold. CLI: `headroom plan`.
+
+### `quota_gate`
+
+`needs` (array of `"5h:15"` / `"wk:3"` strings), optional `meter`, `plan`, `reserve_percent`,
+`owner`, `plan_share_percent`, `action_class` (adds a `lanes_remaining_for_class` figure from the
+learned cost for that class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
+the current window (and, with `plan`, the plan line); under even pacing a 5h need is also checked
+against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
+CLI: `headroom gate` (exit 2 when it does not fit).
+
+### `quota_wait`
+
+`meter`. Never blocks: returns the window's reset time and a suggested sleep in seconds so the
+caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
+
+### `quota_fill`
+
+`meter`, optional `lane_cost_percent`, `weekly_reserve_percent`, `owner`, `plan_share_percent`.
+How many more lanes fit before the 5h window's unspent points are lost at reset, and which
+`routing.toml` action classes still fit the remaining points and minutes. CLI: `headroom fill`.
+
+### `quota_cost`
+
+Optional `action_class`. The learned cost per action class from leases: median spent percent,
+interquartile range and sample count. CLI: `headroom cost`.
+
+### `quota_route`
+
+`action_class`, `owner`, optional `allow_unknown`. Among the principals the routing entry for
+that action class allows, picks the one with the most remaining headroom on its own tightest
+window, and returns its launch environment (for example `CLAUDE_CONFIG_DIR`). `null` when none
+fits; UNKNOWN rows never win unless `allow_unknown` is set. CLI: `headroom route`.
+
 ## How an orchestrator should use them
 
 This mirrors `skills/headroom/SKILL.md`, which any Claude Code session with the skill installed
@@ -227,10 +299,16 @@ For agents that call a shell instead of MCP, such as Codex or Gemini CLI session
 | `quota_status` | `headroom [--json] [--principal <id>] [--threshold <n>]` |
 | `quota_can` | `headroom can <action-class> --owner <name> [--allow-unknown] [--json]` |
 | `quota_events` | `headroom events [--since 24h]` |
-| `quota_lease_start` | `headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note "..."]` |
+| `quota_lease_start` | `headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note "..."] [--class <action-class>]` |
 | `quota_lease_end` | `headroom lease end <id> --owner <name> [--force]` |
 | `quota_leases` | `headroom lease list` |
 | `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
+| `quota_rate` | `headroom rate [--meter <meter_id>] [--minutes 30] [--json]` |
+| `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]` |
+| `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--json]` (exit 2 when it does not fit) |
+| `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
+| `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |
+| `quota_cost` | `headroom cost [<action-class>] [--json]` |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match

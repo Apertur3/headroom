@@ -47,8 +47,13 @@ Example: an observation for `claude-main:fable` at 82% used, `resets_at` next Sa
 
 Every observation is `fresh`, `stale`, `failed`, or `not_enforced`. `fresh` is a good, recent
 vendor read. `stale` means the last good read is older than the staleness threshold (15 minutes by
-default). `failed` means the last attempt errored, timed out, or the vendor returned data Headroom
-won't trust, such as an Antigravity availability-only payload. `not_enforced` is different from
+default). `failed` means the last attempt errored, timed out, exceeded Headroom's own bounds on
+the response, or -- for a vendor-reported idle window that looks like a placeholder -- contradicted
+a real-usage reading Headroom already trusted for that same window within the last two hours (a
+vendor cannot legitimately go from spending back to idle without a reset in between). An idle
+reading that does not contradict recent history is not failed: it's shown as the vendor reported
+it, marked `estimated` at reduced confidence rather than hidden behind UNKNOWN, since a real idle
+window looks identical to a placeholder from a single snapshot alone. `not_enforced` is different from
 the other three: it means the vendor confirmed there is no cap on this window at all, so it prints
 as `n/a` and never counts toward `can` or a threshold. Anything `stale` or `failed` becomes the
 pace state UNKNOWN everywhere Headroom shows it, and `headroom can` answers NO for it unless you

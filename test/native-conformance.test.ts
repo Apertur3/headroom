@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { adaptCodexPayload } from "../src/engine/codexbar/adapt.js";
-import { AVAILABILITY_ONLY_REASON, detectPlaceholder, normalizeObservations, observationsFromReading } from "../src/engine/observation.js";
+import { IDLE_WINDOW_REASON, detectPlaceholder, normalizeObservations, observationsFromReading } from "../src/engine/observation.js";
 import { parseObservations } from "../src/engine/native/run.js";
 
 describe("native engine conformance", () => {
@@ -18,13 +18,16 @@ describe("native engine conformance", () => {
     expect(fallback.every((item) => item.quantity?.unit === "percent")).toBe(true);
   });
 
-  it("rejects the synthesized-reset availability placeholder but accepts a real capture", async () => {
+  it("flags the synthesized-reset idle window with a doubt marker but accepts a real capture as-is", async () => {
     const placeholderText = await readFile(new URL("../fixtures/native/v0.56.4/antigravity-placeholder.json", import.meta.url), "utf8");
     const realText = await readFile(new URL("../fixtures/native/v0.56.4/codex-antigravity.json", import.meta.url), "utf8");
     const rawPlaceholder = JSON.parse(placeholderText);
     expect(detectPlaceholder(rawPlaceholder)).toBe(true);
+    // The vendor's own numbers stay: freshness and quantity are untouched, only
+    // truth and confidence move to flag the doubt (the 2026-09 vendor-numbers
+    // decision -- Headroom shows what Google reports instead of UNKNOWN).
     expect(parseObservations(placeholderText)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ meter_id: "antigravity:gemini", freshness: "failed", truth: "estimated", reason: AVAILABILITY_ONLY_REASON }),
+      expect.objectContaining({ meter_id: "antigravity:gemini", freshness: "fresh", truth: "estimated", confidence: 0.5, reason: IDLE_WINDOW_REASON, quantity: expect.objectContaining({ used: 0 }) }),
     ]));
     expect(detectPlaceholder(JSON.parse(realText))).toBe(false);
     expect(parseObservations(realText).filter((item) => item.principal_id === "antigravity")).toEqual(expect.arrayContaining([
@@ -40,7 +43,7 @@ describe("native engine conformance", () => {
     expect(detectPlaceholder(nonSynthetic)).toBe(false);
   });
 
-  it("does not alter local or not-enforced observations in a rejected snapshot", async () => {
+  it("does not alter local or not-enforced observations in a flagged snapshot", async () => {
     const placeholder = JSON.parse(await readFile(new URL("../fixtures/native/v0.56.4/antigravity-placeholder.json", import.meta.url), "utf8"));
     const absent = { ...placeholder[0], meter_id: "antigravity:claude-gpt", freshness: "not_enforced", quantity: null, resets_at: null };
     const local = { ...placeholder[0], principal_id: "gpu-box", meter_id: "gpu-box:capacity", source: "native:local", window: { kind: "state", minutes: null, enforcement: "soft" }, resets_at: null };

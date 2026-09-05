@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { endedLeaseMessage, formatMeters, printEventsOutput, thresholdReport } from "../src/cli.js";
-import { AVAILABILITY_ONLY_REASON } from "../src/engine/observation.js";
+import { IDLE_WINDOW_REASON, idleContradictionReason } from "../src/engine/observation.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -467,31 +467,71 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
-  it("normalizes availability-only batches, fails closed, and records recovery", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-store-placeholder-")); temporary.push(root);
+  it("shows an idle vendor-reported window with a doubt marker instead of failing it closed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-idle-doubt-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
-    const fetchedAt = "2026-09-03T19:38:37Z";
+    // fetched_at is "now" (not a fixed past date) so formatMeters' own
+    // staleness check -- which only applies to a genuinely fresh reading, not
+    // a failed one -- never fires here regardless of when this test runs.
+    const fetchedAt = new Date().toISOString();
     const fiveHour = observation({
       principal_id: "antigravity", meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 300, enforcement: "hard" },
-      quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, fetched_at: fetchedAt, observed_at: fetchedAt, resets_at: "2026-09-04T00:38:37Z",
+      quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, fetched_at: fetchedAt, observed_at: fetchedAt, resets_at: new Date(Date.now() + 300 * 60_000).toISOString(),
     });
-    const weekly = { ...fiveHour, window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const }, resets_at: "2026-09-10T19:38:37Z" };
+    const weekly = { ...fiveHour, window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const }, resets_at: new Date(Date.now() + 10_080 * 60_000).toISOString() };
     try {
+      // No prior history exists for either window, so there is nothing to
+      // contradict this idle reading: it is shown, not failed.
       store.insertAll([fiveHour, weekly]);
-      const failed = store.latestPerWindow("antigravity:gemini");
-      expect(failed).toEqual(expect.arrayContaining([
-        expect.objectContaining({ freshness: "failed", truth: "estimated", reason: AVAILABILITY_ONLY_REASON }),
+      const rows = store.latestPerWindow("antigravity:gemini");
+      expect(rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ freshness: "fresh", truth: "estimated", confidence: 0.5, reason: IDLE_WINDOW_REASON, quantity: expect.objectContaining({ used: 0 }) }),
       ]));
-      expect(formatMeters(failed, defaultPolicy)[0]).toContain("antigravity:gemini  5h UNKNOWN (availability-only payload; quota summary not served) | wk UNKNOWN (availability-only payload; quota summary not served)");
-      expect(canConsume(["antigravity:gemini"], new Map([["antigravity:gemini", failed]]), defaultPolicy, false, new Date(fetchedAt))).toMatchObject({ allowed: false, state: "UNKNOWN" });
+      // The vendor's own 0% is on the line, with the doubt marker appended --
+      // never "UNKNOWN" for a reading Headroom was actually given.
+      expect(formatMeters(rows, defaultPolicy)[0]).toContain("antigravity:gemini  5h 0%");
+      expect(formatMeters(rows, defaultPolicy)[0]).toContain("(idle, unverified)");
+      expect(formatMeters(rows, defaultPolicy)[0]).not.toContain("UNKNOWN");
+      // A shown-with-doubt reading is not fail-closed the way a genuinely
+      // failed/UNKNOWN one is: it reads as a normal (idle) window.
+      expect(canConsume(["antigravity:gemini"], new Map([["antigravity:gemini", rows]]), defaultPolicy, false, new Date(fetchedAt)).state).not.toBe("UNKNOWN");
+      expect(store.events("2026-09-03T00:00:00Z").filter((event) => event.meter_id === "antigravity:gemini")).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("demotes an idle reading to failed only when it contradicts a recent fresh reading with usage not yet reset", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-idle-contradiction-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    const window = { kind: "fixed" as const, minutes: 300, enforcement: "hard" as const };
+    const real = observation({
+      principal_id: "antigravity", meter_id: "antigravity:gemini", window,
+      quantity: { used: 42, limit: 100, remaining: 58, unit: "percent" },
+      fetched_at: "2026-09-03T18:00:00Z", observed_at: "2026-09-03T18:00:00Z", resets_at: "2026-09-03T23:00:00Z",
+    });
+    try {
+      store.insert(real);
+      // 30 minutes later (well within the 2h lookback and before the 5h
+      // window's own reset), the vendor reports the window idle -- exactly
+      // the shape normalizeObservations flags with IDLE_WINDOW_REASON.
+      const idleContradicting = { ...real, fetched_at: "2026-09-03T18:30:00Z", observed_at: "2026-09-03T18:30:00Z", quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" as const }, resets_at: "2026-09-03T23:30:00Z", reason: IDLE_WINDOW_REASON, truth: "estimated" as const, confidence: 0.5 };
+      const [stored] = store.insertAll([idleContradicting]);
+      expect(stored).toMatchObject({ freshness: "failed", truth: "estimated", confidence: 0, reason: idleContradictionReason(42) });
+      // A demoted reading reads UNKNOWN and blocks, the same as any other
+      // failed observation -- fed directly rather than round-tripped through
+      // latestPerWindow(), which is unrelated store history plumbing this
+      // test does not exercise.
+      expect(formatMeters([stored], defaultPolicy)[0]).toContain("UNKNOWN");
+      expect(canConsume(["antigravity:gemini"], new Map([["antigravity:gemini", stored]]), defaultPolicy)).toMatchObject({ allowed: false, state: "UNKNOWN" });
       expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "source_failed", origin: "inferred", confidence: 0.8, reason: AVAILABILITY_ONLY_REASON }),
+        expect.objectContaining({ kind: "source_failed", origin: "inferred", confidence: 0.8, reason: idleContradictionReason(42) }),
       ]));
 
-      store.insertAll([{ ...fiveHour, fetched_at: "2026-09-03T19:39:37Z", observed_at: "2026-09-03T19:39:37Z", quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" }, resets_at: "2026-09-03T23:10:00Z" }]);
-      expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "source_recovered", origin: "inferred", confidence: 0.8 }),
-      ]));
+      // A later idle reading with no such recent contradicting evidence (the
+      // reset has since passed) is shown, not failed -- the contradiction
+      // check only ever escalates a doubt, it never blanket-distrusts idle.
+      const idleAfterReset = { ...idleContradicting, fetched_at: "2026-09-04T00:00:00Z", observed_at: "2026-09-04T00:00:00Z", resets_at: "2026-09-04T05:00:00Z" };
+      const [afterReset] = store.insertAll([idleAfterReset]);
+      expect(afterReset).toMatchObject({ freshness: "fresh", truth: "estimated", reason: IDLE_WINDOW_REASON });
     } finally { store.close(); }
   });
 });

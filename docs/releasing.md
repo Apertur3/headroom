@@ -40,9 +40,11 @@ Release candidates, if ever needed, use `-rc.N` the same way.
    tag that does not match.
 3. The tag is `v<version>` on `master`, annotated, created by the maintainer and pushed after
    `npm run release:check` is green.
-4. The release workflow verifies on ubuntu, macos and windows, builds the tarball, attaches it to
-   a GitHub release with the changelog section as the body, and publishes to npm through the
-   trusted publisher (or `NPM_TOKEN` while that is not configured).
+4. The release workflow verifies on ubuntu and macos (the CI workflow already covers windows on
+   every push), builds the tarball on macos so it carries a real signed Claude probe, attaches it
+   to a GitHub release with the changelog section as the body, and publishes to npm with
+   `NPM_TOKEN` and npm provenance; the publish step is skipped, with a notice on the run, if
+   `NPM_TOKEN` isn't configured.
 5. A published version is never changed; a mistake gets the next number.
 
 ## Deprecations

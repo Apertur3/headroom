@@ -41,7 +41,7 @@ states and freshness. Capability routing stays yours, in `~/.headroom/routing.to
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
-- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_cost`, `quota_rate`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill` expose the same from a daemon (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
+- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_cost`, `quota_rate`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_route` (plus `quota_lease_start`, `quota_lease_end`, `quota_leases`) expose the same from a daemon (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
 
 ## Leases
 
