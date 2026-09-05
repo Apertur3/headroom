@@ -7,6 +7,9 @@
 secrets/
 .claude/settings.local.json
 
+# --- generated Claude probe binary (built by scripts/build-probe.sh; never committed) ---
+bin/probe/
+
 # --- dependencies / build ---
 node_modules/
 dist/

@@ -1,5 +1,5 @@
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { socketPath } from "../src/daemon.js";
@@ -94,5 +94,27 @@ describe("service generators", () => {
     expect(plist).toContain("<key>StandardOutPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
     expect(plist).toContain("<key>StandardErrorPath</key><string>/Users/alice/.headroom/logs/daemon.log</string>");
     expect(plist).toContain("<key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/alice/.local/bin:/opt/homebrew/bin");
+  });
+
+  it("a --dry-run install carries the full unit/plist/task text it would have written, on all three platforms", async () => {
+    const linux = await installService("/usr/bin/headroom", "linux", "/home/alice", "/usr/bin/node", true);
+    expect(linux.contents).toBe(serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", userInfo().username, "/home/alice"));
+    expect(linux.contents).toContain("[Unit]");
+
+    const darwin = await installService("/usr/bin/headroom", "darwin", "/Users/alice", "/usr/bin/node", true);
+    expect(darwin.contents).toBe(serviceContents("/usr/bin/headroom", "darwin", "/usr/bin/node", userInfo().username, "/Users/alice"));
+    expect(darwin.contents).toContain("<key>Label</key><string>com.headroom.daemon</string>");
+
+    const windows = await installService("cli.js", "win32", "C:\\Users\\alice", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }, "alice");
+    expect(windows.contents).toBe(serviceContents("cli.js", "win32", "node.exe", "alice", "C:\\Users\\alice", { LOCALAPPDATA: "C:\\Users\\alice\\AppData\\Local" }));
+    expect(windows.contents).toContain("<Task version=\"1.4\"");
+
+    // A real (non-dry-run) install still returns the exact contents it wrote to disk.
+    const root = await mkdtemp(join(tmpdir(), "headroom-service-write-"));
+    try {
+      const written = await installService("/usr/bin/headroom", "linux", root, "/usr/bin/node", false);
+      expect(written.contents).toBe(serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", userInfo().username, root));
+      await expect(readFile(written.path, "utf8")).resolves.toBe(written.contents);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

@@ -10,6 +10,7 @@ import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepaliv
 import { appendDaemonLog } from "./logs.js";
 import { executablePath, headroomHome } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals } from "./policy.js";
+import { withResetsIn } from "./resets.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -228,7 +229,7 @@ export class HeadroomDaemon {
       switch (request.method) {
         case "status":
           await this.poll(undefined, false);
-          result = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          result = withResetsIn(this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id)));
           break;
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";

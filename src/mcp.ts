@@ -6,6 +6,7 @@ import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals } from "./policy.js";
 import { readAccounts } from "./registry.js";
+import { withResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type ProviderAccount } from "./types.js";
@@ -98,10 +99,10 @@ export async function directStatus(): Promise<DirectResult> {
     const backoff = store.directPollBackoff();
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
-      return { source: "direct", observations: store.latestPerWindow(), failures: [] };
+      return { source: "direct", observations: withResetsIn(store.latestPerWindow()), failures: [] };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: store.latestPerWindow(), failures: [] };
+      return { source: "direct", observations: withResetsIn(store.latestPerWindow()), failures: [] };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -110,14 +111,14 @@ export async function directStatus(): Promise<DirectResult> {
     const accounts = await readAccounts();
     const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
     await syncClaudeGrantState(store, claudeIds);
-    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store) });
+    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
     store.insertAll(polled.observations);
     for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);
     store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: store.latestPerWindow(), failures: polled.failures };
+    return { source: "direct", observations: withResetsIn(store.latestPerWindow()), failures: polled.failures };
   } finally { store.close(); }
 }
 

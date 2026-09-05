@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agyLoginStateFromLog, AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
-import { selectAntigravitySource } from "../src/collector.js";
-import type { Observation } from "../src/types.js";
+import { noDaemonObservations } from "../src/adapters/antigravity.js";
+import { pollAccounts, selectAntigravitySource } from "../src/collector.js";
+import type { Observation, ProviderAccount } from "../src/types.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -27,6 +28,41 @@ describe("Antigravity source order", () => {
     expect(selectAntigravitySource(warm, remote, "antigravity")).toBe(warm);
     const cold = [...warm.slice(0, 2), row("claude-gpt", 10_080, "local:antigravity:warm", "failed")];
     expect(selectAntigravitySource(cold, remote, "antigravity")).toBe(remote);
+  });
+});
+
+describe("Antigravity one-shot reads with no daemon", () => {
+  it("noDaemonObservations names the daemon-kept agy fix, across every meter and window, without contacting a vendor", () => {
+    const account: ProviderAccount = { name: "antigravity", vendor: "antigravity", location: "agy", adapter: "native-ts" };
+    const rows = noDaemonObservations(account, new Date("2026-09-03T12:00:00Z"));
+    expect(rows).toHaveLength(4); // gemini + claude-gpt, each 5h and weekly
+    expect(rows.every((item) => item.freshness === "failed" && item.reason === "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service")).toBe(true);
+  });
+
+  it("pollAccounts with noDaemon skips the deprecated remote OAuth fallback entirely, never calling fetch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-antigravity-nodaemon-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "antigravity"',
+      'vendor = "antigravity"',
+      'location = "agy"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      const result = await pollAccounts(undefined, { noDaemon: true });
+      const rows = result.observations.filter((item) => item.principal_id === "antigravity");
+      expect(rows).toHaveLength(4);
+      expect(rows.every((item) => item.reason === "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service")).toBe(true);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+    }
   });
 });
 

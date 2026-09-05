@@ -77,6 +77,18 @@ function failed(account: ProviderAccount, reason: string, now: string): Observat
   })));
 }
 
+/**
+ * Synthetic failed observations for a one-shot CLI/MCP read with no daemon
+ * responding. Built without ever attempting the deprecated remote Google
+ * OAuth fallback: on a fresh install the account was discovered from `agy`
+ * on PATH, not a Gemini CLI OAuth credential file, so that fallback is
+ * doomed anyway and would only surface a confusing "OAuth client
+ * unavailable" error instead of the one actionable fix.
+ */
+export function noDaemonObservations(account: ProviderAccount, now = new Date()): Observation[] {
+  return failed(account, "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service", now.toISOString());
+}
+
 /** The quota request is exactly `{ project?: string }`; Google's response buckets carry modelId, remainingFraction and resetTime. */
 function requestBody(projectId?: string): string { return JSON.stringify(projectId ? { project: projectId } : {}); }
 function requestHeaders(token: string): HeadersInit { return { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "User-Agent": "antigravity" }; }

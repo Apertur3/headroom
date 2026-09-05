@@ -9,7 +9,6 @@ import { outboundFetch, redact } from "../security.js";
 import { assertVendorResponseLimits, vendorJson } from "../limits.js";
 import { credentialPath } from "../paths.js";
 import { executablePath } from "../paths.js";
-import { nativeEnginePath } from "../engine/native/run.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -61,7 +60,9 @@ export function claudeGrantNeededReason(principalId: string): string {
 }
 
 async function claudeProbe(configDir: string): Promise<string> {
-  const helper = await keychainHelper();
+  let helper: string | undefined;
+  try { helper = await keychainHelper(); }
+  catch (error) { throw new ClaudeProbeError("unavailable", error instanceof Error ? error.message : "Claude probe unavailable"); }
   if (!helper) throw new ClaudeProbeError("unavailable", "Claude probe not built; run npm run engine:build");
   try {
     const { stdout } = await execFileAsync(helper, ["--config-dir", resolve(configDir)], { timeout: TIMEOUT_MS + 2_000, maxBuffer: 1024 * 1024 + 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
@@ -73,12 +74,14 @@ async function claudeProbe(configDir: string): Promise<string> {
     const stderr = result.stderr ?? "";
     if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied");
     if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access timed out");
-    if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; run: claude`);
+    if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; ${claudeCommandForDirectory(configDir)}`);
     // Parenthesized status code, matching ProviderHTTPError's own format:
     // collector.ts's and daemon.ts's shared backoff detection looks for this
     // exact shape, so a probe-side 403/429 backs off the same way a direct
-    // fetch's would, instead of being silently discarded.
-    if (stderr.includes("HEADROOM_PROBE_FORBIDDEN")) throw new ClaudeProbeError("missing", "Claude usage request failed (403)");
+    // fetch's would, instead of being silently discarded. The wording itself
+    // is the same actionable "rejected the token" fix observeClaude() uses
+    // for a live 401/403 over the direct-fetch path.
+    if (stderr.includes("HEADROOM_PROBE_FORBIDDEN")) throw new ClaudeProbeError("missing", `Claude rejected the token (403); ${claudeCommandForDirectory(configDir)}`);
     if (stderr.includes("HEADROOM_PROBE_RATE_LIMITED")) throw new ClaudeProbeError("missing", "Claude usage request failed (429)");
     if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
     throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
@@ -90,18 +93,63 @@ export async function grantClaudeKeychainAccess(configDir: string): Promise<void
   await claudeProbe(configDir);
 }
 
+/** Thrown only when a packaged probe (bin/probe/darwin) is physically present
+ * but fails SHA-256 verification: a real integrity problem the caller must
+ * surface, distinct from "not built yet" (which silently falls through to
+ * the next candidate, or ultimately to probeBinaryHash()/claudeProbe()'s own
+ * "not built" message). */
+export class ProbeVerificationError extends Error {}
+
+/** Verifies bin/probe/darwin/headroom-claude-probe against its sibling SHA256
+ * file (written by scripts/build-probe.sh). Returns undefined -- never
+ * throws for "not packaged here" -- when the directory or binary is simply
+ * absent, e.g. a source checkout before packing, or any non-darwin platform. */
+export async function verifiedPackagedProbe(root: string): Promise<string | undefined> {
+  const directory = join(root, "bin", "probe", "darwin");
+  const binaryPath = join(directory, "headroom-claude-probe");
+  const shaPath = join(directory, "SHA256");
+  try { await lstat(binaryPath); }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  const verified = await executablePath(binaryPath);
+  let recorded: string;
+  try { recorded = (await readFile(shaPath, "utf8")).trim().split(/\s+/)[0] ?? ""; }
+  catch { throw new ProbeVerificationError(`Claude probe SHA-256 record missing (${shaPath}); reinstall headroomd`); }
+  const actual = createHash("sha256").update(await readFile(verified)).digest("hex");
+  if (!recorded || actual !== recorded) throw new ProbeVerificationError("Claude probe SHA-256 verification failed; reinstall headroomd");
+  return verified;
+}
+
+/**
+ * Resolution order: HEADROOM_PROBE_PATH (a development override, never
+ * SHA-256 verified -- the operator named it explicitly), the packaged macOS
+ * probe shipped in the npm tarball (bin/probe/darwin, SHA-256 verified
+ * against every use), then a repo dev build (engine/.build/release, the
+ * output of `npm run engine:build`, confined to this repository checkout).
+ * A verification failure on the packaged probe propagates as
+ * ProbeVerificationError instead of silently falling through, so a
+ * tampered or corrupted install never quietly downgrades to "not built".
+ */
 async function keychainHelper(): Promise<string | undefined> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  const native = await nativeEnginePath();
-  const candidates = [native ? join(dirname(native), "headroom-claude-probe") : "", join(root, "engine", ".build", "release", "headroom-claude-probe")];
-  for (const candidate of candidates) try { return await executablePath(candidate, { repoRoot: root, development: true }); } catch { /* next candidate */ }
+  const override = process.env.HEADROOM_PROBE_PATH;
+  if (override) { try { return await executablePath(override); } catch { return undefined; } }
+  if (process.platform === "darwin") {
+    const packaged = await verifiedPackagedProbe(root);
+    if (packaged) return packaged;
+  }
+  const candidate = join(root, "engine", ".build", "release", "headroom-claude-probe");
+  try { return await executablePath(candidate, { repoRoot: root, development: true }); } catch { /* not a repo dev build either */ }
   return undefined;
 }
 
 /** sha256 of the resolved Claude probe binary, or undefined when none is
- * built/installed. Used only to detect a rebuild (see syncClaudeGrantState). */
+ * built/installed or the packaged probe fails verification. Used only to
+ * detect a rebuild (see syncClaudeGrantState); a verification failure here
+ * must never crash a background caller like doctor or an ordinary poll, so
+ * it is treated the same as "no probe available". */
 export async function probeBinaryHash(): Promise<string | undefined> {
-  const helper = await keychainHelper();
+  let helper: string | undefined;
+  try { helper = await keychainHelper(); } catch { return undefined; }
   if (!helper) return undefined;
   return createHash("sha256").update(await readFile(helper)).digest("hex");
 }
@@ -173,10 +221,12 @@ export async function syncClaudeGrantState(
 
 interface Credential { token: string; expired: boolean; }
 
-function claudeCommand(account: ProviderAccount): string {
-  const directory = resolve(account.location);
+function claudeCommandForDirectory(configDir: string): string {
+  const directory = resolve(configDir);
   return directory === resolve(homedir(), ".claude") ? "run: claude" : `run: CLAUDE_CONFIG_DIR=${directory} claude`;
 }
+
+function claudeCommand(account: ProviderAccount): string { return claudeCommandForDirectory(account.location); }
 
 function shape(value: unknown, path = "$"): Array<{ path: string; kind: string }> {
   const kind = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
@@ -293,7 +343,12 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     return observationsFromClaudeUsage(await vendorJson(response), account, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    const reason = error instanceof ProviderHTTPError ? error.message
+    // A live 401/403 (a well-formed token the vendor rejected outright) is
+    // just as actionable as a locally detected "no credentials" -- name the
+    // exact fix instead of the bare "Claude usage request failed (401)",
+    // which told the operator nothing to do about it.
+    const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Claude rejected the token (${error.status}); ${claudeCommand(account)}`
+      : error instanceof ProviderHTTPError ? error.message
       : error instanceof ClaudeProbeError && error.message.startsWith("token expired") ? `token expired; ${claudeCommand(account)}`
       : error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout") ? claudeGrantNeededReason(account.name)
       : error instanceof ClaudeProbeError ? error.message

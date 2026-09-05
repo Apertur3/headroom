@@ -67,5 +67,22 @@ fi
 file_count="$(find "$pkg_dir" -type f | wc -l | tr -d ' ')"
 echo "PASS packed tarball canary scan ($tarball_name, $file_count files, none suspicious)"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  step "packaged Claude probe (macOS)"
+  probe="$pkg_dir/bin/probe/darwin/headroom-claude-probe"
+  sha_file="$pkg_dir/bin/probe/darwin/SHA256"
+  if [[ ! -f "$probe" || ! -f "$sha_file" ]]; then
+    echo "FAIL packaged Claude probe missing from the tarball (expected $probe and $sha_file)"
+    exit 1
+  fi
+  recorded="$(awk '{print $1}' "$sha_file")"
+  actual="$(shasum -a 256 "$probe" | awk '{print $1}')"
+  if [[ -z "$recorded" || "$recorded" != "$actual" ]]; then
+    echo "FAIL packaged Claude probe SHA-256 mismatch (recorded $recorded, actual $actual)"
+    exit 1
+  fi
+  echo "PASS packaged Claude probe present and verified ($probe)"
+fi
+
 echo
 echo "release:check passed"

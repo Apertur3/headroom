@@ -3,7 +3,7 @@
 // tries to `require("node:sqlite")`, which throws a raw stack trace on Node
 // older than the version that ships that built-in unflagged. This file is
 // hand-written, not compiled from src/, so it stays tiny and dependency-free.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -80,6 +80,25 @@ export function childEnvironment(env = process.env, proxyConfigured = policyProx
   return output;
 }
 
+/** Signals a launcher process worth forwarding: the ones a shell, a service
+ * manager, or an operator's `kill` are actually likely to send it. */
+const FORWARDED_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+/**
+ * Sends `signal` on to `child`. On Windows, `ChildProcess#kill()` only
+ * terminates the immediate child process, never anything it spawned itself
+ * (e.g. the daemon's own supervised processes); `taskkill /T` terminates the
+ * whole process tree instead, which is the closest Windows equivalent of a
+ * POSIX signal reaching every descendant. Never throws: the child may
+ * already have exited by the time a signal arrives.
+ */
+export function forwardSignal(child, signal, platform = process.platform, killTree = spawnSync) {
+  try {
+    if (platform === "win32") { killTree("taskkill", ["/pid", String(child.pid), "/T", "/F"]); return; }
+    child.kill(signal);
+  } catch { /* the child may already be gone */ }
+}
+
 function main() {
   if (!supportsBuiltinSqlite(process.versions.node)) {
     process.stderr.write(
@@ -91,12 +110,20 @@ function main() {
 
   const here = dirname(fileURLToPath(import.meta.url));
   const target = join(here, "..", "dist", "cli.js");
-  const result = spawnSync(process.execPath, [warningSuppressionFlag(process.versions.node), target, ...process.argv.slice(2)], { stdio: "inherit", env: childEnvironment() });
-  if (result.error) {
-    process.stderr.write(`headroom error: ${result.error.message}\n`);
+  // Spawned asynchronously (not spawnSync) specifically so this launcher can
+  // stay alive just long enough to forward a signal and wait for the real
+  // exit: a long-running command (the daemon, most notably) must not be
+  // orphaned -- left holding the socket -- just because something killed the
+  // launcher's own PID without knowing a second process was doing the work.
+  const child = spawn(process.execPath, [warningSuppressionFlag(process.versions.node), target, ...process.argv.slice(2)], { stdio: "inherit", env: childEnvironment() });
+  for (const signal of FORWARDED_SIGNALS) process.on(signal, () => forwardSignal(child, signal));
+  child.on("error", (error) => {
+    process.stderr.write(`headroom error: ${error.message}\n`);
     process.exit(1);
-  }
-  process.exit(result.status ?? (result.signal ? 1 : 0));
+  });
+  child.on("exit", (code, signal) => {
+    process.exit(code ?? (signal ? 1 : 0));
+  });
 }
 
 /**
