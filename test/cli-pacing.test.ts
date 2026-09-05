@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { formatMeters, main } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { defaultPolicy } from "../src/policy.js";
@@ -58,6 +59,21 @@ function captureLog(): { logs: string[]; restore: () => void } {
   return { logs, restore: () => spy.mockRestore() };
 }
 
+/** The exact shape a pending Keychain grant leaves behind (see
+ * adapters/claude.ts's failed()/observeClaude()): window null (not just
+ * quantity), freshness "failed", and the actionable grant-needed reason.
+ * A meter in this state has no window at all for rate/plan/gate/fill/wait to
+ * find, which is the "meter's reading is UNKNOWN" case each of them must
+ * report by name rather than a bare CLI usage error. */
+function claudeGrantNeeded(meterId = "claude-main:all", principal = "claude-main"): Observation {
+  const now = new Date().toISOString();
+  return {
+    principal_id: principal, meter_id: meterId, window: null, quantity: null, resets_at: null,
+    observed_at: now, fetched_at: now, source: "fixture", truth: "estimated", freshness: "failed",
+    confidence: 0, reason: claudeGrantNeededReason(principal), adapter_version: "fixture", upstream_schema_version: "fixture",
+  };
+}
+
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
@@ -95,6 +111,27 @@ describe("headroom rate", () => {
     const lines = JSON.parse(logs[0]);
     expect(lines).toEqual([expect.objectContaining({ meter: "claude-main:all", window_minutes: 300 })]);
     expect(lines[0].burn_percent_per_hour).toBeCloseTo(180, 0);
+  });
+
+  it("renders an UNKNOWN meter (e.g. a pending Keychain grant) as 'meter  UNKNOWN (reason)' and still exits 0", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(claudeGrantNeeded());
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["rate", "--meter", "claude-main:all"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
+  });
+
+  it("still rejects a genuine CLI usage error instead of the UNKNOWN reading's exit 0", async () => {
+    const home = await seededHome();
+    await withHeadroomHome(home, async () => {
+      await expect(main(["rate", "--meter", "claude-main:all", "--minutes", "not-a-number"])).rejects.toThrow("--minutes must be a positive number");
+    });
   });
 });
 
@@ -135,6 +172,27 @@ describe("headroom plan", () => {
     expect(result).toMatchObject({ meter: "claude-main:all", weekly_remaining_percent: 60, reserve_percent: 10, remaining_5h_windows: 5 });
     expect(result.points_per_5h_window).toBeCloseTo(10, 6);
   });
+
+  it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)' and exits 0 instead of a generic error", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(claudeGrantNeeded());
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["plan", "--meter", "claude-main:all", "--until", "reset", "--reserve", "10"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
+  });
+
+  it("still rejects a genuine CLI usage error instead of the UNKNOWN reading's exit 0", async () => {
+    const home = await seededHome();
+    await withHeadroomHome(home, async () => {
+      await expect(main(["plan", "--until", "reset", "--reserve", "10"])).rejects.toThrow("Usage: headroom plan");
+    });
+  });
 });
 
 describe("headroom gate", () => {
@@ -155,6 +213,20 @@ describe("headroom gate", () => {
       await expect(main(["gate", "--need", "5h:5", "--owner", "x"])).rejects.toThrow("--meter <meter_id> | --class <action-class>");
     });
   });
+
+  it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)', not a plain NO, and still exits 2", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(claudeGrantNeeded());
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["gate", "--need", "5h:15", "--meter", "claude-main:all", "--owner", "x", "--plan-share", "65"])).toBe(2);
+      });
+    } finally { restore(); }
+    expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
+  });
 });
 
 describe("headroom wait", () => {
@@ -168,11 +240,25 @@ describe("headroom wait", () => {
     });
   });
 
-  it("exits 1 when the meter has no windowed reading to wait on", async () => {
+  it("exits 0, not 1, when the meter has no windowed reading to wait on -- an unknown reading, not a CLI failure", async () => {
     const home = await seededHome();
     await withHeadroomHome(home, async () => {
-      expect(await main(["wait", "--meter", "claude-main:all", "--until-reset"])).toBe(1);
+      expect(await main(["wait", "--meter", "claude-main:all", "--until-reset"])).toBe(0);
     });
+  });
+
+  it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)' and exits 0", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(claudeGrantNeeded());
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["wait", "--meter", "claude-main:all", "--until-reset"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
   });
 
   it("accepts a seconds --max like 5s (not just m/h/d)", async () => {
@@ -221,6 +307,27 @@ describe("headroom fill", () => {
     store2.close();
     await withHeadroomHome(home2, async () => {
       expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x"])).toBe(2);
+    });
+  });
+
+  it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)' and exits 0 instead of a generic error", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(claudeGrantNeeded());
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--owner", "x"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
+  });
+
+  it("still rejects a genuine CLI usage error instead of the UNKNOWN reading's exit 0", async () => {
+    const home = await seededHome();
+    await withHeadroomHome(home, async () => {
+      await expect(main(["fill", "--until-reset", "--owner", "x"])).rejects.toThrow("Usage: headroom fill");
     });
   });
 });

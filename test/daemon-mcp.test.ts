@@ -126,22 +126,41 @@ describe("daemon JSON-RPC", () => {
 
   it("starts on a private temp socket and coalesces concurrent status polls", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    // The status handler filters observations by the daemon's own account
+    // registry, which is read from the *global* headroom home (HEADROOM_HOME,
+    // or ~/.headroom) -- not the `home` passed to HeadroomDaemon.create. Left
+    // unscoped, that lookup falls through to whatever accounts.toml happens to
+    // exist on the machine running the test: empty on a clean CI runner (so
+    // the filter drops every observation and this assertion sees `[]`), or a
+    // real accounts.toml with a matching account on a dev machine that dogfoods
+    // headroom, which only passes by accident. Pin it to this temp root instead.
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "codex-main"',
+      'vendor = "codex"',
+      'location = "/nonexistent/.codex"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
     const path = join(root, "headroom.sock");
     let polls = 0;
-    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; await new Promise((resolve) => setTimeout(resolve, 15)); return { observations: [fixture()], failures: [] }; } });
-    try { await daemon.start(); }
-    catch (error: unknown) {
-      // The hosted sandbox forbids AF_UNIX listen(2); local/macOS CI runs the
-      // round-trip below. Treat only that environmental restriction as skipped.
-      if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
-      throw error;
-    }
-    try {
-      const [first, second] = await Promise.all([rpc(path, "status"), rpc(path, "status")]);
-      expect(first).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
-      expect(second).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
-      expect(polls).toBe(1);
-    } finally { await daemon.stop(); }
+    await withHeadroomHome(root, async () => {
+      const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; await new Promise((resolve) => setTimeout(resolve, 15)); return { observations: [fixture()], failures: [] }; } });
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        // The hosted sandbox forbids AF_UNIX listen(2); local/macOS CI runs the
+        // round-trip below. Treat only that environmental restriction as skipped.
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
+      try {
+        const [first, second] = await Promise.all([rpc(path, "status"), rpc(path, "status")]);
+        expect(first).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
+        expect(second).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
+        expect(polls).toBe(1);
+      } finally { await daemon.stop(); }
+    });
   });
 });
 

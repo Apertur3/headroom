@@ -193,7 +193,12 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
   if (!checked.length) {
     const single = typeof meter === "string" ? meter : Array.isArray(meter) && meter.length === 1 ? meter[0] : undefined;
     const label = typeof meter === "string" ? meter : Array.isArray(meter) ? meter.join(", ") : undefined;
-    return { allowed: false, reason: single ? meterUnknownReason(store, single, `no windowed reading for ${single}`) : label ? `no windowed reading for ${label}` : "no meters configured", meters_checked: checked };
+    // A named target (--meter or --class) with no windowed reading at all is
+    // the meter's usage being unknown (a failed/never-seen read), not a
+    // genuine "doesn't fit" refusal; "no meters configured" (no target named
+    // and the store is empty) is a distinct configuration state and keeps
+    // the plain refusal rendering.
+    return { allowed: false, reason: single ? meterUnknownReason(store, single, `no windowed reading for ${single}`) : label ? `no windowed reading for ${label}` : "no meters configured", meters_checked: checked, ...((single || label) ? { unknown: true as const } : {}) };
   }
   const lanesRemaining = options.actionClass && lastShort?.quantity?.unit === "percent" ? (() => {
     const learned = store.learnedCost(options.actionClass)[0];
