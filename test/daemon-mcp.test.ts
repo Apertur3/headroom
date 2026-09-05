@@ -416,6 +416,55 @@ describe("MCP direct status shares a persisted backoff across calls", () => {
       expect((result.observations as Observation[]).some((item) => item.meter_id === "codex-main:main")).toBe(true);
     });
   });
+
+  it("names the real backoff deadline on a cached 429 failure instead of repeating the original vendor error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-backoff-429-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "poll_interval_minutes = 5\n", { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      const failedAt = new Date().toISOString();
+      store.insert({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: null, quantity: null, resets_at: null,
+        observed_at: failedAt, fetched_at: failedAt, source: "fixture", truth: "estimated", freshness: "failed",
+        confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture", reason: "Codex usage request failed (429)",
+      });
+      const until = Date.now() + 10 * 60_000;
+      store.setDirectPollBackoff({ lastPollAt: Date.now(), until, failures: 1 });
+      store.close();
+      const result = await directStatus();
+      const row = (result.observations as Observation[]).find((item) => item.meter_id === "codex-main:main");
+      expect(row?.reason).toMatch(/^rate limited by the vendor \(429\); backing off until \d\d:\d\d$/);
+    });
+  });
+});
+
+describe("daemon status names the real backoff deadline on a live 429", () => {
+  it("rewrites a stored 429 failure's reason once the poller's own failure has set the daemon's in-memory backoff", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-status-backoff-")); temporary.push(root);
+    const failedAt = new Date().toISOString();
+    const rateLimited: Observation = {
+      principal_id: "codex-main", meter_id: "codex-main:main", window: null, quantity: null, resets_at: null,
+      observed_at: failedAt, fetched_at: failedAt, source: "fixture", truth: "estimated", freshness: "failed",
+      confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture", reason: "Codex usage request failed (429)",
+    };
+    const daemon = await HeadroomDaemon.create({
+      home: root, path: join(root, "headroom.sock"),
+      poller: async () => ({ observations: [rateLimited], failures: ["codex-main source failed: Codex usage request failed (429)"] }),
+    });
+    try {
+      // A single "status" call both runs the poll (which stores the failure
+      // and sets the daemon's in-memory backoff for this cycle) and reads it
+      // straight back -- the backoff is already live by the time the store
+      // read below happens, so the rewrite applies within this one call.
+      const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"status"}');
+      const row = (reply.result as Observation[]).find((item) => item.meter_id === "codex-main:main");
+      expect(row?.reason).toMatch(/^rate limited by the vendor \(429\); backing off until \d\d:\d\d$/);
+      // The backoff itself took effect too: an immediate forced re-poll is refused.
+      const second = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":2,"method":"refresh","params":{}}');
+      expect(second.result).toEqual({ rate_limited: true });
+    } finally { await daemon.stop(); }
+  });
 });
 
 describe("not enforced windows", () => {

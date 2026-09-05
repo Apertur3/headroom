@@ -4,6 +4,8 @@ import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { claudeGrantNeededObservations, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
+import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
+import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
 import { noDaemonObservations, observeAntigravity } from "./adapters/antigravity.js";
 import { observeLocal } from "./engine/local.js";
@@ -22,8 +24,11 @@ export interface PollResult {
    * a gate-blocked skip render the identical failed reason on purpose -- so
    * every caller (daemon, CLI, MCP) audits from this field instead of
    * inferring an outcome from the observation source. Absent when no Claude
-   * principal was polled. */
-  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed">;
+   * principal was polled. "skipped: statusline fresh" covers the zero-auth
+   * statusline snapshot path (see adapters/claude-statusline.ts): the probe
+   * was never attempted because a fresh-enough snapshot already answered
+   * this principal. */
+  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh">;
 }
 export interface PollOptions {
   /** Set only by the daemon while it owns a warmed `agy` PTY. */
@@ -61,6 +66,38 @@ export interface AntigravityLocalRead {
  */
 export const PROTECTED_STATUS_PATTERN = /\((?:401|403|429)\)|\bHTTP (?:401|403|429)\b/;
 
+/** A live vendor rate-limit response specifically (not the broader 401/403
+ * territory PROTECTED_STATUS_PATTERN also covers): the one case a caller
+ * currently serving a cached reading during backoff can name a real,
+ * upcoming deadline for, rather than repeating the original attempt's
+ * now-stale failure text. */
+const RATE_LIMIT_STATUS_PATTERN = /\(429\)|\bHTTP 429\b/;
+
+/** "rate limited by the vendor (429); backing off until HH:MM" -- local
+ * time, matching cli.ts's/resets.ts's other short clock-time formatting. */
+export function backoffReason(untilMs: number): string {
+  return `rate limited by the vendor (429); backing off until ${new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(untilMs))}`;
+}
+
+/**
+ * Rewrites the reason of a failed, currently-backed-off 429 observation to
+ * name the real backoff deadline, so a caller serving a cached reading
+ * during an active backoff window says when it will actually try again
+ * instead of repeating whatever the original vendor error said (which only
+ * gets staler the longer the backoff runs). `backoffUntil` resolves a
+ * principal id to its current backoff deadline (epoch ms), or undefined/past
+ * when that principal isn't currently backed off; a 401/403 failure (not a
+ * rate limit) and any non-failed observation are returned unchanged.
+ */
+export function withBackoffReasons<T extends Observation>(observations: T[], backoffUntil: (principalId: string) => number | undefined, now = Date.now()): T[] {
+  return observations.map((item) => {
+    if (item.freshness !== "failed" || !item.reason || !RATE_LIMIT_STATUS_PATTERN.test(item.reason)) return item;
+    const until = backoffUntil(item.principal_id);
+    if (until === undefined || until <= now) return item;
+    return { ...item, reason: backoffReason(until) };
+  });
+}
+
 const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
 const ANTIGRAVITY_WINDOWS = [300, 10_080];
 
@@ -82,15 +119,37 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // Claude always stays in the TypeScript adapter: on macOS it delegates the
   // credential read and request to the separately-granted Claude probe.
   const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
-  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed"> = {};
+  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh"> = {};
+  const claudePrincipalsPresent = tsAccounts.some((account) => account.vendor === "claude");
+  // Read once per poll, only when there is a Claude principal to check at
+  // all: this is the sole reason the collector reads policy.toml.
+  const statuslineDirs = claudePrincipalsPresent ? statuslineSnapshotDirs((await readPolicy()).statusline_snapshot_dirs) : [];
   for (const account of tsAccounts) {
+    if (account.vendor === "claude") {
+      // Tried before the grant gate below, and before ever touching the
+      // probe: a fresh statusline snapshot answers this principal with no
+      // Keychain access at all, so a principal the operator has never
+      // granted (or one currently blocked pending a grant) still reads,
+      // exactly the point of Ask 0 in the 2026-09-05 dogfood report.
+      const snapshot = await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
+      if (snapshot) {
+        observations.push(...observationsFromStatuslineSnapshot(snapshot, account.name, new Date()));
+        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
+        continue;
+      }
+    }
     if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
       observations.push(...claudeGrantNeededObservations(account));
       claudeProbeOutcomes[account.name] = "skipped: grant needed";
       continue;
     }
     if (account.vendor === "claude") claudeProbeOutcomes[account.name] = "called";
-    const result = account.vendor === "claude" ? await observeClaude(account) : await observeCodex(account);
+    // The pinned probe path (once one exists -- see store.ts's probePath()):
+    // every poll uses exactly the binary this Headroom home was granted
+    // under, never silently switching to a different candidate that happens
+    // to resolve too (a repo checkout built alongside an existing global
+    // install, for one).
+    const result = account.vendor === "claude" ? await observeClaude(account, { probePath: options.claudeGrant?.probePath() }) : await observeCodex(account);
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
       if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();

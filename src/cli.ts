@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { realpathSync } from "node:fs";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
 import { doctor } from "./doctor.js";
@@ -8,6 +12,7 @@ import { engineStatus, installEngine, installNativeEngine } from "./engine/codex
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
+import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
@@ -16,14 +21,16 @@ import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecis
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
-import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, type RateLine } from "./orchestrator-reads.js";
+import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { migrateLegacyHome } from "./paths.js";
+import { headroomHome, migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 import { installService, uninstallService } from "./service.js";
+import { modelTokenShare } from "./session-logs.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount } from "./types.js";
+import { headroomVersion } from "./version.js";
 
 function since(value: string | undefined): string {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "24h");
@@ -403,23 +410,34 @@ async function plan(argv: string[]): Promise<number> {
 async function gate(argv: string[]): Promise<number> {
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class>) --owner <name> [--plan] [--plan-share N] [--json]";
+  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share N] [--json]";
   if (!owner) throw new Error(usage);
   const needs: GateNeed[] = [];
   for (let index = 0; index < argv.length; index += 1) if (argv[index] === "--need") needs.push(parseGateNeed(argv[index + 1] ?? ""));
   if (!needs.length) throw new Error("--need is required (5h:N or wk:N)");
   const meter = option(argv, "--meter");
   const actionClass = option(argv, "--class");
+  const model = option(argv, "--model");
   // An omitted target used to fail closed silently over every known meter,
   // which read as a plain "NO" against whichever meter happened to sort
   // first rather than the one the caller actually meant.
-  if (!meter && !actionClass) throw new Error(usage);
+  if (!meter && !actionClass && !model) throw new Error(usage);
   let target: string | string[] | undefined = meter;
   if (!meter && actionClass) {
     const routing = await readRouting();
     const meters = routing.consumes[actionClass];
     if (!meters) throw new Error(`Unknown action class: ${actionClass}`);
     target = meters;
+  }
+  // `--model fable` is a resolved shorthand for every configured Claude
+  // principal's own `<principal>:fable` (or any other model-scoped) meter --
+  // resolved here, client-side, so the daemon and MCP paths never need to
+  // know the concept exists; they just see the same meter list `--meter`
+  // would have given them directly.
+  if (!meter && !actionClass && model) {
+    const claudeAccounts = (await readAccounts()).filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude");
+    if (!claudeAccounts.length) throw new Error("--model requires at least one configured Claude principal");
+    target = claudeAccounts.map((account) => `${account.name}:${model}`);
   }
   const usePlan = argv.includes("--plan");
   const planShareValue = option(argv, "--plan-share");
@@ -518,14 +536,112 @@ async function fill(argv: string[]): Promise<number> {
   return result.lanes && result.lanes.lanes > 0 ? 0 : 2;
 }
 
+/**
+ * Direct read only, deliberately: unlike status/can/gate/fill, `route` is a
+ * deliberate, occasional operator (or orchestrator) call before dispatching
+ * one lane, not a hot path a daemon needs to cache -- so it always opens its
+ * own store rather than adding a daemon RPC case and an MCP forwarding path
+ * for a command this infrequent.
+ */
+async function route(argv: string[]): Promise<number> {
+  const ownerAt = argv.indexOf("--owner");
+  const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
+  const actionClass = option(argv, "--class");
+  const usage = "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]";
+  if (!owner || !actionClass) throw new Error(usage);
+  const routing = await readRouting();
+  if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
+  const meters = routing.consumes[actionClass];
+  if (!meters) throw new Error(`Unknown action class: ${actionClass}`);
+  const accounts = await readAccounts();
+  const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+  if (unknownMeters.length) throw new Error(`Routing action class ${actionClass} names unknown meter(s): ${unknownMeters.join(", ")}`);
+  const policy = await readPolicy();
+  const store = await HeadroomStore.open();
+  let result: RouteResult;
+  try {
+    result = routeFor(store, meters, accounts, policy, argv.includes("--allow-unknown"), new Date());
+    store.audit("cli", "route", actionClass, result.principal ? "yes" : "no");
+  } finally { store.close(); }
+  if (argv.includes("--json")) { console.log(JSON.stringify(result)); return result.principal ? 0 : 2; }
+  if (!result.principal) {
+    console.log(`no principal fits ${actionClass} (${result.reason})`);
+    for (const candidate of result.candidates) console.log(`  ${candidate.principal} ${candidate.state} (${candidate.reason})`);
+    return 2;
+  }
+  const environment = Object.entries(result.environment).map(([key, value]) => `${key}=${value}`).join(" ");
+  console.log(`${result.principal}${environment ? ` ${environment}` : ""}  (${result.reason})`);
+  return 0;
+}
+
+/**
+ * `headroom --principal X --models`: a best-effort LOCAL estimate of
+ * per-model token share over the current 5h window, read straight from
+ * Claude Code's own session logs (never a vendor call). The vendor's own
+ * `/usage` percentages cannot be split by model at all -- this is a token
+ * count, not a percent-of-limit figure, and is always labeled `estimated`
+ * for exactly that reason. See docs/concepts.md.
+ */
+async function printModelShare(principal: string | undefined, asJson: boolean): Promise<number> {
+  if (!principal) throw new Error("--models requires --principal <id>");
+  const accounts = await readAccounts();
+  const account = accounts.find((item) => item.name === principal);
+  if (!account || isLocalAccount(account) || account.vendor !== "claude") throw new Error(`--models requires a configured Claude principal (got ${principal})`);
+  const now = new Date();
+  // Best effort: prefer the stored <principal>:all 5h window's own resets_at
+  // (whatever the vendor last reported) as the window boundary; fall back to
+  // a flat trailing 5 hours when nothing has ever been read for this meter.
+  let since = new Date(now.getTime() - 5 * 3_600_000);
+  try {
+    const store = await HeadroomStore.open();
+    try {
+      const row = store.latestPerWindow(`${principal}:all`).find((item) => item.window?.minutes === 300);
+      if (row?.resets_at) { const reset = Date.parse(row.resets_at); if (Number.isFinite(reset)) since = new Date(Math.max(0, reset - 300 * 60_000)); }
+    } finally { store.close(); }
+  } catch { /* no store yet: keep the flat trailing-5h fallback */ }
+  const shares = await modelTokenShare(account.location, since, now);
+  const totalTokens = shares.reduce((sum, item) => sum + item.input_tokens + item.output_tokens, 0);
+  if (asJson) {
+    console.log(JSON.stringify({
+      principal, truth: "estimated", source: "local session logs", window_start: since.toISOString(), window_end: now.toISOString(),
+      models: shares.map((item) => ({ ...item, share_percent: totalTokens > 0 ? Math.round(((item.input_tokens + item.output_tokens) / totalTokens) * 1000) / 10 : 0 })),
+    }));
+    return 0;
+  }
+  if (!shares.length || totalTokens === 0) {
+    console.log(`${principal}  no local session-log token data for the current 5h window (estimated, from ${account.location}/projects)`);
+    return 0;
+  }
+  console.log(`${principal} model token share (estimated, local session logs, current 5h window from ${formatReset(since.toISOString())})`);
+  for (const item of shares) {
+    const tokens = item.input_tokens + item.output_tokens;
+    const share = totalTokens > 0 ? (tokens / totalTokens) * 100 : 0;
+    console.log(`  ${item.model.padEnd(24)} ${share.toFixed(0)}% (${item.input_tokens.toLocaleString()} in / ${item.output_tokens.toLocaleString()} out)`);
+  }
+  return 0;
+}
+
 async function observe(argv: string[]): Promise<number> {
-  const allowed = new Set(["--json", "--threshold", "--principal"]);
-  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: headroom [--json] [--principal X] [--threshold N]"); if (argv[index] !== "--json") index += 1; }
+  const allowed = new Set(["--json", "--threshold", "--principal", "--refresh", "--ttl", "--models"]);
+  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models]"); if (argv[index] !== "--json" && argv[index] !== "--refresh" && argv[index] !== "--models") index += 1; }
   const thresholdIndex = argv.indexOf("--threshold");
   const threshold = thresholdIndex >= 0 ? Number(argv[thresholdIndex + 1]) : undefined;
   if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 100)) throw new Error("--threshold must be 0 through 100");
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
+  if (argv.includes("--models")) return printModelShare(principal, argv.includes("--json"));
+  // --ttl 0 is a synonym for --refresh: both force a fresh probe through the
+  // daemon's own `refresh` method (still gated by the grant marker and the
+  // daemon's own vendor backoff, same as any other poll) instead of serving
+  // whatever the daemon last cached. A no-daemon direct read already polls
+  // fresh on every call, so this is a no-op there.
+  if (argv.includes("--refresh") || option(argv, "--ttl") === "0") {
+    const refreshed = await requestDaemon("refresh", { principal });
+    if (refreshed !== undefined) {
+      const outcome = unwrapRpc(refreshed) as { rate_limited?: true } | Observation[];
+      if (outcome && !Array.isArray(outcome) && outcome.rate_limited) process.stderr.write("(refresh throttled by the daemon's own poll interval or vendor backoff; showing the latest cached reading)\n");
+    }
+  }
   const request = await requestDaemon("status");
   const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
   let observations: Observation[];
@@ -600,10 +716,29 @@ function unwrapRpc(value: unknown): unknown {
   return value;
 }
 
+/**
+ * policy.ts's meterDecision() already builds its own reason as
+ * "<window label> STATE (<detail>)" for a window whose state has no bare
+ * percentage to show (UNKNOWN, most commonly) -- a self-contained line, good
+ * on its own (e.g. in `--json`, or a routing decision read straight from
+ * `can`'s meters array). printCan's own template below wraps that same
+ * reason a second time as "STATE (<reason>)", so a windowless failure (no
+ * window label at all, printed as "-") came out doubled: "UNKNOWN (-
+ * UNKNOWN (Codex rejected the token (401); run: codex login))". Strip the
+ * redundant "<label> STATE (" .. ")" shell down to its inner detail before
+ * printCan wraps it again, so the state appears exactly once. A reason that
+ * was never wrapped that way (e.g. "no readings for X") passes through
+ * unchanged.
+ */
+function dedupeStateReason(state: string, reason: string): string {
+  const match = new RegExp(`^\\S+\\s+${state}\\s*\\((.*)\\)$`).exec(reason);
+  return match ? match[1] : reason;
+}
+
 function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
   if (asJson) { console.log(JSON.stringify({ ...decision, cost, leased_id: leasedId ?? null })); return; }
-  console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${decision.reason})`);
-  for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${meter.reason})`);
+  console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
+  for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
   if (cost.expected_percent !== null) {
     const iqr = cost.iqr_low !== null && cost.iqr_high !== null ? ` (IQR ${cost.iqr_low.toFixed(1)}-${cost.iqr_high.toFixed(1)}%, n=${cost.sample_count})` : "";
     const maxMore = cost.max_more_before_reset === null ? "" : `; max ${cost.max_more_before_reset} more before reset at the current sustainable pace`;
@@ -613,6 +748,75 @@ function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | 
 }
 
 function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }
+
+function readStdinText(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk: string) => { data += chunk; });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
+}
+
+/** Runs the operator's own prior statusLine command (--chain), feeding it the
+ * exact same stdin payload headroom itself received, and returns its stdout
+ * verbatim -- headroom still snapshots the reading (the caller does that
+ * before calling this) without silently replacing an existing statusline
+ * setup Claude Code only lets one command own. */
+function runChainCommand(command: string, stdin: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, { shell: true, stdio: ["pipe", "pipe", "inherit"] });
+    let out = "";
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("close", () => resolve(out));
+    child.stdin.write(stdin);
+    child.stdin.end();
+  });
+}
+
+/**
+ * Meant to be configured as Claude Code's own `statusLine` command (see
+ * docs/quickstart.md): reads the JSON object Claude Code renders on every
+ * prompt, containing `rate_limits.five_hour`/`rate_limits.seven_day` (and
+ * possibly other model-scoped buckets), snapshots it to
+ * `<HEADROOM_HOME>/statusline/<profile>.json` for the statusline adapter to
+ * read as a zero-auth Claude source, and prints a compact one-line bar for
+ * Claude Code's own status bar. `--chain <command>` runs an existing
+ * statusLine command with the same stdin and prints its output instead, so
+ * adopting headroom does not require giving up a prior custom statusline.
+ * Never fails to print a line: a statusLine command that errors blanks the
+ * user's prompt bar.
+ */
+async function statusline(argv: string[]): Promise<number> {
+  const chainAt = argv.indexOf("--chain");
+  const chainCommand = chainAt >= 0 ? argv.slice(chainAt + 1).join(" ") : undefined;
+  let raw = "";
+  let snapshot: ReturnType<typeof snapshotFromStatuslinePayload>;
+  const now = new Date();
+  try {
+    raw = await readStdinText();
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch { payload = undefined; }
+    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+    const profile = statuslineProfile(configDir);
+    snapshot = snapshotFromStatuslinePayload(payload, profile, now);
+    if (snapshot) {
+      const dir = join(headroomHome(), "statusline");
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const path = join(dir, `${profile}.json`);
+      await writeFile(path, JSON.stringify(snapshot), { mode: 0o600 });
+      await chmod(path, 0o600);
+    }
+  } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }
+  if (chainCommand) {
+    try { process.stdout.write(await runChainCommand(chainCommand, raw)); return 0; }
+    catch { /* fall through to headroom's own bar rather than print nothing */ }
+  }
+  console.log(formatStatuslineBar(snapshot, now));
+  return 0;
+}
 
 async function daemon(): Promise<number> {
   const instance = await HeadroomDaemon.create();
@@ -647,6 +851,11 @@ export function noKeychainItemMessage(directory: string): string {
  * probing it on its next poll. */
 async function keychain(argv: string[]): Promise<number> {
   if (argv[0] !== "grant" || argv.length > 3 || (argv[1] && argv[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>]");
+  // Printed unconditionally, before ever touching the Keychain: an agent
+  // shell running this command has no way to learn why a dialog it cannot
+  // see never appeared, and the dogfooded failure mode ("no credentials")
+  // gave no hint that the real problem was the shell itself.
+  if (process.platform === "darwin") console.log("Run this from your own terminal; macOS shows a Keychain dialog that cannot appear in a sandboxed or remote shell.");
   const requested = option(argv, "--principal");
   const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
@@ -654,10 +863,12 @@ async function keychain(argv: string[]): Promise<number> {
   const store = await HeadroomStore.open();
   let failures = 0;
   try {
-    const hash = process.platform === "darwin" ? await probeBinaryHash() : undefined;
+    const existingPin = store.probePath();
+    const hash = process.platform === "darwin" ? await probeBinaryHash(existingPin) : undefined;
     for (const account of targets) {
+      let probePath: string | undefined;
       try {
-        await grantClaudeKeychainAccess(account.location);
+        ({ probePath } = await grantClaudeKeychainAccess(account.location, existingPin));
       } catch (error) {
         // Claude Code was never run against this config dir, so there is
         // nothing for the operator to grant access to yet: a distinct,
@@ -668,12 +879,26 @@ async function keychain(argv: string[]): Promise<number> {
           failures += 1;
           continue;
         }
+        // The dialog exists and would have worked (doctor already confirmed
+        // the Keychain item is present); this shell just cannot show it.
+        // Distinct from the case above on purpose: the fix here is "run this
+        // command somewhere else", never "there's nothing to grant yet".
+        if (error instanceof ClaudeProbeError && error.kind === "no_interaction") {
+          console.error(`${account.name}: ${error.message}`);
+          failures += 1;
+          continue;
+        }
         throw error;
       }
       store.clearKeychainGrantNeeded(account.name);
       // The binary that just proved itself under an operator-run grant must
       // never be treated as an unproven first run again by a background poll.
       if (hash) store.setProbeGrantedHash(hash);
+      // Pinned once, on the very first successful grant this Headroom home
+      // has ever recorded -- every later probe call (background polls
+      // included, see collector.ts) uses exactly this path from here on,
+      // even if a second candidate binary later appears on disk.
+      if (!existingPin && probePath) store.setProbePath(probePath);
       console.log(`Keychain access granted for ${account.name}`);
     }
   } finally { store.close(); }
@@ -682,7 +907,7 @@ async function keychain(argv: string[]): Promise<number> {
 
 /** One line per top-level command for `headroom --help` / `headroom help`. */
 export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
-  ["status", "Print one line per meter (the default; also takes --json, --principal, --threshold)"],
+  ["status", "Print one line per meter (the default; also takes --json, --principal, --threshold, --refresh, --models)"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
   ["history <meter>", "List stored observations for one meter"],
@@ -693,6 +918,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
+  ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
   ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config"],
   ["keychain grant", "macOS: grant the Claude probe Keychain access"],
@@ -703,6 +929,8 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["engine install", "Install the optional native sensing engine"],
   ["engine status", "Show whether the native and upstream engines are installed"],
   ["logs", "Print the tail of the daemon log"],
+  ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar"],
+  ["version", "Print the Headroom version"],
 ];
 
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
@@ -719,9 +947,10 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--minutes 30] [--window 10m] [--json]",
   plan: "Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]",
-  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class>) --owner <name> [--plan] [--plan-share <N>] [--json]",
+  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
+  route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
   accounts: "Usage: headroom accounts discover",
   doctor: "Usage: headroom doctor",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
@@ -731,6 +960,8 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   mcp: "Usage: headroom mcp",
   engine: "Usage: headroom engine <install|status> [--pin]",
   logs: "Usage: headroom logs [--tail 50]",
+  statusline: "Usage: headroom statusline [--chain <command>]",
+  version: "Usage: headroom version (or: headroom --version)",
 };
 
 export function helpText(): string {
@@ -747,7 +978,14 @@ export function helpText(): string {
 
 export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "--help" || argv[0] === "help") { console.log(helpText()); return 0; }
+  if (argv[0] === "--version" || argv[0] === "version") { console.log(await headroomVersion()); return 0; }
   if (argv.includes("--help") && argv[0] && COMMAND_HELP[argv[0]]) { console.log(COMMAND_HELP[argv[0]]); return 0; }
+  // Dispatched before anything else in main() (the proxy strip, the legacy
+  // home migration, both of which can throw on a corrupted policy.toml or an
+  // unusual home layout): this runs on every Claude Code prompt render, and
+  // a statusLine command that fails to print at all blanks the user's status
+  // bar. statusline() itself never throws for the same reason.
+  if (argv[0] === "statusline") return statusline(argv.slice(1));
   // Before any command can fetch a vendor endpoint: an operator's shell
   // proxy must never silently carry a credentialed request unless
   // policy.toml opts in.
@@ -799,6 +1037,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "gate") return gate(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));
   if (argv[0] === "fill") return fill(argv.slice(1));
+  if (argv[0] === "route") return route(argv.slice(1));
   if (argv.includes("--shape")) return responseShape(argv);
   return observe(argv);
 }

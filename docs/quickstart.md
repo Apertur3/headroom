@@ -85,28 +85,84 @@ Claude Code stores its OAuth token in the macOS Keychain, under the service name
 `Claude Code-credentials` for `~/.claude`, or `Claude Code-credentials-<8 hex characters>` for any
 other config directory. Headroom never reads that token itself: it runs a small binary,
 `headroom-claude-probe`, which reads the Keychain item and makes the usage request in the same
-process, so the token never reaches Node or stdout. That binary ships inside the npm package
-(built as a universal macOS binary by `scripts/build-probe.sh`, verified against a recorded
-SHA-256 before every use) and is **ad-hoc signed**, not signed with a Developer ID certificate --
-fine for a beta, but it means macOS treats each new package version as a new, unrecognized signer.
-Running `headroom keychain grant` triggers one macOS Keychain access dialog for that probe; choose
-Always Allow so future polls don't prompt again. If you run more than one Claude Code profile,
-repeat this once per profile:
+process, so the token never reaches Node or stdout. That binary is built by
+`scripts/build-probe.sh` (a universal macOS binary, verified against a recorded SHA-256 before
+every use) and, by default, signed under a **stable local identity** named "Headroom Local" that
+`build-probe.sh` creates once in your login keychain and reuses for every later build. This is why
+a rebuild -- a new headroomd version, `npm run engine:build`, `npm pack`, `release:check` -- does
+not ask for the Keychain dialog again: every build after the first is signed under the exact same
+identity, so macOS still recognizes it as the same signer. The tradeoff is one extra one-time
+dialog the first time `build-probe.sh` ever runs on a machine (creating that identity touches the
+login keychain); after that, `headroom keychain grant` triggers one macOS Keychain access dialog
+for the probe itself, and that grant survives every rebuild from then on. Choose Always Allow so
+future polls don't prompt again. Set `HEADROOM_CODESIGN_IDENTITY` to sign with a different identity
+instead (a real Developer ID, once this ships past beta); if creating the local identity fails for
+any reason, `build-probe.sh` falls back to ad-hoc signing with a printed warning, and every rebuild
+after that will ask again, the same as headroomd versions before this one. Headroom also only ever
+uses the exact probe binary a grant actually succeeded under (see doctor's "claude probe binary"
+line) -- a second candidate appearing later (a repo checkout built alongside an existing global
+install, say) is reported, never silently substituted. If you run more than one Claude Code
+profile, repeat the grant once per profile:
 
 ```sh
 headroom keychain grant --principal claude-2
 ```
 
-An updated probe binary (a new headroomd version, or your own `npm run engine:build`) is a new
-signing identity to Keychain and will ask again once. If a config dir has no Claude Code login at
-all yet, `keychain grant` says so instead of popping a dialog for nothing:
+If a config dir has no Claude Code login at all yet, `keychain grant` says so instead of popping a
+dialog for nothing:
 
 ```
 no Claude login for /Users/you/.claude2; run: CLAUDE_CONFIG_DIR=/Users/you/.claude2 claude, or remove this principal from accounts.toml
 ```
 
+Running `keychain grant` from a sandboxed or remote shell (an agent's own shell, not a Terminal
+window) is a different, and more common, failure: macOS refuses to show the Keychain access dialog
+at all there, even when doctor already confirms the Keychain item is present. Headroom distinguishes
+this from "no login" and says so plainly:
+
+```
+claude-main: the Keychain dialog cannot be shown from this shell; run this command in your own Terminal
+```
+
 On Linux and Windows there's no Keychain step: Headroom reads the token straight from
 `<config-dir>/.credentials.json`.
+
+## 4b. Or skip the Keychain dialog entirely: `headroom statusline`
+
+Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+`rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`, `resets_at`) -- the exact
+numbers `keychain grant` and the vendor probe exist to fetch, already sitting on stdin for free.
+Register `headroom statusline` as that command and Headroom reads it as a zero-auth source instead:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "headroom statusline" }
+}
+```
+
+Add this to `~/.claude/settings.json` for the default profile, or `<CLAUDE_CONFIG_DIR>/settings.json`
+for any other profile (e.g. `~/.claude2/settings.json` for `claude-2`) -- one line per profile,
+same as `keychain grant --principal`. Claude Code only supports one `statusLine` command; if you
+already have one, chain it instead of replacing it:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "headroom statusline --chain 'my-existing-statusline.sh'" }
+}
+```
+
+`headroom statusline` still writes the snapshot and prints Headroom's own compact bar
+(`5h 37% ↻13:19 | wk 17% ↻Sat 14:00`) when `--chain` is omitted; with it, it runs your command with
+the same stdin and prints your command's own output instead, so the visible status bar doesn't
+change.
+
+Every reading this way snapshots to `~/.headroom/statusline/<profile>.json` (0600); the collector
+prefers a snapshot under 10 minutes old over the vendor probe, and reads a Fable-scoped or other
+model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **This removes
+the macOS Keychain dialog entirely for a profile set up this way** -- no `headroom keychain grant`
+ever needed for it, since Headroom never has to open the Keychain item itself. A profile whose
+statusline hasn't rendered yet (or has gone stale) still falls back to the probe, subject to the
+usual grant gate.
 
 ## 5. Read a line
 

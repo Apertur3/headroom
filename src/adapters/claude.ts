@@ -32,6 +32,12 @@ export interface ClaudeDependencies {
   /** Test seam only. Production macOS reads credentials exclusively in the probe. */
   keychain?: (service: string) => Promise<string>;
   probe?: (configDir: string) => Promise<string>;
+  /** The exact probe binary this Headroom home was granted under (see
+   * store.ts's probePath()); passed through to claudeProbe() so a poll uses
+   * the same binary the operator actually granted rather than whatever the
+   * plain resolution order would otherwise pick. Ignored once `probe` (the
+   * test seam above) is given. */
+  probePath?: string;
 }
 
 export function claudeServiceName(configDir: string, home = homedir()): string {
@@ -48,8 +54,17 @@ async function readCredentialFile(path: string): Promise<string> {
 }
 
 export class ClaudeProbeError extends Error {
-  constructor(readonly kind: "missing" | "denied" | "timeout" | "unavailable", message: string) { super(message); }
+  constructor(readonly kind: "missing" | "denied" | "timeout" | "unavailable" | "no_interaction", message: string) { super(message); }
 }
+
+/** The one wording for "the Keychain cannot show its access dialog from this
+ * shell" -- macOS's errSecInteractionNotAllowed (a sandboxed or otherwise
+ * non-interactive process) or a cancelled interaction, distinguished by the
+ * probe from a genuine "no login here yet" (see HEADROOM_PROBE_NO_CREDENTIALS
+ * below) which needs a completely different fix. Shared by the probe's own
+ * error mapping and `headroom keychain grant`'s direct catch, so both say
+ * exactly the same thing instead of drifting. */
+export const KEYCHAIN_INTERACTION_BLOCKED_MESSAGE = "the Keychain dialog cannot be shown from this shell; run this command in your own Terminal";
 
 /** The single wording for "this principal cannot be probed again until the
  * operator runs the grant command", shared by the daemon's synthetic
@@ -59,9 +74,9 @@ export function claudeGrantNeededReason(principalId: string): string {
   return `Keychain grant needed; run: headroom keychain grant --principal ${principalId}`;
 }
 
-async function claudeProbe(configDir: string): Promise<string> {
+async function claudeProbe(configDir: string, pinnedPath?: string): Promise<string> {
   let helper: string | undefined;
-  try { helper = await keychainHelper(); }
+  try { helper = await keychainHelper(pinnedPath); }
   catch (error) { throw new ClaudeProbeError("unavailable", error instanceof Error ? error.message : "Claude probe unavailable"); }
   if (!helper) throw new ClaudeProbeError("unavailable", "Claude probe not built; run npm run engine:build");
   try {
@@ -72,6 +87,16 @@ async function claudeProbe(configDir: string): Promise<string> {
   } catch (error: unknown) {
     const result = error as { stderr?: string; code?: number | string };
     const stderr = result.stderr ?? "";
+    // Checked before HEADROOM_PROBE_KEYCHAIN_DENIED (errSecAuthFailed, a real
+    // ACL denial) and before the generic "no credentials" fallback
+    // (errSecItemNotFound, a genuinely absent login): errSecInteractionNotAllowed
+    // and a cancelled interaction both mean the dialog itself could not be
+    // shown here, which used to fall through to the same "no credentials in
+    // Keychain for this config dir" wording as an absent login and, from
+    // `headroom keychain grant`, print the wrong fix ("no Claude login for
+    // ...") even though the Keychain item is present -- exactly the dogfooded
+    // failure from a sandboxed agent shell.
+    if (stderr.includes("HEADROOM_PROBE_INTERACTION_NOT_ALLOWED")) throw new ClaudeProbeError("no_interaction", KEYCHAIN_INTERACTION_BLOCKED_MESSAGE);
     if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied");
     if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access timed out");
     if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; ${claudeCommandForDirectory(configDir)}`);
@@ -89,8 +114,15 @@ async function claudeProbe(configDir: string): Promise<string> {
 }
 
 /** Interactive CLI entry point; its sole prompt is owned by the signed probe. */
-export async function grantClaudeKeychainAccess(configDir: string): Promise<void> {
-  await claudeProbe(configDir);
+/** Returns the exact probe path this grant actually ran under, so the caller
+ * (cli.ts's `keychain grant`) can pin it -- see store.ts's setProbePath() --
+ * the first time a grant ever succeeds for this Headroom home. undefined
+ * only if somehow no probe resolved at all despite claudeProbe() not
+ * throwing, which should not happen in practice. */
+export async function grantClaudeKeychainAccess(configDir: string, pinnedPath?: string): Promise<{ probePath: string | undefined }> {
+  const probePath = await resolveProbePath(pinnedPath);
+  await claudeProbe(configDir, probePath ?? pinnedPath);
+  return { probePath };
 }
 
 /** Thrown only when a packaged probe (bin/probe/darwin) is physically present
@@ -121,18 +153,27 @@ export async function verifiedPackagedProbe(root: string): Promise<string | unde
 
 /**
  * Resolution order: HEADROOM_PROBE_PATH (a development override, never
- * SHA-256 verified -- the operator named it explicitly), the packaged macOS
- * probe shipped in the npm tarball (bin/probe/darwin, SHA-256 verified
- * against every use), then a repo dev build (engine/.build/release, the
- * output of `npm run engine:build`, confined to this repository checkout).
- * A verification failure on the packaged probe propagates as
- * ProbeVerificationError instead of silently falling through, so a
- * tampered or corrupted install never quietly downgrades to "not built".
+ * SHA-256 verified -- the operator named it explicitly, always wins even
+ * over a pin), `pinnedPath` (the exact binary this Headroom home was
+ * actually granted under -- see store.ts's probePath()/setProbePath(), tried
+ * next so a second candidate appearing later, e.g. a repo checkout built
+ * alongside an existing global install, never silently takes over), the
+ * packaged macOS probe shipped in the npm tarball (bin/probe/darwin,
+ * SHA-256 verified against every use), then a repo dev build
+ * (engine/.build/release, the output of `npm run engine:build`, confined to
+ * this repository checkout). A verification failure on the packaged probe
+ * propagates as ProbeVerificationError instead of silently falling through,
+ * so a tampered or corrupted install never quietly downgrades to "not
+ * built". A `pinnedPath` that no longer resolves (the granted binary was
+ * removed or replaced) falls through to the normal order below it, rather
+ * than failing outright -- the resulting hash mismatch against
+ * probeGrantedHash is what correctly asks for a fresh grant.
  */
-async function keychainHelper(): Promise<string | undefined> {
+async function keychainHelper(pinnedPath?: string): Promise<string | undefined> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   const override = process.env.HEADROOM_PROBE_PATH;
   if (override) { try { return await executablePath(override); } catch { return undefined; } }
+  if (pinnedPath) { try { return await executablePath(pinnedPath); } catch { /* the pinned binary is gone; fall through below */ } }
   if (process.platform === "darwin") {
     const packaged = await verifiedPackagedProbe(root);
     if (packaged) return packaged;
@@ -142,14 +183,21 @@ async function keychainHelper(): Promise<string | undefined> {
   return undefined;
 }
 
+/** Public entry point for callers that need to know the exact path
+ * (doctor's mismatch report, `headroom keychain grant`'s own pinning) rather
+ * than just whether one resolves. Same resolution order as keychainHelper. */
+export async function resolveProbePath(pinnedPath?: string): Promise<string | undefined> {
+  return keychainHelper(pinnedPath);
+}
+
 /** sha256 of the resolved Claude probe binary, or undefined when none is
  * built/installed or the packaged probe fails verification. Used only to
  * detect a rebuild (see syncClaudeGrantState); a verification failure here
  * must never crash a background caller like doctor or an ordinary poll, so
  * it is treated the same as "no probe available". */
-export async function probeBinaryHash(): Promise<string | undefined> {
+export async function probeBinaryHash(pinnedPath?: string): Promise<string | undefined> {
   let helper: string | undefined;
-  try { helper = await keychainHelper(); } catch { return undefined; }
+  try { helper = await keychainHelper(pinnedPath); } catch { return undefined; }
   if (!helper) return undefined;
   return createHash("sha256").update(await readFile(helper)).digest("hex");
 }
@@ -167,6 +215,11 @@ export interface ClaudeGrantStore {
    * the same binary. */
   probeGrantedHash(): string | undefined;
   setProbeGrantedHash(hash: string): void;
+  /** The exact probe binary path this Headroom home was granted under, once
+   * pinned (see store.ts's probePath()/setProbePath()). undefined before the
+   * first successful `headroom keychain grant`. */
+  probePath(): string | undefined;
+  setProbePath(path: string): void;
 }
 
 /** Gate consulted by the collector before every Claude probe attempt. */
@@ -177,6 +230,10 @@ export interface ClaudeGrantGate {
    * returns a real vendor response, so that hash is recorded as known-good
    * and never treated as an unproven first run again. */
   markProbeSucceeded(): void;
+  /** The pinned probe path, passed to observeClaude()'s probePath dependency
+   * so every poll uses the exact binary this Headroom home was granted
+   * under. undefined before the first grant. */
+  probePath(): string | undefined;
 }
 
 export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
@@ -184,6 +241,7 @@ export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
     needsGrant: (id) => store.keychainGrantNeeded(id),
     markGrantNeeded: (id, reason) => store.setKeychainGrantNeeded(id, reason),
     markProbeSucceeded: () => { const hash = store.probeBinaryHash(); if (hash) store.setProbeGrantedHash(hash); },
+    probePath: () => store.probePath(),
   };
 }
 
@@ -208,7 +266,10 @@ export async function syncClaudeGrantState(
 ): Promise<boolean> {
   const platform = dependencies.platform ?? process.platform;
   if (platform !== "darwin" || !claudePrincipalIds.length) return false;
-  const hash = await (dependencies.hash ?? probeBinaryHash)();
+  // Hashes the pinned path once one exists, not just whatever the plain
+  // resolution order would currently pick -- the same "use exactly one
+  // path" rule claudeProbe() itself follows once a grant has pinned one.
+  const hash = await (dependencies.hash ?? (() => probeBinaryHash(store.probePath())))();
   if (!hash) return false;
   const previous = store.probeBinaryHash();
   store.setProbeBinaryHash(hash);
@@ -269,9 +330,38 @@ function window(account: ProviderAccount, meter: string, raw: unknown, minutes: 
   return { ...base(account, meter, now), window: { kind: resets ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: resets, freshness: "fresh" };
 }
 
+/**
+ * A scoped limit that carries a percent is always emitted as a real,
+ * fresh window -- even when the vendor flags it `is_active: false`. The
+ * vendor's own "inactive" flag on `/usage` describes a bucket with no
+ * enforced cap at all (nothing to show, hence the not_enforced fallback
+ * below), not a live percent the vendor happens to be hiding elsewhere: the
+ * owner-reported gap (`/usage` shows a Fable weekly bar near its cap while
+ * Headroom read the same account's scoped meter as "inactive") was exactly
+ * this case, a bucket with a real percent that got dropped because the flag
+ * was trusted over the number sitting right beside it. Enforcement is
+ * `soft` and `metadata.vendor_active` is `false` only in that case, purely
+ * descriptive (nothing in Headroom currently branches on `enforcement`) so
+ * a caller can still tell the two states apart. A scoped limit with no
+ * percent at all -- active or not -- has nothing to report and keeps the
+ * original not_enforced reporting.
+ */
 function scoped(account: ProviderAccount, meter: string, candidate: unknown, now: string): Observation {
-  if (isObject(candidate) && candidate.is_active === false) return { ...base(account, meter, now), window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor marks scoped limit inactive" };
+  const inactive = isObject(candidate) && candidate.is_active === false;
+  if (inactive) {
+    const real = window(account, meter, candidate, 10_080, now);
+    if (real) return { ...real, window: { ...real.window!, enforcement: "soft" }, reason: "vendor flags this limit inactive; shown because it carries a cap", metadata: { vendor_active: false } };
+    return { ...base(account, meter, now), window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor marks scoped limit inactive" };
+  }
   return window(account, meter, candidate, 10_080, now) ?? { ...base(account, meter, now), window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no scoped limit in response" };
+}
+
+/** `claude-main:sonnet-5`, not `claude-main:Sonnet 5`: lowercase, non-alnum
+ * runs collapsed to one hyphen, no leading/trailing hyphen. Empty for a
+ * display name that is somehow entirely non-alphanumeric, which the caller
+ * treats as "nothing usable to name this meter" and skips. */
+function modelSlug(name: string): string {
+  return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 /** Parse Claude's OAuth usage body without retaining the credential or response body. */
@@ -281,6 +371,10 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
   const output = [window(account, "all", body.five_hour, 300, now), window(account, "all", body.seven_day, 10_080, now)].filter((item): item is Observation => Boolean(item));
   let fable: unknown;
   let routines: unknown;
+  // Any other model-scoped bucket the response offers, keyed by its own
+  // display name's slug -- Sonnet, Opus, or any future named allowance
+  // beyond the two Headroom already gives a dedicated meter.
+  const modelBuckets = new Map<string, unknown>();
   for (const [key, value] of Object.entries(body)) {
     const lower = key.toLowerCase();
     if (!lower.startsWith("seven_day_")) continue;
@@ -295,11 +389,19 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
     if (limit.is_active !== false && finiteNumber(limit.utilization) === undefined && finiteNumber(limit.percent) === undefined) continue;
     const scope = isObject(limit.scope) ? limit.scope : undefined;
     const model = scope && isObject(scope.model) ? scope.model : undefined;
-    const name = String(model?.display_name ?? model?.name ?? "").toLowerCase();
-    if (name.includes("fable")) { if (!isObject(fable) || limit.is_active !== false) fable = limit; }
-    else if (!isObject(routines) || limit.is_active !== false) routines = limit;
+    const name = String(model?.display_name ?? model?.name ?? "");
+    const lower = name.toLowerCase();
+    if (lower.includes("fable")) { if (!isObject(fable) || limit.is_active !== false) fable = limit; }
+    else if (lower.includes("routine") || lower.includes("cowork")) { if (!isObject(routines) || limit.is_active !== false) routines = limit; }
+    else {
+      const slug = modelSlug(name);
+      if (!slug) continue;
+      const existing = modelBuckets.get(slug);
+      if (existing === undefined || limit.is_active !== false) modelBuckets.set(slug, limit);
+    }
   }
   output.push(scoped(account, "fable", fable, now), scoped(account, "routines", routines, now));
+  for (const [slug, limit] of modelBuckets) output.push(scoped(account, slug, limit, now));
   if (!output.some((item) => item.meter_id === `${account.name}:all`)) throw new Error("Claude usage response had no primary windows");
   return output;
 }
@@ -308,7 +410,7 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
 export async function claudeResponseShape(account: ProviderAccount, dependencies: ClaudeDependencies = {}): Promise<Array<{ path: string; kind: string }>> {
   const now = dependencies.now?.() ?? new Date();
   const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
-  if (darwin && !dependencies.keychain) return shape(JSON.parse(await (dependencies.probe ?? claudeProbe)(account.location)));
+  if (darwin && !dependencies.keychain) return shape(JSON.parse(await (dependencies.probe ? dependencies.probe(account.location) : claudeProbe(account.location, dependencies.probePath))));
   let payload: string;
   try {
     payload = darwin
@@ -330,7 +432,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
   const darwin = dependencies.platform === "darwin" || (!dependencies.platform && process.platform === "darwin");
   let credentialLoaded = false;
   try {
-    if (darwin && !dependencies.keychain) return observationsFromClaudeUsage(JSON.parse(await (dependencies.probe ?? claudeProbe)(account.location)), account, now);
+    if (darwin && !dependencies.keychain) return observationsFromClaudeUsage(JSON.parse(await (dependencies.probe ? dependencies.probe(account.location) : claudeProbe(account.location, dependencies.probePath))), account, now);
     const payload = darwin
       ? await dependencies.keychain!(claudeServiceName(account.location))
       : await (dependencies.readFile ?? readCredentialFile)(credentialPath("claude", resolve(account.location)), "utf8");
@@ -350,7 +452,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Claude rejected the token (${error.status}); ${claudeCommand(account)}`
       : error instanceof ProviderHTTPError ? error.message
       : error instanceof ClaudeProbeError && error.message.startsWith("token expired") ? `token expired; ${claudeCommand(account)}`
-      : error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout") ? claudeGrantNeededReason(account.name)
+      : error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout" || error.kind === "no_interaction") ? claudeGrantNeededReason(account.name)
       : error instanceof ClaudeProbeError ? error.message
       : error instanceof Error && error.message.startsWith("vendor response") ? error.message
       : darwin && !credentialLoaded ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`

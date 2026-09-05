@@ -35,6 +35,11 @@ export interface ProviderAccount {
   adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
   /** Optional explicit agy executable for the daemon-owned warm local probe. */
   agy_path?: string;
+  /** Optional principal name a third-party statusline collector (e.g.
+   * an external collector) uses for this same profile, so the statusline snapshot
+   * adapter can match its file to this principal when the collector's own
+   * naming does not follow headroom's config-dir-basename convention. */
+  alias?: string;
 }
 
 /** A local pool is a probed OpenAI-compatible capacity source. */
@@ -79,6 +84,13 @@ export interface Observation {
     running?: number;
     waiting?: number;
     cost_model?: "sunk" | "marginal";
+    /** Present only on a model-scoped Claude meter (fable/routines/other)
+     * the vendor flags inactive while still reporting a percent -- see
+     * claude.ts's `scoped()`. False means the vendor's own dashboard treats
+     * this cap as off even though Headroom still enforces it, since a bucket
+     * that carries a real percent is never dropped just because the vendor
+     * calls it inactive. */
+    vendor_active?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the

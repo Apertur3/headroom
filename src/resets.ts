@@ -28,6 +28,15 @@ export function formatResetsInCoarse(totalSeconds: number): string {
   return `${days}d`;
 }
 
+/** Local HH:MM, no date -- for a short-horizon estimate (a next poll time,
+ * a backoff deadline) where the day is always implicitly "soon" and adding
+ * it would only be noise. cli.ts's own reset-time formatting adds a date
+ * once the target isn't today; this helper is for estimates always close
+ * enough that the date never matters. */
+export function formatClockTime(date: Date): string {
+  return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+}
+
 export interface ResetsIn { resets_in_seconds: number | null; resets_in: string | null; }
 
 export function resetsIn(resetsAt: string | null | undefined, now = new Date()): ResetsIn {

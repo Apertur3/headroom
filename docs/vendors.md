@@ -15,6 +15,31 @@ without network access to GitHub fails at dependency resolution, not at compile 
 
 ## Claude
 
+Headroom reads Claude Code usage two ways: a zero-auth statusline snapshot (preferred whenever
+it's fresh) and the vendor probe (the fallback, and the only path for a profile that has never
+rendered a statusline).
+
+### Zero-auth source: the statusline snapshot
+
+Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+`rate_limits.five_hour`/`rate_limits.seven_day` (`used_percentage`, `resets_at`, epoch seconds) and
+possibly other model-scoped buckets. `headroom statusline`, registered as that command (see
+quickstart.md), snapshots it to `<HEADROOM_HOME>/statusline/<profile>.json` (0600; `<profile>` is
+the `CLAUDE_CONFIG_DIR` basename, or `default`). The `native:claude-statusline` adapter
+(`src/adapters/claude-statusline.ts`) reads that file back: `truth: official`, freshness `fresh`
+under 10 minutes old and `stale` beyond that. It also reads the an external collector collector's own
+existing shape (`state/<alias>.json`: top-level `alias`, `five_hour`/`seven_day` with `used_pct`),
+matched to a principal by an explicit `alias` field on that account in `accounts.toml`, or by the
+convention alias `"main"` means the default profile. Which directories are scanned is
+`policy.toml`'s `statusline_snapshot_dirs` (default: just `<HEADROOM_HOME>/statusline`).
+
+The collector prefers a fresh snapshot over the probe outright -- for a Claude principal set up
+this way, Headroom never touches the Keychain at all, and a principal still waiting on
+`headroom keychain grant` reads normally anyway. A stale or missing snapshot falls back to the
+probe below, unchanged.
+
+### Vendor probe
+
 Headroom reads Claude Code's own OAuth access token and calls
 `GET https://api.anthropic.com/api/oauth/usage`.
 
@@ -27,15 +52,21 @@ so the token never reaches Node or Headroom's own output. On Linux and Windows, 
 token directly from `<config-dir>/.credentials.json` (default `~/.claude/.credentials.json`).
 
 Meters emitted: `<principal>:all` (the 5-hour and 7-day windows from the response's `five_hour`
-and `seven_day` fields), `<principal>:fable`, and `<principal>:routines`. The last two come from
-whichever "scoped limit" in the response's `limits[]` array matches Fable or Routines by model
-display name, falling back to the older `seven_day_fable*` / `seven_day_routine*` /
-`seven_day_cowork*` fields if present.
+and `seven_day` fields), `<principal>:fable`, `<principal>:routines`, and one
+`<principal>:<model-slug>` meter for every other model-scoped bucket the response's `limits[]`
+array carries (e.g. `<principal>:sonnet-5`). Fable and Routines come from whichever scoped limit
+matches by model display name, falling back to the older `seven_day_fable*` / `seven_day_routine*`
+/ `seven_day_cowork*` fields if present.
 
-Known limitation, verified live: when the vendor marks a scoped limit inactive
-(`is_active: false`), Headroom reports that meter with freshness `not_enforced`, which the CLI
-prints as `n/a` rather than a stale or zero percentage. A Fable-scoped weekly meter that the
-vendor has turned off for an account shows `n/a`, not `0%`.
+A scoped limit's `is_active: false` flag means "no percent to show" only when there genuinely is no
+percent in the response -- that meter reports freshness `not_enforced` (`n/a` in the CLI), same as
+before. A scoped limit that carries a percent is never dropped just because the vendor flags it
+inactive: Headroom emits it as a real, fresh window (enforcement `soft` rather than `hard`,
+`metadata.vendor_active: false`, reason "vendor flags this limit inactive; shown because it carries
+a cap"), since a real cap the vendor's own `/usage` dashboard shows near its limit is exactly the
+number an orchestrator needs, whatever the vendor calls the bucket. `gate --model fable` (and
+`--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
+routing class already consumes it via `routing.toml`.
 
 ## Codex
 

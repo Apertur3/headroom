@@ -214,6 +214,25 @@ describe("headroom gate", () => {
     });
   });
 
+  it("--model resolves to every configured Claude principal's own <principal>:<model> meter", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "accounts.toml"), ["[[accounts]]", 'name = "claude-main"', 'vendor = "claude"', 'location = "/nonexistent/.claude"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert({
+      principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "soft" },
+      quantity: { used: 50, limit: 100, remaining: 50, unit: "percent" }, resets_at: at(HOUR),
+      observed_at: at(0), fetched_at: at(0), source: "fixture", truth: "official", freshness: "fresh",
+      confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      reason: "vendor flags this limit inactive; shown because it carries a cap", metadata: { vendor_active: false },
+    });
+    store.close();
+    await withHeadroomHome(home, async () => {
+      // 50% used, 10% reserve -> 40 points free: a 5-point ask fits, a 45-point ask does not.
+      expect(await main(["gate", "--need", "wk:5", "--model", "fable", "--owner", "x"])).toBe(0);
+      expect(await main(["gate", "--need", "wk:45", "--model", "fable", "--owner", "x"])).toBe(2);
+    });
+  });
+
   it("renders an UNKNOWN meter as 'meter  UNKNOWN (reason)', not a plain NO, and still exits 2", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
@@ -502,6 +521,29 @@ describe("headroom can: learned cost and --lease", () => {
       const leases = after.leases("claude-main:all", true, new Date(Date.now() + 60_000));
       expect(leases.some((lease) => lease.owner === "cadence" && lease.action_class === "claude-fable" && lease.expected_percent === 4)).toBe(true);
     } finally { after.close(); }
+  });
+
+  it("prints a windowless failure's UNKNOWN reason once, not nested ('UNKNOWN (- UNKNOWN (...))')", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "routing.toml"), '[consumes]\ncodex-build = ["codex-main:main"]\n', { mode: 0o600 });
+    await writeFile(join(home, "accounts.toml"), ["[[accounts]]", 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert({
+      principal_id: "codex-main", meter_id: "codex-main:main", window: null, quantity: null, resets_at: null,
+      observed_at: new Date().toISOString(), fetched_at: new Date().toISOString(), source: "fixture", truth: "estimated",
+      freshness: "failed", confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture",
+      reason: "Codex rejected the token (401); run: codex login",
+    });
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["can", "codex-build", "--owner", "x", "--allow-unknown"])).toBe(0);
+      });
+    } finally { restore(); }
+    const text = logs.join("\n");
+    expect(text).toContain("UNKNOWN (Codex rejected the token (401); run: codex login)");
+    expect(text).not.toMatch(/UNKNOWN \(.*UNKNOWN/); // no nested state
   });
 
   it("uses an explicit --expect over the learned median", async () => {
