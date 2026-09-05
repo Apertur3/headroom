@@ -596,7 +596,7 @@ describe("plan/gate/fill round-trip through a real daemon socket for a meter who
     // HEADROOM_HOME -- unlike the POSIX branch, it cannot be pointed at a
     // private, root-scoped path. The daemon under test has to listen on
     // that same real path for main() to ever find it.
-    const path = process.platform === "win32" ? socketPath() : join(root, "headroom.sock");
+    const path = socketPath(root);
     const daemon = await HeadroomDaemon.create({ home: root, path });
     try { await daemon.start(); }
     catch (error: unknown) {

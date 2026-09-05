@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
 import { doctor } from "./doctor.js";
@@ -1064,13 +1064,24 @@ export function isMainModule(metaUrl: string, argv1: string | undefined): boolea
   catch { return false; }
 }
 
+function sameMissingFile(left: string, right: string): boolean {
+  if (left === right) return true;
+  try {
+    return basename(left) === basename(right)
+      && realpathSync.native(dirname(left)) === realpathSync.native(dirname(right));
+  } catch { return false; }
+}
+
 /** True only for the exact ENOENT a fresh install produces the first time any
  * command reads accounts.toml -- never for a symlink/permission failure or an
  * ENOENT on some other path, which must still surface as a real error. */
 export function isAccountsMissingError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const errno = error as NodeJS.ErrnoException;
-  return errno.code === "ENOENT" && errno.path === accountsPath();
+  if (errno.code !== "ENOENT" || typeof errno.path !== "string") return false;
+  // Compare through the directory's real path: Windows may report a short
+  // (8.3) form of the temp directory, and both forms name the same file.
+  return sameMissingFile(errno.path, accountsPath());
 }
 
 if (isMainModule(import.meta.url, process.argv[1])) {
