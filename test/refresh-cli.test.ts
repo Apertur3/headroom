@@ -25,10 +25,14 @@ describe("headroom --refresh / --ttl 0", () => {
   // and main()'s own daemon client always dials the real one.
   it("--refresh forces a fresh poll once the poll interval has elapsed, and is a safe no-op (rate_limited, not a vendor hit) within it", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-refresh-cli-")); temporary.push(root);
-    // 500ms: short enough to keep the test fast, generous enough to stay well
-    // clear of the real socket round-trips the "within interval" assertions
-    // below need to land inside on a loaded CI machine.
-    await writeFile(join(root, "policy.toml"), "poll_interval_minutes = 0.00833\n"); // ~500ms
+    // 3s: the "within interval" assertions below need three real main()
+    // round-trips (daemon.start() plus three socket calls) to land inside
+    // this window before it elapses. A ~500ms window left almost no margin
+    // for that -- on a loaded Windows CI runner the combined overhead of
+    // those calls could itself exceed 500ms, so the interval had already
+    // elapsed by the third call, and the "still throttled" assertion saw an
+    // extra real poll it didn't expect.
+    await writeFile(join(root, "policy.toml"), "poll_interval_minutes = 0.05\n"); // 3s
     let polls = 0;
     const path = process.platform === "win32" ? socketPath() : join(root, "headroom.sock");
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; return { observations: [fixture()], failures: [] }; } });
@@ -56,19 +60,19 @@ describe("headroom --refresh / --ttl 0", () => {
       } finally { stderrSpy.mockRestore(); }
       expect(polls).toBe(1);
 
-      // Once the (short) interval has actually elapsed, --refresh (and its
-      // --ttl 0 synonym) really does force a fresh poll.
-      await new Promise((resolve) => setTimeout(resolve, 700));
+      // Once the interval has actually elapsed, --refresh (and its --ttl 0
+      // synonym) really does force a fresh poll.
+      await new Promise((resolve) => setTimeout(resolve, 3_500));
       expect(await main(["--refresh", "--json"])).toBe(0);
       expect(polls).toBe(2);
-      await new Promise((resolve) => setTimeout(resolve, 700));
+      await new Promise((resolve) => setTimeout(resolve, 3_500));
       expect(await main(["--json", "--ttl", "0"])).toBe(0);
       expect(polls).toBe(3);
     } finally {
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
       await daemon.stop();
     }
-  });
+  }, 20_000); // two deliberate 3.5s waits blow past the default 5s per-test timeout
 
   it("--refresh accepts --principal and is a harmless no-op with no daemon running (a direct read always polls fresh)", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-refresh-nodaemon-")); temporary.push(root);

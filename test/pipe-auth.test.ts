@@ -7,7 +7,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { rpc, HeadroomDaemon } from "../src/daemon.js";
 
 const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+// maxRetries/retryDelay: this file's client-side test spins up a raw
+// net.Server on a real Windows named pipe: server.close()'s callback firing
+// doesn't guarantee Windows has finished releasing the underlying handle,
+// which otherwise intermittently fails this recursive delete with EPERM on
+// a just-vacated temp dir (a well-documented Node/Windows race -- see
+// fs.rm's own docs for these options). A plain retry with backoff is enough;
+// no other file in this suite spins up a raw platform-level pipe server.
+afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))); });
 
 /** A real Windows host has no filesystem-backed Unix-domain-socket
  * equivalent: net.Server#listen() on a plain temp-dir path fails with

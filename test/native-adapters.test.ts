@@ -1,6 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
@@ -326,7 +326,10 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     delete process.env.GEMINI_OAUTH2_JS_PATH;
     delete process.env.GEMINI_OAUTH_CLIENT_ID;
     delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
-    process.env.PATH = `${join(root, "bin")}:${previous.path ?? ""}`;
+    // delimiter, not a hardcoded ":": a Windows path's own drive letter
+    // ("C:\...") already contains a colon, which would otherwise tear the
+    // very entry this test is adding in two before geminiBinary() ever sees it.
+    process.env.PATH = `${join(root, "bin")}${delimiter}${previous.path ?? ""}`;
     try {
       const detail = await discoverGeminiOAuthClientDetail();
       expect(detail?.client).toEqual({ clientId: oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345"), clientSecret: oauthSecret("abcdefghijklmnopqrstuvwxyz01") });

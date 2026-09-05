@@ -1,6 +1,6 @@
 import { access, constants, lstat, readFile, realpath, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { normalizeObservations } from "../engine/observation.js";
 import { outboundFetch, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
@@ -268,7 +268,10 @@ export async function discoverGeminiOAuthClient(): Promise<GeminiOAuthClient | u
 }
 
 async function geminiBinary(): Promise<string | undefined> {
-  for (const path of (process.env.PATH ?? "").split(":").filter(Boolean).map((directory) => join(directory, "gemini"))) try {
+  // `delimiter` (not a hardcoded ":") because a Windows PATH entry's own
+  // drive letter ("C:\...") already contains a colon -- splitting on ":"
+  // there tears "C:\Users\...\bin" into "C" and "\Users\...\bin".
+  for (const path of (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, "gemini"))) try {
     await access(path, constants.X_OK);
     return await realpath(path);
   } catch { /* continue */ }

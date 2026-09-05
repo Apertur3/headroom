@@ -27,7 +27,11 @@ describe("statuslineProfile", () => {
 
 describe("statuslineSnapshotDirs", () => {
   it("defaults to <home>/statusline when policy.toml configures nothing", () => {
-    expect(statuslineSnapshotDirs([], "/Users/test/.headroom")).toEqual(["/Users/test/.headroom/statusline"]);
+    // statuslineSnapshotDirs() joins with the host's own path separator (via
+    // node:path's join, same as production), so the expectation has to use
+    // the same join rather than a hardcoded POSIX literal -- on win32 that
+    // legitimately comes back with backslashes.
+    expect(statuslineSnapshotDirs([], "/Users/test/.headroom")).toEqual([join("/Users/test/.headroom", "statusline")]);
   });
   it("uses the configured list verbatim when non-empty", () => {
     expect(statuslineSnapshotDirs(["/Users/test/collector/state"], "/Users/test/.headroom")).toEqual(["/Users/test/collector/state"]);

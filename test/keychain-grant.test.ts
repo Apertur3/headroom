@@ -21,6 +21,17 @@ async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise
   finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
 }
 
+// Mirrors doctor.ts's homeCheck(): on win32 the detail always gets a note
+// appended that group/world permission bits weren't checked (NTFS has none),
+// so a bare path never matches there. Getting this wrong doesn't just fail
+// the assertion -- toMatchObject() throwing before a test's own store?.close()
+// runs leaves the SQLite handle open, which then fails cleanup too (EBUSY
+// unlinking headroom.db on Windows, which -- unlike POSIX -- refuses to
+// delete a file still open elsewhere).
+function expectedHomeDetail(home: string): string {
+  return process.platform === "win32" ? `${home} (group/world permission checks are not applicable on Windows; relying on NTFS ACLs)` : home;
+}
+
 describe("collector gate for a Claude principal awaiting a Keychain grant", () => {
   it("never attempts the probe for a gated principal, returning the synthetic grant-needed observations instead", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-collector-gate-")); temporary.push(root);
@@ -118,8 +129,9 @@ describe("doctor home directory and keychain grant checks", () => {
     await chmod(userHome, 0o755); // belt and suspenders: mkdir's mode is umask-masked too
     await mkdir(headroomHomePath, { recursive: true, mode: 0o700 });
     const { check, store } = await homeCheck(headroomHomePath);
-    expect(check).toMatchObject({ level: "OK", check: "home directory", detail: headroomHomePath });
-    store?.close();
+    try {
+      expect(check).toMatchObject({ level: "OK", check: "home directory", detail: expectedHomeDetail(headroomHomePath) });
+    } finally { store?.close(); }
   });
 
   it("uses the resolved HEADROOM_HOME, never $HOME/.headroom, when HEADROOM_HOME points elsewhere", async () => {
@@ -130,7 +142,7 @@ describe("doctor home directory and keychain grant checks", () => {
     await withHeadroomHome(actual, async () => {
       const checks = await doctorChecks();
       const home = checks.find((item) => item.check === "home directory");
-      expect(home).toMatchObject({ level: "OK", detail: actual });
+      expect(home).toMatchObject({ level: "OK", detail: expectedHomeDetail(actual) });
       await expect(lstat(join(userHome, ".headroom"))).rejects.toThrow(); // never created under $HOME
     });
   });
