@@ -1,0 +1,18 @@
+# Force LF line endings on checkout regardless of the OS or the local
+# core.autocrlf setting. Without this, a Windows checkout (GitHub's hosted
+# windows-latest runner ships git with core.autocrlf=true) rewrites every
+# text file to CRLF, which breaks two things that only show up on Windows CI:
+#
+#   - bin/headroom.js's leading shebang line: Vite's ssr-transform locates it
+#     with a bare `/^#!.*\n/` regex that never matches a `\r\n`-terminated
+#     line, so on a CRLF checkout it fails to find the shebang, hoists its
+#     injected import-analysis code above position 0 anyway, and the shebang
+#     is no longer valid syntax once something precedes it.
+#   - .privacy-denylist: each pattern line is read with a trailing `\r` still
+#     attached on a CRLF checkout, so scripts/privacy-sweep.sh's grep pattern
+#     silently requires a literal carriage return right after the match and
+#     never fires.
+#
+# `text=auto` lets git's own binary-detection decide what to normalize;
+# `eol=lf` pins the checked-out line ending to LF on every platform.
+* text=auto eol=lf

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { installNativeEngine, nativePlatformAssetName, platformAssetName, readEngineLock, verifiedEnginePath } from "../src/engine/codexbar/install.js";
+import { installNativeEngine, nativePlatformAssetName, platformAssetName, readEngineLock, verifiedEnginePath, type EngineLock } from "../src/engine/codexbar/install.js";
 import { nativeEnginePath } from "../src/engine/native/run.js";
 
 const temporary: string[] = [];
@@ -26,16 +26,61 @@ describe("engine asset selection", () => {
   it("refuses to install a native engine release asset whose lock entry is status: unpinned", async () => {
     // engine.lock.json's committed native section has no pinned platform yet;
     // installNativeEngine() must refuse before ever fetching release bytes.
-    await expect(installNativeEngine()).resolves.toEqual({ installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." });
+    const expected = process.platform === "win32"
+      // The native (Swift/CodexBarCore) engine has no release target for
+      // Windows at all (macOS and Linux only); installNativeEngine() reports
+      // that explicitly instead of throwing, the same graceful shape as the
+      // "still unpinned" case below.
+      ? { installed: false, hint: "Native engine has no release asset for this platform; build locally with npm run engine:build." }
+      : { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
+    await expect(installNativeEngine()).resolves.toEqual(expected);
   });
 });
 
 describe("verifiedEnginePath re-verifies the cached engine on every call", () => {
-  async function stageCachedEngine(home: string): Promise<{ binary: string }> {
-    const lock = await readEngineLock();
+  const HEADROOM_ENGINE_LOCK = "HEADROOM_ENGINE_LOCK";
+
+  /**
+   * CodexBarCLI (the optional external engine binary these tests cache and
+   * re-verify) ships for macOS and Linux only -- there is no Windows release
+   * at all, so platformAssetName() has no naming convention to fabricate a
+   * pin for. There is nothing for these tests to exercise on that platform.
+   */
+  function skipOnUnsupportedPlatform(name: string): boolean {
+    if (process.platform !== "win32") return false;
+    process.stderr.write(`SKIP ${name}: CodexBarCLI has no Windows release asset to pin\n`);
+    return true;
+  }
+
+  /**
+   * verifiedEnginePath() always reads engine.lock.json's own, committed pin
+   * for the platform it runs on -- and only macOS arm64's CodexBarCLI asset
+   * is actually pinned there today (see engine.lock.json). These tests
+   * exercise the cache re-verification logic itself, not which platforms
+   * happen to be pinned yet, so they point HEADROOM_ENGINE_LOCK at a
+   * throwaway lock file with a fabricated pin for whatever (supported)
+   * platform is actually running the suite.
+   */
+  async function withSyntheticLock<T>(home: string, run: (lock: EngineLock) => Promise<T>): Promise<T> {
+    const tag = "v0.0.0-test";
+    const wanted = platformAssetName(tag);
+    const lock: EngineLock = {
+      tag,
+      repository: "example/example",
+      releaseAssets: [wanted],
+      assets: { [wanted]: { name: wanted, sha256: "f".repeat(64), url: `https://example.invalid/${wanted}` } },
+    };
+    const lockFile = join(home, "engine.lock.test.json");
+    await writeFile(lockFile, JSON.stringify(lock), { mode: 0o600 });
+    const previous = process.env[HEADROOM_ENGINE_LOCK];
+    process.env[HEADROOM_ENGINE_LOCK] = lockFile;
+    try { return await run(lock); }
+    finally { if (previous === undefined) delete process.env[HEADROOM_ENGINE_LOCK]; else process.env[HEADROOM_ENGINE_LOCK] = previous; }
+  }
+
+  async function stageCachedEngine(home: string, lock: EngineLock): Promise<{ binary: string }> {
     const wanted = platformAssetName(lock.tag);
     const locked = lock.assets[wanted];
-    if (!locked?.sha256) throw new Error("test fixture assumes a pinned asset for this platform");
     const root = join(home, "engine", lock.tag);
     await mkdir(root, { recursive: true, mode: 0o700 });
     const binary = join(root, "codexbar");
@@ -53,32 +98,48 @@ describe("verifiedEnginePath re-verifies the cached engine on every call", () =>
   }
 
   it("accepts a correctly owned, non-writable-by-others cached binary that matches its marker", async () => {
+    if (skipOnUnsupportedPlatform("accepts a correctly owned cached binary")) return;
     const root = await mkdtemp(join(tmpdir(), "headroom-verified-engine-ok-")); temporary.push(root);
-    const { binary } = await stageCachedEngine(root);
-    const canonical = await import("node:fs/promises").then((fs) => fs.realpath(binary));
-    await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).resolves.toBe(canonical); });
+    await withSyntheticLock(root, async (lock) => {
+      const { binary } = await stageCachedEngine(root, lock);
+      const canonical = await import("node:fs/promises").then((fs) => fs.realpath(binary));
+      await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).resolves.toBe(canonical); });
+    });
   });
 
   it("refuses a cached binary another local user (or this one) made group/world writable, even though its hash still matches the marker", async () => {
+    if (skipOnUnsupportedPlatform("refuses a group/world writable cached binary")) return;
     const root = await mkdtemp(join(tmpdir(), "headroom-verified-engine-writable-")); temporary.push(root);
-    const { binary } = await stageCachedEngine(root);
-    await chmod(binary, 0o777);
-    await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).rejects.toThrow(/group or world writable/); });
+    await withSyntheticLock(root, async (lock) => {
+      const { binary } = await stageCachedEngine(root, lock);
+      await chmod(binary, 0o777);
+      await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).rejects.toThrow(/group or world writable/); });
+    });
   });
 
   it("refuses a cached binary whose bytes changed after verification, never trusting the marker's recorded hash alone", async () => {
+    if (skipOnUnsupportedPlatform("refuses a tampered cached binary")) return;
     const root = await mkdtemp(join(tmpdir(), "headroom-verified-engine-tampered-")); temporary.push(root);
-    const { binary } = await stageCachedEngine(root);
-    await writeFile(binary, "#!/bin/sh\necho tampered\n", { mode: 0o700 });
-    await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).rejects.toThrow(/changed after verification/); });
+    await withSyntheticLock(root, async (lock) => {
+      const { binary } = await stageCachedEngine(root, lock);
+      await writeFile(binary, "#!/bin/sh\necho tampered\n", { mode: 0o700 });
+      await withHeadroomHome(root, async () => { await expect(verifiedEnginePath()).rejects.toThrow(/changed after verification/); });
+    });
   });
 
   it("never trusts a native engine marker whose asset.sha256 is null, even if a tampered marker matches it exactly", async () => {
     // The native section's release assets are committed unpinned
     // (sha256: null, status: "unpinned"); a marker crafted to match that
     // null sha256 must never be treated as a verified install.
-    const root = await mkdtemp(join(tmpdir(), "headroom-native-unpinned-marker-")); temporary.push(root);
     const lock = await readEngineLock();
+    if (process.platform === "win32") {
+      // The native engine has no release target for Windows at all yet --
+      // nativePlatformAssetName() refuses before any marker is even
+      // consulted, so there is nothing to plant a marker for.
+      expect(() => nativePlatformAssetName(lock)).toThrow(/No CodexBarCLI release asset/);
+      return;
+    }
+    const root = await mkdtemp(join(tmpdir(), "headroom-native-unpinned-marker-")); temporary.push(root);
     const asset = nativePlatformAssetName(lock);
     expect(asset.sha256).toBeNull();
     const binaryName = lock.native!.binary;

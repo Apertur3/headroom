@@ -7,6 +7,7 @@ import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { pollAccounts } from "../src/collector.js";
 import { isMainModule as cliIsMainModule } from "../src/cli.js";
 import { doctorChecks, homeCheck, keychainGrantCheck } from "../src/doctor.js";
+import { credentialPath } from "../src/paths.js";
 import { HeadroomStore } from "../src/store.js";
 import { isMainModule, supportsBuiltinSqlite, warningSuppressionFlag } from "../bin/headroom.js";
 
@@ -133,15 +134,27 @@ describe("doctor home directory and keychain grant checks", () => {
       seed.close();
       const checks = await doctorChecks();
       const credential = checks.find((item) => item.check === "principal claude-main credential");
-      // Distinct from the real "Claude Keychain item is unavailable" message
-      // credentialCheck's own security(1) call would otherwise produce; this
-      // text only appears on the gated, no-Keychain-touch path.
-      expect(credential).toMatchObject({ level: "FAIL", detail: "Keychain grant needed; probe skipped" });
       const store = await HeadroomStore.open(home);
       try {
         const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
         const rows = db.prepare("SELECT * FROM audit WHERE action = 'claude_probe' AND caller = 'doctor'").all();
-        expect(rows).toEqual([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]);
+        if (process.platform === "darwin") {
+          // Distinct from the real "Claude Keychain item is unavailable" message
+          // credentialCheck's own security(1) call would otherwise produce; this
+          // text only appears on the gated, no-Keychain-touch path.
+          expect(credential).toMatchObject({ level: "FAIL", detail: "Keychain grant needed; probe skipped" });
+          expect(rows).toEqual([expect.objectContaining({ meter_or_principal: "claude-main", outcome: "skipped: grant needed" })]);
+        } else {
+          // The Keychain-gated path only exists on macOS, where Claude's
+          // credentials actually live in the Keychain; credentialCheck's
+          // grant-marker gate is guarded by `process.platform === "darwin"`
+          // (src/doctor.ts) for exactly that reason. Elsewhere it reads the
+          // plain credential file directly, ignoring the marker set above,
+          // so there is nothing to skip and no claude_probe audit row at all.
+          const path = credentialPath("claude", "/nonexistent/.claude");
+          expect(credential).toMatchObject({ level: "FAIL", detail: `missing or unsafe credential file (${path})` });
+          expect(rows).toEqual([]);
+        }
       } finally { store.close(); }
     });
   });

@@ -2,17 +2,26 @@ import { createHmac, randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { rpc, HeadroomDaemon } from "../src/daemon.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
+/** A real Windows host has no filesystem-backed Unix-domain-socket
+ * equivalent: net.Server#listen() on a plain temp-dir path fails with
+ * EACCES there. A `\\.\pipe\...` name is the only thing that actually binds. */
+function testSocketPath(root: string, label: string): string {
+  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
+}
+
 /**
  * The Windows pipe session-token handshake only runs when process.platform
- * is "win32". There is no Windows CI runner here; every filesystem/path
- * helper elsewhere in the codebase also branches on process.platform (path
+ * is "win32". On a real Windows CI runner this is a harmless no-op (the
+ * platform already is "win32"); on macOS/Linux it lets these tests exercise
+ * that handshake without a Windows machine. Every filesystem/path helper
+ * elsewhere in the codebase also branches on process.platform (path
  * separators, ancestry checks, socket-vs-pipe naming), so faking the global
  * platform for an entire daemon start()/create() would fight those unrelated
  * branches on a real macOS/Linux filesystem. Instead these tests fake the
@@ -70,7 +79,7 @@ describe("Windows pipe authentication: client side (rpc)", () => {
   it("computes an HMAC proof of the server's nonce and never sends the plaintext session token", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-pipe-auth-client-")); temporary.push(root);
     const home = join(root, ".headroom");
-    const path = join(root, "fake-pipe.sock");
+    const path = testSocketPath(root, "fake-pipe");
     const token = randomBytes(32).toString("hex");
     let received: Record<string, unknown> | undefined;
     const server = createServer((socket) => {

@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { lstat, realpath, rename } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep, win32 } from "node:path";
+import { dirname, join, posix, relative, resolve, sep, win32 } from "node:path";
 
 export interface PathOptions {
   platform?: NodeJS.Platform;
@@ -12,8 +12,17 @@ function values(options: PathOptions): Required<PathOptions> {
   return { platform: options.platform ?? process.platform, env: options.env ?? process.env, home: options.home ?? homedir() };
 }
 
+/**
+ * A plain `join()` from "node:path" always uses the *host* OS's separator,
+ * not the `platform` a caller asked to simulate (headroomHome() and friends
+ * accept an explicit `platform` precisely so callers, and tests, can compute
+ * another platform's path without actually running there). On a real Windows
+ * host, `join()` is `win32.join()`, so the `platform !== "win32"` branch must
+ * reach for `posix.join()` explicitly -- otherwise a simulated macOS/Linux
+ * path silently comes back with backslashes and a drive-relative root.
+ */
 export function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): string {
-  return platform === "win32" ? win32.join(...parts) : join(...parts);
+  return platform === "win32" ? win32.join(...parts) : posix.join(...parts);
 }
 
 export function headroomHome(options: PathOptions = {}): string {

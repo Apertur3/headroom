@@ -43,7 +43,12 @@ describe("headroom accounts discover", () => {
     try {
       // PATH cleared so a real `agy` binary elsewhere on this machine never
       // adds an unplanned Antigravity account and changes the expected count.
-      await withEnv({ HOME: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      // USERPROFILE alongside HOME: node:os's homedir() reads USERPROFILE on
+      // Windows and ignores HOME entirely, so discoverAccounts()'s default
+      // homedir() lookup would otherwise fall through to the real runner
+      // profile (finding no .claude dir, and reporting 0 accounts instead
+      // of the 1 this test seeds).
+      await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
         const code = await main(["accounts", "discover"]);
         expect(code).toBe(0);
       });
