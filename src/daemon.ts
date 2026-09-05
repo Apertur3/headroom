@@ -1,6 +1,6 @@
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, stat, unlink, readFile, writeFile } from "node:fs/promises";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
@@ -32,7 +32,14 @@ export function socketPath(home = headroomHome(), platform = process.platform, u
   // joinForPlatform, not a bare join(): join() always uses the *host* OS's
   // separator, which would mis-simulate a non-native `platform` argument
   // (e.g. a "linux" home path on a real Windows host) with backslashes.
-  return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : joinForPlatform(platform, home, "headroom.sock");
+  // A named pipe has no directory, so the pipe name carries a digest of the
+  // Headroom home: two homes for one Windows user (or two test daemons on
+  // one runner) get two pipes instead of fighting over one.
+  if (platform === "win32") {
+    const homeDigest = createHash("sha256").update(home.replace(/[\\/]+$/, "").toLowerCase()).digest("hex").slice(0, 8);
+    return `\\\\.\\pipe\\headroom-${username}-${homeDigest}`;
+  }
+  return joinForPlatform(platform, home, "headroom.sock");
 }
 
 const SESSION_FILE = "pipe-session-token";
