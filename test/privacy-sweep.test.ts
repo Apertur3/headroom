@@ -11,13 +11,27 @@ const scriptPath = join(__dirname, "..", "scripts", "privacy-sweep.sh");
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-async function checkFile(contents: string): Promise<{ code: number; stdout: string }> {
+async function checkFile(contents: string, opts: { denylist?: string } = {}): Promise<{ code: number; stdout: string }> {
   const root = await mkdtemp(join(tmpdir(), "headroom-privacy-sweep-"));
   temporary.push(root);
   const target = join(root, "fixture.txt");
   await writeFile(target, contents, "utf8");
+  const args = ["--check", target];
+  if (opts.denylist) args.push("--denylist", opts.denylist);
   try {
-    const { stdout } = await execFileAsync("bash", [scriptPath, "--check", target]);
+    const { stdout } = await execFileAsync("bash", [scriptPath, ...args], {
+      env: {
+        ...process.env,
+        // scripts/privacy-sweep.sh merges in an untracked local denylist
+        // (PRIVACY_DENYLIST, or ~/.config/headroom-privacy-denylist) that
+        // holds real machine/person names on a developer's own machine.
+        // Point it at a path that can never exist so every check here runs
+        // against only the tracked denylist (or the one --denylist names
+        // above) -- never a real local list, and never CI's total absence
+        // of one either.
+        PRIVACY_DENYLIST: join(root, "no-such-local-denylist"),
+      },
+    });
     return { code: 0, stdout };
   } catch (error: unknown) {
     const result = error as { code?: number; stdout?: string };
@@ -74,7 +88,17 @@ describe("scripts/privacy-sweep.sh --check", () => {
   });
 
   it("fails on a denylist match (case-insensitive)", async () => {
-    const { code, stdout } = await checkFile(`deployed to ${denylistWord} last night\n`);
+    // The tracked .privacy-denylist is generic-only (see its own header) --
+    // real machine/person names live only in an untracked local list, which
+    // checkFile() above deliberately keeps out of this run. So this test
+    // supplies its own throwaway denylist: a case-insensitive pattern for
+    // denylistWord, matched here against a differently-cased occurrence to
+    // actually exercise the (?i) case-folding rather than a literal match.
+    const root = await mkdtemp(join(tmpdir(), "headroom-privacy-denylist-"));
+    temporary.push(root);
+    const denylistPath = join(root, "denylist.txt");
+    await writeFile(denylistPath, `(?i)${denylistWord.toLowerCase()}\n`, "utf8");
+    const { code, stdout } = await checkFile(`deployed to ${denylistWord} last night\n`, { denylist: denylistPath });
     expect(code).not.toBe(0);
     expect(stdout).toContain("denylist match");
   });
