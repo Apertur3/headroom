@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.3] - 2026-09-06
+
 ### Added
 - `headroom setup`: a one-shot interactive setup for a person without an agent. Walks through
   account discovery, `doctor`, the macOS Keychain grant, the background service install and the
