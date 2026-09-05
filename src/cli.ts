@@ -12,7 +12,7 @@ import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { canRouteWithLeases, paceDecision, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
@@ -182,8 +182,12 @@ async function can(argv: string[]): Promise<number> {
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
   if (!owner) throw new Error("--owner is required");
   const routing = await readRouting();
+  if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
   const meters = routing.consumes[action];
   if (!meters) throw new Error(`Unknown action class: ${action}`);
+  const accounts = await readAccounts();
+  const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+  if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
   const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
   if (request !== undefined) {
     const decision = unwrapRpc(request) as CanDecision;
@@ -193,7 +197,7 @@ async function can(argv: string[]): Promise<number> {
   directReadNotice();
   const [policy, store] = await Promise.all([readPolicy(), HeadroomStore.open()]);
   try {
-    const localAccounts = (await readAccounts()).filter(isLocalAccount);
+    const localAccounts = accounts.filter(isLocalAccount);
     // With no daemon, `can` is also a direct read: refresh local state rather
     // than deciding a routing preference from an old queue-depth sample.
     store.insertAll(await Promise.all(localAccounts.map(observeLocal)));

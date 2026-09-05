@@ -6,6 +6,17 @@ import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js"
 import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
+import { redact } from "./security.js";
+
+/** Applies redact() to every string leaf of a value, so a metadata object
+ * carrying a leaked secret in one of its string fields is scrubbed the same
+ * way a plain error string would be. */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === "string") return redact(value);
+  if (Array.isArray(value)) return value.map(redactDeep);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, redactDeep(item)]));
+  return value;
+}
 
 interface Database {
   exec(sql: string): void;
@@ -290,19 +301,28 @@ export class HeadroomStore {
 
   insert(observation: Observation): StoredObservation {
     const previous = this.previous(observation);
+    // Reasons and metadata come from vendor responses (or their diagnostics)
+    // and are persisted; redact them the same way any other vendor-adjacent
+    // output is redacted, so a token or cookie that leaked into a failure
+    // reason or a metadata string never lands in the database either.
+    const reason = observation.reason ? redact(observation.reason) : observation.reason ?? null;
+    const metadata = observation.metadata ? redactDeep(observation.metadata) as Observation["metadata"] : observation.metadata;
     const result = this.db.prepare(`INSERT INTO observations
       (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       observation.principal_id, observation.meter_id, json(observation.window), json(observation.quantity), observation.resets_at ?? null,
       observation.observed_at ?? null, observation.fetched_at ?? null, observation.source, observation.truth, observation.freshness, observation.confidence,
-      observation.adapter_version, observation.upstream_schema_version, observation.reason ?? null, json(observation.metadata));
-    const stored: StoredObservation = { ...observation, id: Number(result.lastInsertRowid) };
+      observation.adapter_version, observation.upstream_schema_version, reason, json(metadata));
+    const stored: StoredObservation = { ...observation, reason, metadata, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.recordFailure([stored.id], stored);
     // The first reading ever stored under this exact meter id has no immediate
     // previous row, even though the legacy doubled-principal form of the same
     // meter does; the baseline lookup below checks that form on its own.
     else if (stored.freshness === "fresh") { const baseline = this.freshBaseline(stored); if (baseline) this.classifyUsageDrop(baseline, stored); }
+    // Independent of the window-scoped previous()/detectEvents() path above:
+    // a windowless failure is only ever closed by this separate check.
+    if (stored.freshness === "fresh") this.recoverWindowlessFailure(stored);
     if (previous) this.attributeLeaseSpend(previous, stored);
     return stored;
   }
@@ -330,17 +350,73 @@ export class HeadroomStore {
     this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null, current.fetched_at);
   }
 
+  /** The still-open source_failed event for this meter and window, or
+   * undefined if the last event for that (meter, window) pair was a recovery
+   * (or there has never been a failure). Scoped by the evidence observations'
+   * own window rather than the events table (which has no window column) so
+   * a failed 5h window and a failed weekly window never collapse into, or
+   * silently close, each other's event. */
+  private openFailureForWindow(meterId: string, window: Observation["window"]): Row | undefined {
+    const minutes = window?.minutes ?? null;
+    // IS (not =) with an INTEGER cast on the JSON side only, matching
+    // eventEvidenceFor's pattern below: node:sqlite binds a JS number
+    // parameter as SQLite REAL, so CAST(?, AS TEXT) on that parameter would
+    // produce '10080.0' against json_extract's '10080' and never match. IS
+    // also makes a windowless (null-minutes) comparison exact rather than
+    // SQL NULL's usual never-equal-anything behavior.
+    const row = this.db.prepare(`SELECT e.* FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.meter_id = ? AND e.kind IN ('source_failed', 'source_recovered')
+        AND o.window_json IS NOT NULL AND o.window_json <> 'null'
+        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) IS ?
+      ORDER BY e.created_at DESC, e.id DESC LIMIT 1`).get(meterId, minutes);
+    return row && row.kind === "source_failed" ? row : undefined;
+  }
+
+  /** The still-open windowless source_failed event for this meter (a
+   * transport/auth failure with no vendor window, representing the whole
+   * meter), independent of window equality: it is open exactly when no
+   * source_recovered event of ANY window has fired since it, since a
+   * windowless failure is only ever closed by whatever reading recovers
+   * next, which may carry a real window (a real window's own recordFailure /
+   * recovery bookkeeping is otherwise scoped to matching windows only). */
+  private openWindowlessFailure(meterId: string): Row | undefined {
+    const lastFailure = this.db.prepare(`SELECT e.* FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.meter_id = ? AND e.kind = 'source_failed' AND (o.window_json IS NULL OR o.window_json = 'null')
+      ORDER BY e.created_at DESC, e.id DESC LIMIT 1`).get(meterId);
+    if (!lastFailure) return undefined;
+    const closed = this.db.prepare("SELECT 1 FROM events WHERE meter_id = ? AND kind = 'source_recovered' AND created_at > ? LIMIT 1")
+      .get(meterId, String(lastFailure.created_at));
+    return closed ? undefined : lastFailure;
+  }
+
   /** Emit source_failed only on the transition into failure (or when nothing
-   * is open yet); while a principal stays failed, advance last_seen_at on
-   * the still-open event instead of inserting a new one every poll. */
+   * is open yet, scoped to this observation's own window); while a principal
+   * stays failed, advance last_seen_at on the still-open event instead of
+   * inserting a new one every poll. */
   private recordFailure(evidence: number[], current: StoredObservation): void {
-    const open = this.db.prepare(`SELECT * FROM events WHERE meter_id = ? AND kind IN ('source_failed', 'source_recovered')
-      ORDER BY created_at DESC, id DESC LIMIT 1`).get(current.meter_id);
-    if (open && open.kind === "source_failed") {
+    const open = current.window ? this.openFailureForWindow(current.meter_id, current.window) : this.openWindowlessFailure(current.meter_id);
+    if (open) {
       this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(current.fetched_at, String(open.id));
       return;
     }
     this.addSourceFailedEvent(evidence, current);
+  }
+
+  /** A windowless (whole-meter transport/auth) failure is not directly
+   * comparable to a subsequent windowed reading via previous()'s exact
+   * window match, so it would otherwise never be recovered: a real-window
+   * fresh reading after it must still close it, or a second outage separated
+   * by that recovery would silently extend the first failure's event instead
+   * of opening a new one. Called for every fresh observation regardless of
+   * its own window. */
+  private recoverWindowlessFailure(current: StoredObservation): void {
+    if (current.freshness !== "fresh") return;
+    if (!this.openWindowlessFailure(current.meter_id)) return;
+    this.addEvent("source_recovered", "vendor_reported", 1, [current.id], current);
   }
 
   /** The comparison baseline for a fresh observation is the most recent FRESH
@@ -444,13 +520,21 @@ export class HeadroomStore {
       WHERE current.row_number = 1
         -- A transport/auth failure has no vendor window. It replaces an older
         -- successful read for the whole meter; an older failure must not add a
-        -- spurious '-' window beside a newer vendor response.
+        -- spurious '-' window beside a newer vendor response. This supersession
+        -- is scoped to the SAME window as the failure (a failed 5h window must
+        -- not be hidden by a fresh weekly one, and vice versa) unless the
+        -- failure itself is windowless, in which case it represents the whole
+        -- meter and is superseded by any newer reading regardless of window.
         AND NOT EXISTS (
           SELECT 1 FROM observations AS peer
           WHERE peer.meter_id = current.meter_id
             AND (
               (current.freshness = 'failed' AND peer.freshness <> 'failed')
               OR (current.freshness <> 'failed' AND peer.freshness = 'failed')
+            )
+            AND (
+              current.window_json IS NULL OR current.window_json = 'null' OR peer.window_json IS NULL OR peer.window_json = 'null'
+              OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
         )
@@ -618,5 +702,27 @@ export class HeadroomStore {
 
   setProbeGrantedHash(hash: string): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
+  }
+
+  /**
+   * Shared backoff state for a poll path that has no daemon scheduler to
+   * enforce it in memory (MCP's direct, no-daemon fallback: see mcp.ts's
+   * directStatus). Backed by the same on-disk daemon_state table every other
+   * caller of the same database already sees, so repeated MCP tool calls
+   * within a poll interval -- or across separate MCP client processes
+   * sharing one HEADROOM_HOME -- share one throttle instead of each hammering
+   * the vendor independently.
+   */
+  directPollBackoff(): { lastPollAt: number; until: number; failures: number } {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'mcp_direct_poll_backoff'").get();
+    if (!row) return { lastPollAt: 0, until: 0, failures: 0 };
+    try {
+      const parsed = JSON.parse(String(row.value)) as { lastPollAt?: number; until?: number; failures?: number };
+      return { lastPollAt: Number(parsed.lastPollAt) || 0, until: Number(parsed.until) || 0, failures: Number(parsed.failures) || 0 };
+    } catch { return { lastPollAt: 0, until: 0, failures: 0 }; }
+  }
+
+  setDirectPollBackoff(state: { lastPollAt: number; until: number; failures: number }): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('mcp_direct_poll_backoff', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(state));
   }
 }

@@ -9,7 +9,10 @@ describe("CodexBar Codex adapter", () => {
     const readings = adaptCodexPayload(payload, "codex-main", "2026-09-03T13:24:00Z");
     expect(readings).toHaveLength(2);
     expect(readings[0]).toMatchObject({
-      account: "codex-main", pool: "main", plan: "pro", truth: "official",
+      // CodexBarCore performs its own outbound request outside Headroom's
+      // allowlist, so every codexbar reading is estimated regardless of the
+      // vendor's own source label (see adapt.ts and SECURITY.md).
+      account: "codex-main", pool: "main", plan: "pro", truth: "estimated",
       windows: { five_hour: { used_percent: 12, window_minutes: 300 }, weekly: { used_percent: 3, window_minutes: 10080 } },
       extras: { free_resets_available: 1, credits: [{ status: "available", expires_at: "2026-09-08T17:23:00Z" }] },
     });

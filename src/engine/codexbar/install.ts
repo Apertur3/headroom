@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { headroomHome, migrateLegacyHome } from "../../paths.js";
+import { assertSafeAncestry, executablePath, headroomHome, migrateLegacyHome } from "../../paths.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -179,13 +179,24 @@ async function findEngineBinary(root: string): Promise<string> {
 
 export async function verifiedEnginePath(): Promise<string> {
   const lock = await readEngineLock();
+  const root = installRoot(lock.tag);
+  // A co-tenant on a shared machine must not be able to redirect the engine
+  // cache by planting a symlink somewhere above it, the same bar Headroom's
+  // own home directory is held to.
+  await assertSafeAncestry(root);
   const marker = JSON.parse(await fs.readFile(markerPath(lock.tag), "utf8")) as { asset?: string; sha256?: string; binarySha256?: string };
   if (!marker.asset || !marker.sha256 || lock.assets[marker.asset]?.sha256 !== marker.sha256) {
     throw new Error("Engine is absent or no longer matches engine.lock.json; run headroom engine install");
   }
-  const binary = await findEngineBinary(installRoot(lock.tag));
-  if (!marker.binarySha256 || marker.binarySha256 !== await sha256File(binary)) throw new Error("Engine binary changed after verification; run headroom engine install");
-  return binary;
+  const binary = await findEngineBinary(root);
+  // Ownership and permissions are re-checked on every call, not only at
+  // install time: a cache marker recording a stale binarySha256 must never
+  // be enough to trust an executable another local user could have swapped
+  // since. The binary itself is also re-hashed here, never trusted from the
+  // marker alone.
+  const verified = await executablePath(binary);
+  if (!marker.binarySha256 || marker.binarySha256 !== await sha256File(verified)) throw new Error("Engine binary changed after verification; run headroom engine install");
+  return verified;
 }
 
 export async function engineStatus(): Promise<{ tag: string; path: string; present: boolean }> {

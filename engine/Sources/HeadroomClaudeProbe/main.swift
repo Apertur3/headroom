@@ -23,13 +23,51 @@ func containsEmailAddress(_ value: String) -> Bool {
     value.range(of: #"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"#, options: .regularExpression) != nil
 }
 
-/// Cancels every HTTP redirect. `URLSession.shared` follows redirects and
-/// re-sends the Authorization header to whatever host issued the 3xx; a
-/// nil completion here refuses the redirect and the original task fails
-/// or resolves to the non-redirected response instead.
-final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+/// A value that merely looks like a credential must never reach stdout,
+/// regardless of which JSON key it sits under: the key-name filter below
+/// (token/refresh/email) only catches a key that says what it is, not a
+/// vendor field that happens to carry a stray key/token/JWT as its value.
+func containsTokenShapedSecret(_ value: String) -> Bool {
+    // Word-boundary prefixes (not a bare substring search) so an unrelated
+    // word like "risk-level" does not false-positive on "sk-"; the final
+    // alternative is a long unbroken run of base64/hex-alphabet characters,
+    // which looks like a key or token even under an unrelated field name.
+    let pattern = #"\bsk-ant-[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]+|\bya29\.[A-Za-z0-9._-]+|\bGOCSPX-[A-Za-z0-9_-]+|\beyJ[A-Za-z0-9_-]+|[A-Za-z0-9+/_=-]{41,}"#
+    return value.range(of: pattern, options: .regularExpression) != nil
+}
+
+/// Cancels every HTTP redirect and enforces a byte cap while streaming.
+/// `URLSession.shared` follows redirects and re-sends the Authorization
+/// header to whatever host issued the 3xx; a nil completion here refuses the
+/// redirect and the original task fails or resolves to the non-redirected
+/// response instead. Driving the request via a data-task delegate (rather
+/// than the completion-handler convenience API, whose data/didReceive
+/// callbacks Foundation never invokes) means bytes are counted and the task
+/// is cancelled the moment the cap is exceeded, instead of buffering a
+/// complete response before ever checking its size.
+final class RedirectRefusingDelegate: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate, @unchecked Sendable {
+    let cap: Int
+    private(set) var data = Data()
+    private(set) var capExceeded = false
+    var onComplete: ((URLResponse?, Error?) -> Void)?
+
+    init(cap: Int = 1_048_576) { self.cap = cap }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        if capExceeded { return }
+        data.append(chunk)
+        if data.count > cap {
+            capExceeded = true
+            dataTask.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        onComplete?(task.response, error)
     }
 }
 
@@ -61,21 +99,29 @@ struct HeadroomClaudeProbe {
         request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
         let wait = DispatchSemaphore(value: 0)
         let resultBox = ResultBox()
-        let session = URLSession(configuration: .ephemeral, delegate: RedirectRefusingDelegate(), delegateQueue: nil)
-        session.dataTask(with: request) { data, response, _ in
+        let delegate = RedirectRefusingDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        delegate.onComplete = { response, _ in
             let http = response as? HTTPURLResponse
             resultBox.status = http?.statusCode ?? 0
             resultBox.finalURL = http?.url
             resultBox.ok = resultBox.status == 200
-            resultBox.data = data; wait.signal()
-        }.resume()
+            wait.signal()
+        }
+        session.dataTask(with: request).resume()
         guard wait.wait(timeout: .now() + 12) == .success else { fail("HEADROOM_PROBE_TIMEOUT", 4) }
         // A refused redirect still resolves the task with whatever response the
         // last hop returned; verify the host before trusting anything else about it.
         guard isAnthropicUsageHost(resultBox.finalURL) else { fail("HEADROOM_PROBE_BAD_HOST", 5) }
         if resultBox.status == 401 { fail("HEADROOM_PROBE_EXPIRED", 1) }
-        guard resultBox.ok, let data = resultBox.data, data.count <= 1_048_576, safeUsageJSON(data) else { fail("HEADROOM_PROBE_USAGE_FAILED", 1) }
-        FileHandle.standardOutput.write(data)
+        // Distinct markers for 403/429 let the TypeScript adapter propagate a
+        // status-carrying reason, so the collector's shared backoff logic
+        // treats a probe rate-limit or forbidden response the same way it
+        // treats one from any other credentialed vendor call.
+        if resultBox.status == 403 { fail("HEADROOM_PROBE_FORBIDDEN", 1) }
+        if resultBox.status == 429 { fail("HEADROOM_PROBE_RATE_LIMITED", 1) }
+        guard !delegate.capExceeded, resultBox.ok, delegate.data.count <= 1_048_576, safeUsageJSON(delegate.data) else { fail("HEADROOM_PROBE_USAGE_FAILED", 1) }
+        FileHandle.standardOutput.write(delegate.data)
     }
 
     private static func fail(_ marker: String, _ code: Int32) -> Never { fputs("\(marker)\n", stderr); exit(code) }
@@ -91,7 +137,7 @@ struct HeadroomClaudeProbe {
         guard depth <= 32 else { return false }
         if let string = value as? String {
             guard string.lengthOfBytes(using: .utf8) <= 65_536 else { return false }
-            return !containsEmailAddress(string)
+            return !containsEmailAddress(string) && !containsTokenShapedSecret(string)
         }
         if let array = value as? [Any] { return array.count <= 10_000 && array.allSatisfy { check($0, depth: depth + 1) } }
         if let object = value as? [String: Any] {
@@ -111,7 +157,6 @@ struct HeadroomClaudeProbe {
 }
 
 private final class ResultBox: @unchecked Sendable {
-    var data: Data?
     var ok = false
     var status = 0
     var finalURL: URL?

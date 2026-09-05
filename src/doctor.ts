@@ -83,11 +83,17 @@ export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, s
   return check("FAIL", `principal ${account.name} keychain grant`, `Keychain grant needed; run: headroom keychain grant --principal ${account.name}`, `headroom keychain grant --principal ${account.name}`);
 }
 
-function adapterCheck(account: Account): DoctorCheck {
+export function adapterCheck(account: Account): DoctorCheck {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} adapter`, "native local adapter selected", "no action needed");
   const level: DoctorLevel = account.adapter === "pending" ? "FAIL" : account.adapter === "codexbar" ? "WARN" : "OK";
   const fix = account.adapter === "pending" ? "run: headroom accounts discover" : account.adapter === "codexbar" ? "run: headroom engine install, or rediscover for native-ts" : "no action needed";
-  return check(level, `principal ${account.name} adapter`, `${account.vendor} uses ${account.adapter}`, fix);
+  // CodexBarCore (the optional Swift engine's dependency) performs its own
+  // authenticated HTTP request outside Headroom's outbound allowlist; make
+  // that visible at every `doctor` run, not only in SECURITY.md.
+  const detail = account.adapter === "codexbar"
+    ? `${account.vendor} uses codexbar; this optional engine performs its own network calls outside Headroom's outbound allowlist, and its readings are marked truth: estimated`
+    : `${account.vendor} uses ${account.adapter}`;
+  return check(level, `principal ${account.name} adapter`, detail, fix);
 }
 
 async function configCheck(name: "policy" | "routing", path: string): Promise<DoctorCheck> {

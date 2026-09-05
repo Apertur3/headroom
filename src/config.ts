@@ -13,7 +13,7 @@ export async function readPolicy(): Promise<Policy> {
 }
 
 export type LocalPreference = "fallback" | "prefer" | "never";
-export interface Routing { consumes: Record<string, string[]>; local_preference: LocalPreference; }
+export interface Routing { consumes: Record<string, string[]>; local_preference: LocalPreference; /** Absent only when parseRouting() built this literal directly; readRouting() always sets it. */ present?: boolean; }
 
 /** Parse Headroom's deliberately small routing surface without accepting arbitrary
  * TOML features into a security-sensitive local config. */
@@ -47,5 +47,5 @@ export async function readConsumes(): Promise<Record<string, string[]>> {
 export async function readRouting(): Promise<Routing> {
   const path = process.env.HEADROOM_ROUTING ?? join(headroomHome(), "routing.toml");
   const text = await optionalText(path);
-  return text === undefined ? { consumes: {}, local_preference: "fallback" } : parseRouting(text);
+  return text === undefined ? { consumes: {}, local_preference: "fallback", present: false } : { ...parseRouting(text), present: true };
 }

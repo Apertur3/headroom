@@ -45,6 +45,16 @@ export interface AntigravityLocalRead {
   at: string;
 }
 
+/**
+ * Matches a protected vendor status (401/403/429) in either the parenthesized
+ * form every adapter using ProviderHTTPError produces ("... (429)") or
+ * Google's own bare "HTTP 429" formatting (AntigravityHTTPError, and the
+ * Gemini Code Assist fallback's own errors), so a backoff decision never
+ * silently misses one vendor's status-code wording. Exported so daemon.ts's
+ * scheduler-level backoff shares the exact same detection.
+ */
+export const PROTECTED_STATUS_PATTERN = /\((?:401|403|429)\)|\bHTTP (?:401|403|429)\b/;
+
 const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
 const ANTIGRAVITY_WINDOWS = [300, 10_080];
 
@@ -81,7 +91,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       const denied = result.find((item) => item.freshness === "failed" && item.reason?.startsWith("Keychain grant needed;"));
       if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
     }
-    const protectedFailure = result.find((item) => item.freshness === "failed" && /\(401|403|429\)/.test(item.reason ?? ""));
+    const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
   }
   // A one-shot CLI/MCP read is intentionally remote-only. The Swift local
@@ -121,7 +131,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     } else {
       const remote = await observeAntigravity(account);
       observations.push(...selectAntigravitySource(local, remote, account.name));
-      const protectedFailure = remote.find((item) => item.freshness === "failed" && /\(401|403|429\)/.test(item.reason ?? ""));
+      const protectedFailure = remote.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
       if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
     }
   }
