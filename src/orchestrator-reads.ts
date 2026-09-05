@@ -55,18 +55,30 @@ function meterUnknownReason(store: HeadroomStore, meterId: string, fallback: str
 
 export interface MeterWindows { short?: StoredObservation; long?: StoredObservation; }
 
+/** A window at or above this duration is "long" (the weekly one, currently
+ * always exactly 10_080 minutes); anything shorter is "short" (the 5h one,
+ * currently always exactly 300 minutes). One day is a wide, deliberately
+ * generous boundary between the two -- comfortably above any real 5h-class
+ * window and comfortably below any real weekly-class one. */
+const LONG_WINDOW_THRESHOLD_MINUTES = 24 * 60;
+
 /** The shortest window (typically the 5h one) and the longest (typically the
  * weekly one) currently known for a meter, including a not_enforced window
  * (see knownPercentWindows) so a meter whose 5h is confirmed capless still
- * resolves its genuine weekly window as `long` rather than losing it to the
- * "only one window known" ambiguity. Either may be absent; with only one
- * window known, `long` stays absent rather than aliasing the same row
- * `short` already names -- callers that only care about a genuine second
- * (weekly) window must be able to tell "no weekly window yet" apart from
- * "the only window IS the weekly one". */
+ * resolves its genuine weekly window as `long`. Each slot is picked by its
+ * own absolute duration (see LONG_WINDOW_THRESHOLD_MINUTES), never by array
+ * position or how many windows are known in total -- a meter whose 5h window
+ * has literally never been stored (not even a not_enforced placeholder; the
+ * native Swift engine omits it entirely rather than storing one) still has
+ * exactly one known window, the weekly one, and it must resolve as `long`,
+ * not be aliased to `short` for having arrived alone. Either slot may be
+ * absent when no window of that duration class has ever been read. */
 export function meterWindows(store: HeadroomStore, meterId: string): MeterWindows {
   const rows = knownPercentWindows(store, meterId);
-  return { short: rows[0], long: rows.length > 1 ? rows[rows.length - 1] : undefined };
+  return {
+    short: rows.find((row) => (row.window!.minutes as number) < LONG_WINDOW_THRESHOLD_MINUTES),
+    long: rows.find((row) => (row.window!.minutes as number) >= LONG_WINDOW_THRESHOLD_MINUTES),
+  };
 }
 
 export interface RateLine {
