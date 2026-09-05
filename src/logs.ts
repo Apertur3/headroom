@@ -1,12 +1,17 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { headroomHome } from "./paths.js";
+import { headroomHome, joinForPlatform } from "./paths.js";
 
 export const DAEMON_LOG_MAX_BYTES = 5 * 1024 * 1024;
 /** The active log plus four archives keeps at most five 5 MiB files. */
 export const DAEMON_LOG_FILE_COUNT = 5;
 
-export function daemonLogPath(home = headroomHome()): string { return join(home, "logs", "daemon.log"); }
+// joinForPlatform, not a bare join(): service.ts calls this while generating
+// another platform's service file (e.g. a Linux unit's log path from a
+// macOS dry run), and a bare join() always uses the host's own separator.
+export function daemonLogPath(home = headroomHome(), platform: NodeJS.Platform = process.platform): string {
+  return joinForPlatform(platform, home, "logs", "daemon.log");
+}
 
 /** Rotate before appending so Headroom's own daemon messages never grow unbounded. */
 export async function rotateDaemonLog(path = daemonLogPath()): Promise<void> {

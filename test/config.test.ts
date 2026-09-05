@@ -41,8 +41,15 @@ describe("seedExampleConfig", () => {
     const routingText = await readFile(join(home, "routing.toml"), "utf8");
     expect(Object.keys(parseRouting(routingText).consumes)).toEqual(["claude-fable", "codex-build", "gemini-bulk"]);
 
-    const policyStat = await stat(join(home, "policy.toml"));
-    expect(policyStat.mode & 0o777).toBe(0o600);
+    if (process.platform === "win32") {
+      // Windows has no POSIX permission bits (seedExampleConfig's writeFile
+      // mode: 0o600 is a harmless no-op there); there is nothing meaningful
+      // to assert about the file's mode on this platform.
+      console.log("SKIP policy.toml mode assertion on win32: no POSIX permission bits to check");
+    } else {
+      const policyStat = await stat(join(home, "policy.toml"));
+      expect(policyStat.mode & 0o777).toBe(0o600);
+    }
   });
 
   it("never overwrites an existing policy.toml or routing.toml, and reports nothing for files already present", async () => {

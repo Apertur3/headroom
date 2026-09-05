@@ -1,11 +1,12 @@
+import { createHmac, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
-import { daemonRequest, rpc, HeadroomDaemon } from "../src/daemon.js";
+import { daemonRequest, rpc, socketPath, HeadroomDaemon } from "../src/daemon.js";
 import { tailDaemonLog } from "../src/logs.js";
 import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
@@ -28,6 +29,40 @@ function fixture(): Observation {
     quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T13:00:00Z",
     observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
   };
+}
+
+/** A real Windows daemon listens on a `\\.\pipe\...` name, never a plain
+ * filesystem path -- net.Server#listen() on a bare temp-dir path fails with
+ * EACCES on a real win32 host. root is already unique (mkdtemp), so folding
+ * its basename into the pipe name keeps concurrent tests from colliding. */
+function testSocketPath(root: string, label: string): string {
+  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
+}
+
+function pipeAuthProof(token: string, nonce: string): string {
+  return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");
+}
+function healthSignature(token: string): string {
+  return createHmac("sha256", token).update("headroom-health-v1").digest("hex");
+}
+
+/**
+ * handleLine() requires the Windows pipe-auth handshake (a proof of a
+ * per-connection nonce) for every method but "health" -- production code
+ * always supplies a real nonce from handleSocket(). Tests that call
+ * handleLine() directly are exercising request dispatch, not the pipe
+ * transport itself (test/pipe-auth.test.ts covers that), so on win32 they
+ * authenticate the same way a real client would: force a known session
+ * token onto the daemon, then sign a fresh nonce the same way rpc() does.
+ */
+async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> {
+  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> };
+  if (process.platform !== "win32") return internal.handleLine(line);
+  internal.sessionToken ??= randomBytes(32).toString("hex");
+  const nonce = randomBytes(16).toString("hex");
+  const request = JSON.parse(line) as { params?: Record<string, unknown> };
+  const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
+  return internal.handleLine(JSON.stringify({ ...request, params }), nonce);
 }
 
 describe("daemon JSON-RPC", () => {
@@ -94,34 +129,64 @@ describe("daemon JSON-RPC", () => {
     const ended = internal.store.startLease("cadence", "codex-main:main", null, 60_000, null, now);
     internal.store.endLease(ended.id, "cadence", false, now);
     try {
-      await expect(internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"leases"}')).resolves.toMatchObject({ result: [expect.objectContaining({ id: active.id })] });
-      const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"leases"}');
+      await expect(authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"leases"}')).resolves.toMatchObject({ result: [expect.objectContaining({ id: active.id })] });
+      const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"leases"}');
       expect((reply.result as Array<{ id: string }>).map((lease) => lease.id)).toEqual([active.id]);
     } finally { await daemon.stop(); }
   });
 
   it("uses a healthy fake daemon after its bounded health probe", async function () {
     const root = await mkdtemp(join(tmpdir(), "headroom-client-")); temporary.push(root);
-    const path = join(root, "headroom.sock");
+    const path = testSocketPath(root, "headroom");
     const methods: string[] = [];
+    // Windows only: daemonRequest()'s health probe also verifies an HMAC
+    // signature over a session token it reads locally (src/daemon.ts's
+    // healthSignature/pipeAuthProof), and every non-health request must
+    // carry the proof of that connection's nonce. The fake server below
+    // plays both roles so daemonRequest() sees the exact wire protocol a
+    // real daemon speaks; on POSIX none of this applies (isWin32 guards
+    // keep the behavior identical to before).
+    const token = randomBytes(32).toString("hex");
+    let previousHome: string | undefined;
+    if (process.platform === "win32") {
+      previousHome = process.env.HEADROOM_HOME;
+      process.env.HEADROOM_HOME = root;
+      await writeFile(join(root, "pipe-session-token"), `${token}\n`, { mode: 0o600 });
+    }
     const server = createServer((socket) => {
       socket.setEncoding("utf8");
+      let nonce: string | undefined;
+      if (process.platform === "win32") {
+        nonce = randomBytes(16).toString("hex");
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
+      }
       socket.on("data", (line: string) => {
-        const request = JSON.parse(line) as { id: number; method: string };
+        const request = JSON.parse(line) as { id: number; method: string; params?: { _proof?: string } };
         methods.push(request.method);
-        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: request.method === "status" ? [fixture()] : { ok: true } })}\n`);
+        if (process.platform === "win32" && request.method !== "health" && request.params?._proof !== pipeAuthProof(token, nonce!)) {
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32001, message: "Unauthorized pipe client" } })}\n`);
+          return;
+        }
+        const result = request.method === "health"
+          ? (process.platform === "win32" ? { ok: true, signature: healthSignature(token) } : { ok: true })
+          : request.method === "status" ? [fixture()] : { ok: true };
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
       });
     });
     try {
-      await new Promise<void>((resolve, reject) => { server.once("error", reject).listen(path, resolve); });
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP fake Unix-socket daemon test: sandbox forbids listen(2)\n"); return; }
-      throw error;
+      try {
+        await new Promise<void>((resolve, reject) => { server.once("error", reject).listen(path, resolve); });
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP fake Unix-socket daemon test: sandbox forbids listen(2)\n"); return; }
+        throw error;
+      }
+      try {
+        await expect(daemonRequest(path, "status")).resolves.toMatchObject({ status: "available", result: [expect.objectContaining({ meter_id: "codex-main:main" })] });
+        expect(methods).toEqual(["health", "status"]);
+      } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+    } finally {
+      if (process.platform === "win32") { if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome; }
     }
-    try {
-      await expect(daemonRequest(path, "status")).resolves.toMatchObject({ status: "available", result: [expect.objectContaining({ meter_id: "codex-main:main" })] });
-      expect(methods).toEqual(["health", "status"]);
-    } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
   });
 
   it("starts on a private temp socket and coalesces concurrent status polls", async () => {
@@ -143,7 +208,7 @@ describe("daemon JSON-RPC", () => {
       'adapter = "native-ts"',
       "",
     ].join("\n"), { mode: 0o600 });
-    const path = join(root, "headroom.sock");
+    const path = testSocketPath(root, "headroom");
     let polls = 0;
     await withHeadroomHome(root, async () => {
       const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; await new Promise((resolve) => setTimeout(resolve, 15)); return { observations: [fixture()], failures: [] }; } });
@@ -242,9 +307,8 @@ describe("can validates routing before ever answering", () => {
     await writeFile(join(root, "routing.toml"), '[consumes]\nbuild = ["codex-main:main"]\n', { mode: 0o600 });
     await withHeadroomHome(root, async () => {
       const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
       try {
-        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"typo-action","owner":"cadence"}}');
+        const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"typo-action","owner":"cadence"}}');
         expect(reply.error).toMatchObject({ code: -32602 });
         expect(reply.error?.message).toContain("Unknown action class");
       } finally { await daemon.stop(); }
@@ -261,9 +325,8 @@ describe("can validates routing before ever answering", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-can-no-routing-")); temporary.push(root);
     await withHeadroomHome(root, async () => {
       const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
       try {
-        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
+        const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
         expect(reply.error).toMatchObject({ code: -32602 });
         expect(reply.error?.message).toContain("No routing.toml configured");
       } finally { await daemon.stop(); }
@@ -277,9 +340,8 @@ describe("can validates routing before ever answering", () => {
     await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
     await withHeadroomHome(root, async () => {
       const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-      const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
       try {
-        const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
+        const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"can","params":{"action_class":"build","owner":"cadence"}}');
         expect(reply.error).toMatchObject({ code: -32602 });
         expect(reply.error?.message).toContain("unknown meter");
         expect(reply.error?.message).toContain("ghost-principal:main");
@@ -370,11 +432,10 @@ describe("a genuine daemon handler exception is logged and surfaced with its rea
   it("logs '<method> failed: <message>' to the daemon log and returns a JSON-RPC error carrying that same message", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-log-error-")); temporary.push(root);
     const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
-    const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
     try {
       // store.endLease() throws "lease not found" for an id that was never
       // started -- a genuine handler exception, not a domain-level "no".
-      const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"lease_end","params":{"id":"nonexistent","owner":"cadence"}}');
+      const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"lease_end","params":{"id":"nonexistent","owner":"cadence"}}');
       expect(reply.error).toMatchObject({ code: -32000, message: "lease not found" });
     } finally { await daemon.stop(); }
     const log = await tailDaemonLog(50, root);
@@ -393,7 +454,12 @@ describe("plan/gate/fill round-trip through a real daemon socket for a meter who
   // 5h row displaced it as "the only window known".
   it("plan finds the weekly window and returns real numbers, not a generic 'Daemon request failed'", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-plan-liveroundtrip-")); temporary.push(root);
-    const path = join(root, "headroom.sock");
+    // main()'s own daemon client always dials the real socketPath() (see
+    // src/cli.ts), which on Windows is a per-user pipe name independent of
+    // HEADROOM_HOME -- unlike the POSIX branch, it cannot be pointed at a
+    // private, root-scoped path. The daemon under test has to listen on
+    // that same real path for main() to ever find it.
+    const path = process.platform === "win32" ? socketPath() : join(root, "headroom.sock");
     const daemon = await HeadroomDaemon.create({ home: root, path });
     try { await daemon.start(); }
     catch (error: unknown) {

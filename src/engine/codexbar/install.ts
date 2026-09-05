@@ -9,7 +9,12 @@ import { assertSafeAncestry, executablePath, headroomHome, migrateLegacyHome } f
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const lockPath = join(repoRoot, "engine.lock.json");
+
+/** Overridable only so tests can point readEngineLock() at a throwaway lock
+ * file with a synthetic pin for whatever platform actually runs the suite,
+ * instead of depending on which platforms engine.lock.json's real, committed
+ * assets happen to cover (today: macOS arm64 only). Never set in production. */
+function defaultLockPath(): string { return process.env.HEADROOM_ENGINE_LOCK || join(repoRoot, "engine.lock.json"); }
 
 export interface LockedAsset { name: string; sha256?: string; url?: string }
 export interface NativeLockedAsset { name: string; sha256?: string | null; status?: "unpinned" | "pinned"; comment?: string; url?: string }
@@ -57,7 +62,7 @@ function unsupported(os: string, cpu: string): never {
   throw new Error(`No CodexBarCLI release asset for ${os}/${cpu}`);
 }
 
-export async function readEngineLock(path = lockPath): Promise<EngineLock> {
+export async function readEngineLock(path = defaultLockPath()): Promise<EngineLock> {
   return JSON.parse(await fs.readFile(path, "utf8")) as EngineLock;
 }
 
@@ -133,7 +138,13 @@ export async function installEngine(options: { pin?: boolean } = {}): Promise<{ 
 export async function installNativeEngine(): Promise<{ installed: true; tag: string; path: string; sha256: string } | { installed: false; hint: string }> {
   const lock = await readEngineLock();
   if (!lock.native) return { installed: false, hint: "Native engine is not configured; build locally with npm run engine:build." };
-  const asset = nativePlatformAssetName(lock);
+  let asset: NativeLockedAsset;
+  // No release target at all for this platform (e.g. Windows: the native
+  // engine is Swift/CodexBarCore, macOS and Linux only) is exactly as
+  // "nothing to install" as an unpinned asset -- report it the same
+  // graceful way instead of letting nativePlatformAssetName's throw escape.
+  try { asset = nativePlatformAssetName(lock); }
+  catch { return { installed: false, hint: "Native engine has no release asset for this platform; build locally with npm run engine:build." }; }
   if (!asset.sha256 || asset.status === "unpinned") return { installed: false, hint: "Native engine is unpinned; build locally with npm run engine:build." };
   const url = asset.url ?? `https://github.com/${lock.native.repository}/releases/download/${lock.native.tag}/${asset.name}`;
   const response = await fetch(url, { headers: { "User-Agent": "headroomq" } });

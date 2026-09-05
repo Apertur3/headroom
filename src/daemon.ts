@@ -8,7 +8,7 @@ import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
 import { pollAccounts, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
-import { executablePath, headroomHome } from "./paths.js";
+import { executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals } from "./policy.js";
 import { withResetsIn } from "./resets.js";
 import { withPaceInfo } from "./pace.js";
@@ -29,7 +29,10 @@ const MAX_CONNECTION_BUFFER_BYTES = 64 * 1024;
 const MAX_CONCURRENT_CONNECTIONS = 64;
 
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
-  return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : join(home, "headroom.sock");
+  // joinForPlatform, not a bare join(): join() always uses the *host* OS's
+  // separator, which would mis-simulate a non-native `platform` argument
+  // (e.g. a "linux" home path on a real Windows host) with backslashes.
+  return platform === "win32" ? `\\\\.\\pipe\\headroom-${username}` : joinForPlatform(platform, home, "headroom.sock");
 }
 
 const SESSION_FILE = "pipe-session-token";
@@ -117,7 +120,12 @@ export class HeadroomDaemon {
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
     stripAmbientProxyEnvironment(startupPolicy.proxy);
-    if (process.platform === "win32") this.sessionToken = await sessionToken(this.path.includes("\\pipe\\") ? headroomHome() : this.path, true);
+    // The session token always lives under the daemon's own resolved home
+    // (this.home), never derived from this.path: this.path is a named pipe
+    // in production (nothing to write a token file relative to) and, in
+    // tests, sometimes a bare filename standing in for one -- neither is a
+    // directory the token file could sensibly live under.
+    if (process.platform === "win32") this.sessionToken = await sessionToken(this.home, true);
     await this.prepareSocket();
     this.server = createServer((socket) => this.handleSocket(socket));
     // A restrictive umask means the OS never briefly creates the socket file

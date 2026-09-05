@@ -26,7 +26,7 @@ export function windowsTaskXml(script: string, runtime: string, username = userI
 }
 
 export function serviceContents(script: string, platform = process.platform, runtime = process.execPath, username = userInfo().username, home = homedir(), env = process.env): string {
-  const log = daemonLogPath(headroomHome({ platform, home, env }));
+  const log = daemonLogPath(headroomHome({ platform, home, env }), platform);
   const path = serviceEnvironmentPath(home, platform, env.PATH);
   if (platform === "darwin") return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>com.headroom.daemon</string><key>ProgramArguments</key><array><string>${xml(runtime)}</string><string>${xml(script)}</string><string>daemon</string></array><key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(path)}</string></dict><key>StandardOutPath</key><string>${xml(log)}</string><key>StandardErrorPath</key><string>${xml(log)}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`;
   if (platform === "win32") return windowsTaskXml(script, runtime, username, log, path);
@@ -39,7 +39,7 @@ export async function installService(script = process.argv[1] ?? "headroom", pla
   const contents = serviceContents(script, platform, runtime, username, home, env);
   if (!dryRun) {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    await mkdir(dirname(daemonLogPath(headroomHome({ platform, home, env }))), { recursive: true, mode: 0o700 });
+    await mkdir(dirname(daemonLogPath(headroomHome({ platform, home, env }), platform)), { recursive: true, mode: 0o700 });
     await writeFile(path, contents, { mode: 0o600 });
   }
   return { path, command, dryRun, contents };
