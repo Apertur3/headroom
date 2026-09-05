@@ -16,6 +16,7 @@ import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile }
 import { codexResponseShape } from "./adapters/codex.js";
 import { antigravityResponseShape } from "./adapters/antigravity.js";
 import { pollAccounts } from "./collector.js";
+import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
@@ -95,7 +96,12 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
   const seconds = resetsIn(observation.resets_at).resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${evidence}${paceSegment(observation)}`;
+  // A vendor-reported idle window that looks like a manufactured placeholder
+  // (see engine/observation.ts's normalizeObservations) is still shown as a
+  // real number -- the owner's decision is to annotate doubt, not hide the
+  // vendor's own reading behind UNKNOWN.
+  const doubt = observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON ? " (idle, unverified)" : "";
+  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${doubt}${evidence}${paceSegment(observation)}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -383,7 +389,7 @@ async function rate(argv: string[]): Promise<number> {
 
 async function plan(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
-  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]");
+  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]");
   const until = option(argv, "--until");
   if (until !== "reset") throw new Error("--until must be 'reset' (the only supported value)");
   const reserveValue = option(argv, "--reserve");
@@ -950,7 +956,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   ].join("\n"),
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--minutes 30] [--window 10m] [--json]",
-  plan: "Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]",
+  plan: "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",

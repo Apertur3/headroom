@@ -1,26 +1,21 @@
 # Quickstart
 
-Five minutes from a clone to a line of output you can trust, on macOS or Linux. Windows steps
-are noted separately at the end; that platform is verified by CI, not yet by a person running it
-against real accounts.
+Five minutes from install to a line of output you can trust, on macOS or Linux. Windows steps
+are noted separately at the end.
 
-## 1. Clone and build
+## 1. Install
 
-Headroom isn't on npm yet.
-
-```sh
-git clone https://github.com/Apertur3/headroom.git
-cd headroom
-npm install
-npm run build
-```
-
-The commands below say `npx headroomd`. Until the first npm release, run `node dist/cli.js`
-instead, or alias it for the rest of this walkthrough:
+Headroom is on npm as `headroomd` and needs Node 22.13 or newer.
 
 ```sh
-alias headroom="node dist/cli.js"
+npm install -g headroomd
+headroom version
 ```
+
+`npx headroomd <command>` works without installing, but the daemon, the MCP registration and
+the service installer all expect a `headroom` command on your PATH, so the global install is the
+one this walkthrough assumes. To work from source instead, clone the repository, run
+`npm install && npm run build`, and use `node dist/cli.js` where the steps say `headroom`.
 
 ## 2. Find your accounts
 
@@ -221,8 +216,8 @@ buys you and where it still falls short.
 claude mcp add headroom -- npx headroomd mcp
 ```
 
-(swap `npx headroomd` for `node /path/to/headroom/dist/cli.js`, same as above, until the npm
-release)
+(swap `npx headroomd` for `node /path/to/headroom/dist/cli.js` if you're working from a source
+checkout instead of the published package, same as step 1)
 
 For every extra Claude Code profile, point at its config directory:
 
@@ -257,7 +252,9 @@ that warm session isn't built for Windows either. An Antigravity principal on Wi
 the remote OAuth path, which Google can reject for the free Gemini Code Assist tier; see
 [vendors.md](vendors.md).
 
-All of this is verified by CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, in
-`.github/workflows/ci.yml`) on every push: lint, the full test suite, and a build. It has not yet
-been run by a person against a real Windows machine with real accounts; the daily-verified
-environment described in the README's Status section is macOS only.
+CI runs lint, the full test suite and a build on `ubuntu-latest`, `windows-latest` and
+`macos-latest` on every push, and every release is installed from the npm registry into a fresh
+home on macOS, Linux (a Raspberry Pi 5) and Windows 11 (a VM), where a scripted run walks the
+install, discovery, doctor, daemon, socket or named pipe, service install and MCP steps above.
+What has not happened yet is a person using it daily on Windows with real accounts; the
+daily-used environment is macOS.

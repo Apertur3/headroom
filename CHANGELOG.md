@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Antigravity: a daemon-kept `agy` local quota summary reporting an idle window (0% or unknown
+  usage, reset equal to fetch time plus window length) is now shown with its vendor-reported
+  numbers and a doubt marker (`truth: "estimated"`, halved confidence, `(idle, unverified)` in
+  `headroom` status) instead of being replaced with UNKNOWN on a heuristic. It is only demoted to a
+  real failure when the store's own history contradicts it -- a fresh reading for the same meter
+  and window within the last 2 hours already showed real usage whose reset has not yet passed. An
+  availability-only payload (no vendor bucket carries a `remainingFraction` at all) is unchanged:
+  still reported UNKNOWN, since there is no number to show.
+
 ## [0.1.0-beta.2] - 2026-09-05
 
 ### Added

@@ -8,9 +8,10 @@
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 
 One daemon reads the real meters of every account you own: Claude and Codex today, any number of
-accounts per vendor, and local inference boxes. Google Antigravity is experimental: the adapter is
-in, but on some accounts its local server serves only an availability placeholder, so the rows read
-UNKNOWN rather than a fake 100%. It keeps history, notices resets and free
+accounts per vendor, and local inference boxes. Google Antigravity is experimental: the adapter
+reads the daemon-kept `agy` local quota summary and shows it as-is, with an idle window flagged
+rather than hidden -- only an availability-only payload or a reading that contradicts the last one
+reads UNKNOWN. It keeps history, notices resets and free
 reset grants, and turns the numbers into a go or no-go an orchestrator can act on.
 
 ![headroom output](docs/assets/headroom-terminal.svg)
@@ -32,10 +33,12 @@ UNKNOWN never counts as capacity.
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
 token from the Keychain or credentials file, the Codex token from its auth file, and, experimentally, the Antigravity
 token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
-quota summary; on some accounts that server serves only an availability placeholder, which
-Headroom refuses, so those rows read UNKNOWN. The older remote Google OAuth path is deprecated for
-the free tier. Each call goes straight to the vendor's usage endpoint and the token is
-dropped afterwards. The endpoint contracts were learned from
+quota summary: a summary with real fractions is shown as-is, and an idle window whose reset equals
+fetch time plus window length is shown too, with a doubt marker, rather than replaced with UNKNOWN
+on a heuristic -- only an availability-only payload or a reading that contradicts the previous one
+becomes UNKNOWN. Google's remote quota endpoint answers 403 for free-tier accounts, so it serves as
+diagnosis there, not as a usable reading. Each call goes straight to the vendor's usage endpoint
+and the token is dropped afterwards. The endpoint contracts were learned from
 [CodexBar](https://github.com/steipete/codexbar) (MIT) by Peter Steinberger; an optional engine
 links its library for providers Headroom does not cover natively.
 
@@ -84,7 +87,7 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 
 ## Documentation
 
-- [docs/quickstart.md](docs/quickstart.md): clone to first truthful line, macOS, Linux and Windows
+- [docs/quickstart.md](docs/quickstart.md): install to first truthful line, macOS, Linux and Windows
 - [docs/concepts.md](docs/concepts.md): principal, meter, window, observation, pace states, leases, events
 - [docs/mcp-and-agents.md](docs/mcp-and-agents.md): the MCP tools, example calls, and how an orchestrator should use them
 - [docs/vendors.md](docs/vendors.md): what Headroom reads per vendor, and its known live limitations
@@ -103,9 +106,10 @@ is pinned and checksum verified, and every query lands in an audit log. Details 
 
 ## Status
 
-Beta. Verified daily on one macOS machine with two Claude config dirs, one Codex home, one
-Antigravity account and two local inference boxes; Linux and Windows are verified through CI, not
-yet by hand. Vendor endpoints are private and change without notice; Headroom pins, records
+Beta. Used daily on one macOS machine with two Claude config dirs, one Codex home, one
+Antigravity account and two local inference boxes. Every release is installed from the npm
+registry into a fresh home on Linux (a Raspberry Pi 5) and Windows 11 (a VM) and walked through
+the quickstart by script; CI runs the suite on all three platforms. Vendor endpoints are private and change without notice; Headroom pins, records
 fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Google can
 reject the remote Antigravity fallback for unsupported Gemini Code Assist tiers (for example
 `UNSUPPORTED_CLIENT`); keep the daemon running so its warm `agy` source remains available.
