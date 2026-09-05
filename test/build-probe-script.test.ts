@@ -147,7 +147,7 @@ describe.skipIf(process.platform !== "darwin")("build-probe.sh: signing identity
     expect(result.code).toBe(0);
   });
 
-  it("Astra F1: exports and imports the PKCS12 under one real, random per-run password, never a fixed one", async () => {
+  it("exports and imports the PKCS12 under one real, random per-run password, never a fixed one", async () => {
     const { root, log, env } = await fakeRepo();
     const result = await run(root, env, { HEADROOM_CODESIGN_IDENTITY: "" });
     expect(result.code).toBe(0);
@@ -161,7 +161,7 @@ describe.skipIf(process.platform !== "darwin")("build-probe.sh: signing identity
     expect(password.length).toBeGreaterThanOrEqual(32); // openssl rand -hex 24
   });
 
-  it("Astra F1: two separate runs use two different passwords", async () => {
+  it("two separate runs use two different passwords", async () => {
     const { root, log, env } = await fakeRepo();
     await run(root, env, { HEADROOM_CODESIGN_IDENTITY: "" });
     const first = /p12-verified: ok \((\S+)\)/.exec(await readLog(log))![1];
@@ -178,7 +178,7 @@ describe.skipIf(process.platform !== "darwin")("build-probe.sh: signing identity
     expect(second).not.toBe(first);
   });
 
-  it("Astra F1: imports with -T /usr/bin/codesign only, never -A", async () => {
+  it("imports with -T /usr/bin/codesign only, never -A", async () => {
     const { root, log, env } = await fakeRepo();
     await run(root, env, { HEADROOM_CODESIGN_IDENTITY: "" });
     const calls = await readLog(log);
@@ -205,7 +205,7 @@ describe.skipIf(process.platform !== "darwin")("build-probe.sh: signing identity
     const certText = (await execFileAsync("openssl", ["x509", "-in", join(workdir, "cert.pem"), "-noout", "-text"])).stdout;
     expect(certText).toMatch(/Code Signing|1\.3\.6\.1\.5\.5\.7\.3\.3/);
 
-    // Astra F1: HEADROOM_BUILD_PROBE_KEEP_WORKDIR keeps only the certificate
+    // HEADROOM_BUILD_PROBE_KEEP_WORKDIR keeps only the certificate
     // and the openssl config for inspection -- never the private key or the
     // PKCS12 bundle, both of which the script shreds right after import.
     await expect(access(join(workdir, "key.pem"))).rejects.toThrow();

@@ -83,7 +83,7 @@ identity_exists() {
 
 # Overwrites a file with random bytes before unlinking it, so a plain `rm`
 # never leaves key material recoverable from the underlying disk blocks.
-# Astra F1: applied to the private key and the PKCS#12 bundle immediately
+# applied to the private key and the PKCS#12 bundle immediately
 # after `security import` consumes them -- neither is useful again after
 # that, and both are shredded regardless of HEADROOM_BUILD_PROBE_KEEP_WORKDIR.
 shred_file() {
@@ -137,7 +137,7 @@ CONF
   openssl req -x509 -newkey rsa:2048 -keyout "$workdir/key.pem" -out "$workdir/cert.pem" \
     -days 36500 -nodes -config "$workdir/ext.cnf" -extensions v3_req >/dev/null 2>&1
 
-  # Astra F1: a random password generated fresh for this one run, held only
+  # a random password generated fresh for this one run, held only
   # in this shell variable -- it is passed to openssl/security via
   # -passout/-P and never written to any file. The export and import below
   # must agree on it (the same random value), unlike the former fixed
@@ -161,12 +161,12 @@ CONF
       -out "$workdir/cert.p12" -passout "pass:$p12_password" -name "$local_identity_name" \
       -macalg sha1 -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES >/dev/null 2>&1
   fi
-  # Astra F1: -T names exactly one application (codesign) allowed to use
+  # -T names exactly one application (codesign) allowed to use
   # this key without a prompt; no -A, which would have granted every
   # application silent access to it.
   security import "$workdir/cert.p12" -k login.keychain-db -P "$p12_password" \
     -T /usr/bin/codesign
-  # Astra F1: the private key and the PKCS#12 bundle are never needed again
+  # the private key and the PKCS#12 bundle are never needed again
   # after this import -- shred both immediately, whether or not the import
   # above actually succeeded, and regardless of HEADROOM_BUILD_PROBE_KEEP_WORKDIR.
   shred_file "$workdir/key.pem"
