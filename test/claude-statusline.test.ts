@@ -30,7 +30,7 @@ describe("statuslineSnapshotDirs", () => {
     expect(statuslineSnapshotDirs([], "/Users/test/.headroom")).toEqual(["/Users/test/.headroom/statusline"]);
   });
   it("uses the configured list verbatim when non-empty", () => {
-    expect(statuslineSnapshotDirs(["/Users/test/an external collector/state"], "/Users/test/.headroom")).toEqual(["/Users/test/an external collector/state"]);
+    expect(statuslineSnapshotDirs(["/Users/test/collector/state"], "/Users/test/.headroom")).toEqual(["/Users/test/collector/state"]);
   });
 });
 
@@ -66,9 +66,9 @@ describe("parseStatuslineSnapshot", () => {
     expect(parseStatuslineSnapshot(raw)).toEqual({ profile: "default", observed_at: 100, five_hour: { used_percent: 10, resets_at: 200 }, seven_day: { used_percent: 20, resets_at: 300 }, extra: {} });
   });
 
-  it("reads an external collector's real on-disk shape (alias + used_pct, no extra)", () => {
-    // The exact shape at ~/Projects/an external collector/state/main.json.
-    const raw = JSON.stringify({ alias: "main", observed_at: 1_788_631_403, model: "Fable 5.1", cwd: "/Users/x", context_window_used_pct: 90, five_hour: { used_pct: 44, resets_at: 1_788_643_800 }, seven_day: { used_pct: 56.000000001, resets_at: 1_788_696_000 }, source: "statusline" });
+  it("reads an existing collector's real on-disk shape (alias + used_pct, no extra)", () => {
+    // The exact shape at ~/Projects/<collector>/state/main.json.
+    const raw = JSON.stringify({ alias: "main", observed_at: 1_788_631_403, model: "Fable 5.1", cwd: "/Users/test", context_window_used_pct: 90, five_hour: { used_pct: 44, resets_at: 1_788_643_800 }, seven_day: { used_pct: 56.000000001, resets_at: 1_788_696_000 }, source: "statusline" });
     const snapshot = parseStatuslineSnapshot(raw);
     expect(snapshot?.alias).toBe("main");
     expect(snapshot?.observed_at).toBe(1_788_631_403);
@@ -137,7 +137,7 @@ describe("latestStatuslineSnapshot / freshStatuslineSnapshot", () => {
     expect(noneForClaude2).toBeUndefined();
   });
 
-  it("matches the an external collector shape's alias 'main' to the default profile with zero configuration", async () => {
+  it("matches the external collector shape's alias 'main' to the default profile with zero configuration", async () => {
     const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-fc-")); temporary.push(dir);
     await writeFile(join(dir, "main.json"), JSON.stringify({ alias: "main", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_pct: 44, resets_at: 0 }, seven_day: { used_pct: 56, resets_at: 0 } }));
     const fresh = await freshStatuslineSnapshot([dir], claudeMain, [claudeMain, claude2], new Date());

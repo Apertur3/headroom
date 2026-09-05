@@ -19,7 +19,7 @@ export interface Policy {
   proxy?: string;
   /** Directories the statusline snapshot adapter scans for `<profile>.json`
    * files (headroom's own `headroom statusline` output) and third-party
-   * shapes like an external collector's `state/<alias>.json`. Empty means the
+   * shapes like a collector's `state/<alias>.json`. Empty means the
    * caller's own default (`<HEADROOM_HOME>/statusline`) applies -- kept
    * empty here rather than resolved, since HEADROOM_HOME can change per call
    * (HEADROOM_HOME env var, tests) and this module has no path helpers of

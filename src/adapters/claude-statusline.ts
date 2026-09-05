@@ -50,7 +50,7 @@ export interface StatuslineSnapshot {
   /** "default" or a CLAUDE_CONFIG_DIR basename, present only on headroom's
    * own written files (see `headroom statusline`). */
   profile?: string;
-  /** an external collector's own principal name for this profile, present only on
+  /** the external collector's own principal name for this profile, present only on
    * that shape. */
   alias?: string;
   observed_at: number; // epoch seconds
@@ -60,7 +60,7 @@ export interface StatuslineSnapshot {
    * (a model-scoped bucket, keyed by its own name), captured verbatim by
    * `headroom statusline` so this adapter can map it the same way claude.ts's
    * live probe maps a scoped `limits[]` entry. Always empty for the
-   * an external collector shape, which does not carry these. */
+   * external collector shape, which does not carry these. */
   extra: Record<string, StatuslineBucket>;
 }
 
@@ -68,7 +68,7 @@ function readBucket(value: unknown): StatuslineBucket | undefined {
   if (!isObject(value)) return undefined;
   // Three field-name dialects accepted on purpose: Claude Code's own
   // statusLine payload uses `used_percentage`; a snapshot this adapter reads
-  // back that `headroom statusline` wrote uses `used_percent`; an external collector's
+  // back that `headroom statusline` wrote uses `used_percent`; the external collector's
   // existing on-disk shape uses `used_pct`. Never guess a fourth.
   const used = finiteNumber(value.used_percent) ?? finiteNumber(value.used_percentage) ?? finiteNumber(value.used_pct) ?? finiteNumber(value.percent);
   if (used === undefined) return undefined;
@@ -147,9 +147,9 @@ async function readSnapshotDirectory(dir: string): Promise<Array<{ file: string;
 /**
  * Matches one snapshot to a configured Claude principal. Headroom's own
  * shape matches by filename identity (statuslineProfile(account.location)),
- * always exact since headroom wrote the file itself. The an external collector shape
+ * always exact since headroom wrote the file itself. The external collector shape
  * matches by its `alias` field: first against accounts.toml's own `alias`
- * (explicit, always wins), then against the convention an external collector itself
+ * (explicit, always wins), then against the convention the external collector itself
  * uses today -- alias "main" for the default `~/.claude` profile, any other
  * alias against the same profile-basename rule headroom's own shape uses.
  */
@@ -203,7 +203,7 @@ export function observationsFromStatuslineSnapshot(snapshot: StatuslineSnapshot,
 /**
  * The freshest usable snapshot for one Claude principal across every
  * configured directory (headroom's own `<profile>.json`, plus any
- * an external collector-shaped file matched by alias). Returns undefined when no
+ * collector-shaped file matched by alias). Returns undefined when no
  * directory has a matching, parseable file at all -- the caller (collector.ts)
  * then falls through to the probe unconditionally. A snapshot older than
  * `freshMinutes` is still returned (so a caller can report a specific age

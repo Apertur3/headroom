@@ -439,6 +439,75 @@ describe("MCP direct status shares a persisted backoff across calls", () => {
   });
 });
 
+describe("Antigravity keepalive: lazy, secondary start", () => {
+  async function keepaliveTestHome(): Promise<{ root: string; agyPath: string }> {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-keepalive-lazy-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const agyPath = join(root, "fake-agy");
+    await writeFile(agyPath, "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "antigravity"',
+      'vendor = "antigravity"',
+      'location = "/nonexistent/.gemini"',
+      'adapter = "native-ts"',
+      `agy_path = ${JSON.stringify(agyPath)}`,
+      "",
+    ].join("\n"), { mode: 0o600 });
+    return { root, agyPath };
+  }
+
+  const failedRemote: Observation = {
+    principal_id: "antigravity", meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+    quantity: null, resets_at: null, observed_at: "2026-09-05T12:00:00Z", fetched_at: "2026-09-05T12:00:00Z",
+    source: "remote:antigravity", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: "test", upstream_schema_version: "test",
+    reason: "quota endpoint returned availability only",
+  };
+
+  it("never starts keepalive from poll() alone when the daemon has never been start()ed", async () => {
+    const { root } = await keepaliveTestHome();
+    await withHeadroomHome(root, async () => {
+      const started = vi.fn();
+      const keepalive = { running: false, pid: undefined, uptimeMs: undefined, loginState: "unknown", start: started, stop() {} } as never;
+      const daemon = await HeadroomDaemon.create({
+        home: root, path: join(root, "headroom.sock"), keepalive,
+        poller: async () => ({ observations: [failedRemote], failures: [] }),
+      });
+      const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
+      try {
+        // this.schedulingStarted stays false without a real start() -- the
+        // same guard that already protects currentAccounts()'s own
+        // principal-scheduling side effect from firing early.
+        await internal.poll(undefined, true);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(started).not.toHaveBeenCalled();
+      } finally { await daemon.stop(); }
+    });
+  });
+
+  it("starts keepalive lazily once a real start()ed daemon's poll shows remote fell short for Antigravity", async () => {
+    const { root } = await keepaliveTestHome();
+    await withHeadroomHome(root, async () => {
+      const started = vi.fn();
+      const keepalive = { running: false, pid: undefined, uptimeMs: undefined, loginState: "unknown", start: started, stop() {} } as never;
+      const daemon = await HeadroomDaemon.create({
+        home: root, path: join(root, "headroom.sock"), keepalive,
+        poller: async () => ({ observations: [failedRemote], failures: [] }),
+      });
+      const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
+      try {
+        await daemon.start();
+        await internal.poll(undefined, true);
+        // maybeStartKeepalive() is fire-and-forget (`void`) from inside the
+        // poll's own .then(); give its awaited executablePath() a tick to
+        // resolve before asserting.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(started).toHaveBeenCalledTimes(1);
+      } finally { await daemon.stop(); }
+    });
+  });
+});
+
 describe("daemon status names the real backoff deadline on a live 429", () => {
   it("rewrites a stored 429 failure's reason once the poller's own failure has set the daemon's in-memory backoff", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-status-backoff-")); temporary.push(root);

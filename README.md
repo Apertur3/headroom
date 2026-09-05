@@ -9,7 +9,7 @@ Headroom tells your agents how much of each AI subscription is left before they 
 
 One daemon reads the real meters of every account you own: Claude and Codex today, any number of
 accounts per vendor, and local inference boxes. Google Antigravity is experimental: the adapter is
-in, but on our account its local server only serves an availability placeholder, so the rows read
+in, but on some accounts its local server serves only an availability placeholder, so the rows read
 UNKNOWN rather than a fake 100%. It keeps history, notices resets and free
 reset grants, and turns the numbers into a go or no-go an orchestrator can act on.
 
@@ -32,7 +32,7 @@ UNKNOWN never counts as capacity.
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
 token from the Keychain or credentials file, the Codex token from its auth file, and, experimentally, the Antigravity
 token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
-quota summary; on our account that server currently serves only an availability placeholder, which
+quota summary; on some accounts that server serves only an availability placeholder, which
 Headroom refuses, so those rows read UNKNOWN. The older remote Google OAuth path is deprecated for
 the free tier. Each call goes straight to the vendor's usage endpoint and the token is
 dropped afterwards. The endpoint contracts were learned from
@@ -55,8 +55,8 @@ the request path.
 
 ## Install
 
-Not on npm yet. Until the first release, clone the repo, run `npm install && npm run build`, and
-use `node dist/cli.js` where the commands below say `npx headroomd`.
+Beta on npm as `headroomd` (Node 22.13 or newer). `npm install -g headroomd` gives you the
+`headroom` command; `npx headroomd` runs it without installing.
 
 ```sh
 npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity; also seeds policy/routing.toml

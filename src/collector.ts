@@ -101,12 +101,25 @@ export function withBackoffReasons<T extends Observation>(observations: T[], bac
 const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
 const ANTIGRAVITY_WINDOWS = [300, 10_080];
 
-/** A local server is preferred only after its quota summary supplies every real lane. */
+/** Called only once remote has already failed to answer: picks the
+ * daemon-owned agy summary in preference to remote's own failed/estimated
+ * rows, but only once agy's quota summary supplies every real lane -- a
+ * partial warm read is worse than remote's own honest failure reason. */
 export function selectAntigravitySource(local: Observation[], remote: Observation[], principal: string): Observation[] {
   const expected = new Set(ANTIGRAVITY_METERS.flatMap((meter) => ANTIGRAVITY_WINDOWS.map((minutes) => `${principal}:${meter}:${minutes}`)));
   const real = local.filter((row) => row.principal_id === principal && row.source === "local:antigravity:warm" && row.freshness === "fresh" && row.quantity !== null && row.window?.minutes !== null);
   const available = new Set(real.map((row) => `${row.principal_id}:${row.meter_id.slice(principal.length + 1)}:${row.window?.minutes}`));
   return [...expected].every((key) => available.has(key)) ? local : remote;
+}
+
+/** Explains, alongside remote's own failure reason, why the daemon-kept agy
+ * couldn't rescue this read either -- so a failed Antigravity observation
+ * always names both outcomes, never just the remote one. */
+export function antigravityFallbackNote(daemonOwnsAntigravity: boolean, local: Observation[], loginState: AgyLoginState | undefined): string {
+  if (!daemonOwnsAntigravity) return "agy keepalive not running";
+  if (!local.length) return "agy warm read unavailable";
+  if (loginState === "not_logged_in") return "agy not logged in";
+  return "agy quota summary not ready";
 }
 
 /** One credential-backed collection pass. The daemon supplies serialization/rate limits. */
@@ -186,20 +199,30 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   }
   for (const account of antigravityAccounts) {
     const local = localAntigravity.get(account.name) ?? [];
-    // Do not spend a remote request after a complete local quota summary. Cold
-    // local replies contain failed placeholder rows and therefore fall through.
-    if (selectAntigravitySource(local, [], account.name) === local && local.length) {
-      observations.push(...local);
-    } else if (options.skipRemoteAntigravity) {
+    if (options.noDaemon) { observations.push(...noDaemonObservations(account)); continue; }
+    if (options.skipRemoteAntigravity) {
       // A remote failure must never suppress the next daemon-owned warm read.
       observations.push(...local);
-    } else if (options.noDaemon) {
-      observations.push(...noDaemonObservations(account));
+      continue;
+    }
+    // Remote is the primary source: agy's warm local summary is a fallback
+    // for when the remote quota endpoint can't answer at all (the free-tier
+    // availability-only response, a 403, or a transport failure), not the
+    // default path. A poll that gets real remote buckets never needs a
+    // running agy at all.
+    const remote = await observeAntigravity(account);
+    const remoteReal = remote.length > 0 && remote.every((item) => item.freshness === "fresh");
+    const protectedFailure = remote.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
+    if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
+    if (remoteReal) { observations.push(...remote); continue; }
+    const chosen = selectAntigravitySource(local, remote, account.name);
+    if (chosen === remote) {
+      // Local didn't rescue this read either: name why, alongside remote's
+      // own reason, so a failed observation never explains only one side.
+      const note = antigravityFallbackNote(options.daemonOwnsAntigravity === true, local, options.antigravityLoginState);
+      observations.push(...chosen.map((item) => item.freshness === "failed" && item.reason ? { ...item, reason: `${item.reason}; ${note}` } : item));
     } else {
-      const remote = await observeAntigravity(account);
-      observations.push(...selectAntigravitySource(local, remote, account.name));
-      const protectedFailure = remote.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
-      if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
+      observations.push(...chosen);
     }
   }
   if (native && engineAccounts.length) {

@@ -1,4 +1,4 @@
-# Headroom spec v0.2 (2026-09-03, after review)
+# Headroom spec v0.2 (2026-09-03)
 
 Brand Headroom. Package `headroomd`, repo `https://github.com/Apertur3/headroom`, command `headroom`.
 
@@ -26,7 +26,7 @@ apps or single-account CLIs. Headroom owns the second and third and keeps the fi
 | Observation | One sample of one window: typed quantity (`used`, `limit`, `remaining`, `unit = percent | tokens | requests | credits`), nullable `resets_at`, `observed_at` (vendor time if given) and `fetched_at`, `source`, `truth = official | estimated`, `freshness = fresh | stale | failed | not_enforced`, `confidence 0..1`, `adapter_version`, `upstream_schema_version`. `not_enforced` is a vendor-confirmed absent cap (printed `n/a`), not an unknown read. Never a whole "reading" with mixed provenance; each datum carries its own. |
 | Consumes | An action class maps to the set of meters it draws from. A Fable call on `claude-main` consumes `claude-main:all` and `claude-main:fable`. `headroom can` checks every consumed meter; one frozen meter freezes the action. |
 | Event | Separate record with id, kind (`reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`, `source_recovered`), `origin = vendor_reported | inferred`, `confidence`, evidence (observation ids), and later corrections. Never embedded in observations. |
-| Pace state | Per window: HARVEST (>10 pts under straight-line burn), NORMAL, CONSERVE (>10 pts over), FREEZE (past freeze reserve, overrides all), UNKNOWN (stale or failed). Ported from the fleet pace machine. |
+| Pace state | Per window: HARVEST (>10 pts under straight-line burn), NORMAL, CONSERVE (>10 pts over), FREEZE (past freeze reserve, overrides all), UNKNOWN (stale or failed).. |
 | Cost model | `sunk` (subscriptions, capacity expires at reset) or `marginal` (local inference, energy per hour). |
 
 ## Fail-closed semantics
@@ -56,7 +56,7 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   binaries ship in Headroom's releases; the TypeScript side downloads, checksum-verifies, and, when
   upstream publishes attestations, signature-verifies them. Updating = bump the tag, rebuild,
   run conformance fixtures. Upstream drift breaks a test, not a user.
-- **Engine (fallback).** Slice 2's runner for the upstream CodexBarCLI stays as a fallback and as
+- **Engine (fallback).** The runner for the upstream CodexBarCLI stays as a fallback and as
   the conformance oracle.
 - **Antigravity.** `agy` has no server mode but bootstraps its local HTTPS server when started
   under a pseudo-terminal (`script -q /dev/null agy`), verified 2026-09-03 with real numbers.
@@ -98,20 +98,20 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - Adapter SDK: an adapter is a pure function `(principal) → observations[]` plus a conformance
   fixture directory; third parties add vendors without touching the core.
 
-## Slices and acceptance
+## Acceptance criteria
 
-| # | Slice | Accepted when |
-|---|---|---|
-| 2 | Upstream engine runner + Codex adapter + fixtures | DONE 2026-09-03: Codex main and spark match CodexBar; SHA pinned |
-| 3 | `headroom-engine` on CodexBarCore with Keychain | `claude-main` and `claude-2` rows; main matches the app's Usage screen within a few percent, twice on two days; Codex and Antigravity rows from the same engine |
-| 4 | Antigravity headless | DONE as spike 2026-09-03; supervision lands with the daemon |
-| 5 | Store, observations, events, pace, consumes graph | A fired Codex free reset yields `free_reset_used`; stale meters print UNKNOWN |
-| 6 | Daemon + MCP + `can` + threshold | `quota_status` answers from a fresh Claude Code session in both profiles; `--threshold 90` exits 2 |
-| 7 | Routing, skill, adapter SDK docs, README, public | `npx headroomd` gives truthful lines in under two minutes on a clean machine; owner approves README |
+| Area | Accepted when |
+|---|---|
+| Codex adapter and fixtures | The main and per-model rows match CodexBar's output; the engine revision is pinned |
+| Claude adapter | Each configured config dir is its own row and matches the app's Usage screen within a few percent on two days; only the grant command can raise a Keychain dialog |
+| Antigravity | A logged-in `agy` yields rows with the vendor's numbers; placeholder readings are annotated, never silently trusted |
+| Store, events, pace | A fired Codex free reset yields `free_reset_used`; stale meters print UNKNOWN |
+| Daemon, MCP, `can`, threshold | `quota_status` answers from a fresh Claude Code session; `--threshold 90` exits 2 |
+| Routing, skill, docs, release | A fresh install gives truthful lines in under two minutes on macOS, Linux and Windows |
 
 ## Risks
 
 1. Vendor drift and bot walls on private endpoints. Mitigation: pinned engine + conformance
    fixtures, per-datum freshness and truth, backoff, UNKNOWN instead of stale numbers.
 2. Concurrent token refresh corrupting credential files. Mitigation: Headroom never refreshes
-   tokens; the vendor CLI owns refresh. Open: CodexBarCore may refresh on its own; audit in slice 3.
+   tokens; the vendor CLI owns refresh. Open: CodexBarCore may refresh on its own; to be audited.

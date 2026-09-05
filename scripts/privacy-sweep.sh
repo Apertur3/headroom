@@ -31,6 +31,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Private names (people, machines, hosts) never live in the tracked denylist.
+# They come from an untracked local list, merged in here when present.
+local_denylist="${PRIVACY_DENYLIST:-$HOME/.config/headroom-privacy-denylist}"
+if [[ -f "$local_denylist" && -f "$denylist_file" ]]; then
+  merged_denylist="$(mktemp)"
+  trap 'rm -f "$merged_denylist"' EXIT
+  cat "$denylist_file" "$local_denylist" > "$merged_denylist"
+  denylist_file="$merged_denylist"
+fi
+
 EMAIL_PATTERN='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 IP_PATTERN='(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|100\.64\.[0-9]{1,3}\.[0-9]{1,3})([^0-9.]|$)'
 HOME_PATH_PATTERN='(/Users/|/home/)[A-Za-z0-9_.-]+'

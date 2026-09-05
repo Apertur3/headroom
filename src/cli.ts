@@ -14,6 +14,7 @@ import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { codexResponseShape } from "./adapters/codex.js";
+import { antigravityResponseShape } from "./adapters/antigravity.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
@@ -694,9 +695,12 @@ async function observe(argv: string[]): Promise<number> {
 async function responseShape(argv: string[]): Promise<number> {
   if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
-  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
-  const responses = account.vendor === "codex" ? await codexResponseShape(account) : account.vendor === "claude" ? { usage: await claudeResponseShape(account) } : undefined;
-  if (!responses) throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude, Codex, or Antigravity principal");
+  const responses = account.vendor === "codex" ? await codexResponseShape(account)
+    : account.vendor === "claude" ? { usage: await claudeResponseShape(account) }
+    : account.vendor === "antigravity" ? await antigravityResponseShape(account)
+    : undefined;
+  if (!responses) throw new Error("--shape requires a native TypeScript Claude, Codex, or Antigravity principal");
   console.log(JSON.stringify({ principal_id: account.name, vendor: account.vendor, responses }));
   return 0;
 }

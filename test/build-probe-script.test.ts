@@ -126,6 +126,35 @@ describe.skipIf(process.platform !== "darwin")("build-probe.sh: signing identity
     // fully-exercised path, and never a crash.
     expect(result.code).toBe(0);
   });
+
+  it("generates an openssl config with a real codeSigning EKU and a macOS-readable legacy PKCS12, without ever touching a keychain", async () => {
+    const { root, env } = await fakeRepo();
+    const result = await run(root, env, { HEADROOM_CODESIGN_IDENTITY: "", HEADROOM_BUILD_PROBE_KEEP_WORKDIR: "1" });
+    expect(result.code).toBe(0);
+    const workdirMatch = /HEADROOM_BUILD_PROBE_KEEP_WORKDIR set; leaving (\S+) in place/.exec(result.stderr);
+    expect(workdirMatch).not.toBeNull();
+    const workdir = workdirMatch![1];
+    temporary.push(workdir); // the script deliberately left this in place; clean it up ourselves
+
+    const cnf = await readFile(join(workdir, "ext.cnf"), "utf8");
+    expect(cnf).toContain("extendedKeyUsage = codeSigning");
+    expect(cnf).toContain("CN = Headroom Local");
+
+    // Not just requested in the config: the certificate openssl actually
+    // produced from it really carries the codeSigning EKU (OID 1.3.6.1.5.5.7.3.3).
+    const certText = (await execFileAsync("openssl", ["x509", "-in", join(workdir, "cert.pem"), "-noout", "-text"])).stdout;
+    expect(certText).toMatch(/Code Signing|1\.3\.6\.1\.5\.5\.7\.3\.3/);
+
+    // The PKCS12 file reads back with the exact same non-empty passphrase
+    // the script passes to `security import -P` -- proving the export and
+    // the later import agree on one real passphrase, the root cause of the
+    // original "MAC verification failed during PKCS12 import" failure.
+    // `-legacy` on the read mirrors the export's own fallback: whichever
+    // form the export actually produced, the read below matches it.
+    const p12 = join(workdir, "cert.p12");
+    const readP12 = (extra: string[]) => execFileAsync("openssl", ["pkcs12", "-in", p12, "-passin", "pass:headroom", "-noout", "-info", ...extra]);
+    await readP12(["-legacy"]).catch(() => readP12([]));
+  });
 });
 
 describe.skipIf(process.platform !== "darwin")("build-probe.sh: rebuild only when the source hash changes", () => {
