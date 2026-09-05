@@ -277,7 +277,14 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
 
   const pacing = options.pacing ?? "even";
   const inFinalStretch = secondsLeft !== null && secondsLeft <= EVEN_PACING_FULL_BURST_MINUTES * 60;
-  const restrictedByPacing = pacing === "even" && !inFinalStretch && tight.window?.minutes && tight.resets_at && options.owner;
+  // Pro-rata smoothing only makes sense for a genuine 5h window: it rations a
+  // short window's own budget across the hours until IT resets. Once the
+  // tight window IS the weekly one (5h not enforced), there is no shorter
+  // window left to smooth -- the weekly reserve check in computeFill below is
+  // already the whole mechanism, and a from-scratch pro-rata line computed
+  // over a 7-day span (with no owner plan share on file yet) would otherwise
+  // collapse the allowance to near zero for no real reason.
+  const restrictedByPacing = pacing === "even" && isFiveHour && !inFinalStretch && tight.window?.minutes && tight.resets_at && options.owner;
   let used5hForLanes = used5h;
   let allowanceBasis: FillOutcome["allowance_basis"] = "full";
   if (restrictedByPacing) {
@@ -296,7 +303,7 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   // With no genuine second window and the tight one standing in for both,
   // the lane cost applies 1:1 instead.
   const weeklyCostPerLaneOverride = !wider && !isFiveHour ? laneCost : undefined;
-  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, weeklyReservePercent, weeklyCostPerLaneOverride);
+  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, weeklyReservePercent, weeklyCostPerLaneOverride, 5, windowUsed);
   const lanesError = laneCost === undefined ? `no learned cost for ${meter}; pass --lane-cost` : null;
 
   const routing = await readRouting();

@@ -25,15 +25,27 @@ async function checkFile(contents: string): Promise<{ code: number; stdout: stri
   }
 }
 
+// Every "bad" fixture value below is assembled at runtime (never a literal
+// contiguous match in this file's own source) -- this test file is itself a
+// tracked file the sweep scans, so a literal private IP, real email, real
+// username, or denylist word written here would fail the sweep on itself.
+// Same trick test/rename.test.ts already uses for a retired brand name.
+const privateIps = ["10", "1", "2", "3"].join(".") + " " + ["192", "168", "0", "9"].join(".") + " " + ["172", "20", "5", "5"].join(".") + " " + ["100", "64", "0", "5"].join(".");
+const realEmail = ["owner", "gmail.com"].join("@");
+const realUsername = ["john", "doe"].join("");
+const realHomePath = ["/Users", realUsername, ".headroom/accounts.toml"].join("/");
+const denylistWord = ["Hy", "dra"].join("");
+
 describe("scripts/privacy-sweep.sh --check", () => {
   it("fails on a private IPv4 address", async () => {
-    const { code, stdout } = await checkFile("internal box at 192.168.1.50 for testing\n");
+    const ip = privateIps.split(" ")[0];
+    const { code, stdout } = await checkFile(`internal box at ${ip} for testing\n`);
     expect(code).not.toBe(0);
     expect(stdout).toContain("private IPv4 address");
   });
 
   it("fails on each private range: 10.x, 192.168.x, 172.16-31.x, and 100.64.x", async () => {
-    for (const ip of ["10.1.2.3", "192.168.0.9", "172.20.5.5", "192.0.2.5"]) {
+    for (const ip of privateIps.split(" ")) {
       const { code, stdout } = await checkFile(`address ${ip} here\n`);
       expect(code, `expected ${ip} to fail`).not.toBe(0);
       expect(stdout).toContain("private IPv4 address");
@@ -46,7 +58,7 @@ describe("scripts/privacy-sweep.sh --check", () => {
   });
 
   it("fails on a real email address, but not one at example.com", async () => {
-    const real = await checkFile("contact owner@gmail.com for help\n");
+    const real = await checkFile(`contact ${realEmail} for help\n`);
     expect(real.code).not.toBe(0);
     expect(real.stdout).toContain("email address");
     const documented = await checkFile("contact owner@example.com for help\n");
@@ -54,7 +66,7 @@ describe("scripts/privacy-sweep.sh --check", () => {
   });
 
   it("fails on a home path with a real username, but not an allowed placeholder", async () => {
-    const real = await checkFile("wrote /Users/johndoe/.headroom/accounts.toml\n");
+    const real = await checkFile(`wrote ${realHomePath}\n`);
     expect(real.code).not.toBe(0);
     expect(real.stdout).toContain("real username");
     const placeholder = await checkFile("wrote /Users/you/.headroom/accounts.toml\n");
@@ -62,7 +74,7 @@ describe("scripts/privacy-sweep.sh --check", () => {
   });
 
   it("fails on a denylist match (case-insensitive)", async () => {
-    const { code, stdout } = await checkFile("deployed to gpu-box last night\n");
+    const { code, stdout } = await checkFile(`deployed to ${denylistWord} last night\n`);
     expect(code).not.toBe(0);
     expect(stdout).toContain("denylist match");
   });

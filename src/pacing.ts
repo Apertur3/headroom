@@ -102,7 +102,7 @@ export interface FillResult {
  * above its own reserve. weeklyCostPerLanePercent is normally the learned
  * per-lane weekly cost; fall back to the calibration ratio
  * (fiveHourPercentToWeeklyPercent) when nothing has been learned yet. */
-export function computeFill(used5hPercent: number, usedWeeklyPercent: number, laneCost5hPercent: number, weeklyReservePercent: number, weeklyCostPerLanePercent = fiveHourPercentToWeeklyPercent(laneCost5hPercent), safetyMarginPercent = 5): FillResult {
+export function computeFill(used5hPercent: number, usedWeeklyPercent: number, laneCost5hPercent: number, weeklyReservePercent: number, weeklyCostPerLanePercent = fiveHourPercentToWeeklyPercent(laneCost5hPercent), safetyMarginPercent = 5, windowLabel = "5h"): FillResult {
   const remaining5h = Math.max(0, 100 - used5hPercent) - safetyMarginPercent;
   const lanesBy5h = laneCost5hPercent > 0 ? Math.floor(remaining5h / laneCost5hPercent) : 0;
   const weeklyBudget = Math.max(0, 100 - usedWeeklyPercent - weeklyReservePercent);
@@ -113,7 +113,12 @@ export function computeFill(used5hPercent: number, usedWeeklyPercent: number, la
     ? `${lanes} lane${lanes === 1 ? "" : "s"} fit`
     : boundByWeekly
       ? `weekly reserve would be breached: ${weeklyBudget.toFixed(1)}% weekly budget left, ${weeklyCostPerLanePercent.toFixed(2)}% weekly per lane`
-      : `5h window has only ${Math.max(0, remaining5h).toFixed(1)}% left above the ${safetyMarginPercent}% safety margin`;
+      // windowLabel names whichever window used5hPercent actually came from:
+      // the caller's own 5h window normally, but the weekly window itself
+      // when there is no separate 5h window to speak of (fillFor's fallback,
+      // see orchestrator-reads.ts) -- a message that always says "5h window"
+      // regardless would misname the very number it just reported.
+      : `${windowLabel} window has only ${Math.max(0, remaining5h).toFixed(1)}% left above the ${safetyMarginPercent}% safety margin`;
   return { lanes, points_used: lanes * laneCost5hPercent, reason };
 }
 
