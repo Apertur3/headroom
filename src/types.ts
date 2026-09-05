@@ -80,6 +80,15 @@ export interface Observation {
     waiting?: number;
     cost_model?: "sunk" | "marginal";
   };
+  /** Computed, never persisted: least-squares burn rate from this window's
+   * fresh samples in the last lookback minutes (60 by default), the
+   * projected time to 100% used at that rate, and the straight-line percent
+   * per hour that would exactly spend the remaining allowance by reset.
+   * Present once a caller has enriched the observation via pace.ts;
+   * undefined on a raw vendor reading or a stored row read back verbatim. */
+  burn_percent_per_hour?: number | null;
+  empty_in_seconds?: number | null;
+  sustainable_percent_per_hour?: number | null;
 }
 
 export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED" | "UP" | "BUSY" | "DOWN";
@@ -88,7 +97,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve";
 
 export interface Lease {
   id: string;
@@ -96,6 +105,9 @@ export interface Lease {
   meter_id: string;
   expected_percent: number | null;
   note: string | null;
+  /** Set by `lease start --class <name>` or by `can --lease`; groups this
+   * lease's eventual spend into store.learnedCost()'s per-class statistics. */
+  action_class: string | null;
   started_at: string;
   expires_at: string;
   ended_at: string | null;

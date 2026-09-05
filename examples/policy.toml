@@ -7,6 +7,11 @@ poll_interval_minutes = 5
 # Keep the daemon-owned `agy` pseudo-terminal warm for real local quota summaries.
 # This keeps one background process and pseudo-terminal alive (small but continuous energy cost).
 antigravity_keepalive = true
+# "even" (default): `gate` enforces the pro-rata line and a 10-minute burst
+# check for a 5h request; `fill` only offers a window's full remaining
+# points in its last 45 minutes, the pro-rata allowance before that.
+# "none" skips both, leaving only the plain reserve/plan-line checks.
+pacing = "even"
 # Proxy environment variables are ignored. Set this explicitly when a proxy is required.
 # proxy = "http://127.0.0.1:8080"
 # Per-principal intervals override the default:

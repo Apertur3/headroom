@@ -11,6 +11,9 @@ import { appendDaemonLog } from "./logs.js";
 import { executablePath, headroomHome } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals } from "./policy.js";
 import { withResetsIn } from "./resets.js";
+import { withPaceInfo } from "./pace.js";
+import { fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
+import type { GateNeed } from "./pacing.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -227,10 +230,13 @@ export class HeadroomDaemon {
     try {
       let result: unknown;
       switch (request.method) {
-        case "status":
+        case "status": {
           await this.poll(undefined, false);
-          result = withResetsIn(this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id)));
+          const now = new Date();
+          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          result = withResetsIn(withPaceInfo(observations, this.store.burnRateFor(observations, now), now));
           break;
+        }
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
@@ -255,7 +261,11 @@ export class HeadroomDaemon {
           const policy = await readPolicy();
           const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
-          result = canRouteWithLeases(meters, localMeters, new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)])), routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), params.owner);
+          const now = new Date();
+          const rows = new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)]));
+          const burn = this.store.burnRateFor([...rows.values()].flat(), now);
+          const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+          result = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), params.owner, now);
           break;
         }
         case "lease_start": {
@@ -263,7 +273,8 @@ export class HeadroomDaemon {
           const meter = typeof params.meter_id === "string" ? params.meter_id : "";
           const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
           const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
-          result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null); break;
+          const actionClass = typeof params.action_class === "string" && params.action_class.trim() ? params.action_class.trim() : null;
+          result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null, new Date(), actionClass); break;
         }
         case "lease_end": {
           if (typeof params.id !== "string") return reject(-32602, "lease id is required");
@@ -285,6 +296,48 @@ export class HeadroomDaemon {
         }
         case "free_reset_used": {
           result = Object.fromEntries(this.store.freeResetUsedFor(parseResetWindows(params.windows))); break;
+        }
+        case "cost": {
+          const actionClass = typeof params.action_class === "string" && params.action_class.trim() ? params.action_class.trim() : undefined;
+          result = this.store.learnedCost(actionClass); break;
+        }
+        case "rate": {
+          const meter = typeof params.meter === "string" ? params.meter : undefined;
+          const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
+          result = rateLines(this.store, meter, minutes); break;
+        }
+        case "plan": {
+          const meter = typeof params.meter === "string" ? params.meter : "";
+          if (!meter) return reject(-32602, "meter is required");
+          const policy = await readPolicy();
+          const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
+          result = planFor(this.store, meter, reserve); break;
+        }
+        case "gate": {
+          const meter = typeof params.meter === "string" ? params.meter : undefined;
+          const rawNeeds = Array.isArray(params.needs) ? params.needs : [];
+          const needs: GateNeed[] = rawNeeds.flatMap((item) => {
+            const candidate = item as { window?: unknown; points?: unknown };
+            return (candidate.window === "5h" || candidate.window === "wk") && typeof candidate.points === "number" ? [{ window: candidate.window, points: candidate.points }] : [];
+          });
+          if (!needs.length) return reject(-32602, "needs is required");
+          await this.poll(undefined, false);
+          const policy = await readPolicy();
+          const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
+          const owner = typeof params.owner === "string" ? params.owner : undefined;
+          const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
+          const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing }); break;
+        }
+        case "fill": {
+          const meter = typeof params.meter === "string" ? params.meter : "";
+          if (!meter) return reject(-32602, "meter is required");
+          const laneCost = typeof params.lane_cost_percent === "number" ? params.lane_cost_percent : undefined;
+          const policy = await readPolicy();
+          const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
+          const owner = typeof params.owner === "string" ? params.owner : undefined;
+          const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing }); break;
         }
         case "health": result = {
           socket: this.path,

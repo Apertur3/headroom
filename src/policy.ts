@@ -1,4 +1,4 @@
-import { formatResetsInCoarse, resetsIn } from "./resets.js";
+import { formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 export interface Policy {
@@ -9,6 +9,12 @@ export interface Policy {
   principal_intervals: Record<string, number>;
   /** Keep one daemon-owned `agy` PTY alive for warm local Antigravity reads. */
   antigravity_keepalive: boolean;
+  /** "even" (default): `gate` enforces the pro-rata line and burst check for
+   * a 5h need, and `fill` only offers the window's full remaining points in
+   * its last 45 minutes (otherwise it offers the pro-rata allowance).
+   * "none": neither restriction applies -- gate falls back to the plain
+   * reserve/plan-line checks, and fill always offers the full remainder. */
+  pacing: "even" | "none";
   proxy?: string;
 }
 
@@ -19,7 +25,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(),
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even",
 };
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
@@ -29,6 +35,7 @@ export function parsePolicy(text: string): Policy {
   let principal: string | undefined;
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
+  let pacing: Policy["pacing"] | undefined;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
@@ -40,6 +47,8 @@ export function parsePolicy(text: string): Policy {
     if (proxyMatch) { try { const url = new URL(proxyMatch[1]); if (!/^https?:$/.test(url.protocol)) throw new Error("invalid"); proxy = url.toString(); continue; } catch { throw new Error("Invalid Headroom proxy"); } }
     const keepalive = /^antigravity_keepalive\s*=\s*(true|false)\s*$/.exec(line);
     if (keepalive) { antigravityKeepalive = keepalive[1] === "true"; continue; }
+    const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
+    if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
     const match = /^(freeze_reserve_pct|pace_grace_fraction|staleness_minutes|poll_interval_minutes)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (match) values[match[1]] = Number(match[2]);
   }
@@ -48,7 +57,7 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, ...(proxy ? { proxy } : {}) };
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
@@ -76,7 +85,22 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   // the same inferred start, which is the only vendor-independent anchor we have.
   const start = reset - duration;
   const elapsedFraction = Math.min(1, Math.max(0, (now.getTime() - start) / duration));
-  if (elapsedFraction < policy.pace_grace_fraction) return { state: "NORMAL", reason: "grace period" };
+  // A window burning fast enough to run dry before its own reset is CONSERVE
+  // regardless of the straight-line surplus below: the straight-line rule
+  // only looks at usage-to-date against elapsed time, so it can still read
+  // NORMAL or even HARVEST one poll before a fast, recent burn empties the
+  // window early. Grace still holds off this projection unless the window
+  // would stall within 30 minutes -- an opening burst that is about to run
+  // out right away is not what grace exists to protect.
+  const resetsInSeconds = Math.max(0, (reset - now.getTime()) / 1000);
+  const emptyIn = observation.empty_in_seconds ?? null;
+  const projectingStall = emptyIn !== null && emptyIn < resetsInSeconds;
+  const inGrace = elapsedFraction < policy.pace_grace_fraction;
+  if (inGrace && !(projectingStall && emptyIn! < 1800)) return { state: "NORMAL", reason: "grace period" };
+  if (projectingStall) {
+    const burn = observation.burn_percent_per_hour ?? 0;
+    return { state: "CONSERVE", reason: `burning ${Math.round(burn)}%/h, empty in ${formatResetsIn(emptyIn!)}, reset in ${formatResetsIn(resetsInSeconds)}` };
+  }
   const surplus = (1 - used / observation.quantity.limit) - (1 - elapsedFraction);
   if (surplus > 0.10) return { state: "HARVEST", reason: "ahead of pace" };
   if (surplus < -0.10) return { state: "CONSERVE", reason: "behind pace" };

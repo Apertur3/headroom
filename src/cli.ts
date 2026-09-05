@@ -13,6 +13,10 @@ import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { withPaceInfo } from "./pace.js";
+import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
+import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
+import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, type RateLine } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
@@ -48,6 +52,18 @@ function label(observation: Observation): string {
 
 function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
 
+/** The short pace segment appended to a window's status line once its burn
+ * rate is known: the live burn alongside the sustainable pace that would
+ * exactly spend the remaining allowance by reset, so a glance says whether
+ * the current rate is faster or slower than that line. */
+function paceSegment(observation: Observation): string {
+  const burn = observation.burn_percent_per_hour;
+  if (burn === null || burn === undefined) return "";
+  const sustainable = observation.sustainable_percent_per_hour;
+  const sustainableText = sustainable === null || sustainable === undefined ? "?" : `${Math.round(sustainable)}%/h`;
+  return ` burn ${Math.round(burn)}%/h, ok ${sustainableText}`;
+}
+
 function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string): string {
   if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
     const available = observation.quantity.remaining ?? 0;
@@ -60,7 +76,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
   const seconds = resetsIn(observation.resets_at).resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${evidence}`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${evidence}${paceSegment(observation)}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -180,10 +196,14 @@ function printEvents(items: HeadroomEvent[]): void {
 
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
-  if (!action) throw new Error("Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--json]");
+  if (!action) throw new Error("Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]");
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
   if (!owner) throw new Error("--owner is required");
+  const expectValue = option(argv, "--expect");
+  const expectOverride = expectValue === undefined ? null : Number(expectValue);
+  if (expectOverride !== null && (!Number.isFinite(expectOverride) || expectOverride < 0 || expectOverride > 100)) throw new Error("--expect must be 0 through 100");
+  const leaseFlag = argv.includes("--lease");
   const routing = await readRouting();
   if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
   const meters = routing.consumes[action];
@@ -191,32 +211,57 @@ async function can(argv: string[]): Promise<number> {
   const accounts = await readAccounts();
   const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
   if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
+
   const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
+  let decision: CanDecision;
   if (request !== undefined) {
-    const decision = unwrapRpc(request) as CanDecision;
-    printCan(decision, argv.includes("--json"));
-    return decision.allowed ? 0 : 2;
+    decision = unwrapRpc(request) as CanDecision;
+  } else {
+    directReadNotice();
+    const [policy, directStore] = await Promise.all([readPolicy(), HeadroomStore.open()]);
+    try {
+      const localAccounts = accounts.filter(isLocalAccount);
+      // With no daemon, `can` is also a direct read: refresh local state rather
+      // than deciding a routing preference from an old queue-depth sample.
+      directStore.insertAll(await Promise.all(localAccounts.map(observeLocal)));
+      const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+      const allMeters = [...new Set([...meters, ...localMeters])];
+      const now = new Date();
+      const rows = new Map(allMeters.map((meter) => [meter, directStore.latestPerWindow(meter)]));
+      const burn = directStore.burnRateFor([...rows.values()].flat(), now);
+      const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+      decision = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, argv.includes("--allow-unknown"), directStore.leases(undefined, true), owner, now);
+      directStore.audit("cli", "can", action, decision.allowed ? "yes" : "no");
+    } finally { directStore.close(); }
   }
-  directReadNotice();
-  const [policy, store] = await Promise.all([readPolicy(), HeadroomStore.open()]);
+
+  // The learned-cost/max-more/optional-lease report is a direct read
+  // regardless of the daemon: it is advisory bookkeeping over the same
+  // on-disk store the daemon also writes to, not a vendor call, so it never
+  // needs a daemon round trip of its own (see store.ts's WAL comment on
+  // safe concurrent direct reads).
+  const store = await HeadroomStore.open();
+  let cost: CostEstimate;
+  let leasedId: string | undefined;
   try {
-    const localAccounts = accounts.filter(isLocalAccount);
-    // With no daemon, `can` is also a direct read: refresh local state rather
-    // than deciding a routing preference from an old queue-depth sample.
-    store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
-    const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
-    const allMeters = [...new Set([...meters, ...localMeters])];
-    const latest = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
-    const decision = canRouteWithLeases(meters, localMeters, latest, routing.local_preference, policy, argv.includes("--allow-unknown"), store.leases(undefined, true), owner);
-    store.audit("cli", "can", action, decision.allowed ? "yes" : "no");
-    printCan(decision, argv.includes("--json"));
-    return decision.allowed ? 0 : 2;
+    const learned = store.learnedCost(action)[0];
+    const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
+    const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
+    cost = buildCostEstimate(action, expectOverride, learned as LearnedCost | undefined, remaining);
+    if (leaseFlag && decision.allowed && cost.expected_percent !== null) {
+      const lease = store.startLease(owner, decision.meter, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, new Date(), action);
+      store.audit("cli", "lease_start", `${owner}:${decision.meter}`, "ok");
+      leasedId = lease.id;
+    }
   } finally { store.close(); }
+
+  printCan(decision, cost, leasedId, argv.includes("--json"));
+  return decision.allowed ? 0 : 2;
 }
 
-function ttl(value: string | undefined): number {
+function ttl(value: string | undefined, flag = "--ttl"): number {
   const match = /^(\d+)(m|h|d)$/.exec(value ?? "30m");
-  if (!match) throw new Error("--ttl must be like 30m, 2h, or 1d");
+  if (!match) throw new Error(`${flag} must be like 30m, 2h, or 1d`);
   return Number(match[1]) * (match[2] === "m" ? 60_000 : match[2] === "h" ? 3_600_000 : 86_400_000);
 }
 
@@ -230,14 +275,14 @@ export function endedLeaseMessage(lease: Lease): string { return lease.already_e
 
 async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
-    const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note");
-    if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...]");
+    const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note"); const actionClass = option(argv, "--class");
+    if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]");
     const expected = expect === undefined ? null : Number(expect);
     if (expected !== null && (!Number.isFinite(expected) || expected < 0 || expected > 100)) throw new Error("--expect must be 0 through 100");
-    const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null };
+    const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null, action_class: actionClass ?? null };
     const request = await requestDaemon("lease_start", params);
     if (request !== undefined) { console.log((unwrapRpc(request) as Lease).id); return 0; }
-    directReadNotice(); const store = await HeadroomStore.open(); try { const created = store.startLease(params.owner, params.meter_id, params.expected_percent, params.ttl_ms, params.note); store.audit("cli", "lease_start", meter, "ok"); console.log(created.id); return 0; } finally { store.close(); }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const created = store.startLease(params.owner, params.meter_id, params.expected_percent, params.ttl_ms, params.note, new Date(), params.action_class); store.audit("cli", "lease_start", meter, "ok"); console.log(created.id); return 0; } finally { store.close(); }
   }
   if (argv[0] === "end") {
     const id = argv[1]; const owner = option(argv, "--owner"); if (!id) throw new Error("Usage: headroom lease end <id> [--owner <name>] [--force]");
@@ -258,6 +303,172 @@ async function lease(argv: string[]): Promise<number> {
     directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); printLeases(items); return 0; } finally { store.close(); }
   }
   throw new Error("Usage: headroom lease <start|end|list>");
+}
+
+async function cost(argv: string[]): Promise<number> {
+  const actionClass = argv[0] && !argv[0].startsWith("--") ? argv[0] : undefined;
+  const asJson = argv.includes("--json");
+  const request = await requestDaemon("cost", { action_class: actionClass });
+  let items: LearnedCost[];
+  if (request !== undefined) { items = unwrapRpc(request) as LearnedCost[]; }
+  else {
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { items = store.learnedCost(actionClass); store.audit("cli", "cost", actionClass ?? null, "ok"); }
+    finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(items)); return 0; }
+  if (!items.length) { console.log(actionClass ? `no learned cost for ${actionClass} yet` : "no learned cost yet"); return 0; }
+  for (const item of items) console.log(`${item.action_class}  median ${item.median_percent.toFixed(2)}% (IQR ${item.iqr_low.toFixed(2)}%-${item.iqr_high.toFixed(2)}%, n=${item.sample_count})`);
+  return 0;
+}
+
+/** --window accepts a duration string (10m, 1h); --minutes takes a bare
+ * number. Both set the same lookback; --window is the more ergonomic form
+ * for a short burst-detection read like `rate --window 10m`. */
+function rateLookbackMinutes(argv: string[]): number {
+  const windowValue = option(argv, "--window");
+  if (windowValue !== undefined) return ttl(windowValue, "--window") / 60_000;
+  const minutesValue = option(argv, "--minutes");
+  const minutes = minutesValue === undefined ? 30 : Number(minutesValue);
+  if (!Number.isFinite(minutes) || minutes <= 0) throw new Error("--minutes must be a positive number");
+  return minutes;
+}
+
+async function rate(argv: string[]): Promise<number> {
+  const meter = option(argv, "--meter");
+  const minutes = rateLookbackMinutes(argv);
+  const asJson = argv.includes("--json");
+  const request = await requestDaemon("rate", { meter, minutes });
+  let lines: RateLine[];
+  if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
+  else {
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { lines = rateLines(store, meter, minutes); store.audit("cli", "rate", meter ?? null, "ok"); }
+    finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(lines)); return 0; }
+  if (!lines.length) { console.log(meter ? `no readings for ${meter}` : "no readings"); return 0; }
+  for (const line of lines) {
+    const windowLabel = line.window_minutes === 300 ? "5h" : line.window_minutes === 10_080 ? "wk" : line.window_minutes ? `${line.window_minutes}m` : "-";
+    const usedText = line.used_percent === null ? "?" : `${Math.round(line.used_percent)}%`;
+    if (line.burn_percent_per_hour === null) { console.log(`${line.meter}  ${windowLabel} ${usedText}  burn unknown (need 2+ fresh samples in the last ${minutes}m)`); continue; }
+    const stall = line.empty_in_seconds === null ? "not projected to empty before reset" : `stall in ${formatResetsIn(line.empty_in_seconds)}`;
+    console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${Math.round(line.burn_percent_per_hour)}%/h, ${stall}`);
+  }
+  return 0;
+}
+
+async function plan(argv: string[]): Promise<number> {
+  const meter = option(argv, "--meter");
+  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]");
+  const until = option(argv, "--until");
+  if (until !== "reset") throw new Error("--until must be 'reset' (the only supported value)");
+  const reserveValue = option(argv, "--reserve");
+  if (reserveValue !== undefined && (!Number.isFinite(Number(reserveValue)) || Number(reserveValue) < 0 || Number(reserveValue) > 100)) throw new Error("--reserve must be 0 through 100");
+  const asJson = argv.includes("--json");
+  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue) });
+  let result: ({ meter: string } & PlanResult) | { meter: string; error: string };
+  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+  else {
+    directReadNotice();
+    const policy = await readPolicy();
+    const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
+    const store = await HeadroomStore.open();
+    try { result = planFor(store, meter, reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  if ("error" in result) { console.error(result.error); return 1; }
+  console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h`);
+  return 0;
+}
+
+async function gate(argv: string[]): Promise<number> {
+  const ownerAt = argv.indexOf("--owner");
+  const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
+  if (!owner) throw new Error("Usage: headroom gate --need 5h:N [--need wk:N] [--meter M] [--plan] [--plan-share N] [--class <action-class>] --owner <name> [--json]");
+  const needs: GateNeed[] = [];
+  for (let index = 0; index < argv.length; index += 1) if (argv[index] === "--need") needs.push(parseGateNeed(argv[index + 1] ?? ""));
+  if (!needs.length) throw new Error("--need is required (5h:N or wk:N)");
+  const meter = option(argv, "--meter");
+  const usePlan = argv.includes("--plan");
+  const planShareValue = option(argv, "--plan-share");
+  const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
+  if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
+  const actionClass = option(argv, "--class");
+  const asJson = argv.includes("--json");
+  const options = { owner, planSharePercent, actionClass };
+  const request = await requestDaemon("gate", { needs, meter, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
+  let result: Awaited<ReturnType<typeof gateFor>>;
+  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+  else {
+    directReadNotice();
+    const policy = await readPolicy();
+    const store = await HeadroomStore.open();
+    try { result = gateFor(store, needs, meter, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing }); store.audit("cli", "gate", meter ?? null, result.allowed ? "yes" : "no"); } finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
+  console.log(`${result.allowed ? "YES" : "NO"} ${meter ?? "(all meters)"} (${result.reason})${lanesRemaining}`);
+  return result.allowed ? 0 : 2;
+}
+
+async function wait(argv: string[]): Promise<number> {
+  const meter = option(argv, "--meter");
+  if (!meter || !argv.includes("--until-reset")) throw new Error("Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]");
+  const maxValue = option(argv, "--max");
+  const maxMs = maxValue === undefined ? null : ttl(maxValue, "--max");
+  const getResetsAt = async (): Promise<string | null> => {
+    const request = await requestDaemon("status");
+    let observations: Observation[];
+    if (request !== undefined) { observations = unwrapRpc(request) as Observation[]; }
+    else {
+      const store = await HeadroomStore.open();
+      try { observations = store.latestPerWindow(meter); } finally { store.close(); }
+    }
+    const rows = observations.filter((item) => item.meter_id === meter && item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
+    const shortest = [...rows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER))[0];
+    return shortest?.resets_at ?? null;
+  };
+  const outcome = await waitForReset(getResetsAt, maxMs);
+  if (outcome === "reset") { console.log(`${meter} reset`); return 0; }
+  if (outcome === "timeout") { console.error(`timed out waiting for ${meter} to reset${maxValue ? ` after ${maxValue}` : ""}`); return 3; }
+  console.error(`${meter}: resets_at unknown`);
+  return 1;
+}
+
+async function fill(argv: string[]): Promise<number> {
+  const ownerAt = argv.indexOf("--owner");
+  const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
+  const meter = option(argv, "--meter");
+  if (!meter || !owner || !argv.includes("--until-reset")) throw new Error("Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] --owner <name> [--json]");
+  const laneCostValue = option(argv, "--lane-cost");
+  const laneCost = laneCostValue === undefined ? undefined : Number(laneCostValue);
+  if (laneCost !== undefined && (!Number.isFinite(laneCost) || laneCost <= 0)) throw new Error("--lane-cost must be a positive percent");
+  const weeklyReserveValue = option(argv, "--weekly-reserve");
+  if (weeklyReserveValue !== undefined && (!Number.isFinite(Number(weeklyReserveValue)) || Number(weeklyReserveValue) < 0 || Number(weeklyReserveValue) > 100)) throw new Error("--weekly-reserve must be 0 through 100");
+  const planShareValue = option(argv, "--plan-share");
+  const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
+  if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
+  const asJson = argv.includes("--json");
+  const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent });
+  let result: Awaited<ReturnType<typeof fillFor>>;
+  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+  else {
+    directReadNotice();
+    const policy = await readPolicy();
+    const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
+    const store = await HeadroomStore.open();
+    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  if ("error" in result) { console.error(result.error); return 1; }
+  const timeLeft = result.resets_in_seconds === null ? "?" : formatResetsIn(result.resets_in_seconds);
+  if (result.lanes) console.log(`${result.meter}  ${result.lanes.lanes} lanes, ${result.lanes.points_used.toFixed(1)}% used, time left ${timeLeft} (${result.lanes.reason})`);
+  else console.log(`${result.meter}  lanes unknown (${result.lanes_error}); time left ${timeLeft}`);
+  for (const item of result.classes as FillClassFit[]) console.log(`  ${item.action_class}: ${item.percent} pts, ${item.duration_minutes} min, fits ${item.fits}x`);
+  return result.lanes && result.lanes.lanes > 0 ? 0 : 2;
 }
 
 async function observe(argv: string[]): Promise<number> {
@@ -291,7 +502,9 @@ async function observe(argv: string[]): Promise<number> {
       failures = polled.failures;
       store.insertAll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
-      observations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      const now = new Date();
+      observations = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);
@@ -333,10 +546,16 @@ function unwrapRpc(value: unknown): unknown {
   return value;
 }
 
-function printCan(decision: CanDecision, asJson: boolean): void {
-  if (asJson) { console.log(JSON.stringify(decision)); return; }
+function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
+  if (asJson) { console.log(JSON.stringify({ ...decision, cost, leased_id: leasedId ?? null })); return; }
   console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${decision.reason})`);
   for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${meter.reason})`);
+  if (cost.expected_percent !== null) {
+    const iqr = cost.iqr_low !== null && cost.iqr_high !== null ? ` (IQR ${cost.iqr_low.toFixed(1)}-${cost.iqr_high.toFixed(1)}%, n=${cost.sample_count})` : "";
+    const maxMore = cost.max_more_before_reset === null ? "" : `; max ${cost.max_more_before_reset} more before reset at the current sustainable pace`;
+    console.log(`cost: ${cost.source} ${cost.expected_percent.toFixed(1)}%${iqr}, confidence ${cost.confidence}${maxMore}`);
+  }
+  if (leasedId) console.log(`leased ${leasedId}`);
 }
 
 function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }
@@ -414,6 +633,12 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["events", "List reset and free-reset events"],
   ["history <meter>", "List stored observations for one meter"],
   ["lease start|list|end", "Reserve, list, or release a meter lease"],
+  ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
+  ["rate", "Burn in percent per hour over a recent window, and ETA to the limit"],
+  ["plan", "Points available per remaining 5h window and the plan line to hold"],
+  ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
+  ["wait", "Block until a meter's window resets, or --max elapses"],
+  ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
   ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config"],
   ["keychain grant", "macOS: grant the Claude probe Keychain access"],
@@ -428,15 +653,21 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
 
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
 export const COMMAND_HELP: Readonly<Record<string, string>> = {
-  can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--json]",
+  can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
   history: "Usage: headroom history <meter> [--since 24h]",
   lease: [
     "Usage: headroom lease <start|end|list>",
-    "  start: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...]",
+    "  start: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]",
     "  end:   headroom lease end <id> --owner <name> [--force]",
     "  list:  headroom lease list",
   ].join("\n"),
+  cost: "Usage: headroom cost [<action-class>] [--json]",
+  rate: "Usage: headroom rate [--meter <meter_id>] [--minutes 30] [--window 10m] [--json]",
+  plan: "Usage: headroom plan --meter <meter_id> --until reset --reserve <percent> [--json]",
+  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] [--meter <meter_id>] [--plan] [--plan-share <N>] [--class <action-class>] --owner <name> [--json]",
+  wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
+  fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   accounts: "Usage: headroom accounts discover",
   doctor: "Usage: headroom doctor",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
@@ -508,6 +739,12 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
+  if (argv[0] === "cost") return cost(argv.slice(1));
+  if (argv[0] === "rate") return rate(argv.slice(1));
+  if (argv[0] === "plan") return plan(argv.slice(1));
+  if (argv[0] === "gate") return gate(argv.slice(1));
+  if (argv[0] === "wait") return wait(argv.slice(1));
+  if (argv[0] === "fill") return fill(argv.slice(1));
   if (argv.includes("--shape")) return responseShape(argv);
   return observe(argv);
 }
