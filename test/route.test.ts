@@ -97,6 +97,33 @@ describe("routeFor", () => {
       expect(result.candidates[0].state).toBe("FREEZE");
     } finally { store.close(); }
   });
+
+  it("reserves another owner's active lease against the same meter before scoring and ranking a candidate (F14)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-route-leases-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    const store = await HeadroomStore.open(home);
+    try {
+      const now = new Date();
+      store.insert(meter("claude-2", "all", 20, now.toISOString())); // 80% remaining, unadjusted
+      const accounts: ProviderAccount[] = [{ name: "claude-2", vendor: "claude", location: claude2Location, adapter: "native-ts" }];
+
+      // Without any lease, route picks claude-2 on its raw 80% remaining.
+      const before = routeFor(store, ["claude-2:all"], accounts, defaultPolicy, false, now, "review");
+      expect(before.principal).toBe("claude-2");
+      expect(before.candidates[0].remaining_percent).toBe(80);
+
+      // A different owner has already reserved 90% of this same meter --
+      // the same reservation `can` would apply. route must no longer treat
+      // this candidate as freely available: the same request that would
+      // otherwise be reported as ahead of pace (HARVEST-shaped remaining
+      // capacity) is now FREEZE, and no candidate is picked.
+      store.startLease("other-review", "claude-2:all", 90, 3_600_000, null, now);
+      const after = routeFor(store, ["claude-2:all"], accounts, defaultPolicy, false, now, "review");
+      expect(after.candidates[0].state).toBe("FREEZE");
+      expect(after.principal).toBeNull();
+    } finally { store.close(); }
+  });
 });
 
 describe("headroom route (CLI)", () => {

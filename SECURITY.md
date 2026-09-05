@@ -33,7 +33,17 @@ cookies, which unlock paid subscriptions.
    in the reply, and treats a missing or wrong proof exactly like no daemon answering at all. Binding
    both nonces means a captured reply from one connection can never be replayed on another: `health`
    no longer returns a static, replayable signature, so an impostor that once obtained a real
-   `health` reply learns nothing it can reuse. Headroom has no TCP listener.
+   `health` reply learns nothing it can reuse. The proof also binds the exact request and reply bytes
+   exchanged, not just the two nonces: it travels on its own line immediately after the reply, keyed
+   over SHA-256 hashes of the request line the daemon received and the reply line it just sent. This
+   means a live process relaying a genuine handshake to the real daemon can no longer substitute the
+   request it forwards or the reply it hands back without the proof failing to verify. Every pipe name is also
+   derived from one canonicalized form of the Headroom home, so two equivalent spellings of the same
+   directory (trailing separator, letter case, `.`/`..` components) always select the same pipe rather
+   than letting a client and the daemon land on two different ones. A pipe connection that never
+   completes the handshake is closed after a short deadline, every connection is closed after a period
+   of inactivity, at most one request is processed at a time per connection, and neither side buffers
+   an unbounded amount of unread output or unverified input. Headroom has no TCP listener.
 4. **Polite polling.** Vendor polls are rate-limited and jittered so Headroom never triggers a
    lockout or a bot-defense challenge; a 401/403/429 backs off exponentially and is surfaced, never
    retried in a tight loop. Backoff detection recognizes both the parenthesized status format

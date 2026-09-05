@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -76,6 +76,44 @@ describe("headroom statusline", () => {
       expect(code).toBe(0);
       expect(stdout.join("\n")).toContain("no rate limit data");
     });
+  });
+
+  it("writes atomically, leaving no temp file behind next to the real one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-cli-atomic-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const payload = JSON.stringify({ rate_limits: { five_hour: { used_percentage: 20, resets_at: null } } });
+    await withHeadroomHome(home, () => withConfigDir(undefined, async () => {
+      const { code } = await runStatusline([], payload);
+      expect(code).toBe(0);
+      const entries = await readdir(join(home, "statusline"));
+      expect(entries).toEqual(["default.json"]);
+    }));
+  });
+
+  it("refuses to write through a symlinked destination, leaving the linked-to file untouched", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-cli-symlink-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const outside = join(root, "outside-secret.json");
+    await writeFile(outside, "untouched");
+    const firstPayload = JSON.stringify({ rate_limits: { five_hour: { used_percentage: 1, resets_at: null } } });
+    await withHeadroomHome(home, () => withConfigDir(undefined, async () => {
+      // First run creates the real snapshot directory and file normally.
+      await runStatusline([], firstPayload);
+      const snapshotPath = join(home, "statusline", "default.json");
+      await rm(snapshotPath);
+      await symlink(outside, snapshotPath);
+      const secondPayload = JSON.stringify({ rate_limits: { five_hour: { used_percentage: 88, resets_at: null } } });
+      const { code, stdout } = await runStatusline([], secondPayload);
+      // The bar still prints from the in-memory reading -- a refused write
+      // must never blank the user's prompt.
+      expect(code).toBe(0);
+      expect(stdout.join("\n")).toContain("5h 88%");
+      // Neither the symlink itself nor the file it points to was written
+      // through: the symlink is refused outright, not silently replaced.
+      const stat = await lstat(snapshotPath);
+      expect(stat.isSymbolicLink()).toBe(true);
+      expect(await readFile(outside, "utf8")).toBe("untouched");
+    }));
   });
 
   it("--chain runs the given command with the same stdin and prints its output instead", async () => {

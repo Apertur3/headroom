@@ -46,8 +46,11 @@ Release candidates, if ever needed, use `-rc.N` the same way.
    trusted publishing: npmjs.com trusts this repository's `release.yml` workflow directly, no
    token exists anywhere, and every version carries provenance. If npm refuses the publish (the
    trusted publisher is not configured, or the version already exists) the job prints a warning
-   instead of failing; re-run it after fixing the cause. Every version, beta or not, is published
-   under the `latest` dist-tag until a stable line exists.
+   instead of failing; re-run it after fixing the cause via `workflow_dispatch`, passing the
+   existing release tag (`v<version>`, checked against that grammar before use). The workflow
+   refuses to publish when the downloaded release asset's own `package.json` version does not
+   match the dispatched tag. Every version, beta or not, is published under the `latest` dist-tag
+   until a stable line exists.
 5. A published version is never changed; a mistake gets the next number.
 
 ## Deprecations

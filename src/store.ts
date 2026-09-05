@@ -604,13 +604,19 @@ export class HeadroomStore {
   /**
    * Median, interquartile range and sample count of the per-lease total
    * spent percent, grouped by the lease's action_class (set by `lease start
-   * --class` or `can --lease`). Every lease with that action_class counts as
-   * one sample, spent or not: a call that turned out free is still a real
-   * data point. Restricted to one class when given, otherwise every class
-   * that has at least one sample.
+   * --class` or `can --lease`). Only a lease that has actually ENDED --
+   * finished normally or expired -- counts as a sample: an in-progress
+   * lease has no observed spend yet, so counting it would let a batch of
+   * just-started jobs drag the median toward zero and inflate the sample
+   * count before any of them are actually done. A completed lease with
+   * genuinely zero spend still counts as one real (zero-cost) sample --
+   * only an unfinished lease is excluded, not a finished free one.
+   * Restricted to one class when given, otherwise every class that has at
+   * least one sample.
    */
-  learnedCost(actionClass?: string): LearnedCost[] {
-    const filter = actionClass ? "WHERE l.action_class = ?" : "WHERE l.action_class IS NOT NULL";
+  learnedCost(actionClass?: string, now = new Date()): LearnedCost[] {
+    this.expireLeases(now);
+    const filter = actionClass ? "WHERE l.action_class = ? AND l.ended_at IS NOT NULL" : "WHERE l.action_class IS NOT NULL AND l.ended_at IS NOT NULL";
     const rows = this.db.prepare(`SELECT l.action_class AS action_class, COALESCE(SUM(s.amount_percent), 0) AS spent
       FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter} GROUP BY l.id`).all(...(actionClass ? [actionClass] : []));
     const byClass = new Map<string, number[]>();
@@ -626,10 +632,12 @@ export class HeadroomStore {
   /** The same median/IQR/count learned-cost summary, but grouped by meter
    * instead of action_class: `fill`'s fallback lane cost when --lane-cost is
    * omitted, from whatever leases (of any class) have run against that
-   * meter before. */
-  learnedCostForMeter(meterId: string): LearnedCost | undefined {
+   * meter before. Only ended/expired leases count, for the same reason
+   * learnedCost excludes an in-progress one. */
+  learnedCostForMeter(meterId: string, now = new Date()): LearnedCost | undefined {
+    this.expireLeases(now);
     const rows = this.db.prepare(`SELECT l.id AS id, COALESCE(SUM(s.amount_percent), 0) AS spent
-      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.meter_id = ? GROUP BY l.id`).all(meterId);
+      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.meter_id = ? AND l.ended_at IS NOT NULL GROUP BY l.id`).all(meterId);
     return summarizeLearnedCost(meterId, rows.map((row) => Number(row.spent)));
   }
 

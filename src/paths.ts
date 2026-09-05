@@ -147,6 +147,28 @@ export async function assertSafeAncestry(target: string, options: AncestryOption
   }
 }
 
+/**
+ * Canonicalizes a Headroom home string the one way every Windows-pipe caller
+ * must use before hashing it into a pipe name. `socketPath()` (src/daemon.ts)
+ * is the only place a home turns into a pipe: the daemon calls it with the
+ * home `safeHeadroomDirectory` already resolved and `realpath`'d, while a
+ * client calls it with whatever raw `HEADROOM_HOME` (or the untouched
+ * default) it was given -- two spellings of the same directory that differ
+ * only in trailing separators, slash style, `.`/`..` components, or letter
+ * case previously hashed to two different pipe names, because only the
+ * server's call site ever normalized anything. `resolve()` collapses the
+ * syntactic differences (separators, dot components, relative segments)
+ * without touching the filesystem, so it works for a home that does not
+ * exist yet; the case fold matches NTFS's own case-insensitive-but-preserving
+ * semantics. This does not resolve symlinks or system path aliases -- that
+ * requires `realpath`, which only the side that already has the directory
+ * (the daemon) can safely call.
+ */
+export function canonicalizeHomeForPipe(home: string, platform: NodeJS.Platform = process.platform): string {
+  const resolved = platform === "win32" ? win32.resolve(home) : posix.resolve(home);
+  return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
 export type VendorHome = "claude" | "codex" | "gemini";
 
 export function vendorHome(vendor: VendorHome, options: PathOptions = {}): string {

@@ -142,37 +142,60 @@ describe("store.learnedCost", () => {
       spend("codex-main:one", 2, "review", now);
       spend("codex-main:two", 4, "review", new Date(now.getTime() + 2000));
       spend("codex-main:three", 4, "review", new Date(now.getTime() + 4000));
+      // Past every lease's 1h ttl, so learnedCost's own expiry sweep has
+      // ended all three before counting them -- see "keeps an in-progress
+      // lease out of the statistics" below for the still-active case.
+      const wellAfterExpiry = new Date(now.getTime() + 2 * 3_600_000);
 
-      const learned = store.learnedCost("review");
+      const learned = store.learnedCost("review", wellAfterExpiry);
       expect(learned).toHaveLength(1);
       expect(learned[0]).toMatchObject({ action_class: "review", sample_count: 3, median_percent: 4 });
 
       // A class with no leases at all is simply absent, not a zero-sample row.
-      expect(store.learnedCost("nonexistent")).toEqual([]);
+      expect(store.learnedCost("nonexistent", wellAfterExpiry)).toEqual([]);
       // With no filter, every class with a sample is returned.
-      expect(store.learnedCost().map((item) => item.action_class)).toEqual(["review"]);
+      expect(store.learnedCost(undefined, wellAfterExpiry).map((item) => item.action_class)).toEqual(["review"]);
     } finally { store.close(); }
   });
 
-  it("counts an unspent lease as a real zero-cost sample, not a missing one", async () => {
+  it("counts an ended lease with no spend as a real zero-cost sample, not a missing one", async () => {
     const store = await open();
     try {
-      store.startLease("cadence", "codex-main:main", null, 60_000, null, new Date("2026-09-03T12:00:00Z"), "idle-check");
-      const learned = store.learnedCost("idle-check");
+      const now = new Date("2026-09-03T12:00:00Z");
+      const lease = store.startLease("cadence", "codex-main:main", null, 60_000, null, now, "idle-check");
+      store.endLease(lease.id, "cadence", false, new Date(now.getTime() + 1000));
+      const learned = store.learnedCost("idle-check", new Date(now.getTime() + 2000));
       expect(learned).toEqual([expect.objectContaining({ action_class: "idle-check", sample_count: 1, median_percent: 0 })]);
+    } finally { store.close(); }
+  });
+
+  it("keeps an in-progress lease out of the statistics until it ends or expires", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      // Still well inside its 60s ttl: no spend has been observed yet, so
+      // this must not look like a completed, genuinely free job.
+      store.startLease("cadence", "codex-main:main", null, 60_000, null, now, "idle-check");
+      expect(store.learnedCost("idle-check", new Date(now.getTime() + 1000))).toEqual([]);
+      // Past the ttl, the same lease has expired (with no observed spend)
+      // and now counts as one real zero-cost sample.
+      expect(store.learnedCost("idle-check", new Date(now.getTime() + 61_000))).toEqual([expect.objectContaining({ action_class: "idle-check", sample_count: 1, median_percent: 0 })]);
     } finally { store.close(); }
   });
 });
 
 describe("store.learnedCostForMeter", () => {
-  it("aggregates every lease on a meter regardless of action_class", async () => {
+  it("aggregates every ended lease on a meter regardless of action_class, but not an in-progress one", async () => {
     const store = await open();
     try {
       const now = new Date("2026-09-03T12:00:00Z");
       store.startLease("cadence", "claude-main:all", null, 60_000, null, now, "review");
       store.startLease("cadence", "claude-main:all", null, 60_000, null, new Date(now.getTime() + 1000), "design-pass");
-      expect(store.learnedCostForMeter("claude-main:all")?.sample_count).toBe(2);
-      expect(store.learnedCostForMeter("no-such-meter")).toBeUndefined();
+      const stillActive = new Date(now.getTime() + 2000);
+      expect(store.learnedCostForMeter("claude-main:all", stillActive)?.sample_count).toBeUndefined();
+      const pastExpiry = new Date(now.getTime() + 61_000);
+      expect(store.learnedCostForMeter("claude-main:all", pastExpiry)?.sample_count).toBe(2);
+      expect(store.learnedCostForMeter("no-such-meter", pastExpiry)).toBeUndefined();
     } finally { store.close(); }
   });
 });

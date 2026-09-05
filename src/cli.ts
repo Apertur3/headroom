@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { realpathSync } from "node:fs";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join, basename, dirname } from "node:path";
@@ -26,12 +25,12 @@ import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.j
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
 import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { headroomHome, migrateLegacyHome } from "./paths.js";
+import { migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
-import { safeError, stripAmbientProxyEnvironment } from "./security.js";
+import { safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
-import { HeadroomStore } from "./store.js";
+import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount } from "./types.js";
 import { headroomVersion } from "./version.js";
 
@@ -404,7 +403,7 @@ async function plan(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
     const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
@@ -460,7 +459,7 @@ async function gate(argv: string[]): Promise<number> {
     directReadNotice();
     const policy = await readPolicy();
     const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
@@ -530,7 +529,7 @@ async function fill(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
     const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -568,7 +567,7 @@ async function route(argv: string[]): Promise<number> {
   const store = await HeadroomStore.open();
   let result: RouteResult;
   try {
-    result = routeFor(store, meters, accounts, policy, argv.includes("--allow-unknown"), new Date());
+    result = routeFor(store, meters, accounts, policy, argv.includes("--allow-unknown"), new Date(), owner);
     store.audit("cli", "route", actionClass, result.principal ? "yes" : "no");
   } finally { store.close(); }
   if (argv.includes("--json")) { console.log(JSON.stringify(result)); return result.principal ? 0 : 2; }
@@ -814,11 +813,17 @@ async function statusline(argv: string[]): Promise<number> {
     const profile = statuslineProfile(configDir);
     snapshot = snapshotFromStatuslinePayload(payload, profile, now);
     if (snapshot) {
-      const dir = join(headroomHome(), "statusline");
-      await mkdir(dir, { recursive: true, mode: 0o700 });
+      // Resolves and verifies the same safe Headroom home every other
+      // command uses (never the raw, unchecked headroomHome() this used to
+      // call directly), then verifies the statusline subdirectory itself
+      // the same way before ever writing into it, and writes atomically
+      // (temp file + rename, refusing an existing symlink at the
+      // destination outright) rather than truncating the destination path
+      // in place.
+      const home = await safeHeadroomDirectory();
+      const dir = await safeOutputDirectory(join(home, "statusline"));
       const path = join(dir, `${profile}.json`);
-      await writeFile(path, JSON.stringify(snapshot), { mode: 0o600 });
-      await chmod(path, 0o600);
+      await writeFileAtomic(path, JSON.stringify(snapshot), 0o600);
     }
   } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }
   if (chainCommand) {
