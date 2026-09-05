@@ -34,7 +34,7 @@ token from the Keychain or credentials file, the Codex token from its auth file,
 token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
 quota summary; on our account that server currently serves only an availability placeholder, which
 Headroom refuses, so those rows read UNKNOWN. The older remote Google OAuth path is deprecated for
-the free tier.
+the free tier. Each call goes straight to the vendor's usage endpoint and the token is
 dropped afterwards. The endpoint contracts were learned from
 [CodexBar](https://github.com/steipete/codexbar) (MIT) by Peter Steinberger; an optional engine
 links its library for providers Headroom does not cover natively.
