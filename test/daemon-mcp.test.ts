@@ -42,8 +42,8 @@ function testSocketPath(root: string, label: string): string {
 function pipeAuthProof(token: string, nonce: string): string {
   return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");
 }
-function healthSignature(token: string): string {
-  return createHmac("sha256", token).update("headroom-health-v1").digest("hex");
+function pipeServerProof(token: string, serverNonce: string, clientNonce: string): string {
+  return createHmac("sha256", token).update(`headroom-pipe-server-v1:${serverNonce}:${clientNonce}`).digest("hex");
 }
 
 /**
@@ -139,13 +139,14 @@ describe("daemon JSON-RPC", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-client-")); temporary.push(root);
     const path = testSocketPath(root, "headroom");
     const methods: string[] = [];
-    // Windows only: daemonRequest()'s health probe also verifies an HMAC
-    // signature over a session token it reads locally (src/daemon.ts's
-    // healthSignature/pipeAuthProof), and every non-health request must
-    // carry the proof of that connection's nonce. The fake server below
-    // plays both roles so daemonRequest() sees the exact wire protocol a
-    // real daemon speaks; on POSIX none of this applies (isWin32 guards
-    // keep the behavior identical to before).
+    // Windows only: daemonRequest() and every non-health request also carry
+    // mutual auth (src/daemon.ts's pipeAuthProof/pipeServerProof) -- the
+    // client proves it holds the session token, and every server reply
+    // (health included) carries a server_proof bound to the client's own
+    // nonce for the client to verify in turn. The fake server below plays
+    // both roles so daemonRequest() sees the exact wire protocol a real
+    // daemon speaks; on POSIX none of this applies (isWin32 guards keep the
+    // behavior identical to before).
     const token = randomBytes(32).toString("hex");
     let previousHome: string | undefined;
     if (process.platform === "win32") {
@@ -161,16 +162,16 @@ describe("daemon JSON-RPC", () => {
         socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "nonce", params: { nonce } })}\n`);
       }
       socket.on("data", (line: string) => {
-        const request = JSON.parse(line) as { id: number; method: string; params?: { _proof?: string } };
+        const request = JSON.parse(line) as { id: number; method: string; params?: { _proof?: string; _client_nonce?: string } };
         methods.push(request.method);
         if (process.platform === "win32" && request.method !== "health" && request.params?._proof !== pipeAuthProof(token, nonce!)) {
           socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32001, message: "Unauthorized pipe client" } })}\n`);
           return;
         }
-        const result = request.method === "health"
-          ? (process.platform === "win32" ? { ok: true, signature: healthSignature(token) } : { ok: true })
-          : request.method === "status" ? [fixture()] : { ok: true };
-        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
+        const result = request.method === "health" ? { ok: true } : request.method === "status" ? [fixture()] : { ok: true };
+        const reply: Record<string, unknown> = { jsonrpc: "2.0", id: request.id, result };
+        if (process.platform === "win32" && request.params?._client_nonce) reply.server_proof = pipeServerProof(token, nonce!, request.params._client_nonce);
+        socket.write(`${JSON.stringify(reply)}\n`);
       });
     });
     try {

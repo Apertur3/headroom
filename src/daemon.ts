@@ -59,8 +59,6 @@ async function sessionToken(home = headroomHome(), create = false): Promise<stri
     return token;
   }
 }
-function healthSignature(token: string): string { return createHmac("sha256", token).update("headroom-health-v1").digest("hex"); }
-
 /** HMAC of a per-connection server nonce, keyed by the session token. The
  * client proves it holds the token by sending this proof; the raw token
  * itself never has to cross the pipe, so another local user who squats the
@@ -68,6 +66,17 @@ function healthSignature(token: string): string { return createHmac("sha256", to
  * connection from an unsuspecting client) learns nothing usable -- an HMAC
  * output does not reveal its key. */
 function pipeAuthProof(token: string, nonce: string): string { return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex"); }
+
+/** The other half of mutual authentication: proves the *server* holds the
+ * session token, so a process that squats the pipe path before the real
+ * daemon starts cannot forge answers even though the nonces it needs travel
+ * in plain text. Binding both the server's own per-connection nonce and the
+ * client's freshly generated one means a reply captured on one connection
+ * (for example a `health` reply, which needs no client proof to request)
+ * can never be replayed on another connection -- the pair never repeats. */
+function pipeServerProof(token: string, serverNonce: string, clientNonce: string): string {
+  return createHmac("sha256", token).update(`headroom-pipe-server-v1:${serverNonce}:${clientNonce}`).digest("hex");
+}
 
 /** Byte-length-safe constant-time string compare. Buffer.from(x).length is a
  * byte count, not the string's UTF-16 length; comparing string.length before
@@ -240,17 +249,29 @@ export class HeadroomDaemon {
     // `request.jsonrpc` on a non-object `request` (e.g. the JSON literal
     // `null`) would otherwise throw here, escaping as an unhandled rejection
     // since handleSocket's `.then()` below has no `.catch()`.
+    // Read defensively, ahead of the envelope-shape check below: even an
+    // "Invalid Request" reply needs a server_proof, and the client's own
+    // nonce (echoed back into every server_proof so a reply is bound to this
+    // exact connection and cannot be replayed onto a different one -- see
+    // pipeServerProof's own comment) is read from params regardless of
+    // whether the rest of the envelope turns out to be well-formed.
+    const rawParams = request && typeof request === "object" && !Array.isArray(request) && request.params && typeof request.params === "object" ? request.params as Json : {};
+    const clientNonce = process.platform === "win32" && typeof rawParams._client_nonce === "string" && /^[0-9a-f]{32}$/.test(rawParams._client_nonce) ? rawParams._client_nonce : undefined;
+    const finish = (reply: Json): Json => {
+      if (process.platform === "win32" && nonce && clientNonce && this.sessionToken) reply.server_proof = pipeServerProof(this.sessionToken, nonce, clientNonce);
+      return reply;
+    };
     if (!request || typeof request !== "object" || Array.isArray(request) || request.jsonrpc !== "2.0" || typeof request.method !== "string") {
       const id = request && typeof request === "object" && !Array.isArray(request) ? (request as Json).id : null;
-      return rpcError(id, -32600, "Invalid Request");
+      return finish(rpcError(id, -32600, "Invalid Request"));
     }
-    const params = request.params && typeof request.params === "object" ? request.params as Json : {};
+    const params = rawParams;
     const caller = callerFrom(params);
     // A rejected request is still audited before it returns: a caller
     // learning nothing about capacity does not mean the daemon saw nothing.
     const reject = (code: number, message: string, subject: string | null = null): Json => {
       this.store.audit(caller, request.method as string, subject, "rejected");
-      return rpcError(request.id, code, message);
+      return finish(rpcError(request.id, code, message));
     };
     if (process.platform === "win32" && request.method !== "health") {
       const received = typeof params._proof === "string" ? params._proof : "";
@@ -388,7 +409,6 @@ export class HeadroomDaemon {
             login_state: this.keepalive?.loginState ?? "unknown",
             local_reads: Object.fromEntries(this.antigravityLocal),
           },
-          ...(this.sessionToken ? { signature: healthSignature(this.sessionToken) } : {}),
         }; break;
         default: return reject(-32601, "Method not found");
       }
@@ -399,7 +419,7 @@ export class HeadroomDaemon {
         : request.method === "lease_end" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.id === "string" ? params.id : "?"}`
         : typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null;
       this.store.audit(caller, request.method, auditSubject, "ok");
-      return rpcResult(request.id, result);
+      return finish(rpcResult(request.id, result));
     } catch (error) {
       this.store.audit(caller, request.method, null, "error");
       const message = safeError(error);
@@ -411,7 +431,7 @@ export class HeadroomDaemon {
       // does -- an operator reading the log right after seeing the error
       // must never race an unflushed write.
       await appendDaemonLog(`${request.method} failed: ${message}`, this.home);
-      return rpcError(request.id, -32000, message);
+      return finish(rpcError(request.id, -32000, message));
     }
   }
 
@@ -562,13 +582,12 @@ export async function daemonRequest(path: string, method: string, params: Json =
   | { status: "absent" }
   | { status: "unresponsive" }
 > {
+  // Mutual auth (win32 only) is verified entirely inside rpc() itself now: a
+  // reply -- health included -- whose server_proof does not check out comes
+  // back as `undefined`, indistinguishable here from no daemon answering at
+  // all. There is nothing left for daemonRequest to double-check.
   const health = await rpc(path, "health", {}, healthTimeoutMs);
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
-  if (process.platform === "win32") {
-    const token = await sessionToken();
-    const signature = health && typeof health === "object" ? (health as Json).signature : undefined;
-    if (!token || typeof signature !== "string" || signature !== healthSignature(token)) return { status: "unresponsive" };
-  }
   const result = await rpc(path, method, params, 30_000);
   return result === undefined ? { status: "unresponsive" } : { status: "available", result };
 }
@@ -578,16 +597,24 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     const socket = createConnection(path);
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
     let buffer = "";
-    let nonce: string | undefined;
+    let nonce: string | undefined; // the server's per-connection nonce
     const isWin32 = process.platform === "win32";
+    // Generated once per connection and, on the wire, sent with the single
+    // request this connection ever makes (see the loop below): it is the
+    // other half of pipeServerProof, so a captured reply from a different
+    // connection -- a different server_nonce, a different client_nonce --
+    // never verifies here, even for a replayed `health` answer.
+    const clientNonce = isWin32 ? randomBytes(16).toString("hex") : undefined;
+    let token: string | undefined;
     const done = (value: unknown | undefined) => { socket.destroy(); resolve(value); };
     const send = (): void => {
       void (async () => {
         // The session token is read locally from the 0600 token file and used
-        // only to compute an HMAC proof of the server's per-connection nonce;
-        // the token itself is never written to the socket.
-        const proof = isWin32 && nonce && method !== "health" ? pipeAuthProof((await sessionToken()) ?? "", nonce) : undefined;
-        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
+        // only to compute HMAC proofs; the token itself is never written to
+        // the socket.
+        if (isWin32) token = await sessionToken();
+        const proof = isWin32 && nonce && token && method !== "health" ? pipeAuthProof(token, nonce) : undefined;
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), ...(clientNonce ? { _client_nonce: clientNonce } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } })}\n`);
       })().catch(() => done(undefined));
     };
     // On Windows the server always sends a nonce notification first; wait for
@@ -605,8 +632,19 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
             if (parsed.method === "nonce" && parsedParams && typeof parsedParams.nonce === "string") { nonce = parsedParams.nonce; send(); continue; }
           } catch { done(undefined); return; }
         }
-        try { const reply = JSON.parse(line) as Json; done(reply.error ? reply : reply.result); }
-        catch { done(undefined); }
+        try {
+          const reply = JSON.parse(line) as Json;
+          if (isWin32) {
+            // The server's half of mutual auth: verified on every reply, not
+            // only health's, and treated exactly like no answer at all on
+            // failure -- a missing or wrong server_proof must never surface
+            // as a usable result, whatever it claims.
+            const expected = token && nonce && clientNonce ? pipeServerProof(token, nonce, clientNonce) : undefined;
+            const actual = typeof reply.server_proof === "string" ? reply.server_proof : "";
+            if (!expected || !safeTimingEqual(actual, expected)) { done(undefined); return; }
+          }
+          done(reply.error ? reply : reply.result);
+        } catch { done(undefined); }
         return;
       }
     });
