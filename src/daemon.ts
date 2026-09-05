@@ -314,7 +314,9 @@ export class HeadroomDaemon {
           result = planFor(this.store, meter, reserve); break;
         }
         case "gate": {
-          const meter = typeof params.meter === "string" ? params.meter : undefined;
+          const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
+            : Array.isArray(params.meter) ? params.meter.filter((item): item is string => typeof item === "string")
+            : undefined;
           const rawNeeds = Array.isArray(params.needs) ? params.needs : [];
           const needs: GateNeed[] = rawNeeds.flatMap((item) => {
             const candidate = item as { window?: unknown; points?: unknown };
@@ -364,7 +366,16 @@ export class HeadroomDaemon {
       return rpcResult(request.id, result);
     } catch (error) {
       this.store.audit(caller, request.method, null, "error");
-      return rpcError(request.id, -32000, safeError(error));
+      const message = safeError(error);
+      // The client only ever sees the JSON-RPC error's message; without a
+      // matching daemon-log line, a genuine handler exception (as opposed to
+      // a domain-level "no" answer) leaves no local trail to diagnose from.
+      // Awaited (unlike this file's other informational appendDaemonLog
+      // calls) so the log line is guaranteed to land before the error reply
+      // does -- an operator reading the log right after seeing the error
+      // must never race an unflushed write.
+      await appendDaemonLog(`${request.method} failed: ${message}`, this.home);
+      return rpcError(request.id, -32000, message);
     }
   }
 

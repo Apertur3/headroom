@@ -20,6 +20,7 @@ jobs:
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run lint
+      - run: bash scripts/privacy-sweep.sh
       - run: npm test
       - run: npm run build
       - run: npm pack --dry-run

@@ -113,6 +113,22 @@ describe("evaluateGate", () => {
     expect(result.reason).toContain("wk needs 60 more");
   });
 
+  it("skips a need on a not_enforced window instead of failing with 'usage unknown'", () => {
+    const notEnforced = { ...usage, used5h: null, freshness5h: "not_enforced" as const };
+    const result = evaluateGate([{ window: "5h", points: 50 }], notEnforced, 10, false, now);
+    expect(result).toMatchObject({ allowed: true, not_enforced: ["5h"] });
+  });
+
+  it("evaluates the remaining need normally when only one of two windows is not enforced", () => {
+    const notEnforced = { ...usage, used5h: null, freshness5h: "not_enforced" as const };
+    // used5h is null (would refuse as "5h usage unknown" without the skip
+    // above), but the wk need still gets checked against real usage.
+    const passes = evaluateGate([{ window: "5h", points: 50 }, { window: "wk", points: 5 }], notEnforced, 10, false, now);
+    expect(passes).toMatchObject({ allowed: true, not_enforced: ["5h"] });
+    const refuses = evaluateGate([{ window: "5h", points: 50 }, { window: "wk", points: 60 }], notEnforced, 10, false, now);
+    expect(refuses).toMatchObject({ allowed: false, reason: expect.stringContaining("wk needs 60 more") });
+  });
+
   it("with --plan, a 5h need must also fit under the plan line, a stricter bar than the reserve alone", () => {
     // Plan line: 50% weekly remaining - 10 reserve = 40 budget over
     // ceil(168h/5h)=34 windows -> ~1.18 points/window. A 5h need of 5 fits

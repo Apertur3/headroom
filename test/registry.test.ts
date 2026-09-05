@@ -24,7 +24,7 @@ describe("account discovery", () => {
     await mkdir(join(root, ".gemini", "antigravity-cli"));
     const accounts = await discoverAccounts(root, { PATH: "" });
     expect(accounts).toContainEqual(expect.objectContaining({ name: "antigravity", vendor: "antigravity", adapter: "native-ts" }));
-    expect(accountsToml([{ name: "gpu-box", kind: "local", base_url: "http://10.0.0.20:8000", adapter: "native" }])).toContain('adapter = "native"');
+    expect(accountsToml([{ name: "gpu-box", kind: "local", base_url: "http://192.0.2.20:8000", adapter: "native" }])).toContain('adapter = "native"');
     expect(accountsToml([{ name: "antigravity", vendor: "antigravity", location: "agy", adapter: "native-ts", agy_path: "~/.local/bin/agy" }])).toContain('agy_path = "~/.local/bin/agy"');
   });
 });

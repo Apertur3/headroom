@@ -23,23 +23,49 @@ export function pickDecidingObservation(rows: Observation[]): Observation | unde
 
 /** The enforced percent windows for one meter, ordered short to long. Local
  * pools (window kind `state`) and availability counts (`count`) are never
- * included: neither carries a percent used against a reset. */
+ * included: neither carries a percent used against a reset. A vendor-
+ * confirmed not_enforced window (real, just capless) is excluded here too --
+ * it has no percent to report -- unlike knownPercentWindows below. */
 function enforcedPercentWindows(store: HeadroomStore, meterId: string): StoredObservation[] {
   return store.latestPerWindow(meterId)
     .filter((row) => row.quantity?.unit === "percent" && row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes)
     .sort((a, b) => (a.window!.minutes as number) - (b.window!.minutes as number));
 }
 
+/** Like enforcedPercentWindows, but keeps a vendor-confirmed not_enforced
+ * window instead of dropping it: plan/gate need to tell "this window is
+ * genuinely capless" (Codex's 5h main window, for one) apart from "this
+ * window has never been read yet", which enforcedPercentWindows alone
+ * cannot distinguish once the row is filtered out. */
+function knownPercentWindows(store: HeadroomStore, meterId: string): StoredObservation[] {
+  return store.latestPerWindow(meterId)
+    .filter((row) => row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes && (row.quantity?.unit === "percent" || row.freshness === "not_enforced"))
+    .sort((a, b) => (a.window!.minutes as number) - (b.window!.minutes as number));
+}
+
+/** When a meter has nothing usable to report against, its own most recent
+ * observation (whatever its window or freshness) usually explains why -- a
+ * pending Keychain grant, a vendor failure, and so on. Falls back to a
+ * generic hint only when the meter genuinely has no reading, or its latest
+ * one carries no reason of its own. */
+function meterUnknownReason(store: HeadroomStore, meterId: string, fallback: string): string {
+  const latest = store.latestPerWindow(meterId)[0];
+  return latest?.reason ? latest.reason : fallback;
+}
+
 export interface MeterWindows { short?: StoredObservation; long?: StoredObservation; }
 
 /** The shortest window (typically the 5h one) and the longest (typically the
- * weekly one) currently known for a meter. Either may be absent; with only
- * one window known, `long` stays absent rather than aliasing the same row
+ * weekly one) currently known for a meter, including a not_enforced window
+ * (see knownPercentWindows) so a meter whose 5h is confirmed capless still
+ * resolves its genuine weekly window as `long` rather than losing it to the
+ * "only one window known" ambiguity. Either may be absent; with only one
+ * window known, `long` stays absent rather than aliasing the same row
  * `short` already names -- callers that only care about a genuine second
  * (weekly) window must be able to tell "no weekly window yet" apart from
  * "the only window IS the weekly one". */
 export function meterWindows(store: HeadroomStore, meterId: string): MeterWindows {
-  const rows = enforcedPercentWindows(store, meterId);
+  const rows = knownPercentWindows(store, meterId);
   return { short: rows[0], long: rows.length > 1 ? rows[rows.length - 1] : undefined };
 }
 
@@ -50,6 +76,11 @@ export interface RateLine {
   burn_percent_per_hour: number | null;
   empty_in_seconds: number | null;
   resets_at: string | null;
+  /** Set only on the synthetic line used when a specifically requested meter
+   * has no enforced window at all: the meter's own latest reason (e.g. a
+   * pending Keychain grant), so a caller sees why instead of a bare "no
+   * readings". Absent on every real per-window line. */
+  reason?: string | null;
 }
 
 /** One rate line per window: with a meter given, every enforced window of
@@ -62,6 +93,11 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
   for (const id of meterIds) {
     const rows = enforcedPercentWindows(store, id);
     const targets = meter ? rows : rows.slice(0, 1);
+    if (meter && !targets.length) {
+      const reason = meterUnknownReason(store, id, "");
+      if (reason) lines.push({ meter: id, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason });
+      continue;
+    }
     for (const row of targets) {
       const burn = store.burnRateFor([row], now, lookbackMinutes).get(`${row.meter_id}:${row.window!.minutes}`) ?? { burn_percent_per_hour: null, empty_in_seconds: null };
       lines.push({ meter: id, window_minutes: row.window!.minutes, used_percent: row.quantity!.used, burn_percent_per_hour: burn.burn_percent_per_hour, empty_in_seconds: burn.empty_in_seconds, resets_at: row.resets_at });
@@ -74,7 +110,7 @@ export type PlanOutcome = ({ meter: string } & PlanResult) | { meter: string; er
 
 export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date()): PlanOutcome {
   const { short, long } = meterWindows(store, meter);
-  if (!long || !long.resets_at) return { meter, error: `no weekly window for ${meter}` };
+  if (!long || !long.resets_at) return { meter, error: meterUnknownReason(store, meter, `no weekly window for ${meter}`) };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
   return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, reservePercent, now) };
 }
@@ -103,12 +139,14 @@ export interface GateOutcome extends GateResult {
 /** Fail closed over every meter checked: with no --meter, every account meter
  * that has both a short and a long window must pass, and the first one that
  * does not stops the check (mirrors policy.ts's canConsume: one bad meter
- * blocks the whole gate). */
-export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
-  const candidates = meter ? [meter] : [...new Set(store.latestPerWindow().map((row) => row.meter_id))];
+ * blocks the whole gate). `meter` also accepts an explicit list (a --class
+ * resolved through routing.toml to several meters), checked the same way. */
+export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
+  const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
   let lastShort: StoredObservation | undefined;
+  let lastResult: GateResult | undefined;
   for (const id of candidates) {
     const { short, long } = meterWindows(store, id);
     if (!short && !long) continue; // a local pool or availability-only meter: nothing to gate
@@ -119,9 +157,12 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
       usedWk: long?.quantity?.used ?? null,
       weeklyResetsAt: long?.resets_at ?? null,
       hoursPer5hWindow: short?.window?.minutes ? short.window.minutes / 60 : 5,
+      freshness5h: short?.freshness ?? null,
+      freshnessWk: long?.freshness ?? null,
     };
     const result = evaluateGate(needs, usage, reservePercent, usePlan, now);
     if (!result.allowed) return { ...result, meters_checked: checked };
+    lastResult = result;
 
     const fiveHourNeed = needs.find((need) => need.window === "5h");
     if (pacing === "even" && fiveHourNeed && short?.resets_at && short.window?.minutes && options.owner) {
@@ -137,13 +178,18 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
       if (!burst.allowed) return { allowed: false, reason: burst.reason, meters_checked: checked };
     }
   }
-  if (!checked.length) return { allowed: false, reason: meter ? `no windowed reading for ${meter}` : "no meters configured", meters_checked: checked };
+  if (!checked.length) {
+    const single = typeof meter === "string" ? meter : Array.isArray(meter) && meter.length === 1 ? meter[0] : undefined;
+    const label = typeof meter === "string" ? meter : Array.isArray(meter) ? meter.join(", ") : undefined;
+    return { allowed: false, reason: single ? meterUnknownReason(store, single, `no windowed reading for ${single}`) : label ? `no windowed reading for ${label}` : "no meters configured", meters_checked: checked };
+  }
   const lanesRemaining = options.actionClass && lastShort?.quantity?.unit === "percent" ? (() => {
     const learned = store.learnedCost(options.actionClass)[0];
     const remaining = lastShort!.quantity!.remaining ?? (100 - lastShort!.quantity!.used);
     return learned ? maxMoreBeforeReset(remaining, learned.median_percent) : null;
   })() : undefined;
-  return { allowed: true, reason: "fits", meters_checked: checked, ...(lanesRemaining !== undefined ? { lanes_remaining_for_class: lanesRemaining } : {}) };
+  const notEnforcedNote = lastResult?.not_enforced?.length ? ` (${lastResult.not_enforced.join(", ")} not enforced on ${checked[checked.length - 1]})` : "";
+  return { allowed: true, reason: `fits${notEnforcedNote}`, meters_checked: checked, ...(lanesRemaining !== undefined ? { lanes_remaining_for_class: lanesRemaining } : {}) };
 }
 
 export interface FillOutcome {
@@ -163,6 +209,11 @@ export interface FillOutcome {
    * smooth by then). "pro_rata": even pacing restricted the offer to the
    * owner's pro-rata line, this far from reset. */
   allowance_basis: "full" | "pro_rata";
+  /** The tightest enforced window the lane math actually used -- "5h" on a
+   * normal meter; "wk" (or another label) when the 5h window is not
+   * enforced and the tightest enforced window found was the weekly one
+   * instead (Codex's main pool, for one). */
+  window_used: string;
 }
 
 export interface FillOptions {
@@ -172,6 +223,17 @@ export interface FillOptions {
 }
 
 const EVEN_PACING_FULL_BURST_MINUTES = 45;
+
+/** Mirrors cli.ts's/policy.ts's own window labeling: the two durations every
+ * current vendor actually uses get their short names, anything else falls
+ * back to a generic one. */
+function windowShortLabel(minutes: number | null | undefined): string {
+  if (minutes === 300) return "5h";
+  if (minutes === 10_080) return "wk";
+  if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
+  return minutes ? `${minutes}m` : "?";
+}
 
 /**
  * How many more lanes of a fixed cost fit in the current 5h window before
@@ -188,24 +250,39 @@ const EVEN_PACING_FULL_BURST_MINUTES = 45;
  * the owner's pro-rata allowance (planned share times elapsed fraction,
  * minus what that owner has already spent), the same line `gate` enforces.
  */
-export async function fillFor(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now = new Date(), options: FillOptions = {}): Promise<FillOutcome | { meter: string; error: string }> {
-  const { short, long } = meterWindows(store, meter);
-  if (!short) return { meter, error: `no 5h window for ${meter}` };
-  const used5h = short.quantity!.used;
-  const usedWeekly = long?.quantity?.used ?? 0;
-  const secondsLeft = short.resets_at ? Math.max(0, (Date.parse(short.resets_at) - now.getTime()) / 1000) : null;
+export async function fillFor(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now = new Date(), options: FillOptions = {}): Promise<FillOutcome | { meter: string; error: string; no_enforced_window?: true }> {
+  // Deliberately the strict enforced-only list (not meterWindows' not_enforced-
+  // aware one): a not_enforced window has no percent to spend against, so it
+  // can never be "the tightest enforced window" fill counts lanes against.
+  const enforced = enforcedPercentWindows(store, meter);
+  if (!enforced.length) return { meter, error: meterUnknownReason(store, meter, `no enforced window for ${meter}`), no_enforced_window: true };
+  const tight = enforced[0];
+  const isFiveHour = tight.window?.minutes === 300;
+  // A genuine second (weekly) window, distinct from the tight one -- only
+  // present when both are actually enforced.
+  const wider = enforced.length > 1 ? enforced[enforced.length - 1] : undefined;
+  const used5h = tight.quantity!.used;
+  // With no distinct weekly window, the tight window IS the weekly boundary
+  // too when it isn't the 5h one (Codex's main pool with 5h not enforced):
+  // its own usage stands in directly rather than defaulting to an unspent 0
+  // that would let the (nonexistent) separate weekly cap never bind. A
+  // genuinely 5h-only meter (weekly just not read yet) keeps the old
+  // "unknown, don't block on it" default of 0.
+  const usedWeekly = wider ? wider.quantity!.used : (isFiveHour ? 0 : used5h);
+  const windowUsed = windowShortLabel(tight.window?.minutes);
+  const secondsLeft = tight.resets_at ? Math.max(0, (Date.parse(tight.resets_at) - now.getTime()) / 1000) : null;
   const learned = laneCostOverride === undefined ? store.learnedCostForMeter(meter) : undefined;
   const laneCost = laneCostOverride ?? learned?.median_percent;
   const source: FillOutcome["lane_cost_source"] = laneCostOverride !== undefined ? "given" : learned ? "learned" : "unknown";
 
   const pacing = options.pacing ?? "even";
   const inFinalStretch = secondsLeft !== null && secondsLeft <= EVEN_PACING_FULL_BURST_MINUTES * 60;
-  const restrictedByPacing = pacing === "even" && !inFinalStretch && short.window?.minutes && short.resets_at && options.owner;
+  const restrictedByPacing = pacing === "even" && !inFinalStretch && tight.window?.minutes && tight.resets_at && options.owner;
   let used5hForLanes = used5h;
   let allowanceBasis: FillOutcome["allowance_basis"] = "full";
   if (restrictedByPacing) {
-    const windowStart = new Date(Date.parse(short.resets_at!) - (short.window!.minutes as number) * 60_000);
-    const windowHours = (short.window!.minutes as number) / 60;
+    const windowStart = new Date(Date.parse(tight.resets_at!) - (tight.window!.minutes as number) * 60_000);
+    const windowHours = (tight.window!.minutes as number) / 60;
     const ownerLeases = store.leases(meter, true, now).filter((lease) => lease.owner === options.owner);
     const plannedShare = options.planSharePercent ?? ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
     const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
@@ -214,7 +291,12 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
     used5hForLanes = Math.max(used5h, 100 - proRataRemaining);
     allowanceBasis = "pro_rata";
   }
-  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, weeklyReservePercent);
+  // computeFill's default weekly-cost-per-lane is the 5h-to-weekly
+  // calibration ratio, which only makes sense between two distinct windows.
+  // With no genuine second window and the tight one standing in for both,
+  // the lane cost applies 1:1 instead.
+  const weeklyCostPerLaneOverride = !wider && !isFiveHour ? laneCost : undefined;
+  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, weeklyReservePercent, weeklyCostPerLaneOverride);
   const lanesError = laneCost === undefined ? `no learned cost for ${meter}; pass --lane-cost` : null;
 
   const routing = await readRouting();
@@ -226,5 +308,5 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   const remainingMinutes = secondsLeft === null ? 0 : secondsLeft / 60;
   const classes = fillClassFits(Math.max(0, remainingPercent), remainingMinutes, costs);
 
-  return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis };
+  return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis, window_used: windowUsed };
 }

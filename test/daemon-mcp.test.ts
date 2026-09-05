@@ -2,9 +2,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
+import { main } from "../src/cli.js";
 import { daemonRequest, rpc, HeadroomDaemon } from "../src/daemon.js";
+import { tailDaemonLog } from "../src/logs.js";
 import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
@@ -342,5 +344,70 @@ describe("not enforced windows", () => {
     const policy = defaultPolicy;
     expect(paceState(absent, policy, new Date("2026-09-03T12:00:00Z"))).toBe("NOT_ENFORCED");
     expect(canConsume([absent.meter_id], new Map([[absent.meter_id, absent]]), policy, false, new Date("2026-09-03T12:00:00Z"))).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
+  });
+});
+
+describe("a genuine daemon handler exception is logged and surfaced with its real message", () => {
+  it("logs '<method> failed: <message>' to the daemon log and returns a JSON-RPC error carrying that same message", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-log-error-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
+    const internal = daemon as unknown as { handleLine(line: string): Promise<{ error?: { code: number; message: string } }> };
+    try {
+      // store.endLease() throws "lease not found" for an id that was never
+      // started -- a genuine handler exception, not a domain-level "no".
+      const reply = await internal.handleLine('{"jsonrpc":"2.0","id":1,"method":"lease_end","params":{"id":"nonexistent","owner":"cadence"}}');
+      expect(reply.error).toMatchObject({ code: -32000, message: "lease not found" });
+    } finally { await daemon.stop(); }
+    const log = await tailDaemonLog(50, root);
+    expect(log).toContain("lease_end failed: lease not found");
+  });
+});
+
+describe("plan/gate/fill round-trip through a real daemon socket for a meter whose 5h window is not enforced", () => {
+  // The exact live defect reported against codex-main:main: its 5h window is
+  // not_enforced (Codex reports no 5-hour limit), only the weekly window is
+  // fresh. `plan` used to come back through the daemon as the generic
+  // "Daemon request failed" -- unwrapRpc mistook plan's own domain-level
+  // `{meter, error}` result for a JSON-RPC error envelope because both carry
+  // an "error" key, discarding the real "no weekly window" reason -- itself a
+  // symptom of meterWindows() losing the weekly window once the not_enforced
+  // 5h row displaced it as "the only window known".
+  it("plan finds the weekly window and returns real numbers, not a generic 'Daemon request failed'", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-plan-liveroundtrip-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    const daemon = await HeadroomDaemon.create({ home: root, path });
+    try { await daemon.start(); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      const store = await HeadroomStore.open(root);
+      store.insert({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: null, resets_at: null, observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture",
+        truth: "official", freshness: "not_enforced", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+      store.insert({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used: 83, limit: 100, remaining: 17, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z",
+        observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture",
+        truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+      store.close();
+      const logs: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
+      try {
+        const code = await main(["plan", "--meter", "codex-main:main", "--until", "reset", "--reserve", "10", "--json"]);
+        expect(code).toBe(0);
+      } finally { spy.mockRestore(); }
+      const result = JSON.parse(logs[0]);
+      expect(result).toMatchObject({ meter: "codex-main:main", weekly_remaining_percent: 17 });
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await daemon.stop();
+    }
   });
 });
