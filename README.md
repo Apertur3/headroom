@@ -30,10 +30,11 @@ UNKNOWN never counts as capacity.
 </picture>
 
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
-token from the Keychain or credentials file, the Codex token from its auth file, and Antigravity
-from the daemon-kept `agy` session. The daemon keeps an `agy` pseudo-terminal alive so local
-Antigravity quota summaries stay warm. The older remote Google OAuth path is deprecated and only
-remains as a compatibility fallback for accounts whose Gemini Code Assist tier still serves it. Each call goes straight to the vendor's usage endpoint and the token is
+token from the Keychain or credentials file, the Codex token from its auth file, and, experimentally, the Antigravity
+token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
+quota summary; on our account that server currently serves only an availability placeholder, which
+Headroom refuses, so those rows read UNKNOWN. The older remote Google OAuth path is deprecated for
+the free tier.
 dropped afterwards. The endpoint contracts were learned from
 [CodexBar](https://github.com/steipete/codexbar) (MIT) by Peter Steinberger; an optional engine
 links its library for providers Headroom does not cover natively.
