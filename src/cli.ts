@@ -363,7 +363,7 @@ async function rate(argv: string[]): Promise<number> {
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
   if (!lines.length) { console.log(meter ? `no readings for ${meter}` : "no readings"); return 0; }
   for (const line of lines) {
-    if (line.reason !== undefined) { console.log(`${line.meter}  ${line.reason}`); continue; }
+    if (line.reason !== undefined) { console.log(`${line.meter}  UNKNOWN (${line.reason})`); continue; }
     const windowLabel = line.window_minutes === 300 ? "5h" : line.window_minutes === 10_080 ? "wk" : line.window_minutes ? `${line.window_minutes}m` : "-";
     const usedText = line.used_percent === null ? "?" : `${Math.round(line.used_percent)}%`;
     if (line.burn_percent_per_hour === null) { console.log(`${line.meter}  ${windowLabel} ${usedText}  burn unknown (need 2+ fresh samples in the last ${minutes}m)`); continue; }
@@ -392,7 +392,10 @@ async function plan(argv: string[]): Promise<number> {
     try { result = planFor(store, meter, reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
-  if ("error" in result) { console.error(result.error); return 1; }
+  // planFor's only error path is an unreadable/never-seen meter (no weekly
+  // window at all) -- that is a data state to report, not a CLI failure, so
+  // it renders like status's own UNKNOWN line and exits 0 rather than 1.
+  if ("error" in result) { console.log(`${result.meter}  UNKNOWN (${result.error})`); return 0; }
   console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h`);
   return 0;
 }
@@ -434,8 +437,13 @@ async function gate(argv: string[]): Promise<number> {
     try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
-  const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
+  // A refusal because the meter's own usage could not be read at all (an
+  // unreadable/never-seen window) is a different state than a refusal
+  // because a known usage does not fit the request -- render it the same way
+  // status/rate/plan/fill do, rather than as a plain "NO".
+  if (result.unknown) { console.log(`${targetLabel}  UNKNOWN (${result.reason})`); return result.allowed ? 0 : 2; }
+  const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
   console.log(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}`);
   return result.allowed ? 0 : 2;
 }
@@ -445,6 +453,12 @@ async function wait(argv: string[]): Promise<number> {
   if (!meter || !argv.includes("--until-reset")) throw new Error("Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]");
   const maxValue = option(argv, "--max");
   const maxMs = maxValue === undefined ? null : ttl(maxValue, "--max");
+  // Set whenever a poll finds no windowed reading for this meter at all: the
+  // meter's own latest reason (e.g. a pending Keychain grant), so the final
+  // "unknown" outcome below can name why instead of a bare "resets_at
+  // unknown". Kept from the last poll, since waitForReset stops polling as
+  // soon as it decides there is nothing to wait on.
+  let unknownReason: string | undefined;
   const getResetsAt = async (): Promise<string | null> => {
     const request = await requestDaemon("status");
     let observations: Observation[];
@@ -455,13 +469,17 @@ async function wait(argv: string[]): Promise<number> {
     }
     const rows = observations.filter((item) => item.meter_id === meter && item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
     const shortest = [...rows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER))[0];
+    if (!shortest) unknownReason = observations.find((item) => item.meter_id === meter)?.reason ?? undefined;
     return shortest?.resets_at ?? null;
   };
   const outcome = await waitForReset(getResetsAt, maxMs);
   if (outcome === "reset") { console.log(`${meter} reset`); return 0; }
   if (outcome === "timeout") { console.error(`timed out waiting for ${meter} to reset${maxValue ? ` after ${maxValue}` : ""}`); return 3; }
-  console.error(`${meter}: resets_at unknown`);
-  return 1;
+  // Not a CLI failure: the meter's reading itself is unknown, the same data
+  // state status/rate/plan/gate/fill all report the same way, and exiting 0
+  // like they do lets a caller distinguish "don't know yet" from a real error.
+  console.log(`${meter}  UNKNOWN (${unknownReason ?? "resets_at unknown"})`);
+  return 0;
 }
 
 async function fill(argv: string[]): Promise<number> {
@@ -489,7 +507,10 @@ async function fill(argv: string[]): Promise<number> {
     try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
-  if ("error" in result) { console.error(result.error); return result.no_enforced_window ? 2 : 1; }
+  // fillFor's only error path is an unreadable/never-seen meter (no enforced
+  // window at all) -- a data state to report, not a CLI failure, so it
+  // renders like status's own UNKNOWN line and exits 0 rather than 1 or 2.
+  if ("error" in result) { console.log(`${result.meter}  UNKNOWN (${result.error})`); return 0; }
   const timeLeft = result.resets_in_seconds === null ? "?" : formatResetsIn(result.resets_in_seconds);
   if (result.lanes) console.log(`${result.meter}  ${result.window_used} window  ${result.lanes.lanes} lanes, ${result.lanes.points_used.toFixed(1)}% used, time left ${timeLeft} (${result.lanes.reason})`);
   else console.log(`${result.meter}  ${result.window_used} window  lanes unknown (${result.lanes_error}); time left ${timeLeft}`);

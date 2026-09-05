@@ -2,23 +2,30 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { migrateLegacyHome } from "../src/paths.js";
 
 const execFileAsync = promisify(execFile);
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 describe("brand identity", () => {
   it("has no retired brand text outside the changelog", async () => {
-    const retired = `(${["ta", "lly"].join("")}|${["keep", "ta", "lly"].join("")})`;
-    try {
-      const { stdout } = await execFileAsync("rg", ["-l", "-i", retired, "--glob", "!CHANGELOG.md", "."]);
-      expect(stdout.trim()).toBe("");
-    } catch (error: unknown) {
-      const result = error as { code?: number; stdout?: string };
-      if (result.code === 1) return;
-      throw error;
+    // No external binary (ripgrep is not guaranteed on CI runners, and this
+    // must also pass on Windows without shell quoting or /dev/null): walk the
+    // files git actually tracks and grep them in Node instead.
+    const retired = new RegExp(`(${["ta", "lly"].join("")}|${["keep", "ta", "lly"].join("")})`, "i");
+    const { stdout } = await execFileAsync("git", ["ls-files"], { cwd: repoRoot, maxBuffer: 16 * 1024 * 1024 });
+    const files = stdout.split("\n").map((line) => line.trim()).filter((line) => line && line !== "CHANGELOG.md");
+    const offenders: string[] = [];
+    for (const file of files) {
+      let content: string;
+      try { content = await readFile(join(repoRoot, file), "utf8"); }
+      catch { continue; } // gone, unreadable, or not a regular file: nothing to scan
+      if (retired.test(content)) offenders.push(file);
     }
+    expect(offenders).toEqual([]);
   });
 
   it("moves the prior state directory only when the replacement is absent", async () => {

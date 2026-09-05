@@ -61,6 +61,12 @@ export interface GateResult {
   /** Present only when at least one need was skipped because its window is
    * not enforced on this meter -- informational, never a refusal on its own. */
   not_enforced?: Array<"5h" | "wk">;
+  /** True when the refusal is because a needed window's usage could not be
+   * read at all (a failed, never-seen, or unreadable meter/window) rather
+   * than because a known usage simply does not fit the request. Callers
+   * render this the same way as status/rate/plan/fill's own UNKNOWN state,
+   * rather than as a plain refusal. */
+  unknown?: true;
 }
 
 /** Fail closed over every --need: the first one that does not fit stops the
@@ -74,7 +80,7 @@ export function evaluateGate(needs: GateNeed[], usage: GateUsage, reservePercent
     const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
     if (freshness === "not_enforced") { notEnforced.push(need.window); continue; }
     const used = need.window === "5h" ? usage.used5h : usage.usedWk;
-    if (used === null) return { allowed: false, reason: `${need.window} usage unknown` };
+    if (used === null) return { allowed: false, reason: `${need.window} usage unknown`, unknown: true };
     const prospective = used + need.points;
     const ceiling = 100 - reservePercent;
     if (prospective > ceiling) {
