@@ -58,16 +58,25 @@ the request path.
 
 ## Install
 
-Beta on npm as `headroomd` (Node 22.13 or newer). `npm install -g headroomd` gives you the
-`headroom` command; `npx headroomd` runs it without installing.
+Node 22.13 or newer.
 
 ```sh
-npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity; also seeds policy/routing.toml
-npx headroomd doctor             # one-line installation and daemon diagnostics, with next steps on a fresh install
-npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
-npx headroomd                    # one line per meter
-npx headroomd install-service    # launchd, systemd user unit, or Windows Task Scheduler
-npx headroomd --help             # full command list; `headroom <command> --help` for one command
+npm install -g headroomd
+headroom accounts discover   # finds your Claude, Codex and Antigravity logins
+headroom                     # one line per meter
+```
+
+Already running Claude Code or another agent? Copy [skills/headroom/SKILL.md](skills/headroom/SKILL.md)
+into its skills directory and say "set up headroom": the agent runs discovery, the doctor, the one
+macOS Keychain prompt, the background service and the MCP registration for you.
+
+By hand, the same steps are:
+
+```sh
+headroom doctor              # what is missing, with the next command for each item
+headroom keychain grant      # macOS: one Claude Keychain prompt; choose Always Allow
+headroom install-service     # launchd, systemd user unit, or Windows Task Scheduler
+headroom --help              # full command list; `headroom <command> --help` for one command
 ```
 
 `accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom
