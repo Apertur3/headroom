@@ -176,7 +176,7 @@ describe("agy keepalive", () => {
     } finally { supervisor.stop(); }
   }, 15_000); // default 5s per-test timeout is too tight for two sequential 5s waitFor()s on a loaded CI runner
 
-  it("Astra F12: reads only a bounded tail of a growing log, never the whole file", async () => {
+  it("reads only a bounded tail of a growing log, never the whole file", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-log-tail-")); temporary.push(root);
     const path = join(root, "cli-big.log");
     // A marker placed only in the first megabyte (well past the 64 KiB tail
@@ -190,7 +190,7 @@ describe("agy keepalive", () => {
     await expect(agyLoginStateFromLog(root)).resolves.toBe("not_logged_in");
   });
 
-  it("Astra F12: never follows a symlink in place of a real log file", async () => {
+  it("never follows a symlink in place of a real log file", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-log-symlink-")); temporary.push(root);
     const real = join(root, "elsewhere.log");
     await writeFile(real, "applyAuthResult authMethod=consumer\n");

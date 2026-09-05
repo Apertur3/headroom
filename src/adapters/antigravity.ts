@@ -14,7 +14,7 @@ const LOAD_CODE_ASSIST = `${BASE_URL}/v1internal:loadCodeAssist`;
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 /** Same metadata CodexBar's Antigravity fetcher sends on every loadCodeAssist call. */
 const CODE_ASSIST_METADATA = { ideType: "ANTIGRAVITY", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
-/** Astra F11: Headroom reads usage; it must never provision a remote Code
+/** Headroom reads usage; it must never provision a remote Code
  * Assist project or select a billing tier on the caller's behalf. When
  * neither the stored credential nor loadCodeAssist names a project, this is
  * the one reason surfaced -- never an onboardUser call. */
@@ -192,7 +192,7 @@ function extractOAuthClient(text: string): GeminiOAuthClient | undefined {
   return clientId && clientSecret ? { clientId, clientSecret } : undefined;
 }
 
-/** Astra F12: every candidate/chunk file this discovery reads is charged
+/** every candidate/chunk file this discovery reads is charged
  * against one shared budget for the whole attempt, so a symlink farm, a
  * PATH-derived ancestry with many siblings, or a huge/adversarial bundle can
  * cost at most this much work before discovery gives up -- never the whole
@@ -352,7 +352,7 @@ async function loadCodeAssist(fetcher: typeof fetch, token: string): Promise<unk
 /**
  * The project id `retrieveUserQuota` needs: a project id already on the
  * stored credential wins outright, otherwise `loadCodeAssist`'s own
- * `cloudaicompanionProject`. Astra F11: Headroom never provisions a Code
+ * `cloudaicompanionProject`. Headroom never provisions a Code
  * Assist project or picks a billing tier on the caller's behalf -- there is
  * no `onboardUser` call anywhere in this adapter. When neither source names
  * a project, the caller has not finished Code Assist setup in the vendor's
@@ -410,7 +410,7 @@ function shape(value: unknown, path = "$"): Array<{ path: string; kind: string }
  * and any ineligible-tier reasonCode `loadCodeAssist` reported -- so a
  * maintainer can see why a tier was denied without guessing at Google's
  * response shape. Never retains response values beyond their kind, and never
- * calls onboardUser: see resolveProjectId (Astra F11).
+ * calls onboardUser: see resolveProjectId.
  */
 export async function antigravityResponseShape(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Record<string, unknown>> {
   const now = dependencies.now?.() ?? new Date();

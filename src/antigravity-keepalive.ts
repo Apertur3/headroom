@@ -8,7 +8,7 @@ type Spawn = (command: string, args: string[], options: { stdio: "ignore"; env: 
 
 export type AgyLoginState = "unknown" | "logged_in" | "not_logged_in";
 
-/** Astra F12: bytes read from the tail of agy's newest log per sample --
+/** bytes read from the tail of agy's newest log per sample --
  * enough to catch the auth-state markers even past rotation noise, small
  * enough that a growing (or adversarial) log can never make this unbounded. */
 const LOG_TAIL_BYTES = 64 * 1024;
@@ -95,7 +95,7 @@ export class AgyKeepaliveSupervisor {
   private loginWatchStartedAt: number | undefined;
   private notLoggedInSamples = 0;
   private _loginState: AgyLoginState = "unknown";
-  /** Astra F12: a sample already in flight skips the next tick instead of
+  /** a sample already in flight skips the next tick instead of
    * starting a second concurrent read of the same log file. */
   private sampling = false;
 
