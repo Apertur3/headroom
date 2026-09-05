@@ -18,14 +18,22 @@ cookies, which unlock paid subscriptions.
    ones named `token`/`refresh`/`email`. Observation reasons and metadata are redacted again before
    they are persisted, so a leaked fragment cannot survive a round trip through the database either.
 3. **Local-only surface.** The daemon listens on a mode-0600 Unix socket on macOS and Linux. On
-   Windows Node cannot supply an explicit pipe DACL through its public API, so a random per-daemon
-   session token is stored mode 0600 under `HEADROOM_HOME`. The token itself never crosses the
-   pipe: on every connection the daemon sends a fresh random nonce first, and the client answers
-   with an HMAC-SHA256 of that nonce keyed by the token it read locally from the 0600 file. A
-   client that cannot produce the correct proof is refused before any other request is processed;
-   `health` alone requires no proof, and its own response carries an HMAC signature so a caller can
-   tell a real daemon from an impostor squatting the same pipe name before ever trusting anything
-   else it says. Headroom has no TCP listener.
+   Windows Node cannot supply an explicit pipe DACL through its public API, and the pipe namespace
+   is machine-global, so any local process (including one running as a different user, with no
+   access to the real session token) can create the same pipe name before the real daemon starts
+   and try to answer in its place. Windows authentication is therefore mutual, not one-sided: a
+   random per-daemon session token is stored mode 0600 under `HEADROOM_HOME`, and it never crosses
+   the pipe in either direction. On every connection the daemon sends a fresh random server nonce
+   first; the client answers with its own freshly generated client nonce plus, for every method but
+   `health`, an HMAC-SHA256 proof of the server nonce keyed by the token it read locally. A client
+   that cannot produce the correct proof is refused before any other request is processed. In the
+   other direction, every reply the daemon sends -- including `health`'s, which needs no client
+   proof to request -- carries its own HMAC-SHA256 proof keyed by the same token, over both the
+   server's nonce and the client's nonce together; the client verifies it before trusting anything
+   in the reply, and treats a missing or wrong proof exactly like no daemon answering at all. Binding
+   both nonces means a captured reply from one connection can never be replayed on another: `health`
+   no longer returns a static, replayable signature, so an impostor that once obtained a real
+   `health` reply learns nothing it can reuse. Headroom has no TCP listener.
 4. **Polite polling.** Vendor polls are rate-limited and jittered so Headroom never triggers a
    lockout or a bot-defense challenge; a 401/403/429 backs off exponentially and is surfaced, never
    retried in a tight loop. Backoff detection recognizes both the parenthesized status format
