@@ -1,9 +1,9 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { childEnvironment, policyProxyConfigured } from "../bin/headroom.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { childEnvironment, forwardSignal, policyProxyConfigured } from "../bin/headroom.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -46,4 +46,64 @@ describe("launcher proxy stripping", () => {
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual([]);
   });
+});
+
+describe("launcher signal forwarding", () => {
+  it("forwards the signal to the child on POSIX, and shells out to `taskkill /T` on Windows instead of a bare kill()", () => {
+    const posixChild = { pid: 4242, kill: vi.fn() };
+    forwardSignal(posixChild, "SIGTERM", "darwin");
+    expect(posixChild.kill).toHaveBeenCalledWith("SIGTERM");
+
+    const windowsChild = { pid: 4343, kill: vi.fn() };
+    const killTree = vi.fn();
+    forwardSignal(windowsChild, "SIGTERM", "win32", killTree);
+    expect(windowsChild.kill).not.toHaveBeenCalled();
+    expect(killTree).toHaveBeenCalledWith("taskkill", ["/pid", "4343", "/T", "/F"]);
+  });
+
+  it("never throws when the child has already exited", () => {
+    const gone = { pid: 1, kill: vi.fn(() => { throw new Error("ESRCH"); }) };
+    expect(() => forwardSignal(gone, "SIGTERM", "darwin")).not.toThrow();
+    const goneWindows = { pid: 1, kill: vi.fn() };
+    const killTree = vi.fn(() => { throw new Error("gone"); });
+    expect(() => forwardSignal(goneWindows, "SIGTERM", "win32", killTree)).not.toThrow();
+  });
+
+  // Regression for the bug where bin/headroom.js used spawnSync: killing the
+  // launcher's own PID left a long-running child (most importantly the
+  // daemon) orphaned, still holding the socket, because nothing forwarded
+  // the signal to it. This spawns the real launcher against a fake
+  // dist/cli.js that reports which signal it received, then signals the
+  // launcher (never the fake child directly) and checks the fake child saw
+  // it and the launcher exited with the fake child's own exit code.
+  it("end-to-end: signaling the launcher process reaches its child, which is never orphaned", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-launcher-e2e-"));
+    temporary.push(root);
+    await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
+    const binDir = join(root, "bin");
+    const distDir = join(root, "dist");
+    await mkdir(binDir, { recursive: true });
+    await mkdir(distDir, { recursive: true });
+    await writeFile(join(binDir, "headroom.js"), await readFile(new URL("../bin/headroom.js", import.meta.url), "utf8"));
+    const receivedFile = join(root, "received-signal.txt");
+    await writeFile(join(distDir, "cli.js"), [
+      "import { writeFileSync } from \"node:fs\";",
+      "const receivedFile = process.argv[2];",
+      "process.on(\"SIGTERM\", () => { writeFileSync(receivedFile, \"SIGTERM\"); process.exit(7); });",
+      "process.stdout.write(\"ready\\n\");",
+      "setInterval(() => {}, 1000);",
+    ].join("\n"));
+
+    const launcher = spawn(process.execPath, [join(binDir, "headroom.js"), receivedFile], { stdio: ["ignore", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("fake cli.js never reported ready")), 5000);
+      launcher.stdout.on("data", (chunk: Buffer) => { if (chunk.toString().includes("ready")) { clearTimeout(timeout); resolve(); } });
+    });
+
+    launcher.kill("SIGTERM"); // signals the LAUNCHER's own PID, exactly like an external `kill` or a service manager would
+    const [code] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => launcher.on("exit", (code, signal) => resolve([code, signal])));
+
+    expect(await readFile(receivedFile, "utf8")).toBe("SIGTERM"); // the child was reached, not orphaned
+    expect(code).toBe(7); // the launcher exits with the child's own exit code
+  }, 10_000);
 });

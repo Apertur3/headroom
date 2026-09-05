@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { claudeServiceName, syncClaudeGrantState } from "./adapters/claude.js";
@@ -99,7 +99,7 @@ export function adapterCheck(account: Account): DoctorCheck {
 async function configCheck(name: "policy" | "routing", path: string): Promise<DoctorCheck> {
   try {
     const status = await doctorFileStatus(path);
-    if (status === "missing") return check("WARN", name, `not present; using built-in defaults (${path})`, name === "policy" ? "copy examples/policy.toml to this path" : "create routing.toml with [consumes]");
+    if (status === "missing") return check("INFO", name, `not present; using built-in defaults (${path})`, name === "policy" ? "copy examples/policy.toml to this path" : "create routing.toml with [consumes]");
     if (status === "unsafe") return check("FAIL", name, `unsafe file (${path})`, `fix ownership or writable permissions on ${path}`);
     await (name === "policy" ? readPolicy() : readRouting());
     return check("OK", name, `valid ${path}`, "no action needed");
@@ -122,7 +122,12 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       accounts = await readAccounts();
       output.push(check(accounts.length ? "OK" : "WARN", "principals", accounts.length ? `${accounts.length} configured (${accountsPath()})` : "no principals configured", accounts.length ? "no action needed" : "headroom accounts discover"));
     } catch (error) {
-      output.push(check("FAIL", "principals", error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT" ? `missing ${accountsPath()}` : "accounts.toml is invalid", "headroom accounts discover"));
+      // A never-created accounts.toml (first run, before `accounts discover`)
+      // has no configured principal to block reading -- WARN, matching the
+      // empty-registry case just above. A present but unparseable file is a
+      // real, blocking misconfiguration and stays FAIL.
+      const missing = error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+      output.push(check(missing ? "WARN" : "FAIL", "principals", missing ? `missing ${accountsPath()}` : "accounts.toml is invalid", "headroom accounts discover"));
     }
     // Runs even when `headroom doctor` is the very first command ever
     // invoked (no prior daemon poll or CLI observe()), so a fresh install or
@@ -150,8 +155,8 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     ? check("OK", "engine upstream hash", `${upstream.tag} verified (${upstream.path})`, "no action needed")
     : check("INFO", "engine upstream hash", `${upstream.tag} absent or hash mismatch; optional, needed only for providers without a native adapter`, "headroom engine install"));
   output.push(native
-    ? check(native.includes(`${home}/engine/native/`) ? "OK" : "WARN", "engine native hash", native.includes(`${home}/engine/native/`) ? `verified (${native})` : `development binary (${native}) is not release-pinned`, native.includes(`${home}/engine/native/`) ? "no action needed" : "build a pinned native release or run headroom engine install")
-    : check("WARN", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
+    ? check(native.includes(`${home}/engine/native/`) ? "OK" : "INFO", "engine native hash", native.includes(`${home}/engine/native/`) ? `verified (${native})` : `development binary (${native}) is not release-pinned`, native.includes(`${home}/engine/native/`) ? "no action needed" : "build a pinned native release or run headroom engine install")
+    : check("INFO", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
 
   const daemon = await daemonRequest(socketPath(), "health");
   if (daemon.status === "available") {
@@ -173,8 +178,14 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     }
     else output.push(check("FAIL", "Antigravity keepalive", "agy process is not running", "set antigravity_keepalive = true and restart headroom service"));
   } else {
-    output.push(check("FAIL", "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
-    output.push(check("FAIL", "daemon health", "not available", "headroom install-service"));
+    // A missing daemon never blocks reading a configured principal -- every
+    // CLI/MCP entry point falls back to a direct read -- so it is a WARN, not
+    // a FAIL. A socket that exists but does not answer health is different:
+    // requestDaemon() throws on that state instead of falling back, which
+    // does block a read, so it stays FAIL.
+    const level: DoctorLevel = daemon.status === "absent" ? "WARN" : "FAIL";
+    output.push(check(level, "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
+    output.push(check(level, "daemon health", daemon.status === "absent" ? "not available" : "present but unresponsive", "headroom install-service"));
     if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) output.push(keepaliveEnabled
       ? check("WARN", "Antigravity keepalive", "cannot inspect agy without a healthy daemon", "headroom install-service")
       : check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
@@ -190,8 +201,41 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       : check("WARN", "daemon log", `unsafe log file (${daemonLogPath(home)})`, "fix ownership or writable permissions"));
 }
 
+/**
+ * First-run mode: no daemon is running, and none has ever started on this
+ * Headroom home. A brand-new install needs one ordered list of commands, not
+ * eight independent FAIL/WARN lines to triage by hand.
+ *
+ * The daemon log's mere existence is not a usable signal here: opening the
+ * store (homeCheck(), the very first step of doctorChecks()) runs one-time
+ * schema migrations that themselves write a summary line to the log, so the
+ * file exists after doctor's own first run even though no daemon has ever
+ * started. Only cli.ts's daemon() writes the literal "daemon started" line,
+ * so its absence is what actually means "never started".
+ */
+export async function isFreshInstall(checks: DoctorCheck[], home = headroomHome()): Promise<boolean> {
+  const daemonAbsent = checks.some((item) => item.check === "daemon socket" && item.detail === "not found");
+  if (!daemonAbsent) return false;
+  try { return !(await readFile(daemonLogPath(home), "utf8")).includes("daemon started"); }
+  catch { return true; } // no log at all: certainly never started
+}
+
+/** Exact commands for isFreshInstall()'s "Next steps" block, in run order.
+ * Exported for tests; keychain grant is macOS-only, mirroring keychain
+ * grant's own platform gate. */
+export function nextSteps(platform: NodeJS.Platform = process.platform): string[] {
+  const steps = platform === "darwin" ? ["headroom keychain grant"] : [];
+  steps.push("headroom install-service", "claude mcp add headroom -- npx headroomd mcp");
+  return steps;
+}
+
 export async function doctor(): Promise<number> {
   const checks = await doctorChecks();
   for (const item of checks) console.log(rendered(item));
+  if (await isFreshInstall(checks)) {
+    console.log("");
+    console.log("Next steps:");
+    nextSteps().forEach((step, index) => console.log(`${index + 1}. ${step}`));
+  }
   return checks.some((item) => item.level === "FAIL") ? 1 : 0;
 }

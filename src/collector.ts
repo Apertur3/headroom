@@ -5,7 +5,7 @@ import { normalizeObservations, observationsFromReading } from "./engine/observa
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { claudeGrantNeededObservations, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { observeCodex } from "./adapters/codex.js";
-import { observeAntigravity } from "./adapters/antigravity.js";
+import { noDaemonObservations, observeAntigravity } from "./adapters/antigravity.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
@@ -37,6 +37,12 @@ export interface PollOptions {
    * `headroom keychain grant` clears it. Absent for callers that do not
    * track grant state (e.g. --shape diagnostics). */
   claudeGrant?: ClaudeGrantGate;
+  /** Set only by the CLI's and MCP's no-daemon direct-read fallbacks (the
+   * only callers that ever poll with no responding daemon at all -- the
+   * daemon's own poll loop never sets this). Skips the deprecated remote
+   * Antigravity fallback entirely in favor of one clear "start the daemon"
+   * reason; see noDaemonObservations(). */
+  noDaemon?: boolean;
 }
 
 export interface AntigravityLocalRead {
@@ -128,6 +134,8 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     } else if (options.skipRemoteAntigravity) {
       // A remote failure must never suppress the next daemon-owned warm read.
       observations.push(...local);
+    } else if (options.noDaemon) {
+      observations.push(...noDaemonObservations(account));
     } else {
       const remote = await observeAntigravity(account);
       observations.push(...selectAntigravitySource(local, remote, account.name));

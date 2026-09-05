@@ -203,7 +203,13 @@ export async function observeCodex(account: ProviderAccount, dependencies: Codex
     const events = await (dependencies.readRateLimitEvents ?? readCodexRateLimitEvents)(resolve(account.location || vendorHome("codex")));
     return mergeSessionFallback(endpoint, observationsFromCodexRateLimitEvents(events, account, now));
   } catch (error) {
-    const reason = error instanceof ProviderHTTPError ? error.message : error instanceof Error && error.message.startsWith("vendor response") ? error.message : error instanceof Error && /auth unavailable|auth invalid|unsafe permissions/.test(error.message) ? `no credentials for this config dir; ${codexLoginCommand(account)}` : "Codex usage unavailable";
+    // A live 401/403 (a well-formed token the vendor rejected outright) is
+    // just as actionable as a locally detected "no credentials" -- name the
+    // exact fix instead of the bare "Codex usage request failed (401)",
+    // which told the operator nothing to do about it.
+    const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Codex rejected the token (${error.status}); ${codexLoginCommand(account)}`
+      : error instanceof ProviderHTTPError ? error.message
+      : error instanceof Error && error.message.startsWith("vendor response") ? error.message : error instanceof Error && /auth unavailable|auth invalid|unsafe permissions/.test(error.message) ? `no credentials for this config dir; ${codexLoginCommand(account)}` : "Codex usage unavailable";
     return failed(account, reason, timestamp);
   }
 }

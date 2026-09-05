@@ -222,6 +222,30 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(expiredAntigravity[0].reason).toBe("token expired; run: gemini");
   });
 
+  it("names the exact fix for a live 401/403 (a well-formed token the vendor rejected), not the bare status message", async () => {
+    // A non-default config dir (as elsewhere in this file, .claude2/.codex2)
+    // is the only portable way to assert the exact CLAUDE_CONFIG_DIR/CODEX_HOME
+    // wording: the plain "run: claude"/"run: codex login" form only appears
+    // when the fixture's path equals this machine's *real* home directory,
+    // which a test cannot control without mocking os.homedir() itself.
+    const claude2 = { ...claude, name: "claude-2", location: "/Users/test/.claude2" };
+    const rejected401 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
+    const rejected403 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 403 }) });
+    expect(rejected401[0].reason).toBe("Claude rejected the token (401); run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
+    expect(rejected403[0].reason).toBe("Claude rejected the token (403); run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
+
+    const codex2 = { ...codex, location: "/Users/test/.codex2" };
+    const codexRejected401 = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
+    const codexRejected403 = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 403 }) });
+    expect(codexRejected401[0].reason).toBe("Codex rejected the token (401); run: CODEX_HOME=/Users/test/.codex2 codex login");
+    expect(codexRejected403[0].reason).toBe("Codex rejected the token (403); run: CODEX_HOME=/Users/test/.codex2 codex login");
+
+    // The parenthesized status code -- collector.ts's shared backoff pattern --
+    // must still match the new, friendlier wording.
+    expect(PROTECTED_STATUS_PATTERN.test(rejected401[0].reason ?? "")).toBe(true);
+    expect(PROTECTED_STATUS_PATTERN.test(codexRejected403[0].reason ?? "")).toBe(true);
+  });
+
   it("accepts Gemini CLI's top-level JSON token as the fallback credential format", () => {
     expect(parseAntigravityCredential(JSON.stringify({ access_token: "token", expiry_date: at.getTime() + 60_000 }), at)).toMatchObject({ token: "token", expired: false });
   });

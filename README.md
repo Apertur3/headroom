@@ -51,12 +51,18 @@ Not on npm yet. Until the first release, clone the repo, run `npm install && npm
 use `node dist/cli.js` where the commands below say `npx headroomd`.
 
 ```sh
-npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity
-npx headroomd doctor             # one-line installation and daemon diagnostics
+npx headroomd accounts discover  # find ~/.claude*, ~/.codex*, Antigravity; also seeds policy/routing.toml
+npx headroomd doctor             # one-line installation and daemon diagnostics, with next steps on a fresh install
 npx headroomd keychain grant     # macOS: one Claude Keychain prompt; choose Always Allow
 npx headroomd                    # one line per meter
 npx headroomd install-service    # launchd, systemd user unit, or Windows Task Scheduler
+npx headroomd --help             # full command list; `headroom <command> --help` for one command
 ```
+
+`accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom
+doctor`) and, the first time, seeds `~/.headroom/policy.toml` and `routing.toml` from `examples/` so
+`headroom can <class>` works immediately with the example action classes (`claude-fable`, `codex-build`,
+`gemini-bulk`) -- edit `routing.toml` to match your accounts.
 
 Register the MCP server in each Claude Code profile:
 
@@ -77,10 +83,12 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 
 ## Security
 
-No secret touches disk or output. On macOS the signed `headroom-claude-probe` reads the Claude
-Keychain token and makes the usage request itself, so the token never enters Node or stdout. Run
-`headroom keychain grant` once and choose **Always Allow**; an updated probe binary prompts once
-again. Tokens are otherwise read at call time from the Keychain or the
+No secret touches disk or output. On macOS `headroom-claude-probe` reads the Claude Keychain token
+and makes the usage request itself, so the token never enters Node or stdout. It ships inside the
+npm package as a universal binary, verified against a recorded SHA-256 before every use, and is
+ad-hoc signed rather than Developer ID signed -- fine for a beta, but it means each package update
+is a new signing identity to macOS. Run `headroom keychain grant` once and choose **Always Allow**;
+an updated probe binary prompts once again. Tokens are otherwise read at call time from the Keychain or the
 vendor's own credential file and dropped after the request. The daemon listens on a 0600 local
 socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry, the engine
 is pinned and checksum verified, and every query lands in an audit log. Details in [SECURITY.md](SECURITY.md).
