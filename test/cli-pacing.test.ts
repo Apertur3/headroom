@@ -225,6 +225,80 @@ describe("headroom fill", () => {
   });
 });
 
+describe("live shape: codex-main:main with 5h not_enforced, weekly fresh (reported live-fail repro)", () => {
+  // Copied field-for-field from a real `headroom --principal codex-main --json`
+  // dump (per the maintainer's live report): exactly one enforced observation
+  // for codex-main:main (the weekly window, fresh at 83%) plus a vendor-
+  // confirmed not_enforced 5h row with no quantity at all. Only fetched_at/
+  // resets_at are shifted to `at()` offsets so the fixture never goes stale;
+  // every other field, including the exact quantity and window shapes, is
+  // verbatim.
+  function seedCodexMainFixture(store: HeadroomStore): void {
+    store.insert({
+      principal_id: "codex-main", meter_id: "codex-main:main",
+      window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+      quantity: null, resets_at: null,
+      observed_at: at(0), fetched_at: at(0), source: "native:codex", truth: "official",
+      freshness: "not_enforced", confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4",
+      reason: "no 5-hour window from endpoint or session logs",
+    });
+    store.insert({
+      principal_id: "codex-main", meter_id: "codex-main:main",
+      window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      quantity: { used: 83, limit: 100, remaining: 17, unit: "percent" }, resets_at: at(5 * DAY + 8 * 60_000),
+      observed_at: at(0), fetched_at: at(0), source: "native:codex", truth: "official",
+      freshness: "fresh", confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4",
+    });
+  }
+
+  it("plan resolves the weekly window instead of 'no weekly window for codex-main:main'", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedCodexMainFixture(store);
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["plan", "--meter", "codex-main:main", "--until", "reset", "--reserve", "10", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    const result = JSON.parse(logs[0]);
+    expect(result).toMatchObject({ meter: "codex-main:main", weekly_remaining_percent: 17, reserve_percent: 10 });
+  });
+
+  it("gate evaluates the wk need against the real 83% used instead of 'wk usage unknown'", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedCodexMainFixture(store);
+    store.close();
+    await withHeadroomHome(home, async () => {
+      expect(await main(["gate", "--meter", "codex-main:main", "--need", "wk:3", "--owner", "headroom"])).toBe(0);
+      // 83 + 15 = 98, over the 90% ceiling (100 - 10% reserve): must refuse on
+      // the real weekly number, not silently pass a stale/unknown one.
+      expect(await main(["gate", "--meter", "codex-main:main", "--need", "wk:15", "--owner", "headroom"])).toBe(2);
+    });
+  });
+
+  it("fill uses the weekly window (not a 0%-remaining phantom 5h reading) and reports which window it used", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    seedCodexMainFixture(store);
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["fill", "--meter", "codex-main:main", "--until-reset", "--lane-cost", "2", "--owner", "headroom", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    const result = JSON.parse(logs[0]);
+    expect(result.window_used).toBe("wk");
+    expect(result.used_weekly_percent).toBe(83);
+    // Weekly budget = 100 - 83 - 10(reserve) = 7; at 2 pts/lane -> 3 lanes.
+    // The old bug reported "5h window has only 0.0% left" and 0 lanes.
+    expect(result.lanes).toMatchObject({ lanes: 3 });
+  });
+});
+
 describe("headroom can: learned cost and --lease", () => {
   it("reports the learned median as the expected cost with no --expect, and --lease records a new lease under the action class", async () => {
     const home = await seededHome();
