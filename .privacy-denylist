@@ -1,7 +1,12 @@
 # scripts/privacy-sweep.sh: one regex per line, checked against every tracked
 # file and the packed npm tarball. A leading (?i) makes that one line
 # case-insensitive; a line starting with # is a comment.
-(?i)\bgpu-box\b
-(?i)\bgpu-box-2\b
-(?i)\bedge-box\b
-(?i)the maintainer
+#
+# This tracked file holds only generic patterns. Names of people, machines or
+# private hosts belong in an untracked local list: the file named by the
+# PRIVACY_DENYLIST environment variable, or ~/.config/headroom-privacy-denylist.
+# The sweep reads both.
+Co-Authored-By
+Claude-Session
+(?i)\bthe fleet pace machine\b
+(?i)an external collector

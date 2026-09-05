@@ -35,8 +35,8 @@ export interface ProviderAccount {
   adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
   /** Optional explicit agy executable for the daemon-owned warm local probe. */
   agy_path?: string;
-  /** Optional principal name a third-party statusline collector (e.g.
-   * an external collector) uses for this same profile, so the statusline snapshot
+  /** Optional principal name a third-party statusline collector
+   * uses for this same profile, so the statusline snapshot
    * adapter can match its file to this principal when the collector's own
    * naming does not follow headroom's config-dir-basename convention. */
   alias?: string;

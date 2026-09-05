@@ -27,7 +27,7 @@ possibly other model-scoped buckets. `headroom statusline`, registered as that c
 quickstart.md), snapshots it to `<HEADROOM_HOME>/statusline/<profile>.json` (0600; `<profile>` is
 the `CLAUDE_CONFIG_DIR` basename, or `default`). The `native:claude-statusline` adapter
 (`src/adapters/claude-statusline.ts`) reads that file back: `truth: official`, freshness `fresh`
-under 10 minutes old and `stale` beyond that. It also reads the an external collector collector's own
+under 10 minutes old and `stale` beyond that. It also reads an existing collector's own
 existing shape (`state/<alias>.json`: top-level `alias`, `five_hour`/`seven_day` with `used_pct`),
 matched to a principal by an explicit `alias` field on that account in `accounts.toml`, or by the
 convention alias `"main"` means the default profile. Which directories are scanned is
@@ -93,21 +93,50 @@ printed as `n/a`, rather than guessing.
 
 ## Antigravity
 
-Headroom reads Antigravity through two separate paths, not one.
+The remote quota endpoint is the primary source; the daemon-kept local `agy` process is a
+fallback, used only when remote can't answer.
 
-While the daemon owns a warmed `agy` pseudo-terminal (started under `script -q /dev/null agy` on
-macOS and Linux only; the daemon never keeps this warm on Windows), it asks the native Swift
-engine to read agy's own local quota summary. A one-shot CLI or MCP call made without a running
-daemon never touches this local path; it always goes straight to the remote path instead. The
-remote path reads Gemini CLI's Google OAuth credentials and POSTs to Google's
-`v1internal:retrieveUserQuota` on `cloudcode-pa.googleapis.com`, refreshing the token first if it's
-expired.
+The remote path reads Gemini CLI's Google OAuth credentials, refreshing the token first if it's
+expired, then follows the same sequence CodexBar's Antigravity provider does against
+`cloudcode-pa.googleapis.com`: `v1internal:loadCodeAssist` (metadata `ideType: "ANTIGRAVITY"`) for
+the account's current tier and project id; if there is no project id yet, `v1internal:onboardUser`
+into the best available tier (the tier flagged default among `allowedTiers`, else the first listed,
+else the paid tier, else whatever tier is already current), then a few `loadCodeAssist` polls for
+the project it provisions; finally `v1internal:retrieveUserQuota` with that project id. Never
+persists anything it learns (project id included) -- every poll re-resolves it, so a failed write
+can never leave a stale or wrong value on disk.
+
+Token refresh needs the Gemini CLI's own OAuth client id/secret, which Headroom never hardcodes:
+it checks `GEMINI_OAUTH_CLIENT_ID`/`GEMINI_OAUTH_CLIENT_SECRET`, then `GEMINI_OAUTH2_JS_PATH`, then
+the installed Gemini CLI package (the `gemini` binary's real path, walked upward for
+`oauth2.js`/`bundle/gemini.js` under an npm-global or Homebrew layout). A Homebrew-published
+`gemini-cli`'s `bundle/gemini.js` is only a small bootstrap that dynamically imports the real code
+from content-hashed sibling files (`bundle/chunk-<hash>.js`), so on that layout none of the fixed
+candidate paths ever contain the client -- the last resort is a scan of every `.js` file directly
+in the bundle directory. `headroom doctor`'s "Antigravity OAuth client" check reports which layout
+actually matched (never the id/secret themselves).
+
+Only when the daemon owns a warmed `agy` pseudo-terminal (started under `script -q /dev/null agy`
+on macOS and Linux only; never on Windows, and never merely because a principal is configured --
+see keepalive below) does a poll also ask the native Swift engine for agy's own local quota
+summary, used only once remote comes back short of real buckets.
 
 Credential location: the remote path reads `~/.gemini/oauth_creds.json` on every platform, the
 same file the Gemini CLI itself writes. There's no Keychain path for Antigravity.
 
 Meters emitted: `<principal>:gemini` and `<principal>:claude-gpt`, each with a 5-hour and a weekly
 window, with `used` computed as `(1 - remainingFraction) * 100` from the vendor's quota buckets.
+`headroom --principal <name> --shape` prints the key/kind shape of every response the sequence
+made (`loadCodeAssist`, `onboardUser` only if it actually ran, `retrieveUserQuota`), plus
+`loadCodeAssist`'s own tier and any `ineligibleTiers[].reasonCode` it reported, so a denied tier is
+visible without guessing at Google's response shape.
+
+Keepalive is secondary: a poll's remote read is always tried first, and the daemon starts `agy`
+lazily -- only the first time a poll shows remote fell short (availability-only, a 403, or a
+transport failure) for an Antigravity principal, never unconditionally at daemon startup. A daemon
+whose remote reads are always real spawns agy exactly never. Once started it keeps running the
+same way it always has; a failed read's `reason` names both outcomes (e.g. "quota endpoint
+returned availability only; agy keepalive not running" or "...; agy quota summary not ready").
 
 Known limitations, verified live:
 

@@ -10,7 +10,11 @@ const TIMEOUT_MS = 10_000;
 const SOURCE = "remote:antigravity";
 const BASE_URL = "https://cloudcode-pa.googleapis.com";
 const RETRIEVE_USER_QUOTA = `${BASE_URL}/v1internal:retrieveUserQuota`;
+const LOAD_CODE_ASSIST = `${BASE_URL}/v1internal:loadCodeAssist`;
+const ONBOARD_USER = `${BASE_URL}/v1internal:onboardUser`;
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+/** Same metadata CodexBar's Antigravity fetcher sends on every loadCodeAssist/onboardUser call. */
+const CODE_ASSIST_METADATA = { ideType: "ANTIGRAVITY", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
 const METERS = ["gemini", "claude-gpt"] as const;
 const WINDOWS = [
   { name: "5h", minutes: 300, kind: "rolling" as const },
@@ -34,6 +38,12 @@ export interface AntigravityDependencies {
   credentialPaths?: () => string[];
   /** Test seam and explicit override for Gemini CLI's bundled OAuth client. */
   oauthClient?: () => Promise<GeminiOAuthClient | undefined>;
+  /** Onboarding project-id polling: how many times to re-check loadCodeAssist
+   * after onboardUser, and how long to wait between checks. Real onboarding
+   * needs a few seconds for Google's side to provision a project; tests
+   * override both to keep the suite fast. */
+  onboardPollAttempts?: number;
+  onboardPollDelayMs?: number;
 }
 
 interface Credential { token: string; refreshToken?: string; projectId?: string; expired: boolean; }
@@ -170,38 +180,91 @@ async function credential(paths: string[], reader: (path: string, encoding: Buff
 
 function formBody(values: Record<string, string>): string { return new URLSearchParams(values).toString(); }
 
-/** Finds the same Gemini CLI oauth2.js bundle locations documented by CodexBar, without persisting any extracted client data. */
-export async function discoverGeminiOAuthClient(): Promise<GeminiOAuthClient | undefined> {
+/** Prefers the named `OAUTH_CLIENT_ID`/`OAUTH_CLIENT_SECRET` constants Google
+ * ships the Gemini CLI source with (unambiguous even when a bundle also
+ * contains an unrelated Google client id elsewhere in the same file), and
+ * falls back to the bare id/secret shape for a bundle that keeps the values
+ * but not the names. */
+function extractOAuthClient(text: string): GeminiOAuthClient | undefined {
+  const namedId = /(?:const|let|var)\s+OAUTH_CLIENT_ID\s*=\s*["']([\w.-]+)["']/.exec(text)?.[1];
+  const namedSecret = /(?:const|let|var)\s+OAUTH_CLIENT_SECRET\s*=\s*["']([\w-]+)["']/.exec(text)?.[1];
+  if (namedId && namedSecret) return { clientId: namedId, clientSecret: namedSecret };
+  const clientId = /[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com/.exec(text)?.[0];
+  const clientSecret = /GOCSPX-[A-Za-z0-9_-]{28}/.exec(text)?.[0];
+  return clientId && clientSecret ? { clientId, clientSecret } : undefined;
+}
+
+/** Last-resort fallback for a Homebrew-published gemini-cli install: its
+ * `bundle/gemini.js` is only a ~5 KB bootstrap that dynamically imports the
+ * real code from content-hashed sibling files (`bundle/chunk-<hash>.js`), so
+ * none of the fixed candidate paths below ever match it. Scans every .js
+ * file directly in the bundle directory (sorted, for a deterministic match)
+ * until one contains the OAuth client. */
+async function scanDirectoryForOAuthClient(dir: string): Promise<GeminiOAuthClient | undefined> {
+  let names: string[];
+  try { names = (await readdir(dir)).filter((name) => name.endsWith(".js")).sort(); }
+  catch { return undefined; }
+  for (const name of names) {
+    try {
+      const found = extractOAuthClient(await readFile(join(dir, name), "utf8"));
+      if (found) return found;
+    } catch { /* an unreadable chunk never blocks the rest */ }
+  }
+  return undefined;
+}
+
+/** Finds the same Gemini CLI oauth2.js bundle locations documented by
+ * CodexBar, without persisting any extracted client data. `layout` names
+ * which resolution path matched, for `headroom doctor` to report -- never
+ * the client id/secret themselves. */
+export async function discoverGeminiOAuthClientDetail(): Promise<{ client: GeminiOAuthClient; layout: string } | undefined> {
   const envClientId = string(process.env.GEMINI_OAUTH_CLIENT_ID);
   const envClientSecret = string(process.env.GEMINI_OAUTH_CLIENT_SECRET);
-  if (envClientId && envClientSecret) return { clientId: envClientId, clientSecret: envClientSecret };
-  const candidates = new Set<string>();
+  if (envClientId && envClientSecret) return { client: { clientId: envClientId, clientSecret: envClientSecret }, layout: "GEMINI_OAUTH_CLIENT_ID/SECRET environment override" };
   const override = string(process.env.GEMINI_OAUTH2_JS_PATH);
-  if (override) candidates.add(override);
+  if (override) {
+    try {
+      const found = extractOAuthClient(await readFile(override, "utf8"));
+      if (found) return { client: found, layout: `GEMINI_OAUTH2_JS_PATH (${override})` };
+    } catch { /* fall through to auto-discovery */ }
+  }
+  const fileCandidates = new Set<string>();
+  const dirCandidates = new Set<string>();
   const binary = await geminiBinary();
   if (binary) for (const root of parents(dirname(binary), 8)) {
-    candidates.add(join(root, "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
-    candidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
-    candidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
-    candidates.add(join(root, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
-    candidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
-    candidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    fileCandidates.add(join(root, "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    fileCandidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    fileCandidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    fileCandidates.add(join(root, "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    fileCandidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    fileCandidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    dirCandidates.add(join(root, "node_modules", "@google", "gemini-cli", "bundle"));
+    dirCandidates.add(join(root, "lib", "node_modules", "@google", "gemini-cli", "bundle"));
+    dirCandidates.add(join(root, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle"));
   }
   for (const prefix of ["/opt/homebrew", "/usr/local"]) {
-    candidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
-    candidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    fileCandidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+    fileCandidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+    dirCandidates.add(join(prefix, "opt", "gemini-cli", "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle"));
     try { for (const version of await readdir(join(prefix, "Cellar", "gemini-cli"))) {
-      candidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
-      candidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+      fileCandidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "node_modules", "@google", "gemini-cli-core", "dist", "src", "code_assist", "oauth2.js"));
+      fileCandidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle", "gemini.js"));
+      dirCandidates.add(join(prefix, "Cellar", "gemini-cli", version, "libexec", "lib", "node_modules", "@google", "gemini-cli", "bundle"));
     } } catch { /* not a Homebrew installation */ }
   }
-  for (const path of candidates) try {
-    const text = await readFile(path, "utf8");
-    const clientId = /[0-9]+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com/.exec(text)?.[0];
-    const clientSecret = /GOCSPX-[A-Za-z0-9_-]{28}/.exec(text)?.[0];
-    if (clientId && clientSecret) return { clientId, clientSecret };
+  for (const path of fileCandidates) try {
+    const found = extractOAuthClient(await readFile(path, "utf8"));
+    if (found) return { client: found, layout: path };
   } catch { /* continue through the documented candidates */ }
+  for (const dir of dirCandidates) {
+    const found = await scanDirectoryForOAuthClient(dir);
+    if (found) return { client: found, layout: `${dir} (chunk scan)` };
+  }
   return undefined;
+}
+
+export async function discoverGeminiOAuthClient(): Promise<GeminiOAuthClient | undefined> {
+  return (await discoverGeminiOAuthClientDetail())?.client;
 }
 
 async function geminiBinary(): Promise<string | undefined> {
@@ -228,8 +291,108 @@ async function refresh(fetcher: typeof fetch, credentials: Credential, resolveCl
   return { ...credentials, token: string(body.access_token)!, expired: false };
 }
 
-async function post(fetcher: typeof fetch, credential: Credential): Promise<Response> {
-  return outboundFetch(fetcher, new Request(RETRIEVE_USER_QUOTA, { method: "POST", headers: requestHeaders(credential.token), body: requestBody(credential.projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
+function sleep(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+/** `loadCodeAssist`'s `cloudaicompanionProject` comes back either as a bare
+ * project id string or as an object carrying `id`/`projectId` -- CodexBar's
+ * own decoder (`ProjectReference`) accepts both, so this does too. */
+function projectIdFrom(value: unknown): string | undefined {
+  if (typeof value === "string") return string(value);
+  if (object(value)) return string(field(value, "id", "projectId", "project_id"));
+  return undefined;
+}
+
+interface CodeAssistParsed { projectId?: string; tierId?: string; tierName?: string; reasonCode?: string; }
+
+/** Reads `loadCodeAssist`'s project id, current tier, and (when Google
+ * denies the consumer tier) the `ineligibleTiers[].reasonCode` that explains
+ * why -- the same field CodexBar's Gemini provider reads for its
+ * UNSUPPORTED_CLIENT migration signal. */
+function parseCodeAssist(body: unknown): CodeAssistParsed {
+  if (!object(body)) return {};
+  const projectId = projectIdFrom(field(body, "cloudaicompanionProject"));
+  const currentTier = object(field(body, "currentTier")) ? field(body, "currentTier") as ObjectValue : undefined;
+  const ineligible = Array.isArray(body.ineligibleTiers) ? body.ineligibleTiers : [];
+  const reasonCode = ineligible.flatMap((item) => object(item) ? [string(field(item, "reasonCode", "reason_code"))] : []).find(Boolean);
+  return { projectId, tierId: string(currentTier?.id), tierName: string(currentTier?.name), reasonCode };
+}
+
+/** Which tier to onboard into, in the same preference order as CodexBar's
+ * `pickOnboardTier`: the allowed tier flagged default, else the first
+ * allowed tier, else the paid tier, else whatever tier is already current. */
+function pickOnboardTier(body: unknown): string | undefined {
+  if (!object(body)) return undefined;
+  const allowed = (Array.isArray(body.allowedTiers) ? body.allowedTiers : []).filter(object) as ObjectValue[];
+  const byDefault = string(allowed.find((tier) => tier.isDefault === true && string(tier.id))?.id);
+  if (byDefault) return byDefault;
+  const first = string(allowed.find((tier) => string(tier.id))?.id);
+  if (first) return first;
+  const paidTier = object(field(body, "paidTier")) ? string((field(body, "paidTier") as ObjectValue).id) : undefined;
+  if (paidTier) return paidTier;
+  const currentTier = object(field(body, "currentTier")) ? string((field(body, "currentTier") as ObjectValue).id) : undefined;
+  return currentTier;
+}
+
+function onboardProjectId(body: unknown): string | undefined {
+  if (!object(body)) return undefined;
+  return projectIdFrom(field(body, "cloudaicompanionProject"))
+    ?? (object(body.response) ? projectIdFrom(field(body.response as ObjectValue, "cloudaicompanionProject")) : undefined);
+}
+
+async function loadCodeAssist(fetcher: typeof fetch, token: string): Promise<unknown> {
+  const response = await outboundFetch(fetcher, new Request(LOAD_CODE_ASSIST, {
+    method: "POST", headers: requestHeaders(token), body: JSON.stringify({ metadata: CODE_ASSIST_METADATA }), signal: AbortSignal.timeout(TIMEOUT_MS),
+  }));
+  if (!response.ok) throw await antigravityHTTPError(response);
+  return vendorJson(response);
+}
+
+async function onboardUser(fetcher: typeof fetch, token: string, tierId: string): Promise<unknown> {
+  const response = await outboundFetch(fetcher, new Request(ONBOARD_USER, {
+    method: "POST", headers: requestHeaders(token), body: JSON.stringify({ tierId, metadata: CODE_ASSIST_METADATA }), signal: AbortSignal.timeout(TIMEOUT_MS),
+  }));
+  if (!response.ok) throw await antigravityHTTPError(response);
+  return vendorJson(response);
+}
+
+/**
+ * The project id `retrieveUserQuota` needs, resolved the same way CodexBar's
+ * `resolveProjectID` does: a project id already on the stored credential
+ * wins outright; otherwise `loadCodeAssist`'s own `cloudaicompanionProject`;
+ * otherwise (a brand new Code Assist account) `onboardUser` into the best
+ * available tier and poll `loadCodeAssist` a few times for the project it
+ * provisions. Never persists anything -- the id is used for this one poll
+ * and re-resolved next time, so a failed write can never leave a stale or
+ * wrong project id on disk.
+ */
+async function resolveProjectId(
+  fetcher: typeof fetch, token: string, storedProjectId: string | undefined, initial: unknown,
+  dependencies: AntigravityDependencies, trace?: { onboard?: unknown },
+): Promise<string | undefined> {
+  if (storedProjectId) return storedProjectId;
+  const fromInitial = parseCodeAssist(initial).projectId;
+  if (fromInitial) return fromInitial;
+  const tierId = pickOnboardTier(initial);
+  if (!tierId) return undefined;
+  try {
+    const onboardBody = await onboardUser(fetcher, token, tierId);
+    if (trace) trace.onboard = onboardBody;
+    const fromOnboard = onboardProjectId(onboardBody);
+    if (fromOnboard) return fromOnboard;
+  } catch { /* Onboarding is best-effort; the loadCodeAssist poll below is the real fallback. */ }
+  const attempts = dependencies.onboardPollAttempts ?? 5;
+  const delayMs = dependencies.onboardPollDelayMs ?? 2000;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (delayMs > 0) await sleep(delayMs);
+    const refreshed = await loadCodeAssist(fetcher, token);
+    const projectId = parseCodeAssist(refreshed).projectId;
+    if (projectId) return projectId;
+  }
+  return undefined;
+}
+
+async function post(fetcher: typeof fetch, token: string, projectId: string | undefined): Promise<Response> {
+  return outboundFetch(fetcher, new Request(RETRIEVE_USER_QUOTA, { method: "POST", headers: requestHeaders(token), body: requestBody(projectId), signal: AbortSignal.timeout(TIMEOUT_MS) }));
 }
 
 export async function observeAntigravity(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Observation[]> {
@@ -239,10 +402,16 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const fetcher = dependencies.fetch ?? fetch;
     const stored = await credential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureRead, now);
     const credentials = await refresh(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient);
-    const quota = await post(fetcher, credentials);
+    const codeAssist = await loadCodeAssist(fetcher, credentials.token);
+    const parsed = parseCodeAssist(codeAssist);
+    const projectId = await resolveProjectId(fetcher, credentials.token, credentials.projectId, codeAssist, dependencies);
+    const quota = await post(fetcher, credentials.token, projectId);
     if (!quota.ok) throw await antigravityHTTPError(quota);
     const body: unknown = await vendorJson(quota);
-    if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) return failed(account, "quota endpoint returned availability only", timestamp);
+    if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) {
+      const tier = parsed.reasonCode ? `; tier ${parsed.tierId ?? parsed.tierName ?? "unknown"} (${parsed.reasonCode})` : "";
+      return failed(account, `quota endpoint returned availability only${tier}`, timestamp);
+    }
     return observationsFromAntigravityQuota(body, account, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
@@ -253,4 +422,52 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const reason = error instanceof AntigravityHTTPError ? error.message : message ? redact(message).slice(0, 512) : "Antigravity usage unavailable";
     return failed(account, reason, timestamp);
   }
+}
+
+function shape(value: unknown, path = "$"): Array<{ path: string; kind: string }> {
+  const kind = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
+  const output = [{ path, kind }];
+  if (object(value)) for (const [key, child] of Object.entries(value)) output.push(...shape(child, `${path}.${key}`));
+  else if (Array.isArray(value) && value[0] !== undefined) output.push(...shape(value[0], `${path}[]`));
+  return output;
+}
+
+/**
+ * Returns response key paths and value kinds for every request the remote
+ * sequence makes (loadCodeAssist, onboardUser only if it actually ran,
+ * retrieveUserQuota), plus the tier id/name and any ineligible-tier
+ * reasonCode `loadCodeAssist` reported -- so a maintainer can see why a tier
+ * was denied without guessing at Google's response shape. Never retains
+ * response values beyond their kind.
+ */
+export async function antigravityResponseShape(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Record<string, unknown>> {
+  const now = dependencies.now?.() ?? new Date();
+  const fetcher = dependencies.fetch ?? fetch;
+  let stored: Credential;
+  try { stored = await credential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureRead, now); }
+  catch { throw new Error("no Gemini CLI OAuth credentials; run: gemini"); }
+  let credentials: Credential;
+  try { credentials = await refresh(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient); }
+  catch (error) { throw error instanceof Error && error.message === "expired" ? new Error("token expired; run: gemini") : error; }
+  const codeAssist = await loadCodeAssist(fetcher, credentials.token);
+  const parsed = parseCodeAssist(codeAssist);
+  const trace: { onboard?: unknown } = {};
+  const projectId = await resolveProjectId(fetcher, credentials.token, credentials.projectId, codeAssist, dependencies, trace);
+  const result: Record<string, unknown> = {
+    loadCodeAssist: { shape: shape(codeAssist), tier: parsed.tierId ?? parsed.tierName ?? null, reasonCode: parsed.reasonCode ?? null },
+    ...(trace.onboard !== undefined ? { onboardUser: { shape: shape(trace.onboard) } } : {}),
+  };
+  // A denied tier is exactly the case this diagnostic exists for: a
+  // retrieveUserQuota failure (a 403 verified live against a free-tier
+  // Antigravity account -- "The caller does not have permission", no
+  // buckets ever returned) must not discard loadCodeAssist's own tier and
+  // reasonCode above, the very thing that explains the denial.
+  try {
+    const quota = await post(fetcher, credentials.token, projectId);
+    if (!quota.ok) throw await antigravityHTTPError(quota);
+    result.retrieveUserQuota = { shape: shape(await vendorJson(quota)) };
+  } catch (error) {
+    result.retrieveUserQuota = { error: error instanceof Error ? redact(error.message).slice(0, 512) : "retrieveUserQuota failed" };
+  }
+  return result;
 }
