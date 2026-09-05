@@ -70,13 +70,10 @@ Already running Claude Code or another agent? Copy [skills/headroom/SKILL.md](sk
 into its skills directory and say "set up headroom": the agent runs discovery, the doctor, the one
 macOS Keychain prompt, the background service and the MCP registration for you.
 
-By hand, the same steps are:
+By hand, the same steps are one command:
 
 ```sh
-headroom doctor              # what is missing, with the next command for each item
-headroom keychain grant      # macOS: one Claude Keychain prompt; choose Always Allow
-headroom install-service     # launchd, systemd user unit, or Windows Task Scheduler
-headroom --help              # full command list; `headroom <command> --help` for one command
+headroom setup                # discovery, doctor, Keychain grant, service, MCP registration -- asks before each change
 ```
 
 `accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom

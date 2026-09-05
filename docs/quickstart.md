@@ -17,6 +17,17 @@ the service installer all expect a `headroom` command on your PATH, so the globa
 one this walkthrough assumes. To work from source instead, clone the repository, run
 `npm install && npm run build`, and use `node dist/cli.js` where the steps say `headroom`.
 
+## Or run `headroom setup`
+
+`headroom setup` does sections 2 through 7 below for you, one step at a time: it prints what
+each step is about to do, asks a yes/no question before anything that changes something, and
+skips the Keychain dialog and the MCP registration if you say no. `--dry-run` shows the whole
+plan without changing anything; `--yes` answers yes to every step except the Keychain grant,
+which it never runs on its own -- it prints the command for you to run yourself instead;
+`--skip-service` and `--skip-mcp` leave those two steps out entirely. The sections below are
+still the explanation of what each step does and why; read them if you want the detail, or if
+something `setup` reports needs a closer look.
+
 ## 2. Find your accounts
 
 ```sh

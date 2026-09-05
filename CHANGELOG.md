@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `headroom setup`: a one-shot interactive setup for a person without an agent. Walks through
+  account discovery, `doctor`, the macOS Keychain grant, the background service install and the
+  MCP registration, printing each step before it runs and asking a yes/no question before
+  anything that changes something. `--dry-run` shows the full plan without changing anything;
+  `--yes` answers yes to every step except the Keychain grant, which it never runs on its own --
+  it prints the command to run by hand instead; `--skip-service` and `--skip-mcp` leave those
+  steps out. With no TTY on stdin and no `--yes`, it prints the plan and exits 0 instead of
+  blocking on a question a script cannot answer. Replaces sections 2-7 of the quickstart for
+  anyone who would rather run one command than read the walkthrough.
+
 ### Changed
 - Antigravity: a daemon-kept `agy` local quota summary reporting an idle window (0% or unknown
   usage, reset equal to fetch time plus window length) is now shown with its vendor-reported
