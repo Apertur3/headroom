@@ -1,6 +1,6 @@
 #!/bin/bash
 # Public-repo audit: things that must never reach a public repository. Exits non-zero on any hit.
-# Checks tracked files, commit metadata and full history. A local, untracked denylist of private
+# Checks tracked files, commit metadata and the history of HEAD and the tags (the refs that get pushed; local backup branches are ignored). A local, untracked denylist of private
 # names may be supplied via PRIVACY_DENYLIST=<file> (one POSIX extended regex per line); it is never committed.
 set -u
 fail=0
@@ -88,7 +88,7 @@ if [ -f "$PRIVACY_DENYLIST" ]; then
       f=$(git ls-files -z -- . ':!LICENSE' ':!package.json' ':!.privacy-denylist' ':!scripts/public-audit.sh' \
         | scan_xargs_grep -n -E "$rx" || true)
       [ -n "$f" ] && note "denylist hit in files ($rx):"$'\n'"$f"
-      h=$(git log -p --all | grep -c -E "$rx" || true); [ "${h:-0}" -gt 0 ] && note "denylist hit in history ($rx): $h lines"
+      h=$(git log -p HEAD --tags -- . ":!LICENSE" ":!package.json" | grep -c -E "$rx" || true); [ "${h:-0}" -gt 0 ] && note "denylist hit in history ($rx): $h lines"
     done < "$PRIVACY_DENYLIST"
   fi
 fi
