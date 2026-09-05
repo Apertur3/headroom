@@ -53,9 +53,9 @@ describe("native:local adapter", () => {
   });
 
   it("fails closed with the reported-only wake command when the base URL is down", async () => {
-    const observation = await observeLocal(local("http://127.0.0.1:1", "ssh gateway wake-workstation"));
-    expect(observation).toMatchObject({ freshness: "failed", reason: "down; wake: ssh gateway wake-workstation", metadata: { state: "DOWN", cost_model: "marginal" } });
-    expect(formatMeters([observation], defaultPolicy)).toEqual(["gpu-box:capacity  DOWN (wake: ssh gateway wake-workstation)"]);
+    const observation = await observeLocal(local("http://127.0.0.1:1", "ssh gateway wake-gpu-box"));
+    expect(observation).toMatchObject({ freshness: "failed", reason: "down; wake: ssh gateway wake-gpu-box", metadata: { state: "DOWN", cost_model: "marginal" } });
+    expect(formatMeters([observation], defaultPolicy)).toEqual(["gpu-box:capacity  DOWN (wake: ssh gateway wake-gpu-box)"]);
   });
 });
 
@@ -74,7 +74,7 @@ describe("local routing preference", () => {
     const observations = new Map([["codex:main", subscription()], ["gpu-box:capacity", localUp()]]);
     expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "fallback", { ...defaultPolicy, pace_grace_fraction: 0 }, false, now)).toMatchObject({ allowed: true, meter: "gpu-box:capacity", state: "UP", reason: "UP, model unknown, 0 running", local_preference: "fallback", local_meter_considered: true });
     expect(canRoute(["codex:main"], ["gpu-box:capacity"], observations, "never", { ...defaultPolicy, pace_grace_fraction: 0 }, false, now)).toMatchObject({ allowed: false, local_preference: "never", local_meter_considered: false });
-    expect(parseRouting('local_preference = "prefer"\n[consumes]\nbuild = ["codex:main"]')).toEqual({ local_preference: "prefer", consumes: { build: ["codex:main"] } });
+    expect(parseRouting('local_preference = "prefer"\n[consumes]\nbuild = ["codex:main"]')).toEqual({ local_preference: "prefer", consumes: { build: ["codex:main"] }, costs: {} });
   });
 
   it("does not treat UNKNOWN subscriptions as a local fallback budget signal", () => {
