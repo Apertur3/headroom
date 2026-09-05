@@ -8,6 +8,23 @@ description: Budget-aware orchestration with Headroom. Use before spawning agent
 Headroom reports remaining capacity per meter (account × limit family), with reset times, pace
 states and freshness. Capability routing stays yours, in `~/.headroom/routing.toml`.
 
+## Setting Headroom up
+
+When the user asks to set up, install or configure Headroom, run these in order and stop at the
+first one that fails, showing its output:
+
+1. `headroom version`; if the command is missing, `npm install -g headroomd` (Node 22.13 or newer).
+2. `headroom accounts discover`, then show the user the accounts it found and ask which to keep.
+3. `headroom doctor`; every non-OK line names the next command. Repeat until only WARN lines about
+   the daemon remain.
+4. macOS only: tell the user to run `headroom keychain grant` themselves in a terminal, because it
+   opens one Keychain dialog that must be answered with Always Allow. Never run it for them.
+5. `headroom install-service` (launchd, a systemd user unit, or Windows Task Scheduler), then
+   `headroom doctor` again until the daemon lines are OK.
+6. Register the MCP server in the agent that will use it, for example
+   `claude mcp add headroom -- headroom mcp`, and confirm with a `quota_status` call.
+7. Show `headroom` once and explain the pace state on each row.
+
 ## The rule of order
 
 1. **Pick by capability first.** Decide which pool is best for the task from your own routing
