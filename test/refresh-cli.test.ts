@@ -34,7 +34,7 @@ describe("headroom --refresh / --ttl 0", () => {
     // extra real poll it didn't expect.
     await writeFile(join(root, "policy.toml"), "poll_interval_minutes = 0.05\n"); // 3s
     let polls = 0;
-    const path = process.platform === "win32" ? socketPath() : join(root, "headroom.sock");
+    const path = socketPath(root);
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => { polls += 1; return { observations: [fixture()], failures: [] }; } });
     try { await daemon.start(); }
     catch (error: unknown) {
