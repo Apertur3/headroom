@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Windows named pipe: the daemon only ever authenticated the client, not itself. Because the pipe
+  namespace is machine-global, another local process (including one running as a different user)
+  could squat the pipe name before the real daemon started and answer requests with forged results;
+  `health`'s static signature made this worse since it could be captured once from a real daemon and
+  replayed forever. The client now verifies a per-connection proof on every reply, including
+  `health`'s, and treats a missing or wrong one exactly like no daemon answering at all. POSIX is
+  unaffected.
+
 ## [0.1.0-beta.3] - 2026-09-06
 
 ### Added
