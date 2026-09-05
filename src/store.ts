@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
-import { AVAILABILITY_ONLY_REASON, normalizeObservations } from "./engine/observation.js";
+import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
@@ -326,19 +326,20 @@ export class HeadroomStore {
       }
     }
     const previous = this.previous(observation);
+    const resolved = this.resolveIdleContradiction(observation);
     // Reasons and metadata come from vendor responses (or their diagnostics)
     // and are persisted; redact them the same way any other vendor-adjacent
     // output is redacted, so a token or cookie that leaked into a failure
     // reason or a metadata string never lands in the database either.
-    const reason = observation.reason ? redact(observation.reason) : observation.reason ?? null;
-    const metadata = observation.metadata ? redactDeep(observation.metadata) as Observation["metadata"] : observation.metadata;
+    const reason = resolved.reason ? redact(resolved.reason) : resolved.reason ?? null;
+    const metadata = resolved.metadata ? redactDeep(resolved.metadata) as Observation["metadata"] : resolved.metadata;
     const result = this.db.prepare(`INSERT INTO observations
       (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      observation.principal_id, observation.meter_id, json(observation.window), json(observation.quantity), observation.resets_at ?? null,
-      observation.observed_at ?? null, observation.fetched_at ?? null, observation.source, observation.truth, observation.freshness, observation.confidence,
-      observation.adapter_version, observation.upstream_schema_version, reason, json(metadata));
-    const stored: StoredObservation = { ...observation, reason, metadata, id: Number(result.lastInsertRowid) };
+      resolved.principal_id, resolved.meter_id, json(resolved.window), json(resolved.quantity), resolved.resets_at ?? null,
+      resolved.observed_at ?? null, resolved.fetched_at ?? null, resolved.source, resolved.truth, resolved.freshness, resolved.confidence,
+      resolved.adapter_version, resolved.upstream_schema_version, reason, json(metadata));
+    const stored: StoredObservation = { ...resolved, reason, metadata, id: Number(result.lastInsertRowid) };
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.recordFailure([stored.id], stored);
     // The first reading ever stored under this exact meter id has no immediate
@@ -362,6 +363,40 @@ export class HeadroomStore {
     return row ? observationFromRow(row) : undefined;
   }
 
+  /** The most recent FRESH reading for this exact meter and window, fetched
+   * within the last 2 hours of this new observation's own fetch time --
+   * the contradiction evidence resolveIdleContradiction() checks a
+   * detectPlaceholder-flagged idle reading against. */
+  private recentFreshReading(observation: Observation): StoredObservation | undefined {
+    const window = observation.window ? JSON.stringify(observation.window) : null;
+    const since = new Date(Date.parse(observation.fetched_at) - 2 * 3_600_000).toISOString();
+    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
+      AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
+      .get(observation.meter_id, window, window, since);
+    return row ? observationFromRow(row) : undefined;
+  }
+
+  /**
+   * observation.ts's normalizeObservations() flags a vendor-reported idle
+   * window (IDLE_WINDOW_REASON) rather than failing it, since the owner's
+   * decision is to show the vendor's own numbers and annotate doubt instead
+   * of guessing. The one case that doubt becomes an outright failure: this
+   * store's own history, within the last 2 hours, already showed real usage
+   * on this exact meter and window whose reset has not happened yet -- a
+   * vendor cannot legitimately go from spending to idle without a reset in
+   * between, so a reading that claims otherwise contradicts evidence Headroom
+   * already trusted, not just a heuristic shape.
+   */
+  private resolveIdleContradiction(observation: Observation): Observation {
+    if (observation.freshness !== "fresh" || observation.reason !== IDLE_WINDOW_REASON) return observation;
+    const evidence = this.recentFreshReading(observation);
+    if (!evidence || evidence.quantity?.unit !== "percent" || !(evidence.quantity.used > 0)) return observation;
+    const resetDue = evidence.resets_at ? Date.parse(evidence.resets_at) : Number.NaN;
+    const now = Date.parse(observation.fetched_at);
+    if (!Number.isFinite(resetDue) || !Number.isFinite(now) || resetDue <= now) return observation;
+    return { ...observation, freshness: "failed", confidence: 0, reason: idleContradictionReason(evidence.quantity.used) };
+  }
+
   private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null): void {
     const created = current.fetched_at;
     const id = `${kind}:${current.id}`;
@@ -372,8 +407,8 @@ export class HeadroomStore {
   }
 
   private addSourceFailedEvent(evidence: number[], current: StoredObservation): void {
-    const availabilityOnly = current.reason === AVAILABILITY_ONLY_REASON;
-    this.addEvent("source_failed", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current, availabilityOnly ? AVAILABILITY_ONLY_REASON : null, current.fetched_at);
+    const inferred = isInferredFailureReason(current.reason);
+    this.addEvent("source_failed", inferred ? "inferred" : "vendor_reported", inferred ? 0.8 : 1, evidence, current, inferred ? current.reason : null, current.fetched_at);
   }
 
   /** The still-open source_failed event for this meter and window, or
@@ -606,8 +641,8 @@ export class HeadroomStore {
     }
     if (previous.freshness === "failed") {
       if (current.freshness !== "fresh") return; // recovered into an unenforced/stale read, not a real recovery
-      const availabilityOnly = previous.reason === AVAILABILITY_ONLY_REASON;
-      this.addEvent("source_recovered", availabilityOnly ? "inferred" : "vendor_reported", availabilityOnly ? 0.8 : 1, evidence, current);
+      const inferred = isInferredFailureReason(previous.reason);
+      this.addEvent("source_recovered", inferred ? "inferred" : "vendor_reported", inferred ? 0.8 : 1, evidence, current);
       const baseline = this.freshBaseline(current);
       if (baseline) this.classifyUsageDrop(baseline, current);
       return;

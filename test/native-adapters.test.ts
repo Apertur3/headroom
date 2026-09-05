@@ -117,7 +117,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]));
   });
 
-  it("normalizes a synthetic-reset quota snapshot with the shared placeholder rule", () => {
+  it("flags a synthetic-reset idle quota snapshot with the shared doubt marker instead of failing it", () => {
     const at = new Date("2026-09-03T17:26:36Z");
     const rows = observationsFromAntigravityQuota({ buckets: [
       { modelId: "gemini-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
@@ -125,8 +125,11 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       { modelId: "claude-gpt-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
       { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
     ] }, antigravity, at);
+    // Every window here is idle with a manufactured reset, so the vendor's own
+    // 0%-used numbers stay (freshness fresh, quantity present) but truth and
+    // confidence flag the doubt -- see engine/observation.ts's IDLE_WINDOW_REASON.
     expect(rows.filter((row) => row.meter_id === "antigravity:gemini")).toEqual(expect.arrayContaining([
-      expect.objectContaining({ freshness: "failed", reason: "availability-only payload; quota summary not served" }),
+      expect.objectContaining({ freshness: "fresh", truth: "estimated", confidence: 0.5, reason: "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder", quantity: expect.objectContaining({ used: 0 }) }),
     ]));
   });
 

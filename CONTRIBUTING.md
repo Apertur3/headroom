@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for taking a look. Headroom is pre-alpha and moves quickly; small, focused pull requests
+Thanks for taking a look. Headroom is in beta and moves quickly; small, focused pull requests
 land fastest.
 
 ## Ground rules
