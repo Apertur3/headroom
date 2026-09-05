@@ -1,4 +1,9 @@
-# Headroom
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img alt="Headroom" src="docs/assets/logo-light.svg" width="300">
+  </picture>
+</p>
 
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 

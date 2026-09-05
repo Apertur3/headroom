@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 64" width="360" height="64" fill="none">
+  <g stroke="currentColor" stroke-width="7" stroke-linecap="round">
+    <line x1="10" y1="12" x2="54" y2="12"/>
+    <line x1="18" y1="24" x2="18" y2="56"/>
+    <line x1="46" y1="24" x2="46" y2="56"/>
+    <line x1="18" y1="42" x2="46" y2="42"/>
+  </g>
+  <text x="76" y="47" fill="currentColor" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="36" font-weight="600" letter-spacing="-0.5">headroom</text>
+</svg>
