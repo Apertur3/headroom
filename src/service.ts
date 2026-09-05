@@ -33,7 +33,7 @@ export function serviceContents(script: string, platform = process.platform, run
   return `[Unit]\nDescription=Headroom quota daemon\n[Service]\nEnvironment="PATH=${path}"\nExecStart=${JSON.stringify(runtime)} ${JSON.stringify(script)} daemon\nStandardOutput=append:${log}\nStandardError=append:${log}\nRestart=on-failure\n[Install]\nWantedBy=default.target\n`;
 }
 
-export async function installService(script = process.argv[1] ?? "headroom", platform = process.platform, home = homedir(), runtime = process.execPath, dryRun = false, env = process.env, username = userInfo().username): Promise<{ path: string; command: string; dryRun: boolean }> {
+export async function installService(script = process.argv[1] ?? "headroom", platform = process.platform, home = homedir(), runtime = process.execPath, dryRun = false, env = process.env, username = userInfo().username): Promise<{ path: string; command: string; dryRun: boolean; contents: string }> {
   const path = servicePath(platform, home, env);
   const command = platform === "darwin" ? `launchctl bootstrap gui/$(id -u) ${path}` : platform === "win32" ? `schtasks /Create /TN "Headroom Daemon" /XML "${path}" /F` : "systemctl --user enable --now headroom.service";
   const contents = serviceContents(script, platform, runtime, username, home, env);
@@ -42,7 +42,7 @@ export async function installService(script = process.argv[1] ?? "headroom", pla
     await mkdir(dirname(daemonLogPath(headroomHome({ platform, home, env }))), { recursive: true, mode: 0o700 });
     await writeFile(path, contents, { mode: 0o600 });
   }
-  return { path, command, dryRun };
+  return { path, command, dryRun, contents };
 }
 
 export async function uninstallService(platform = process.platform, home = homedir(), dryRun = false, env = process.env): Promise<{ path: string; command: string; dryRun: boolean }> {

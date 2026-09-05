@@ -1,3 +1,4 @@
+import { formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 export interface Policy {
@@ -133,9 +134,11 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   // `label value STATE` form, since there the trailing state word is the pace
   // classification of a real percentage, not a duplicate of it.
   if (deciding.state === "UNKNOWN") return { state: deciding.state, reason: `${windowLabel(deciding.observation)} UNKNOWN (${deciding.reason})` };
+  const seconds = resetsIn(deciding.observation.resets_at, now).resets_in_seconds;
+  const resetSuffix = seconds === null ? "" : `, resets in ${formatResetsInCoarse(seconds)}`;
   return {
     state: deciding.state,
-    reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}`,
+    reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}${resetSuffix}`,
   };
 }
 

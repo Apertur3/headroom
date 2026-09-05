@@ -10,6 +10,9 @@ secrets/
 # --- gbrain per-worktree pin (machine-local) ---
 .gbrain-source
 
+# --- generated Claude probe binary (built by scripts/build-probe.sh; never committed) ---
+bin/probe/
+
 # --- dependencies / build ---
 node_modules/
 dist/

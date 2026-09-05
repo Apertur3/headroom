@@ -133,6 +133,21 @@ else
   fail "headroom doctor" "exit $doctor_code: stdout=[$doctor_out] stderr=[$doctor_err]"
 fi
 
+# --- step: headroom --help / help -------------------------------------------
+# Regression: the launcher rewrite for signal forwarding, and the CLI's own
+# --help addition, must both keep working from the actual packed, globally
+# installed binary -- not just from `node dist/cli.js` in a source checkout.
+run_headroom help_flag --help
+run_headroom help_word help
+if [[ "$help_flag_code" -eq 0 && "$help_word_code" -eq 0 ]] \
+  && printf '%s' "$help_flag_out" | grep -q "^Commands:$" \
+  && printf '%s' "$help_flag_out" | grep -q "  doctor " \
+  && printf '%s' "$help_word_out" | grep -q "^Commands:$"; then
+  pass "headroom --help / headroom help"
+else
+  fail "headroom --help" "flag exit $help_flag_code, word exit $help_word_code: stdout=[$help_flag_out] stderr=[$help_flag_err]"
+fi
+
 # --- step: headroom (bare) --------------------------------------------------
 run_headroom bare
 up_lines="$(printf '%s\n' "$bare_out" | grep -c "fixture-local:capacity  UP model=local-27b running=0 waiting=0" || true)"

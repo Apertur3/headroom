@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readPolicy, readRouting } from "./config.js";
+import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
@@ -7,14 +7,15 @@ import { doctor } from "./doctor.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
+import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
+import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { HeadroomStore } from "./store.js";
@@ -57,7 +58,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   const evidence = `${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed)}` : ""}`;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)} ${state}${evidence}`;
+  const seconds = resetsIn(observation.resets_at).resets_in_seconds;
+  const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${evidence}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -284,7 +287,7 @@ async function observe(argv: string[]): Promise<number> {
       const accounts = await readAccounts();
       const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude" && (!principal || account.name === principal)).map((account) => account.name);
       await syncClaudeGrantState(store, claudeIds);
-      const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store) });
+      const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store), noDaemon: true });
       failures = polled.failures;
       store.insertAll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
@@ -306,7 +309,7 @@ async function observe(argv: string[]): Promise<number> {
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) console.log(JSON.stringify(thresholdRows === undefined ? { observations, leases } : { observations, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }));
+  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } })); }
   else { for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line); for (const failure of failures) console.log(failure); }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
@@ -358,6 +361,12 @@ async function logs(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** The message for a config dir Claude Code was never logged into: distinct
+ * from a Keychain access denial, since there is nothing to grant yet. */
+export function noKeychainItemMessage(directory: string): string {
+  return `no Claude login for ${directory}; run: CLAUDE_CONFIG_DIR=${directory} claude, or remove this principal from accounts.toml`;
+}
+
 /** With no --principal this grants every Claude principal in the registry: one
  * Keychain dialog per principal, one printed confirmation line each. A grant
  * always clears that principal's keychain_grant_needed marker (set by a prior
@@ -370,10 +379,24 @@ async function keychain(argv: string[]): Promise<number> {
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
   if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
   const store = await HeadroomStore.open();
+  let failures = 0;
   try {
     const hash = process.platform === "darwin" ? await probeBinaryHash() : undefined;
     for (const account of targets) {
-      await grantClaudeKeychainAccess(account.location);
+      try {
+        await grantClaudeKeychainAccess(account.location);
+      } catch (error) {
+        // Claude Code was never run against this config dir, so there is
+        // nothing for the operator to grant access to yet: a distinct,
+        // actionable message beats the probe's generic "no credentials"
+        // wording, and must not abort the remaining principals.
+        if (error instanceof ClaudeProbeError && error.message === "no credentials in Keychain for this config dir") {
+          console.error(noKeychainItemMessage(account.location));
+          failures += 1;
+          continue;
+        }
+        throw error;
+      }
       store.clearKeychainGrantNeeded(account.name);
       // The binary that just proved itself under an operator-run grant must
       // never be treated as an unproven first run again by a background poll.
@@ -381,10 +404,65 @@ async function keychain(argv: string[]): Promise<number> {
       console.log(`Keychain access granted for ${account.name}`);
     }
   } finally { store.close(); }
-  return 0;
+  return failures ? 1 : 0;
 }
 
-async function main(argv: string[]): Promise<number> {
+/** One line per top-level command for `headroom --help` / `headroom help`. */
+export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
+  ["status", "Print one line per meter (the default; also takes --json, --principal, --threshold)"],
+  ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
+  ["events", "List reset and free-reset events"],
+  ["history <meter>", "List stored observations for one meter"],
+  ["lease start|list|end", "Reserve, list, or release a meter lease"],
+  ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
+  ["doctor", "Diagnose the installation: principals, credentials, daemon, config"],
+  ["keychain grant", "macOS: grant the Claude probe Keychain access"],
+  ["install-service", "Install the daemon as a launchd/systemd/Task Scheduler service"],
+  ["uninstall-service", "Remove the installed daemon service"],
+  ["daemon", "Run the daemon in the foreground (an installed service does this for you)"],
+  ["mcp", "Run the MCP server over stdio"],
+  ["engine install", "Install the optional native sensing engine"],
+  ["engine status", "Show whether the native and upstream engines are installed"],
+  ["logs", "Print the tail of the daemon log"],
+];
+
+/** Usage text for `headroom <command> --help`, keyed by the command's first token. */
+export const COMMAND_HELP: Readonly<Record<string, string>> = {
+  can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--json]",
+  events: "Usage: headroom events [--since 24h] [--table]",
+  history: "Usage: headroom history <meter> [--since 24h]",
+  lease: [
+    "Usage: headroom lease <start|end|list>",
+    "  start: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...]",
+    "  end:   headroom lease end <id> --owner <name> [--force]",
+    "  list:  headroom lease list",
+  ].join("\n"),
+  accounts: "Usage: headroom accounts discover",
+  doctor: "Usage: headroom doctor",
+  keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
+  "install-service": "Usage: headroom install-service [--dry-run]",
+  "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
+  daemon: "Usage: headroom daemon",
+  mcp: "Usage: headroom mcp",
+  engine: "Usage: headroom engine <install|status> [--pin]",
+  logs: "Usage: headroom logs [--tail 50]",
+};
+
+export function helpText(): string {
+  const width = Math.max(...COMMAND_LIST.map(([name]) => name.length));
+  return [
+    "Usage: headroom [command] [options]",
+    "",
+    "Commands:",
+    ...COMMAND_LIST.map(([name, summary]) => `  ${name.padEnd(width)}  ${summary}`),
+    "",
+    "Run `headroom <command> --help` for usage on one command.",
+  ].join("\n");
+}
+
+export async function main(argv: string[]): Promise<number> {
+  if (argv[0] === "--help" || argv[0] === "help") { console.log(helpText()); return 0; }
+  if (argv.includes("--help") && argv[0] && COMMAND_HELP[argv[0]]) { console.log(COMMAND_HELP[argv[0]]); return 0; }
   // Before any command can fetch a vendor endpoint: an operator's shell
   // proxy must never silently carry a credentialed request unless
   // policy.toml opts in.
@@ -401,7 +479,14 @@ async function main(argv: string[]): Promise<number> {
     console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256})`); return 0;
   }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
-  if (argv[0] === "accounts" && argv[1] === "discover") { const accounts = await discoverAccounts(); console.log(accountsToml(accounts)); await writeDiscoveredAccounts(accounts); return 0; }
+  if (argv[0] === "accounts" && argv[1] === "discover") {
+    const accounts = await discoverAccounts();
+    console.log(accountsToml(accounts));
+    await writeDiscoveredAccounts(accounts);
+    console.log(`Wrote ${accountsPath()} (${accounts.length} account${accounts.length === 1 ? "" : "s"}). Next: headroom doctor`);
+    for (const line of await seedExampleConfig()) console.log(line);
+    return 0;
+  }
   if (argv[0] === "doctor") return doctor();
   if (argv[0] === "logs") return logs(argv.slice(1));
   if (argv[0] === "daemon") return daemon();
@@ -410,7 +495,9 @@ async function main(argv: string[]): Promise<number> {
   if (argv[0] === "install-service") {
     if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom install-service [--dry-run]");
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
-    console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`); return 0;
+    console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`);
+    if (result.dryRun) console.log(`\n${result.contents}`);
+    return 0;
   }
   if (argv[0] === "uninstall-service") {
     if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom uninstall-service [--dry-run]");
@@ -443,6 +530,18 @@ export function isMainModule(metaUrl: string, argv1: string | undefined): boolea
   catch { return false; }
 }
 
+/** True only for the exact ENOENT a fresh install produces the first time any
+ * command reads accounts.toml -- never for a symlink/permission failure or an
+ * ENOENT on some other path, which must still surface as a real error. */
+export function isAccountsMissingError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const errno = error as NodeJS.ErrnoException;
+  return errno.code === "ENOENT" && errno.path === accountsPath();
+}
+
 if (isMainModule(import.meta.url, process.argv[1])) {
-  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => { console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1; });
+  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => {
+    if (isAccountsMissingError(error)) { console.error("No accounts configured yet. Run: headroom accounts discover"); process.exitCode = 1; return; }
+    console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1;
+  });
 }

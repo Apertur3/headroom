@@ -34,6 +34,7 @@
   "files": [
     "dist",
     "bin",
+    "bin/probe/**",
     "engine.lock.json",
     "README.md",
     "LICENSE",
@@ -47,7 +48,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepack": "npm run build",
+    "prepack": "(npm run build && bash scripts/build-probe.sh) 1>&2",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "engine:build": "bash scripts/build-engine.sh",

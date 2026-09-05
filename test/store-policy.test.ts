@@ -441,7 +441,7 @@ describe("pace and consumes", () => {
     expect(paceState(frozen, policy, now)).toBe("FREEZE");
     expect(paceState(paced(10, { freshness: "stale" }), policy, now)).toBe("UNKNOWN");
     const parent = paced(10, { meter_id: "claude-main:all" });
-    expect(canConsume([parent.meter_id, frozen.meter_id], new Map([[parent.meter_id, parent], [frozen.meter_id, frozen]]), policy, false, now)).toMatchObject({ allowed: false, meter: "claude-main:fable", state: "FREEZE", reason: "100m 95% FREEZE", meters: [expect.objectContaining({ meter: "claude-main:all" }), expect.objectContaining({ meter: "claude-main:fable", state: "FREEZE" })] });
+    expect(canConsume([parent.meter_id, frozen.meter_id], new Map([[parent.meter_id, parent], [frozen.meter_id, frozen]]), policy, false, now)).toMatchObject({ allowed: false, meter: "claude-main:fable", state: "FREEZE", reason: "100m 95% FREEZE, resets in 50m", meters: [expect.objectContaining({ meter: "claude-main:all" }), expect.objectContaining({ meter: "claude-main:fable", state: "FREEZE" })] });
   });
 
   it("holds pace at NORMAL for the early grace period unless frozen", () => {
@@ -466,7 +466,7 @@ describe("pace and consumes", () => {
     const fiveHour = paced(0, { window: { kind: "rolling", minutes: 300, enforcement: "hard" }, freshness: "not_enforced", quantity: null, resets_at: null });
     const weekly = paced(17, { window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, resets_at: "2026-09-10T12:00:00Z" });
     const decision = canConsume([weekly.meter_id], new Map([[weekly.meter_id, [fiveHour, weekly]]]), { ...policy, pace_grace_fraction: 0 }, false, now);
-    expect(decision).toMatchObject({ allowed: false, state: "CONSERVE", reason: "wk 17% CONSERVE", meters: [expect.objectContaining({ state: "CONSERVE", reason: "wk 17% CONSERVE" })] });
+    expect(decision).toMatchObject({ allowed: false, state: "CONSERVE", reason: "wk 17% CONSERVE, resets in 7d", meters: [expect.objectContaining({ state: "CONSERVE", reason: "wk 17% CONSERVE, resets in 7d" })] });
   });
 
   it("formats each latest window once, with reasons only once", () => {
@@ -507,6 +507,14 @@ describe("pace and consumes", () => {
     const absent = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "not_enforced", quantity: null, fetched_at: new Date().toISOString() });
     expect(formatMeters([fresh, absent], defaultPolicy)[0]).toContain("(fresh <1m)");
     expect(formatMeters([absent], defaultPolicy)[0]).toContain("(not enforced <1m)");
+  });
+
+  it("prints a reset countdown next to the absolute reset time, and omits it when the window has no reset", () => {
+    const resetsAt = new Date(Date.now() + 5 * 3_600_000);
+    const fresh = observation({ meter_id: "codex-main:main", fetched_at: new Date().toISOString(), resets_at: resetsAt.toISOString() });
+    expect(formatMeters([fresh], defaultPolicy)[0]).toContain("(in 5h)");
+    const unknown = observation({ meter_id: "codex-main:main", freshness: "failed", quantity: null, reason: "boom" });
+    expect(formatMeters([unknown], defaultPolicy)[0]).not.toContain("(in ");
   });
 
   it("returns every window's threshold result and preserves fail-closed blocking", () => {
