@@ -137,33 +137,27 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      # A step-level `if: secrets.X != ''` is unreliable (secrets aren't a
-      # valid context there); mirror it into env once at job level instead.
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - name: Skip notice
-        if: ${{ env.NPM_TOKEN == '' }}
-        run: echo "::notice title=npm publish skipped::NPM_TOKEN is not configured; the GitHub release was created but nothing was published to npm."
       - uses: actions/checkout@v4
-        if: ${{ env.NPM_TOKEN != '' }}
       - uses: actions/setup-node@v4
-        if: ${{ env.NPM_TOKEN != '' }}
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Trusted publishing (OpenID Connect) needs npm 11.5.1 or newer; Node 22
+      # ships an older npm. No token is involved: npmjs.com trusts this
+      # repository's release workflow directly and records provenance.
+      - run: npm install -g npm@latest && npm --version
       - uses: actions/download-artifact@v4
-        if: ${{ env.NPM_TOKEN != '' }}
         with:
           name: npm-tarball
           path: dist-release
       - name: npm publish
-        if: ${{ env.NPM_TOKEN != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
-          VERSION: ${{ needs.tarball.outputs.version }}
+        id: publish
+        continue-on-error: true
         run: |
           tarball="$(ls dist-release/*.tgz)"
-          tag="latest"
-          [[ "$VERSION" == *-* ]] && tag="beta"
-          npm publish "$tarball" --provenance --access public --tag "$tag"
+          npm publish "$tarball" --provenance --access public --tag latest
+      - name: Publish did not happen
+        if: ${{ steps.publish.outcome == 'failure' }}
+        run: |
+          echo "::warning title=npm publish skipped::npm refused the publish. Either the trusted publisher for this repository and workflow is not configured on npmjs.com yet, or this version already exists. The GitHub release was created; re-run this job after fixing the cause."
