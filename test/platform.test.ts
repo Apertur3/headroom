@@ -49,6 +49,13 @@ describe("HEADROOM_HOME ancestor safety", () => {
     const loose = join(root, "loose");
     await mkdir(loose, { mode: 0o777 });
     await chmod(loose, 0o777); // belt and suspenders: mkdir's mode is umask-masked too
+    if (process.platform === "win32") {
+      // Windows has no POSIX mode bits to inspect; assertSafeAncestry itself
+      // skips this check for platform "win32" (see its `continue` on the
+      // writable-without-sticky test), so there is nothing to refuse here.
+      await expect(assertSafeAncestry(join(loose, ".headroom"))).resolves.toBeUndefined();
+      return;
+    }
     await expect(assertSafeAncestry(join(loose, ".headroom"))).rejects.toThrow("group or world writable without the sticky bit");
   });
 
@@ -56,6 +63,15 @@ describe("HEADROOM_HOME ancestor safety", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-ancestry-otheruser-")); temporary.push(root);
     const home = join(root, "home");
     await mkdir(home, { mode: 0o755 });
+    if (process.platform === "win32") {
+      // fs.Stats.uid is always 0 on Windows (there is no real POSIX uid to
+      // read), so there is no ownership to compare against a synthetic
+      // "other user" -- assertSafeAncestry has no meaningful uid model here
+      // even when a caller forces its way past the "no uid at all" early
+      // return by passing an explicit uid, as this test does.
+      await expect(assertSafeAncestry(join(home, ".headroom"), { uid: (process.getuid?.() ?? 0) + 1 })).resolves.toBeUndefined();
+      return;
+    }
     await expect(assertSafeAncestry(join(home, ".headroom"), { uid: (process.getuid?.() ?? 0) + 1 })).rejects.toThrow("is owned by another user");
   });
 

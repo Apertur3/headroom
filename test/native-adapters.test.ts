@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
@@ -14,6 +14,16 @@ const claude = { name: "claude-main", vendor: "claude", location: "/Users/test/.
 const codex = { name: "codex-main", vendor: "codex", location: "/Users/test/.codex", adapter: "native-ts" } as const;
 const antigravity = { name: "antigravity", vendor: "antigravity", location: "/Users/test/.gemini/antigravity-cli", adapter: "native-ts" } as const;
 const at = new Date("2026-09-03T17:26:36Z");
+// The adapters build their "run: CLAUDE_CONFIG_DIR=... claude" / "run:
+// CODEX_HOME=... codex login" reason text from resolve(account.location):
+// on Windows, resolve() of this POSIX-looking fixture path comes back
+// drive-relative with backslashes (there is no real Windows equivalent of
+// "/Users/test/.claude2" -- it is just a fixed fixture, not a simulated
+// platform path). Building the expectation through the same resolve() call
+// keeps the assertion correct on every platform instead of hardcoding the
+// forward-slash form.
+const claude2Dir = resolve("/Users/test/.claude2");
+const codex2Dir = resolve("/Users/test/.codex2");
 
 describe("native TypeScript adapter conformance (synthetic until recorder capture)", () => {
   it("ports Claude usage windows and its scoped not-enforced semantics", async () => {
@@ -238,9 +248,9 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const expiredCodex = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() - 1 } }) });
     const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: "token", expiry_date: "2026-09-03T17:26:35Z" }) });
-    expect(expiredClaude[0].reason).toBe("token expired; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
-    expect(missingClaude[0].reason).toBe("no credentials in Keychain for this config dir; run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
-    expect(expiredCodex[0].reason).toBe("token expired; run: CODEX_HOME=/Users/test/.codex2 codex login");
+    expect(expiredClaude[0].reason).toBe(`token expired; run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
+    expect(missingClaude[0].reason).toBe(`no credentials in Keychain for this config dir; run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
+    expect(expiredCodex[0].reason).toBe(`token expired; run: CODEX_HOME=${codex2Dir} codex login`);
     expect(expiredAntigravity[0].reason).toBe("token expired; run: gemini");
   });
 
@@ -253,14 +263,14 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const claude2 = { ...claude, name: "claude-2", location: "/Users/test/.claude2" };
     const rejected401 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
     const rejected403 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 403 }) });
-    expect(rejected401[0].reason).toBe("Claude rejected the token (401); run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
-    expect(rejected403[0].reason).toBe("Claude rejected the token (403); run: CLAUDE_CONFIG_DIR=/Users/test/.claude2 claude");
+    expect(rejected401[0].reason).toBe(`Claude rejected the token (401); run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
+    expect(rejected403[0].reason).toBe(`Claude rejected the token (403); run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
 
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const codexRejected401 = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
     const codexRejected403 = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 403 }) });
-    expect(codexRejected401[0].reason).toBe("Codex rejected the token (401); run: CODEX_HOME=/Users/test/.codex2 codex login");
-    expect(codexRejected403[0].reason).toBe("Codex rejected the token (403); run: CODEX_HOME=/Users/test/.codex2 codex login");
+    expect(codexRejected401[0].reason).toBe(`Codex rejected the token (401); run: CODEX_HOME=${codex2Dir} codex login`);
+    expect(codexRejected403[0].reason).toBe(`Codex rejected the token (403); run: CODEX_HOME=${codex2Dir} codex login`);
 
     // The parenthesized status code -- collector.ts's shared backoff pattern --
     // must still match the new, friendlier wording.
