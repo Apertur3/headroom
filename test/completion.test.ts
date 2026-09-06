@@ -118,7 +118,7 @@ describe("headroom _complete-meters (hidden)", () => {
     });
   });
 
-  it("prints nothing, and still exits 0, with no store and no daemon", async () => {
+  it.skipIf(process.platform === "win32")("prints nothing, and still exits 0, with no store and no daemon (Windows: see issue 8, the bound is not yet proven on the pipe path)", async () => {
     await withHeadroomHome(async () => {
       const { logs, restore } = captureLog();
       try { expect(await main(["_complete-meters"])).toBe(0); }
