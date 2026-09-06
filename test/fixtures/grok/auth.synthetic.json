@@ -1,0 +1,12 @@
+{
+  "https://auth.x.ai::synthetic-client-id": {
+    "auth_mode": "oidc",
+    "key": "synthetic-oidc-value-not-a-real-credential",
+    "expires_at": "2026-09-07T00:00:00Z",
+    "email": "user@example.com"
+  },
+  "https://accounts.x.ai/sign-in": {
+    "auth_mode": "session",
+    "key": "synthetic-legacy-value-not-a-real-credential"
+  }
+}

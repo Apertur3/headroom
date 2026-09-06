@@ -1,0 +1,8 @@
+{
+  "_comment": "SYNTHETIC. loadCodeAssist for an account that has not finished Code Assist setup: a current tier and allowed tiers, but no cloudaicompanionProject to ask quota for.",
+  "currentTier": { "id": "free-tier", "name": "Gemini Code Assist for individuals" },
+  "allowedTiers": [
+    { "id": "free-tier", "isDefault": true },
+    { "id": "standard-tier" }
+  ]
+}

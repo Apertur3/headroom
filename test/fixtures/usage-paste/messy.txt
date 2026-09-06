@@ -1,0 +1,14 @@
+# synthetic fixture, hand written for these tests, not a capture of anyone's account
+# ragged spacing, a stray figure above the panel that belongs to no window, and a
+# label whose bar never rendered a percentage.
+
+   total cost $0.55 this session
+
+Session          22 %   used
+     Resets  in   45 minutes
+
+Current week (all models)
+     Resets Sep 13, 14:00
+
+Current week (Fable)
+   88% used

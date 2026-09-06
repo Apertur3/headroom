@@ -1,8 +1,10 @@
 import { constants, promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
 import { expandHome, headroomHome, vendorHome } from "./paths.js";
+import { grokAuthPath } from "./adapters/grok.js";
+import { kimiTokenPath } from "./adapters/kimi.js";
 
 export function accountsPath(): string { return join(headroomHome(), "accounts.toml"); }
 
@@ -25,6 +27,15 @@ async function agyOnPath(pathValue: string | undefined): Promise<boolean> {
   }))).some(Boolean);
 }
 
+/** `gemini` for the Gemini CLI's default home, `gemini-<basename>` for a
+ * GEMINI_CLI_HOME override, so two Gemini logins on one machine stay
+ * distinguishable in accounts.toml and in every meter id. */
+function geminiPrincipalName(geminiRoot: string, home: string): string {
+  if (resolve(geminiRoot) === resolve(home)) return "gemini";
+  const label = basename(geminiRoot).replace(/^\.+/, "").replace(/[^A-Za-z0-9._-]+/g, "-");
+  return label ? `gemini-${label}` : "gemini";
+}
+
 export async function discoverAccounts(home = homedir(), environment = process.env): Promise<Account[]> {
   const entries = await fs.readdir(home, { withFileTypes: true });
   const candidates = entries.filter((entry) => entry.isDirectory() && (/^\.codex(?:\d+|[-_].+)?$/.test(entry.name) || /^\.claude(?:\d+|[-_].+)?$/.test(entry.name))).map((entry) => entry.name).sort();
@@ -44,6 +55,28 @@ export async function discoverAccounts(home = homedir(), environment = process.e
   const antigravityCLI = join(vendorHome("gemini", { home }), "antigravity-cli");
   if (await exists(antigravityCLI) || await agyOnPath(environment.PATH)) {
     accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "native-ts" });
+  }
+  // The Gemini CLI keeps its own subscription credential in `<home>/.gemini`,
+  // where `home` is GEMINI_CLI_HOME when that is set (the CLI's own home
+  // override) and the OS home otherwise. Antigravity above reads the same
+  // credential file for a different product's quota, so both principals can
+  // legitimately exist side by side on one machine.
+  const geminiRoot = environment.GEMINI_CLI_HOME ? expandHome(environment.GEMINI_CLI_HOME) : home;
+  const geminiDirectory = environment.GEMINI_CLI_HOME ? join(geminiRoot, ".gemini") : vendorHome("gemini", { home });
+  if (await exists(join(geminiDirectory, "oauth_creds.json"))) {
+    accounts.push({ name: geminiPrincipalName(geminiRoot, home), vendor: "gemini", location: geminiDirectory, adapter: "native-ts" });
+  }
+  // `grok login` writes its token under GROK_HOME, defaulting to ~/.grok.
+  const grokHome = environment.GROK_HOME ? expandHome(environment.GROK_HOME) : join(home, ".grok");
+  if (await exists(grokAuthPath(grokHome, home))) {
+    accounts.push({ name: "grok", vendor: "grok", location: grokHome, adapter: "native-ts" });
+  }
+  // Kimi has no CLI-written credential Headroom is willing to read: the desktop
+  // app keeps its session token in a browser cookie store. `location` is the
+  // token file the operator writes themselves (see docs/vendors.md).
+  const kimiToken = kimiTokenPath(undefined, home);
+  if (await exists(kimiToken)) {
+    accounts.push({ name: "kimi", vendor: "kimi", location: kimiToken, adapter: "native-ts" });
   }
   return accounts;
 }
@@ -75,7 +108,7 @@ function validate(value: Record<string, string>): Account {
     if (!value.name || !value.base_url || (value.adapter && value.adapter !== "native")) throw new Error("Invalid local account entry in accounts.toml");
     return { name: value.name, kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "native" } satisfies LocalAccount;
   }
-  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "native-ts" && value.adapter !== "engine" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
+  if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity" && value.vendor !== "gemini" && value.vendor !== "grok" && value.vendor !== "kimi") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "native-ts" && value.adapter !== "engine" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
   // `native` was the old Swift-first spelling. Preserve existing configs while
   // making the new registry default unambiguous.
   const adapter = value.adapter === "native" ? (value.vendor === "antigravity" ? "engine" : "native-ts") : value.adapter;

@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
-import type { EventKind, Lease, Observation, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, Lease, NotifyDelivery, Observation, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -104,6 +104,10 @@ function eventFromRow(row: Row): HeadroomEvent {
   return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at) };
 }
 
+function notifyFromRow(row: Row): NotifyDelivery {
+  return { id: Number(row.id), event_id: String(row.event_id), channel: String(row.channel), status: row.status as NotifyDelivery["status"], attempts: Number(row.attempts), text: String(row.text), detail: string(row.detail), created_at: String(row.created_at), updated_at: String(row.updated_at) };
+}
+
 function leaseFromRow(row: Row): Lease {
   return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
 }
@@ -198,6 +202,12 @@ export class HeadroomStore {
       CREATE TABLE IF NOT EXISTS daemon_state (
         key TEXT PRIMARY KEY, value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS notify_ledger (
+        id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, channel TEXT NOT NULL, status TEXT NOT NULL,
+        attempts INTEGER NOT NULL, text TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE (event_id, channel)
+      );
+      CREATE INDEX IF NOT EXISTS notify_ledger_channel_status ON notify_ledger(channel, status);
     `);
     // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
     // NOT EXISTS, so retain a narrow compatibility migration.
@@ -325,6 +335,7 @@ export class HeadroomStore {
         if (Date.parse(existing.fetched_at) >= Date.parse(observation.fetched_at)) return existing;
       }
     }
+    const newBucket = this.newBucketName(observation);
     const previous = this.previous(observation);
     const resolved = this.resolveIdleContradiction(observation);
     // Reasons and metadata come from vendor responses (or their diagnostics)
@@ -340,6 +351,7 @@ export class HeadroomStore {
       resolved.observed_at ?? null, resolved.fetched_at ?? null, resolved.source, resolved.truth, resolved.freshness, resolved.confidence,
       resolved.adapter_version, resolved.upstream_schema_version, reason, json(metadata));
     const stored: StoredObservation = { ...resolved, reason, metadata, id: Number(result.lastInsertRowid) };
+    if (newBucket) this.addEvent("model_new", "vendor_reported", 1, [stored.id], stored, newBucket);
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.recordFailure([stored.id], stored);
     // The first reading ever stored under this exact meter id has no immediate
@@ -495,6 +507,27 @@ export class HeadroomStore {
       ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(meterId, window, window, current.id, since);
     const row = lookup(current.meter_id) ?? lookup(`${current.principal_id}:${current.meter_id}`);
     return row ? observationFromRow(row) : undefined;
+  }
+
+  /**
+   * The bucket name of a meter this principal has never reported before, or
+   * undefined. A vendor names its model-scoped allowances itself (Claude's
+   * `limits[]` display names become `claude-main:<slug>` meters), so a meter
+   * id appearing for the first time on an account Headroom has already been
+   * reading is a new named allowance: a model release, or a bucket the
+   * vendor just split out. The principal must already have history, so a
+   * first-ever poll of a new account reports every one of its meters as
+   * normal readings instead of a burst of model_new. Count and local-pool
+   * state windows are excluded: those are credits and pool health, not
+   * named allowances.
+   */
+  private newBucketName(observation: Observation): string | undefined {
+    const kind = observation.window?.kind;
+    if (!kind || kind === "count" || kind === "state") return undefined;
+    if (this.db.prepare("SELECT 1 FROM observations WHERE meter_id = ? LIMIT 1").get(observation.meter_id)) return undefined;
+    if (!this.db.prepare("SELECT 1 FROM observations WHERE principal_id = ? LIMIT 1").get(observation.principal_id)) return undefined;
+    const prefix = `${observation.principal_id}:`;
+    return observation.meter_id.startsWith(prefix) ? observation.meter_id.slice(prefix.length) : observation.meter_id;
   }
 
   /** Classify a usage drop of more than 50%, or non-zero to zero, against its
@@ -715,6 +748,12 @@ export class HeadroomStore {
               OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
+            -- A reading the operator pasted from the vendor's own panel stays
+            -- authoritative for an hour: a failed poll in that hour (a denied
+            -- probe, a transport error) must not hide it, or the paste would be
+            -- pointless on exactly the machine where the probe cannot read.
+            AND NOT (current.source = 'paste' AND peer.freshness = 'failed'
+                     AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
         )
       ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)
       .all(...(meterId === undefined ? [] : [meterId]))
@@ -728,6 +767,56 @@ export class HeadroomStore {
   }
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+
+  /** Free-form daemon-owned key/value state, backed by the same daemon_state
+   * table the Claude probe hashes and the MCP backoff already use. The
+   * notifier keeps its delivery watermark here. */
+  daemonState(key: string): string | undefined {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = ?").get(key);
+    return row ? String(row.value) : undefined;
+  }
+
+  setDaemonState(key: string, value: string): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  /**
+   * Notification delivery ledger (src/notify.ts). One row per event per
+   * channel, so an event that was already delivered is never delivered twice
+   * however often the daemon re-reads it: the (event_id, channel) uniqueness
+   * constraint, not the caller, is what makes that true.
+   */
+  notifyEnqueue(eventId: string, channel: string, text: string, at: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'pending',0,?,NULL,?,?)")
+      .run(eventId, channel, text, at, at);
+  }
+
+  /** Queued rows for one channel, oldest first: a single new event, or every
+   * event a quiet-hours window held back, which the caller sends as one
+   * batched message. */
+  notifyPending(channel: string, maxAttempts = 3, limit = 100): NotifyDelivery[] {
+    return this.db.prepare("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'pending' AND attempts < ? ORDER BY created_at ASC, id ASC LIMIT ?")
+      .all(channel, maxAttempts, limit).map(notifyFromRow);
+  }
+
+  notifyDelivered(ids: number[], at: string): void {
+    if (!ids.length) return;
+    this.db.prepare(`UPDATE notify_ledger SET status = 'sent', detail = NULL, updated_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`).run(at, ...ids);
+  }
+
+  /** One failed attempt for each row: the attempt counter carries the retry
+   * budget, and a row that exhausts it stops being pending so the next poll
+   * does not pick it up again. */
+  notifyAttemptFailed(ids: number[], detail: string, at: string, maxAttempts = 3): void {
+    if (!ids.length) return;
+    const placeholders = ids.map(() => "?").join(",");
+    this.db.prepare(`UPDATE notify_ledger SET attempts = attempts + 1, detail = ?, updated_at = ?,
+      status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END WHERE id IN (${placeholders})`).run(detail, at, maxAttempts, ...ids);
+  }
+
+  notifyLedger(limit = 20): NotifyDelivery[] {
+    return this.db.prepare("SELECT * FROM notify_ledger ORDER BY updated_at DESC, id DESC LIMIT ?").all(limit).map(notifyFromRow);
+  }
 
   private expireLeases(now = new Date()): void {
     const at = now.toISOString();

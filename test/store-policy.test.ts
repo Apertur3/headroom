@@ -806,3 +806,33 @@ describe("Keychain grant marker lifecycle", () => {
     } finally { store.close(); }
   });
 });
+
+describe("pasted readings and failed polls", () => {
+  it("keeps a fresh pasted reading visible when a newer windowless poll failure arrives", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-paste-vs-failure-")); temporary.push(root);
+    const store = await HeadroomStore.open(root);
+    try {
+      const now = new Date();
+      const pasted = new Date(now.getTime() - 5 * 60_000).toISOString();
+      const failed = new Date(now.getTime() - 60_000).toISOString();
+      store.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: { used: 95, limit: 100, remaining: 5, unit: "percent" }, resets_at: new Date(now.getTime() + 3_600_000).toISOString(), observed_at: pasted, fetched_at: pasted, source: "paste", confidence: 0.9 }));
+      store.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:fable", window: null, quantity: null, resets_at: null, observed_at: failed, fetched_at: failed, source: "native:claude", truth: "estimated", freshness: "failed", confidence: 0, reason: "Keychain grant needed; run: headroom keychain grant" }));
+      const rows = store.latestPerWindow("claude-main:fable");
+      expect(rows.some((row) => row.source === "paste" && row.freshness === "fresh" && row.quantity?.used === 95)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it("lets a windowless failure supersede a pasted reading once the paste is older than an hour", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-paste-old-")); temporary.push(root);
+    const store = await HeadroomStore.open(root);
+    try {
+      const now = new Date();
+      const pasted = new Date(now.getTime() - 3 * 3_600_000).toISOString();
+      const failed = new Date(now.getTime() - 60_000).toISOString();
+      store.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, observed_at: pasted, fetched_at: pasted, source: "paste", confidence: 0.9 }));
+      store.insert(observation({ principal_id: "claude-main", meter_id: "claude-main:fable", window: null, quantity: null, resets_at: null, observed_at: failed, fetched_at: failed, source: "native:claude", truth: "estimated", freshness: "failed", confidence: 0, reason: "Keychain grant needed" }));
+      const rows = store.latestPerWindow("claude-main:fable");
+      expect(rows.some((row) => row.source === "paste")).toBe(false);
+    } finally { store.close(); }
+  });
+});

@@ -169,7 +169,7 @@ export function canonicalizeHomeForPipe(home: string, platform: NodeJS.Platform 
   return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-export type VendorHome = "claude" | "codex" | "gemini";
+export type VendorHome = "claude" | "codex" | "gemini" | "grok" | "kimi";
 
 export function vendorHome(vendor: VendorHome, options: PathOptions = {}): string {
   const { home } = values(options);
@@ -178,8 +178,13 @@ export function vendorHome(vendor: VendorHome, options: PathOptions = {}): strin
 
 /** Credential locations used by native TypeScript adapters. Claude uses the
  * macOS Keychain instead of this file when running on macOS. */
-export function credentialPath(vendor: "claude" | "codex" | "antigravity", location?: string, options: PathOptions = {}): string {
+export function credentialPath(vendor: "claude" | "codex" | "antigravity" | "gemini" | "grok" | "kimi", location?: string, options: PathOptions = {}): string {
+  // Antigravity has no home of its own: it reads the same Gemini CLI credential
+  // the Gemini principal reads, which is why both land on the same filename.
   const directory = location || vendorHome(vendor === "antigravity" ? "gemini" : vendor, options);
-  const filename = vendor === "claude" ? ".credentials.json" : vendor === "codex" ? "auth.json" : "oauth_creds.json";
+  const filename = vendor === "claude" ? ".credentials.json"
+    : vendor === "codex" || vendor === "grok" ? "auth.json"
+    : vendor === "kimi" ? "auth.token"
+    : "oauth_creds.json";
   return joinForPlatform(values(options).platform, directory, filename);
 }
