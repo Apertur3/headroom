@@ -7,6 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runNpmInstall, runUpdate, type SpawnResult } from "../src/update.js";
 import { headroomVersion } from "../src/version.js";
 
+// The executable name the platform under test resolves: npm.cmd on Windows.
+const npmName = process.platform === "win32" ? "npm.cmd" : "npm";
+
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
@@ -109,7 +112,7 @@ describe("headroom update --dry-run", () => {
     finally { restore(); }
     expect(code).toBe(0);
     expect(spy.calls).toHaveLength(0);
-    expect(logs.some((line) => line.includes("would run: npm install -g headroomd@999.0.0"))).toBe(true);
+    expect(logs.some((line) => line.includes(`would run: ${npmName} install -g headroomd@999.0.0`))).toBe(true);
   });
 });
 
@@ -152,7 +155,7 @@ describe("headroom update --notes", () => {
     } finally { restore(); }
     expect(code).toBe(0);
     expect(asked).not.toHaveBeenCalled();
-    expect(spy.calls[0]).toEqual({ command: "npm", args: ["install", "-g", "headroomd@999.0.0"] });
+    expect(spy.calls[0]).toEqual({ command: npmName, args: ["install", "-g", "headroomd@999.0.0"] });
     expect(logs.some((line) => line.includes("headroom 1.2.3 installed"))).toBe(true);
   });
 });
