@@ -3,8 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  kimiCreditsPath, kimiPlanName, kimiTokenExpired, kimiTokenPath, kimiWindowMinutes,
-  observationFromMoonshotBalance, observationsFromKimiUsage, observeKimi, readKimiToken,
+  isKimiCliCredential, kimiCliCredentialPath, kimiCodePlanName, kimiCreditsPath, kimiPlanName,
+  kimiTokenExpired, kimiTokenPath, kimiWindowMinutes, observationFromMoonshotBalance,
+  observationsFromKimiCodeUsage, observationsFromKimiUsage, observeKimi, readKimiCliCredential,
+  readKimiToken,
 } from "../src/adapters/kimi.js";
 import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
 import { allowedOutbound } from "../src/security.js";
@@ -267,6 +269,153 @@ describe("Kimi discovery and outbound allowlist", () => {
     expect(() => allowedOutbound("https://api.moonshot.ai/v1/users/me/balance")).not.toThrow();
     expect(() => allowedOutbound("https://kimi.com/apiv2/x")).toThrow(/not allowed/);
     expect(() => allowedOutbound("https://api.moonshot.cn/v1/users/me/balance")).toThrow(/not allowed/);
+  });
+});
+
+describe("Kimi Code CLI credential source", () => {
+  const seconds = (offset: number): number => Math.floor(at.getTime() / 1000) + offset;
+
+  /** Writes a `~/.kimi-code`-shaped tree under a temporary home and returns
+   * that home plus the credential path inside it. */
+  async function cliHome(body: unknown, mode = 0o600): Promise<{ home: string; path: string }> {
+    const home = await mkdtemp(join(tmpdir(), "headroom-kimi-cli-"));
+    temporary.push(home);
+    const path = kimiCliCredentialPath(home, {});
+    await mkdir(join(home, ".kimi-code", "credentials"), { recursive: true });
+    await writeFile(path, typeof body === "string" ? body : JSON.stringify(body), "utf8");
+    await chmod(path, mode);
+    return { home, path };
+  }
+
+  const credential = (expires: number | undefined = seconds(3600)): Record<string, unknown> => ({
+    access_token: "synthetic-cli-access-token",
+    refresh_token: "synthetic-cli-refresh-token",
+    ...(expires === undefined ? {} : { expires_at: expires }),
+  });
+
+  const cliAccount = (path: string): ProviderAccount => ({ name: "kimi", vendor: "kimi", location: path, adapter: "native-ts" });
+
+  it("maps the CLI usages response onto the meters the gateway path already emits", async () => {
+    const rows = observationsFromKimiCodeUsage(await fixture("code-usages"), kimi, at);
+    expect(rows.map((row) => row.meter_id)).toEqual(["kimi:main", "kimi:main"]);
+    expect(rows).toEqual(expect.arrayContaining([
+      // 512/2048 requests over the vendor's documented 7-day allowance period,
+      // which this response declares no window of its own for.
+      expect.objectContaining({ window: expect.objectContaining({ kind: "fixed", minutes: 10_080 }), quantity: expect.objectContaining({ used: 25, limit: 100, unit: "percent" }), resets_at: "2026-09-10T00:00:00.000Z", freshness: "fresh", truth: "official", source: "native:kimi" }),
+      // 50/200 requests over the 5-hour window the response does declare.
+      expect.objectContaining({ window: expect.objectContaining({ kind: "fixed", minutes: 300 }), quantity: expect.objectContaining({ used: 25 }), resets_at: "2026-09-06T18:00:00.000Z" }),
+    ]));
+    // The CLI endpoint reports no shared pool and no membership 7-day ratio.
+    expect(rows.some((row) => row.meter_id === "kimi:total" || row.meter_id === "kimi:code-7d")).toBe(false);
+    // The plan comes from the response's own membership level, no web call.
+    expect(rows.every((row) => row.metadata?.plan === "Allegro")).toBe(true);
+  });
+
+  it("reads the plan level, skips an unreadable bucket, and fails rather than inventing 0%", () => {
+    expect(kimiCodePlanName({ user: { membership: { level: "LEVEL_BASIC" } }, version: "GOODS_VERSION_V1" })).toBe("Moderato");
+    // An unknown level, and an unknown catalog version, keep the vendor's own spelling.
+    expect(kimiCodePlanName({ user: { membership: { level: "LEVEL_FUTURE" } } })).toBe("LEVEL_FUTURE");
+    expect(kimiCodePlanName({ user: { membership: { level: "LEVEL_ADVANCED" } }, version: "GOODS_VERSION_FUTURE" })).toBe("LEVEL_ADVANCED");
+    expect(kimiCodePlanName({ user: { membership: { level: "LEVEL_UNSPECIFIED" } } })).toBeUndefined();
+    const rows = observationsFromKimiCodeUsage({ usage: { limit: "100", used: "not-a-number" }, limits: [{ window: { duration: 1, timeUnit: "TIME_UNIT_FORTNIGHT" }, detail: { limit: "10", used: "5" } }] }, kimi, at);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ freshness: "failed", truth: "estimated", confidence: 0, quantity: null, reason: "vendor returned no usable allowance counters" });
+    expect(() => observationsFromKimiCodeUsage({ limits: [] }, kimi, at)).toThrow(/Kimi usage response invalid/);
+  });
+
+  it("gives a bucket the response names for itself its own meter", () => {
+    // Forward compatibility: the shape seen today carries only unnamed
+    // rate-limit windows, which share `main`.
+    const rows = observationsFromKimiCodeUsage({ usage: { limit: "100", used: "10" }, limits: [{ scope: "FEATURE_OPUS_LANE", window: { duration: 1, timeUnit: "TIME_UNIT_DAY" }, detail: { limit: "40", used: "10" } }] }, kimi, at);
+    expect(rows.map((row) => row.meter_id)).toEqual(["kimi:main", "kimi:feature-opus-lane"]);
+    expect(rows[1]).toMatchObject({ window: expect.objectContaining({ minutes: 1440 }), quantity: expect.objectContaining({ used: 25 }) });
+  });
+
+  it("calls only the CLI endpoint, sends the access token, and never leaks either token", async () => {
+    const { home, path } = await cliHome(credential());
+    const { fetch: fetcher, requests } = gateway({ "coding/v1/usages": await fixture("code-usages") });
+    const rows = await observeKimi(cliAccount(path), { fetch: fetcher, now: () => at, home });
+    expect(requests.map((request) => new URL(request.url).hostname)).toEqual(["api.kimi.com"]);
+    expect(requests[0].method).toBe("GET");
+    expect(requests[0].headers.get("authorization")).toBe("Bearer synthetic-cli-access-token");
+    expect(requests[0].headers.get("x-msh-platform")).toBe("kimi_code_cli");
+    // No machine identity travels with the request, and no cookie is involved.
+    expect(requests[0].headers.get("cookie")).toBeNull();
+    expect(requests[0].headers.get("x-msh-device-id")).toBeNull();
+    expect(() => allowedOutbound(requests[0].url)).not.toThrow();
+    expect(rows.every((row) => row.freshness === "fresh")).toBe(true);
+    // Token canary: neither the access token nor the refresh token appears in
+    // any meter id, reason, metadata or other serialized field.
+    expect(JSON.stringify(rows)).not.toContain("synthetic-cli-access-token");
+    expect(JSON.stringify(rows)).not.toContain("synthetic-cli-refresh-token");
+  });
+
+  it("never calls the vendor for an expired, missing or unusable CLI credential", async () => {
+    let called = 0;
+    const fetcher = (async () => { called += 1; return json({}); }) as unknown as typeof fetch;
+    const expired = await cliHome(credential(seconds(-60)));
+    const rows = await observeKimi(cliAccount(expired.path), { fetch: fetcher, now: () => at, home: expired.home });
+    expect(rows.map((row) => row.meter_id)).toEqual(["kimi:main"]);
+    expect(rows[0]).toMatchObject({ freshness: "failed", truth: "estimated", confidence: 0, quantity: null });
+    expect(rows[0].reason).toBe("Kimi CLI credential expired; run: kimi login (Headroom never refreshes it)");
+    // A credential that expires inside the grace window is already expired.
+    const expiring = await cliHome(credential(seconds(30)));
+    expect((await observeKimi(cliAccount(expiring.path), { fetch: fetcher, now: () => at, home: expiring.home }))[0].reason).toContain("run: kimi login");
+    // No recorded expiry: the token's own JWT expiry still decides.
+    const jwt = ["e30", Buffer.from(JSON.stringify({ exp: seconds(-60) })).toString("base64url"), "sig"].join(".");
+    const stale = await cliHome({ access_token: jwt, refresh_token: "synthetic-cli-refresh-token" });
+    expect((await observeKimi(cliAccount(stale.path), { fetch: fetcher, now: () => at, home: stale.home }))[0].reason).toContain("run: kimi login");
+    const absent = join(tmpdir(), "headroom-kimi-absent", "credentials", "kimi-code.json");
+    const missing = await observeKimi(cliAccount(absent), { fetch: fetcher, now: () => at, home: tmpdir() });
+    expect(missing[0].reason).toMatch(/^no Kimi CLI credential .*; run: kimi login$/);
+    expect(called).toBe(0);
+  });
+
+  it("refuses a CLI credential anyone else can read, or one that is not the CLI's own shape", async () => {
+    const { path } = await cliHome({ refresh_token: "synthetic-cli-refresh-token" });
+    await expect(readKimiCliCredential(path)).rejects.toThrow(/no access token/);
+    const broken = await cliHome("{not-json");
+    await expect(readKimiCliCredential(broken.path)).rejects.toThrow(/not valid JSON/);
+    const good = await cliHome(credential());
+    expect(await readKimiCliCredential(good.path)).toEqual({ token: "synthetic-cli-access-token", expires_at: seconds(3600) * 1000 });
+    if (posix) {
+      const shared = await cliHome(credential(), 0o644);
+      await expect(readKimiCliCredential(shared.path)).rejects.toThrow(/group or other/);
+      const rows = await observeKimi(cliAccount(shared.path), { now: () => at, home: shared.home });
+      expect(rows[0].reason).toMatch(/readable by group or other .*; chmod 600 that file, or run: kimi login/);
+    }
+  });
+
+  it("names the CLI's login command on 401, backs off on 403 and 429, and refuses a redirect", async () => {
+    const { home, path } = await cliHome(credential());
+    for (const status of [401, 403, 429]) {
+      const { fetch: fetcher } = gateway({ "coding/v1/usages": {} }, { "coding/v1/usages": status });
+      const rows = await observeKimi(cliAccount(path), { fetch: fetcher, now: () => at, home });
+      expect(rows.map((row) => row.meter_id)).toEqual(["kimi:main"]);
+      expect(PROTECTED_STATUS_PATTERN.test(rows[0].reason ?? "")).toBe(true);
+      if (status !== 429) expect(rows[0].reason).toBe(`Kimi rejected the CLI credential (${status}); run: kimi login`);
+      expect(JSON.stringify(rows)).not.toContain("synthetic-cli-access-token");
+    }
+    const redirect = (async () => new Response("", { status: 302, headers: { location: "https://example.invalid/steal" } })) as unknown as typeof fetch;
+    expect((await observeKimi(cliAccount(path), { fetch: redirect, now: () => at, home }))[0]).toMatchObject({ freshness: "failed", reason: "redirect refused" });
+  });
+
+  it("prefers the CLI credential over the manual token file, and allows only the CLI host", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-kimi-both-"));
+    temporary.push(home);
+    await mkdir(join(home, ".kimi"));
+    await writeFile(join(home, ".kimi", "auth.token"), "synthetic-opaque-token", "utf8");
+    expect(await discoverAccounts(home, { PATH: "" })).toContainEqual(expect.objectContaining({ name: "kimi", location: join(home, ".kimi", "auth.token") }));
+    await mkdir(join(home, ".kimi-code", "credentials"), { recursive: true });
+    await writeFile(kimiCliCredentialPath(home, {}), JSON.stringify(credential()), "utf8");
+    const discovered = (await discoverAccounts(home, { PATH: "" })).filter((item) => item.name === "kimi");
+    // One kimi principal, pointing at the preferred source.
+    expect(discovered).toEqual([expect.objectContaining({ name: "kimi", vendor: "kimi", adapter: "native-ts", location: kimiCliCredentialPath(home, {}) })]);
+    expect(isKimiCliCredential(kimiCliCredentialPath(home, {}))).toBe(true);
+    expect(isKimiCliCredential(join(home, ".kimi", "auth.token"))).toBe(false);
+    expect(kimiCliCredentialPath("/Users/test", { KIMI_CODE_HOME: "/elsewhere/kimi-code" })).toBe(join("/elsewhere/kimi-code", "credentials", "kimi-code.json"));
+    expect(() => allowedOutbound("https://api.kimi.com/coding/v1/usages")).not.toThrow();
+    expect(() => allowedOutbound("https://api.kimi.cn/coding/v1/usages")).toThrow(/not allowed/);
   });
 });
 

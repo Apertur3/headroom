@@ -1,0 +1,22 @@
+{
+  "_fixture": "SYNTHETIC. Hand-written from the endpoint contract of api.kimi.com/coding/v1/usages, not a live capture. No real account, token or quota appears anywhere in this directory.",
+  "usage": {
+    "limit": "2048",
+    "used": "512",
+    "remaining": "1536",
+    "resetTime": "2026-09-10T00:00:00Z"
+  },
+  "limits": [
+    {
+      "window": { "duration": 300, "timeUnit": "TIME_UNIT_MINUTE" },
+      "detail": {
+        "limit": "200",
+        "used": "50",
+        "remaining": "150",
+        "resetTime": "2026-09-06T18:00:00Z"
+      }
+    }
+  ],
+  "user": { "membership": { "level": "LEVEL_ADVANCED" } },
+  "version": "GOODS_VERSION_V1"
+}

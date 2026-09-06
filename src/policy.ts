@@ -32,6 +32,12 @@ export interface Policy {
    * (HEADROOM_HOME env var, tests) and this module has no path helpers of
    * its own. */
   statusline_snapshot_dirs: string[];
+  /** Whether `status` and `doctor` check the npm registry (at most once every
+   * 24 hours) for a newer `headroomd` and print a one-line notice. `false`
+   * disables the check outright -- no network call at all -- as well as the
+   * notice line. Never affects `headroom update` itself, which is always an
+   * explicit, human-initiated check. */
+  update_check: boolean;
 }
 
 /** Keep the local Antigravity reader warm by default wherever `script` is available. */
@@ -41,7 +47,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", statusline_snapshot_dirs: [],
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", statusline_snapshot_dirs: [], update_check: true,
 };
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
@@ -53,6 +59,7 @@ export function parsePolicy(text: string): Policy {
   let inReserve = false;
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
+  let updateCheck: boolean | undefined;
   let pacing: Policy["pacing"] | undefined;
   let statuslineSnapshotDirs: string[] | undefined;
   for (const raw of text.split("\n")) {
@@ -77,6 +84,8 @@ export function parsePolicy(text: string): Policy {
     if (proxyMatch) { try { const url = new URL(proxyMatch[1]); if (!/^https?:$/.test(url.protocol)) throw new Error("invalid"); proxy = url.toString(); continue; } catch { throw new Error("Invalid Headroom proxy"); } }
     const keepalive = /^antigravity_keepalive\s*=\s*(true|false)\s*$/.exec(line);
     if (keepalive) { antigravityKeepalive = keepalive[1] === "true"; continue; }
+    const updateCheckMatch = /^update_check\s*=\s*(true|false)\s*$/.exec(line);
+    if (updateCheckMatch) { updateCheck = updateCheckMatch[1] === "true"; continue; }
     const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
     if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
     const dirsMatch = /^statusline_snapshot_dirs\s*=\s*\[(.*)\]\s*$/.exec(line);
@@ -92,7 +101,7 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0) || Object.values(reserves).some((value) => !Number.isFinite(value) || value < 0 || value > 90)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, ...(proxy ? { proxy } : {}) };
 }
 
 /** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from

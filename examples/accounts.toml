@@ -31,12 +31,20 @@ adapter = "native-ts"
 # location = "~/.grok"
 # adapter = "native-ts"
 
-# Kimi has no credential file Headroom is willing to read on its own: the desktop
-# app keeps its session token in a browser cookie store, which is out of scope
-# here. `location` is a file you write yourself, mode 0600, holding only the
-# kimi-auth token from https://www.kimi.com/code/console. Put an optional
-# Moonshot API key in a `moonshot.key` file beside it to also get a credits
-# meter. See docs/vendors.md.
+# Kimi, preferred source: the credential the Kimi Code CLI writes for itself
+# (`kimi login`). Headroom reads it, never refreshes it, and calls the CLI's own
+# usages endpoint with it.
+# [[accounts]]
+# name = "kimi"
+# vendor = "kimi"
+# location = "~/.kimi-code/credentials/kimi-code.json"
+# adapter = "native-ts"
+
+# Kimi, alternative source: a file you write yourself, mode 0600, holding only
+# the kimi-auth token from https://www.kimi.com/code/console. For the desktop
+# app, which keeps that token in a browser cookie store this project does not
+# open. Put an optional Moonshot API key in a `moonshot.key` file beside either
+# credential to also get a credits meter. See docs/vendors.md.
 # [[accounts]]
 # name = "kimi"
 # vendor = "kimi"

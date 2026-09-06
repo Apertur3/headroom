@@ -20,6 +20,16 @@ import { redact } from "./security.js";
  * enough that the table stays a working set rather than an archive. */
 export const SPEND_LEDGER_RETENTION_DAYS = 30;
 
+/** True when `newUsed` is far enough below `oldUsed` to be a reset rather
+ * than ordinary noise: a drop to zero, or a fall past half of what it was.
+ * classifyUsageDrop uses this to recognize a reset from raw usage alone
+ * (before it even looks at resets_at); burnRateFor reuses the exact same
+ * rule so a burn-rate sample window and the event log this produces never
+ * disagree on where a reset falls. */
+function isUsageReset(oldUsed: number, newUsed: number): boolean {
+  return oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5);
+}
+
 function redactDeep(value: unknown): unknown {
   if (typeof value === "string") return redact(value);
   if (Array.isArray(value)) return value.map(redactDeep);
@@ -557,7 +567,7 @@ export class HeadroomStore {
     if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
     const oldUsed = baseline.quantity.used;
     const newUsed = current.quantity.used;
-    if (!(oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5))) return;
+    if (!isUsageReset(oldUsed, newUsed)) return;
     const previousReset = baseline.resets_at ? Date.parse(baseline.resets_at) : Number.NaN;
     const currentReset = current.resets_at ? Date.parse(current.resets_at) : Number.NaN;
     if (!Number.isFinite(previousReset) || !Number.isFinite(currentReset)) return;
@@ -576,6 +586,24 @@ export class HeadroomStore {
     else this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
   }
 
+  /** The most recent reset_seen event for this meter+window within
+   * [since, now], if any -- the vendor-confirmed sign a reset actually
+   * happened, used by burnRateFor to cut a sample window off at the reset
+   * instead of letting it span the drop. Mirrors eventEvidenceFor's own
+   * julianday() comparison for the same reason: an event's created_at is an
+   * observation's fetched_at verbatim, not guaranteed to carry milliseconds. */
+  private lastResetEventAt(meterId: string, minutes: number, sinceIso: string, nowIso: string): number | null {
+    const row = this.db.prepare(`SELECT e.created_at FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.kind = 'reset_seen' AND e.meter_id = ?
+        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) = ?
+        AND julianday(e.created_at) >= julianday(?) AND julianday(e.created_at) <= julianday(?)
+      ORDER BY e.created_at DESC LIMIT 1`).get(meterId, minutes, sinceIso, nowIso);
+    const at = row?.created_at && typeof row.created_at === "string" ? Date.parse(row.created_at) : Number.NaN;
+    return Number.isFinite(at) ? at : null;
+  }
+
   /**
    * Least-squares burn rate (percent per hour) and projected time to 100%
    * used, per meter+window, from that window's fresh percent samples fetched
@@ -583,10 +611,26 @@ export class HeadroomStore {
    * shorter or longer window reuses this with a different value). At least
    * two samples are required; fewer returns nulls for that window. Keyed by
    * `${meter_id}:${minutes}`, matching pace.ts's withPaceInfo().
+   *
+   * A window's samples are cut off at its most recent reset within the
+   * lookback -- otherwise a poll straddling a reset (weekly or free) pairs a
+   * near-100% pre-reset sample with a near-0% post-reset one and reports a
+   * wildly negative "burn", which is really just the reset itself. The
+   * boundary is whichever is more recent of the store's own confirmed
+   * reset_seen event, or -- for a reset that never made it into the event
+   * log (e.g. resets_at was unparseable at the time) -- the same raw
+   * usage-drop rule classifyUsageDrop uses to recognize one directly from
+   * the samples. Fewer than two samples after that cut leaves burn null,
+   * same as fewer than two samples overall. A straight-line fit should
+   * never come out negative once reset-spanning samples are excluded --
+   * used only climbs within one window -- so a small negative slope left
+   * over (rounding noise on a whole-percent meter) is clamped to 0 rather
+   * than reported as falling usage.
    */
   burnRateFor(observations: Array<Pick<Observation, "meter_id" | "window">>, now = new Date(), lookbackMinutes = 60): Map<string, BurnInfo> {
     const output = new Map<string, BurnInfo>();
     const seen = new Set<string>();
+    const nowIso = now.toISOString();
     const since = new Date(now.getTime() - lookbackMinutes * 60_000).toISOString();
     for (const observation of observations) {
       const minutes = observation.window?.minutes;
@@ -600,11 +644,21 @@ export class HeadroomStore {
       // and ISO timestamps only sort lexicographically when every value
       // shares the same precision.
       const rows = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND freshness = 'fresh' AND julianday(fetched_at) >= julianday(?) AND julianday(fetched_at) <= julianday(?) ORDER BY fetched_at ASC, id ASC")
-        .all(observation.meter_id, since, now.toISOString())
+        .all(observation.meter_id, since, nowIso)
         .map(observationFromRow)
         .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent");
-      const samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
-      const burn = leastSquaresBurnPerHour(samples);
+      let samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
+
+      const eventBoundary = this.lastResetEventAt(observation.meter_id, minutes, since, nowIso);
+      let sampleBoundary: number | null = null;
+      for (let i = 1; i < samples.length; i++) {
+        if (isUsageReset(samples[i - 1].used, samples[i].used)) sampleBoundary = samples[i].at;
+      }
+      const boundary = Math.max(eventBoundary ?? -Infinity, sampleBoundary ?? -Infinity);
+      if (Number.isFinite(boundary)) samples = samples.filter((sample) => sample.at >= boundary);
+
+      let burn = leastSquaresBurnPerHour(samples);
+      if (burn !== null && burn < 0) burn = 0;
       const currentUsed = samples.length ? samples[samples.length - 1].used : null;
       output.set(key, { burn_percent_per_hour: burn, empty_in_seconds: burn !== null && currentUsed !== null ? emptyInSeconds(currentUsed, burn) : null });
     }

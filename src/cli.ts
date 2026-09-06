@@ -37,6 +37,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
 function since(value: string | undefined): string {
@@ -818,7 +819,14 @@ export async function observe(argv: string[]): Promise<number> {
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
   if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } })); }
-  else { for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line); for (const failure of failures) console.log(failure); }
+  else {
+    for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line);
+    for (const failure of failures) console.log(failure);
+    // Silent on failure (policy.update_check = false or a network problem):
+    // the update notice must never turn a routine status call into one.
+    const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
+    if (updateNotice) console.log(updateNotice);
+  }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
 }
@@ -1143,6 +1151,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["notify", "Send a test notification to every configured channel, or show the delivery ledger"],
   ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar"],
   ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard)"],
+  ["update", "Check the npm registry for a newer headroomd and install it (--notes, --dry-run)"],
   ["version", "Print the Headroom version"],
 ];
 
@@ -1182,6 +1191,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   notify: "Usage: headroom notify (--test | --last <n>)",
   statusline: "Usage: headroom statusline [--chain <command>]",
   usage: USAGE_PASTE_HELP,
+  update: "Usage: headroom update [--notes] [--dry-run] [--yes]",
   version: "Usage: headroom version (or: headroom --version)",
 };
 
@@ -1251,6 +1261,7 @@ export async function main(argv: string[]): Promise<number> {
     console.log(`${result.dryRun ? "would remove" : "removed"} ${result.path}\nTo unload it: ${result.command}`); return 0;
   }
   if (argv[0] === "usage") return usagePaste(argv.slice(1));
+  if (argv[0] === "update") return runUpdate(argv.slice(1));
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));
