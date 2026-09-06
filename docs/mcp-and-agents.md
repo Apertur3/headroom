@@ -276,6 +276,24 @@ Optional `action_class`. The learned cost per action class from ENDED leases onl
 normally, or expired): median spent percent, interquartile range and sample count. An in-progress
 lease is never counted -- it has no observed spend yet. CLI: `headroom cost`.
 
+### `quota_spend`
+
+Optional `meter`, `owner`, `since` (an ISO timestamp, defaulting to 24 hours ago). Per-owner
+attributed spend from the spend ledger: for each meter and window, how much of the movement over
+that period Headroom books to each lease owner, with `confidence` and the number of deltas behind
+it. The owner `unattributed` is real movement that happened while no lease was open. Take a lease
+per lane if you want your own spend to be attributable. CLI: `headroom spend`.
+
+### `quota_inbox`
+
+`session` (required), optional `since` (milliseconds since the epoch). Reads that session's
+hand-off messages from `<HEADROOM_HOME>/inbox/<session>/`, oldest first, and marks each read by
+renaming it -- so a hand-off is acted on once. Each message carries `kind` (`budget`, `note`, or
+`handoff`), `from`, `at`, and `body`. A backlog over 200 messages returns the first 200 and
+reports the rest as `remaining`. Read-only on purpose: sending is `headroom inbox send`, never a
+tool call, so nothing can fabricate a hand-off from a session that did not make one. CLI:
+`headroom inbox --session <id>`.
+
 ### `quota_route`
 
 `action_class`, `owner`, optional `allow_unknown`. Among the principals the routing entry for
@@ -318,6 +336,11 @@ already follows:
 7. Take a lease (`quota_lease_start`) before fanning out a batch of work against a meter, and end
    it (`quota_lease_end`) when the batch finishes, so other orchestrators on the same machine see
    the reservation instead of racing it.
+8. On a shared account, take one lease per lane so the ledger can attribute what the meter
+   actually moves to you, and read `quota_spend` with your own `owner` at each window boundary to
+   see what your share really cost. Leave anything another session has to act on in its inbox
+   rather than in a lease note, and read your own with `quota_inbox` before you plan the next
+   window.
 
 ## CLI equivalents
 
@@ -332,12 +355,14 @@ For agents that call a shell instead of MCP, such as Codex or Gemini CLI session
 | `quota_lease_end` | `headroom lease end <id> --owner <name> [--force]` |
 | `quota_leases` | `headroom lease list` |
 | `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
-| `quota_rate` | `headroom rate [--meter <meter_id>] [--minutes 30] [--json]` |
+| `quota_rate` | `headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--json]` |
 | `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]` |
 | `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--json]` (exit 2 when it does not fit) |
 | `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
 | `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |
 | `quota_cost` | `headroom cost [<action-class>] [--json]` |
+| `quota_spend` | `headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]` |
+| `quota_inbox` | `headroom inbox --session <session-id> [--since <epoch-ms>] [--json]` (send: `headroom inbox send --to <session-id> --kind <budget\|note\|handoff> (--file <path> \| --text <text>)`) |
 | `quota_usage_paste` | `headroom usage --paste [--principal <id>] [--json]` (or `--clipboard`) |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check

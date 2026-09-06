@@ -145,6 +145,23 @@ export interface Lease {
   already_ended?: boolean;
 }
 
+/** One owner's attributed movement on one meter window, aggregated from the
+ * `spend_ledger` rows written per poll. `owner` is `unattributed` for the
+ * movement that happened while nobody held a lease on the meter. */
+export interface SpendRow {
+  meter_id: string;
+  window_minutes: number | null;
+  owner: string;
+  attributed_percent: number;
+  /** Share-weighted mean of the underlying rows' confidence: 1 when this
+   * owner held the meter alone, 1/n while n owners overlapped, 0.5 for the
+   * `unattributed` row. */
+  confidence: number;
+  samples: number;
+  from_at: string;
+  to_at: string;
+}
+
 export interface HeadroomEvent {
   id: string;
   kind: EventKind;

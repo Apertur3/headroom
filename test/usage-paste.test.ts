@@ -265,10 +265,10 @@ describe("quota_usage_paste", () => {
   const call = (params: Record<string, unknown>): Promise<Record<string, unknown> | undefined> =>
     handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_usage_paste", arguments: params } }));
 
-  it("is advertised in tools/list, making fourteen tools", async () => {
+  it("is advertised in tools/list, making sixteen tools", async () => {
     const listed = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
     const names = ((listed?.result as { tools: Array<{ name: string }> }).tools).map((item) => item.name);
-    expect(names).toHaveLength(14);
+    expect(names).toHaveLength(16);
     expect(names).toContain("quota_usage_paste");
   });
 
