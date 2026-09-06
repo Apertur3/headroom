@@ -138,22 +138,25 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // all: this is the sole reason the collector reads policy.toml.
   const statuslineDirs = claudePrincipalsPresent ? statuslineSnapshotDirs((await readPolicy()).statusline_snapshot_dirs) : [];
   for (const account of tsAccounts) {
-    if (account.vendor === "claude") {
-      // Tried before the grant gate below, and before ever touching the
-      // probe: a fresh statusline snapshot answers this principal with no
-      // Keychain access at all, so a principal the operator has never
-      // granted (or one currently blocked pending a grant) still reads,
-      // exactly the point of Ask 0 in the 2026-09-05 dogfood report.
-      const snapshot = await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
-      if (snapshot) {
-        observations.push(...observationsFromStatuslineSnapshot(snapshot, account.name, new Date()));
-        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
-        continue;
-      }
-    }
+    // The statusline snapshot is the zero-auth fallback, never the preferred
+    // source: it carries only the 5h and weekly account-wide figures, while
+    // the granted probe also returns every model-scoped bucket (Fable,
+    // Routines). Skipping a granted probe whenever a snapshot was fresh left
+    // the scoped meters stale for as long as the snapshot kept arriving.
+    const claudeSnapshot = account.vendor === "claude"
+      ? await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date())
+      : undefined;
     if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
-      observations.push(...claudeGrantNeededObservations(account));
-      claudeProbeOutcomes[account.name] = "skipped: grant needed";
+      if (claudeSnapshot) {
+        // A principal blocked pending a grant still reads its account-wide
+        // figures from the snapshot; its scoped meters stay grant-needed.
+        observations.push(...observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date()));
+        observations.push(...claudeGrantNeededObservations(account).filter((item) => !item.meter_id.endsWith(":all")));
+        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
+      } else {
+        observations.push(...claudeGrantNeededObservations(account));
+        claudeProbeOutcomes[account.name] = "skipped: grant needed";
+      }
       continue;
     }
     if (account.vendor === "claude") claudeProbeOutcomes[account.name] = "called";
@@ -162,7 +165,15 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     // under, never silently switching to a different candidate that happens
     // to resolve too (a repo checkout built alongside an existing global
     // install, for one).
-    const result = account.vendor === "claude" ? await observeClaude(account, { probePath: options.claudeGrant?.probePath() }) : await observeCodex(account);
+    let result = account.vendor === "claude" ? await observeClaude(account, { probePath: options.claudeGrant?.probePath() }) : await observeCodex(account);
+    if (claudeSnapshot && !result.some((item) => item.freshness === "fresh")) {
+      // The probe failed this poll (transport, backoff, a denied dialog): the
+      // snapshot still answers the account-wide windows; the probe's own
+      // failure rows stay for every meter the snapshot does not carry.
+      const fromSnapshot = observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date());
+      const covered = new Set(fromSnapshot.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
+      result = [...fromSnapshot, ...result.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`))];
+    }
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
       if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();
