@@ -68,16 +68,33 @@ into a real reading instead of dispatching blind.
 - `headroom --threshold 90` : exit 2 if any fresh window is at or above 90%.
 - `headroom events --since 24h` : resets seen, free resets granted or used, source failures.
 - `headroom cost [<action-class>]` : learned median/IQR/sample-count spent percent per class.
-- `headroom rate [--meter M] [--minutes 30]` : burn over a recent window and ETA to the limit.
+- `headroom rate [--meter M] [--owner X] [--minutes 30]` : burn over a recent window and ETA to the limit, plus X's attributed share of it.
+- `headroom spend [--meter M] [--owner X] [--since 24h]` : per-owner attributed spend on a shared meter.
+- `headroom inbox --session <id>` / `headroom inbox send --to <id> --kind <budget|note|handoff> --text ...` : hand-offs between orchestrators.
 - `headroom plan --meter M --until reset --reserve N` : points per remaining 5h window and the plan line.
+- `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
-- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_cost`, `quota_rate`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_route` (plus `quota_lease_start`, `quota_lease_end`, `quota_leases`) expose the same from a daemon (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
+- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_route` (plus `quota_lease_start`, `quota_lease_end`, `quota_leases`) expose the same from a daemon (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
 
 ## Leases
 
 Take a lease before fanning out work: `headroom lease start --owner <name> --meter <meter_id> --expect <percent> [--class <action-class>]`. Pass `--owner <name>` to `headroom can` (and to `headroom route --class <action-class> --owner <name>`, which reserves the same way) so your own reservation is not counted twice, and end the lease when the work is done. Other orchestrators on this machine see active leases.
+
+## Sharing one account with other orchestrators
+
+Take a lease per lane, not one per session: the spend ledger books each poll's actual meter
+movement to whoever held a lease at that moment, so a lane you did not lease spends under
+`unattributed` and disappears from your own numbers. Read `headroom spend --owner <self>` (MCP
+`quota_spend`) at every window boundary, and `headroom rate --owner <self>` mid-window, to see
+what your share of the shared meter really cost rather than what you expected it to. A confidence
+below 1 means other owners overlapped yours and the split is proportional to declared `--expect`
+values, so declaring one makes your own figure sharper. When a human hands you an agreed division
+of a window, `headroom plan import <file>` turns it into advisory leases the other sessions' gates
+already respect. Leave anything another session must act on in its inbox (`headroom inbox send
+--to <session> --kind handoff --text ...`) and read your own with `headroom inbox --session <self>`
+before planning the next window; reading marks a message read, so a hand-off is acted on once.
 
 ## Pacing
 

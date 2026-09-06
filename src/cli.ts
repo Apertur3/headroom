@@ -25,16 +25,18 @@ import { runSetup } from "./setup.js";
 import { canRouteWithLeases, paceDecision, reserveFor, reserveNote, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
+import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
+import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
 import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
-import { safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount } from "./types.js";
+import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { headroomVersion } from "./version.js";
 
 function since(value: string | undefined): string {
@@ -375,15 +377,16 @@ function rateLookbackMinutes(argv: string[]): number {
 
 async function rate(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
+  const owner = option(argv, "--owner");
   const minutes = rateLookbackMinutes(argv);
   const asJson = argv.includes("--json");
-  const request = await requestDaemon("rate", { meter, minutes });
+  const request = await requestDaemon("rate", { meter, minutes, owner });
   let lines: RateLine[];
   if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
   else {
     directReadNotice();
     const store = await HeadroomStore.open();
-    try { lines = rateLines(store, meter, minutes); store.audit("cli", "rate", meter ?? null, "ok"); }
+    try { lines = rateLines(store, meter, minutes, new Date(), owner); store.audit("cli", "rate", meter ?? null, "ok"); }
     finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
@@ -392,14 +395,123 @@ async function rate(argv: string[]): Promise<number> {
     if (line.reason !== undefined) { console.log(`${line.meter}  UNKNOWN (${line.reason})`); continue; }
     const windowLabel = line.window_minutes === 300 ? "5h" : line.window_minutes === 10_080 ? "wk" : line.window_minutes ? `${line.window_minutes}m` : "-";
     const usedText = line.used_percent === null ? "?" : `${Math.round(line.used_percent)}%`;
-    if (line.burn_percent_per_hour === null) { console.log(`${line.meter}  ${windowLabel} ${usedText}  burn unknown (need 2+ fresh samples in the last ${minutes}m)`); continue; }
+    if (line.burn_percent_per_hour === null) { console.log(`${line.meter}  ${windowLabel} ${usedText}  burn unknown (need 2+ fresh samples in the last ${minutes}m)${attributedSegment(line)}`); continue; }
     const stall = line.empty_in_seconds === null ? "not projected to empty before reset" : `stall in ${formatResetsIn(line.empty_in_seconds)}`;
-    console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${formatRatePercent(line.burn_percent_per_hour)}, ${stall}`);
+    console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${formatRatePercent(line.burn_percent_per_hour)}, ${stall}${attributedSegment(line)}`);
   }
   return 0;
 }
 
+const SPEND_HELP = "Usage: headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]";
+const INBOX_HELP = "Usage: headroom inbox --session <session-id> [--since <epoch-ms>] [--json]";
+const INBOX_SEND_HELP = "Usage: headroom inbox send --to <session-id> --kind <budget|note|handoff> (--file <path> | --text <text>) [--from <session-id>]";
+const PLAN_IMPORT_HELP = "Usage: headroom plan import <file>";
+
+/** The " attributed to X ..%" tail `rate --owner` adds to a burn line. Empty
+ * for a plain `rate`, so the existing one-line-per-window shape is unchanged
+ * for every caller that did not ask for an owner. */
+function attributedSegment(line: RateLine): string {
+  if (line.attributed_owner === undefined) return "";
+  return `, attributed to ${line.attributed_owner} ${(line.attributed_percent ?? 0).toFixed(2)}% (confidence ${(line.attributed_confidence ?? 0).toFixed(2)})`;
+}
+
+function windowLabelFor(minutes: number | null): string {
+  return minutes === 300 ? "5h" : minutes === 10_080 ? "wk" : minutes ? `${minutes}m` : "-";
+}
+
+export function spendLines(rows: SpendRow[]): string[] {
+  return rows.map((row) => `${row.meter_id}  ${windowLabelFor(row.window_minutes)}  ${row.owner}  ${row.attributed_percent.toFixed(2)}%  confidence ${row.confidence.toFixed(2)} (n=${row.samples})`);
+}
+
+/**
+ * `headroom spend`: who moved the shared meter. The ledger books every poll's
+ * delta against whoever held a lease at that moment, so this is the read that
+ * turns one account's single total into a per-orchestrator answer. An
+ * `unattributed` row is movement that happened with no lease open at all --
+ * real spend whose owner simply cannot be known, shown rather than hidden.
+ */
+async function spend(argv: string[]): Promise<number> {
+  const meter = option(argv, "--meter");
+  const owner = option(argv, "--owner");
+  const sinceIso = since(option(argv, "--since"));
+  const asJson = argv.includes("--json");
+  const request = await requestDaemon("spend", { meter, owner, since: sinceIso });
+  let rows: SpendRow[];
+  if (request !== undefined) { rows = unwrapRpc(request) as SpendRow[]; }
+  else {
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { rows = store.spendByOwner({ meter, owner, since: sinceIso }); store.audit("cli", "spend", meter ?? owner ?? null, "ok"); }
+    finally { store.close(); }
+  }
+  if (asJson) { console.log(JSON.stringify(rows)); return 0; }
+  if (!rows.length) { console.log(`no attributed spend since ${sinceIso}`); return 0; }
+  for (const line of spendLines(rows)) console.log(line);
+  return 0;
+}
+
+export function inboxLines(result: { messages: InboxMessage[]; remaining: number }): string[] {
+  const lines = result.messages.map((message) => `${message.at}  ${message.kind}  from ${message.from ?? "-"}  ${typeof message.body === "string" ? message.body : JSON.stringify(message.body)}`);
+  if (result.remaining) lines.push(`(${result.remaining} more message${result.remaining === 1 ? "" : "s"} still queued; run inbox again)`);
+  return lines;
+}
+
+/**
+ * `headroom inbox`: the hand-off channel between orchestrators sharing an
+ * account. Reading is destructive by design -- each message is renamed with a
+ * `.read` suffix once its content has been printed -- so two reads of the
+ * same inbox never both act on the same hand-off.
+ */
+async function inbox(argv: string[]): Promise<number> {
+  if (argv[0] === "send") {
+    const to = option(argv, "--to");
+    const kind = option(argv, "--kind");
+    const file = option(argv, "--file");
+    const text = option(argv, "--text");
+    if (!to || !kind) throw new Error(INBOX_SEND_HELP);
+    if (!isInboxKind(kind)) throw new Error(`--kind must be one of ${INBOX_KINDS.join(", ")}`);
+    if ((file === undefined) === (text === undefined)) throw new Error("pass exactly one of --file or --text");
+    const body = file !== undefined ? await readBoundedRegularFile(file, MAX_INBOX_MESSAGE_BYTES) : text!;
+    const sent = await sendInboxMessage({ to, kind: kind as InboxKind, text: body, from: option(argv, "--from") ?? null });
+    console.log(`sent ${sent.file} to ${sent.session}`);
+    return 0;
+  }
+  const session = option(argv, "--session");
+  if (!session) throw new Error(INBOX_HELP);
+  const sinceValue = option(argv, "--since");
+  const sinceEpoch = sinceValue === undefined ? undefined : Number(sinceValue);
+  if (sinceEpoch !== undefined && (!Number.isFinite(sinceEpoch) || sinceEpoch < 0)) throw new Error("--since must be milliseconds since the epoch");
+  const result = await readInbox({ session, since: sinceEpoch });
+  if (argv.includes("--json")) { console.log(JSON.stringify(result)); return 0; }
+  if (!result.messages.length) { console.log(`no unread messages for ${result.session}`); return 0; }
+  for (const line of inboxLines(result)) console.log(line);
+  return 0;
+}
+
+/** `headroom plan import <file>`: turns a budget plan's declared shares into
+ * ordinary advisory leases, so `gate --owner`, `route` and `spend` see the
+ * agreed division without a second reservation mechanism of their own. */
+async function planImport(argv: string[]): Promise<number> {
+  const file = argv[0];
+  if (!file || file.startsWith("--")) throw new Error(PLAN_IMPORT_HELP);
+  const plan = parseBudgetPlan(await readBoundedRegularFile(file));
+  const now = new Date();
+  const planned = budgetPlanLeases(plan, now);
+  if (!planned.length) { console.log(`no window in ${file} is still open; nothing imported`); return 0; }
+  const store = await HeadroomStore.open();
+  try {
+    for (const lease of planned) {
+      const created = store.startLease(lease.owner, lease.meter_id, lease.expect_percent, lease.ttl_ms, lease.note, now);
+      console.log(`${created.id}  ${created.owner}  ${created.meter_id}  expect ${lease.expect_percent}%  expires ${created.expires_at}`);
+    }
+    store.audit("cli", "plan_import", file, `${planned.length} lease${planned.length === 1 ? "" : "s"}`);
+  } finally { store.close(); }
+  console.log(`imported ${planned.length} advisory lease${planned.length === 1 ? "" : "s"} from ${plan.windows.length} window${plan.windows.length === 1 ? "" : "s"}`);
+  return 0;
+}
+
 async function plan(argv: string[]): Promise<number> {
+  if (argv[0] === "import") return planImport(argv.slice(1));
   const meter = option(argv, "--meter");
   if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]");
   const until = option(argv, "--until");
@@ -1010,7 +1122,9 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["lease start|list|end", "Reserve, list, or release a meter lease"],
   ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
   ["rate", "Burn in percent per hour over a recent window, and ETA to the limit"],
-  ["plan", "Points available per remaining 5h window and the plan line to hold"],
+  ["spend", "Per-owner attributed spend on a shared meter, from the spend ledger"],
+  ["inbox", "Read this session's hand-off messages, or send one to another session"],
+  ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
@@ -1044,8 +1158,13 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "  list:  headroom lease list",
   ].join("\n"),
   cost: "Usage: headroom cost [<action-class>] [--json]",
-  rate: "Usage: headroom rate [--meter <meter_id>] [--minutes 30] [--window 10m] [--json]",
-  plan: "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
+  rate: "Usage: headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--window 10m] [--json]",
+  spend: SPEND_HELP,
+  inbox: [INBOX_HELP, `  send: ${INBOX_SEND_HELP}`].join("\n"),
+  plan: [
+    "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
+    `  import: ${PLAN_IMPORT_HELP}`,
+  ].join("\n"),
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
@@ -1138,6 +1257,8 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "can") return can(argv.slice(1));
   if (argv[0] === "cost") return cost(argv.slice(1));
   if (argv[0] === "rate") return rate(argv.slice(1));
+  if (argv[0] === "spend") return spend(argv.slice(1));
+  if (argv[0] === "inbox") return inbox(argv.slice(1));
   if (argv[0] === "plan") return plan(argv.slice(1));
   if (argv[0] === "gate") return gate(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));

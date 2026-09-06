@@ -233,6 +233,52 @@ Example: a burst of parallel lanes that jumps a 5h window from 1% to 23% in ten 
 burst check (well over twice a modest plan rate) even though 23% used is nowhere near the freeze
 reserve -- `gate` refuses with `burst: 48 pts/h over the last 10 min, plan 4 pts/h; hold until 17:45`.
 
+## Spend ledger
+
+A lease says what an orchestrator *expects* to spend. The spend ledger says what the meter
+*actually* moved, and who was holding it at the time. On every poll of a hard percent window,
+Headroom takes the delta against the previous fresh reading of that same meter and window and
+books it against the owners with an active lease on that meter, split in proportion to their
+expected percents (equal shares when nobody declared one). Each row carries a confidence: 1.0 when
+a single owner held the meter, 1/n while n owners overlapped, and 0.5 for the `unattributed` owner
+that movement is booked to when no lease was open at all. A drop is never negative spend -- a
+window whose used percent falls has reset, so nothing is written across that boundary. Rows are
+kept for 30 days and pruned on the next write.
+
+`headroom spend [--meter M] [--owner X] [--since 24h]` prints one line per owner and window;
+`headroom rate --owner X` adds that owner's attributed share next to the meter's own burn. This is
+the read that turns one shared account's single total into a per-orchestrator answer, so several
+sessions on the same subscription can see who is actually spending it. It is attribution, not
+metering: an orchestrator that never takes a lease is invisible to it, and its spend lands under
+`unattributed` instead.
+
+A budget plan is the forward-looking half of the same idea. `headroom plan import <file>` reads a
+small JSON document that divides a window between sessions and turns each declared share into an
+ordinary advisory lease (owner = the session id, expected percent = the share, expiring at the
+window's end), so `gate --owner`, `route`, `can` and `spend` all see the agreed division without a
+second reservation mechanism:
+
+```json
+{ "windows": [ { "starts_at": "2026-09-06T09:00:00Z", "ends_at": "2026-09-06T14:00:00Z",
+                 "meter": "claude-main:all", "shares": { "session-a": 60, "session-b": 20 } } ] }
+```
+
+## Inbox
+
+Orchestrators sharing an account also need to leave each other notes, which the meters cannot
+carry. Each session has a directory `<HEADROOM_HOME>/inbox/<session-id>/` holding one file per
+message, named `<epoch-ms>-<kind>.json` for a kind of `budget`, `note`, or `handoff`. The file is
+a small envelope: `version`, `kind`, `to`, `from` (null when the sender did not name itself), `at`,
+and `body` -- the sender's payload, parsed when it was JSON and kept as text otherwise.
+
+`headroom inbox send --to <session-id> --kind <kind> (--file <path> | --text <text>)` writes one,
+atomically and 0600, capped at 64 KiB. `headroom inbox --session <id> [--since <epoch-ms>]` prints
+the unread ones oldest first and marks each read by renaming it with a `.read` suffix, so a
+hand-off is delivered once rather than acted on twice. The MCP tool `quota_inbox` reads; it never
+sends. A session id is one path segment of `[A-Za-z0-9._-]{1,64}` and nothing else, the directory
+tree lives inside the verified Headroom home at 0700, and a file Headroom did not write is skipped
+rather than guessed at.
+
 ## Events
 
 An event is a separate, append-only record of something that happened to a principal or meter: a

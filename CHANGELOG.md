@@ -7,6 +7,28 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Spend ledger: per-orchestrator attribution of what a shared meter actually moved. On every poll
+  of a hard percent window, the delta against the previous fresh reading of that meter and window
+  is booked to the owners holding an active lease at that moment, split in proportion to their
+  expected percents (equal shares when none was declared), with the movement nobody had leased
+  landing under the owner `unattributed`. Each row carries a confidence: 1.0 for a single owner,
+  1/n across n overlapping owners, 0.5 for unattributed. A drop is a reset, never negative spend,
+  so nothing is written across a reset boundary. Rows are kept for 30 days and pruned on the next
+  write. New `headroom spend [--meter M] [--owner X] [--since 24h] [--json]` and MCP `quota_spend`;
+  `headroom rate --owner X` adds that owner's attributed share next to the meter's own burn.
+- Orchestrator inbox: `<HEADROOM_HOME>/inbox/<session-id>/<epoch>-<kind>.json` for hand-offs
+  between sessions sharing an account, with kinds `budget`, `note` and `handoff`.
+  `headroom inbox send --to <session-id> --kind <kind> (--file <path> | --text <text>)` writes one
+  atomically at 0600, capped at 64 KiB; `headroom inbox --session <id> [--since <epoch-ms>]` prints
+  the unread ones oldest first and marks each read by renaming it with a `.read` suffix, so a
+  hand-off is delivered once. MCP `quota_inbox` reads and never sends. Session ids are one path
+  segment of `[A-Za-z0-9._-]{1,64}`, directory references and traversal are refused, and the tree
+  is created 0700 inside the verified Headroom home.
+- `headroom plan import <file>`: a budget plan (`{ "windows": [ { "starts_at", "ends_at", "meter",
+  "shares": { "<session>": <percent> } } ] }`) becomes one advisory lease per share, owned by the
+  session id and expiring at the window's end, so `gate --owner`, `route`, `can` and `spend` see the
+  agreed division without a second reservation mechanism. Windows that have already ended are
+  skipped.
 - Notifications for humans. A `[notify]` block in policy.toml delivers stored events (resets, free
   resets, source failures and recoveries, projected stalls, `model_new`) plus a `threshold_percent`
   crossing to Telegram, ntfy, or a webhook, from the daemon after each poll. A per-event ledger in

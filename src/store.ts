@@ -3,18 +3,23 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
-import type { EventKind, Lease, NotifyDelivery, Observation, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
-import { summarizeLearnedCost, type LearnedCost } from "./cost.js";
+import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { redact } from "./security.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
  * carrying a leaked secret in one of its string fields is scrubbed the same
  * way a plain error string would be. */
+/** How long an attributed spend row is kept before it is pruned on the next
+ * write. Long enough to cover a weekly window several times over, short
+ * enough that the table stays a working set rather than an archive. */
+export const SPEND_LEDGER_RETENTION_DAYS = 30;
+
 function redactDeep(value: unknown): unknown {
   if (typeof value === "string") return redact(value);
   if (Array.isArray(value)) return value.map(redactDeep);
@@ -193,6 +198,12 @@ export class HeadroomStore {
         observation_id INTEGER NOT NULL, amount_percent REAL NOT NULL, estimated INTEGER NOT NULL, at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS lease_spend_lease ON lease_spend(lease_id);
+      CREATE TABLE IF NOT EXISTS spend_ledger (
+        id INTEGER PRIMARY KEY, meter_id TEXT NOT NULL, window_minutes INTEGER,
+        from_at TEXT NOT NULL, to_at TEXT NOT NULL, delta_percent REAL NOT NULL,
+        owner TEXT NOT NULL, share_percent REAL NOT NULL, confidence REAL NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS spend_ledger_meter_to_at ON spend_ledger(meter_id, to_at);
       CREATE TABLE IF NOT EXISTS schema_migrations (
         id TEXT PRIMARY KEY, applied_at TEXT NOT NULL
       );
@@ -362,6 +373,7 @@ export class HeadroomStore {
     // a windowless failure is only ever closed by this separate check.
     if (stored.freshness === "fresh") this.recoverWindowlessFailure(stored);
     if (previous) this.attributeLeaseSpend(previous, stored);
+    if (stored.freshness === "fresh") this.recordSpendLedger(stored);
     if (stored.freshness === "fresh") this.detectPaceProjection(stored);
     return stored;
   }
@@ -878,6 +890,82 @@ export class HeadroomStore {
     const total = weights.reduce((sum, value) => sum + value, 0);
     if (total <= 0) return;
     for (let index = 0; index < leases.length; index += 1) this.db.prepare("INSERT INTO lease_spend (lease_id,meter_id,observation_id,amount_percent,estimated,at) VALUES (?,?,?,?,?,?)").run(leases[index].id, current.meter_id, current.id, delta * weights[index] / total, 1, current.fetched_at);
+  }
+
+  /**
+   * Books one poll's movement on a hard percent window into `spend_ledger`,
+   * attributed to whoever held a lease on that meter while it happened.
+   *
+   * The delta is measured against the previous FRESH reading of the same
+   * meter and window (freshBaseline), not the immediately previous row, so a
+   * failed or stale poll in between does not silently drop a window's real
+   * movement. A drop is never negative spend: a window whose used percent
+   * falls has reset (or had a free reset applied), and the movement across
+   * that boundary is not attributable to anyone, so nothing is written at
+   * all until the next pair of readings both sit on the same side of it.
+   *
+   * Unlike lease_spend -- which exists to learn what an action class costs,
+   * and so only ever records against a lease -- this ledger is a complete
+   * account of the meter itself: a delta nobody had leased still lands, under
+   * the `unattributed` owner, so the per-owner shares and the meter's own
+   * total can be compared instead of quietly disagreeing.
+   */
+  private recordSpendLedger(current: StoredObservation): void {
+    const window = current.window;
+    if (!window || !window.minutes || window.enforcement !== "hard" || window.kind === "state" || window.kind === "count") return;
+    if (current.quantity?.unit !== "percent") return;
+    const baseline = this.freshBaseline(current);
+    if (!baseline || baseline.quantity?.unit !== "percent") return;
+    const delta = current.quantity.used - baseline.quantity.used;
+    if (!Number.isFinite(delta) || delta <= 0) return;
+    const at = new Date(current.fetched_at);
+    const owners = this.leases(current.meter_id, true, at)
+      .filter((lease) => lease.started_at <= current.fetched_at && lease.expires_at > baseline.fetched_at)
+      .map((lease) => ({ owner: lease.owner, expect: lease.expected_percent }));
+    for (const share of attributeSpend(delta, owners)) {
+      this.db.prepare("INSERT INTO spend_ledger (meter_id,window_minutes,from_at,to_at,delta_percent,owner,share_percent,confidence) VALUES (?,?,?,?,?,?,?,?)")
+        .run(current.meter_id, window.minutes, baseline.fetched_at, current.fetched_at, delta, share.owner, share.share_percent, share.confidence);
+    }
+    this.pruneSpendLedger(at);
+  }
+
+  /** Bounded history: the ledger answers "who spent what recently", never
+   * "who spent what ever", so a row older than the retention is dropped on
+   * every write rather than accumulating for the life of the database.
+   * julianday() rather than a string range, since fetched_at is not
+   * guaranteed to carry milliseconds (see eventEvidenceFor). */
+  private pruneSpendLedger(now: Date): void {
+    const cutoff = new Date(now.getTime() - SPEND_LEDGER_RETENTION_DAYS * 86_400_000).toISOString();
+    this.db.prepare("DELETE FROM spend_ledger WHERE julianday(to_at) < julianday(?)").run(cutoff);
+  }
+
+  /**
+   * Per-owner attributed spend, grouped by meter and window, newest activity
+   * first. `confidence` is the share-weighted mean of the underlying rows'
+   * own confidence, so a total dominated by well-attributed deltas is not
+   * dragged down by one tiny ambiguous one.
+   */
+  spendByOwner(options: { meter?: string; owner?: string; since?: string } = {}): SpendRow[] {
+    const filters = ["1 = 1"];
+    const params: unknown[] = [];
+    if (options.meter) { filters.push("meter_id = ?"); params.push(options.meter); }
+    if (options.owner) { filters.push("owner = ?"); params.push(options.owner); }
+    if (options.since) { filters.push("julianday(to_at) >= julianday(?)"); params.push(options.since); }
+    const rows = this.db.prepare(`SELECT meter_id, window_minutes, owner,
+      SUM(share_percent) AS attributed_percent, SUM(share_percent * confidence) AS weighted_confidence,
+      COUNT(*) AS samples, MIN(from_at) AS from_at, MAX(to_at) AS to_at
+      FROM spend_ledger WHERE ${filters.join(" AND ")}
+      GROUP BY meter_id, window_minutes, owner
+      ORDER BY MAX(to_at) DESC, meter_id ASC, window_minutes ASC, SUM(share_percent) DESC`).all(...params);
+    return rows.map((row) => {
+      const attributed = Number(row.attributed_percent ?? 0);
+      return {
+        meter_id: String(row.meter_id), window_minutes: number(row.window_minutes), owner: String(row.owner),
+        attributed_percent: attributed,
+        confidence: attributed > 0 ? Number(row.weighted_confidence ?? 0) / attributed : 0,
+        samples: Number(row.samples ?? 0), from_at: String(row.from_at), to_at: String(row.to_at),
+      };
+    });
   }
 
   /** Latest reset evidence for each current meter/window, limited to that window. */
