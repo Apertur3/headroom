@@ -1,0 +1,8 @@
+{
+  "contract": "string",
+  "events": [
+    "unknown (empty array in the fixture data)"
+  ],
+  "generated_at": "string",
+  "source": "string"
+}

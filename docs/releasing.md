@@ -53,6 +53,41 @@ Release candidates, if ever needed, use `-rc.N` the same way.
    until a stable line exists.
 5. A published version is never changed; a mistake gets the next number.
 
+## The Homebrew tap
+
+`brew install apertur3/tap/headroom` installs the published npm tarball through Homebrew and adds
+a `brew services start headroom` service. The tap is the separate repository
+[Apertur3/homebrew-tap](https://github.com/Apertur3/homebrew-tap), which holds one file that
+matters, `Formula/headroom.rb`. After a tag push publishes to npm, the release workflow's
+`homebrew` job downloads the tarball it just attached to the GitHub release, checks that the npm
+registry carries those same bytes (npm's `dist.integrity` against a sha512 of the asset), hashes
+it, runs `scripts/homebrew-formula.sh <version> <npm-tarball-url> <sha256>` and pushes the result
+to the tap's default branch as a commit named `headroom <version>`, authored by `headroom-release`
+at a GitHub noreply address. The job needs a repository secret `HOMEBREW_TAP_TOKEN`: a fine-grained
+personal access token with contents write on `Apertur3/homebrew-tap` and nothing else. Without that
+secret the job prints a notice and stops, so a missing or expired token never fails a release, it
+only leaves the tap on the previous version; the same happens when the version is not on the npm
+registry yet.
+
+The tap has to be seeded by hand once, because a workflow cannot create the repository's first
+commit for you. `docs/homebrew-tap-seed/` holds exactly what that first push contains, generated
+by the same script and kept out of the npm package:
+
+```sh
+gh repo clone Apertur3/homebrew-tap /tmp/homebrew-tap
+cp -R docs/homebrew-tap-seed/. /tmp/homebrew-tap/
+git -C /tmp/homebrew-tap add README.md Formula/headroom.rb
+git -C /tmp/homebrew-tap commit -m "headroom 0.1.0-beta.4"
+git -C /tmp/homebrew-tap push
+```
+
+Create the token at https://github.com/settings/personal-access-tokens/new: resource owner
+`Apertur3`, repository access "Only select repositories" with `Apertur3/homebrew-tap` alone,
+repository permission Contents: Read and write, no account permissions, an expiry you will
+remember. Then `gh secret set HOMEBREW_TAP_TOKEN --repo Apertur3/headroom` and paste it. When the
+seed formula in this repository drifts from the version on npm, regenerate it with the script
+rather than editing it: the tests compare the two.
+
 ## Deprecations
 
 A command, flag or field that will be removed keeps working for at least one minor release,

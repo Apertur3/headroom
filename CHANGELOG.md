@@ -7,6 +7,48 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- A versioned JSON contract for every machine reader: every `--json` CLI output that is a JSON
+  object (`status`, `can`, `gate`, `plan`, `fill`, `route`, `inbox`, `lease list`, `--models`) and
+  every MCP tool result that is an object now carries `contract: "1.0"` and `generated_at` (ISO
+  8601) at the top level, with every existing field unchanged. `cost`, `rate`, `spend`, and
+  `events` stay bare JSON arrays (no top level to add fields to) and are documented as such. New
+  `headroom contract` prints the contract version and where it is documented.
+  `test/json-contract.test.ts` snapshots the field shape of every output against
+  `test/fixtures/json-contract/*.json` so a rename or removal fails CI. Full reference, the shared
+  `freshness`/`truth`/`confidence`/`reason`/pace-state vocabulary, exit codes per command, and the
+  compatibility promise: docs/json-contract.md.
+- `headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind observations|events|spend|leases|all] [--format json|csv] [--out <path>]`:
+  dumps stored history for a period as one JSON document (`schema_version`, `exported_at`, `range`,
+  then an array per requested kind) or as CSV (one file per kind for `--kind all`, suffixed
+  `-observations.csv` and so on, with RFC 4180 quoting). Observations come back with every stored
+  column and no derived pace fields; spend is the raw `spend_ledger` movement rows, not the
+  per-owner aggregate `headroom spend` prints. Reasons are redacted again defensively even though
+  they are already redacted at insert time. JSON defaults to stdout; CSV requires `--out`. Refuses
+  a range that would return more than 1,000,000 rows rather than building an unbounded document.
+- `headroom statusline --render [--style compact|full] [--meters M,...] [--color]`: prints one line
+  for Claude Code's own status bar after writing the usual snapshot. This session's 5h and weekly
+  percentages come from the JSON Claude Code just piped in, so they are exact; the other
+  principals, model-scoped meters, pace states, active leases and the protected reserve come from
+  Headroom, read from the daemon under a 150ms budget with a fallback to the store and never a
+  vendor call, so the line cannot delay a prompt. A pace state is shown only when it is not
+  NORMAL, compact style stays under 120 characters by dropping the least important segments as a
+  trailing `+N`, `--style full` adds burn and time-to-stall, and colour is ANSI only on a TTY or
+  with `--color`. `--chain` still works: the chained command's output prints first, on its own
+  row. See docs/quickstart.md's "Put the whole picture in the status bar".
+- `headroom completion <bash|zsh|fish|pwsh>`: prints a completion script for the given shell,
+  generated from the same command table `--help` reads, so top-level commands, subcommands
+  (`accounts discover`, `lease start|list|end`, `keychain grant`, `inbox send`, `plan import`,
+  `engine install`) and every flag stay in sync with `--help` automatically. Bash and zsh also
+  complete `--meter` and `--principal` values, backed by a hidden `_complete-meters` /
+  `_complete-principals` helper that reads the daemon or the local store within a 200ms budget and
+  prints nothing past that rather than ever hanging a shell's Tab key. See docs/quickstart.md's
+  "Shell completions".
+- Homebrew tap: `brew install apertur3/tap/headroom` installs the published npm tarball on macOS
+  and Linux and adds a `brew services start headroom` service that keeps the daemon running, with
+  logs under `$(brew --prefix)/var/log/headroom/`. `scripts/homebrew-formula.sh` generates the
+  formula from a version, a tarball URL and a sha256, and a `homebrew` job in the release workflow
+  runs it after every published tag and pushes the result to `Apertur3/homebrew-tap`; without the
+  `HOMEBREW_TAP_TOKEN` secret that job prints a notice and skips instead of failing the release.
 - `headroom update [--notes] [--dry-run] [--yes]`: checks the npm registry for a newer
   `headroomd`, installs it by spawning `npm install -g headroomd@<version>` as an argument vector
   (never a shell string), restarts the Headroom service if one is installed, and prints the version
@@ -118,6 +160,22 @@ All notable changes to this project are documented here. The format follows
   token file exists, `doctor` reports its presence, a 401 says "run: grok login", and 403/429 keep the
   status the collector backs off on. The browser-cookie fallback is deliberately not implemented: see
   docs/vendors.md.
+- `headroom uninstall [--home] [--yes] [--dry-run]`: reverses `setup` in order -- stops and removes
+  the background service, removes the Claude Code MCP registration for every configured profile that
+  has one (`claude mcp remove headroom`, with `CLAUDE_CONFIG_DIR` set for a non-default profile), and
+  with `--home` deletes the Headroom home directory (database, logs, config, and accounts.toml) after
+  a y/N question `--yes` answers. Always ends by printing `npm uninstall -g headroomd` for the user to
+  run themselves -- Headroom never removes its own package while running. `--dry-run` prints the plan
+  and changes nothing; exits 0 on success or nothing to do, 1 when a step failed.
+- `headroom doctor --bundle [path]`: writes one redacted, human-readable text file
+  (`headroom-bundle-<date>.txt` in the current directory by default) for pasting into a GitHub
+  issue, and prints its path and size. Holds the Headroom and Node versions, OS and arch, the
+  running binary's path, the same lines `headroom doctor` prints, configured principals (vendor
+  and adapter only, never a location), the policy and routing config, the last 50 lines of the
+  daemon log, the last 20 audit rows, and the current status lines. A single redaction pass over
+  the whole file removes token and credential shapes, email addresses, private network addresses,
+  this machine's hostname, home directory and username before anything is written; never includes
+  accounts.toml's own location, the database, or a credential file. Never polls a vendor.
 
 ### Fixed
 - Burn rate: a lookback window spanning a reset (weekly or free) no longer pairs a near-full
@@ -127,6 +185,21 @@ All notable changes to this project are documented here. The format follows
   so `rate`, the status line's burn segment, and the burn-driven projection into CONSERVE all read
   only the post-reset slope; with fewer than two samples since the reset, burn is null instead of
   negative, and a small negative slope left over from whole-percent rounding noise is clamped to 0.
+- Daemon log rotation (`daemon.log` capped at 5 MiB, shifting into `.1`..`.4` before every write,
+  rename-before-create so a concurrent `headroom logs --tail` never sees a half-rotated file) is now
+  covered by tests for the full shift chain, the mode-0600 new file, and a tail racing the rotation,
+  and documented in the quickstart alongside the one path Headroom cannot rotate itself: the OS-level
+  stdout/stderr redirect the service definitions also point at that file.
+- The SQLite store had no schema version: `open()` ran `CREATE TABLE IF NOT EXISTS` and ad hoc
+  `ALTER TABLE` for every table on every start, so a shape change could apply silently out of order
+  and a downgrade could open a newer database without noticing. `headroom.db` now tracks its shape
+  with `PRAGMA user_version`, applied through numbered migrations in new `src/migrations.ts`
+  (migration 1 is the exact previous shape, so an existing database migrates to it with no changes),
+  each run inside its own transaction with the version bumped only on success. A database newer than
+  the running binary understands is refused outright, before any statement runs, naming both versions
+  and `headroom update`. Before any migration above the baseline runs, the database file is backed up
+  once to `headroom.db.bak-<version>`. `headroom doctor` prints the database's schema version next to
+  the version this binary expects.
 
 ## [0.1.0-beta.4] - 2026-09-06
 

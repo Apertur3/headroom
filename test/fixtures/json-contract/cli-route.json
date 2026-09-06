@@ -1,0 +1,19 @@
+{
+  "candidates": [
+    {
+      "principal": "string",
+      "reason": "string",
+      "remaining_percent": "number",
+      "reserve_percent": "number",
+      "state": "string",
+      "window_minutes": "number"
+    }
+  ],
+  "contract": "string",
+  "environment": {
+    "CLAUDE_CONFIG_DIR": "string"
+  },
+  "generated_at": "string",
+  "principal": "string",
+  "reason": "string"
+}

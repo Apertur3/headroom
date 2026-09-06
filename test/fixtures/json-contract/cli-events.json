@@ -1,0 +1,17 @@
+[
+  {
+    "confidence": "number",
+    "corrected_by": "null",
+    "created_at": "string",
+    "evidence_observation_ids": [
+      "number"
+    ],
+    "id": "string",
+    "kind": "string",
+    "last_seen_at": "null",
+    "meter_id": "string",
+    "origin": "string",
+    "principal_id": "string",
+    "reason": "null"
+  }
+]

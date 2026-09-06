@@ -7,12 +7,15 @@ import { homedir } from "node:os";
 import { join, basename, delimiter, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
+import { completionCommand, printCompletionMeterIds, printCompletionPrincipalIds, COMPLETION_HELP } from "./completion.js";
 import { doctor } from "./doctor.js";
+import { exportCommand, EXPORT_HELP } from "./export.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { antigravityResponseShape } from "./adapters/antigravity.js";
@@ -22,6 +25,7 @@ import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
+import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, paceDecision, reserveFor, reserveNote, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
@@ -35,6 +39,7 @@ import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
+import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
@@ -339,11 +344,17 @@ async function lease(argv: string[]): Promise<number> {
     }
   }
   if (argv[0] === "list") {
+    const asJson = argv.includes("--json");
     const request = await requestDaemon("leases");
-    if (request !== undefined) { printLeases(unwrapRpc(request) as Lease[]); return 0; }
-    directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); printLeases(items); return 0; } finally { store.close(); }
+    if (request !== undefined) {
+      const items = unwrapRpc(request) as Lease[];
+      if (asJson) { console.log(JSON.stringify(withContract({ leases: items }))); return 0; }
+      printLeases(items);
+      return 0;
+    }
+    directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); if (asJson) { console.log(JSON.stringify(withContract({ leases: items }))); return 0; } printLeases(items); return 0; } finally { store.close(); }
   }
-  throw new Error("Usage: headroom lease <start|end|list>");
+  throw new Error("Usage: headroom lease <start|end|list> [--json]");
 }
 
 async function cost(argv: string[]): Promise<number> {
@@ -483,7 +494,7 @@ async function inbox(argv: string[]): Promise<number> {
   const sinceEpoch = sinceValue === undefined ? undefined : Number(sinceValue);
   if (sinceEpoch !== undefined && (!Number.isFinite(sinceEpoch) || sinceEpoch < 0)) throw new Error("--since must be milliseconds since the epoch");
   const result = await readInbox({ session, since: sinceEpoch });
-  if (argv.includes("--json")) { console.log(JSON.stringify(result)); return 0; }
+  if (argv.includes("--json")) { console.log(JSON.stringify(withContract(result))); return 0; }
   if (!result.messages.length) { console.log(`no unread messages for ${result.session}`); return 0; }
   for (const line of inboxLines(result)) console.log(line);
   return 0;
@@ -530,7 +541,7 @@ async function plan(argv: string[]): Promise<number> {
     const store = await HeadroomStore.open();
     try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
-  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
   // window at all) -- that is a data state to report, not a CLI failure, so
   // it renders like status's own UNKNOWN line and exits 0 rather than 1.
@@ -586,7 +597,7 @@ async function gate(argv: string[]): Promise<number> {
     const store = await HeadroomStore.open();
     try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
-  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
   // A refusal because the meter's own usage could not be read at all (an
   // unreadable/never-seen window) is a different state than a refusal
@@ -656,7 +667,7 @@ async function fill(argv: string[]): Promise<number> {
     const store = await HeadroomStore.open();
     try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
-  if (asJson) { console.log(JSON.stringify(result)); return 0; }
+  if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
   // window at all) -- a data state to report, not a CLI failure, so it
   // renders like status's own UNKNOWN line and exits 0 rather than 1 or 2.
@@ -695,7 +706,7 @@ async function route(argv: string[]): Promise<number> {
     result = routeFor(store, meters, accounts, policy, argv.includes("--allow-unknown"), new Date(), owner);
     store.audit("cli", "route", actionClass, result.principal ? "yes" : "no");
   } finally { store.close(); }
-  if (argv.includes("--json")) { console.log(JSON.stringify(result)); return result.principal ? 0 : 2; }
+  if (argv.includes("--json")) { console.log(JSON.stringify(withContract(result))); return result.principal ? 0 : 2; }
   if (!result.principal) {
     console.log(`no principal fits ${actionClass} (${result.reason})`);
     for (const candidate of result.candidates) console.log(`  ${candidate.principal} ${candidate.state} (${candidate.reason})`);
@@ -734,10 +745,10 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
   const shares = await modelTokenShare(account.location, since, now);
   const totalTokens = shares.reduce((sum, item) => sum + item.input_tokens + item.output_tokens, 0);
   if (asJson) {
-    console.log(JSON.stringify({
+    console.log(JSON.stringify(withContract({
       principal, truth: "estimated", source: "local session logs", window_start: since.toISOString(), window_end: now.toISOString(),
       models: shares.map((item) => ({ ...item, share_percent: totalTokens > 0 ? Math.round(((item.input_tokens + item.output_tokens) / totalTokens) * 1000) / 10 : 0 })),
-    }));
+    })));
     return 0;
   }
   if (!shares.length || totalTokens === 0) {
@@ -818,7 +829,7 @@ export async function observe(argv: string[]): Promise<number> {
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } })); }
+  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
     for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line);
     for (const failure of failures) console.log(failure);
@@ -880,7 +891,7 @@ function dedupeStateReason(state: string, reason: string): string {
 }
 
 function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
-  if (asJson) { console.log(JSON.stringify({ ...decision, cost, leased_id: leasedId ?? null })); return; }
+  if (asJson) { console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null }))); return; }
   console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
   for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
   if (cost.expected_percent !== null) {
@@ -932,19 +943,29 @@ function runChainCommand(command: string, stdin: string): Promise<string> {
  * adopting headroom does not require giving up a prior custom statusline.
  * Never fails to print a line: a statusLine command that errors blanks the
  * user's prompt bar.
+ *
+ * `--render` prints the fuller line instead: the session's own two numbers
+ * from this very payload, plus Headroom's view of every other principal,
+ * model-scoped meter, pace state, lease and reserve, read from the daemon
+ * under a fixed millisecond budget with a store fallback and no vendor call
+ * at all. With `--chain` the chained output goes first and this line follows
+ * on its own row.
  */
 async function statusline(argv: string[]): Promise<number> {
   const chainAt = argv.indexOf("--chain");
   const chainCommand = chainAt >= 0 ? argv.slice(chainAt + 1).join(" ") : undefined;
+  // Everything after --chain belongs to the chained command, so headroom's
+  // own flags are only ever read from the part before it.
+  const renderOptions = parseRenderOptions(chainAt >= 0 ? argv.slice(0, chainAt) : argv, process.stdout.isTTY === true);
   let raw = "";
   let snapshot: ReturnType<typeof snapshotFromStatuslinePayload>;
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const profile = statuslineProfile(configDir);
   const now = new Date();
   try {
     raw = await readStdinText();
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { payload = undefined; }
-    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-    const profile = statuslineProfile(configDir);
     snapshot = snapshotFromStatuslinePayload(payload, profile, now);
     if (snapshot) {
       // Resolves and verifies the same safe Headroom home every other
@@ -961,9 +982,18 @@ async function statusline(argv: string[]): Promise<number> {
     }
   } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }
   if (chainCommand) {
-    try { process.stdout.write(await runChainCommand(chainCommand, raw)); return 0; }
-    catch { /* fall through to headroom's own bar rather than print nothing */ }
+    try {
+      const chained = await runChainCommand(chainCommand, raw);
+      // Without --render the chained command owns the bar outright, exactly
+      // as before. With it, the chained output goes first and headroom's own
+      // line follows on a row of its own -- Claude Code renders one row per
+      // printed line -- so adopting --render never costs an existing
+      // statusline its place.
+      if (!renderOptions) { process.stdout.write(chained); return 0; }
+      process.stdout.write(chained.endsWith("\n") || chained === "" ? chained : `${chained}\n`);
+    } catch { /* fall through to headroom's own bar rather than print nothing */ }
   }
+  if (renderOptions) { console.log(await renderedStatusline(snapshot, profile, renderOptions, now)); return 0; }
   console.log(formatStatuslineBar(snapshot, now));
   return 0;
 }
@@ -1131,6 +1161,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
   ["rate", "Burn in percent per hour over a recent window, and ETA to the limit"],
   ["spend", "Per-owner attributed spend on a shared meter, from the spend ledger"],
+  ["export", "Export observations, events, the spend ledger, and leases for a period as JSON or CSV"],
   ["inbox", "Read this session's hand-off messages, or send one to another session"],
   ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
@@ -1138,21 +1169,24 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
   ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
-  ["doctor", "Diagnose the installation: principals, credentials, daemon, config"],
+  ["doctor", "Diagnose the installation: principals, credentials, daemon, config (--bundle [path] writes a redacted report for a GitHub issue)"],
   ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
   ["keychain grant", "macOS: grant the Claude probe Keychain access"],
   ["install-service", "Install the daemon as a launchd/systemd/Task Scheduler service"],
   ["uninstall-service", "Remove the installed daemon service"],
+  ["uninstall", "Reverse setup: stop/remove the service, remove the Claude Code MCP registration, optionally delete the Headroom home (--home), and print the npm uninstall command"],
   ["daemon", "Run the daemon in the foreground (an installed service does this for you)"],
   ["mcp", "Run the MCP server over stdio"],
   ["engine install", "Install the optional native sensing engine"],
   ["engine status", "Show whether the native and upstream engines are installed"],
   ["logs", "Print the tail of the daemon log"],
   ["notify", "Send a test notification to every configured channel, or show the delivery ledger"],
-  ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar"],
+  ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar (--render for the full line)"],
   ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard)"],
   ["update", "Check the npm registry for a newer headroomd and install it (--notes, --dry-run)"],
   ["version", "Print the Headroom version"],
+  ["contract", "Print the JSON contract version and where it is documented"],
+  ["completion <bash|zsh|fish|pwsh>", "Print a shell completion script for the given shell"],
 ];
 
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
@@ -1164,11 +1198,12 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "Usage: headroom lease <start|end|list>",
     "  start: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]",
     "  end:   headroom lease end <id> --owner <name> [--force]",
-    "  list:  headroom lease list",
+    "  list:  headroom lease list [--json]",
   ].join("\n"),
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--window 10m] [--json]",
   spend: SPEND_HELP,
+  export: EXPORT_HELP,
   inbox: [INBOX_HELP, `  send: ${INBOX_SEND_HELP}`].join("\n"),
   plan: [
     "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
@@ -1179,20 +1214,23 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
   accounts: "Usage: headroom accounts discover",
-  doctor: "Usage: headroom doctor",
+  doctor: "Usage: headroom doctor [--bundle [path]]",
   setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
   "install-service": "Usage: headroom install-service [--dry-run]",
   "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
+  uninstall: "Usage: headroom uninstall [--home] [--yes] [--dry-run]",
   daemon: "Usage: headroom daemon",
   mcp: "Usage: headroom mcp",
   engine: "Usage: headroom engine <install|status> [--pin]",
   logs: "Usage: headroom logs [--tail 50]",
   notify: "Usage: headroom notify (--test | --last <n>)",
-  statusline: "Usage: headroom statusline [--chain <command>]",
+  statusline: "Usage: headroom statusline [--render] [--style compact|full] [--meters <m1,m2>] [--color] [--chain <command>]",
   usage: USAGE_PASTE_HELP,
   update: "Usage: headroom update [--notes] [--dry-run] [--yes]",
   version: "Usage: headroom version (or: headroom --version)",
+  contract: "Usage: headroom contract",
+  completion: COMPLETION_HELP,
 };
 
 export function helpText(): string {
@@ -1210,6 +1248,10 @@ export function helpText(): string {
 export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "--help" || argv[0] === "help") { console.log(helpText()); return 0; }
   if (argv[0] === "--version" || argv[0] === "version") { console.log(await headroomVersion()); return 0; }
+  // The JSON contract version is independent of the package version above:
+  // it names the shape of --json/MCP output, which can stay at 1.0 across
+  // many package releases. See docs/json-contract.md for what it covers.
+  if (argv[0] === "contract") { console.log(`contract ${JSON_CONTRACT_VERSION}`); console.log(JSON_CONTRACT_DOC_PATH); return 0; }
   if (argv.includes("--help") && argv[0] && COMMAND_HELP[argv[0]]) { console.log(COMMAND_HELP[argv[0]]); return 0; }
   // Dispatched before anything else in main() (the proxy strip, the legacy
   // home migration, both of which can throw on a corrupted policy.toml or an
@@ -1217,6 +1259,14 @@ export async function main(argv: string[]): Promise<number> {
   // a statusLine command that fails to print at all blanks the user's status
   // bar. statusline() itself never throws for the same reason.
   if (argv[0] === "statusline") return statusline(argv.slice(1));
+  // Same reasoning as statusline just above: a shell completion pop-up runs
+  // on every Tab press, and the legacy-home notice line printed a few lines
+  // down would land inside the completion script's own stdout (fatal for
+  // `eval "$(headroom completion ...)"`) or as a spurious extra candidate --
+  // so these are dispatched before that notice can ever print.
+  if (argv[0] === "completion") return completionCommand(argv.slice(1));
+  if (argv[0] === "_complete-meters") return printCompletionMeterIds();
+  if (argv[0] === "_complete-principals") return printCompletionPrincipalIds();
   // Before any command can fetch a vendor endpoint: an operator's shell
   // proxy must never silently carry a credentialed request unless
   // policy.toml opts in.
@@ -1241,7 +1291,7 @@ export async function main(argv: string[]): Promise<number> {
     for (const line of await seedExampleConfig()) console.log(line);
     return 0;
   }
-  if (argv[0] === "doctor") return doctor();
+  if (argv[0] === "doctor") return doctor(argv.slice(1));
   if (argv[0] === "setup") return runSetup(argv.slice(1));
   if (argv[0] === "logs") return logs(argv.slice(1));
   if (argv[0] === "notify") return notifyCommand(argv.slice(1));
@@ -1260,6 +1310,7 @@ export async function main(argv: string[]): Promise<number> {
     const result = await uninstallService(process.platform, undefined, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would remove" : "removed"} ${result.path}\nTo unload it: ${result.command}`); return 0;
   }
+  if (argv[0] === "uninstall") return runUninstall(argv.slice(1));
   if (argv[0] === "usage") return usagePaste(argv.slice(1));
   if (argv[0] === "update") return runUpdate(argv.slice(1));
   if (argv[0] === "history") return history(argv.slice(1));
@@ -1269,6 +1320,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "cost") return cost(argv.slice(1));
   if (argv[0] === "rate") return rate(argv.slice(1));
   if (argv[0] === "spend") return spend(argv.slice(1));
+  if (argv[0] === "export") return exportCommand(argv.slice(1));
   if (argv[0] === "inbox") return inbox(argv.slice(1));
   if (argv[0] === "plan") return plan(argv.slice(1));
   if (argv[0] === "gate") return gate(argv.slice(1));

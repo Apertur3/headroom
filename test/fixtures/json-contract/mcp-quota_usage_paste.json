@@ -1,0 +1,39 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "observations": [
+    {
+      "adapter_version": "string",
+      "confidence": "number",
+      "fetched_at": "string",
+      "freshness": "string",
+      "id": "number",
+      "meter_id": "string",
+      "observed_at": "string",
+      "principal_id": "string",
+      "quantity": {
+        "limit": "number",
+        "remaining": "number",
+        "unit": "string",
+        "used": "number"
+      },
+      "reason": "string",
+      "resets_at": "string",
+      "resets_in": "string",
+      "resets_in_seconds": "number",
+      "source": "string",
+      "truth": "string",
+      "upstream_schema_version": "string",
+      "window": {
+        "enforcement": "string",
+        "kind": "string",
+        "minutes": "number"
+      }
+    }
+  ],
+  "principal": "string",
+  "source": "string",
+  "unparsed": [
+    "unknown (empty array in the fixture data)"
+  ]
+}
