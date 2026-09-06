@@ -81,3 +81,41 @@ export function buildCostEstimate(actionClass: string, expectOverride: number | 
     iqr_low: learned?.iqr_low ?? null, iqr_high: learned?.iqr_high ?? null, max_more_before_reset: maxMore,
   };
 }
+
+/** One owner's share of a single metered delta, as stored in `spend_ledger`. */
+export interface SpendShare {
+  owner: string;
+  share_percent: number;
+  confidence: number;
+}
+
+/** The owner name a delta is booked under when no lease was active for it. */
+export const UNATTRIBUTED_OWNER = "unattributed";
+
+/**
+ * Splits one meter delta across the owners holding an active lease on that
+ * meter at the moment the delta was observed.
+ *
+ * The split is proportional to each owner's declared expectation, with an
+ * owner who declared nothing weighted as 1 -- the same weighting
+ * store.attributeLeaseSpend() already uses for per-lease spend, so the two
+ * views of the same movement never disagree about who was holding what.
+ * When every weight is zero (every active owner declared an expectation of
+ * exactly 0) the split falls back to equal shares rather than dividing by
+ * zero and dropping the delta.
+ *
+ * Confidence says how much a single row may be trusted on its own: 1.0 when
+ * exactly one owner held the meter (nothing to guess), 1/n across n
+ * simultaneous owners, and 0.5 for the `unattributed` row written when no
+ * lease was active at all -- the movement is real and its owner is simply
+ * not knowable from leases.
+ */
+export function attributeSpend(deltaPercent: number, owners: Array<{ owner: string; expect: number | null }>): SpendShare[] {
+  if (!Number.isFinite(deltaPercent) || deltaPercent <= 0) return [];
+  if (!owners.length) return [{ owner: UNATTRIBUTED_OWNER, share_percent: deltaPercent, confidence: 0.5 }];
+  const confidence = owners.length === 1 ? 1 : 1 / owners.length;
+  const weights = owners.map((item) => (item.expect !== null && Number.isFinite(item.expect) && item.expect > 0 ? item.expect : item.expect === null ? 1 : 0));
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  const shares = total > 0 ? weights.map((weight) => deltaPercent * weight / total) : owners.map(() => deltaPercent / owners.length);
+  return owners.map((item, index) => ({ owner: item.owner, share_percent: shares[index], confidence }));
+}

@@ -97,14 +97,25 @@ export interface RateLine {
    * pending Keychain grant), so a caller sees why instead of a bare "no
    * readings". Absent on every real per-window line. */
   reason?: string | null;
+  /** Set only when `rate` was asked for one owner: how much of this window's
+   * movement over the same lookback the spend ledger attributes to them, and
+   * how much that attribution can be trusted. Absent otherwise, so a plain
+   * `rate` read is unchanged. */
+  attributed_owner?: string;
+  attributed_percent?: number;
+  attributed_confidence?: number;
 }
 
 /** One rate line per window: with a meter given, every enforced window of
  * that meter; without one, every known meter's shortest (primary) window,
  * so a broad read stays one line per account instead of flooding the
- * terminal with every weekly window too. */
-export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date()): RateLine[] {
+ * terminal with every weekly window too. With `owner` given, each line also
+ * carries that owner's ledger-attributed share of the same lookback, so
+ * "the meter is burning 22%/h" and "9%/h of that is mine" are read together
+ * rather than from two separate commands. */
+export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date(), owner?: string): RateLine[] {
   const meterIds = meter ? [meter] : [...new Set(store.latestPerWindow().map((row) => row.meter_id))];
+  const sinceIso = new Date(now.getTime() - lookbackMinutes * 60_000).toISOString();
   const lines: RateLine[] = [];
   for (const id of meterIds) {
     const rows = enforcedPercentWindows(store, id);
@@ -116,7 +127,14 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
     }
     for (const row of targets) {
       const burn = store.burnRateFor([row], now, lookbackMinutes).get(`${row.meter_id}:${row.window!.minutes}`) ?? { burn_percent_per_hour: null, empty_in_seconds: null };
-      lines.push({ meter: id, window_minutes: row.window!.minutes, used_percent: row.quantity!.used, burn_percent_per_hour: burn.burn_percent_per_hour, empty_in_seconds: burn.empty_in_seconds, resets_at: row.resets_at });
+      const line: RateLine = { meter: id, window_minutes: row.window!.minutes, used_percent: row.quantity!.used, burn_percent_per_hour: burn.burn_percent_per_hour, empty_in_seconds: burn.empty_in_seconds, resets_at: row.resets_at };
+      if (owner) {
+        const attributed = store.spendByOwner({ meter: id, owner, since: sinceIso }).find((item) => item.window_minutes === row.window!.minutes);
+        line.attributed_owner = owner;
+        line.attributed_percent = attributed?.attributed_percent ?? 0;
+        line.attributed_confidence = attributed?.confidence ?? 0;
+      }
+      lines.push(line);
     }
   }
   return lines;

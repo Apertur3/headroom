@@ -486,7 +486,14 @@ export class HeadroomDaemon {
         case "rate": {
           const meter = typeof params.meter === "string" ? params.meter : undefined;
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
-          result = rateLines(this.store, meter, minutes); break;
+          const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          result = rateLines(this.store, meter, minutes, new Date(), owner); break;
+        }
+        case "spend": {
+          const meter = typeof params.meter === "string" && params.meter.trim() ? params.meter.trim() : undefined;
+          const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          const sinceValue = typeof params.since === "string" && params.since.trim() ? params.since.trim() : new Date(Date.now() - 86_400_000).toISOString();
+          result = this.store.spendByOwner({ meter, owner, since: sinceValue }); break;
         }
         case "plan": {
           const meter = typeof params.meter === "string" ? params.meter : "";
