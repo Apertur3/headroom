@@ -279,8 +279,36 @@ there is no Grok reading.
 
 ## Kimi
 
-Kimi is Moonshot's subscription (the Kimi app and the Kimi Code CLI). Headroom calls the same
-Connect-style gateway the Kimi Code console itself uses, at `https://www.kimi.com/apiv2`:
+Kimi is Moonshot's subscription (the Kimi app and the Kimi Code CLI). There are two credential
+sources, and Headroom prefers the first:
+
+1. **The Kimi Code CLI's own OAuth credential**, at `~/.kimi-code/credentials/kimi-code.json` (or
+   the same path under `KIMI_CODE_HOME`). If you are signed in with the CLI, there is nothing to
+   copy by hand. Headroom reads the `access_token` out of that file and calls
+   `GET https://api.kimi.com/coding/v1/usages` with it. To create or replace it, run `kimi login`.
+2. **A token file you write yourself**, for anyone who only has the desktop app, read against the
+   web gateway below.
+
+The CLI credential is read and never written, and its `refresh_token` is never used or returned:
+Headroom does not refresh a credential another tool owns. An access token whose recorded
+`expires_at` has passed (or passes within the next minute), or whose own JWT `exp` has passed, is a
+`failed` reading with the reason "Kimi CLI credential expired; run: kimi login (Headroom never
+refreshes it)" and costs no vendor request. The file must be a regular file you own, mode 0600, and
+at most 16 KiB; a symlink, a foreign-owned file, one readable by group or other, or anything that
+is not the CLI's own JSON shape is refused. The request carries the access token and the CLI's
+`x-msh-platform` value and nothing else -- Headroom deliberately leaves out the hostname, OS version
+and device-id headers the CLI itself sends, and never creates the CLI's `device_id` file.
+
+From that response `<principal>:main` carries the plan allowance (labelled with the vendor's
+documented 7-day period, which the response declares no window of its own for) plus every
+rate-limit window the response does declare, and the plan name comes from the response's own
+membership level, so no web session is needed for it. A bucket that ever names itself in that
+response gets its own `<principal>:<slug>` meter instead of sharing `main`. The endpoint reports no
+shared subscription pool and no membership 7-day ratio, so that source emits neither of those
+meters.
+
+The second source, the manual token file, calls the same Connect-style gateway the Kimi Code
+console itself uses, at `https://www.kimi.com/apiv2`:
 
 - `kimi.gateway.billing.v1.BillingService/GetUsages`, body `{"scope": ["FEATURE_CODING"]}`. This is
   the required call and the only one whose failure fails the read.
@@ -291,21 +319,24 @@ Connect-style gateway the Kimi Code console itself uses, at `https://www.kimi.co
 The last two are best effort: a failure there costs the plan name or the pool meter, never the
 allowance read.
 
-Credential location: **a file you write yourself**, named by `location` in `accounts.toml`
+Its credential location is **a file you write yourself**, named by `location` in `accounts.toml`
 (default `~/.kimi/auth.token`). It must be a regular file you own, mode 0600, containing only the
-token and nothing else. There is no automatic credential path here on purpose: the Kimi desktop app
-keeps its session token in its own Chromium cookie database (`~/Library/Application
-Support/kimi-desktop/Cookies`), and reading another application's cookie store is outside this
-project's threat model, so Headroom never opens it. To fill the file: sign in at
-`https://www.kimi.com/code/console`, copy the `kimi-auth` token from your own session, write it to
-that path and `chmod 600` it. The token is held in memory for the length of one poll and is never
-logged, stored, or written anywhere; every failure reason is redacted before it is recorded.
-`headroom accounts discover` adds a `kimi` principal when that file exists, and `headroom doctor`
-reports whether it is present and still 0600. The adapter refuses a symlink, a file owned by
-someone else, a file readable by group or other, anything over 8 KiB, and any content that is not
-one bare token.
+token and nothing else. The desktop app is not read automatically on purpose: it keeps its session
+token in its own Chromium cookie database (`~/Library/Application Support/kimi-desktop/Cookies`),
+and reading another application's cookie store is outside this project's threat model, so Headroom
+never opens it. To fill the file: sign in at `https://www.kimi.com/code/console`, copy the
+`kimi-auth` token from your own session, write it to that path and `chmod 600` it. The adapter
+refuses a symlink, a file owned by someone else, a file readable by group or other, anything over
+8 KiB, and any content that is not one bare token.
 
-Meters emitted: `<principal>:main` carries the FEATURE_CODING allowance window plus every
+Either credential is held in memory for the length of one poll and is never logged, stored, or
+written anywhere; every failure reason is redacted before it is recorded. `location` decides which
+source is used: a file named `kimi-code.json` is read as the CLI credential, anything else as a
+manual token file. `headroom accounts discover` adds one `kimi` principal pointing at whichever
+exists, the CLI credential first, and `headroom doctor` reports whether that file is present and
+still 0600 (its fix is `kimi login` for the CLI credential, a fresh paste for the token file).
+
+Meters emitted on the gateway source: `<principal>:main` carries the FEATURE_CODING allowance window plus every
 rate-limit window the same response declares (the 5-hour bucket on current plans), the way Codex's
 `main` carries both its 5-hour and weekly windows; `<principal>:total` is the shared subscription
 pool (`amountUsedRatio`), which spans every feature and not just Code; `<principal>:code-7d` is the
@@ -315,20 +346,26 @@ is dropped); `<principal>:credits` is optional, see below. Window kind, window l
 come from the response. The one exception is the allowance bucket, which the gateway reports
 without a window of its own: it is labelled with the vendor's documented 7-day period.
 
-Optional second location, the Moonshot platform balance: if a file named `moonshot.key` sits beside
-the token file (same directory, same 0600 rules) holding a Moonshot API key, Headroom also calls
+Optional extra location, the Moonshot platform balance: if a file named `moonshot.key` sits beside
+the credential the principal points at (same directory, same 0600 rules) holding a Moonshot API
+key, Headroom also calls
 `GET https://api.moonshot.ai/v1/users/me/balance` and emits `<principal>:credits`, a `count` window
 with no reset. It is informational, never a gate, and its failure never touches the subscription
-meters. Its absence is simply "not configured": no meter, no failure row. Only the international
-host is called; there is no `api.moonshot.cn` path.
+meters. Its absence is simply "not configured": no meter, no failure row. A principal on the CLI
+credential also accepts the documented default `~/.kimi/moonshot.key`, so moving from one source to
+the other does not silently drop an already configured credits meter. Only the international host
+is called; there is no `api.moonshot.cn` path.
 
-Both hosts (`www.kimi.com`, `api.moonshot.ai`) are on the outbound allowlist and nothing else in
-this adapter may leave the machine; redirects are refused rather than followed, and responses are
-size- and depth-bounded like every other vendor read.
+All three hosts (`api.kimi.com`, `www.kimi.com`, `api.moonshot.ai`) are on the outbound allowlist
+and nothing else in this adapter may leave the machine; redirects are refused rather than followed,
+and responses are size- and depth-bounded like every other vendor read.
 
 Known limitations:
 
-- A 401 fails the read with "Kimi rejected the token (401); sign in at
+- On the CLI source, a 401 or 403 fails the read with "Kimi rejected the CLI credential (401); run:
+  kimi login". Headroom cannot repair that itself, because repairing it means spending the refresh
+  token it refuses to touch.
+- A 401 on the token-file source fails the read with "Kimi rejected the token (401); sign in at
   https://www.kimi.com/code/console and refresh `<path>`" -- the token is a web session token, so it
   expires on the vendor's own schedule and is replaced by hand. A JWT whose own `exp` has already
   passed fails the same way without spending a request. 403 and 429 go through the collector's

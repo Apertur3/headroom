@@ -159,6 +159,27 @@ describe("status line pace segment formatting", () => {
   });
 });
 
+describe("burn-rate reset regression (issue #7)", () => {
+  it("reports a null burn, not a negative one, on the poll right after a weekly reset", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    // Near-full weekly usage, then the very next poll lands after the real
+    // weekly reset: resets_at jumps forward by far more than the 10 minutes
+    // between the two polls, so the store records it as a reset.
+    store.insert(weekly(96, -10 * 60_000, 5 * 60_000));
+    store.insert(weekly(4, 0, 7 * 24 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["rate", "--meter", "claude-main:all", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    const [line] = JSON.parse(logs[0]);
+    expect(line.burn_percent_per_hour).toBeNull();
+  });
+});
+
 describe("headroom plan", () => {
   it("prints points per remaining 5h window and the plan line, in --json too", async () => {
     const home = await seededHome();

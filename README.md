@@ -93,6 +93,9 @@ CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
 Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your skills directory.
 Full walkthrough, including what each step grants and why: [docs/quickstart.md](docs/quickstart.md).
 
+`status`/`doctor` print a one-line notice when a newer `headroomd` is out; run `headroom update`
+(never automatic) to install it -- see [Staying up to date](docs/quickstart.md#staying-up-to-date).
+
 ## Documentation
 
 - [docs/quickstart.md](docs/quickstart.md): install to first truthful line, macOS, Linux and Windows

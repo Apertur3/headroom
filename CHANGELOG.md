@@ -7,6 +7,20 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `headroom update [--notes] [--dry-run] [--yes]`: checks the npm registry for a newer
+  `headroomd`, installs it by spawning `npm install -g headroomd@<version>` as an argument vector
+  (never a shell string), restarts the Headroom service if one is installed, and prints the version
+  the freshly installed binary reports for itself. `--notes` prints the GitHub release body before
+  asking to install; `--dry-run` changes nothing. `status` and `headroom doctor` also check the
+  registry (at most once every 24 hours, cached in the store) and print a one-line notice when a
+  newer version is out; `update_check = false` in policy.toml turns the check and the notice off.
+  Headroom never installs anything on its own -- only this explicit, human-run command does; see
+  docs/quickstart.md's "Staying up to date" for why.
+- Kimi: the Kimi Code CLI's own OAuth credential (`~/.kimi-code/credentials/kimi-code.json`, or the
+  same path under `KIMI_CODE_HOME`) is now the preferred credential source, read against
+  `api.kimi.com/coding/v1/usages`. Discovery points a `kimi` principal at it when it exists and
+  falls back to the manual token file otherwise; the credential is read and never refreshed, and an
+  expired one fails the reading with `run: kimi login`.
 - Spend ledger: per-orchestrator attribution of what a shared meter actually moved. On every poll
   of a hard percent window, the delta against the previous fresh reading of that meter and window
   is booked to the owners holding an active lease at that moment, split in proportion to their
@@ -104,6 +118,15 @@ All notable changes to this project are documented here. The format follows
   token file exists, `doctor` reports its presence, a 401 says "run: grok login", and 403/429 keep the
   status the collector backs off on. The browser-cookie fallback is deliberately not implemented: see
   docs/vendors.md.
+
+### Fixed
+- Burn rate: a lookback window spanning a reset (weekly or free) no longer pairs a near-full
+  pre-reset sample with a near-empty post-reset one and reports a wildly negative rate (issue #7,
+  e.g. `-113%/h`). `store.burnRateFor` now cuts a window's samples off at its most recent reset
+  (the confirmed `reset_seen` event, or the same raw usage-drop rule when no event was recorded),
+  so `rate`, the status line's burn segment, and the burn-driven projection into CONSERVE all read
+  only the post-reset slope; with fewer than two samples since the reset, burn is null instead of
+  negative, and a small negative slope left over from whole-percent rounding noise is clamped to 0.
 
 ## [0.1.0-beta.4] - 2026-09-06
 
