@@ -24,6 +24,15 @@ first one that fails, showing its output:
 4. `headroom doctor` once more; every non-OK line names the next command.
 5. Show `headroom` once and explain the pace state on each row.
 
+## Scoped models gate on their own meter
+
+A vendor can cap one model separately from the account (Claude's Fable and Routines buckets are
+`<principal>:fable` and `<principal>:routines`). A YES from `gate` or `can` on `<principal>:all`
+says nothing about those. Before dispatching a scoped model, gate on its meter: `headroom gate
+--model fable --need wk:5 --owner <name>` (or `--meter <principal>:fable`). When that meter reads
+UNKNOWN the answer is no, not "use the account figure". `headroom --models` is a local token-share
+estimate from session logs, never the vendor meter; do not gate on it.
+
 ## The rule of order
 
 1. **Pick by capability first.** Decide which pool is best for the task from your own routing
