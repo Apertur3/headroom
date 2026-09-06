@@ -298,3 +298,35 @@ home on macOS, Linux (a Raspberry Pi 5) and Windows 11 (a VM), where a scripted 
 install, discovery, doctor, daemon, socket or named pipe, service install and MCP steps above.
 What has not happened yet is a person using it daily on Windows with real accounts; the
 daily-used environment is macOS.
+
+## Staying up to date
+
+`headroom` and `headroom doctor` check the npm registry at most once every 24 hours and print a
+one-line notice when a newer `headroomd` is out:
+
+```
+headroomd 0.2.0 is available; run: headroom update
+```
+
+That check sends nothing but the package name -- no account identifiers, no telemetry -- and a
+failed check is silent (never delays a status line; at most a debug line in `headroom logs
+--tail`). Set `update_check = false` in `policy.toml` to turn it, and the network call behind it,
+off entirely.
+
+Run the update yourself:
+
+```sh
+headroom update            # installs the newer version and restarts the service, if one is running
+headroom update --notes    # shows the release's changelog first, then asks before installing
+headroom update --dry-run  # prints what it would do without changing anything
+```
+
+Headroom never installs an update on its own. Only `headroom update`, run by you, ever calls
+`npm install -g`. The daemon never checks and never installs anything -- the check above only ever
+happens from the CLI a human is looking at. This is deliberate, not an oversight: Headroom reads
+credentials for every account it watches, so the one process with that access must never replace
+its own binary unattended. A silent auto-update is also a silent supply-chain risk -- an update
+you didn't ask for is a lot easier to slip a compromised build past than one you triggered and can
+watch. Provenance on the published `headroomd` package (the same npm publish attestation every
+`npm install -g headroomd@<version>` verifies) is what makes a manual update trustworthy; skipping
+the manual step would skip that check too.

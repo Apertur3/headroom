@@ -12,6 +12,10 @@ antigravity_keepalive = true
 # points in its last 45 minutes, the pro-rata allowance before that.
 # "none" skips both, leaving only the plain reserve/plan-line checks.
 pacing = "even"
+# Check the npm registry at most once every 24 hours for a newer headroomd
+# and print a one-line notice from `status`/`doctor`. Never installs
+# anything on its own; set false to disable the check entirely.
+update_check = true
 # Proxy environment variables are ignored. Set this explicitly when a proxy is required.
 # proxy = "http://127.0.0.1:8080"
 # Per-principal intervals override the default:

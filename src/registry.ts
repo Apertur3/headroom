@@ -4,7 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
 import { expandHome, headroomHome, vendorHome } from "./paths.js";
 import { grokAuthPath } from "./adapters/grok.js";
-import { kimiTokenPath } from "./adapters/kimi.js";
+import { kimiCliCredentialPath, kimiTokenPath } from "./adapters/kimi.js";
 
 export function accountsPath(): string { return join(headroomHome(), "accounts.toml"); }
 
@@ -71,12 +71,17 @@ export async function discoverAccounts(home = homedir(), environment = process.e
   if (await exists(grokAuthPath(grokHome, home))) {
     accounts.push({ name: "grok", vendor: "grok", location: grokHome, adapter: "native-ts" });
   }
-  // Kimi has no CLI-written credential Headroom is willing to read: the desktop
-  // app keeps its session token in a browser cookie store. `location` is the
-  // token file the operator writes themselves (see docs/vendors.md).
-  const kimiToken = kimiTokenPath(undefined, home);
-  if (await exists(kimiToken)) {
-    accounts.push({ name: "kimi", vendor: "kimi", location: kimiToken, adapter: "native-ts" });
+  // Kimi, in order of preference. The Kimi Code CLI writes an OAuth credential
+  // of its own, which needs nothing from the operator; the manual token file
+  // stays the documented alternative for anyone who only has the desktop app,
+  // whose session token lives in a browser cookie store this project does not
+  // open. Whichever exists names the principal's `location`; the CLI credential
+  // wins when both do (see docs/vendors.md).
+  const kimiCredentials = [kimiCliCredentialPath(home, environment), kimiTokenPath(undefined, home)];
+  for (const credential of kimiCredentials) {
+    if (!await exists(credential)) continue;
+    accounts.push({ name: "kimi", vendor: "kimi", location: credential, adapter: "native-ts" });
+    break;
   }
   return accounts;
 }

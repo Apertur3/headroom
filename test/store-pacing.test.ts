@@ -69,6 +69,53 @@ describe("store.burnRateFor", () => {
       expect(burn.size).toBe(0);
     } finally { store.close(); }
   });
+
+  // Issue #7: a lookback that spans a reset paired a near-full pre-reset
+  // sample with a near-empty post-reset one and reported a wildly negative
+  // burn ("-113%/h"). Samples must be cut off at the reset instead.
+  it("cuts a burn-rate window off at its reset, reporting only the post-reset slope", async () => {
+    const store = await open();
+    try {
+      // 90% used, then a weekly reset lands (resets_at jumps forward far more
+      // than the 1h between polls), then usage climbs again post-reset.
+      store.insert(rolling(90, "2026-09-03T11:00:00Z", "2026-09-03T17:00:00Z"));
+      store.insert(rolling(10, "2026-09-03T12:00:00Z", "2026-09-04T19:00:00Z"));
+      store.insert(rolling(30, "2026-09-03T12:30:00Z", "2026-09-04T19:00:00Z"));
+      const current = store.latest("claude-main:all")!;
+      const now = new Date("2026-09-03T12:30:00Z");
+      const burn = store.burnRateFor([current], now, 120).get("claude-main:all:300");
+      // Only the two post-reset samples (10% at 12:00, 30% at 12:30) count:
+      // (30 - 10) / 0.5h = 40%/h, not a negative slope back to the 90% peak.
+      expect(burn!.burn_percent_per_hour).toBeCloseTo(40, 6);
+    } finally { store.close(); }
+  });
+
+  it("is null, not negative, with only one fresh sample since the reset", async () => {
+    const store = await open();
+    try {
+      store.insert(rolling(90, "2026-09-03T11:00:00Z", "2026-09-03T17:00:00Z"));
+      store.insert(rolling(10, "2026-09-03T12:00:00Z", "2026-09-04T19:00:00Z"));
+      const current = store.latest("claude-main:all")!;
+      const now = new Date("2026-09-03T12:00:00Z");
+      const burn = store.burnRateFor([current], now, 120).get("claude-main:all:300");
+      expect(burn).toEqual({ burn_percent_per_hour: null, empty_in_seconds: null });
+    } finally { store.close(); }
+  });
+
+  it("clamps a small negative slope from rounding noise to 0, not a negative rate", async () => {
+    const store = await open();
+    try {
+      // A whole-percent meter jittering down by 1 point between polls with no
+      // reset anywhere near it (the drop is nowhere near the >50% threshold).
+      store.insert(rolling(42, "2026-09-03T11:00:00Z", "2026-09-03T17:00:00Z"));
+      store.insert(rolling(41, "2026-09-03T11:30:00Z", "2026-09-03T17:00:00Z"));
+      const current = store.latest("claude-main:all")!;
+      const now = new Date("2026-09-03T11:30:00Z");
+      const burn = store.burnRateFor([current], now, 120).get("claude-main:all:300");
+      expect(burn!.burn_percent_per_hour).toBe(0);
+      expect(burn!.empty_in_seconds).toBeNull();
+    } finally { store.close(); }
+  });
 });
 
 describe("pace_projection_conserve event", () => {
