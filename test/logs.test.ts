@@ -41,7 +41,7 @@ describe("daemon logs", () => {
     await expect(stat(`${path}.${archiveCount + 1}`)).rejects.toThrow();
   });
 
-  it("keeps the new active file at mode 0600 even when the rotated-out file was looser", async () => {
+  it.skipIf(process.platform === "win32")("keeps the new active file at mode 0600 even when the rotated-out file was looser (POSIX mode bits)", async () => {
     const home = await freshHome();
     const path = daemonLogPath(home);
     await writeFile(path, "x".repeat(DAEMON_LOG_MAX_BYTES), { mode: 0o644 });
