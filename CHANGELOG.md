@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- A fresh statusline snapshot no longer skips a granted Claude probe, so the model-scoped meters (Fable, Routines) update every poll; the snapshot is the fallback for the account-wide windows when the probe is blocked or fails.
 - Windows named pipe: the daemon only ever authenticated the client, not itself. Because the pipe
   namespace is machine-global, another local process (including one running as a different user)
   could squat the pipe name before the real daemon started and answer requests with forged results;
