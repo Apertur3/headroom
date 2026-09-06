@@ -252,6 +252,22 @@ function safeObservedAtIso(seconds: number, fallback: Date): string {
   try { return new Date(seconds * 1000).toISOString(); } catch { return fallback.toISOString(); }
 }
 
+/**
+ * Headroom's own meter name for one `rate_limits` key beyond the two
+ * account-wide buckets: the vendor's named model-scoped caps keep their
+ * short, stable names (`fable`, `routines`) whatever wording the payload
+ * spells them with, and anything else is slugged. Shared by the observation
+ * mapping below and by the rendered status line, so a scoped bucket is
+ * called the same thing wherever it appears. Returns "" for a key with no
+ * usable characters at all; the caller skips those.
+ */
+export function statuslineMeterName(key: string): string {
+  const lower = key.toLowerCase();
+  if (lower.includes("fable")) return "fable";
+  if (lower.includes("routine") || lower.includes("cowork")) return "routines";
+  return lower.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
 function bucketObservation(principal: string, meter: string, bucket: StatuslineBucket, minutes: number, observedAtIso: string, fetchedAtIso: string, freshness: "fresh" | "stale"): Observation {
   const active = bucket.is_active !== false;
   return {
@@ -279,7 +295,7 @@ export function observationsFromStatuslineSnapshot(snapshot: StatuslineSnapshot,
   if (snapshot.five_hour) output.push(bucketObservation(principal, "all", snapshot.five_hour, 300, observedAtIso, fetchedAtIso, freshness));
   if (snapshot.seven_day) output.push(bucketObservation(principal, "all", snapshot.seven_day, 10_080, observedAtIso, fetchedAtIso, freshness));
   for (const [key, bucket] of Object.entries(snapshot.extra)) {
-    const meter = key.toLowerCase().includes("fable") ? "fable" : key.toLowerCase().includes("routine") || key.toLowerCase().includes("cowork") ? "routines" : key.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    const meter = statuslineMeterName(key);
     if (!meter) continue;
     output.push(bucketObservation(principal, meter, bucket, 10_080, observedAtIso, fetchedAtIso, freshness));
   }

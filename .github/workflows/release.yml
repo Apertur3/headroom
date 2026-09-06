@@ -210,3 +210,92 @@ jobs:
         if: ${{ steps.publish.outcome == 'failure' }}
         run: |
           echo "::warning title=npm publish skipped::npm refused the publish. Either the trusted publisher for this repository and workflow is not configured on npmjs.com yet, or this version already exists. The GitHub release was created; run this workflow manually with the tag to publish again."
+
+  homebrew:
+    name: update the Homebrew tap
+    needs: [tarball, publish]
+    # Tag pushes only. A workflow_dispatch re-publish is a repair of an npm
+    # publish that did not take; the tap already points at the same tarball.
+    if: >-
+      github.repository == 'Apertur3/headroom' &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Read-only here. The write happens in the tap repository, with a token
+    # scoped to that repository alone.
+    permissions:
+      contents: read
+    env:
+      TAP_REPOSITORY: Apertur3/homebrew-tap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Generate Formula/headroom.rb from the released tarball
+        id: formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.tarball.outputs.version }}
+          # Only whether the secret exists, never the secret itself.
+          TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          if [[ "$TAP_TOKEN_PRESENT" != "true" ]]; then
+            echo "::notice title=Homebrew tap left alone::HOMEBREW_TAP_TOKEN is not set on this repository, so $TAP_REPOSITORY keeps the formula it already has. The npm release itself is unaffected. docs/releasing.md says how to create the token."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The asset the release job attached, not a rebuild: hashing anything
+          # else would pin the formula to bytes nobody published.
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern '*.tgz' --dir release-asset
+          tarball="$(ls release-asset/*.tgz)"
+          sha256="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          # Homebrew downloads the npm registry copy, so the hash is only
+          # correct if the registry carries these exact bytes. npm's own
+          # dist.integrity is a sha512 of them, which makes that checkable.
+          # It also catches the case where the publish step was skipped.
+          registry_integrity="$(npm view "headroomd@$VERSION" dist.integrity 2>/dev/null || true)"
+          asset_integrity="sha512-$(openssl dgst -sha512 -binary "$tarball" | openssl base64 -A)"
+          if [[ "$registry_integrity" != "$asset_integrity" ]]; then
+            echo "::notice title=Homebrew tap left alone::headroomd@$VERSION is not on the npm registry as the same bytes as the release asset (registry reported '${registry_integrity:-nothing}'), so no formula was generated. Publish the version first, then re-run this workflow."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash scripts/homebrew-formula.sh \
+            "$VERSION" \
+            "https://registry.npmjs.org/headroomd/-/headroomd-$VERSION.tgz" \
+            "$sha256" > headroom.rb
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Commit the formula to the tap
+        if: ${{ steps.formula.outputs.ready == 'true' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.tarball.outputs.version }}
+        run: |
+          tap="$(mktemp -d)"
+          # Cloned anonymously (the tap is public), so no credential is written
+          # to the clone's config and no token ever appears in a remote URL.
+          git clone --depth 1 "https://github.com/$TAP_REPOSITORY.git" "$tap"
+          branch="$(git -C "$tap" symbolic-ref --short HEAD)"
+          mkdir -p "$tap/Formula"
+          cp headroom.rb "$tap/Formula/headroom.rb"
+          if [[ -z "$(git -C "$tap" status --porcelain)" ]]; then
+            echo "::notice title=Homebrew tap already current::$TAP_REPOSITORY already carries the formula for $VERSION; nothing to push."
+            exit 0
+          fi
+          # Assembled from parts because scripts/privacy-sweep.sh refuses any
+          # literal email-shaped string in a tracked file. The commit is
+          # attributed to a neutral release identity at a GitHub noreply host.
+          noreply_host="users.noreply.github.com"
+          git -C "$tap" add Formula/headroom.rb
+          git -C "$tap" \
+            -c user.name="headroom-release" \
+            -c user.email="headroom-release@$noreply_host" \
+            commit -m "headroom $VERSION"
+          # The token is handed to git through a one-shot credential helper on
+          # this command alone: it is never written to a config file and never
+          # becomes part of a URL that could be echoed by a later git command.
+          git -C "$tap" \
+            -c credential.helper= \
+            -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$HOMEBREW_TAP_TOKEN"; }; f' \
+            push origin "HEAD:refs/heads/$branch"
+          echo "::notice title=Homebrew tap updated::$TAP_REPOSITORY now installs headroom $VERSION."

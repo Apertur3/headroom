@@ -1,0 +1,18 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "lease": {
+    "action_class": "null",
+    "ended_at": "string",
+    "ended_reason": "string",
+    "expected_percent": "number",
+    "expires_at": "string",
+    "id": "string",
+    "meter_id": "string",
+    "note": "null",
+    "owner": "string",
+    "spent_percent": "number",
+    "started_at": "string"
+  },
+  "source": "string"
+}

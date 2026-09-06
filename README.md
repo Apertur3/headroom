@@ -68,6 +68,9 @@ headroom accounts discover   # finds your Claude, Codex and Antigravity logins
 headroom                     # one line per meter
 ```
 
+On macOS and Linux, `brew install apertur3/tap/headroom` installs the same package and adds a
+`brew services start headroom` service.
+
 Already running Claude Code or another agent? Copy [skills/headroom/SKILL.md](skills/headroom/SKILL.md)
 into its skills directory and say "set up headroom": the agent runs discovery, the doctor, the one
 macOS Keychain prompt, the background service and the MCP registration for you.
@@ -101,6 +104,7 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 - [docs/quickstart.md](docs/quickstart.md): install to first truthful line, macOS, Linux and Windows
 - [docs/concepts.md](docs/concepts.md): principal, meter, window, observation, pace states, leases, events
 - [docs/mcp-and-agents.md](docs/mcp-and-agents.md): the MCP tools, example calls, and how an orchestrator should use them
+- [docs/json-contract.md](docs/json-contract.md): the versioned field-by-field shape of every `--json` output and MCP tool result, and its compatibility promise
 - [docs/vendors.md](docs/vendors.md): what Headroom reads per vendor, and its known live limitations
 
 ## Security

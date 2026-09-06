@@ -24,6 +24,18 @@ first one that fails, showing its output:
 4. `headroom doctor` once more; every non-OK line names the next command.
 5. Show `headroom` once and explain the pace state on each row.
 
+## Keep the budget in sight
+
+When the user works in Claude Code, offer to put Headroom in its status bar: set
+`"statusLine": { "type": "command", "command": "headroom statusline --render" }` in
+`~/.claude/settings.json` (or `<CLAUDE_CONFIG_DIR>/settings.json` for another profile), adding
+`--chain '<their existing command>'` after `--render` when they already have one. That single line
+shows this session's own 5h and weekly percentages exactly as Claude Code reported them, plus every
+other principal, model-scoped meter, pace state, active lease and reserve from Headroom's own view.
+It is a read of the store, never a vendor call, and it is capped at 150 ms so it cannot slow a
+prompt down; the non-session figures on it can be one poll interval old, so keep deciding from
+`can`, `gate` and `route` rather than from what the bar happened to show.
+
 ## Scoped models gate on their own meter
 
 A vendor can cap one model separately from the account (Claude's Fable and Routines buckets are

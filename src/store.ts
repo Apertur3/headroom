@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, copyFile, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
@@ -10,6 +11,7 @@ import { defaultPolicy, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
+import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion } from "./migrations.js";
 import { redact } from "./security.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
@@ -128,7 +130,7 @@ function leaseFromRow(row: Row): Lease {
 }
 
 export class HeadroomStore {
-  private constructor(private readonly db: Database) {}
+  private constructor(private readonly db: Database, private readonly dbPath: string) {}
 
   static async open(home?: string): Promise<HeadroomStore> {
     const path = await safeDatabasePath(home);
@@ -138,7 +140,16 @@ export class HeadroomStore {
     const descriptor = await open(path, "a", 0o600);
     await descriptor.close();
     const db = new DatabaseSync(path);
-    const store = new HeadroomStore(db);
+    // Checked before anything else touches the connection: a database a
+    // newer Headroom wrote is refused outright, with no PRAGMA, no journal
+    // mode change, no migration -- nothing here ever writes to a shape this
+    // binary does not understand.
+    const version = schemaVersion(db);
+    if (version > CURRENT_SCHEMA_VERSION) {
+      db.close();
+      throw new NewerSchemaError(version, CURRENT_SCHEMA_VERSION);
+    }
+    const store = new HeadroomStore(db, path);
     // Direct CLI reads may briefly overlap the daemon. WAL permits readers with
     // its writer; the busy timeout turns a short writer handoff into a wait,
     // rather than an immediate "database is locked" failure.
@@ -153,6 +164,29 @@ export class HeadroomStore {
   }
 
   close(): void { this.db.close(); }
+
+  /** The schema version this open connection is on, read live from
+   * `PRAGMA user_version` -- see migrations.ts. `headroom doctor` shows this
+   * next to the binary's own CURRENT_SCHEMA_VERSION. */
+  schemaVersion(): number { return schemaVersion(this.db); }
+
+  /** A byte-for-byte copy of the database file, taken once before each
+   * migration numbered above the baseline (never for the baseline itself --
+   * see migrations.ts's runMigrations), named after the version being
+   * upgraded FROM. If that file already exists -- a previous attempt backed
+   * up and then failed partway through the migration itself -- it is left
+   * alone rather than overwritten with a since-modified copy: the backup is
+   * kept once, from the last known-good version. WAL is checkpointed first
+   * so the single file this copies actually holds everything; without it, a
+   * recent write could still be sitting in `-wal` only. */
+  private async backupBeforeMigration(fromVersion: number): Promise<void> {
+    try { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* best effort */ }
+    try {
+      await copyFile(this.dbPath, `${this.dbPath}.bak-${fromVersion}`, fsConstants.COPYFILE_EXCL);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
 
   /** Preserve observation history from the transient post-rename legacy store,
    * then remove that duplicate only after the INSERT and audit succeed. */
@@ -179,67 +213,10 @@ export class HeadroomStore {
   }
 
   private async migrate(home: string): Promise<void> {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS observations (
-        id INTEGER PRIMARY KEY, principal_id TEXT NOT NULL, meter_id TEXT NOT NULL,
-        window_json TEXT, quantity_json TEXT, resets_at TEXT, observed_at TEXT NOT NULL, fetched_at TEXT NOT NULL,
-        source TEXT NOT NULL, truth TEXT NOT NULL, freshness TEXT NOT NULL, confidence REAL NOT NULL,
-        adapter_version TEXT NOT NULL, upstream_schema_version TEXT NOT NULL, reason TEXT, metadata_json TEXT
-      );
-      CREATE INDEX IF NOT EXISTS observations_meter_fetched_at ON observations(meter_id, fetched_at);
-      CREATE TABLE IF NOT EXISTS events (
-        id TEXT PRIMARY KEY, kind TEXT NOT NULL, origin TEXT NOT NULL, confidence REAL NOT NULL,
-        evidence_observation_ids TEXT NOT NULL, created_at TEXT NOT NULL, corrected_by TEXT,
-        meter_id TEXT, principal_id TEXT, reason TEXT
-      );
-      CREATE INDEX IF NOT EXISTS events_created_at ON events(created_at);
-      CREATE TABLE IF NOT EXISTS audit (
-        id INTEGER PRIMARY KEY, caller TEXT NOT NULL, action TEXT NOT NULL, meter_or_principal TEXT,
-        outcome TEXT NOT NULL, at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS leases (
-        id TEXT PRIMARY KEY, owner TEXT NOT NULL, meter_id TEXT NOT NULL,
-        expected_percent REAL, note TEXT, started_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-        ended_at TEXT, ended_reason TEXT
-      );
-      CREATE INDEX IF NOT EXISTS leases_active_meter ON leases(meter_id, ended_at, expires_at);
-      CREATE TABLE IF NOT EXISTS lease_spend (
-        id INTEGER PRIMARY KEY, lease_id TEXT NOT NULL, meter_id TEXT NOT NULL,
-        observation_id INTEGER NOT NULL, amount_percent REAL NOT NULL, estimated INTEGER NOT NULL, at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS lease_spend_lease ON lease_spend(lease_id);
-      CREATE TABLE IF NOT EXISTS spend_ledger (
-        id INTEGER PRIMARY KEY, meter_id TEXT NOT NULL, window_minutes INTEGER,
-        from_at TEXT NOT NULL, to_at TEXT NOT NULL, delta_percent REAL NOT NULL,
-        owner TEXT NOT NULL, share_percent REAL NOT NULL, confidence REAL NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS spend_ledger_meter_to_at ON spend_ledger(meter_id, to_at);
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        id TEXT PRIMARY KEY, applied_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS keychain_grants (
-        principal_id TEXT PRIMARY KEY, reason TEXT NOT NULL, set_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS daemon_state (
-        key TEXT PRIMARY KEY, value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS notify_ledger (
-        id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, channel TEXT NOT NULL, status TEXT NOT NULL,
-        attempts INTEGER NOT NULL, text TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        UNIQUE (event_id, channel)
-      );
-      CREATE INDEX IF NOT EXISTS notify_ledger_channel_status ON notify_ledger(channel, status);
-    `);
-    // Existing v0.1 databases lack event reasons. SQLite has no ADD COLUMN IF
-    // NOT EXISTS, so retain a narrow compatibility migration.
-    try { this.db.exec("ALTER TABLE events ADD COLUMN reason TEXT"); }
-    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
-    try { this.db.exec("ALTER TABLE events ADD COLUMN last_seen_at TEXT"); }
-    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
-    // Existing databases predate per-class learned cost: leases had no
-    // action_class column to group lease_spend by.
-    try { this.db.exec("ALTER TABLE leases ADD COLUMN action_class TEXT"); }
-    catch (error) { if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error; }
+    // Numbered, versioned schema migrations (table/column shape) -- see
+    // migrations.ts. This is separate from the string-keyed data repairs
+    // below, which predate schema versioning and stay exactly as they were.
+    await runMigrations(this.db, (fromVersion) => this.backupBeforeMigration(fromVersion));
     this.removeFalseResetSeenEvents();
     await this.backfillResetEvents(home);
     await this.collapseDuplicateSourceFailedEvents(home);
@@ -1157,5 +1134,29 @@ export class HeadroomStore {
 
   setDirectPollBackoff(state: { lastPollAt: number; until: number; failures: number }): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('mcp_direct_poll_backoff', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(state));
+  }
+
+  /**
+   * Raw spend_ledger rows for `headroom export`'s spend kind: one row per
+   * booked movement, not grouped by owner the way spendByOwner() is, so
+   * export can hand back every movement's own from_at/to_at/delta_percent
+   * instead of a pre-aggregated total. since/until are compared against
+   * to_at (the timestamp each row's movement completed at), matching
+   * spendByOwner's own convention; spend_ledger has no principal_id column,
+   * so export applies no principal filter here.
+   */
+  spendLedgerRows(options: { since?: string; until?: string; meter?: string } = {}): Array<{ id: number; meter_id: string; window_minutes: number | null; from_at: string; to_at: string; delta_percent: number; owner: string; share_percent: number; confidence: number }> {
+    const filters = ["1 = 1"];
+    const params: unknown[] = [];
+    if (options.meter) { filters.push("meter_id = ?"); params.push(options.meter); }
+    if (options.since) { filters.push("julianday(to_at) >= julianday(?)"); params.push(options.since); }
+    if (options.until) { filters.push("julianday(to_at) <= julianday(?)"); params.push(options.until); }
+    return this.db.prepare(`SELECT id, meter_id, window_minutes, from_at, to_at, delta_percent, owner, share_percent, confidence
+      FROM spend_ledger WHERE ${filters.join(" AND ")} ORDER BY to_at ASC, id ASC`).all(...params)
+      .map((row) => ({
+        id: Number(row.id), meter_id: String(row.meter_id), window_minutes: number(row.window_minutes),
+        from_at: String(row.from_at), to_at: String(row.to_at), delta_percent: Number(row.delta_percent),
+        owner: String(row.owner), share_percent: Number(row.share_percent), confidence: Number(row.confidence),
+      }));
   }
 }

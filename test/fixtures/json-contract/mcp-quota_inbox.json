@@ -1,0 +1,18 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "messages": [
+    {
+      "at": "string",
+      "at_epoch": "number",
+      "body": "string",
+      "file": "string",
+      "from": "null",
+      "kind": "string",
+      "session": "string"
+    }
+  ],
+  "remaining": "number",
+  "session": "string",
+  "source": "string"
+}

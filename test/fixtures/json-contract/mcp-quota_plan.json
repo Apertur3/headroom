@@ -1,0 +1,12 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "hours_per_window": "number",
+  "meter": "string",
+  "plan_line_percent_per_hour": "number",
+  "points_per_5h_window": "number",
+  "remaining_5h_windows": "number",
+  "reserve_percent": "number",
+  "source": "string",
+  "weekly_remaining_percent": "number"
+}
