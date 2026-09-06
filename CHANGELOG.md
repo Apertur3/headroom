@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] - 2026-09-06
+
 ### Fixed
 - A fresh statusline snapshot no longer skips a granted Claude probe, so the model-scoped meters (Fable, Routines) update every poll; the snapshot is the fallback for the account-wide windows when the probe is blocked or fails.
 - Windows named pipe: the daemon only ever authenticated the client, not itself. Because the pipe
