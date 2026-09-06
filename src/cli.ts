@@ -619,11 +619,12 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
     console.log(`${principal}  no local session-log token data for the current 5h window (estimated, from ${account.location}/projects)`);
     return 0;
   }
-  console.log(`${principal} model token share (estimated, local session logs, current 5h window from ${formatReset(since.toISOString())})`);
+  console.log(`${principal} model token share, current 5h window from ${formatReset(since.toISOString())}: a local estimate from session logs, not the vendor meter`);
+  console.log(`  (for the vendor's model-scoped meter use \`headroom --principal ${principal}\` and gate with --model <slug>)`);
   for (const item of shares) {
     const tokens = item.input_tokens + item.output_tokens;
     const share = totalTokens > 0 ? (tokens / totalTokens) * 100 : 0;
-    console.log(`  ${item.model.padEnd(24)} ${share.toFixed(0)}% (${item.input_tokens.toLocaleString()} in / ${item.output_tokens.toLocaleString()} out)`);
+    console.log(`  ${item.model.padEnd(24)} ${share.toFixed(0)}% of tokens, estimate (${item.input_tokens.toLocaleString()} in / ${item.output_tokens.toLocaleString()} out)`);
   }
   return 0;
 }

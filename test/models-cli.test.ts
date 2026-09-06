@@ -65,7 +65,8 @@ describe("headroom --principal X --models", () => {
         expect(code).toBe(0);
       } finally { restore(); }
       const text = logs.join("\n");
-      expect(text).toContain("claude-main model token share (estimated");
+      expect(text).toContain("claude-main model token share, current 5h window")
+      expect(text).toContain("not the vendor meter");;
       expect(text).toContain("claude-fable-5-1");
       expect(text).toContain("claude-sonnet-5");
       // 3000 total tokens vs 300: claude-fable-5-1 has ~91% of the total share.
