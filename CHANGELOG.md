@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-09-06
+
 ### Added
 - A versioned JSON contract for every machine reader: every `--json` CLI output that is a JSON
   object (`status`, `can`, `gate`, `plan`, `fill`, `route`, `inbox`, `lease list`, `--models`) and
