@@ -1,0 +1,17 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "models": [
+    {
+      "input_tokens": "number",
+      "model": "string",
+      "output_tokens": "number",
+      "share_percent": "number"
+    }
+  ],
+  "principal": "string",
+  "source": "string",
+  "truth": "string",
+  "window_end": "string",
+  "window_start": "string"
+}

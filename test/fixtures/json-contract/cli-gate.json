@@ -1,0 +1,10 @@
+{
+  "allowed": "boolean",
+  "contract": "string",
+  "generated_at": "string",
+  "lanes_remaining_for_class": "number",
+  "meters_checked": [
+    "string"
+  ],
+  "reason": "string"
+}

@@ -12,6 +12,18 @@ npm install -g headroomd
 headroom version
 ```
 
+On macOS and Linux, Homebrew installs the same package and brings Node with it:
+
+```sh
+brew install apertur3/tap/headroom
+headroom version
+```
+
+The Homebrew install also registers the daemon as a Homebrew service, so `brew services start
+headroom` replaces step 6's `headroom install-service` and `brew services stop headroom` stops
+it again. Logs land in `$(brew --prefix)/var/log/headroom/`. Everything else in this walkthrough
+is the same either way.
+
 `npx headroomd <command>` works without installing, but the daemon, the MCP registration and
 the service installer all expect a `headroom` command on your PATH, so the global install is the
 one this walkthrough assumes. To work from source instead, clone the repository, run
@@ -162,6 +174,48 @@ already have one, chain it instead of replacing it:
 the same stdin and prints your command's own output instead, so the visible status bar doesn't
 change.
 
+### Put the whole picture in the status bar: `--render`
+
+`headroom statusline --render` writes the same snapshot and then prints one line for Claude Code's
+own status bar that combines both halves of what you need to see while you work:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "headroom statusline --render" }
+}
+```
+
+Already have a status line command? Keep it, and put `--render` in front of `--chain`; your
+command's output prints first, on its own row, and Headroom's line follows on the next one:
+
+```json
+{
+  "statusLine": { "type": "command", "command": "headroom statusline --render --chain 'my-existing-statusline.sh'" }
+}
+```
+
+The line reads left to right: this session's own 5h window with its percentage and a countdown to
+its reset, then this session's weekly percentage, then any model-scoped bucket the payload carried
+(Fable, Routines), then one segment per other principal Headroom knows about -- its name, the
+window that constrains it, its percentage -- then the number of active leases and the protected
+reserve on your own meter. A pace state (`HARVEST`, `CONSERVE`, `FREEZE`, `UNKNOWN`) is printed
+after a segment's numbers only when it is not `NORMAL`, so the bar stays quiet while everything is
+on pace. The most constrained principal comes first, and in compact style anything past 120
+characters is dropped from the right and counted as a trailing `+N`.
+
+- `--style full` adds each window's burn and its projected time to stall, the same figures
+  `headroom rate` prints, and drops the width budget.
+- `--meters codex,claude-main:fable` narrows the Headroom half to the meters, principals or window
+  labels you name. Your own session's two windows are always shown.
+- `--color` forces ANSI colour on the pace states (Claude Code renders ANSI in the status line).
+  Colour is on by itself only when stdout is a TTY, and `NO_COLOR` turns it off.
+
+**The two numbers for your own session are exact**: they come from the JSON Claude Code just piped
+in, on this very render. **Everything else is read from Headroom's store**, through the daemon when
+it answers within 150 ms and straight from the store when it does not, so those figures can be up
+to one poll interval old (`poll_interval_minutes`, five minutes by default). Nothing on this path
+ever calls a vendor, so the line cannot delay your prompt.
+
 Every reading this way snapshots to `~/.headroom/statusline/<profile>.json` (0600); the collector
 prefers a snapshot under 10 minutes old over the vendor probe, and reads a Fable-scoped or other
 model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **This removes
@@ -248,7 +302,11 @@ systemctl --user enable --now headroom.service
 Once it's running, `headroom` and `headroom doctor` talk to the daemon over a local socket
 (`~/.headroom/headroom.sock`, mode 0600) instead of polling directly, and, by default, the daemon
 keeps the Antigravity `agy` session warm between reads. See [vendors.md](vendors.md) for what that
-buys you and where it still falls short.
+buys you and where it still falls short. Everything the daemon logs through its own writer goes to
+`~/.headroom/logs/daemon.log` (mode 0600, read with `headroom logs --tail`) and rotates itself at 5
+MiB into `daemon.log.1`..`.4`; the service definition above also points the OS's raw stdout/stderr
+at that same file, and Headroom does not rotate that half of the pipe, so lean on the platform's own
+log rotation (`logrotate`, `newsyslog`) if a process crash ever needs to be bounded too.
 
 ## 7. Register the MCP server
 
@@ -278,6 +336,31 @@ cp skills/headroom/SKILL.md ~/.claude/skills/headroom/SKILL.md
 
 That's the skill that tells a Claude Code orchestrator to check `headroom can` before it fans out
 work and to treat UNKNOWN as no capacity, the same rule this file just described.
+
+## Shell completions
+
+`headroom completion <shell>` prints a completion script for `bash`, `zsh`, `fish` or `pwsh`,
+covering every command, subcommand and flag `--help` knows about. Add one line to your profile:
+
+```sh
+# bash (~/.bashrc)
+eval "$(headroom completion bash)"
+
+# zsh (~/.zshrc)
+eval "$(headroom completion zsh)"
+
+# fish (~/.config/fish/config.fish)
+headroom completion fish | source
+```
+
+```powershell
+# PowerShell ($PROFILE)
+Invoke-Expression (headroom completion pwsh | Out-String)
+```
+
+In bash and zsh, `--meter` and `--principal` also complete to the actual meter and principal ids
+Headroom currently knows about (read from the daemon if it answers quickly, the local store
+otherwise) rather than just the flag name.
 
 ## Windows today
 
@@ -330,3 +413,32 @@ you didn't ask for is a lot easier to slip a compromised build past than one you
 watch. Provenance on the published `headroomd` package (the same npm publish attestation every
 `npm install -g headroomd@<version>` verifies) is what makes a manual update trustworthy; skipping
 the manual step would skip that check too.
+
+## Uninstall
+
+`headroom uninstall` reverses what `setup` (and `install-service` / `claude mcp add`) did, in
+order, printing each step and its result:
+
+```sh
+headroom uninstall              # stops/removes the service, removes the MCP registration
+headroom uninstall --home       # also deletes the Headroom home (asks first; --yes skips the ask)
+headroom uninstall --home --yes # deletes the Headroom home without asking
+headroom uninstall --dry-run    # prints the plan; changes nothing
+```
+
+1. **Stops and removes the background service** -- the launchd plist, systemd user unit, or Task
+   Scheduler task `install-service`/`setup` wrote, identified by the exact name Headroom itself
+   gave it. A machine with no service installed reports nothing to do.
+2. **Removes the Claude Code MCP registration** (`claude mcp remove headroom`) for every configured
+   Claude profile that actually has one registered, setting `CLAUDE_CONFIG_DIR` for a non-default
+   profile. If the `claude` executable isn't on `PATH`, the command is printed instead of run.
+3. **With `--home`**, deletes the Headroom home directory: the database, logs, and config,
+   including `accounts.toml` -- so that goes with it too. This step asks first (`y/N`); `--yes`
+   answers yes without asking, and neither `--home` nor a plain run without it touches this
+   directory. The Keychain grant marker lives inside this directory and is deleted with it; the
+   separate macOS Keychain ACL granted to the probe binary itself disappears when that binary is
+   removed, not from this step.
+4. **Prints the npm uninstall command** -- `npm uninstall -g headroomd`. Headroom cannot remove its
+   own package while it is running, so this is always left for you to run yourself.
+
+Exits 0 on success or when there was nothing to do, 1 if any step failed.

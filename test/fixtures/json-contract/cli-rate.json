@@ -1,0 +1,10 @@
+[
+  {
+    "burn_percent_per_hour": "null | number",
+    "empty_in_seconds": "null | number",
+    "meter": "string",
+    "resets_at": "string",
+    "used_percent": "number",
+    "window_minutes": "number"
+  }
+]

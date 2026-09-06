@@ -14,6 +14,7 @@ import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } f
 import { resetsIn, withResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
+import { isEnvelopable, withContract } from "./json-contract.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type ProviderAccount } from "./types.js";
 
@@ -529,7 +530,13 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
     const finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved as CanDecision, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true, typeof arguments_.owner === "string" ? arguments_.owner : "") : resolved;
-    return response(request.id, { content: [{ type: "text", text: JSON.stringify(finalResult) }], structuredContent: finalResult });
+    // The contract envelope only fits an object result: a daemon-sourced
+    // list method (cost/rate/spend/leases/events/status) answers with the
+    // same bare JSON array the CLI's own --json prints for it, which has no
+    // place to carry named fields -- see json-contract.ts's own doc comment
+    // and docs/json-contract.md's "Array-shaped outputs" section.
+    const envelopedResult = isEnvelopable(finalResult) ? withContract(finalResult) : finalResult;
+    return response(request.id, { content: [{ type: "text", text: JSON.stringify(envelopedResult) }], structuredContent: envelopedResult });
   } catch (error) {
     return failure(request.id, -32000, safeError(error));
   }

@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { claudeServiceName, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
@@ -13,6 +14,7 @@ import { engineStatus } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
 import { credentialPath, headroomHome } from "./paths.js";
+import { CURRENT_SCHEMA_VERSION } from "./migrations.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 import { updateNoticeLine } from "./update.js";
@@ -177,6 +179,7 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   const output: DoctorCheck[] = [];
   const { check: homeResult, store } = await homeCheck(home);
   output.push(homeResult);
+  if (store) output.push(check("OK", "schema version", `${store.schemaVersion()} (this binary supports up to ${CURRENT_SCHEMA_VERSION})`, "no action needed"));
   try {
     let keepaliveEnabled = process.platform === "darwin" || process.platform === "linux";
     try { keepaliveEnabled = (await readPolicy()).antigravity_keepalive; } catch { /* The policy check below reports the parse error. */ }
@@ -355,7 +358,16 @@ export function nextSteps(platform: NodeJS.Platform = process.platform): string[
   return steps;
 }
 
-export async function doctor(): Promise<number> {
+export async function doctor(argv: string[] = []): Promise<number> {
+  // A redacted, pasteable-into-an-issue text file instead of the normal
+  // check-by-check console output: writeDoctorBundle() gathers its own
+  // sections (including a fresh doctorChecks() run) and never mutates
+  // anything, same as the rest of this file.
+  if (argv.includes("--bundle")) {
+    const result = await writeDoctorBundle(parseBundleFlag(argv));
+    console.log(`${result.path} (${result.bytes} bytes)`);
+    return 0;
+  }
   console.log(`Headroom ${await headroomVersion()}`);
   // Silent on any failure (a broken policy.toml is reported below by the
   // policy config check, a failed registry call at most logs a debug line):

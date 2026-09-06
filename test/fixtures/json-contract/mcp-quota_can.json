@@ -1,0 +1,32 @@
+{
+  "contract": "string",
+  "cost": {
+    "action_class": "string",
+    "confidence": "string",
+    "expected_percent": "number",
+    "iqr_high": "number",
+    "iqr_low": "number",
+    "max_more_before_reset": "number",
+    "median_percent": "number",
+    "sample_count": "number",
+    "source": "string"
+  },
+  "decision": {
+    "allowed": "boolean",
+    "local_meter_considered": "boolean",
+    "local_preference": "string",
+    "meter": "string",
+    "meters": [
+      {
+        "meter": "string",
+        "reason": "string",
+        "state": "string"
+      }
+    ],
+    "reason": "string",
+    "state": "string"
+  },
+  "generated_at": "string",
+  "leased_id": "null",
+  "source": "string"
+}

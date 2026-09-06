@@ -1,0 +1,12 @@
+[
+  {
+    "attributed_percent": "number",
+    "confidence": "number",
+    "from_at": "string",
+    "meter_id": "string",
+    "owner": "string",
+    "samples": "number",
+    "to_at": "string",
+    "window_minutes": "number"
+  }
+]

@@ -32,6 +32,18 @@ npm run engine:build   # optional, macOS or Linux with a Swift toolchain
 Run `headroom` against your own accounts before opening a pull request and paste the redacted
 output in the description.
 
+## Reporting a problem
+
+Run `headroom doctor --bundle` before opening an issue. It writes one redacted text file
+(`headroom-bundle-<date>.txt` in the current directory by default, or a path you give it) and
+prints where it landed and how big it is. The file holds your Headroom and Node versions, OS and
+arch, the installed binary's path, the same diagnostics `headroom doctor` prints, your configured
+principals (vendor and adapter only, never a path), your policy and routing config, the tail of
+the daemon log, the last 20 audit rows, and the current status lines. Known token and credential
+shapes, email addresses, private network addresses, this machine's hostname, home directory and
+username are stripped before the file is written. Redaction is best effort, not a guarantee --
+read the file yourself once before pasting it into the issue.
+
 ## Reporting a security issue
 
 See `SECURITY.md`. Please use a private advisory rather than a public issue.

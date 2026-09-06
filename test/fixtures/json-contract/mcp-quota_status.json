@@ -1,0 +1,41 @@
+{
+  "contract": "string",
+  "failures": [
+    "unknown (empty array in the fixture data)"
+  ],
+  "generated_at": "string",
+  "observations": [
+    {
+      "adapter_version": "string",
+      "burn_percent_per_hour": "null",
+      "confidence": "number",
+      "empty_in_seconds": "null",
+      "fetched_at": "string",
+      "freshness": "string",
+      "id": "number",
+      "meter_id": "string",
+      "observed_at": "string",
+      "principal_id": "string",
+      "quantity": {
+        "limit": "number",
+        "remaining": "number",
+        "unit": "string",
+        "used": "number"
+      },
+      "reason": "null",
+      "resets_at": "string",
+      "resets_in": "string",
+      "resets_in_seconds": "number",
+      "source": "string",
+      "sustainable_percent_per_hour": "number",
+      "truth": "string",
+      "upstream_schema_version": "string",
+      "window": {
+        "enforcement": "string",
+        "kind": "string",
+        "minutes": "number"
+      }
+    }
+  ],
+  "source": "string"
+}

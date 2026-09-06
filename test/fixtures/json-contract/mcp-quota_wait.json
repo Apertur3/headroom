@@ -1,0 +1,9 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "meter": "string",
+  "resets_at": "string",
+  "resets_in_seconds": "number",
+  "source": "string",
+  "suggested_sleep_seconds": "number"
+}

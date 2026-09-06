@@ -1,0 +1,14 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "items": [
+    {
+      "action_class": "string",
+      "iqr_high": "number",
+      "iqr_low": "number",
+      "median_percent": "number",
+      "sample_count": "number"
+    }
+  ],
+  "source": "string"
+}

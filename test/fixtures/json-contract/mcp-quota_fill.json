@@ -1,0 +1,27 @@
+{
+  "allowance_basis": "string",
+  "classes": [
+    {
+      "action_class": "string",
+      "duration_minutes": "number",
+      "fits": "number",
+      "percent": "number"
+    }
+  ],
+  "contract": "string",
+  "generated_at": "string",
+  "lane_cost_percent": "number",
+  "lane_cost_source": "string",
+  "lanes": {
+    "lanes": "number",
+    "points_used": "number",
+    "reason": "string"
+  },
+  "lanes_error": "null",
+  "meter": "string",
+  "resets_in_seconds": "number",
+  "source": "string",
+  "used_5h_percent": "number",
+  "used_weekly_percent": "number",
+  "window_used": "string"
+}

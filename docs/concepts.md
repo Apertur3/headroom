@@ -291,3 +291,54 @@ of record.
 
 Example: `codex-main` shows `reset seen 14:00 (inferred, 62%)` when usage drops sharply without a
 vendor-confirmed reset timestamp yet.
+
+## Export
+
+`headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind
+observations|events|spend|leases|all] [--format json|csv] [--out <path>]` dumps stored history for
+a period rather than the live view every other command shows. Observations come back with every
+column exactly as stored (no burn rate, ETA, or other field pace.ts derives at read time); spend is
+the raw `spend_ledger` movement rows -- one per booked delta, each with its own `from_at`/`to_at`
+-- not the per-owner totals `headroom spend` prints. `--principal` filters observations and events
+(both carry a `principal_id`); leases and the spend ledger have no principal column, so it does not
+narrow those two. A reason string is passed through `redact()` again on the way out, even though it
+was already redacted once at insert time.
+
+JSON is one document: `schema_version` (the number `headroom doctor` also shows, from `PRAGMA
+user_version`), `exported_at`, `range` (the resolved `since`/`until` and the `meter`/`principal`
+filters, `null` when not given), then one array per requested kind -- only the kinds actually asked
+for appear as keys at all. It goes to stdout by default, or to `--out` if given. CSV has no single
+document to hold four different shapes: `--kind all` writes one file per kind next to `--out`,
+suffixed `-observations.csv`, `-events.csv`, `-spend.csv`, `-leases.csv`; a single `--kind` writes
+exactly to `--out`. Every CSV field that contains a comma, a double quote, or a line break is
+quoted per RFC 4180, with an embedded quote doubled. CSV always requires `--out`; there is no
+stdout form of a multi-file export.
+
+A period is bounded at 1,000,000 rows total across every kind requested -- comfortably past what a
+personal quota history ever reaches, but a backstop against building an unbounded document from a
+wide-open `--since`. Past that, export refuses outright and names the fix: narrow `--since`/`--until`
+or add `--meter`/`--kind`.
+
+## Database and upgrades
+
+`headroom.db`'s shape is tracked with SQLite's own `PRAGMA user_version`, not inferred from what
+tables happen to exist. Every schema change (a new table, a new column, a new index) is a numbered
+migration in `src/migrations.ts`, applied in order the first time a newer Headroom opens an older
+database, each inside its own transaction so a crash mid-migration leaves the database on its old,
+complete version rather than a half-applied new one. Migration 1 is the baseline: the shape every
+Headroom database already had before schema versions existed, so a pre-versioning database migrates
+to version 1 with no changes at all, and a brand-new one gets the full shape from nothing.
+
+Opening a database with a version newer than the running binary understands -- a downgrade, or a
+database last written by a newer Headroom -- is refused outright, before a single statement runs:
+the error names both versions and says to run `headroom update`. Before any migration above the
+baseline runs, the whole database file is copied once to `headroom.db.bak-<version>`, named after
+the version being upgraded from; if that backup already exists (a previous upgrade attempt got this
+far before failing later), it is left alone rather than overwritten. `headroom doctor` prints the
+database's current schema version next to the version this binary expects, so a mismatch is visible
+without opening the file.
+
+The rule for changing the schema in the future: append a new migration with the next version
+number. Never edit an existing migration's body, even to fix a mistake in it -- a database that
+already ran it has exactly that shape on disk, and a silently changed migration would stop
+describing what such a database actually has. Fix a mistake with a follow-up migration instead.
