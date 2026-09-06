@@ -1,0 +1,19 @@
+# synthetic fixture, hand written for these tests, not a capture of anyone's account
+# the case this whole command exists for: an account-wide week that still looks
+# free, and a model-scoped week sitting on its cap right beside it.
+
+Current session
+████░░░░░░░░░░░░░░░░░░░░░░░░░░  12% used
+Resets at 14:00
+
+Current week (all models)
+██████░░░░░░░░░░░░░░░░░░░░░░░░  21% used
+Resets Sep 13, 14:00
+
+Current week (Fable)
+█████████████████████████████░  95% used
+Resets Sep 13, 14:00
+
+Current week (Sonnet only)
+██░░░░░░░░░░░░░░░░░░░░░░░░░░░░   6% used
+Resets Sep 13, 14:00

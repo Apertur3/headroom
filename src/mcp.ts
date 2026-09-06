@@ -4,12 +4,13 @@ import { daemonRequest, socketPath } from "./daemon.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./collector.js";
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
-import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
+import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { resetsIn, withResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { HeadroomStore } from "./store.js";
@@ -33,6 +34,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_gate", description: "Pre-dispatch check: do these points fit the current window (and, with plan true, the plan line)? Under even pacing (the default), a 5h need is also checked against the caller's pro-rata line and a 10-minute burst check. needs is an array like [\"5h:15\", \"wk:3\"].", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
   { name: "quota_fill", description: "How many more lanes fit before a 5h window's unspent points are lost at reset, and which routing.toml action classes fit the remaining points and minutes. Under even pacing (the default), only offers the full remainder in the last 45 minutes before reset; earlier than that it offers the caller's pro-rata allowance.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 } }, required: ["meter"] } },
+  { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
 ];
 
@@ -213,9 +215,9 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
     const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
     const burn = store.burnRateFor([...rows.values()].flat(), now);
     const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
-    const decision = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, allowUnknown, store.leases(undefined, true), owner, now);
+    const raw = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, allowUnknown, store.leases(undefined, true), owner, now);
+    const { decision, cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, raw, now, policy.reserve);
     store.audit("mcp", "can", action, decision.allowed ? "yes" : "no");
-    const { cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, decision, now);
     return { source: "direct", decision, cost, leased_id: leasedId ?? null };
   } finally { store.close(); }
 }
@@ -224,18 +226,22 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
  * lease for the deciding meter -- the same annotation whether the decision
  * came from the daemon or from directCan's own read, so quota_can's cost
  * report never depends on whether a daemon happens to be running. */
-function annotateCanCost(store: HeadroomStore, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string, decision: CanDecision, now: Date): { cost: ReturnType<typeof buildCostEstimate>; leasedId?: string } {
+function annotateCanCost(store: HeadroomStore, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string, decision: CanDecision, now: Date, reserves: Record<string, number>): { decision: CanDecision; cost: ReturnType<typeof buildCostEstimate>; leasedId?: string } {
   const learned = store.learnedCost(action)[0];
   const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
   const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
   const cost = buildCostEstimate(action, expectOverride, learned, remaining);
+  // The expected cost is only known here, so the meter's protected reserve
+  // (policy.toml [reserve]) is applied here too -- before any lease is
+  // started, so a refused call never reserves capacity it may not spend.
+  const decided = reserveOnCan(decision, reserves, remaining, cost.expected_percent);
   let leasedId: string | undefined;
-  if (leaseFlag && decision.allowed && cost.expected_percent !== null) {
-    const lease = store.startLease(owner, decision.meter, cost.expected_percent, 30 * 60_000, `can:${action}`, now, action);
-    store.audit("mcp", "lease_start", `${owner}:${decision.meter}`, "ok");
+  if (leaseFlag && decided.allowed && cost.expected_percent !== null) {
+    const lease = store.startLease(owner, decided.meter, cost.expected_percent, 30 * 60_000, `can:${action}`, now, action);
+    store.audit("mcp", "lease_start", `${owner}:${decided.meter}`, "ok");
     leasedId = lease.id;
   }
-  return { cost, leasedId };
+  return { decision: decided, cost, leasedId };
 }
 
 async function directEvents(since: unknown): Promise<DirectResult> {
@@ -306,7 +312,27 @@ async function directPlan(meter: unknown, reservePercent: unknown): Promise<Dire
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
-  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+}
+
+/**
+ * `quota_usage_paste`: the CLI's `headroom usage --paste` over MCP, so an
+ * agent handed the text of a `/usage` panel can turn it into readings without
+ * shelling out. Direct only, like the other tools with no daemon RPC case:
+ * this is a rare, human-triggered write, not a hot path.
+ */
+async function directUsagePaste(principal: unknown, text: unknown): Promise<DirectResult> {
+  if (typeof text !== "string" || !text.trim()) throw new Error("text is required: paste the /usage panel");
+  const resolved = resolveClaudePrincipal(await readAccounts(), typeof principal === "string" && principal.trim() ? principal.trim() : undefined);
+  const now = new Date();
+  const panel = parseUsagePanel(text, now);
+  if (!panel.windows.length) throw new Error('no usage window in the pasted text; expected a line like "Current session" or "Current week (all models)" with a percent');
+  const store = await HeadroomStore.open();
+  try {
+    const stored = store.insertAll(observationsFromUsagePaste(panel.windows, resolved, now));
+    store.audit("mcp", "usage_paste", resolved, "ok");
+    return { source: "direct", principal: resolved, observations: withResetsIn(stored, now), unparsed: panel.unparsed };
+  } finally { store.close(); }
 }
 
 async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: unknown): Promise<DirectResult> {
@@ -339,6 +365,7 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
       actionClass: typeof actionClass === "string" ? actionClass : undefined,
       pacing: policy.pacing,
       staleness_minutes: policy.staleness_minutes,
+      reserves: policy.reserve,
     });
     store.audit("mcp", "gate", typeof meter === "string" ? meter : null, result.allowed ? "yes" : "no");
     return { source: "direct", ...result };
@@ -352,7 +379,7 @@ async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReserv
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
   const store = await HeadroomStore.open();
   try {
-    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes });
+    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve });
     store.audit("mcp", "fill", meter, "ok");
     return { source: "direct", ...result };
   } finally { store.close(); }
@@ -388,6 +415,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "wait") return directWait(arguments_.meter);
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent);
   if (method === "route") return directRoute(arguments_.action_class, arguments_.owner, arguments_.allow_unknown);
+  if (method === "usage_paste") return directUsagePaste(arguments_.principal, arguments_.text);
   return directEvents(arguments_.since);
 }
 
@@ -426,6 +454,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
     quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
+    quota_usage_paste: "usage_paste",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
@@ -453,12 +482,13 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
+      : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }
       : {};
     // quota_wait must never block, and quota_route is a direct read only
     // (see routeFor's own doc comment: an infrequent, deliberate call, not a
     // hot path worth a daemon RPC case) -- both skip the daemon `call` step
     // every other tool takes.
-    const result = method === "wait" || method === "route" ? undefined : await call(method, params_);
+    const result = method === "wait" || method === "route" || method === "usage_paste" ? undefined : await call(method, params_);
     const resolved = result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or
@@ -473,10 +503,11 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
 
 /** Wraps a daemon-sourced CanDecision with the same cost/lease annotation
  * directCan() already bundles for its own (no-daemon) result. */
-async function annotateDaemonCan(decision: CanDecision, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string): Promise<Record<string, unknown>> {
+async function annotateDaemonCan(raw: CanDecision, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string): Promise<Record<string, unknown>> {
+  const policy = await readPolicy();
   const store = await HeadroomStore.open();
   try {
-    const { cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, decision, new Date());
+    const { decision, cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, raw, new Date(), policy.reserve);
     return { ...decision, cost, leased_id: leasedId ?? null };
   } finally { store.close(); }
 }

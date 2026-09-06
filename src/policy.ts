@@ -8,6 +8,13 @@ export interface Policy {
   staleness_minutes: number;
   poll_interval_minutes: number;
   principal_intervals: Record<string, number>;
+  /** From the `[reserve]` table: a protected floor per meter, in percent of
+   * every window of that meter, that `gate`, `fill`, `route` and `can` never
+   * dip into. Keys are meter ids (`"claude-main:fable"`); the key `"*"` is
+   * the default for every meter without its own entry. Distinct from
+   * freeze_reserve_pct, which is the FREEZE pace threshold -- see
+   * docs/concepts.md. */
+  reserve: Record<string, number>;
   /** Keep one daemon-owned `agy` PTY alive for warm local Antigravity reads. */
   antigravity_keepalive: boolean;
   /** "even" (default): `gate` enforces the pro-rata line and burst check for
@@ -33,7 +40,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 }
 
 export const defaultPolicy: Policy = {
-  freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {},
+  freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {},
   antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", statusline_snapshot_dirs: [],
 };
 
@@ -41,7 +48,9 @@ export const defaultPolicy: Policy = {
 export function parsePolicy(text: string): Policy {
   const values: Record<string, number> = {};
   const principalIntervals: Record<string, number> = {};
+  const reserves: Record<string, number> = {};
   let principal: string | undefined;
+  let inReserve = false;
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
   let pacing: Policy["pacing"] | undefined;
@@ -49,8 +58,19 @@ export function parsePolicy(text: string): Policy {
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
-    if (section) { principal = section[1]; continue; }
-    if (/^\[.*\]$/.test(line)) { principal = undefined; continue; }
+    if (section) { principal = section[1]; inReserve = false; continue; }
+    if (/^\[reserve\]$/.test(line)) { principal = undefined; inReserve = true; continue; }
+    if (/^\[.*\]$/.test(line)) { principal = undefined; inReserve = false; continue; }
+    if (inReserve && line) {
+      // Meter ids carry a colon and the default key is a bare `*`, so both
+      // have to be quoted in TOML; a plain word key is accepted too. Any
+      // other line inside [reserve] is a typo the doctor must report rather
+      // than silently drop a protected floor the caller believes is set.
+      const entry = /^(?:"([^"\\]+)"|([A-Za-z0-9_.*-]+))\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
+      if (!entry) throw new Error("Invalid Headroom policy");
+      reserves[(entry[1] ?? entry[2]) as string] = Number(entry[3]);
+      continue;
+    }
     const interval = /^interval_minutes\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (principal && interval) { principalIntervals[principal] = Number(interval[1]); continue; }
     const proxyMatch = /^proxy\s*=\s*"([^"\\]+)"\s*$/.exec(line);
@@ -71,8 +91,8 @@ export function parsePolicy(text: string): Policy {
   const grace = values.pace_grace_fraction ?? defaultPolicy.pace_grace_fraction;
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
-  if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, ...(proxy ? { proxy } : {}) };
+  if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0) || Object.values(reserves).some((value) => !Number.isFinite(value) || value < 0 || value > 90)) throw new Error("Invalid Headroom policy");
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, ...(proxy ? { proxy } : {}) };
 }
 
 /** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from
@@ -173,6 +193,42 @@ export function freshnessGate(observation: Observation | undefined, staleMinutes
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
   if (now.getTime() - fetched > staleMinutes * 60_000) return { ok: false, reason: `stale ${ageMinutes}m` };
   return { ok: true, reason: "fresh" };
+}
+
+/**
+ * The protected reserve for one meter, in percent of every window of that
+ * meter: its own `[reserve]` entry when it has one, otherwise the `"*"`
+ * default, otherwise 0. This is a decision floor -- `gate`, `fill`, `route`
+ * and `can` treat `remaining - reserve` (floored at 0) as the capacity they
+ * may spend -- and deliberately NOT a pace rule: pace states stay exactly
+ * what the raw reading says. `freeze_reserve_pct` remains the separate
+ * FREEZE pace threshold; see docs/concepts.md.
+ */
+export function reserveFor(reserves: Record<string, number>, meterId: string): number {
+  const value = reserves[meterId] ?? reserves["*"] ?? 0;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** The status-line annotation appended after a window's numbers when this
+ * meter has a reserve, so a reader can see why an otherwise healthy-looking
+ * percentage still produced a NO. Empty when no reserve is set. */
+export function reserveNote(reservePercent: number): string {
+  return reservePercent > 0 ? ` (reserve ${reservePercent}%)` : "";
+}
+
+/**
+ * Turns an allowed `can` decision into a refusal when the expected cost of
+ * the action would cross into the deciding meter's reserve. The pace state
+ * is left exactly as it was -- the reserve never rewrites a state, it only
+ * withholds capacity -- so the printed line still shows the real state
+ * alongside a reason that names the reserve.
+ */
+export function reserveOnCan(decision: CanDecision, reserves: Record<string, number>, remainingPercent: number | null, expectedPercent: number | null): CanDecision {
+  const reserve = reserveFor(reserves, decision.meter);
+  if (!decision.allowed || reserve <= 0 || remainingPercent === null || expectedPercent === null) return decision;
+  const usable = Math.max(0, remainingPercent - reserve);
+  if (expectedPercent <= usable) return decision;
+  return { ...decision, allowed: false, reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${decision.meter} (${usable.toFixed(1)}% usable of ${remainingPercent.toFixed(1)}% remaining)` };
 }
 
 /** The percent of a meter already reserved by every OTHER owner's active

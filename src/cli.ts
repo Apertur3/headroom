@@ -1,9 +1,10 @@
 #!/usr/bin/env node
+import { geminiResponseShape } from "./adapters/gemini.js";
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
-import { realpathSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { join, basename, dirname } from "node:path";
+import { join, basename, delimiter, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { appendDaemonLog, tailDaemonLog } from "./logs.js";
 import { doctor } from "./doctor.js";
@@ -12,14 +13,16 @@ import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { antigravityResponseShape } from "./adapters/antigravity.js";
 import { pollAccounts } from "./collector.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
+import { notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
-import { canRouteWithLeases, paceDecision, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, paceDecision, reserveFor, reserveNote, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
@@ -84,7 +87,7 @@ function paceSegment(observation: Observation): string {
   return ` burn ${formatRatePercent(burn)}, ok ${sustainableText}`;
 }
 
-function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string): string {
+function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string, reservePercent = 0): string {
   if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
     const available = observation.quantity.remaining ?? 0;
     const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
@@ -101,7 +104,10 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // real number -- the owner's decision is to annotate doubt, not hide the
   // vendor's own reading behind UNKNOWN.
   const doubt = observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON ? " (idle, unverified)" : "";
-  return `${label(observation)} ${Math.round(observation.quantity.used)}% ↻${formatReset(observation.resets_at)}${countdown} ${state}${doubt}${evidence}${paceSegment(observation)}`;
+  // The protected reserve (policy.toml [reserve]) follows the numbers so a
+  // reader can see why a healthy-looking percentage still produced a NO from
+  // gate/fill/route/can. It never changes the pace state beside it.
+  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)} ↻${formatReset(observation.resets_at)}${countdown} ${state}${doubt}${evidence}${paceSegment(observation)}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -165,7 +171,7 @@ export function formatMeters(observations: Observation[], policy: Awaited<Return
     const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy);
-      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)));
+      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id));
     }).join(" | ")}  (${freshness} ${age(ordered[0])})${leaseLabel}`;
   });
 }
@@ -265,6 +271,7 @@ async function can(argv: string[]): Promise<number> {
   // on-disk store the daemon also writes to, not a vendor call, so it never
   // needs a daemon round trip of its own (see store.ts's WAL comment on
   // safe concurrent direct reads).
+  const canPolicy = await readPolicy();
   const store = await HeadroomStore.open();
   let cost: CostEstimate;
   let leasedId: string | undefined;
@@ -273,6 +280,11 @@ async function can(argv: string[]): Promise<number> {
     const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
     const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
     cost = buildCostEstimate(action, expectOverride, learned as LearnedCost | undefined, remaining);
+    // The expected cost is only known once the estimate above exists, so the
+    // deciding meter's protected reserve (policy.toml [reserve]) is applied
+    // here -- before any lease starts, so a refused call never reserves
+    // capacity it may not spend.
+    decision = reserveOnCan(decision, canPolicy.reserve, remaining, cost.expected_percent);
     if (leaseFlag && decision.allowed && cost.expected_percent !== null) {
       const lease = store.startLease(owner, decision.meter, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, new Date(), action);
       store.audit("cli", "lease_start", `${owner}:${decision.meter}`, "ok");
@@ -403,7 +415,7 @@ async function plan(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
     const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
@@ -459,7 +471,7 @@ async function gate(argv: string[]): Promise<number> {
     directReadNotice();
     const policy = await readPolicy();
     const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
@@ -529,7 +541,7 @@ async function fill(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
     const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(result)); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -702,12 +714,13 @@ export async function observe(argv: string[]): Promise<number> {
 async function responseShape(argv: string[]): Promise<number> {
   if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
-  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude, Codex, or Antigravity principal");
+  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude, Codex, Antigravity or Gemini principal");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
     : account.vendor === "claude" ? { usage: await claudeResponseShape(account) }
     : account.vendor === "antigravity" ? await antigravityResponseShape(account)
+    : account.vendor === "gemini" ? await geminiResponseShape(account)
     : undefined;
-  if (!responses) throw new Error("--shape requires a native TypeScript Claude, Codex, or Antigravity principal");
+  if (!responses) throw new Error("--shape requires a native TypeScript Claude, Codex, Antigravity or Gemini principal");
   console.log(JSON.stringify({ principal_id: account.name, vendor: account.vendor, responses }));
   return 0;
 }
@@ -835,6 +848,72 @@ async function statusline(argv: string[]): Promise<number> {
   return 0;
 }
 
+const USAGE_PASTE_HELP = "Usage: headroom usage (--paste | --clipboard) [--principal <id>] [--json]";
+
+/** Whether a bare command name resolves on PATH, checked without running a
+ * shell so nothing in the environment can turn a probe into an execution. */
+function commandOnPath(name: string): boolean {
+  return (process.env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && existsSync(join(dir, name)));
+}
+
+function readClipboardText(): Promise<string> {
+  const { command, args } = clipboardCommand(process.platform, commandOnPath);
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 1024 * 1024, timeout: 10_000 }, (error, stdout) => {
+      if (error) reject(new Error(`could not read the clipboard with ${command}: ${safeError(error)}`));
+      else resolve(stdout);
+    });
+  });
+}
+
+/** One printed line per ingested window: the meter, the window, the vendor's
+ * own percentage, and the reset both as a clock time and as a countdown. */
+export function usagePasteLine(observation: Observation, now = new Date()): string {
+  const used = observation.quantity?.used ?? 0;
+  const remaining = resetsIn(observation.resets_at, now).resets_in;
+  const reset = observation.resets_at ? `resets ${formatReset(observation.resets_at)}${remaining ? ` (in ${remaining})` : ""}` : "no reset in the panel";
+  return `ingested ${observation.meter_id} ${label(observation)} ${Math.round(used)}% used, ${reset}`;
+}
+
+/**
+ * `headroom usage --paste` (stdin) or `--clipboard`: reads Claude Code's own
+ * `/usage` panel as text and stores it as observations, so a figure only the
+ * human can see becomes a machine reading within a minute. This is the answer
+ * to a blocked meter: the account-wide probe can be denied, or a scoped
+ * weekly bar can sit near its cap while the account-wide window still looks
+ * free, and an orchestrator dispatching on the account meter alone would walk
+ * straight into it. The rows go through the same store insert as a polled
+ * reading, so events, pace states, `gate`, `can`, `rate` and `route` see them
+ * immediately; the next successful poll supersedes them by being newer.
+ */
+async function usagePaste(argv: string[]): Promise<number> {
+  const allowed = new Set(["--paste", "--clipboard", "--json", "--principal"]);
+  for (let index = 0; index < argv.length; index += 1) {
+    if (!allowed.has(argv[index])) throw new Error(USAGE_PASTE_HELP);
+    if (argv[index] === "--principal") index += 1;
+  }
+  const fromClipboard = argv.includes("--clipboard");
+  if (fromClipboard === argv.includes("--paste")) throw new Error(USAGE_PASTE_HELP);
+  const principal = resolveClaudePrincipal(await readAccounts(), option(argv, "--principal"));
+  const text = fromClipboard ? await readClipboardText() : await readStdinText();
+  const now = new Date();
+  const panel = parseUsagePanel(text, now);
+  for (const line of panel.unparsed) console.error(`warning: could not read "${line}"`);
+  if (!panel.windows.length) {
+    console.error('no usage window in the pasted text; expected a line like "Current session" or "Current week (all models)" with a percent');
+    return 1;
+  }
+  const store = await HeadroomStore.open();
+  let stored;
+  try {
+    stored = store.insertAll(observationsFromUsagePaste(panel.windows, principal, now));
+    store.audit("cli", "usage_paste", principal, "ok");
+  } finally { store.close(); }
+  if (argv.includes("--json")) { console.log(JSON.stringify(withResetsIn(stored, now))); return 0; }
+  for (const item of stored) console.log(usagePasteLine(item, now));
+  return 0;
+}
+
 async function daemon(): Promise<number> {
   const instance = await HeadroomDaemon.create();
   await instance.start();
@@ -947,7 +1026,9 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["engine install", "Install the optional native sensing engine"],
   ["engine status", "Show whether the native and upstream engines are installed"],
   ["logs", "Print the tail of the daemon log"],
+  ["notify", "Send a test notification to every configured channel, or show the delivery ledger"],
   ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar"],
+  ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard)"],
   ["version", "Print the Headroom version"],
 ];
 
@@ -979,7 +1060,9 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   mcp: "Usage: headroom mcp",
   engine: "Usage: headroom engine <install|status> [--pin]",
   logs: "Usage: headroom logs [--tail 50]",
+  notify: "Usage: headroom notify (--test | --last <n>)",
   statusline: "Usage: headroom statusline [--chain <command>]",
+  usage: USAGE_PASTE_HELP,
   version: "Usage: headroom version (or: headroom --version)",
 };
 
@@ -1032,6 +1115,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "doctor") return doctor();
   if (argv[0] === "setup") return runSetup(argv.slice(1));
   if (argv[0] === "logs") return logs(argv.slice(1));
+  if (argv[0] === "notify") return notifyCommand(argv.slice(1));
   if (argv[0] === "daemon") return daemon();
   if (argv[0] === "keychain") return keychain(argv.slice(1));
   if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }
@@ -1047,6 +1131,7 @@ export async function main(argv: string[]): Promise<number> {
     const result = await uninstallService(process.platform, undefined, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would remove" : "removed"} ${result.path}\nTo unload it: ${result.command}`); return 0;
   }
+  if (argv[0] === "usage") return usagePaste(argv.slice(1));
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));

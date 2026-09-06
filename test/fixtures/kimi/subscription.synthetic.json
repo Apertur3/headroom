@@ -1,0 +1,8 @@
+{
+  "_fixture": "SYNTHETIC. Hand-written from the endpoint contract, not a live capture.",
+  "subscription": {
+    "active": true,
+    "status": "SUBSCRIPTION_STATUS_ACTIVE",
+    "goods": { "title": "Allegro" }
+  }
+}

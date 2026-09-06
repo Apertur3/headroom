@@ -1,0 +1,6 @@
+{
+  "config": {
+    "onDemandCap": { "val": 1000 },
+    "onDemandUsed": { "val": 250.5 }
+  }
+}

@@ -31,7 +31,8 @@ UNKNOWN never counts as capacity.
 </picture>
 
 Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
-token from the Keychain or credentials file, the Codex token from its auth file, and, experimentally, the Antigravity
+token from the Keychain or credentials file, the Codex token from its auth file, the Grok token from the file
+`grok login` writes, and, experimentally, the Antigravity
 token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
 quota summary: a summary with real fractions is shown as-is, and an idle window whose reset equals
 fetch time plus window length is shown too, with a doubt marker, rather than replaced with UNKNOWN
@@ -46,11 +47,12 @@ links its library for providers Headroom does not cover natively.
 
 | | |
 |---|---|
-| Meters | One row per account and limit family: Claude `all`, `fable`, `routines`; Codex `main`, `spark`; Antigravity `gemini`, `claude-gpt`; local `capacity` |
+| Meters | One row per account and limit family: Claude `all`, `fable`, `routines`; Codex `main`, `spark`; Antigravity `gemini`, `claude-gpt`; Grok `main`, `credits`; local `capacity` |
 | Pace | HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset |
 | Memory | SQLite history plus `reset_seen`, `free_reset_granted`, `free_reset_used` and `source_failed` events, each with a confidence |
 | Go or no-go | `headroom can <action>` checks every meter the action draws from. A frozen Fable meter blocks a Fable call even when the account has room overall |
 | Surfaces | `headroom --json`, `headroom --threshold 90` (exit 2), a Unix socket daemon, an MCP server with `quota_status`, `quota_can`, `quota_events`, and a skill that tells an orchestrator how to use them |
+| Blocked meters | `headroom usage --paste` (or `--clipboard`) turns the text of Claude Code's `/usage` panel into real readings, so a figure only the human can see, such as a Fable weekly bar at 95%, still gates the next dispatch |
 
 Headroom is not a router. Which model is good at what is your opinion and changes monthly. Keep it
 in `~/.headroom/routing.toml`; Headroom only filters your fallback list by budget. It also never sits in

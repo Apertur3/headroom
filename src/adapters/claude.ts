@@ -360,7 +360,7 @@ function scoped(account: ProviderAccount, meter: string, candidate: unknown, now
  * runs collapsed to one hyphen, no leading/trailing hyphen. Empty for a
  * display name that is somehow entirely non-alphanumeric, which the caller
  * treats as "nothing usable to name this meter" and skips. */
-function modelSlug(name: string): string {
+export function modelSlug(name: string): string {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 

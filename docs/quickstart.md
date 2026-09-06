@@ -170,6 +170,35 @@ ever needed for it, since Headroom never has to open the Keychain item itself. A
 statusline hasn't rendered yet (or has gone stale) still falls back to the probe, subject to the
 usual grant gate.
 
+## 4c. When the meter is blocked, paste the panel
+
+Some readings only ever exist on screen: a probe the operator has not granted, a machine where the
+statusline has not rendered yet, or a model-scoped weekly bar sitting near its cap while the
+account-wide window still looks free. Run `/usage` in Claude Code, copy the panel, and hand it to
+Headroom:
+
+```sh
+headroom usage --clipboard              # macOS, or Linux with xclip or wl-paste, or Windows
+pbpaste | headroom usage --paste        # or pipe the text in yourself
+headroom usage --paste --principal claude-second < panel.txt
+```
+
+It reads the session line, the all-models week and any model-scoped week, and stores each one the
+way a poll would, with `source: "paste"` and `truth: "official"` (it is the vendor's own number)
+at confidence 0.9:
+
+```
+ingested claude-main:all 5h 12% used, resets 14:00 (in 1h 47m)
+ingested claude-main:all wk 21% used, resets Sep 13 14:00 (in 6d 23h)
+ingested claude-main:fable wk 95% used, resets Sep 13 14:00 (in 6d 23h)
+```
+
+From that moment `gate`, `can`, `rate` and `route` see the Fable meter at 95% and refuse to
+dispatch into it. Any panel line it cannot read is printed as a warning rather than dropped, and
+the next successful poll supersedes the pasted rows simply by being newer. `--principal` is
+required when more than one Claude principal is configured; `--json` prints the stored
+observations.
+
 ## 5. Read a line
 
 ```sh

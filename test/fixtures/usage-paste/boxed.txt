@@ -1,0 +1,17 @@
+# synthetic fixture, hand written for these tests, not a capture of anyone's account
+# a bordered panel, percentages on the label line, two different wordings for
+# when the window rolls over, and a footer key hint that carries no figure.
+
+╭──────────────────────────────────────────────╮
+│  Usage                                       │
+│                                              │
+│  Current session: 7% used                    │
+│  Resets 3pm (Europe/Amsterdam)               │
+│                                              │
+│  Current week (all models): 63% used         │
+│  Resets Sat 09:30                            │
+│                                              │
+│  Current week (Opus): 5%                     │
+╰──────────────────────────────────────────────╯
+
+Press d for daily, w for weekly

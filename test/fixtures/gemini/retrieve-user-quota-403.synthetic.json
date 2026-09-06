@@ -1,0 +1,8 @@
+{
+  "_comment": "SYNTHETIC. The refusal an account tier without quota entitlement gets from retrieveUserQuota, written to Google's error envelope shape.",
+  "error": {
+    "code": 403,
+    "message": "The caller does not have permission",
+    "status": "PERMISSION_DENIED"
+  }
+}

@@ -32,6 +32,9 @@ says nothing about those. Before dispatching a scoped model, gate on its meter: 
 --model fable --need wk:5 --owner <name>` (or `--meter <principal>:fable`). When that meter reads
 UNKNOWN the answer is no, not "use the account figure". `headroom --models` is a local token-share
 estimate from session logs, never the vendor meter; do not gate on it.
+When a scoped meter cannot be polled at all, ask the user to run `/usage` in Claude Code and paste
+the panel into `headroom usage --paste` (or `quota_usage_paste`); that turns the bar they can see
+into a real reading instead of dispatching blind.
 
 ## The rule of order
 
@@ -49,7 +52,11 @@ estimate from session logs, never the vendor meter; do not gate on it.
    `never`: shown, never suggested. Local inference costs energy; that is a user choice.
 6. **FREEZE is the only hard rule.** Never spawn into a frozen meter. Everything else is advice
    you may override, and when you do, say why in the dispatch note so Headroom's audit log has it.
-7. **UNKNOWN is not capacity.** A stale or failed meter blocks `can` unless you pass
+7. **Protect your own meter.** Set a reserve on the meter your orchestrator itself runs on
+   (`policy.toml`'s `[reserve]` table, e.g. `"claude-main:fable" = 10`), so the lanes you dispatch
+   cannot spend the last of the budget you need to keep supervising them. A refusal whose reason
+   names the reserve means stop dispatching that model, not retry with fewer points.
+8. **UNKNOWN is not capacity.** A stale or failed meter blocks `can` unless you pass
    `--allow-unknown` on purpose. Do not assume a failed read means room.
    A displayed `n/a` is different: the vendor confirms that window is not enforced, so Headroom
    ignores it for `can` and thresholds.

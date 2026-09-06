@@ -29,7 +29,7 @@ export interface Reading {
 
 export interface ProviderAccount {
   name: string;
-  vendor: "codex" | "claude" | "antigravity";
+  vendor: "codex" | "claude" | "antigravity" | "gemini" | "grok" | "kimi";
   location: string;
   /** `native-ts` is credential-local TypeScript; `engine` is the optional Swift engine. */
   adapter: "codexbar" | "native" | "native-ts" | "engine" | "pending";
@@ -109,7 +109,23 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new";
+
+/** One row of the notification delivery ledger: a single event's delivery
+ * state on one channel. `pending` is queued (a new event, one held back by
+ * quiet hours, or a retriable failure), `sent` is delivered and never resent,
+ * `failed` gave up after the attempt cap. */
+export interface NotifyDelivery {
+  id: number;
+  event_id: string;
+  channel: string;
+  status: "pending" | "sent" | "failed";
+  attempts: number;
+  text: string;
+  detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface Lease {
   id: string;
