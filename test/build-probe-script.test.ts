@@ -3,7 +3,10 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Shells out to swiftc and openssl; under parallel load the default 5s per test is too tight.
+vi.setConfig({ testTimeout: 60_000 });
 
 const execFileAsync = promisify(execFile);
 const realScript = join(__dirname, "..", "scripts", "build-probe.sh");

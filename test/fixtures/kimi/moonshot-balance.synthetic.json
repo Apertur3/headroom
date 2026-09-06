@@ -1,0 +1,11 @@
+{
+  "_fixture": "SYNTHETIC. Hand-written from the endpoint contract, not a live capture. The balance is invented.",
+  "code": 0,
+  "scode": "0x0",
+  "status": true,
+  "data": {
+    "available_balance": 12.5,
+    "voucher_balance": 2.5,
+    "cash_balance": 10
+  }
+}

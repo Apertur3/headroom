@@ -14,6 +14,7 @@ import { withResetsIn } from "./resets.js";
 import { withPaceInfo } from "./pace.js";
 import { fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import type { GateNeed } from "./pacing.js";
+import { deliverNotifications } from "./notify.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -492,7 +493,7 @@ export class HeadroomDaemon {
           if (!meter) return reject(-32602, "meter is required");
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -510,7 +511,7 @@ export class HeadroomDaemon {
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); break;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -520,7 +521,7 @@ export class HeadroomDaemon {
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
-          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes }); break;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
         }
         case "health": result = {
           socket: this.path,
@@ -598,6 +599,11 @@ export class HeadroomDaemon {
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertAll(result.observations);
       this.store.leases();
+      // Human-facing delivery of the events the inserts above just detected.
+      // Deliberately not awaited: a slow or failing notification channel must
+      // never delay a poll, and the ledger inside carries its own retries.
+      void deliverNotifications(this.store, { home: this.home })
+        .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);

@@ -1,0 +1,7 @@
+{
+  "_comment": "SYNTHETIC. Hand-written to the retrieveUserQuota bucket contract (modelId, remainingFraction, resetTime, tokenType); not a capture of any real account.",
+  "buckets": [
+    { "modelId": "gemini-2.5-pro", "remainingFraction": 0.62, "resetTime": "2026-09-07T00:00:00Z", "tokenType": "input" },
+    { "modelId": "gemini-2.5-flash", "remainingFraction": 0.9, "resetTime": "2026-09-07T00:00:00Z", "tokenType": "input" }
+  ]
+}

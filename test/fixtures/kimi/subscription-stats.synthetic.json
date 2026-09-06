@@ -1,0 +1,15 @@
+{
+  "_fixture": "SYNTHETIC. Hand-written from the endpoint contract, not a live capture.",
+  "subscriptionBalance": {
+    "feature": "FEATURE_OMNI",
+    "type": "SUBSCRIPTION",
+    "amountUsedRatio": 0.4125,
+    "kimiCodeUsedRatio": 0.32,
+    "expireTime": "2026-10-01T00:00:00Z"
+  },
+  "ratelimitCode7d": {
+    "ratio": 0.9,
+    "enabled": true,
+    "resetTime": "2026-09-10T00:00:00Z"
+  }
+}

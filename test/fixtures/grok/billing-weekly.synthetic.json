@@ -1,0 +1,14 @@
+{
+  "config": {
+    "creditUsagePercent": 12.5,
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_WEEKLY",
+      "start": "2026-08-31T00:00:00Z",
+      "end": "2026-09-07T00:00:00Z"
+    },
+    "billingPeriodEnd": "2026-09-07T00:00:00Z",
+    "onDemandCap": { "val": 1000 },
+    "onDemandUsed": { "val": 250 },
+    "subscriptionTier": "SUPERGROK"
+  }
+}

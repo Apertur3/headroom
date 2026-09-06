@@ -17,3 +17,34 @@ pacing = "even"
 # Per-principal intervals override the default:
 # [principal.claude-main]
 # interval_minutes = 5
+# A protected reserve per meter: percent of EVERY window of that meter that
+# gate, fill, route and can never dip into (0-90). Unlike freeze_reserve_pct
+# above, which is the FREEZE pace threshold, this only withholds capacity from
+# decisions -- pace states are unchanged. Set one on the meter your own
+# orchestrator runs on. "*" is the default for meters without their own entry.
+# [reserve]
+# "claude-main:fable" = 10
+# "*" = 5
+
+# --- Notifications (off unless you uncomment [notify] and name a channel) ---
+# Delivered by the daemon after each poll, once per event, over the channels
+# below. Credentials are never written here: the Telegram bot token and the
+# optional webhook bearer are read from the OS secret store at send time.
+# See docs/notifications.md for the store command on each platform.
+# [notify]
+# channels = ["telegram", "ntfy", "webhook"]
+# events = ["reset_seen", "free_reset_granted", "source_failed", "source_recovered", "pace_projection_conserve", "model_new", "threshold"]
+# # Also notify when any hard window crosses this used percent, once per window.
+# threshold_percent = 90
+# # Local time. Events inside the range are batched into one message at the end of it.
+# quiet_hours = "23:00-07:00"
+#
+# [notify.telegram]
+# chat_id = "123456"
+#
+# [notify.ntfy]
+# topic = "headroom-example"
+# # server = "https://ntfy.example.com"
+#
+# [notify.webhook]
+# url = "https://example.com/hook"

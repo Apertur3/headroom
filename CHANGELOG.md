@@ -6,6 +6,83 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Notifications for humans. A `[notify]` block in policy.toml delivers stored events (resets, free
+  resets, source failures and recoveries, projected stalls, `model_new`) plus a `threshold_percent`
+  crossing to Telegram, ntfy, or a webhook, from the daemon after each poll. A per-event ledger in
+  the store means nothing is ever sent twice, quiet hours batch a night's events into one message,
+  and a failing channel is retried at most three times per event. Telegram's bot token and the
+  optional webhook bearer are read from the OS secret store at send time (macOS Keychain,
+  `secret-tool` on Linux, Credential Manager on Windows) and never from a file; without a store the
+  channel is disabled with a reason instead of falling back to plaintext. Every call goes through
+  the existing outbound guard with the channel's own host allowlisted, redirects refused, the
+  response capped and a 5-second timeout. New commands: `headroom notify --test` and
+  `headroom notify --last <n>`. See docs/notifications.md.
+- `model_new` event: a vendor reporting a bucket name Headroom has never seen for a principal it
+  already reads (Claude's `limits[]` display names are stored as meters), so a new model release
+  surfaces as an event and, with notifications on, as a message.
+- Native Gemini CLI adapter (vendor `gemini`, the Gemini Code Assist subscription). It reads
+  `~/.gemini/oauth_creds.json` (or the `.gemini` under a `GEMINI_CLI_HOME` override), refreshes the
+  token in memory, and calls `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` with the Gemini
+  CLI's own `ideType: "GEMINI_CLI"` metadata followed by `v1internal:retrieveUserQuota`. Meters are
+  `<principal>:<model family>` per quota bucket (plus `<principal>:all` for an unscoped bucket),
+  with `used` computed as `(1 - remainingFraction) * 100` and the lowest fraction winning when a
+  family reports several token types. A tier without quota entitlement answers 403: that becomes a
+  `failed` reading with reason "quota endpoint not permitted for this account tier (403)", inside
+  the shared protected-status backoff rather than an exception, and a missing Code Assist project
+  reports "no Code Assist project; finish setup in the Gemini CLI" instead of onboarding one.
+  `accounts discover` adds the principal (`gemini`, or `gemini-<home basename>` for a
+  `GEMINI_CLI_HOME` override) and `doctor` reports its credential file like the other vendors.
+- The Gemini CLI OAuth credential read, in-memory token refresh, bundled OAuth client discovery and
+  both Code Assist calls now live in one shared module (`src/adapters/google-code-assist.ts`) that
+  the Antigravity and Gemini adapters both import, with no behaviour change to the Antigravity path.
+- Native Kimi adapter (vendor `kimi`, Moonshot's Kimi app and CLI). It reads the subscription
+  allowance from `www.kimi.com/apiv2` (`kimi.gateway.billing.v1.BillingService/GetUsages`, plus the
+  membership plan and subscription-stats calls) and emits `<principal>:main` (allowance window and
+  the rate-limit window the response declares), `<principal>:total` (the shared subscription pool)
+  and `<principal>:code-7d` (the membership 7-day Code ratio, only when it diverges from the
+  allowance). Kimi has no credential file Headroom is willing to read on its own, since the desktop
+  app keeps its session token in a browser cookie store, so `location` names a 0600 token file you
+  write yourself (default `~/.kimi/auth.token`); `accounts discover` picks it up and `doctor`
+  reports its presence and permissions. An optional `moonshot.key` file beside it adds an
+  informational `<principal>:credits` meter from the Moonshot platform balance. `www.kimi.com` and
+  `api.moonshot.ai` are on the outbound allowlist; the token stays in memory and is never logged.
+- `headroom usage --paste` (stdin) and `headroom usage --clipboard` (macOS `pbpaste`, Linux `xclip`
+  or `wl-paste`, Windows `Get-Clipboard`) turn the text of Claude Code's `/usage` panel into
+  observations, for the case where a meter exists but cannot be polled: the session line maps to
+  `<principal>:all` over 5h, the all-models week to `<principal>:all` over a week, and a scoped week
+  line (`Fable`, `Sonnet only`, and so on) to `<principal>:<model-slug>`, slugged exactly the way the
+  Claude adapter slugs the vendor's own `limits[]` display names. The parser tolerates bars, box
+  drawing, ragged spacing, `12%` or `12% used`, and resets given relatively (`in 2h 14m`), absolutely
+  (`Sep 13, 2:00pm`, `at 14:00`, `Sat 09:30`) or not at all. Readings are stored with `source: "paste"`,
+  `truth: "official"` and confidence 0.9 through the same insert as a poll, so events, pace states,
+  `gate`, `can`, `rate` and `route` see them at once, and the next poll supersedes them by being newer.
+  One line is printed per ingested window, a warning per panel line that could not be read, exit 0 when
+  at least one window landed and 1 otherwise; `--json` prints the stored observations. The same is
+  available over MCP as `quota_usage_paste` (`{ principal?, text }`).
+- A protected reserve per meter, set in `policy.toml`'s new `[reserve]` table (`"claude-main:fable" = 10`
+  reserves 10 percent of every window of that meter; `"*"` is the default for meters without their own
+  entry; values run 0 through 90, and anything else is a policy error `doctor` reports). `gate`, `fill`,
+  `route` and `can` all treat `remaining - reserve` (floored at 0) as the capacity they may spend: `gate`
+  refuses a need that would cross into it and names it in the reason, `fill` counts lanes only above it,
+  `route` ranks with it removed and skips a meter whose usable remaining is 0, and `can` answers NO when
+  the expected cost would cross it. `plan` draws its line above it too. Where a per-call `--reserve` is
+  also given, the larger of the two applies. Pace states are unchanged, so `status` now prints the
+  reserve after a window's numbers (`wk 85% (reserve 10%)`) to show why an otherwise healthy row
+  produced a NO. The MCP twins (`quota_gate`, `quota_fill`, `quota_route`, `quota_can`) apply the same
+  floor. Intended for the meter an orchestrator itself runs on, so subagent lanes cannot drive their own
+  dispatcher to its weekly wall.
+- Native Grok adapter (vendor `grok`) for the subscription the Grok CLI signs into. It reads the token
+  `grok login` writes to `<GROK_HOME>/auth.json` (default `~/.grok/auth.json`, a regular file owned by
+  you, read in memory only and never logged) and calls the CLI chat proxy:
+  `/v1/billing?format=credits` for usage and `/v1/settings` for the plan name, the latter as optional
+  enrichment that never fails the read. Meters: `<principal>:main`, the allowance percent with the
+  window length and reset taken from the published billing period, and `<principal>:credits`, the
+  on-demand balance as an informational `count` window. `accounts discover` adds the principal once the
+  token file exists, `doctor` reports its presence, a 401 says "run: grok login", and 403/429 keep the
+  status the collector backs off on. The browser-cookie fallback is deliberately not implemented: see
+  docs/vendors.md.
+
 ## [0.1.0-beta.4] - 2026-09-06
 
 ### Fixed

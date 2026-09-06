@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { claudeServiceName, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
+import { grokAuthPath } from "./adapters/grok.js";
+import { kimiTokenPath } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
@@ -57,6 +59,24 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
       store?.audit("doctor", "claude_probe", account.name, "called");
       return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`);
     }
+  }
+  if (account.vendor === "grok") {
+    // `location` may name the token file itself or the directory holding it.
+    const grokPath = grokAuthPath(account.location);
+    return (await doctorFileStatus(grokPath)) === "present"
+      ? check("OK", `principal ${account.name} credential`, `credential file present (${grokPath})`, "no action needed")
+      : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${grokPath})`, "run: grok login");
+  }
+  if (account.vendor === "kimi") {
+    // `location` is the token file the operator writes themselves. The adapter
+    // refuses one anyone else can read, so doctor holds it to that same 0600
+    // bar rather than the looser config-file bar above.
+    const kimiPath = kimiTokenPath(account.location);
+    const status = await doctorFileStatus(kimiPath);
+    const shared = status === "present" && process.platform !== "win32" && ((await lstat(kimiPath)).mode & 0o077) !== 0;
+    return status === "present" && !shared
+      ? check("OK", `principal ${account.name} credential`, `token file present (${kimiPath})`, "no action needed")
+      : check("FAIL", `principal ${account.name} credential`, shared ? `token file is readable by group or other (${kimiPath})` : `missing or unsafe token file (${kimiPath})`, `save the kimi-auth token to ${kimiPath}, then: chmod 600 ${kimiPath}`);
   }
   const path = credentialPath(account.vendor, account.vendor === "antigravity" ? undefined : account.location);
   return (await doctorFileStatus(path)) === "present"

@@ -1,13 +1,15 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes thirteen tools, defined in `src/mcp.ts`: three read status, three manage
-leases, six pace a window, one routes an action class to an account. Every tool but `quota_wait`
-and `quota_route` tries the daemon first, over its local socket or named pipe, and falls back to
-a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`
-and `quota_route` always read directly, since neither has a daemon RPC case at all -- `quota_wait`
-because it never blocks (it just reports the reset time), and `quota_route` because it's a
-deliberate, occasional call, not a hot path worth a daemon round trip.
+SDK dependency. It exposes fourteen tools, defined in `src/mcp.ts`: three read status, three manage
+leases, six pace a window, one routes an action class to an account, and one ingests a pasted
+`/usage` panel. Every tool but `quota_wait`, `quota_route` and `quota_usage_paste` tries the daemon
+first, over its local socket or named pipe, and falls back to
+a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`,
+`quota_route` and `quota_usage_paste` always read directly, since none has a daemon RPC case at
+all -- `quota_wait` because it never blocks (it just reports the reset time), `quota_route` because
+it's a deliberate, occasional call, not a hot path worth a daemon round trip, and
+`quota_usage_paste` because it is a rare, human-triggered write.
 
 Every tool call is validated against its own declared schema before any dispatch, to the daemon or
 to the direct fallback: an argument of the wrong type, a number outside the bounds noted below (the
@@ -283,6 +285,16 @@ every OTHER owner's active lease against these same meters before scoring and ra
 candidate, the same reservation `quota_can` applies. `null` when none fits; UNKNOWN rows never win
 unless `allow_unknown` is set. CLI: `headroom route`.
 
+### `quota_usage_paste`
+
+`text` (the pasted `/usage` panel), optional `principal` (required when more than one Claude
+principal is configured). Parses the panel's session line, all-models week and any model-scoped
+week, and stores each as an observation on `<principal>:all` or `<principal>:<model-slug>` with
+`source: "paste"`, `truth: "official"` and confidence 0.9. Use it when a meter cannot be polled at
+all, or when a human can see a scoped bar the account-wide window hides. Returns the stored
+observations plus `unparsed`, the panel lines it could not place. The next successful poll
+supersedes these rows by being newer. CLI: `headroom usage --paste`.
+
 ## How an orchestrator should use them
 
 This mirrors `skills/headroom/SKILL.md`, which any Claude Code session with the skill installed
@@ -326,6 +338,7 @@ For agents that call a shell instead of MCP, such as Codex or Gemini CLI session
 | `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
 | `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |
 | `quota_cost` | `headroom cost [<action-class>] [--json]` |
+| `quota_usage_paste` | `headroom usage --paste [--principal <id>] [--json]` (or `--clipboard`) |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match

@@ -1,0 +1,9 @@
+# synthetic fixture, hand written for these tests, not a capture of anyone's account
+
+Current session
+███████████████░░░░░░░░░░░░░░░  49% used
+Resets in 2h 14m
+
+Current week (all models)
+██████░░░░░░░░░░░░░░░░░░░░░░░░  17% used
+Resets Sep 13, 2:00pm

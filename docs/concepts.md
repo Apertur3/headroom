@@ -214,6 +214,21 @@ also lists, per `routing.toml` `[cost.<class>]` entry, how many runs of that cla
 remaining points and remaining minutes (a learned median cost overrides the static config number
 once samples exist).
 
+`policy.toml`'s `[reserve]` table is a different thing from `freeze_reserve_pct`, and the two names
+are easy to confuse. `freeze_reserve_pct` is a **pace** threshold: once a window's used percent
+reaches `100 - freeze_reserve_pct`, that window's pace state becomes FREEZE, for every caller
+equally. The `[reserve]` table is a **decision floor** per meter -- `"claude-main:fable" = 10`
+protects 10% of every window of that meter, `"*"` sets the default for meters without their own
+entry, and values run 0 through 90. `gate`, `fill`, `route` and `can` all treat `remaining -
+reserve` (floored at 0) as the capacity they may spend: `gate` refuses a need that would cross into
+it and names it in the reason, `fill` counts lanes only above it, `route` ranks with it removed and
+skips a meter whose usable remaining is 0, and `can` answers NO when the expected cost would cross
+it. Pace states are deliberately unaffected -- a meter inside its reserve still reports the state
+its raw reading earns -- so `status` prints the reserve after the numbers (`wk 85% (reserve 10%)`)
+to show why an otherwise healthy row produced a NO. Where a per-call `--reserve` (or `plan`'s and
+`fill`'s equivalents) is also given, the larger of the two applies. The intended use is the meter an
+orchestrator itself runs on: subagent lanes cannot then drive their own dispatcher to its wall.
+
 Example: a burst of parallel lanes that jumps a 5h window from 1% to 23% in ten minutes trips the
 burst check (well over twice a modest plan rate) even though 23% used is nowhere near the freeze
 reserve -- `gate` refuses with `burst: 48 pts/h over the last 10 min, plan 4 pts/h; hold until 17:45`.

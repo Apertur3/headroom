@@ -23,6 +23,36 @@ vendor = "antigravity"
 location = "~/.gemini/antigravity-cli"
 adapter = "native-ts"
 
+# Grok reads the token `grok login` writes. `location` may name the token file
+# itself or the directory holding it; the default is ~/.grok, or GROK_HOME.
+# [[accounts]]
+# name = "grok"
+# vendor = "grok"
+# location = "~/.grok"
+# adapter = "native-ts"
+
+# Kimi has no credential file Headroom is willing to read on its own: the desktop
+# app keeps its session token in a browser cookie store, which is out of scope
+# here. `location` is a file you write yourself, mode 0600, holding only the
+# kimi-auth token from https://www.kimi.com/code/console. Put an optional
+# Moonshot API key in a `moonshot.key` file beside it to also get a credits
+# meter. See docs/vendors.md.
+# [[accounts]]
+# name = "kimi"
+# vendor = "kimi"
+# location = "~/.kimi/auth.token"
+# adapter = "native-ts"
+
+# The Gemini CLI subscription (Gemini Code Assist quota). `location` is the
+# Gemini home holding oauth_creds.json: ~/.gemini, or the .gemini under a
+# GEMINI_CLI_HOME override. Discovery names an override principal
+# gemini-<home basename>. See docs/vendors.md.
+# [[accounts]]
+# name = "gemini"
+# vendor = "gemini"
+# location = "~/.gemini"
+# adapter = "native-ts"
+
 # Local pools are probed only; a wake command is reported when down and never run.
 # [[accounts]]
 # name = "gpu-box-vllm"

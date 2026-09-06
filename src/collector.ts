@@ -8,6 +8,9 @@ import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statusline
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
 import { noDaemonObservations, observeAntigravity } from "./adapters/antigravity.js";
+import { observeGemini } from "./adapters/gemini.js";
+import { observeGrok } from "./adapters/grok.js";
+import { observeKimi } from "./adapters/kimi.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
@@ -180,6 +183,31 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       const denied = result.find((item) => item.freshness === "failed" && item.reason?.startsWith("Keychain grant needed;"));
       if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
     }
+    const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
+    if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
+  }
+  // Grok reads its own token file and calls the CLI chat proxy directly, so
+  // it needs neither a grant gate nor a warm local process.
+  for (const account of providerAccounts.filter((item) => item.vendor === "grok")) {
+    const result = await observeGrok(account);
+    observations.push(...result);
+    const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
+    if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
+  }
+  // Kimi reads the operator's own token file and calls the subscription
+  // gateway directly; the optional Moonshot credits meter rides along.
+  for (const account of providerAccounts.filter((item) => item.vendor === "kimi")) {
+    const result = await observeKimi(account);
+    observations.push(...result);
+    const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
+    if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
+  }
+  // The Gemini CLI subscription reads its own Code Assist quota over the same
+  // Google endpoints Antigravity uses, but with no local process behind it: it
+  // is a plain remote read, with no daemon or warm probe involved.
+  for (const account of providerAccounts.filter((item) => item.vendor === "gemini")) {
+    const result = await observeGemini(account);
+    observations.push(...result);
     const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
   }

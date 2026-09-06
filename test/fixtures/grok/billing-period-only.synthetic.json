@@ -1,0 +1,9 @@
+{
+  "config": {
+    "currentPeriod": {
+      "type": "USAGE_PERIOD_TYPE_MONTHLY",
+      "end": "2026-09-30T00:00:00Z"
+    },
+    "billingPeriodEnd": "2026-09-30T00:00:00Z"
+  }
+}

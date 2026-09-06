@@ -1,0 +1,29 @@
+{
+  "_fixture": "SYNTHETIC. Hand-written from the endpoint contract, not a live capture. No real account, token or balance appears anywhere in this directory.",
+  "usages": [
+    {
+      "scope": "FEATURE_CODING",
+      "detail": {
+        "limit": "2000",
+        "used": "640",
+        "remaining": "1360",
+        "resetTime": "2026-09-10T00:00:00Z"
+      },
+      "limits": [
+        {
+          "window": { "duration": 5, "timeUnit": "TIME_UNIT_HOUR" },
+          "detail": {
+            "limit": "200",
+            "used": "50",
+            "remaining": "150",
+            "resetTime": "2026-09-06T18:00:00Z"
+          }
+        }
+      ]
+    },
+    {
+      "scope": "FEATURE_CHAT",
+      "detail": { "limit": "100", "used": "1" }
+    }
+  ]
+}

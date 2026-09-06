@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateGate, evaluateProRataLine, fillClassFits, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
-import { canConsume, defaultPolicy, freshnessGate, withOtherOwnerReservations, type Policy } from "./policy.js";
+import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import type { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
@@ -124,7 +124,10 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
 
 export type PlanOutcome = ({ meter: string } & PlanResult) | { meter: string; error: string };
 
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes): PlanOutcome {
+/** `reserves` is policy.toml's `[reserve]` table: the plan line is drawn
+ * above the larger of the caller's own reserve percent and this meter's
+ * protected floor, so `plan` never budgets points `gate` would then refuse. */
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}): PlanOutcome {
   const { short, long } = meterWindows(store, meter);
   if (!long || !long.resets_at) return { meter, error: meterUnknownReason(store, meter, `no weekly window for ${meter}`) };
   // Fail closed on a stale, failed, or long-unpolled weekly reading exactly
@@ -134,7 +137,7 @@ export function planFor(store: HeadroomStore, meter: string, reservePercent: num
   const freshness = freshnessGate(long, staleMinutes, now);
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
-  return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, reservePercent, now) };
+  return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now) };
 }
 
 export interface GateOptions {
@@ -155,6 +158,10 @@ export interface GateOptions {
    * state. Defaults to defaultPolicy's own value; a caller with the real
    * policy loaded should pass its staleness_minutes here explicitly. */
   staleness_minutes?: number;
+  /** policy.toml's `[reserve]` table: the protected floor per meter that
+   * this gate must never dip into. The larger of that floor and the
+   * caller's own reserve percent applies. */
+  reserves?: Record<string, number>;
 }
 
 export interface GateOutcome extends GateResult {
@@ -223,7 +230,24 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
       freshness5h: short?.freshness ?? null,
       freshnessWk: long?.freshness ?? null,
     };
-    const result = evaluateGate(needs, usage, reservePercent, usePlan, now);
+    // The meter's own protected reserve (policy.toml [reserve]) is checked
+    // before the plain ceiling so the refusal can name it: a caller reading
+    // "would use the 10% reserve on claude-main:fable" knows to stop
+    // dispatching that model rather than to retry with fewer points. The
+    // larger of the two reserves then applies to everything else the gate
+    // checks, including the plan line.
+    const meterReserve = reserveFor(options.reserves ?? {}, id);
+    for (const need of meterReserve > 0 ? needs : []) {
+      const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
+      if (freshness === "not_enforced") continue;
+      const used = need.window === "5h" ? usage.used5h : usage.usedWk;
+      if (used === null) continue; // evaluateGate below reports the unknown window
+      if (used + need.points > 100 - meterReserve) {
+        const left = Math.max(0, 100 - meterReserve - used);
+        return { allowed: false, reason: `${need.window} needs ${need.points} more but only ${left.toFixed(1)} left: that would use the ${meterReserve}% reserve on ${id}`, meters_checked: checked };
+      }
+    }
+    const result = evaluateGate(needs, usage, Math.max(reservePercent, meterReserve), usePlan, now);
     if (!result.allowed) return { ...result, meters_checked: checked };
     lastResult = result;
 
@@ -292,6 +316,10 @@ export interface FillOptions {
    * value; a caller with the real policy loaded should pass its
    * staleness_minutes here explicitly. */
   staleness_minutes?: number;
+  /** policy.toml's `[reserve]` table: lanes are only counted above this
+   * meter's protected floor. The larger of that floor and the caller's own
+   * weekly reserve applies. */
+  reserves?: Record<string, number>;
 }
 
 const EVEN_PACING_FULL_BURST_MINUTES = 45;
@@ -386,7 +414,12 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   // With no genuine second window and the tight one standing in for both,
   // the lane cost applies 1:1 instead.
   const weeklyCostPerLaneOverride = !wider && !isFiveHour ? laneCost : undefined;
-  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, weeklyReservePercent, weeklyCostPerLaneOverride, 5, windowUsed);
+  // The meter's protected reserve (policy.toml [reserve]) is withheld from
+  // both windows before any lane is counted: lanes only fit above it, and
+  // the per-class list below reads the same reduced remainder.
+  const meterReserve = reserveFor(options.reserves ?? {}, meter);
+  if (meterReserve > 0) used5hForLanes = Math.min(100, used5hForLanes + meterReserve);
+  const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, Math.max(weeklyReservePercent, meterReserve), weeklyCostPerLaneOverride, 5, windowUsed);
   const lanesError = laneCost === undefined ? `no learned cost for ${meter}; pass --lane-cost` : null;
 
   const routing = await readRouting();
@@ -412,6 +445,9 @@ export interface RouteCandidate {
    * routable; a principal whose own state already fits but has nothing
    * numeric to rank by is reported, never picked. */
   remaining_percent: number | null;
+  /** The protected reserve already removed from remaining_percent, 0 when
+   * this meter has none. */
+  reserve_percent: number;
   window_minutes: number | null;
 }
 
@@ -473,15 +509,23 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
     const reservedRows = [...reserved.values()].flat() as Observation[];
     const deciding = pickDecidingObservation(reservedRows.length ? reservedRows : rows);
     const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? Math.max(0, 100 - deciding.quantity.used) : null;
-    return { principal, state: decision.state, reason: decision.reason, remaining_percent: remaining, window_minutes: deciding?.window?.minutes ?? null };
+    // The deciding meter's protected reserve (policy.toml [reserve]) is
+    // removed before ranking, so a principal is compared on the capacity it
+    // may actually spend. The pace state is deliberately left alone: the
+    // reserve is a decision floor, not a pace rule.
+    const reserve = deciding ? reserveFor(policy.reserve, deciding.meter_id) : 0;
+    const usable = remaining === null ? null : Math.max(0, remaining - reserve);
+    return { principal, state: decision.state, reason: decision.reason, remaining_percent: usable, reserve_percent: reserve, window_minutes: deciding?.window?.minutes ?? null };
   });
-  const eligible = candidates.filter((item) => routeFits(item.state, allowUnknown) && item.remaining_percent !== null);
+  // A meter whose whole remainder is inside its reserve has nothing to
+  // route to, whatever its pace state says.
+  const eligible = candidates.filter((item) => routeFits(item.state, allowUnknown) && item.remaining_percent !== null && (item.reserve_percent <= 0 || item.remaining_percent > 0));
   eligible.sort((a, b) => (b.remaining_percent as number) - (a.remaining_percent as number));
   const winner = eligible[0];
   if (!winner) return { principal: null, environment: {}, reason: candidates.length ? "no candidate fits" : "no principals for this class", candidates };
   const account = accounts.find((item) => item.name === winner.principal);
   return {
     principal: winner.principal, environment: account ? launchEnvironment(account) : {},
-    reason: `${windowShortLabel(winner.window_minutes)} ${winner.remaining_percent!.toFixed(1)}% remaining`, candidates,
+    reason: `${windowShortLabel(winner.window_minutes)} ${winner.remaining_percent!.toFixed(1)}% remaining${winner.reserve_percent > 0 ? ` after the ${winner.reserve_percent}% reserve` : ""}`, candidates,
   };
 }
