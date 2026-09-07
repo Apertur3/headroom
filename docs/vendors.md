@@ -65,6 +65,17 @@ other profile. Headroom never reads that token itself there: a signed helper bin
 so the token never reaches Node or Headroom's own output. On Linux and Windows, Headroom reads the
 token directly from `<config-dir>/.credentials.json` (default `~/.claude/.credentials.json`).
 
+**One grant survives every rebuild.** macOS keys a Keychain item's access control list on the
+trusted application's *designated requirement*, not on the binary's contents, and
+`scripts/build-probe.sh` signs the probe with one stable local identity ("Headroom Local") whose
+requirement is the same after every rebuild. So `npm run engine:build`, a reinstall, or a new
+release does not cost the operator another `headroom keychain grant`: Headroom compares the probe's
+signing identity, not its SHA-256, before deciding a grant is owed. A grant is asked for again only
+when the signing identity actually changed, when the probe fell back to ad-hoc signing (an ad-hoc
+requirement is a per-build hash, so it genuinely is new code to Keychain), or on a first-ever run
+that has never had a successful probe. The recorded SHA-256 next to the binary is still verified on
+every use; it is an integrity check, not the grant marker.
+
 **Keychain grants lapse on their own.** macOS resets an item's access control list every time
 its contents are rewritten, and Claude Code rewrites `Claude Code-credentials` on every token
 refresh -- so a grant `headroom keychain grant` gave the probe stops working again the next time

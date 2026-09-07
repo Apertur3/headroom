@@ -19,7 +19,7 @@
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
-import { formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,19 @@ export function formatRatePercent(value: number): string {
 function age(observation: Observation, now: Date): string {
   const milliseconds = Math.max(0, now.getTime() - new Date(observation.fetched_at).getTime());
   return milliseconds < 60_000 ? "<1m" : `${Math.floor(milliseconds / 60_000)}m`;
+}
+
+/** Same "<1m"/"Nm" shape as age() above, from a last_known reading's own
+ * precomputed age_seconds rather than a fresh now-minus-fetched_at. */
+function lastKnownAge(lastKnown: NonNullable<Observation["last_known"]>): string {
+  return lastKnown.age_seconds < 60 ? "<1m" : `${Math.floor(lastKnown.age_seconds / 60)}m`;
+}
+
+/** "last 41%, 65m ago" -- the compact form used in the grouped view's own
+ * reset column, where the row's meter and window already say which reading
+ * this is. */
+function lastKnownCompact(lastKnown: NonNullable<Observation["last_known"]>): string {
+  return `last ${Math.round(lastKnown.used_percent)}%, ${lastKnownAge(lastKnown)} ago`;
 }
 
 function windowOrder(observation: Observation): number {
@@ -126,7 +139,13 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   }
   const evidence = `${resetSeen ? ` reset seen ${formatReset(resetSeen, now)}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
-  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
+  if (!observation.quantity || state === "UNKNOWN") {
+    // The last known reading is named "at <clock time>" here (unlike the
+    // grouped view's more compact form below) because the dense form has no
+    // separate column to put it in -- it all lives inside one parenthetical.
+    const known = observation.last_known ? `; last ${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
+    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${evidence}`;
+  }
   const seconds = resetsIn(observation.resets_at, now).resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
   // A vendor-reported idle window that looks like a manufactured placeholder
@@ -416,13 +435,18 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
         const countdown = seconds === null || decision.state === "UNKNOWN";
         const unknown = decision.state === "UNKNOWN" ? explainUnknown(observation.reason ?? decision.reason) : undefined;
         if (unknown) explanations.push(unknown);
+        // An UNKNOWN window has no countdown to show in the reset column, so
+        // its last known reading (if any survived the 7-day lookback) takes
+        // that column instead -- a trend beside the "-" used cell, not a
+        // substitute for it.
+        const known = decision.state === "UNKNOWN" && observation.last_known ? lastKnownCompact(observation.last_known) : "";
         rows.push({
           meter: index === 0 ? shortMeter(observation) : "",
           ...(isCredits(observation) ? { text: creditsCell(observation) } : {}),
           window: label(observation),
           used: usedCell(observation, decision.state),
-          reset: countdown ? "" : `resets in ${formatResetsIn(seconds as number)}`,
-          resetCoarse: countdown ? "" : `resets in ${formatResetsInCoarse(seconds as number)}`,
+          reset: countdown ? known : `resets in ${formatResetsIn(seconds as number)}`,
+          resetCoarse: countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`,
           state: isCredits(observation) ? "" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
           detail: detailLine(observation, reserveFor(policy.reserve, observation.meter_id), resetSeen.get(windowKey(observation)), freeResetUsed.get(windowKey(observation)), now),
           unknown,
