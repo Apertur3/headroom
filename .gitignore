@@ -22,3 +22,4 @@ bin/probe/
 .vscode/
 .claude/
 *.swp
+.gstack/
