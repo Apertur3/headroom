@@ -1,11 +1,11 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
-  claudeResponseShape, claudeServiceName, isClaudeGrantIssue, observationsFromClaudeUsage, observeClaude,
-  parseKeychainModifiedAt, syncClaudeGrantState,
+  claudeLoggedOutFix, claudeLoggedOutReason, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
+  isClaudeLoggedOutReason, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeGrantState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import {
@@ -655,6 +655,31 @@ describe("Claude Keychain grant gate", () => {
       keychainMetadata: async () => ({ found: true }),
     });
     expect(rows[0].reason).toBe("Keychain grant lapsed; Claude Code rewrote its credentials at an unknown time; run: headroom keychain grant --principal claude-main");
+  });
+
+  it("maps a probe's logged-out marker to the logged-out reason, never a Keychain grant issue and never the ACL-lapse metadata lookup (issue #11)", async () => {
+    const mustNotRun = async (): Promise<never> => { throw new Error("must not be called: HEADROOM_PROBE_LOGGED_OUT is not the ambiguous 'no credentials' case"); };
+    const rows = await observeClaude(claude, {
+      platform: "darwin",
+      now: () => at,
+      probe: async () => { throw new ClaudeProbeError("missing", claudeLoggedOutReason(claude.location)); },
+      keychainMetadata: mustNotRun,
+    });
+    expect(rows.every((row) => row.freshness === "failed")).toBe(true);
+    expect(rows[0].reason).toBe(`Claude Code is logged out for ${resolve(claude.location)}; run: CLAUDE_CONFIG_DIR=${resolve(claude.location)} claude and sign in`);
+    expect(isClaudeGrantIssue(rows[0].reason)).toBe(false);
+    expect(isClaudeLoggedOutReason(rows[0].reason)).toBe(true);
+  });
+
+  it("claudeLoggedOutFix/claudeLoggedOutReason use the shorter default-profile wording, and isClaudeLoggedOutReason recognizes only that prefix", () => {
+    const defaultDir = join(homedir(), ".claude");
+    expect(claudeLoggedOutFix(defaultDir)).toBe("run: claude and sign in");
+    expect(claudeLoggedOutReason(defaultDir)).toBe("Claude Code is logged out; run: claude and sign in");
+    expect(isClaudeLoggedOutReason(claudeLoggedOutReason(defaultDir))).toBe(true);
+    expect(isClaudeLoggedOutReason(claudeGrantNeededReason("claude-main"))).toBe(false);
+    expect(isClaudeLoggedOutReason("no credentials in Keychain for this config dir")).toBe(false);
+    expect(isClaudeLoggedOutReason(null)).toBe(false);
+    expect(isClaudeLoggedOutReason(undefined)).toBe(false);
   });
 
   it("keeps the original 'no credentials' wording, never fabricating a lapse, once the metadata lookup confirms the item is genuinely absent", async () => {

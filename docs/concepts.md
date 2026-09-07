@@ -292,6 +292,17 @@ of record.
 Example: `codex-main` shows `reset seen 14:00 (inferred, 62%)` when usage drops sharply without a
 vendor-confirmed reset timestamp yet.
 
+When that drop is first noticed across a gap of failed readings (a stretch of UNKNOWN rows
+between the last fresh sample and the next one), Headroom does not trust the raw delta the way it
+would for two readings taken back to back: a gap long enough to hide a scheduled reset always
+produces a big jump once it closes, whether or not the reset actually happened during that
+specific gap. Instead it checks whether the last fresh reading's own scheduled reset time falls
+inside the gap. If it does, the reset is recorded at that scheduled moment, not the moment the gap
+happened to close, with confidence 0.8, and a reset already on record for that same meter, window
+and scheduled moment is never duplicated. If no scheduled reset falls inside the gap, nothing is
+recorded and the status line carries no note; the drop is left to the ordinary free-reset check,
+which still fires when the timestamp held still while usage fell.
+
 ## Export
 
 `headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind

@@ -20,13 +20,13 @@ import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveC
 import { codexResponseShape } from "./adapters/codex.js";
 import { antigravityResponseShape } from "./adapters/antigravity.js";
 import { pollAccounts } from "./collector.js";
-import { IDLE_WINDOW_REASON } from "./engine/observation.js";
+import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
-import { canRouteWithLeases, paceDecision, reserveFor, reserveNote, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
@@ -41,7 +41,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type PaceState, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { isLocalAccount, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -52,82 +52,6 @@ function since(value: string | undefined): string {
   return new Date(Date.now() - Number(match[1]) * multiplier).toISOString();
 }
 
-function formatReset(value: string | null | undefined): string {
-  if (!value) return "?";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "?";
-  const now = new Date();
-  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
-  return date.toDateString() === now.toDateString() ? time : `${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)} ${time}`;
-}
-
-function label(observation: Observation): string {
-  const minutes = observation.window?.minutes;
-  if (minutes === 300) return "5h";
-  if (minutes === 10_080) return "wk";
-  if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
-  if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
-  return minutes ? `${minutes}m` : "-";
-}
-
-function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
-
-/** A whole-percent rate reads cleanly at a glance ("22%/h"); rounding a rate
- * under 1%/h the same way collapses it to a bare "0%/h" and reads as no
- * activity at all, so those get one decimal instead ("0.1%/h"). Exactly
- * zero still prints as a plain "0%/h" -- there's no precision to preserve. */
-function formatRatePercent(value: number): string {
-  const text = value !== 0 && Math.abs(value) < 1 ? value.toFixed(1) : String(Math.round(value));
-  return `${text}%/h`;
-}
-
-/** The short pace segment appended to a window's status line once its burn
- * rate is known: the live burn alongside the sustainable pace that would
- * exactly spend the remaining allowance by reset, so a glance says whether
- * the current rate is faster or slower than that line. Omitted entirely
- * (not "burn 0%/h") when burn itself is null -- fewer than two fresh
- * samples in the lookback, nothing to report yet. */
-function paceSegment(observation: Observation): string {
-  const burn = observation.burn_percent_per_hour;
-  if (burn === null || burn === undefined) return "";
-  const sustainable = observation.sustainable_percent_per_hour;
-  const sustainableText = sustainable === null || sustainable === undefined ? "?" : formatRatePercent(sustainable);
-  return ` burn ${formatRatePercent(burn)}, ok ${sustainableText}`;
-}
-
-function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string, reservePercent = 0): string {
-  if (observation.window?.kind === "count" && observation.quantity?.unit === "credits") {
-    const available = observation.quantity.remaining ?? 0;
-    const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
-    const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)})` : "";
-    return `credits ${available} available${expiry}`;
-  }
-  const evidence = `${resetSeen ? ` reset seen ${formatReset(resetSeen)}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed)}` : ""}`;
-  if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
-  if (!observation.quantity || state === "UNKNOWN") return `${label(observation)} UNKNOWN (${observation.reason ?? reason})${evidence}`;
-  const seconds = resetsIn(observation.resets_at).resets_in_seconds;
-  const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
-  // A vendor-reported idle window that looks like a manufactured placeholder
-  // (see engine/observation.ts's normalizeObservations) is still shown as a
-  // real number -- the owner's decision is to annotate doubt, not hide the
-  // vendor's own reading behind UNKNOWN.
-  const doubt = observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON ? " (idle, unverified)" : "";
-  // The protected reserve (policy.toml [reserve]) follows the numbers so a
-  // reader can see why a healthy-looking percentage still produced a NO from
-  // gate/fill/route/can. It never changes the pace state beside it.
-  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)} ↻${formatReset(observation.resets_at)}${countdown} ${state}${doubt}${evidence}${paceSegment(observation)}`;
-}
-
-function formatLocal(observation: Observation): string {
-  const state = observation.metadata?.state ?? "DOWN";
-  if (state === "DOWN") {
-    const wake = observation.reason?.match(/(?:^|; )wake: (.+)$/)?.[1];
-    return wake ? `${observation.meter_id}  DOWN (wake: ${wake})` : `${observation.meter_id}  DOWN (${observation.reason ?? "down"})`;
-  }
-  const model = observation.metadata?.model_ids?.[0] ?? "unknown";
-  return `${observation.meter_id}  ${state} model=${model} running=${observation.metadata?.running ?? observation.quantity?.used ?? 0} waiting=${observation.metadata?.waiting ?? 0}`;
-}
-
 /** Only fall back to SQLite when no daemon socket exists. A socket which cannot
  * answer health is an operational problem, not permission to race its writer. */
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
@@ -135,18 +59,6 @@ async function requestDaemon(method: string, params: Record<string, unknown> = {
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
-}
-
-function age(observation: Observation): string {
-  const milliseconds = Math.max(0, Date.now() - new Date(observation.fetched_at).getTime());
-  return milliseconds < 60_000 ? "<1m" : `${Math.floor(milliseconds / 60_000)}m`;
-}
-
-function windowOrder(observation: Observation): number {
-  const minutes = observation.window?.minutes;
-  if (minutes === 300) return 0;
-  if (minutes === 10_080) return 1;
-  return 2;
 }
 
 export interface ThresholdWindow {
@@ -167,22 +79,9 @@ export function thresholdReport(observations: Observation[], threshold: number):
   });
 }
 
-export function formatMeters(observations: Observation[], policy: Awaited<ReturnType<typeof readPolicy>>, resetSeen = new Map<string, string>(), leases = new Map<string, Lease[]>(), freeResetUsed = new Map<string, string>()): string[] {
-  const meters = new Map<string, Observation[]>();
-  for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
-  return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
-    const ordered = [...windows].sort((a, b) => windowOrder(a) - windowOrder(b) || (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER));
-    if (ordered.length === 1 && ordered[0].window?.kind === "state") return formatLocal(ordered[0]);
-    const enforced = ordered.filter((item) => item.freshness !== "not_enforced");
-    const freshness = !enforced.length ? "not enforced" : enforced.some((item) => item.freshness === "fresh") ? "fresh" : enforced.some((item) => item.freshness === "failed") ? "failed" : "stale";
-    const active = leases.get(meter) ?? [];
-    const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
-    return `${meter}  ${ordered.map((item) => {
-      const decision = paceDecision(item, policy);
-      return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id));
-    }).join(" | ")}  (${freshness} ${age(ordered[0])})${leaseLabel}`;
-  });
-}
+// The status rendering itself lives in status-view.ts; re-exported here so
+// every existing caller of `formatMeters` keeps its import path.
+export { formatMeters };
 
 async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
@@ -765,9 +664,13 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
   return 0;
 }
 
+/** Usage for the default command, shared by `--help` and the argument check. */
+export const STATUS_HELP = "Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models] [--human|--plain|--agent] [--verbose] [--color|--no-color]";
+
 export async function observe(argv: string[]): Promise<number> {
-  const allowed = new Set(["--json", "--threshold", "--principal", "--refresh", "--ttl", "--models"]);
-  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error("Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models]"); if (argv[index] !== "--json" && argv[index] !== "--refresh" && argv[index] !== "--models") index += 1; }
+  const valueless = new Set(["--json", "--refresh", "--models", ...STATUS_VIEW_FLAGS]);
+  const allowed = new Set(["--threshold", "--principal", "--ttl", ...valueless]);
+  for (let index = 0; index < argv.length; index += 1) { if (!allowed.has(argv[index])) throw new Error(STATUS_HELP); if (!valueless.has(argv[index])) index += 1; }
   const thresholdIndex = argv.indexOf("--threshold");
   const threshold = thresholdIndex >= 0 ? Number(argv[thresholdIndex + 1]) : undefined;
   if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 100)) throw new Error("--threshold must be 0 through 100");
@@ -825,13 +728,19 @@ export async function observe(argv: string[]): Promise<number> {
     const freeResetEvents = unwrapRpc(await requestDaemon("free_reset_used", { windows })) as Record<string, string>;
     freeResetUsed = new Map(Object.entries(freeResetEvents));
   }
-  if (direct) directReadNotice();
+  const view = { ...statusViewOptions(argv, process.stdout.isTTY === true, process.env, process.stdout.columns), direct };
+  // The grouped view's own footer already says where the numbers came from, so
+  // the stderr notice would only repeat it on the one form that carries both.
+  if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
   if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
-    for (const line of formatMeters(observations, policy, resetSeen, leaseMap, freeResetUsed)) console.log(line);
+    // accounts.toml names each principal's vendor; a missing or unreadable
+    // registry only costs the header its vendor word, never the reading.
+    const vendors = new Map((await readAccounts().catch(() => [])).map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
+    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.
@@ -1153,7 +1062,7 @@ export async function keychain(argv: string[]): Promise<number> {
 
 /** One line per top-level command for `headroom --help` / `headroom help`. */
 export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
-  ["status", "Print one line per meter (the default; also takes --json, --principal, --threshold, --refresh, --models)"],
+  ["status", "Print the current meters (the default; grouped for a terminal, one dense line per meter in a pipe)"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
   ["history <meter>", "List stored observations for one meter"],
@@ -1191,6 +1100,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
 
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
 export const COMMAND_HELP: Readonly<Record<string, string>> = {
+  status: STATUS_HELP,
   can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
   history: "Usage: headroom history <meter> [--since 24h]",

@@ -137,6 +137,128 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("records a reset_seen at the scheduled reset time, not the observation time, for a drop across a gap of failed readings whose scheduled reset fell inside the gap (issue #10)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-gap-reset-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const fable = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      const failed = (fetched_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: null, freshness: "failed", reason: "no credentials", fetched_at,
+      });
+      // Last fresh reading before the outage: 99% used, weekly reset due
+      // 14:16 the same day -- the same moment already recorded on the
+      // account row (claude-main:all), per the issue.
+      store.insert(fable(99, "2026-09-02T08:00:00Z", "2026-09-02T14:16:00Z"));
+      store.insert(failed("2026-09-02T20:00:00Z"));
+      store.insert(failed("2026-09-03T10:00:00Z"));
+      // First fresh reading after the day of failures: 40% used, the weekly
+      // window rolled forward to next week.
+      store.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-09T14:16:00Z"));
+      const events = store.events("2026-09-02T00:00:00Z").filter((event) => event.meter_id === "claude-main:fable");
+      const resetEvents = events.filter((event) => event.kind === "reset_seen");
+      expect(resetEvents).toHaveLength(1);
+      expect(resetEvents[0]).toMatchObject({ created_at: "2026-09-02T14:16:00.000Z", confidence: 0.8, origin: "inferred" });
+      // Not also filed as a free reset, and not stamped at the 23:45
+      // observation that merely happened to close the gap.
+      expect(events.filter((event) => event.kind === "free_reset_used")).toHaveLength(0);
+      expect(resetEvents.some((event) => event.created_at === "2026-09-03T23:45:00Z")).toBe(false);
+    } finally { store.close(); }
+  });
+
+  it("does not add a second reset_seen for a scheduled reset that already has one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-gap-reset-dedupe-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      type RawDb = { prepare(sql: string): { run(...params: unknown[]): unknown } };
+      const raw = (store as unknown as { db: RawDb }).db;
+      const fable = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      const failed = (fetched_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: null, freshness: "failed", reason: "no credentials", fetched_at,
+      });
+      const baseline = store.insert(fable(99, "2026-09-02T08:00:00Z", "2026-09-02T14:16:00Z"));
+      // A reset_seen for this exact meter, window and scheduled moment
+      // already exists (planted directly, modeling one filed by an earlier
+      // run or a different code path) before the gap closes.
+      raw.prepare(`INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run("reset_seen:planted", "reset_seen", "inferred", 0.8, JSON.stringify([baseline.id]), "2026-09-02T14:16:00.000Z", null, "claude-main:fable", "claude-main", null);
+      store.insert(failed("2026-09-02T20:00:00Z"));
+      store.insert(failed("2026-09-03T10:00:00Z"));
+      store.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-09T14:16:00Z"));
+      const resetEvents = store.events("2026-09-02T00:00:00Z").filter((event) => event.meter_id === "claude-main:fable" && event.kind === "reset_seen");
+      expect(resetEvents).toEqual([expect.objectContaining({ id: "reset_seen:planted" })]);
+    } finally { store.close(); }
+  });
+
+  it("records nothing for a drop across a gap of failed readings whose scheduled reset does not fall inside the gap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-gap-no-reset-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const fable = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      const failed = (fetched_at: string) => observation({
+        principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: null, freshness: "failed", reason: "no credentials", fetched_at,
+      });
+      // A resets_at already at (not after) the baseline's own fetch time is
+      // already stale -- it cannot be "inside" a gap that starts later --
+      // and it never moves, so this is a vendor correction, not a reset.
+      store.insert(fable(99, "2026-09-02T08:00:00Z", "2026-09-02T08:00:00Z"));
+      store.insert(failed("2026-09-02T20:00:00Z"));
+      store.insert(failed("2026-09-03T10:00:00Z"));
+      store.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-02T08:00:00Z"));
+      const events = store.events("2026-09-02T00:00:00Z").filter((event) => event.meter_id === "claude-main:fable");
+      expect(events.filter((event) => event.kind === "reset_seen" || event.kind === "free_reset_used")).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("shows the reset note on the status line only when the gap's scheduled reset fell inside it", async () => {
+    const fable = (used: number, fetched_at: string, resets_at: string) => observation({
+      principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+    });
+    const failed = (fetched_at: string) => observation({
+      principal_id: "claude-main", meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      quantity: null, freshness: "failed", reason: "no credentials", fetched_at,
+    });
+
+    const withRoot = await mkdtemp(join(tmpdir(), "headroom-store-gap-status-with-")); temporary.push(withRoot);
+    const withStore = await HeadroomStore.open(join(withRoot, ".headroom"));
+    try {
+      withStore.insert(fable(99, "2026-09-02T08:00:00Z", "2026-09-02T14:16:00Z"));
+      withStore.insert(failed("2026-09-02T20:00:00Z"));
+      withStore.insert(failed("2026-09-03T10:00:00Z"));
+      withStore.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-09T14:16:00Z"));
+      const latest = withStore.latestPerWindow("claude-main:fable");
+      const seen = withStore.resetSeenFor(latest, new Date("2026-09-04T00:00:00Z"));
+      const line = formatMeters(latest, defaultPolicy, seen)[0];
+      expect(line).toContain("reset seen");
+    } finally { withStore.close(); }
+
+    const withoutRoot = await mkdtemp(join(tmpdir(), "headroom-store-gap-status-without-")); temporary.push(withoutRoot);
+    const withoutStore = await HeadroomStore.open(join(withoutRoot, ".headroom"));
+    try {
+      withoutStore.insert(fable(99, "2026-09-02T08:00:00Z", "2026-09-02T08:00:00Z"));
+      withoutStore.insert(failed("2026-09-02T20:00:00Z"));
+      withoutStore.insert(failed("2026-09-03T10:00:00Z"));
+      withoutStore.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-02T08:00:00Z"));
+      const latest = withoutStore.latestPerWindow("claude-main:fable");
+      const seen = withoutStore.resetSeenFor(latest, new Date("2026-09-04T00:00:00Z"));
+      const line = formatMeters(latest, defaultPolicy, seen)[0];
+      expect(line).not.toContain("reset seen");
+    } finally { withoutStore.close(); }
+  });
+
   it("classifies an advanced reset timestamp as reset_seen and an unchanged one before schedule as free_reset_used", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-classify-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));

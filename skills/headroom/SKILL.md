@@ -75,7 +75,8 @@ into a real reading instead of dispatching blind.
 
 ## Commands
 
-- `headroom` : one line per meter with pace state and freshness.
+- `headroom` : the current meters with pace state and freshness, grouped by principal for a person at a terminal and one dense line per meter in a pipe.
+- Agents read `headroom --json` or `headroom --agent`, never the human view: `--json` is the contract, `--agent` is the dense one-line-per-meter fallback for a plain shell call, and the grouped `--human` view exists for people.
 - `headroom can <action-class> [--allow-unknown] [--expect <percent>] [--lease]` : go / no-go for an action class.
 - `headroom --threshold 90` : exit 2 if any fresh window is at or above 90%.
 - `headroom events --since 24h` : resets seen, free resets granted or used, source failures.
