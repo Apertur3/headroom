@@ -246,3 +246,41 @@ describe("store.learnedCostForMeter", () => {
     } finally { store.close(); }
   });
 });
+
+describe("store.lastKnownFor", () => {
+  it("returns the newest fresh reading of the same meter and window, with its age", async () => {
+    const store = await open();
+    try {
+      store.insert(rolling(41, "2026-09-03T00:05:00Z", "2026-09-03T05:00:00Z"));
+      // The failed reading itself must never be picked up as its own last
+      // known: only the fresh row above should ever come back here.
+      const failed = store.insert({ ...rolling(0, "2026-09-03T01:10:00Z", "2026-09-03T05:00:00Z"), quantity: null, freshness: "failed", reason: "Keychain grant lapsed; run: headroom keychain grant --principal claude-main" });
+      const now = new Date("2026-09-03T01:10:00Z");
+      const known = store.lastKnownFor([failed], now).get("claude-main:all:300");
+      expect(known).toEqual({ used_percent: 41, resets_at: "2026-09-03T05:00:00Z", observed_at: "2026-09-03T00:05:00Z", age_seconds: 65 * 60 });
+    } finally { store.close(); }
+  });
+
+  it("is absent when nothing fresh exists for that meter and window within 7 days", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      store.insert(rolling(41, new Date(now.getTime() - 8 * 86_400_000).toISOString(), "2026-09-03T05:00:00Z"));
+      const failed = store.insert({ ...rolling(0, now.toISOString(), "2026-09-03T05:00:00Z"), quantity: null, freshness: "failed" });
+      expect(store.lastKnownFor([failed], now).has("claude-main:all:300")).toBe(false);
+      // A meter with no history at all behaves the same way: an empty map,
+      // not a thrown error.
+      expect(store.lastKnownFor([{ meter_id: "no-such-meter:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" } }], now).size).toBe(0);
+    } finally { store.close(); }
+  });
+
+  it("skips local pools and credit counts, which have no used percent to show", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      const localPool: Observation = { principal_id: "gpu-box", meter_id: "gpu-box:capacity", window: { kind: "state", minutes: null, enforcement: "soft" }, quantity: { used: 1, limit: null, remaining: null, unit: "requests" }, resets_at: null, observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture" };
+      const credits: Observation = { principal_id: "codex-main", meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: null, resets_at: null, observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "failed", confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture" };
+      expect(store.lastKnownFor([localPool, credits], now).size).toBe(0);
+    } finally { store.close(); }
+  });
+});
