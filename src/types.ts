@@ -101,6 +101,23 @@ export interface Observation {
   burn_percent_per_hour?: number | null;
   empty_in_seconds?: number | null;
   sustainable_percent_per_hour?: number | null;
+  /** Computed, never persisted: the newest FRESH reading of this exact meter
+   * and window from the last 7 days, attached only when this observation's
+   * own freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
+   * trend for a person or a fail-closed orchestrator to glance at while the
+   * live number is UNKNOWN -- never a decision input: `can`/`gate`/`route`
+   * keep treating UNKNOWN as no capacity regardless of what this carries.
+   * Null when nothing fresh exists in that window, or when this observation
+   * is itself fresh. */
+  last_known?: LastKnownReading | null;
+}
+
+/** See `Observation.last_known`. */
+export interface LastKnownReading {
+  used_percent: number;
+  resets_at: string | null;
+  observed_at: string;
+  age_seconds: number;
 }
 
 export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED" | "UP" | "BUSY" | "DOWN";

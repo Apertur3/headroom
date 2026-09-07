@@ -13,6 +13,7 @@
       "fetched_at": "string",
       "freshness": "string",
       "id": "number",
+      "last_known": "null",
       "meter_id": "string",
       "observed_at": "string",
       "principal_id": "string",

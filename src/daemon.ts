@@ -11,7 +11,7 @@ import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type Policy } from "./policy.js";
 import { withResetsIn } from "./resets.js";
-import { withPaceInfo } from "./pace.js";
+import { withLastKnown, withPaceInfo } from "./pace.js";
 import { fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import type { GateNeed } from "./pacing.js";
 import { deliverNotifications } from "./notify.js";
@@ -416,7 +416,8 @@ export class HeadroomDaemon {
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
-          result = withResetsIn(withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now));
+          const paced = withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now);
+          result = withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now)));
           break;
         }
         case "history": {
