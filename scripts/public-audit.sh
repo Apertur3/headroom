@@ -61,7 +61,7 @@ archives="$(git ls-files -z -- '*.tgz' '*.tar.gz' '*.zip' '*.dmg' '*.pkg' | tr '
 [ -n "$archives" ] && note "archive tracked: $archives"
 
 # 2. commit identities that are not GitHub noreply addresses
-bad_mail=$(git log --format='%ae%n%ce' | sort -u | grep -v -E '@users\.noreply\.github\.com$' || true)
+bad_mail=$(git log --format='%ae%n%ce' | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
 [ -n "$bad_mail" ] && note "personal email in commit metadata: $bad_mail"
 
 # 3. generic PII patterns in tracked files (POSIX ERE only; allowed placeholders filtered out afterwards)
