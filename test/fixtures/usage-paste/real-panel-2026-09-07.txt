@@ -1,0 +1,27 @@
+# Recorded from a real Claude Code /usage panel on 2026-09-07 (limit bars and the
+# usage notes; the cost block above them omitted). No identifiers.
+   Current session
+   ████████████                                       24% used
+   Resets 3am (Europe/Amsterdam)
+
+   Current week (all models)
+   ████████████████▌                                  33% used
+   Resets Sep 13 at 2pm (Europe/Amsterdam)
+   +50% weekly limits promo through Sep 13 · clau.de/cc-50-promo
+
+   Current week (Fable)
+   ████████████████████                               40% used
+   Resets Sep 13 at 2pm (Europe/Amsterdam)
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this machine — does not include other devices or claude.ai
+
+   Last 24h · these are independent characteristics of your usage, not a breakdown
+
+   98% of your usage came from subagent-heavy sessions
+    Each subagent runs its own requests. Be deliberate about spawning them — and consider configuring a cheaper model for simpler subagents.
+
+   87% of your usage was at >150k context
+    Longer sessions are more expensive even when cached. /compact mid-task, /clear when switching to new tasks.
+
+   79% of your usage came from sessions active for 8+ hours

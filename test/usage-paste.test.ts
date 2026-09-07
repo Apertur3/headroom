@@ -299,3 +299,19 @@ describe("quota_usage_paste", () => {
     });
   });
 });
+
+describe("a real /usage panel (recorded 2026-09-07)", () => {
+  it("reads all three windows, the afternoon reset and ignores the promo and usage notes", async () => {
+    const raw = await readFile(new URL("./fixtures/usage-paste/real-panel-2026-09-07.txt", import.meta.url), "utf8");
+    const text = raw.split("\n").filter((line) => !line.startsWith("#")).join("\n");
+    const now = new Date("2026-09-07T21:30:00+02:00");
+    const parsed = parseUsagePanel(text, now);
+    expect(parsed.windows.map((item) => [item.label, item.used_percent])).toEqual([
+      ["Current session", 24], ["Current week (all models)", 33], ["Current week (Fable)", 40],
+    ]);
+    const week = parsed.windows[1];
+    expect(week.resets_at && new Date(week.resets_at).getHours()).toBe(14);
+    expect(parsed.unparsed).toEqual([]);
+  });
+});
+

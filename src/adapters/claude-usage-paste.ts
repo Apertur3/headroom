@@ -104,6 +104,12 @@ function scopeOf(label: string): string | undefined {
   return match ? match[1] : undefined;
 }
 
+/** "at 2pm (Europe/Amsterdam)" → "2pm": the panel writes the clock after "at"
+ * and follows it with the zone in parentheses; neither belongs to the time. */
+function clockText(rest: string): string {
+  return rest.replace(/^\s*(?:at|@)\s+/i, "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+}
+
 function parseClock(text: string): { hours: number; minutes: number } | undefined {
   const withMinutes = /^(\d{1,2}):(\d{2})\s*(am|pm)?$/i.exec(text);
   const hourOnly = /^(\d{1,2})\s*(am|pm)$/i.exec(text);
@@ -164,7 +170,7 @@ export function parseResetAt(text: string, now: Date): string | null {
   const monthIndex = monthName ? MONTHS.indexOf(monthName.slice(0, 3).toLowerCase()) : -1;
   if (monthIndex >= 0) {
     const day = Number(monthFirst ? monthFirst[2] : dayFirst![1]);
-    const clock = parseClock((monthFirst ? monthFirst[3] : dayFirst![3]).trim()) ?? { hours: 0, minutes: 0 };
+    const clock = parseClock(clockText(monthFirst ? monthFirst[3] : dayFirst![3])) ?? { hours: 0, minutes: 0 };
     if (day < 1 || day > 31) return null;
     let candidate = new Date(now.getFullYear(), monthIndex, day, clock.hours, clock.minutes, 0, 0);
     // A panel printed in late December naming a January reset means next
@@ -210,6 +216,9 @@ function resetTextIn(line: string): string | undefined {
  * placed: everything else in a pasted panel (headings, key hints, borders)
  * is decoration and is dropped without a warning. */
 function meaningful(line: string): boolean {
+  // The panel's usage notes ("98% of your usage came from ...") and promo
+  // lines carry percentages that are not meters; they are not worth a warning.
+  if (/% of your usage|\bpromo\b/i.test(line)) return false;
   return percentIn(line) !== undefined || /resets?\b/i.test(line);
 }
 
@@ -219,6 +228,10 @@ function meaningful(line: string): boolean {
  * may sit on the label's own line or on any line beneath it.
  */
 export function parseUsagePanel(text: string, now = new Date()): ParsedUsagePanel {
+  // Everything below the "What's contributing" heading describes sessions,
+  // not limits; it is left unread.
+  const cutoff = /what['\u2019]s contributing/i.exec(text);
+  if (cutoff) text = text.slice(0, cutoff.index);
   const windows: ParsedUsageWindow[] = [];
   const unparsed: string[] = [];
   const seen = new Set<string>();
