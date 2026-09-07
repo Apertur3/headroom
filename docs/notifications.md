@@ -44,7 +44,7 @@ url = "https://example.com/hook"  # POST JSON
 Every stored event kind can be listed: `reset_seen`, `free_reset_granted`,
 `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`,
 `source_recovered`, `lease_started`, `lease_ended`,
-`pace_projection_conserve`, `model_new`.
+`pace_projection_conserve`, `model_new`, `grant_lapsed`.
 
 `model_new` fires when a vendor reports a bucket name Headroom has never seen
 for that principal, which is how a new model release shows up: Claude's
@@ -52,6 +52,19 @@ for that principal, which is how a new model release shows up: Claude's
 on an account Headroom has been reading is a new named allowance. The first
 poll of a brand new account reports every meter as a normal reading instead,
 so adding an account does not produce a burst.
+
+`grant_lapsed` fires when Headroom detects that a Claude principal's Keychain
+grant has lapsed rather than never having been logged in: macOS resets a
+Keychain item's access control list every time Claude Code rewrites it (on
+token refresh), which silently revokes the grant `headroom keychain grant`
+gave the probe. The message names the config directory, when Claude Code
+rewrote the item, and the exact command to run. It is not in the default
+`events` list, since the same observation already trips `source_failed`
+(which is default) -- add it explicitly if you want the lapse called out on
+its own rather than folded into a generic source failure. Like every other
+event, it fires once per lapse: the collector stops probing that principal
+the moment it is detected, so there is nothing left to repeat on later polls
+until the operator re-grants and a fresh lapse can occur.
 
 ## Credentials
 

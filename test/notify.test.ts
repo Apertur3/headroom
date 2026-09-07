@@ -45,6 +45,14 @@ describe("notify config", () => {
   it("is absent when policy.toml has no notify section, and defaults its event list", () => {
     expect(parseNotifyConfig("freeze_reserve_pct = 10\n[principal.claude-main]\ninterval_minutes = 5\n")).toBeUndefined();
     expect(config('[notify]\nchannels = ["ntfy"]\n[notify.ntfy]\ntopic = "t"\n').events).toEqual([...DEFAULT_NOTIFY_EVENTS]);
+    // grant_lapsed is a recognized event, but opted into explicitly -- it is
+    // not in the default list (the same observation already trips
+    // source_failed, which is default).
+    expect(DEFAULT_NOTIFY_EVENTS).not.toContain("grant_lapsed");
+  });
+
+  it("accepts grant_lapsed as a configured event", () => {
+    expect(config('[notify]\nevents = ["grant_lapsed"]\n[notify.ntfy]\ntopic = "t"\n').events).toEqual(["grant_lapsed"]);
   });
 
   it("refuses an unknown channel, an unknown event, an unknown key and an out-of-range threshold", () => {

@@ -142,6 +142,11 @@ this from "no login" and says so plainly:
 claude-main: the Keychain dialog cannot be shown from this shell; run this command in your own Terminal
 ```
 
+A grant that worked yesterday can also lapse on its own -- macOS resets an item's access control
+list every time Claude Code rewrites it on token refresh -- in which case the daemon reports
+`Keychain grant lapsed; ...` instead of "no credentials" and the fix is the same: run
+`headroom keychain grant --principal <name>` again.
+
 On Linux and Windows there's no Keychain step: Headroom reads the token straight from
 `<config-dir>/.credentials.json`.
 

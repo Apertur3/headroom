@@ -190,6 +190,44 @@ describe("doctor home directory and keychain grant checks", () => {
     });
   });
 
+  it("prints the full lapse reason -- rewrite time and one-line fix -- for a gated principal marked by a detected Keychain ACL lapse, distinct from the generic denial wording above", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-gated-lapse-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await withHeadroomHome(home, async () => {
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "accounts.toml"), [
+        "[[accounts]]",
+        'name = "claude-main"',
+        'vendor = "claude"',
+        'location = "/nonexistent/.claude"',
+        'adapter = "native-ts"',
+        "",
+      ].join("\n"), { mode: 0o600 });
+      const lapseReason = "Keychain grant lapsed; Claude Code rewrote its credentials at 2026-09-07 05:24:43; run: headroom keychain grant --principal claude-main";
+      // doctorChecks() runs syncClaudeGrantState() on every call, which marks
+      // every Claude principal on the very first run against a given probe
+      // binary hash (no prior probeBinaryHash recorded yet) -- clobbering
+      // whatever reason was seeded below with its own generic wording. A
+      // throwaway first call lets that hash settle (syncClaudeGrantState only
+      // re-marks on a hash change, never on an unchanged repeat), so the
+      // lapse reason seeded after it survives into the real check below.
+      await doctorChecks();
+      const seed = await HeadroomStore.open(home);
+      seed.setKeychainGrantNeeded("claude-main", lapseReason);
+      seed.close();
+      const checks = await doctorChecks();
+      const credential = checks.find((item) => item.check === "principal claude-main credential");
+      if (process.platform === "darwin") {
+        expect(credential).toMatchObject({ level: "FAIL", detail: lapseReason, fix: "headroom keychain grant --principal claude-main" });
+      } else {
+        // Same non-darwin fallback as the plain-denial case above: the
+        // gate (and this stored reason) is never consulted off macOS.
+        const path = credentialPath("claude", "/nonexistent/.claude");
+        expect(credential).toMatchObject({ level: "FAIL", detail: `missing or unsafe credential file (${path})` });
+      }
+    });
+  });
+
   it("reports the engine upstream hash as INFO (not WARN) on a fresh install, with the optional wording", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-doctor-engine-")); temporary.push(root);
     await withHeadroomHome(join(root, ".headroom"), async () => {

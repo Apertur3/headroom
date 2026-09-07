@@ -1,8 +1,8 @@
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeProbeError, grantClaudeKeychainAccess, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
+import { ClaudeProbeError, claudeKeychainMetadata, grantClaudeKeychainAccess, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 
 const temporary: string[] = [];
@@ -92,5 +92,85 @@ describe.skipIf(process.platform === "win32")("headroom keychain grant: prints t
     const text = [...logs, ...errors].join("\n");
     expect(text).toContain(KEYCHAIN_INTERACTION_BLOCKED_MESSAGE);
     expect(text).not.toContain("no Claude login for");
+  });
+});
+
+async function fakeSecurity(root: string, script: string): Promise<void> {
+  const path = join(root, "security");
+  await writeFile(path, script, { mode: 0o755 });
+  await chmod(path, 0o755);
+}
+
+async function withFakeSecurityOnPath<T>(dir: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.PATH;
+  // Prepended, not replaced: execFile resolves the bare command "security"
+  // through PATH, so this fake must be found before the real /usr/bin/security.
+  process.env.PATH = `${dir}${delimiter}${previous ?? ""}`;
+  try { return await run(); }
+  finally { if (previous === undefined) delete process.env.PATH; else process.env.PATH = previous; }
+}
+
+// claudeKeychainMetadata() itself is platform-agnostic (the darwin gate lives
+// in observeClaude's caller), but a real `security` binary only exists on
+// macOS, and a shell-script fake is not meaningfully executable through
+// execFile on Windows either -- exercised on POSIX runners only, like every
+// other fake-executable test in this file.
+describe.skipIf(process.platform === "win32")("claudeKeychainMetadata: fake `security` command substituted via PATH, never the real login Keychain", () => {
+  it("found=true with a parsed mdat, from a fake item that exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-fake-security-found-")); temporary.push(root);
+    await fakeSecurity(root, [
+      "#!/bin/sh",
+      "cat <<'HRM_EOF'",
+      'keychain: "/x/login.keychain-db"',
+      "version: 512",
+      'class: "genp"',
+      "attributes:",
+      '    "mdat"<timedate>=0x32303236303930373035323434335A00  "20260907052443Z\\000"',
+      "HRM_EOF",
+      "",
+    ].join("\n"));
+    await withFakeSecurityOnPath(root, async () => {
+      const metadata = await claudeKeychainMetadata("Claude Code-credentials-test");
+      expect(metadata.found).toBe(true);
+      expect(metadata.modifiedAt?.toISOString()).toBe("2026-09-07T05:24:43.000Z");
+    });
+  });
+
+  it("found=false on the real `security` tool's own 'could not be found' exit (44), the genuinely-absent-login case", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-fake-security-missing-")); temporary.push(root);
+    await fakeSecurity(root, [
+      "#!/bin/sh",
+      'echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." 1>&2',
+      "exit 44",
+      "",
+    ].join("\n"));
+    await withFakeSecurityOnPath(root, async () => {
+      await expect(claudeKeychainMetadata("nonexistent")).resolves.toEqual({ found: false });
+    });
+  });
+
+  it("found=false rather than throwing when the command fails in some other, unexpected way", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-fake-security-error-")); temporary.push(root);
+    await fakeSecurity(root, ["#!/bin/sh", "exit 1", ""].join("\n"));
+    await withFakeSecurityOnPath(root, async () => {
+      await expect(claudeKeychainMetadata("whatever")).resolves.toEqual({ found: false });
+    });
+  });
+
+  it("never passes -w: the argument vector never asks for the secret itself", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-fake-security-argv-")); temporary.push(root);
+    const capture = join(root, "argv.txt");
+    await fakeSecurity(root, [
+      "#!/bin/sh",
+      `printf '%s\\n' "$@" > ${capture}`,
+      "exit 44",
+      "",
+    ].join("\n"));
+    await withFakeSecurityOnPath(root, async () => {
+      await claudeKeychainMetadata("Claude Code-credentials");
+      const { readFile } = await import("node:fs/promises");
+      const argv = (await readFile(capture, "utf8")).trim().split("\n");
+      expect(argv).toEqual(["find-generic-password", "-s", "Claude Code-credentials"]);
+    });
   });
 });
