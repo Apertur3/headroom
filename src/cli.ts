@@ -27,7 +27,7 @@ import { notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withPaceInfo } from "./pace.js";
+import { withLastKnown, withPaceInfo } from "./pace.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
@@ -714,7 +714,8 @@ export async function observe(argv: string[]): Promise<number> {
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
-      observations = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
+      const paced = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
+      observations = withLastKnown(paced, store.lastKnownFor(rawObservations, now));
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);

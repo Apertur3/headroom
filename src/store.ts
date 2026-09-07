@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
-import type { EventKind, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -1168,6 +1168,22 @@ export class HeadroomStore {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
 
+  /** The probe's designated requirement at the last sync, which is what
+   * macOS keys the Keychain ACL on -- see claude.ts's probeSigningIdentity
+   * and syncClaudeGrantState. Empty (stored as "") means the probe was
+   * ad-hoc signed and has no stable identity to compare against, which is
+   * deliberately distinct from "never recorded". */
+  probeSigningIdentity(): string | undefined {
+    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_signing_identity'").get();
+    if (!row) return undefined;
+    const value = String(row.value);
+    return value ? value : undefined;
+  }
+
+  setProbeSigningIdentity(identity: string): void {
+    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_signing_identity', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(identity);
+  }
+
   /** The exact probe binary path this Headroom home has ever been granted
    * under, set once by the first successful `headroom keychain grant` (or the
    * first poll that got a real vendor response) and never changed after
@@ -1233,5 +1249,46 @@ export class HeadroomStore {
         from_at: String(row.from_at), to_at: String(row.to_at), delta_percent: Number(row.delta_percent),
         owner: String(row.owner), share_percent: Number(row.share_percent), confidence: Number(row.confidence),
       }));
+  }
+
+  /**
+   * The newest FRESH reading of each given meter and window from the last 7
+   * days, keyed by `${meter_id}:${minutes}` (matching burnRateFor()'s own
+   * key scheme) -- so a caller whose live read of that same window just came
+   * back failed or stale can still show its last real number and how old it
+   * is. `pace.ts`'s withLastKnown() is the pure step that attaches this to
+   * an observation; this method is only the read.
+   *
+   * Local pools (window kind `state`) and credit counts (kind `count`) are
+   * skipped: neither carries a used percent, so there is nothing here for
+   * either to show. A meter and window with nothing fresh in range is simply
+   * absent from the returned map -- the caller's null.
+   */
+  lastKnownFor(observations: Array<Pick<Observation, "meter_id" | "window">>, now = new Date()): Map<string, LastKnownReading> {
+    const output = new Map<string, LastKnownReading>();
+    const seen = new Set<string>();
+    const since = new Date(now.getTime() - 7 * 86_400_000).toISOString();
+    for (const observation of observations) {
+      const minutes = observation.window?.minutes;
+      const kind = observation.window?.kind;
+      if (!minutes || kind === "state" || kind === "count") continue;
+      const key = `${observation.meter_id}:${minutes}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const windowJson = JSON.stringify(observation.window);
+      const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND window_json = ?
+        AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
+        .get(observation.meter_id, windowJson, since);
+      if (!row) continue;
+      const stored = observationFromRow(row);
+      if (stored.quantity?.unit !== "percent") continue;
+      const observedMs = Date.parse(stored.observed_at);
+      if (!Number.isFinite(observedMs)) continue;
+      output.set(key, {
+        used_percent: stored.quantity.used, resets_at: stored.resets_at, observed_at: stored.observed_at,
+        age_seconds: Math.max(0, Math.round((now.getTime() - observedMs) / 1000)),
+      });
+    }
+    return output;
   }
 }

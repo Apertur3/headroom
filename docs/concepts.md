@@ -66,6 +66,15 @@ that might no longer be true.
 Example: a Codex account with no 5-hour window in the vendor's response and no recent session log
 shows `5h n/a`, not `5h 0%`.
 
+A window that is `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
+exact meter and window from the last 7 days, with the age of that reading, so a person or a
+fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the word itself --
+`headroom` prints it as `UNKNOWN (reason; last 41% at 00:05, 65m ago)`, and it rides along on
+`--json` and MCP's `quota_status` as `last_known: { used_percent, resets_at, observed_at,
+age_seconds }` (`null` when nothing fresh exists in that window within 7 days). It is informational
+only: `can`, `gate`, and `route` keep treating UNKNOWN as no capacity no matter what `last_known`
+says.
+
 ## Pace states
 
 Each enforced window gets a pace state from a straight-line burn against the time since its last

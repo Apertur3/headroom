@@ -953,6 +953,21 @@ describe("Keychain grant marker lifecycle", () => {
       expect(store.probeGrantedHash()).toBe("hash-b");
     } finally { store.close(); }
   });
+
+  it("tracks the probe's signing identity, with an ad-hoc probe stored as no identity at all", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-identity-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      expect(store.probeSigningIdentity()).toBeUndefined();
+      const requirement = 'designated => identifier "headroom-claude-probe" and certificate leaf = H"23427a14d979b8bf9d14091294da2529becd13e6"';
+      store.setProbeSigningIdentity(requirement);
+      expect(store.probeSigningIdentity()).toBe(requirement);
+      // An ad-hoc build records the absence, so a later sync cannot mistake
+      // "went ad-hoc and came back" for one unbroken run under one identity.
+      store.setProbeSigningIdentity("");
+      expect(store.probeSigningIdentity()).toBeUndefined();
+    } finally { store.close(); }
+  });
 });
 
 describe("pasted readings and failed polls", () => {

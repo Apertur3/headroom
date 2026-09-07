@@ -329,6 +329,39 @@ export async function probeBinaryHash(pinnedPath?: string): Promise<string | und
   return createHash("sha256").update(await readFile(helper)).digest("hex");
 }
 
+/**
+ * The resolved probe's designated requirement, which is the thing macOS
+ * actually keys a Keychain item's ACL on -- not the binary's contents. A
+ * probe signed by the stable local identity scripts/build-probe.sh creates
+ * reads `identifier "headroom-claude-probe" and certificate leaf = H"..."`,
+ * which is identical across every rebuild under that identity, so a grant
+ * the operator already gave keeps working after `npm run engine:build`.
+ *
+ * Returns undefined when the signature is ad-hoc: an ad-hoc requirement is
+ * a bare `cdhash H"..."`, a different value for every build, and a Keychain
+ * grant given to one ad-hoc binary genuinely does not carry over to the
+ * next. Also undefined off darwin, when no probe resolves, or when codesign
+ * cannot read it -- callers then fall back to comparing binary hashes,
+ * which is the conservative answer (ask for a fresh grant).
+ */
+export async function probeSigningIdentity(pinnedPath?: string): Promise<string | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  let helper: string | undefined;
+  try { helper = await keychainHelper(pinnedPath); } catch { return undefined; }
+  if (!helper) return undefined;
+  let requirement: string;
+  try {
+    // `-r-` writes the requirement to stdout; the Executable= banner and any
+    // diagnostics go to stderr.
+    const { stdout } = await execFileAsync("/usr/bin/codesign", ["-d", "-r-", helper], { timeout: TIMEOUT_MS });
+    requirement = stdout;
+  } catch { return undefined; }
+  const designated = requirement.split("\n").map((line) => line.trim()).find((line) => line.startsWith("designated =>"));
+  if (!designated) return undefined;
+  if (/\bcdhash\b/.test(designated)) return undefined; // ad-hoc: a per-build requirement, not an identity
+  return designated;
+}
+
 export interface ClaudeGrantStore {
   keychainGrantNeeded(principalId: string): boolean;
   setKeychainGrantNeeded(principalId: string, reason: string): void;
@@ -347,6 +380,12 @@ export interface ClaudeGrantStore {
    * first successful `headroom keychain grant`. */
   probePath(): string | undefined;
   setProbePath(path: string): void;
+  /** The designated requirement the probe carried at the last sync (see
+   * probeSigningIdentity above), or undefined for an ad-hoc probe. Optional
+   * so a store that predates it, or a test double, keeps the plain
+   * hash-comparison behavior. */
+  probeSigningIdentity?(): string | undefined;
+  setProbeSigningIdentity?(identity: string): void;
 }
 
 /** Gate consulted by the collector before every Claude probe attempt. */
@@ -373,23 +412,42 @@ export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
 }
 
 /**
- * Compares the probe binary's current hash against the one last recorded in
- * the store. Every given Claude principal is marked as needing a fresh grant
- * whenever the current hash has not already proven itself (store.probeGrantedHash()):
- * a rebuild (a hash change, e.g. after `npm run engine:build`) marks them, and
- * so does a genuinely first-ever run (no probeBinaryHash recorded yet) with no
- * prior successful grant or probe under this exact binary -- a fresh install
- * or a freshly rebuilt probe must only ever pop its first Keychain dialog
- * through `headroom keychain grant`, never from a background daemon poll.
- * Once this exact hash has succeeded once (grantClaudeKeychainAccess or a
- * successful poll both call ClaudeGrantGate.markProbeSucceeded), further syncs
- * under the same hash -- including a store that lost its probeBinaryHash but
- * kept probeGrantedHash, e.g. a restore -- are not marked again.
+ * Decides whether a Claude principal has to be sent back through `headroom
+ * keychain grant`, by asking the same question macOS's Keychain asks: is
+ * this the code the ACL was granted to?
+ *
+ * macOS keys a Keychain item's ACL on the trusted application's DESIGNATED
+ * REQUIREMENT, not on the binary's contents. A probe signed by the stable
+ * local identity scripts/build-probe.sh maintains has the same requirement
+ * after every rebuild, so an existing grant still covers it and demanding a
+ * new one would be a dialog the operator never needed to see. That is why
+ * the signing identity, not the binary hash, decides here whenever one is
+ * available: a hash change under an unchanged identity is not a grant
+ * problem.
+ *
+ * A fresh grant is demanded when the signing identity changed, when the
+ * probe is ad-hoc signed (no stable identity to compare -- every ad-hoc
+ * build really is new code to Keychain), or on a genuinely first-ever run
+ * with no prior successful grant or probe recorded: a fresh install must
+ * only ever pop its first Keychain dialog through `headroom keychain
+ * grant`, never from a background daemon poll. An ACL that was reset on the
+ * Keychain side while the identity stayed put is caught where it shows up
+ * -- the probe's own denial, mapped to claudeGrantNeededReason -- not here.
+ *
+ * Once a binary has succeeded once (grantClaudeKeychainAccess or a
+ * successful poll both call ClaudeGrantGate.markProbeSucceeded), further
+ * syncs under the same hash -- including a store that lost its
+ * probeBinaryHash but kept probeGrantedHash, e.g. a restore -- are not
+ * marked again.
  */
 export async function syncClaudeGrantState(
   store: ClaudeGrantStore,
   claudePrincipalIds: string[],
-  dependencies: { platform?: NodeJS.Platform; hash?: () => Promise<string | undefined> } = {},
+  dependencies: {
+    platform?: NodeJS.Platform;
+    hash?: () => Promise<string | undefined>;
+    signingIdentity?: () => Promise<string | undefined>;
+  } = {},
 ): Promise<boolean> {
   const platform = dependencies.platform ?? process.platform;
   if (platform !== "darwin" || !claudePrincipalIds.length) return false;
@@ -400,9 +458,27 @@ export async function syncClaudeGrantState(
   if (!hash) return false;
   const previous = store.probeBinaryHash();
   store.setProbeBinaryHash(hash);
+
+  const identity = await (dependencies.signingIdentity ?? (() => probeSigningIdentity(store.probePath())))();
+  const previousIdentity = store.probeSigningIdentity?.();
+  // Recorded even when it is undefined (an ad-hoc probe), so going ad-hoc
+  // and back cannot look like an unbroken run under one identity.
+  store.setProbeSigningIdentity?.(identity ?? "");
+
   if (previous === hash) return false; // unchanged since the last sync; already resolved either way
   if (store.probeGrantedHash() === hash) return false; // this exact binary already proved itself
-  const reason = previous === undefined ? "no successful probe recorded for this binary" : "probe binary rebuilt";
+  if (identity !== undefined && identity === previousIdentity && store.probeGrantedHash() !== undefined) {
+    // Same signing identity as the binary the operator already granted, so
+    // the Keychain ACL still matches this rebuild. Record the new hash as
+    // proven rather than asking for a grant macOS does not require.
+    store.setProbeGrantedHash(hash);
+    return false;
+  }
+  const reason = previous === undefined
+    ? "no successful probe recorded for this binary"
+    : identity === undefined
+      ? "probe binary rebuilt (ad-hoc signed, so the previous grant does not carry over)"
+      : "probe signing identity changed";
   for (const id of claudePrincipalIds) store.setKeychainGrantNeeded(id, reason);
   return true;
 }

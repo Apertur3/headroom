@@ -32,6 +32,25 @@ Public betas are `0.1.0-beta.N`. N goes up on every published change, however sm
 suffix is dropped for `0.1.0` once a beta has run a week without a blocking bug report.
 Release candidates, if ever needed, use `-rc.N` the same way.
 
+## Signing the Claude probe
+
+`scripts/build-probe.sh` runs from `prepack` and `release:check` and signs `headroom-claude-probe`
+with one stable self-signed identity, "Headroom Local", so a user's macOS Keychain grant survives
+every rebuild (macOS keys the ACL on the signing identity's designated requirement, not on the
+binary's contents). The identity is created once, in its own keychain
+(`~/Library/Keychains/headroom-local-signing.keychain-db`), and reused after that; the private key
+is never left on disk outside that keychain and the PKCS#12 passphrase is random per run. To sign
+with a real Developer ID instead, set `HEADROOM_CODESIGN_IDENTITY` in the environment or run
+`git config headroom.codesign-identity "Developer ID Application: ..."` in the clone, which stays
+untracked and per-machine. Either way, a sign that has not finished within
+`HEADROOM_CODESIGN_TIMEOUT_SECONDS` (default 30) is abandoned and the build falls back to ad-hoc
+with a warning, so an unattended `npm pack` never sits on a Keychain dialog. CI runners always sign
+ad-hoc. To start over on a machine whose keychain is in a bad state, run
+`bash scripts/build-probe.sh --reset-identity`, which deletes the identity, its certificate and its
+keychain; the next build creates one fresh. Check a build with
+`codesign -dvv bin/probe/darwin/headroom-claude-probe`: the release tarball must show
+`Authority=Headroom Local` (or a Developer ID) and no `adhoc` flag.
+
 ## The release itself
 
 1. `CHANGELOG.md` gets a section for the version with the date, grouped as Added, Changed,

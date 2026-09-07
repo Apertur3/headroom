@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { emptyInSeconds, leastSquaresBurnPerHour, sustainablePercentPerHour, withPaceInfo } from "../src/pace.js";
-import type { Observation } from "../src/types.js";
+import { emptyInSeconds, leastSquaresBurnPerHour, sustainablePercentPerHour, withLastKnown, withPaceInfo } from "../src/pace.js";
+import type { LastKnownReading, Observation } from "../src/types.js";
 
 describe("least-squares burn rate", () => {
   it("returns null with fewer than two samples", () => {
@@ -96,5 +96,40 @@ describe("withPaceInfo", () => {
     const original = observation();
     withPaceInfo([original], new Map(), now);
     expect((original as Partial<Observation>).burn_percent_per_hour).toBeUndefined();
+  });
+});
+
+describe("withLastKnown", () => {
+  function observation(overrides: Partial<Observation> = {}): Observation {
+    return {
+      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+      quantity: { used: 40, limit: 100, remaining: 60, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z",
+      observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture", truth: "official", freshness: "fresh",
+      confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture", ...overrides,
+    };
+  }
+
+  const reading: LastKnownReading = { used_percent: 41, resets_at: "2026-09-03T05:00:00Z", observed_at: "2026-09-03T00:05:00Z", age_seconds: 3900 };
+
+  it("attaches last_known only to a failed or stale observation, by meter+window key", () => {
+    const map = new Map([["claude-main:all:300", reading]]);
+    const [failed, stale, fresh] = withLastKnown(
+      [observation({ freshness: "failed", quantity: null }), observation({ freshness: "stale" }), observation()],
+      map,
+    );
+    expect(failed.last_known).toEqual(reading);
+    expect(stale.last_known).toEqual(reading);
+    expect(fresh.last_known).toBeNull();
+  });
+
+  it("is null when the map has nothing for this meter and window", () => {
+    const [item] = withLastKnown([observation({ freshness: "failed", quantity: null })], new Map());
+    expect(item.last_known).toBeNull();
+  });
+
+  it("does not mutate the input observations", () => {
+    const original = observation({ freshness: "failed", quantity: null });
+    withLastKnown([original], new Map([["claude-main:all:300", reading]]));
+    expect((original as Partial<Observation>).last_known).toBeUndefined();
   });
 });

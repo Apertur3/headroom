@@ -5,7 +5,7 @@ import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./co
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withPaceInfo } from "./pace.js";
+import { withLastKnown, withPaceInfo } from "./pace.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
@@ -155,10 +155,13 @@ export function serveMcp(): void {
 
 type DirectResult = Record<string, unknown>;
 
-/** Attaches burn/empty-in/sustainable-pace fields to every observation of a
- * fresh store read, from one shared burn computation. */
+/** Attaches burn/empty-in/sustainable-pace fields, and (for a failed or
+ * stale observation) last_known, to every observation of a fresh store
+ * read -- from one shared burn computation and one shared last-known
+ * lookup. */
 function withPace(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, now: Date): ReturnType<HeadroomStore["latestPerWindow"]> {
-  return withPaceInfo(observations, store.burnRateFor(observations, now), now) as ReturnType<HeadroomStore["latestPerWindow"]>;
+  const paced = withPaceInfo(observations, store.burnRateFor(observations, now), now);
+  return withLastKnown(paced, store.lastKnownFor(observations, now)) as ReturnType<HeadroomStore["latestPerWindow"]>;
 }
 
 /** Exported only for tests: the MCP client that skips the daemon and reads

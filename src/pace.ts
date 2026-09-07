@@ -5,7 +5,7 @@
  * sustainable-pace figure that the CLI, the daemon and the MCP server all
  * attach to the same observation objects the same way.
  */
-import type { Observation } from "./types.js";
+import type { LastKnownReading, Observation } from "./types.js";
 
 export interface BurnInfo {
   /** Least-squares slope of used-percent against time, in percent per hour.
@@ -77,5 +77,23 @@ export function withPaceInfo<T extends Observation>(observations: T[], burn: Map
     const remaining = item.quantity?.unit === "percent" ? item.quantity.remaining ?? (item.quantity.limit !== null ? item.quantity.limit - item.quantity.used : null) : null;
     const sustainable = remaining === null ? null : sustainablePercentPerHour(remaining, item.resets_at, now);
     return { ...item, burn_percent_per_hour: info?.burn_percent_per_hour ?? null, empty_in_seconds: info?.empty_in_seconds ?? null, sustainable_percent_per_hour: sustainable };
+  });
+}
+
+/**
+ * Attaches `last_known` (see types.ts) to every observation whose own
+ * `freshness` is `failed` or `stale` -- the two raw freshness values that
+ * always render as UNKNOWN (see policy.ts's paceDecision) -- from a map
+ * store.ts's lastKnownFor() already collected, keyed the same way as `burn`
+ * above. A fresh observation, or an UNKNOWN one with nothing fresh in the
+ * lookback, gets `last_known: null`: this is purely informational, so it is
+ * always present on the shape rather than sometimes-absent.
+ */
+export function withLastKnown<T extends Observation>(observations: T[], lastKnown: Map<string, LastKnownReading>): Array<T & { last_known: LastKnownReading | null }> {
+  return observations.map((item) => {
+    if (item.freshness !== "failed" && item.freshness !== "stale") return { ...item, last_known: null };
+    const minutes = item.window?.minutes;
+    const known = minutes ? lastKnown.get(`${item.meter_id}:${minutes}`) : undefined;
+    return { ...item, last_known: known ?? null };
   });
 }

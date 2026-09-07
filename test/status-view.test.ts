@@ -202,6 +202,51 @@ describe("status view: UNKNOWN in plain words", () => {
   });
 });
 
+describe("status view: last known beside UNKNOWN", () => {
+  // A separate, deliberately small clock and store: the shared STORE/NOW
+  // above are tuned for the three-forms snapshots, and reusing them here
+  // would make the "65m ago" arithmetic depend on unrelated fixture values.
+  const KNOWN_NOW = new Date("2026-09-08T01:10:00Z");
+  const KNOWN_READ_AT = new Date(KNOWN_NOW.getTime() - 10_000).toISOString();
+  const LAST_KNOWN = { used_percent: 41, resets_at: "2026-09-08T05:00:00Z", observed_at: "2026-09-08T00:05:00Z", age_seconds: 65 * 60 };
+  const REASON = "Keychain grant lapsed; run: headroom keychain grant --principal claude-main";
+
+  function unknownRow(overrides: Partial<Observation> = {}): Observation {
+    return observation({
+      principal_id: "claude-main", meter_id: "claude-main:fable", source: "native:claude",
+      window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      quantity: null, resets_at: null, freshness: "failed", reason: REASON,
+      observed_at: KNOWN_READ_AT, fetched_at: KNOWN_READ_AT,
+      ...overrides,
+    });
+  }
+
+  it("names the newest fresh reading and its age in the dense form", () => {
+    const dense = renderStatus({ observations: [unknownRow({ last_known: LAST_KNOWN })], policy: defaultPolicy, now: KNOWN_NOW }, options({ form: "plain" })).join("\n");
+    expect(dense).toBe(`claude-main:fable  wk UNKNOWN (${REASON}; last 41% at 00:05, 65m ago)  (failed <1m)`);
+  });
+
+  it("puts the same reading, more compactly, in the grouped view's window line", () => {
+    const grouped = renderStatus(
+      { observations: [unknownRow({ last_known: LAST_KNOWN })], policy: defaultPolicy, vendors: new Map([["claude-main", "claude"]]), now: KNOWN_NOW },
+      options(),
+    ).join("\n");
+    expect(grouped).toContain("-  last 41%, 65m ago  UNKNOWN");
+  });
+
+  it("adds nothing to either form when nothing fresh survived the 7-day lookback", () => {
+    const dense = renderStatus({ observations: [unknownRow({ last_known: null })], policy: defaultPolicy, now: KNOWN_NOW }, options({ form: "plain" })).join("\n");
+    expect(dense).toBe(`claude-main:fable  wk UNKNOWN (${REASON})  (failed <1m)`);
+    expect(dense).not.toContain("last ");
+
+    const grouped = renderStatus(
+      { observations: [unknownRow({ last_known: null })], policy: defaultPolicy, vendors: new Map([["claude-main", "claude"]]), now: KNOWN_NOW },
+      options(),
+    ).join("\n");
+    expect(grouped).not.toContain("last ");
+  });
+});
+
 describe("status view: the footer", () => {
   it("counts principals and UNKNOWN windows, names the cause, and dates the daemon reading", () => {
     expect(render().split("\n").at(-1)).toBe("3 principals, 2 UNKNOWN (grant needed), daemon fresh <1m ago");

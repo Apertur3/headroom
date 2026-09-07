@@ -106,17 +106,21 @@ other config directory. Headroom never reads that token itself: it runs a small 
 process, so the token never reaches Node or stdout. That binary is built by
 `scripts/build-probe.sh` (a universal macOS binary, verified against a recorded SHA-256 before
 every use) and, by default, signed under a **stable local identity** named "Headroom Local" that
-`build-probe.sh` creates once in your login keychain and reuses for every later build. This is why
-a rebuild -- a new headroomd version, `npm run engine:build`, `npm pack`, `release:check` -- does
-not ask for the Keychain dialog again: every build after the first is signed under the exact same
-identity, so macOS still recognizes it as the same signer. The tradeoff is one extra one-time
-dialog the first time `build-probe.sh` ever runs on a machine (creating that identity touches the
-login keychain); after that, `headroom keychain grant` triggers one macOS Keychain access dialog
-for the probe itself, and that grant survives every rebuild from then on. Choose Always Allow so
-future polls don't prompt again. Set `HEADROOM_CODESIGN_IDENTITY` to sign with a different identity
-instead (a real Developer ID, once this ships past beta); if creating the local identity fails for
-any reason, `build-probe.sh` falls back to ad-hoc signing with a printed warning, and every rebuild
-after that will ask again, the same as headroomd versions before this one. Headroom also only ever
+`build-probe.sh` creates once, in a keychain of its own
+(`~/Library/Keychains/headroom-local-signing.keychain-db`), and reuses for every later build. This
+is why a rebuild -- a new headroomd version, `npm run engine:build`, `npm pack`, `release:check` --
+does not ask for the Keychain dialog again: every build after the first is signed under the exact
+same identity, and macOS keys the item's access control list on the signer, not on the binary's
+contents. Creating that identity needs no dialog of its own. `headroom keychain grant` triggers one
+macOS Keychain access dialog for the probe itself, and that grant survives every rebuild from then
+on. Choose Always Allow so future polls don't prompt again. To sign with a different identity (a
+real Developer ID, once this ships past beta), set `HEADROOM_CODESIGN_IDENTITY` or run `git config
+headroom.codesign-identity "Developer ID Application: ..."` in the clone. If creating or using the
+identity fails for any reason -- including a sign that has not finished within 30 seconds, which
+means a Keychain dialog with nobody to answer it -- `build-probe.sh` falls back to ad-hoc signing
+with a printed warning, and every rebuild after that will ask again, the same as headroomd versions
+before this one. `bash scripts/build-probe.sh --reset-identity` deletes the local identity and its
+keychain if you ever need to start over. Headroom also only ever
 uses the exact probe binary a grant actually succeeded under (see doctor's "claude probe binary"
 line) -- a second candidate appearing later (a repo checkout built alongside an existing global
 install, say) is reported, never silently substituted. If you run more than one Claude Code

@@ -75,8 +75,22 @@ cookies, which unlock paid subscriptions.
 10. **Keychain ACL identity.** On macOS, `headroom-claude-probe` reads the Keychain item and
     performs the Anthropic request itself. It prints only bounded usage JSON; tokens, refresh
     tokens, and email never cross to Node. Run `headroom keychain grant` once interactively and
-    choose "Always Allow" for this probe. An updated probe binary is a new ACL identity and asks
-    once more. There is no `security` fallback for reading the token itself -- only the probe ever
+    choose "Always Allow" for this probe. A rebuilt probe does *not* ask again: the ACL is keyed on
+    the designated requirement, and `scripts/build-probe.sh` signs every build with one stable
+    self-signed identity ("Headroom Local"), so the requirement is unchanged. A different identity,
+    or a build that fell back to ad-hoc signing, does ask again. That identity lives in its own
+    keychain, `~/Library/Keychains/headroom-local-signing.keychain-db` (mode 0600, empty
+    passphrase, appended to the user's keychain search list), deliberately not the login keychain:
+    a key imported into the login keychain cannot be given a partition list without the login
+    password, so `codesign` would stop on a confirmation dialog on every unattended build. What
+    that key can do is bounded -- it signs locally built copies of this one probe and anchors no
+    trust chain; what it would buy an attacker who already has read access to the user's home
+    directory is the ability to sign a binary carrying the same designated requirement, which is
+    why `headroom keychain grant` remains an explicit, interactive step and the probe's own
+    SHA-256 is verified on every use. Delete it with `bash scripts/build-probe.sh
+    --reset-identity`, or set `HEADROOM_CODESIGN_IDENTITY` / `git config
+    headroom.codesign-identity` to sign with a real Developer ID instead. There is no `security`
+    fallback for reading the token itself -- only the probe ever
     sees it. macOS also resets an item's access control list every time its contents are rewritten,
     and Claude Code rewrites `Claude Code-credentials` on every token refresh, so a grant lapses on
     its own and needs `headroom keychain grant` again; Headroom tells this apart from a genuinely
