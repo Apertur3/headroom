@@ -5,6 +5,7 @@ import { defineConfig } from "vitest/config";
 // before a slow test counts as a hang.
 export default defineConfig({
   test: {
+    setupFiles: ["./test/setup-isolation.ts"],
     testTimeout: 30_000,
     hookTimeout: 30_000,
   },
