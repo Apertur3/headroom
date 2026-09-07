@@ -23,6 +23,18 @@ function rolling(used: number, fetchedAt: string, resetsAt: string, overrides: P
   };
 }
 
+function weekly(used: number, fetchedAt: string, resetsAt: string, overrides: Partial<Observation> = {}): Observation {
+  return rolling(used, fetchedAt, resetsAt, { window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, ...overrides });
+}
+
+function windowless(meterId: string, fetchedAt: string, reason = "Keychain grant lapsed"): Observation {
+  return {
+    principal_id: "claude-main", meter_id: meterId, window: null, quantity: null, resets_at: null,
+    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "estimated", freshness: "failed",
+    confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture", reason,
+  };
+}
+
 describe("store.burnRateFor", () => {
   it("is null for a window with fewer than two fresh samples in the lookback", async () => {
     const store = await open();
@@ -281,6 +293,38 @@ describe("store.lastKnownFor", () => {
       const localPool: Observation = { principal_id: "gpu-box", meter_id: "gpu-box:capacity", window: { kind: "state", minutes: null, enforcement: "soft" }, quantity: { used: 1, limit: null, remaining: null, unit: "requests" }, resets_at: null, observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "estimated", freshness: "failed", confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture" };
       const credits: Observation = { principal_id: "codex-main", meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: null, resets_at: null, observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "failed", confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture" };
       expect(store.lastKnownFor([localPool, credits], now).size).toBe(0);
+    } finally { store.close(); }
+  });
+
+  it("for a windowless failure, borrows the newest fresh reading from any window of the same meter, keyed by meter:none", async () => {
+    const store = await open();
+    try {
+      store.insert(weekly(41, "2026-09-03T00:05:00Z", "2026-09-10T00:00:00Z", { meter_id: "claude-main:fable" }));
+      const failed = store.insert(windowless("claude-main:fable", "2026-09-03T06:05:00Z"));
+      const now = new Date("2026-09-03T06:05:00Z");
+      const known = store.lastKnownFor([failed], now).get("claude-main:fable:none");
+      expect(known).toEqual({ used_percent: 41, resets_at: "2026-09-10T00:00:00Z", observed_at: "2026-09-03T00:05:00Z", age_seconds: 6 * 60 * 60, window_minutes: 10_080 });
+    } finally { store.close(); }
+  });
+
+  it("for a windowless failure, prefers the tighter window when several windows have a fresh reading", async () => {
+    const store = await open();
+    try {
+      store.insert(weekly(41, "2026-09-02T00:00:00Z", "2026-09-10T00:00:00Z", { meter_id: "claude-main:fable" }));
+      store.insert(rolling(22, "2026-09-03T05:00:00Z", "2026-09-03T10:00:00Z", { meter_id: "claude-main:fable" }));
+      const failed = store.insert(windowless("claude-main:fable", "2026-09-03T06:00:00Z"));
+      const now = new Date("2026-09-03T06:00:00Z");
+      const known = store.lastKnownFor([failed], now).get("claude-main:fable:none");
+      expect(known).toEqual({ used_percent: 22, resets_at: "2026-09-03T10:00:00Z", observed_at: "2026-09-03T05:00:00Z", age_seconds: 60 * 60, window_minutes: 300 });
+    } finally { store.close(); }
+  });
+
+  it("is absent for a windowless failure when nothing fresh exists for that meter in any window", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      const failed = store.insert(windowless("claude-main:routines", now.toISOString()));
+      expect(store.lastKnownFor([failed], now).has("claude-main:routines:none")).toBe(false);
     } finally { store.close(); }
   });
 });

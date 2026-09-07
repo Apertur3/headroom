@@ -88,12 +88,18 @@ export function withPaceInfo<T extends Observation>(observations: T[], burn: Map
  * above. A fresh observation, or an UNKNOWN one with nothing fresh in the
  * lookback, gets `last_known: null`: this is purely informational, so it is
  * always present on the shape rather than sometimes-absent.
+ *
+ * A windowless failure (`window: null`, e.g. a Keychain grant or transport
+ * failure -- the failure speaks for the whole meter) looks up
+ * `${meter_id}:none` instead of `${meter_id}:${minutes}`: lastKnownFor()
+ * fills that key with the tightest window of the same meter that still has
+ * a fresh reading, carrying its own `window_minutes` along.
  */
 export function withLastKnown<T extends Observation>(observations: T[], lastKnown: Map<string, LastKnownReading>): Array<T & { last_known: LastKnownReading | null }> {
   return observations.map((item) => {
     if (item.freshness !== "failed" && item.freshness !== "stale") return { ...item, last_known: null };
-    const minutes = item.window?.minutes;
-    const known = minutes ? lastKnown.get(`${item.meter_id}:${minutes}`) : undefined;
+    const key = item.window === null ? `${item.meter_id}:none` : item.window.minutes ? `${item.meter_id}:${item.window.minutes}` : undefined;
+    const known = key ? lastKnown.get(key) : undefined;
     return { ...item, last_known: known ?? null };
   });
 }
