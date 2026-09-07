@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeProbeError, claudeKeychainMetadata, grantClaudeKeychainAccess, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
+import { ClaudeProbeError, claudeKeychainMetadata, claudeLoggedOutReason, grantClaudeKeychainAccess, isClaudeGrantIssue, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 
 const temporary: string[] = [];
@@ -68,6 +68,20 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
     const probe = await fakeProbe(root, "probe-timeout", "HEADROOM_PROBE_TIMEOUT", 4);
     await withProbePath(probe, async () => {
       await expect(grantClaudeKeychainAccess("/nonexistent/.claude")).rejects.toMatchObject({ kind: "timeout" });
+    });
+  });
+
+  it("HEADROOM_PROBE_LOGGED_OUT (item present, no usable OAuth token) -> the logged-out reason, distinct from 'no credentials' and never a grant issue (issue #11)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
+    const probe = await fakeProbe(root, "probe-logged-out", "HEADROOM_PROBE_LOGGED_OUT", 6);
+    await withProbePath(probe, async () => {
+      const error = await grantClaudeKeychainAccess("/nonexistent/.claude").catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(ClaudeProbeError);
+      expect((error as ClaudeProbeError).kind).toBe("missing");
+      const message = (error as ClaudeProbeError).message;
+      expect(message).toBe(claudeLoggedOutReason("/nonexistent/.claude"));
+      expect(message).toContain("run: CLAUDE_CONFIG_DIR=/nonexistent/.claude claude and sign in");
+      expect(isClaudeGrantIssue(message)).toBe(false);
     });
   });
 });

@@ -80,6 +80,11 @@ account-wide `:all` row alive through a lapse regardless, since that path never 
 Keychain at all; only the scoped meters (Fable, Routines) that need the probe go stale until the
 grant is redone.
 
+A Keychain item that exists but carries no OAuth access token (Claude Code logged out locally, not
+an ACL lapse) is reported separately -- "Claude Code is logged out\[ for \<dir\>\]; run:
+\[CLAUDE_CONFIG_DIR=\<dir\>\] claude and sign in" -- and never gates the probe, since signing back
+in fixes it without a Keychain grant.
+
 Meters emitted: `<principal>:all` (the 5-hour and 7-day windows from the response's `five_hour`
 and `seven_day` fields), `<principal>:fable`, `<principal>:routines`, and one
 `<principal>:<model-slug>` meter for every other model-scoped bucket the response's `limits[]`

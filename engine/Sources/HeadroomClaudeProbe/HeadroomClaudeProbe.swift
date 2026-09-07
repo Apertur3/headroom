@@ -98,7 +98,14 @@ struct HeadroomClaudeProbe {
             if status == errSecAuthFailed { fail("HEADROOM_PROBE_KEYCHAIN_DENIED", 3) }
             fail("HEADROOM_PROBE_NO_CREDENTIALS", 1)
         }
-        guard let token = token(credentialData) else { fail("HEADROOM_PROBE_NO_CREDENTIALS", 1) }
+        // credentialData decrypted fine (status == errSecSuccess): the item
+        // exists, distinct from the errSecItemNotFound case above. If its
+        // JSON carries no usable OAuth access token, that is Claude Code
+        // logged out locally (issue #11) -- a different fix (sign back in)
+        // than a genuinely absent item (a Keychain grant or a first login),
+        // so it gets its own marker and exit status rather than folding into
+        // HEADROOM_PROBE_NO_CREDENTIALS above.
+        guard let token = token(credentialData) else { fail("HEADROOM_PROBE_LOGGED_OUT", 6) }
         var request = URLRequest(url: URL(string: "https://\(anthropicUsageHost)/api/oauth/usage")!)
         request.httpMethod = "GET"; request.timeoutInterval = 10
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -134,7 +141,10 @@ struct HeadroomClaudeProbe {
     }
 
     private static func fail(_ marker: String, _ code: Int32) -> Never { fputs("\(marker)\n", stderr); exit(code) }
-    private static func token(_ data: Data) -> String? {
+    // Not `private`: HeadroomClaudeProbeTests exercises this directly
+    // (@testable import) to cover the HEADROOM_PROBE_LOGGED_OUT guard above
+    // without spawning the real binary or touching a Keychain item.
+    static func token(_ data: Data) -> String? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let oauth = root["claudeAiOauth"] as? [String: Any], let token = oauth["accessToken"] as? String, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return token
     }

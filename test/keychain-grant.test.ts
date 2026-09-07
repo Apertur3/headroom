@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { claudeGrantNeededReason } from "../src/adapters/claude.js";
+import { claudeGrantNeededReason, claudeLoggedOutFix, claudeLoggedOutReason } from "../src/adapters/claude.js";
 import { pollAccounts } from "../src/collector.js";
 import { isMainModule as cliIsMainModule } from "../src/cli.js";
 import { doctorChecks, homeCheck, keychainGrantCheck } from "../src/doctor.js";
@@ -222,6 +222,53 @@ describe("doctor home directory and keychain grant checks", () => {
       } else {
         // Same non-darwin fallback as the plain-denial case above: the
         // gate (and this stored reason) is never consulted off macOS.
+        const path = credentialPath("claude", "/nonexistent/.claude");
+        expect(credential).toMatchObject({ level: "FAIL", detail: `missing or unsafe credential file (${path})` });
+      }
+    });
+  });
+
+  it("falls back to the last probe's logged-out reason before ever re-checking Keychain metadata, printing the sign-in fix rather than a grant fix (issue #11)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-logged-out-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await withHeadroomHome(home, async () => {
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "accounts.toml"), [
+        "[[accounts]]",
+        'name = "claude-main"',
+        'vendor = "claude"',
+        'location = "/nonexistent/.claude"',
+        'adapter = "native-ts"',
+        "",
+      ].join("\n"), { mode: 0o600 });
+      // Same reason as the lapse test above for a throwaway first call: it
+      // lets syncClaudeGrantState's first-run marking settle against
+      // whatever probe binary hash (if any) this machine resolves.
+      // clearKeychainGrantNeeded then undoes that unconditionally, so this
+      // test exercises the deliberately *not* gate-marked path issue #11
+      // relies on -- a logged-out principal must never be sent to `headroom
+      // keychain grant`, only to a fresh login.
+      await doctorChecks();
+      const reason = claudeLoggedOutReason("/nonexistent/.claude");
+      const seed = await HeadroomStore.open(home);
+      seed.clearKeychainGrantNeeded("claude-main");
+      const now = new Date().toISOString();
+      seed.insertAll([{
+        principal_id: "claude-main", meter_id: "claude-main:all", window: null, quantity: null, resets_at: null,
+        observed_at: now, fetched_at: now, source: "native:claude", truth: "estimated", freshness: "failed",
+        confidence: 0, adapter_version: "native-ts", upstream_schema_version: "v0.56.4", reason,
+      }]);
+      seed.close();
+      const checks = await doctorChecks();
+      const credential = checks.find((item) => item.check === "principal claude-main credential");
+      const grant = checks.find((item) => item.check === "principal claude-main keychain grant");
+      expect(grant).toBeUndefined(); // never gate-marked: not a Keychain grant issue
+      if (process.platform === "darwin") {
+        expect(credential).toMatchObject({ level: "FAIL", detail: reason, fix: claudeLoggedOutFix("/nonexistent/.claude") });
+      } else {
+        // Same non-darwin fallback as the other Claude-credential cases
+        // above: the logged-out check (like the gate itself) only exists on
+        // macOS, where Claude's credentials actually live in the Keychain.
         const path = credentialPath("claude", "/nonexistent/.claude");
         expect(credential).toMatchObject({ level: "FAIL", detail: `missing or unsafe credential file (${path})` });
       }

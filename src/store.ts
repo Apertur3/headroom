@@ -408,8 +408,8 @@ export class HeadroomStore {
     return { ...observation, freshness: "failed", confidence: 0, reason: idleContradictionReason(evidence.quantity.used) };
   }
 
-  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null): void {
-    const created = current.fetched_at;
+  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null, createdAt?: string): void {
+    const created = createdAt ?? current.fetched_at;
     const id = `${kind}:${current.id}`;
     // OR IGNORE keeps the reset-detection backfill idempotent: replaying it
     // over already-classified observations must not error on a repeat id.
@@ -548,6 +548,37 @@ export class HeadroomStore {
     return observation.meter_id.startsWith(prefix) ? observation.meter_id.slice(prefix.length) : observation.meter_id;
   }
 
+  /** Whether at least one failed reading for this exact meter and window sits
+   * strictly between baseline and current -- a "gap of failed readings" (the
+   * UNKNOWN rows of issue #10) hiding whether the vendor's scheduled reset
+   * actually fell inside it. A plain two-in-a-row fresh comparison (no gap)
+   * keeps using the direct resets_at-delta read below; a gapped one cannot
+   * trust that delta, since a jump far bigger than the elapsed time is
+   * expected the moment a gap is long enough to span a scheduled reset,
+   * whether or not the reset happened inside THIS gap specifically. */
+  private failedGapBetween(meterId: string, window: Observation["window"], afterId: number, beforeId: number): boolean {
+    const windowJson = window ? JSON.stringify(window) : null;
+    const row = this.db.prepare(`SELECT 1 FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
+      AND freshness = 'failed' AND id > ? AND id < ? LIMIT 1`).get(meterId, windowJson, windowJson, afterId, beforeId);
+    return row !== undefined;
+  }
+
+  /** Whether a reset_seen event already exists for this meter and window at
+   * exactly this scheduled moment -- the dedupe a gap-classified reset needs
+   * that addEvent's own id (keyed off the observation that happened to close
+   * the gap) does not provide, since two different closing observations can
+   * in principle name the same scheduled reset. */
+  private resetSeenAtScheduledTime(meterId: string, window: Observation["window"], scheduledAt: string): boolean {
+    const minutes = window?.minutes ?? null;
+    const row = this.db.prepare(`SELECT 1 FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.kind = 'reset_seen' AND e.meter_id = ?
+        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) IS ?
+        AND e.created_at = ? LIMIT 1`).get(meterId, minutes, scheduledAt);
+    return row !== undefined;
+  }
+
   /** Classify a usage drop of more than 50%, or non-zero to zero, against its
    * fresh baseline. Local pools (window kind `state`) and credit counts (kind
    * `count`, handled by the vendor-reported credits path below) never carry
@@ -557,7 +588,22 @@ export class HeadroomStore {
    * bigger than that elapsed time is a real reset, while a timestamp that
    * held still even though usage already fell is a free reset fired ahead of
    * the scheduled one. A baseline older than 24h lowers confidence, since the
-   * gap could hide more than one reset. */
+   * gap could hide more than one reset.
+   *
+   * When the baseline and current are separated by a gap of failed readings
+   * (failedGapBetween), the resets_at-delta jump above is not trustworthy
+   * evidence of WHEN a reset happened -- only of whether one plausibly could
+   * have. Issue #10: a day of failed `claude-main:fable` readings around an
+   * already-recorded account-wide weekly reset produced a second reset_seen
+   * for fable stamped at the moment the gap happened to close (23:45), hours
+   * after the reset itself (14:16). Across a gap, a reset is recorded only
+   * when the baseline's own scheduled reset time falls inside the gap, and
+   * at that scheduled moment, not the observation that ended the gap;
+   * confidence is fixed at 0.8 -- an inferred instant, not two readings taken
+   * close together, so below a same-poll detection's 0.9 but above a stale
+   * one's 0.6. No scheduled reset inside the gap means this rule stays
+   * silent and defers entirely to the ordinary beforeScheduledReset check
+   * below (a vendor correction or a free reset fired ahead of schedule). */
   private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation): void {
     if (current.window?.kind === "state" || current.window?.kind === "count") return;
     if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
@@ -567,19 +613,29 @@ export class HeadroomStore {
     const previousReset = baseline.resets_at ? Date.parse(baseline.resets_at) : Number.NaN;
     const currentReset = current.resets_at ? Date.parse(current.resets_at) : Number.NaN;
     if (!Number.isFinite(previousReset) || !Number.isFinite(currentReset)) return;
+    const evidence = [baseline.id, current.id];
     const elapsedMs = Date.parse(current.fetched_at) - Date.parse(baseline.fetched_at);
     const resetDeltaMs = currentReset - previousReset;
     const toleranceMs = 60_000;
-    const resetsAdvanced = resetDeltaMs > elapsedMs + toleranceMs;
     const resetsUnchanged = Math.abs(resetDeltaMs) <= toleranceMs;
     const beforeScheduledReset = resetsUnchanged && Date.parse(current.fetched_at) < previousReset;
-    if (!resetsAdvanced && !beforeScheduledReset) return;
-    const evidence = [baseline.id, current.id];
     const stale = elapsedMs > 24 * 3_600_000;
     const staleHours = Math.floor(elapsedMs / 3_600_000);
     const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
+    const freeReset = (): void => this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
+    if (this.failedGapBetween(current.meter_id, current.window, baseline.id, current.id)) {
+      if (previousReset > Date.parse(baseline.fetched_at) && previousReset <= Date.parse(current.fetched_at)) {
+        const scheduledAt = new Date(previousReset).toISOString();
+        if (!this.resetSeenAtScheduledTime(current.meter_id, current.window, scheduledAt)) this.addEvent("reset_seen", "inferred", 0.8, evidence, current, suffix(null), null, scheduledAt);
+        return;
+      }
+      if (beforeScheduledReset) freeReset();
+      return;
+    }
+    const resetsAdvanced = resetDeltaMs > elapsedMs + toleranceMs;
+    if (!resetsAdvanced && !beforeScheduledReset) return;
     if (resetsAdvanced) this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null));
-    else this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
+    else freeReset();
   }
 
   /** The most recent reset_seen event for this meter+window within

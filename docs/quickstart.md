@@ -265,25 +265,60 @@ headroom
 ```
 
 With no daemon running yet, this is a direct read: Headroom polls every configured account
-itself, stores the result in `~/.headroom/headroom.db`, and prints one line per meter, for
+itself, stores the result in `~/.headroom/headroom.db`, and prints one block per principal, for
 example:
 
 ```
-claude-main:all  5h 3% ↻17:10 (in 4h 12m) HARVEST | wk 61% ↻Sat 14:00 (in 26h 18m) CONSERVE  (fresh 2m)
+claude-main  claude  Max 20x  fresh 2m
+  all      5h   3% used  resets in 4h 12m  HARVEST
+           wk  61% used  resets in 1d 2h   CONSERVE
+  fable    wk  40% used  resets in 1d 2h   CONSERVE
+
+codex-main  codex  Plus  fresh 2m
+  credits  1 available, expire Oct 5
+  main     wk  81% used  resets in 1d 2h   CONSERVE
+
+gpu-box  UP  local-27b  0 running, 0 waiting
+
+3 principals, direct read, no daemon
 ```
+
+The pace state is always the last column, so a long list reads as one column of states. Percent
+bars are not drawn; colour is added only when stdout is a terminal (`--color` forces it,
+`--no-color` and `NO_COLOR` turn it off).
+
+`--verbose` (`-v`) adds an indented line under each window with the detail the default view
+leaves out: the exact reset time, the burn rate against the pace that would exactly spend the
+window, the protected reserve, and the reset evidence Headroom recorded.
+
+`--plain` prints the dense one-line-per-meter form instead, which is also what you get
+automatically whenever stdout is not a terminal, so existing pipelines are unchanged:
+
+```
+claude-main:all  5h 3% ↻17:10 (in 4h 12m) HARVEST | wk 61% ↻Sat 14:00 (in 1d 2h) CONSERVE  (fresh 2m)
+```
+
+`--agent` is the same form under a name that says who it is for. Agents should read `--json`
+first and `--agent` second; the grouped view above is for people, and `--human` forces it in a
+pipe when you want to read one.
 
 Every window's countdown (`resets_in_seconds`/`resets_in` in `--json`, the daemon status, and the
 MCP `quota_status` result) is computed fresh at response time, not stored. `headroom can` reasons
 carry the same information, more tersely: `wk 61% CONSERVE, resets in 26h`.
 
-If a meter shows UNKNOWN, that's Headroom refusing to guess, not a bug. See
-[concepts.md](concepts.md) for what freshness and UNKNOWN mean.
+If a meter shows UNKNOWN, that's Headroom refusing to guess, not a bug. The grouped view says why
+in plain words and what to do about it, once per principal when every meter shares the reason.
+See [concepts.md](concepts.md) for what freshness and UNKNOWN mean.
 
 Antigravity is the one vendor this direct read can't fully serve: without the daemon's warm `agy`
 session, a one-shot read reports why instead of guessing:
 
 ```
-antigravity:gemini  5h UNKNOWN (no daemon; Antigravity needs the daemon-kept agy: run headroom install-service) | ...
+antigravity  antigravity  failed <1m
+  gemini   5h         -                    UNKNOWN
+           wk         -                    UNKNOWN
+  UNKNOWN: the daemon is not running, and Antigravity needs the daemon-kept agy. Run: headroom
+  install-service
 ```
 
 That resolves itself once you install the daemon in the next step.
