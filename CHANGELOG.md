@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.7] - 2026-09-08
+
 ### Changed
 - `headroom` on a terminal now groups meters under a per-principal header with the pace state as
   the last column, explains UNKNOWN in plain words once per principal, and ends with a summary
