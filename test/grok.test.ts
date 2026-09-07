@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -239,7 +239,7 @@ describe("Grok discovery and collection", () => {
   });
 
   it("dispatches a configured grok principal through the collector", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-grok-poll-")); temporary.push(root);
+    const root = await mkdtemp(join(homedir(), "headroom-grok-poll-")); // inside the (isolated) home: the credential must sit under the user's home temporary.push(root);
     const grokHome = join(root, ".grok");
     await mkdir(grokHome, { recursive: true });
     await writeFile(join(grokHome, "auth.json"), await authFixture(), { mode: 0o600 });
@@ -262,7 +262,7 @@ describe("Grok discovery and collection", () => {
   });
 
   it("reports a rate-limited grok principal as a collector failure so it backs off", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-grok-429-")); temporary.push(root);
+    const root = await mkdtemp(join(homedir(), "headroom-grok-429-")); temporary.push(root);
     const grokHome = join(root, ".grok");
     await mkdir(grokHome, { recursive: true });
     await writeFile(join(grokHome, "auth.json"), await authFixture(), { mode: 0o600 });
