@@ -152,7 +152,7 @@ describe("status view: the three forms", () => {
 
 describe("status view: local pools and credits", () => {
   const pool = (state: "UP" | "DOWN", extra: Partial<Observation> = {}): Observation => observation({
-    principal_id: "hydra", meter_id: "hydra:capacity", source: "native:local",
+    principal_id: "gpu-box", meter_id: "gpu-box:capacity", source: "native:local",
     window: { kind: "state", minutes: null, enforcement: "soft" }, resets_at: null,
     quantity: { used: 0, limit: null, remaining: null, unit: "requests" },
     metadata: { state, model_ids: ["coder"], running: 0, waiting: 0 },
@@ -160,12 +160,12 @@ describe("status view: local pools and credits", () => {
   });
 
   it("renders a running pool as one line naming its state, model and queue", () => {
-    expect(render({}, { observations: [pool("UP")] })).toContain("hydra  UP  coder  0 running, 0 waiting");
+    expect(render({}, { observations: [pool("UP")] })).toContain("gpu-box  UP  coder  0 running, 0 waiting");
   });
 
   it("renders a sleeping pool with the command that wakes it", () => {
     const down = pool("DOWN", { metadata: { state: "DOWN" }, reason: "connect refused; wake: ssh gateway wake-gpu-box" });
-    expect(render({}, { observations: [down] })).toContain("hydra  DOWN  wake: ssh gateway wake-gpu-box");
+    expect(render({}, { observations: [down] })).toContain("gpu-box  DOWN  wake: ssh gateway wake-gpu-box");
   });
 
   it("renders a credit balance as a count and an expiry, with no pace state", () => {
