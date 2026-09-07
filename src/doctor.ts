@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeServiceName, formatLocalTimestamp, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -54,6 +54,16 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
       const storedReason = grantsNeeded.get(account.name);
       const detail = storedReason?.startsWith(CLAUDE_GRANT_LAPSED_PREFIX) ? storedReason : "Keychain grant needed; probe skipped";
       return check("FAIL", `principal ${account.name} credential`, detail, `headroom keychain grant --principal ${account.name}`);
+    }
+    // A stored "logged out" verdict from the most recent probe (issue #11)
+    // is checked before ever touching the Keychain again: metadata alone
+    // cannot tell an item with no usable token apart from a healthy one --
+    // neither ever decrypts the payload -- and this state is deliberately
+    // not gate-marked (unlike a grant issue), so the only place doctor can
+    // learn it is the last real probe result the collector already stored.
+    const lastObservation = store?.latest(`${account.name}:all`);
+    if (lastObservation?.freshness === "failed" && isClaudeLoggedOutReason(lastObservation.reason)) {
+      return check("FAIL", `principal ${account.name} credential`, lastObservation.reason ?? "Claude Code is logged out", claudeLoggedOutFix(account.location));
     }
     // Do not pass -w: doctor verifies Keychain metadata without ever reading a token.
     const metadata = await claudeKeychainMetadata(claudeServiceName(account.location));

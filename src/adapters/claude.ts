@@ -95,6 +95,37 @@ export function isClaudeGrantIssue(reason: string | null | undefined): boolean {
   return typeof reason === "string" && (reason.startsWith("Keychain grant needed;") || reason.startsWith(CLAUDE_GRANT_LAPSED_PREFIX));
 }
 
+/** The single wording for "the Keychain item exists but its JSON carries no
+ * usable OAuth access token" (issue #11: HEADROOM_PROBE_LOGGED_OUT, distinct
+ * from HEADROOM_PROBE_NO_CREDENTIALS -- an absent item entirely). Signing
+ * back in fixes this on its own, so it is never a Keychain grant issue: see
+ * CLAUDE_LOGGED_OUT_PREFIX and isClaudeLoggedOutReason below, which
+ * isClaudeGrantIssue above must never match. */
+export function claudeLoggedOutFix(configDir: string): string {
+  const directory = resolve(configDir);
+  return directory === resolve(homedir(), ".claude") ? "run: claude and sign in" : `run: CLAUDE_CONFIG_DIR=${directory} claude and sign in`;
+}
+
+/** Full reason text for the logged-out state above, built from
+ * claudeLoggedOutFix() so the probe error mapping (claudeProbe, below) and
+ * doctor's per-principal credential line (credentialCheck) always print the
+ * identical fix instead of restating it. */
+export function claudeLoggedOutReason(configDir: string): string {
+  const directory = resolve(configDir);
+  const fix = claudeLoggedOutFix(directory);
+  return directory === resolve(homedir(), ".claude") ? `Claude Code is logged out; ${fix}` : `Claude Code is logged out for ${directory}; ${fix}`;
+}
+
+/** Static prefix of claudeLoggedOutReason()'s output, so a caller (doctor's
+ * credentialCheck) can recognize a stored logged-out verdict without
+ * reconstructing the exact text. */
+export const CLAUDE_LOGGED_OUT_PREFIX = "Claude Code is logged out";
+
+/** True for any reason string produced by claudeLoggedOutReason() above. */
+export function isClaudeLoggedOutReason(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && reason.startsWith(CLAUDE_LOGGED_OUT_PREFIX);
+}
+
 /** The item's `mdat` (modification date) attribute from `security
  * find-generic-password`'s attribute dump, e.g.
  * `"mdat"<timedate>=0x...  "20260907052443Z\000"` -- always UTC/Zulu, per
@@ -197,6 +228,13 @@ async function claudeProbe(configDir: string, pinnedPath?: string): Promise<stri
     // for a live 401/403 over the direct-fetch path.
     if (stderr.includes("HEADROOM_PROBE_FORBIDDEN")) throw new ClaudeProbeError("missing", `Claude rejected the token (403); ${claudeCommandForDirectory(configDir)}`);
     if (stderr.includes("HEADROOM_PROBE_RATE_LIMITED")) throw new ClaudeProbeError("missing", "Claude usage request failed (429)");
+    // The Keychain item exists (unlike HEADROOM_PROBE_NO_CREDENTIALS below)
+    // but its JSON carries no usable OAuth access token: Claude Code is
+    // logged out locally for this config dir (issue #11), not a Keychain
+    // grant issue -- claudeLoggedOutReason()'s wording never matches
+    // isClaudeGrantIssue, so the collector never marks this principal as
+    // needing `headroom keychain grant`; signing back in fixes it on its own.
+    if (stderr.includes("HEADROOM_PROBE_LOGGED_OUT")) throw new ClaudeProbeError("missing", claudeLoggedOutReason(configDir));
     if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
     throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
   }

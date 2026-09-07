@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- `headroom` on a terminal now groups meters under a per-principal header with the pace state as
+  the last column, explains UNKNOWN in plain words once per principal, and ends with a summary
+  footer; burn, sustainable pace, the reserve and the reset evidence move to `--verbose`/`-v`. Off
+  a terminal the dense one line per meter is unchanged (also `--plain`/`--agent`, with `--human`,
+  `--color` and `--no-color` as overrides), and `--json` is untouched.
+
+### Fixed
+- The Claude probe now reports a Keychain item that exists but carries no OAuth access token as
+  `HEADROOM_PROBE_LOGGED_OUT`, distinct from a genuinely absent item, so `headroom doctor` and a
+  poll's failure reason point at `claude` (sign back in) instead of `headroom keychain grant`
+  (issue #11).
+- A usage drop first noticed across a gap of failed readings is now recorded as `reset_seen` only
+  when the previous fresh reading's own scheduled reset time falls inside that gap, and at that
+  scheduled moment rather than the moment the gap happened to close; a reset already recorded for
+  that meter, window and moment is never duplicated, and a drop with no scheduled reset in the gap
+  is left to the existing free-reset check instead (issue #10).
+
 ## [0.1.0-beta.6] - 2026-09-08
 
 ## [0.1.0-beta.5] - 2026-09-06
