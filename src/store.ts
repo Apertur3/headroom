@@ -473,9 +473,28 @@ export class HeadroomStore {
     const open = current.window ? this.openFailureForWindow(current.meter_id, current.window) : this.openWindowlessFailure(current.meter_id);
     if (open) {
       this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(current.fetched_at, String(open.id));
-      return;
+    } else {
+      this.addSourceFailedEvent(evidence, current);
     }
-    this.addSourceFailedEvent(evidence, current);
+    this.recordGrantLapsed(evidence, current);
+  }
+
+  /**
+   * A Claude Keychain ACL lapse (claude.ts's claudeKeychainLapseReason, see
+   * issue #9) carries a distinct reason wording from a plain "grant needed"
+   * denial, and only ever appears on the one poll that first detects it:
+   * once collector.ts marks the grant gate, every later failed observation
+   * for this principal reuses the shorter, generic "Keychain grant needed;"
+   * wording instead (claudeGrantNeededReason), never this prefix again until
+   * the next lapse. That makes the reason text itself the transition signal
+   * -- this fires once per lapse with no extra open/close bookkeeping, on
+   * just the account-wide `:all` meter so one lapse produces one
+   * notification rather than one per meter (all/fable/routines all carry
+   * the identical reason on the same poll).
+   */
+  private recordGrantLapsed(evidence: number[], current: StoredObservation): void {
+    if (!current.meter_id.endsWith(":all") || !current.reason?.startsWith("Keychain grant lapsed;")) return;
+    this.addEvent("grant_lapsed", "vendor_reported", 1, evidence, current, current.reason);
   }
 
   /** A windowless (whole-meter transport/auth) failure is not directly

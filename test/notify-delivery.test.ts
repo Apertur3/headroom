@@ -302,3 +302,54 @@ describe("model_new", () => {
     } finally { store.close(); }
   });
 });
+
+describe("grant_lapsed", () => {
+  const LAPSE_REASON = "Keychain grant lapsed; Claude Code rewrote its credentials at 2026-09-03 20:05:00; run: headroom keychain grant --principal claude-main";
+
+  function failedClaude(reason: string, fetchedAt: string, meterId = "claude-main:all"): Observation {
+    return {
+      principal_id: "claude-main", meter_id: meterId, window: null, quantity: null, resets_at: null,
+      observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "estimated", freshness: "failed",
+      confidence: 0, adapter_version: "fixture", upstream_schema_version: "fixture", reason,
+    };
+  }
+
+  it("delivers one notification for a lapse and never repeats it once later polls fall back to the generic grant-needed wording, even across many polls", async () => {
+    const store = await openStore("headroom-notify-grant-lapsed-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["telegram"] as NotifyConfig["channels"], events: ["grant_lapsed"] };
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      store.insert(failedClaude(LAPSE_REASON, "2026-09-03T20:05:00Z"));
+      const first = await deliverNotifications(store, options({ config: only, fetcher, now: AFTER }));
+      expect(first.sent).toBe(1);
+      expect(calls).toHaveLength(1);
+      const telegram = JSON.parse(calls[0].body);
+      expect(telegram.text).toContain("grant_lapsed claude-main:all");
+      expect(telegram.text).toContain(LAPSE_REASON);
+
+      // Every later poll -- gated, per collector.ts -- reuses the shorter
+      // generic wording, never the lapse prefix again: nothing new to send.
+      store.insert(failedClaude("Keychain grant needed; run: headroom keychain grant --principal claude-main", "2026-09-03T20:10:00Z"));
+      store.insert(failedClaude("Keychain grant needed; run: headroom keychain grant --principal claude-main", "2026-09-03T20:15:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: LATER }));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:15:00Z") }));
+      expect(calls).toHaveLength(1);
+      const ledger = store.notifyLedger(20);
+      expect(ledger.filter((row) => row.event_id.startsWith("grant_lapsed:"))).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  it("stays quiet unless explicitly configured, since the same observation already trips the default source_failed", async () => {
+    const store = await openStore("headroom-notify-grant-lapsed-default-");
+    const { calls, fetcher } = recorder();
+    try {
+      await deliverNotifications(store, options({ fetcher, now: START })); // default config, no grant_lapsed
+      store.insert(failedClaude(LAPSE_REASON, "2026-09-03T20:05:00Z"));
+      await deliverNotifications(store, options({ fetcher, now: AFTER }));
+      const telegramCalls = calls.filter((call) => call.url.startsWith("https://api.telegram.org"));
+      expect(telegramCalls.map((call) => JSON.parse(call.body).text as string)).toEqual(expect.arrayContaining([expect.stringContaining("source_failed claude-main:all")]));
+      expect(telegramCalls.some((call) => (JSON.parse(call.body).text as string).startsWith("grant_lapsed"))).toBe(false);
+    } finally { store.close(); }
+  });
+});

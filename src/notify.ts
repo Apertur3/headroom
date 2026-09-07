@@ -25,7 +25,7 @@ const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
 
 const EVENT_KINDS: readonly EventKind[] = [
   "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed",
-  "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new",
+  "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed",
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
  * latest reading of every hard window, once per window instance. */
@@ -33,7 +33,11 @@ export const NOTIFY_EVENT_NAMES: readonly string[] = [...EVENT_KINDS, "threshold
 
 /** What a `[notify] events` list defaults to: the changes an operator wants to
  * hear about, without the per-poll bookkeeping kinds (lease start/end, credit
- * counts) that would turn a phone into a ticker. */
+ * counts) that would turn a phone into a ticker. `grant_lapsed` is left out of
+ * the default set on purpose: the same observation that trips it also trips
+ * `source_failed` (already default), so an operator who wants the Keychain
+ * lapse called out on its own -- distinct from an ordinary outage -- opts
+ * into it explicitly. */
 export const DEFAULT_NOTIFY_EVENTS: readonly string[] = [
   "reset_seen", "free_reset_granted", "source_failed", "source_recovered", "pace_projection_conserve", "model_new", "threshold",
 ];

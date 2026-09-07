@@ -3,7 +3,7 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
-import { claudeGrantNeededObservations, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
+import { claudeGrantNeededObservations, isClaudeGrantIssue, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
@@ -180,7 +180,10 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
       if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();
-      const denied = result.find((item) => item.freshness === "failed" && item.reason?.startsWith("Keychain grant needed;"));
+      // Either wording -- a plain denial or a detected Keychain ACL lapse
+      // (claude.ts's isClaudeGrantIssue) -- gates the same way: no further
+      // probe attempts for this principal until the operator re-grants.
+      const denied = result.find((item) => item.freshness === "failed" && isClaudeGrantIssue(item.reason));
       if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
     }
     const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));

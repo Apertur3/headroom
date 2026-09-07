@@ -38,6 +38,11 @@ export interface ClaudeDependencies {
    * plain resolution order would otherwise pick. Ignored once `probe` (the
    * test seam above) is given. */
   probePath?: string;
+  /** Test seam only, mirroring `probe` above. Production calls
+   * claudeKeychainMetadata() directly, which spawns the real `security`
+   * binary; a test must never do that (it would touch the real login
+   * Keychain), so it substitutes a fake here instead. */
+  keychainMetadata?: (service: string) => Promise<ClaudeKeychainMetadata>;
 }
 
 export function claudeServiceName(configDir: string, home = homedir()): string {
@@ -72,6 +77,90 @@ export const KEYCHAIN_INTERACTION_BLOCKED_MESSAGE = "the Keychain dialog cannot 
  * in sync by construction rather than by convention. */
 export function claudeGrantNeededReason(principalId: string): string {
   return `Keychain grant needed; run: headroom keychain grant --principal ${principalId}`;
+}
+
+/** Static prefix of claudeKeychainLapseReason()'s formatted text (below), so
+ * a caller can recognize a lapse reason -- as opposed to a plain denial --
+ * without reconstructing the exact timestamp: collector.ts's grant gate
+ * (isClaudeGrantIssue) and store.ts's grant_lapsed notifier event both key
+ * off this. */
+export const CLAUDE_GRANT_LAPSED_PREFIX = "Keychain grant lapsed;";
+
+/** True for any reason string that means "this Claude principal needs
+ * `headroom keychain grant` run again", whether from a plain denial
+ * (claudeGrantNeededReason) or a detected ACL lapse
+ * (claudeKeychainLapseReason). Shared so collector.ts's gate recognizes both
+ * by construction instead of restating either prefix. */
+export function isClaudeGrantIssue(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && (reason.startsWith("Keychain grant needed;") || reason.startsWith(CLAUDE_GRANT_LAPSED_PREFIX));
+}
+
+/** The item's `mdat` (modification date) attribute from `security
+ * find-generic-password`'s attribute dump, e.g.
+ * `"mdat"<timedate>=0x...  "20260907052443Z\000"` -- always UTC/Zulu, per
+ * macOS's own Keychain attribute format. */
+const KEYCHAIN_MDAT_PATTERN = /"mdat"<timedate>=0x[0-9A-Fa-f]*\s+"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z/;
+
+/** Parses the `mdat` line out of `security find-generic-password`'s stdout.
+ * Returns undefined (never throws) for a missing or malformed line -- a
+ * detected lapse is still worth reporting even without an exact time. */
+export function parseKeychainModifiedAt(stdout: string): Date | undefined {
+  const match = KEYCHAIN_MDAT_PATTERN.exec(stdout);
+  if (!match) return undefined;
+  const [, year, month, day, hour, minute, second] = match;
+  const date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
+  return Number.isFinite(date.getTime()) ? date : undefined;
+}
+
+export interface ClaudeKeychainMetadata { found: boolean; modifiedAt?: Date; }
+
+/**
+ * Metadata-only Keychain lookup: `security find-generic-password -s
+ * <service>`, deliberately never `-w`, so it never reads or decrypts the
+ * secret data. macOS permits this without the item's access control list
+ * allowing this process -- exactly what distinguishes a genuinely absent
+ * login (exit 44, "could not be found in the keychain") from an item that
+ * exists but is presently ACL-blocked (see claudeKeychainLapseReason below
+ * and issue #9). Spawned with an explicit argument vector, never a shell.
+ * Any failure -- not found, `security` missing, an unexpected error -- comes
+ * back as `{ found: false }` rather than throwing, so a lookup that could not
+ * answer the question never gets mistaken for a confirmed absence or
+ * fabricates a lapse.
+ */
+export async function claudeKeychainMetadata(service: string): Promise<ClaudeKeychainMetadata> {
+  try {
+    const { stdout } = await execFileAsync("security", ["find-generic-password", "-s", service], { timeout: TIMEOUT_MS, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
+    return { found: true, modifiedAt: parseKeychainModifiedAt(stdout) };
+  } catch {
+    return { found: false };
+  }
+}
+
+/** `en-CA` gives an unambiguous YYYY-MM-DD date; `hour12: false` avoids an
+ * AM/PM string the reader still has to convert. Local to whichever timezone
+ * this process runs in, the same "local time" the operator reading the
+ * message is in. */
+export function formatLocalTimestamp(date: Date): string {
+  return date.toLocaleString("en-CA", { hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).replace(",", "");
+}
+
+/**
+ * Disambiguates the probe's "no credentials" report (HEADROOM_PROBE_NO_CREDENTIALS
+ * in the Swift probe source) between a genuinely absent login and an item
+ * whose access control list Claude Code reset by rewriting it on token
+ * refresh (issue #9: macOS resets an item's ACL on every rewrite, so the
+ * probe loses access it was previously granted). The probe itself cannot
+ * tell these two states apart -- decrypting the secret is exactly what the
+ * lost ACL blocks -- so this reads the item's metadata only, which macOS
+ * permits without the ACL grant. Returns undefined (the caller keeps the
+ * original "no credentials" wording) when the item is genuinely absent.
+ */
+async function claudeKeychainLapseReason(account: ProviderAccount, dependencies: ClaudeDependencies): Promise<string | undefined> {
+  const service = claudeServiceName(account.location);
+  const metadata = await (dependencies.keychainMetadata ?? claudeKeychainMetadata)(service);
+  if (!metadata.found) return undefined;
+  const when = metadata.modifiedAt ? formatLocalTimestamp(metadata.modifiedAt) : "an unknown time";
+  return `${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at ${when}; run: headroom keychain grant --principal ${account.name}`;
 }
 
 async function claudeProbe(configDir: string, pinnedPath?: string): Promise<string> {
@@ -449,16 +538,25 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     // just as actionable as a locally detected "no credentials" -- name the
     // exact fix instead of the bare "Claude usage request failed (401)",
     // which told the operator nothing to do about it.
-    const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Claude rejected the token (${error.status}); ${claudeCommand(account)}`
-      : error instanceof ProviderHTTPError ? error.message
-      : error instanceof ClaudeProbeError && error.message.startsWith("token expired") ? `token expired; ${claudeCommand(account)}`
-      : error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout" || error.kind === "no_interaction") ? claudeGrantNeededReason(account.name)
-      : error instanceof ClaudeProbeError ? error.message
-      : error instanceof Error && error.message.startsWith("vendor response") ? error.message
-      : darwin && !credentialLoaded ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
-      : /no credentials in Keychain/.test(message) ? `no credentials in Keychain for this config dir; ${claudeCommand(account)}`
-        : /credentials unavailable|credentials invalid|unsafe permissions/.test(message) ? `no credentials for this config dir; ${claudeCommand(account)}`
-          : "Claude usage unavailable";
+    let reason: string;
+    if (error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403)) reason = `Claude rejected the token (${error.status}); ${claudeCommand(account)}`;
+    else if (error instanceof ProviderHTTPError) reason = error.message;
+    else if (error instanceof ClaudeProbeError && error.message.startsWith("token expired")) reason = `token expired; ${claudeCommand(account)}`;
+    else if (error instanceof ClaudeProbeError && (error.kind === "denied" || error.kind === "timeout" || error.kind === "no_interaction")) reason = claudeGrantNeededReason(account.name);
+    else if (error instanceof ClaudeProbeError && error.kind === "missing" && /no credentials in Keychain/.test(error.message)) {
+      // The probe's own "no credentials" is ambiguous between a genuinely
+      // absent login and an item that exists but lost its ACL grant when
+      // Claude Code rewrote it (issue #9). Only the real probe path (darwin,
+      // no injected `keychain` test seam) ever reaches this branch, so the
+      // metadata lookup below is safe to run unconditionally here.
+      reason = (await claudeKeychainLapseReason(account, dependencies)) ?? error.message;
+    }
+    else if (error instanceof ClaudeProbeError) reason = error.message;
+    else if (error instanceof Error && error.message.startsWith("vendor response")) reason = error.message;
+    else if (darwin && !credentialLoaded) reason = `no credentials in Keychain for this config dir; ${claudeCommand(account)}`;
+    else if (/no credentials in Keychain/.test(message)) reason = `no credentials in Keychain for this config dir; ${claudeCommand(account)}`;
+    else if (/credentials unavailable|credentials invalid|unsafe permissions/.test(message)) reason = `no credentials for this config dir; ${claudeCommand(account)}`;
+    else reason = "Claude usage unavailable";
     return failed(account, reason, timestamp);
   }
 }

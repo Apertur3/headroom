@@ -76,7 +76,14 @@ cookies, which unlock paid subscriptions.
     performs the Anthropic request itself. It prints only bounded usage JSON; tokens, refresh
     tokens, and email never cross to Node. Run `headroom keychain grant` once interactively and
     choose "Always Allow" for this probe. An updated probe binary is a new ACL identity and asks
-    once more. There is no `security` fallback.
+    once more. There is no `security` fallback for reading the token itself -- only the probe ever
+    sees it. macOS also resets an item's access control list every time its contents are rewritten,
+    and Claude Code rewrites `Claude Code-credentials` on every token refresh, so a grant lapses on
+    its own and needs `headroom keychain grant` again; Headroom tells this apart from a genuinely
+    absent login with one metadata-only lookup, `security find-generic-password -s <service>`
+    (never `-w`), which macOS permits without the ACL grant precisely because it never decrypts the
+    secret data -- it can confirm the item exists and read its modification time without ever
+    touching the credential.
 11. **Bounded vendor input.** Credential-backed responses are limited to 1 MiB, JSON depth 32,
     arrays of 10,000 items, and strings of 64 KiB. The byte cap is enforced while streaming, not
     after buffering a complete body: TypeScript's `vendorText`/`vendorJson` read and count decoded

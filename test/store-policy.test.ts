@@ -228,6 +228,32 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("fires grant_lapsed once, on the :all meter only, for a detected Keychain ACL lapse (issue #9) -- never again once later polls fall back to the generic 'grant needed' wording", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-grant-lapsed-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const window = { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const };
+      const lapseReason = "Keychain grant lapsed; Claude Code rewrote its credentials at 2026-09-03 20:05:00; run: headroom keychain grant --principal claude-main";
+      const failing = (meter: string, reason: string, fetched_at: string) => observation({ principal_id: "claude-main", meter_id: meter, window: null, quantity: null, freshness: "failed", reason, fetched_at, observed_at: fetched_at });
+      // The exact shape the adapter/collector produce on the poll that first
+      // detects a lapse: all/fable/routines all failed with the identical
+      // lapse reason on the same poll.
+      store.insert(failing("claude-main:all", lapseReason, "2026-09-03T20:05:00Z"));
+      store.insert(failing("claude-main:fable", lapseReason, "2026-09-03T20:05:00Z"));
+      store.insert(failing("claude-main:routines", lapseReason, "2026-09-03T20:05:00Z"));
+      // Every later poll, once the collector has gated the principal, reuses
+      // the shorter generic wording instead -- never the lapse prefix again
+      // until a fresh lapse.
+      store.insert(failing("claude-main:all", "Keychain grant needed; run: headroom keychain grant --principal claude-main", "2026-09-03T20:10:00Z"));
+      const lapsed = store.events("2026-09-03T00:00:00Z").filter((event) => event.kind === "grant_lapsed");
+      expect(lapsed).toHaveLength(1);
+      expect(lapsed[0]).toMatchObject({ meter_id: "claude-main:all", principal_id: "claude-main", reason: lapseReason, origin: "vendor_reported" });
+      // source_failed still fires too (recordFailure's existing behavior,
+      // unchanged) -- grant_lapsed is additive, not a replacement.
+      expect(store.events("2026-09-03T00:00:00Z").filter((event) => event.kind === "source_failed" && event.meter_id === "claude-main:all")).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
   it("fires exactly one vendor_reported free_reset_granted event when Codex credits go from 0 to 1", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-credit-grant-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));

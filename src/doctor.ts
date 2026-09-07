@@ -1,9 +1,7 @@
-import { execFile } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
-import { claudeServiceName, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeServiceName, formatLocalTimestamp, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -21,7 +19,6 @@ import { updateNoticeLine } from "./update.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 import { headroomVersion } from "./version.js";
 
-const execFileAsync = promisify(execFile);
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
 export interface DoctorCheck { level: DoctorLevel; check: string; detail: string; fix: string; }
 
@@ -48,20 +45,22 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
     // A principal already marked grant-needed must never touch the Keychain
     // item again here: the keychainGrantCheck below already reports the same
     // FAIL, and probing anyway is exactly the extra Keychain touch the
-    // marker exists to prevent until the operator runs `keychain grant`.
+    // marker exists to prevent until the operator runs `keychain grant`. A
+    // detected ACL lapse (issue #9) prints the stored reason as-is -- it
+    // already names the rewrite time and the one-line fix -- while a plain
+    // denial keeps the shorter, generic wording this line has always used.
     if (grantsNeeded.has(account.name)) {
       store?.audit("doctor", "claude_probe", account.name, "skipped: grant needed");
-      return check("FAIL", `principal ${account.name} credential`, "Keychain grant needed; probe skipped", `headroom keychain grant --principal ${account.name}`);
+      const storedReason = grantsNeeded.get(account.name);
+      const detail = storedReason?.startsWith(CLAUDE_GRANT_LAPSED_PREFIX) ? storedReason : "Keychain grant needed; probe skipped";
+      return check("FAIL", `principal ${account.name} credential`, detail, `headroom keychain grant --principal ${account.name}`);
     }
-    try {
-      // Do not pass -w: doctor verifies Keychain metadata without ever reading a token.
-      await execFileAsync("security", ["find-generic-password", "-s", claudeServiceName(account.location)]);
-      store?.audit("doctor", "claude_probe", account.name, "called");
-      return check("OK", `principal ${account.name} credential`, "Claude Keychain item present", "no action needed");
-    } catch {
-      store?.audit("doctor", "claude_probe", account.name, "called");
-      return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`);
-    }
+    // Do not pass -w: doctor verifies Keychain metadata without ever reading a token.
+    const metadata = await claudeKeychainMetadata(claudeServiceName(account.location));
+    store?.audit("doctor", "claude_probe", account.name, "called");
+    if (!metadata.found) return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`);
+    const modified = metadata.modifiedAt ? `, last modified ${formatLocalTimestamp(metadata.modifiedAt)}` : "";
+    return check("OK", `principal ${account.name} credential`, `Claude Keychain item present${modified}`, "no action needed");
   }
   if (account.vendor === "grok") {
     // `location` may name the token file itself or the directory holding it.
