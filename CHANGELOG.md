@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Every UNKNOWN window (a failed or stale reading) now carries `last_known`: the newest fresh
+  reading of that same meter and window from the last 7 days, with its age, in the dense form, the
+  grouped view, `--json`, and MCP's `quota_status` -- informational only, `can`/`gate`/`route` still
+  treat UNKNOWN as no capacity.
+
+### Fixed
+- The Claude probe is signed under one stable "Headroom Local" identity again instead of ad-hoc, so
+  a macOS Keychain grant survives every rebuild: the identity is found by hash rather than by an
+  ambiguous name, lives in its own keychain so `codesign` never stops on a dialog, falls back to
+  ad-hoc after 30 seconds rather than hanging, honours `git config headroom.codesign-identity`
+  alongside `HEADROOM_CODESIGN_IDENTITY`, can be cleared with `build-probe.sh --reset-identity`,
+  and Headroom now decides a fresh grant is owed from the probe's signing identity rather than its
+  SHA-256.
+
 ## [0.1.0-beta.7] - 2026-09-08
 
 ### Changed

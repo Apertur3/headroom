@@ -125,8 +125,16 @@ free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 credentials or prompt content); `burn_percent_per_hour?: number | null`,
 `empty_in_seconds?: number | null`, `sustainable_percent_per_hour?: number |
 null` (present once pace-enriched, which every `status`/`can`/`gate`/`rate`
-read is); `id?: number` (present once read back from the store, as every
-`--json` reading is).
+read is); `last_known?: { used_percent: number, resets_at: string | null,
+observed_at: string, age_seconds: number } | null` (present once
+last-known-enriched, which every `status` read is; non-null only when this
+observation's own `freshness` is `failed` or `stale` -- the two values that
+always render as UNKNOWN -- and a fresh reading of the same meter and window
+exists within the last 7 days; the newest such reading, so a fail-closed
+caller can still see the trend behind an UNKNOWN. Informational only:
+`can`/`gate`/`route` keep treating UNKNOWN as no capacity regardless of what
+this carries); `id?: number` (present once read back from the store, as
+every `--json` reading is).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at

@@ -72,6 +72,9 @@ into a real reading instead of dispatching blind.
    `--allow-unknown` on purpose. Do not assume a failed read means room.
    A displayed `n/a` is different: the vendor confirms that window is not enforced, so Headroom
    ignores it for `can` and thresholds.
+   An UNKNOWN window may still show `last_known` (the newest fresh reading of that meter from the
+   last 7 days, with its age) so you can see the trend behind it -- read that as history, never as
+   a green light: `can`/`gate`/`route` already ignore it and answer NO the same as if it weren't there.
 
 ## Commands
 
