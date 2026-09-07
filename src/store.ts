@@ -1259,35 +1259,67 @@ export class HeadroomStore {
    * is. `pace.ts`'s withLastKnown() is the pure step that attaches this to
    * an observation; this method is only the read.
    *
+   * A windowless observation (`window: null`, what a Keychain grant or
+   * transport failure produces -- the failure speaks for the whole meter,
+   * not one window of it) is keyed `${meter_id}:none` instead, and its
+   * reading is looked up across every window of that meter rather than one:
+   * the tightest window (smallest minutes, i.e. the nearest reset) that
+   * still has a fresh reading in range wins, and the reading carries
+   * `window_minutes` so a caller knows which window it describes.
+   *
    * Local pools (window kind `state`) and credit counts (kind `count`) are
-   * skipped: neither carries a used percent, so there is nothing here for
-   * either to show. A meter and window with nothing fresh in range is simply
-   * absent from the returned map -- the caller's null.
+   * skipped throughout: neither carries a used percent, so there is nothing
+   * here for either to show. A meter and window with nothing fresh in range
+   * is simply absent from the returned map -- the caller's null.
    */
   lastKnownFor(observations: Array<Pick<Observation, "meter_id" | "window">>, now = new Date()): Map<string, LastKnownReading> {
     const output = new Map<string, LastKnownReading>();
     const seen = new Set<string>();
     const since = new Date(now.getTime() - 7 * 86_400_000).toISOString();
+    const readingFrom = (row: Row | undefined): { reading: Omit<LastKnownReading, "window_minutes">; windowMinutes: number | null } | undefined => {
+      if (!row) return undefined;
+      const stored = observationFromRow(row);
+      if (stored.quantity?.unit !== "percent") return undefined;
+      const observedMs = Date.parse(stored.observed_at);
+      if (!Number.isFinite(observedMs)) return undefined;
+      return {
+        reading: {
+          used_percent: stored.quantity.used, resets_at: stored.resets_at, observed_at: stored.observed_at,
+          age_seconds: Math.max(0, Math.round((now.getTime() - observedMs) / 1000)),
+        },
+        windowMinutes: stored.window?.minutes ?? null,
+      };
+    };
     for (const observation of observations) {
-      const minutes = observation.window?.minutes;
-      const kind = observation.window?.kind;
+      const window = observation.window;
+      if (window === null) {
+        const key = `${observation.meter_id}:none`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ?
+          AND window_json IS NOT NULL AND window_json <> 'null'
+          AND json_extract(window_json, '$.kind') NOT IN ('state', 'count')
+          AND freshness = 'fresh' AND fetched_at >= ?
+          ORDER BY CAST(json_extract(window_json, '$.minutes') AS INTEGER) ASC, fetched_at DESC, id DESC LIMIT 1`)
+          .get(observation.meter_id, since);
+        const found = readingFrom(row);
+        if (!found) continue;
+        output.set(key, { ...found.reading, window_minutes: found.windowMinutes });
+        continue;
+      }
+      const minutes = window.minutes;
+      const kind = window.kind;
       if (!minutes || kind === "state" || kind === "count") continue;
       const key = `${observation.meter_id}:${minutes}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const windowJson = JSON.stringify(observation.window);
+      const windowJson = JSON.stringify(window);
       const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND window_json = ?
         AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
         .get(observation.meter_id, windowJson, since);
-      if (!row) continue;
-      const stored = observationFromRow(row);
-      if (stored.quantity?.unit !== "percent") continue;
-      const observedMs = Date.parse(stored.observed_at);
-      if (!Number.isFinite(observedMs)) continue;
-      output.set(key, {
-        used_percent: stored.quantity.used, resets_at: stored.resets_at, observed_at: stored.observed_at,
-        age_seconds: Math.max(0, Math.round((now.getTime() - observedMs) / 1000)),
-      });
+      const found = readingFrom(row);
+      if (!found) continue;
+      output.set(key, found.reading);
     }
     return output;
   }

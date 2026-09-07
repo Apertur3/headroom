@@ -132,4 +132,17 @@ describe("withLastKnown", () => {
     withLastKnown([original], new Map([["claude-main:all:300", reading]]));
     expect((original as Partial<Observation>).last_known).toBeUndefined();
   });
+
+  it("looks a windowless failure up by meter:none, since the failure speaks for the whole meter and not one window of it", () => {
+    const borrowed: LastKnownReading = { used_percent: 41, resets_at: "2026-09-10T00:00:00Z", observed_at: "2026-09-03T00:05:00Z", age_seconds: 21_600, window_minutes: 10_080 };
+    const map = new Map([["claude-main:all:none", borrowed]]);
+    const [failed] = withLastKnown([observation({ window: null, quantity: null, freshness: "failed" })], map);
+    expect(failed.last_known).toEqual(borrowed);
+  });
+
+  it("is null for a windowless failure when the map has nothing under meter:none", () => {
+    const map = new Map([["claude-main:all:300", reading]]);
+    const [failed] = withLastKnown([observation({ window: null, quantity: null, freshness: "failed" })], map);
+    expect(failed.last_known).toBeNull();
+  });
 });

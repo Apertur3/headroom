@@ -245,6 +245,38 @@ describe("status view: last known beside UNKNOWN", () => {
     ).join("\n");
     expect(grouped).not.toContain("last ");
   });
+
+  // A windowless failure (window: null -- a Keychain grant or transport
+  // failure, which speaks for the whole meter) borrows its last_known from a
+  // different window than the row it is attached to, so that reading names
+  // its source window ("wk") ahead of the percent in every form.
+  const WEEKLY_LAST_KNOWN = { ...LAST_KNOWN, window_minutes: 10_080 };
+
+  function windowlessRow(overrides: Partial<Observation> = {}): Observation {
+    return unknownRow({ window: null, ...overrides });
+  }
+
+  it("names the borrowed window ahead of the percent in the dense form", () => {
+    const dense = renderStatus({ observations: [windowlessRow({ last_known: WEEKLY_LAST_KNOWN })], policy: defaultPolicy, now: KNOWN_NOW }, options({ form: "plain" })).join("\n");
+    expect(dense).toBe(`claude-main:fable  - UNKNOWN (${REASON}; last wk 41% at 00:05, 65m ago)  (failed <1m)`);
+  });
+
+  it("names the borrowed window ahead of the percent in the grouped view", () => {
+    const grouped = renderStatus(
+      { observations: [windowlessRow({ last_known: WEEKLY_LAST_KNOWN })], policy: defaultPolicy, vendors: new Map([["claude-main", "claude"]]), now: KNOWN_NOW },
+      options(),
+    ).join("\n");
+    expect(grouped).toContain("-  last wk 41%, 65m ago  UNKNOWN");
+  });
+
+  it("names no window when the borrowed reading came from the row's own window minutes (window_minutes absent)", () => {
+    const grouped = renderStatus(
+      { observations: [unknownRow({ last_known: LAST_KNOWN })], policy: defaultPolicy, vendors: new Map([["claude-main", "claude"]]), now: KNOWN_NOW },
+      options(),
+    ).join("\n");
+    expect(grouped).toContain("-  last 41%, 65m ago  UNKNOWN");
+    expect(grouped).not.toContain("last wk");
+  });
 });
 
 describe("status view: the footer", () => {

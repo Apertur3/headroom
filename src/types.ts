@@ -118,6 +118,13 @@ export interface LastKnownReading {
   resets_at: string | null;
   observed_at: string;
   age_seconds: number;
+  /** Which window this reading is from, in minutes. Present only when the
+   * observation it is attached to has no window of its own (a whole-meter
+   * failure, e.g. a Keychain grant or transport failure) -- the reading then
+   * comes from a different window than the failed one, so a reader needs
+   * this to know what it describes. Absent (not merely null) for a windowed
+   * failure, where the row's own window already says that. */
+  window_minutes?: number | null;
 }
 
 export type PaceState = "HARVEST" | "NORMAL" | "CONSERVE" | "FREEZE" | "UNKNOWN" | "NOT_ENFORCED" | "UP" | "BUSY" | "DOWN";

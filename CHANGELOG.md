@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A windowless failed reading (`window: null`, what a Keychain grant or transport failure produces)
+  now gets its `last_known` too: previously the beta.8 lookup was keyed by meter and window minutes,
+  so a windowless row -- which has no window of its own -- always came back `last_known: null` even
+  with a fresh reading minutes old. It now borrows the newest fresh reading from the tightest window
+  of the same meter (nearest reset, when more than one qualifies) and names that window
+  (`window_minutes`) in the `last_known` object, in the dense form, the grouped view and `--json`.
+
 ## [0.1.0-beta.8] - 2026-09-08
 
 ### Added

@@ -41,13 +41,27 @@ function formatDay(value: string | null | undefined): string {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
-export function label(observation: Observation): string {
-  const minutes = observation.window?.minutes;
+/** Same short window word `label()` below uses, from a bare minutes number
+ * rather than an observation -- for a `last_known.window_minutes`, which
+ * names a different window than the one the reading is attached to. */
+function labelForMinutes(minutes: number | null | undefined): string {
   if (minutes === 300) return "5h";
   if (minutes === 10_080) return "wk";
   if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
   if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
   return minutes ? `${minutes}m` : "-";
+}
+
+export function label(observation: Observation): string {
+  return labelForMinutes(observation.window?.minutes);
+}
+
+/** "wk " / "5h " ahead of a last_known reading's percent when it names a
+ * window other than the row it is attached to (a windowless failure whose
+ * reading was borrowed from another window of the same meter) -- empty for
+ * an ordinary same-window last_known, which needs no such disambiguation. */
+function lastKnownWindowPrefix(lastKnown: NonNullable<Observation["last_known"]>): string {
+  return lastKnown.window_minutes !== undefined ? `${labelForMinutes(lastKnown.window_minutes)} ` : "";
 }
 
 function windowKey(observation: Observation): string { return `${observation.meter_id}:${observation.window?.minutes ?? "none"}`; }
@@ -74,9 +88,10 @@ function lastKnownAge(lastKnown: NonNullable<Observation["last_known"]>): string
 
 /** "last 41%, 65m ago" -- the compact form used in the grouped view's own
  * reset column, where the row's meter and window already say which reading
- * this is. */
+ * this is. A windowless row's borrowed reading gets its source window named
+ * first instead: "last wk 41%, 6h ago". */
 function lastKnownCompact(lastKnown: NonNullable<Observation["last_known"]>): string {
-  return `last ${Math.round(lastKnown.used_percent)}%, ${lastKnownAge(lastKnown)} ago`;
+  return `last ${lastKnownWindowPrefix(lastKnown)}${Math.round(lastKnown.used_percent)}%, ${lastKnownAge(lastKnown)} ago`;
 }
 
 function windowOrder(observation: Observation): number {
@@ -143,7 +158,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     // The last known reading is named "at <clock time>" here (unlike the
     // grouped view's more compact form below) because the dense form has no
     // separate column to put it in -- it all lives inside one parenthetical.
-    const known = observation.last_known ? `; last ${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
+    // A windowless row's borrowed reading names its source window first
+    // ("last wk 41% at ...") the same way the compact form does.
+    const known = observation.last_known ? `; last ${lastKnownWindowPrefix(observation.last_known)}${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
     return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${evidence}`;
   }
   const seconds = resetsIn(observation.resets_at, now).resets_in_seconds;
