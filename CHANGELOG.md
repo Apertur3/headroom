@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] - 2026-09-08
+
 ### Fixed
 - A windowless failed reading (`window: null`, what a Keychain grant or transport failure produces)
   now gets its `last_known` too: previously the beta.8 lookup was keyed by meter and window minutes,
