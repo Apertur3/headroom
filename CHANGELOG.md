@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.8] - 2026-09-08
+
 ### Added
 - Every UNKNOWN window (a failed or stale reading) now carries `last_known`: the newest fresh
   reading of that same meter and window from the last 7 days, with its age, in the dense form, the
