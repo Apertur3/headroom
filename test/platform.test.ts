@@ -115,6 +115,10 @@ describe("service generators", () => {
   });
 
   it("keeps a complete systemd user unit", async () => {
+    // The unit's log path derives from the home passed in, not from the
+    // test worker's isolated HEADROOM_HOME.
+    const previousHome = process.env.HEADROOM_HOME; delete process.env.HEADROOM_HOME;
+    try {
     const result = await installService("/usr/bin/headroom", "linux", "/home/example", "/usr/bin/node", true);
     expect(result.command).toBe("systemctl --user enable --now headroom.service");
     const unit = serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", "example", "/home/example");
@@ -125,6 +129,7 @@ describe("service generators", () => {
     expect(plist).toContain("<key>StandardOutPath</key><string>/Users/example/.headroom/logs/daemon.log</string>");
     expect(plist).toContain("<key>StandardErrorPath</key><string>/Users/example/.headroom/logs/daemon.log</string>");
     expect(plist).toContain("<key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/example/.local/bin:/opt/homebrew/bin");
+    } finally { if (previousHome !== undefined) process.env.HEADROOM_HOME = previousHome; }
   });
 
   it("a --dry-run install carries the full unit/plist/task text it would have written, on all three platforms", async () => {
