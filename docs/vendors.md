@@ -65,6 +65,21 @@ other profile. Headroom never reads that token itself there: a signed helper bin
 so the token never reaches Node or Headroom's own output. On Linux and Windows, Headroom reads the
 token directly from `<config-dir>/.credentials.json` (default `~/.claude/.credentials.json`).
 
+**Keychain grants lapse on their own.** macOS resets an item's access control list every time
+its contents are rewritten, and Claude Code rewrites `Claude Code-credentials` on every token
+refresh -- so a grant `headroom keychain grant` gave the probe stops working again the next time
+Claude Code refreshes, with no action on Headroom's part. The probe itself cannot tell that apart
+from a genuinely absent login (both look like "no credentials" from inside it), so the adapter
+runs a second, metadata-only lookup (`security find-generic-password -s <service>`, never `-w`,
+which macOS permits without the ACL grant) to check whether the item exists. When it does, Headroom
+reports the real cause -- "Keychain grant lapsed; Claude Code rewrote its credentials at \<local
+time\>; run: headroom keychain grant --principal \<name\>" -- instead of the misleading "no
+credentials" message, and the daemon stops polling that principal until the grant is redone, the
+same as any other denial. A profile reading through the statusline snapshot (above) keeps its
+account-wide `:all` row alive through a lapse regardless, since that path never touches the
+Keychain at all; only the scoped meters (Fable, Routines) that need the probe go stale until the
+grant is redone.
+
 Meters emitted: `<principal>:all` (the 5-hour and 7-day windows from the response's `five_hour`
 and `seven_day` fields), `<principal>:fable`, `<principal>:routines`, and one
 `<principal>:<model-slug>` meter for every other model-scoped bucket the response's `limits[]`

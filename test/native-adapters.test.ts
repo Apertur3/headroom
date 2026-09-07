@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-  ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
-  claudeResponseShape, claudeServiceName, observationsFromClaudeUsage, observeClaude, syncClaudeGrantState,
+  CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
+  claudeResponseShape, claudeServiceName, isClaudeGrantIssue, observationsFromClaudeUsage, observeClaude,
+  parseKeychainModifiedAt, syncClaudeGrantState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import {
@@ -616,6 +617,63 @@ describe("Claude Keychain grant gate", () => {
     expect(timedOut[0].reason).toBe(claudeGrantNeededReason("claude-main"));
     expect(denied.every((row) => row.freshness === "failed")).toBe(true);
     expect(denied[0].reason).toBe("Keychain grant needed; run: headroom keychain grant --principal claude-main");
+  });
+
+  it("parseKeychainModifiedAt reads the mdat attribute as a UTC instant, and returns undefined for anything else", () => {
+    const dump = ["keychain: \"/x/login.keychain-db\"", "attributes:", '    "mdat"<timedate>=0x32303236303930373035323434335A00  "20260907052443Z\\000"'].join("\n");
+    expect(parseKeychainModifiedAt(dump)?.toISOString()).toBe("2026-09-07T05:24:43.000Z");
+    expect(parseKeychainModifiedAt("no mdat line here")).toBeUndefined();
+    expect(parseKeychainModifiedAt("")).toBeUndefined();
+  });
+
+  it("isClaudeGrantIssue recognizes a plain denial and a detected lapse, and nothing else", () => {
+    expect(isClaudeGrantIssue(claudeGrantNeededReason("claude-main"))).toBe(true);
+    expect(isClaudeGrantIssue(`${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at 2026-09-07 05:24:43; run: headroom keychain grant --principal claude-main`)).toBe(true);
+    expect(isClaudeGrantIssue("no credentials in Keychain for this config dir")).toBe(false);
+    expect(isClaudeGrantIssue("token expired; run: claude")).toBe(false);
+    expect(isClaudeGrantIssue(null)).toBe(false);
+    expect(isClaudeGrantIssue(undefined)).toBe(false);
+  });
+
+  it("a probe's 'no credentials' becomes a Keychain-lapsed reason, naming the local rewrite time and the fix, when a metadata-only lookup still finds the item (issue #9)", async () => {
+    const modifiedAt = new Date("2026-09-07T05:24:43Z");
+    const rows = await observeClaude(claude, {
+      platform: "darwin",
+      now: () => at,
+      probe: async () => { throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir"); },
+      keychainMetadata: async (service) => { expect(service).toBe(claudeServiceName(claude.location)); return { found: true, modifiedAt }; },
+    });
+    expect(rows.every((row) => row.freshness === "failed")).toBe(true);
+    expect(rows[0].reason).toMatch(new RegExp(`^${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}; run: headroom keychain grant --principal claude-main$`));
+    expect(isClaudeGrantIssue(rows[0].reason)).toBe(true);
+  });
+
+  it("says 'an unknown time' rather than fabricating one when the item is found but its mdat could not be parsed", async () => {
+    const rows = await observeClaude(claude, {
+      platform: "darwin", now: () => at,
+      probe: async () => { throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir"); },
+      keychainMetadata: async () => ({ found: true }),
+    });
+    expect(rows[0].reason).toBe("Keychain grant lapsed; Claude Code rewrote its credentials at an unknown time; run: headroom keychain grant --principal claude-main");
+  });
+
+  it("keeps the original 'no credentials' wording, never fabricating a lapse, once the metadata lookup confirms the item is genuinely absent", async () => {
+    const rows = await observeClaude(claude, {
+      platform: "darwin", now: () => at,
+      probe: async () => { throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir"); },
+      keychainMetadata: async () => ({ found: false }),
+    });
+    expect(rows[0].reason).toBe("no credentials in Keychain for this config dir");
+  });
+
+  it("never runs the metadata lookup for a denial, timeout, or interaction-blocked probe failure -- only for the ambiguous 'no credentials' case", async () => {
+    const mustNotRun = async (): Promise<never> => { throw new Error("must not be called: not the ambiguous 'no credentials' case"); };
+    const denied = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("denied", "Keychain access denied"); }, keychainMetadata: mustNotRun });
+    const timedOut = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("timeout", "Keychain access timed out"); }, keychainMetadata: mustNotRun });
+    const expired = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("missing", "token expired"); }, keychainMetadata: mustNotRun });
+    expect(denied[0].reason).toBe(claudeGrantNeededReason("claude-main"));
+    expect(timedOut[0].reason).toBe(claudeGrantNeededReason("claude-main"));
+    expect(expired[0].reason).toBe(`token expired; run: CLAUDE_CONFIG_DIR=${resolve(claude.location)} claude`);
   });
 
   it("builds synthetic gate-blocked observations without ever attempting the probe", () => {
