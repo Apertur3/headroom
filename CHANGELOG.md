@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `headroom dashboard` (alias `top`): live terminal quota bars, burn sparklines, events, leases and reserves, with cached reads, pause/verbose keys and a script-safe single-frame mode.
+
+### Changed
+- Notifications now have phone-friendly emoji messages, calm/quiet/everything presets with event overrides, and a shared picker in setup and `headroom notify configure`.
+- The macOS probe reads the Claude credential through `/usr/bin/security`, which the Keychain
+  item's own access list admits since Claude Code 2.1.263 stopped admitting third-party
+  applications, so no Keychain dialog and no grant is involved any more: `headroom keychain grant`
+  is now a check that reports whether the credential is readable, `headroom setup` has no Keychain
+  step, doctor reports the credential as readable through the Apple security tool, and a marker
+  left by the old probe-rebuild detection is retired on the next run rather than gating a principal
+  that was never blocked.
+- A `reset_seen` fired before its window's own scheduled instant, with no reset credit consumed, is
+  now marked `metadata.unscheduled` (issue #20): the status row shows `reset seen HH:MM
+  (unscheduled)` and the grouped view names it under the principal for a flat 24 hours regardless of
+  the window's own duration, `gate`/`plan`/`fill` (CLI and MCP) carry a `notices` array for the same
+  24 hours on any meter checked, and the notifier gives `reset_seen` two dedicated texts naming the
+  window and whether it was scheduled -- a scheduled reset on the 5h window is held back from
+  notifications by default (`notify_scheduled_short = true` opts back in), since it happens five
+  times a day and is not itself unusual the way an unscheduled reset or a scheduled weekly one is.
+
 ## [0.1.0-beta.10] - 2026-09-08
 
 ### Fixed

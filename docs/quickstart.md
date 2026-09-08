@@ -33,12 +33,14 @@ one this walkthrough assumes. To work from source instead, clone the repository,
 
 `headroom setup` does sections 2 through 7 below for you, one step at a time: it prints what
 each step is about to do, asks a yes/no question before anything that changes something, and
-skips the Keychain dialog and the MCP registration if you say no. `--dry-run` shows the whole
-plan without changing anything; `--yes` answers yes to every step except the Keychain grant,
-which it never runs on its own -- it prints the command for you to run yourself instead;
-`--skip-service` and `--skip-mcp` leave those two steps out entirely. The sections below are
+skips the MCP registration if you say no. `--dry-run` shows the whole plan without changing
+anything; `--yes` accepts the main setup steps; `--skip-service` and `--skip-mcp` leave those two
+steps out entirely. The sections below are
 still the explanation of what each step does and why; read them if you want the detail, or if
 something `setup` reports needs a closer look.
+
+After the service step, setup optionally offers notification channels, presets and quiet hours.
+`--yes` skips notifications; run `headroom notify configure` later to choose or change them.
 
 ## 2. Find your accounts
 
@@ -85,92 +87,32 @@ started) the checks end with an ordered punch list:
 
 ```
 Next steps:
-1. headroom keychain grant
-2. headroom install-service
-3. claude mcp add headroom -- npx headroomd mcp
+1. headroom install-service
+2. claude mcp add headroom -- npx headroomd mcp
 ```
 
-(step 1 only appears on macOS). Run `headroom --help` any time for the full command list, or
-`headroom <command> --help` for one command's usage.
+Run `headroom --help` any time for the full command list, or `headroom <command> --help` for one
+command's usage.
 
-## 4. Grant Keychain access (macOS only)
+## 4. Check the Claude credential (macOS only)
 
 ```sh
 headroom keychain grant
 ```
 
-Claude Code stores its OAuth token in the macOS Keychain, under the service name
-`Claude Code-credentials` for `~/.claude`, or `Claude Code-credentials-<8 hex characters>` for any
-other config directory. Headroom never reads that token itself: it runs a small binary,
-`headroom-claude-probe`, which reads the Keychain item and makes the usage request in the same
-process, so the token never reaches Node or stdout. That binary is built by
-`scripts/build-probe.sh` (a universal macOS binary, verified against a recorded SHA-256 before
-every use) and, by default, signed under a **stable local identity** named "Headroom Local" that
-`build-probe.sh` creates once, in a keychain of its own
-(`~/Library/Keychains/headroom-local-signing.keychain-db`), and reuses for every later build. This
-is why a rebuild -- a new headroomd version, `npm run engine:build`, `npm pack`, `release:check` --
-does not ask for the Keychain dialog again: every build after the first is signed under the exact
-same identity, and macOS keys the item's access control list on the signer, not on the binary's
-contents. Creating that identity needs no dialog of its own. `headroom keychain grant` triggers one
-macOS Keychain access dialog for the probe itself, and that grant survives every rebuild from then
-on. Choose Always Allow so future polls don't prompt again. To sign with a different identity (a
-real Developer ID, once this ships past beta), set `HEADROOM_CODESIGN_IDENTITY` or run `git config
-headroom.codesign-identity "Developer ID Application: ..."` in the clone. If creating or using the
-identity fails for any reason -- including a sign that has not finished within 30 seconds, which
-means a Keychain dialog with nobody to answer it -- `build-probe.sh` falls back to ad-hoc signing
-with a printed warning, and every rebuild after that will ask again, the same as headroomd versions
-before this one. `bash scripts/build-probe.sh --reset-identity` deletes the local identity and its
-keychain if you ever need to start over.
-
-`keychain grant` always grants the exact probe binary the background daemon actually uses, not
-whichever one happens to resolve for the CLI process running the command: it reads the pinned
-probe path this Headroom home was granted under (set by the first successful grant) and runs that
-one, printing which binary it granted (`Keychain access granted for claude-main (probe:
-/path/to/headroom-claude-probe)`). This matters when the daemon runs a different install than the
-CLI you happen to be typing into -- a repo checkout's `install-service` pointed a launchd/systemd
-service at that checkout's binary, but you run `headroom keychain grant` from a separate global npm
-install -- since granting whatever this CLI resolves on its own would grant the wrong binary and
-leave the daemon still reporting "Keychain grant needed". If the pinned binary has been removed or
-replaced, `keychain grant` refuses rather than silently substituting a different one: it names the
-missing path and offers `headroom keychain grant --use-this-build`, which grants (and re-pins the
-daemon to) whatever probe this CLI build resolves on its own. `headroom doctor`'s "probe binary"
-line reports the same comparison ahead of time -- OK when the CLI's probe and the daemon's pinned
-probe are the same file or share a signing identity, WARN otherwise, naming both paths. If you run
-more than one Claude Code profile, repeat the grant once per profile:
-
-```sh
-headroom keychain grant --principal claude-2
-```
-
-If a config dir has no Claude Code login at all yet, `keychain grant` says so instead of popping a
-dialog for nothing:
-
-```
-no Claude login for /Users/you/.claude2; run: CLAUDE_CONFIG_DIR=/Users/you/.claude2 claude, or remove this principal from accounts.toml
-```
-
-Running `keychain grant` from a sandboxed or remote shell (an agent's own shell, not a Terminal
-window) is a different, and more common, failure: macOS refuses to show the Keychain access dialog
-at all there, even when doctor already confirms the Keychain item is present. Headroom distinguishes
-this from "no login" and says so plainly:
-
-```
-claude-main: the Keychain dialog cannot be shown from this shell; run this command in your own Terminal
-```
-
-A grant that worked yesterday can also lapse on its own -- macOS resets an item's access control
-list every time Claude Code rewrites it on token refresh -- in which case the daemon reports
-`Keychain grant lapsed; ...` instead of "no credentials" and the fix is the same: run
-`headroom keychain grant --principal <name>` again.
-
-On Linux and Windows there's no Keychain step: Headroom reads the token straight from
+Claude Code stores its OAuth token in the macOS Keychain, and Headroom's probe reads it through
+`/usr/bin/security`, which the Keychain item's own access list admits -- there is no dialog to
+answer and nothing to grant, so this command only runs the probe once and reports either
+`claude-main: credential readable, no dialog needed (probe: /path/to/headroom-claude-probe)` or
+the real error (an absent login, a `security` run that failed, an expired token). On Linux and
+Windows there is no Keychain at all: Headroom reads the token straight from
 `<config-dir>/.credentials.json`.
 
-## 4b. Or skip the Keychain dialog entirely: `headroom statusline`
+## 4b. Or skip the credential read entirely: `headroom statusline`
 
 Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
 `rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`, `resets_at`) -- the exact
-numbers `keychain grant` and the vendor probe exist to fetch, already sitting on stdin for free.
+numbers the vendor probe exists to fetch, already sitting on stdin for free.
 Register `headroom statusline` as that command and Headroom reads it as a zero-auth source instead:
 
 ```json
@@ -181,7 +123,7 @@ Register `headroom statusline` as that command and Headroom reads it as a zero-a
 
 Add this to `~/.claude/settings.json` for the default profile, or `<CLAUDE_CONFIG_DIR>/settings.json`
 for any other profile (e.g. `~/.claude2/settings.json` for `claude-2`) -- one line per profile,
-same as `keychain grant --principal`. Claude Code only supports one `statusLine` command; if you
+same as `keychain grant --principal <name>`. Claude Code only supports one `statusLine` command; if you
 already have one, chain it instead of replacing it:
 
 ```json
@@ -239,15 +181,13 @@ ever calls a vendor, so the line cannot delay your prompt.
 
 Every reading this way snapshots to `~/.headroom/statusline/<profile>.json` (0600); the collector
 prefers a snapshot under 10 minutes old over the vendor probe, and reads a Fable-scoped or other
-model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **This removes
-the macOS Keychain dialog entirely for a profile set up this way** -- no `headroom keychain grant`
-ever needed for it, since Headroom never has to open the Keychain item itself. A profile whose
-statusline hasn't rendered yet (or has gone stale) still falls back to the probe, subject to the
-usual grant gate.
+model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **A profile
+set up this way is read without opening the Keychain item at all.** A profile whose statusline
+hasn't rendered yet (or has gone stale) still falls back to the probe.
 
 ## 4c. When the meter is blocked, paste the panel
 
-Some readings only ever exist on screen: a probe the operator has not granted, a machine where the
+Some readings only ever exist on screen: a probe that cannot reach the credential, a machine where the
 statusline has not rendered yet, or a model-scoped weekly bar sitting near its cap while the
 account-wide window still looks free. Run `/usage` in Claude Code, copy the panel, and hand it to
 Headroom:
@@ -338,6 +278,35 @@ antigravity  antigravity  failed <1m
 ```
 
 That resolves itself once you install the daemon in the next step.
+
+### Live dashboard
+
+Run `headroom dashboard` (or `headroom top`) for an automatically updating terminal view.
+It refreshes every 5 seconds; `--interval 2` selects the minimum interval. Every frame reads
+cached data through the daemon socket with a 500 ms budget, then falls back to the store.
+It never polls a vendor. Here, `direct read` means reading the local cache.
+
+```text
+Headroom 0.1.0 | daemon fresh 30 s ago | 12:00:00 UTC
+
+account-a  claude  Max  fresh <1m
+  all        5h  [####................]  20% resets in 4h NORMAL  ·▁▂▃▄▅▆▇█▅▃▂
+  credits  12 available
+
+gpu-box  local
+  capacity  BUSY  model=local-27b  queue=1  running=2
+
+EVENTS (last 8)                              | LEASES / RESERVES / PACING
+11:50:00 !unscheduled reset_seen account-a:all | worker account-a:all 5% held
+                                            | reserve account-a:all: 10%
+q quit  p pause  v verbose  e events  ? help
+```
+
+This example uses mock data. `p` pauses/resumes reads, `v` shows burn, sustainable pace, reset
+evidence and idle markers, `e` widens events, `?` shows key help, and `q` exits. The terminal is
+restored on exit or error. Below 80 columns the footer stacks; sparklines appear when space
+allows. Short terminals show an overflow notice. Colour requires a terminal; `NO_COLOR` or
+`--no-color` disables it. `--once`, or piping stdout, prints one grouped frame and exits.
 
 ## 6. Install the daemon
 
@@ -491,9 +460,8 @@ headroom uninstall --dry-run    # prints the plan; changes nothing
 3. **With `--home`**, deletes the Headroom home directory: the database, logs, and config,
    including `accounts.toml` -- so that goes with it too. This step asks first (`y/N`); `--yes`
    answers yes without asking, and neither `--home` nor a plain run without it touches this
-   directory. The Keychain grant marker lives inside this directory and is deleted with it; the
-   separate macOS Keychain ACL granted to the probe binary itself disappears when that binary is
-   removed, not from this step.
+   directory. Headroom holds no macOS Keychain permission of its own to remove: it reads the
+   Claude credential through `/usr/bin/security`, and the Keychain item belongs to Claude Code.
 4. **Prints the npm uninstall command** -- `npm uninstall -g headroomd`. Headroom cannot remove its
    own package while it is running, so this is always left for you to run yourself.
 

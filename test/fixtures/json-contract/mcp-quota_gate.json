@@ -6,6 +6,9 @@
   "meters_checked": [
     "string"
   ],
+  "notices": [
+    "unknown (empty array in the fixture data)"
+  ],
   "reason": "string",
   "source": "string"
 }
