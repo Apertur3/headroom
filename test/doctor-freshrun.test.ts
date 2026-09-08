@@ -15,10 +15,14 @@ async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise
 }
 
 describe("nextSteps", () => {
-  it("orders keychain grant, install-service, mcp add, gating keychain grant to macOS", () => {
-    expect(nextSteps("darwin")).toEqual(["headroom keychain grant", "headroom install-service", "claude mcp add headroom -- npx headroomd mcp"]);
-    expect(nextSteps("linux")).toEqual(["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"]);
-    expect(nextSteps("win32")).toEqual(["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"]);
+  it("orders install-service then mcp add, with no Keychain grant step on any platform", () => {
+    // macOS included: the probe reads the Claude credential through the Apple
+    // security tool the Keychain item already admits, so a first run has
+    // nothing to grant.
+    const steps = ["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"];
+    expect(nextSteps("darwin")).toEqual(steps);
+    expect(nextSteps("linux")).toEqual(steps);
+    expect(nextSteps("win32")).toEqual(steps);
   });
 });
 

@@ -2,8 +2,9 @@ import { execFile, spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { createInterface, type Interface } from "node:readline/promises";
 import { promisify } from "node:util";
-import { doctor, doctorChecks, type DoctorCheck } from "./doctor.js";
-import { isAccountsMissingError, keychain, observe } from "./cli.js";
+import { configureNotifications, type Ask } from "./notify-configure.js";
+import { doctor } from "./doctor.js";
+import { isAccountsMissingError, observe } from "./cli.js";
 import { accountsPath, accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { installService } from "./service.js";
 import { safeError } from "./security.js";
@@ -11,8 +12,8 @@ import { safeError } from "./security.js";
 const execFileAsync = promisify(execFile);
 
 export interface SetupOverrides {
-  /** Real Keychain access; overridden in tests so no dialog is ever attempted. */
-  keychainGrant?: (argv: string[]) => Promise<number>;
+  ask?: Ask;
+  configureNotify?: (ask: Ask) => Promise<number>;
   /** Checks PATH for the `claude` command; overridden in tests to avoid depending on the machine. */
   claudeOnPath?: () => Promise<boolean>;
   /** Runs `claude mcp add ...` for real; overridden in tests so `~/.claude.json` is never touched. */
@@ -30,7 +31,7 @@ interface SetupOptions {
    * prompt it cannot answer. */
   planOnly: boolean;
   interactive: boolean;
-  rl: Interface | undefined;
+  rl: Pick<Interface, "question"> | undefined;
 }
 
 async function defaultClaudeOnPath(): Promise<boolean> {
@@ -107,6 +108,7 @@ async function stepDiscoverAccounts(options: SetupOptions): Promise<boolean> {
 
 async function stepDoctor(options: SetupOptions): Promise<boolean> {
   console.log("Step 2: run doctor");
+  if (process.platform === "darwin") console.log("  macOS: no Keychain dialog to answer; the Claude credential is read through /usr/bin/security, which the item already admits.");
   if (options.planOnly) {
     // doctor() opens (and so creates) the Headroom home database and, on
     // macOS, looks up Keychain item metadata for each configured Claude
@@ -119,54 +121,8 @@ async function stepDoctor(options: SetupOptions): Promise<boolean> {
   return true;
 }
 
-function keychainAccountName(check: DoctorCheck): string | undefined {
-  return /^principal (\S+) (?:credential|keychain grant)$/.exec(check.check)?.[1];
-}
-
-async function stepKeychainGrant(options: SetupOptions, overrides: SetupOverrides): Promise<boolean> {
-  console.log("Step 3: grant Keychain access");
-  if (process.platform !== "darwin") {
-    console.log("  skipped; not macOS");
-    return true;
-  }
-  if (options.planOnly) {
-    // doctorChecks() opens (and so creates) the Headroom home database and
-    // performs a Keychain metadata lookup per configured Claude principal --
-    // real reads a plan must never perform. Describe the step instead of
-    // running it; a dry run leaves an empty temporary home empty.
-    console.log("  (dry run) would run: headroom doctor to find configured Claude principals needing a Keychain grant, then headroom keychain grant --principal <name> for each one still missing it");
-    return true;
-  }
-  const keychainGrant = overrides.keychainGrant ?? keychain;
-  let checks: DoctorCheck[];
-  try { checks = await doctorChecks(); }
-  catch (error) { return surviveStepError(options, error); }
-  const needed = checks.filter((item) => item.level === "FAIL" && item.fix.startsWith("headroom keychain grant"));
-  const names = [...new Set(needed.map(keychainAccountName).filter((name): name is string => name !== undefined))];
-  if (!names.length) {
-    console.log("  already granted for every configured Claude principal (or none configured)");
-    return true;
-  }
-  console.log("  This opens one macOS Keychain access dialog per principal below. Answer it with Always Allow, or every future poll will prompt again.");
-  const commands = names.map((name) => `headroom keychain grant --principal ${name}`);
-  if (options.yes) {
-    // The one step --yes never runs on its own: print what the user needs to run themselves.
-    for (const command of commands) console.log(`  run this yourself: ${command}`);
-    return true;
-  }
-  if (!(await confirm(options, `  Run ${commands.length === 1 ? commands[0] : `${commands.length} Keychain grants`} now?`))) {
-    for (const command of commands) console.log(`  skipped; run later: ${command}`);
-    return true;
-  }
-  for (const name of names) {
-    try { await keychainGrant(["grant", "--principal", name]); }
-    catch (error) { if (!(await surviveStepError(options, error))) return false; }
-  }
-  return true;
-}
-
 async function stepInstallService(options: SetupOptions): Promise<boolean> {
-  console.log("Step 4: install the background service (launchd, systemd user unit, or Windows Task Scheduler)");
+  console.log("Step 3: install the background service (launchd, systemd user unit, or Windows Task Scheduler)");
   if (options.skipService) {
     console.log("  skipped via --skip-service");
     return true;
@@ -193,8 +149,24 @@ async function stepInstallService(options: SetupOptions): Promise<boolean> {
   return true;
 }
 
+export async function stepNotifications(options: { yes: boolean; planOnly: boolean; rl?: Pick<Interface, "question"> }, overrides: SetupOverrides = {}): Promise<boolean> {
+  console.log("Notifications (optional)");
+  if (options.yes || options.planOnly || !options.rl) {
+    console.log("  skipped; run `headroom notify configure` later");
+    return true;
+  }
+  if (!isYes(await options.rl.question("Notifications? [y/N] "))) {
+    console.log("  skipped; run `headroom notify configure` later");
+    return true;
+  }
+  const ask: Ask = (question) => options.rl!.question(question);
+  const code = await (overrides.configureNotify ?? ((ask: Ask) => configureNotifications([], { ask })))(ask);
+  if (code) console.log("  Notifications need attention; run `headroom notify configure` later");
+  return true;
+}
+
 async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promise<boolean> {
-  console.log("Step 5: register the MCP server for Claude Code");
+  console.log("Step 4: register the MCP server for Claude Code");
   if (options.skipMcp) {
     console.log("  skipped via --skip-mcp");
     return true;
@@ -225,7 +197,7 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
 }
 
 async function stepFinalCheck(options: SetupOptions): Promise<boolean> {
-  console.log("Step 6: final check");
+  console.log("Step 5: final check");
   if (options.planOnly) {
     // observe() (with no daemon running, the common case for a first-time
     // plan) polls every configured principal directly, which can make a
@@ -245,7 +217,7 @@ async function stepFinalCheck(options: SetupOptions): Promise<boolean> {
 /**
  * One-shot interactive setup for a person without an agent: it composes the same commands
  * `skills/headroom/SKILL.md` tells an agent to run, in the same order, asking before anything
- * that changes something. Reuses `discoverAccounts`/`doctor`/`keychain`/`installService` rather
+ * that changes something. Reuses `discoverAccounts`/`doctor`/`installService` rather
  * than re-implementing any of their logic.
  */
 export async function runSetup(argv: string[], overrides: SetupOverrides = {}): Promise<number> {
@@ -255,18 +227,18 @@ export async function runSetup(argv: string[], overrides: SetupOverrides = {}): 
   const dryRun = argv.includes("--dry-run");
   const skipService = argv.includes("--skip-service");
   const skipMcp = argv.includes("--skip-mcp");
-  const interactive = process.stdin.isTTY === true && !dryRun;
+  const interactive = (process.stdin.isTTY === true || overrides.ask !== undefined) && !dryRun;
   const planOnly = dryRun || (!interactive && !yes);
-  const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : undefined;
-  const options: SetupOptions = { yes, dryRun, skipService, skipMcp, planOnly, interactive, rl };
+  const rl = interactive && !overrides.ask ? createInterface({ input: process.stdin, output: process.stdout }) : undefined;
+  const options: SetupOptions = { yes, dryRun, skipService, skipMcp, planOnly, interactive, rl: overrides.ask && interactive ? { question: overrides.ask } : rl };
   try {
     console.log("Headroom setup");
     if (planOnly) console.log("(nothing will change; showing the plan)");
     for (const step of [
       () => stepDiscoverAccounts(options),
       () => stepDoctor(options),
-      () => stepKeychainGrant(options, overrides),
       () => stepInstallService(options),
+      () => stepNotifications(options, overrides).catch((error: unknown) => surviveStepError(options, error)),
       () => stepMcp(options, overrides),
       () => stepFinalCheck(options),
     ]) {

@@ -18,16 +18,16 @@ function fakeStore(pinned: string | undefined): HeadroomStore {
 
 // probePinCheck is a no-op off macOS by design (the probe concept is
 // macOS-only); every assertion below is about its darwin-only behavior.
-describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binary is granted vs which this CLI resolves", () => {
-  it("reports INFO 'no probe granted yet' when nothing has ever been pinned", async () => {
+describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binary is pinned vs which this CLI resolves", () => {
+  it("reports INFO 'no probe pinned yet', asking for nothing, when nothing has ever been pinned", async () => {
     const result = await probePinCheck(fakeStore(undefined), ["claude-main"]);
-    expect(result).toMatchObject({ level: "INFO", check: "probe binary", detail: expect.stringContaining("no probe granted yet") });
+    expect(result).toMatchObject({ level: "INFO", check: "probe binary", detail: expect.stringContaining("no probe pinned yet"), fix: "no action needed" });
   });
 
   it("reports OK when the pinned binary still resolves and no other candidate exists", async () => {
     (resolveProbePath as Mock).mockImplementation(async (pin?: string) => pin ?? undefined);
     const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
-    expect(result).toMatchObject({ level: "OK", check: "probe binary", detail: "granted: /pinned/headroom-claude-probe" });
+    expect(result).toMatchObject({ level: "OK", check: "probe binary", detail: "pinned: /pinned/headroom-claude-probe" });
   });
 
   it("reports OK, naming both binaries, when a second candidate resolves but shares the pinned binary's signing identity (a rebuild under the same identity, not a mismatch)", async () => {
@@ -50,19 +50,19 @@ describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binar
     expect(result?.fix).toContain("headroom install-service");
   });
 
-  it("reports WARN with the fallback path when the granted binary is gone but something else still resolves", async () => {
+  it("reports WARN with the fallback path when the pinned binary is gone but something else still resolves", async () => {
     // Real fall-through behavior: resolveProbePath(pinnedPath) itself
     // returns whatever the normal order finds once the pin doesn't resolve
     // -- never undefined just because a pin was given and failed.
     (resolveProbePath as Mock).mockResolvedValue("/fallback/headroom-claude-probe");
     const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
     expect(result?.level).toBe("WARN");
-    expect(result?.detail).toContain("granted binary is gone");
+    expect(result?.detail).toContain("pinned binary is gone");
     expect(result?.detail).toContain("/fallback/headroom-claude-probe");
     expect(result?.fix).toBe("headroom keychain grant --use-this-build");
   });
 
-  it("reports FAIL when the granted binary is gone and nothing else resolves either", async () => {
+  it("reports FAIL when the pinned binary is gone and nothing else resolves either", async () => {
     (resolveProbePath as Mock).mockResolvedValue(undefined);
     const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
     expect(result?.level).toBe("FAIL");

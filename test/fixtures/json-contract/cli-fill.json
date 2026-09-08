@@ -19,6 +19,9 @@
   },
   "lanes_error": "null",
   "meter": "string",
+  "notices": [
+    "unknown (empty array in the fixture data)"
+  ],
   "resets_in_seconds": "number",
   "used_5h_percent": "number",
   "used_weekly_percent": "number",

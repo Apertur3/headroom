@@ -13,7 +13,7 @@ import { exportCommand, EXPORT_HELP } from "./export.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCredentialReadable, probeBinaryHash, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
@@ -23,7 +23,7 @@ import { pollAccounts } from "./collector.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
-import { notifyCommand } from "./notify.js";
+import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
@@ -705,9 +705,7 @@ export async function observe(argv: string[]): Promise<number> {
   } else {
     const store = await HeadroomStore.open();
     try {
-      const accounts = await readAccounts();
-      const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude" && (!principal || account.name === principal)).map((account) => account.name);
-      await syncClaudeGrantState(store, claudeIds);
+      await syncClaudeProbeState(store);
       const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store), noDaemon: true });
       failures = polled.failures;
       store.insertAll(polled.observations);
@@ -1000,31 +998,33 @@ export function noKeychainItemMessage(directory: string): string {
   return `no Claude login for ${directory}; run: CLAUDE_CONFIG_DIR=${directory} claude, or remove this principal from accounts.toml`;
 }
 
-/** With no --principal this grants every Claude principal in the registry: one
- * Keychain dialog per principal, one printed confirmation line each, naming
- * the exact probe binary that was granted. A grant always clears that
- * principal's keychain_grant_needed marker (set by a prior denial/timeout, or
- * by a probe binary rebuild), so the daemon resumes probing it on its next
- * poll.
+/** Checks that the Claude credential is readable, for every Claude principal
+ * in the registry or just the named one: it runs the probe once per principal
+ * and prints either "readable, no dialog needed" or the real error the probe
+ * reported. Nothing is granted. The probe reads the credential through
+ * /usr/bin/security, which the Keychain item's own access list admits, so
+ * there is no dialog to answer and nothing for the operator to allow.
  *
- * The probe granted here is always the one the daemon actually uses: the
- * pinned path (store.probePath()) is tried first, so a grant run from a
+ * A successful check still clears that principal's keychain_grant_needed
+ * marker, so a home carrying one from an older build (a denial, a timeout, or
+ * a probe rebuild recorded before this read path existed) resumes polling.
+ *
+ * The probe checked here is always the one the daemon actually uses: the
+ * pinned path (store.probePath()) is tried first, so a check run from a
  * different install than the one running the background daemon (the
- * global-npm-vs-checkout mismatch this exists for) still grants the
+ * global-npm-vs-checkout mismatch this exists for) still exercises the
  * daemon's own binary rather than whichever one this CLI process would
  * otherwise pick. If that pinned binary no longer exists on disk, this
  * refuses to silently substitute a different one -- it says so and asks for
- * `--use-this-build` before granting (and re-pinning to) whatever probe this
+ * `--use-this-build` before checking (and re-pinning to) whatever probe this
  * CLI resolves on its own. */
 export async function keychain(argv: string[]): Promise<number> {
   const useThisBuild = argv.includes("--use-this-build");
   const parsed = argv.filter((arg) => arg !== "--use-this-build");
   if (parsed[0] !== "grant" || parsed.length > 3 || (parsed[1] && parsed[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]");
-  // Printed unconditionally, before ever touching the Keychain: an agent
-  // shell running this command has no way to learn why a dialog it cannot
-  // see never appeared, and the dogfooded failure mode ("no credentials")
-  // gave no hint that the real problem was the shell itself.
-  if (process.platform === "darwin") console.log("Run this from your own terminal; macOS shows a Keychain dialog that cannot appear in a sandboxed or remote shell.");
+  // Printed before anything else so a reader who came here from an older
+  // README, or from a stored marker, learns that there is nothing to answer.
+  if (process.platform === "darwin") console.log("Checking that the Claude credential is readable. No Keychain dialog is involved: the probe reads it through /usr/bin/security, which the item already admits.");
   const requested = option(parsed, "--principal");
   const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
@@ -1038,9 +1038,9 @@ export async function keychain(argv: string[]): Promise<number> {
       const resolvedWithPin = await resolveProbePath(existingPin);
       if (resolvedWithPin !== existingPin) {
         if (!useThisBuild) {
-          console.error(`The daemon's granted probe (${existingPin}) no longer exists on disk.`);
+          console.error(`The daemon's pinned probe (${existingPin}) no longer exists on disk.`);
           console.error(resolvedWithPin
-            ? `This CLI would use a different probe instead (${resolvedWithPin}); re-run with --use-this-build to grant that one and re-pin the daemon to it.`
+            ? `This CLI would use a different probe instead (${resolvedWithPin}); re-run with --use-this-build to check that one and re-pin the daemon to it.`
             : "This CLI has no other probe available either; build one (npm run engine:build) or reinstall headroomd.");
           return 1;
         }
@@ -1053,22 +1053,22 @@ export async function keychain(argv: string[]): Promise<number> {
     for (const account of targets) {
       let probePath: string | undefined;
       try {
-        ({ probePath } = await grantClaudeKeychainAccess(account.location, pinnedPath));
+        ({ probePath } = await checkClaudeCredentialReadable(account.location, pinnedPath));
       } catch (error) {
-        // Claude Code was never run against this config dir, so there is
-        // nothing for the operator to grant access to yet: a distinct,
-        // actionable message beats the probe's generic "no credentials"
-        // wording, and must not abort the remaining principals.
+        // Claude Code was never run against this config dir, so there is no
+        // credential to read yet: a distinct, actionable message beats the
+        // probe's generic "no credentials" wording, and must not abort the
+        // remaining principals.
         if (error instanceof ClaudeProbeError && error.message === "no credentials in Keychain for this config dir") {
           console.error(noKeychainItemMessage(account.location));
           failures += 1;
           continue;
         }
-        // The dialog exists and would have worked (doctor already confirmed
-        // the Keychain item is present); this shell just cannot show it.
-        // Distinct from the case above on purpose: the fix here is "run this
-        // command somewhere else", never "there's nothing to grant yet".
-        if (error instanceof ClaudeProbeError && error.kind === "no_interaction") {
+        // Every other probe failure is reported as it came back -- a failed
+        // `security` read carrying the tool's exit status, an expired token,
+        // a logged-out config dir -- rather than translated into a fix that
+        // no longer exists. One bad principal never stops the rest.
+        if (error instanceof ClaudeProbeError) {
           console.error(`${account.name}: ${error.message}`);
           failures += 1;
           continue;
@@ -1076,17 +1076,17 @@ export async function keychain(argv: string[]): Promise<number> {
         throw error;
       }
       store.clearKeychainGrantNeeded(account.name);
-      // The binary that just proved itself under an operator-run grant must
+      // The binary that just proved itself under an operator-run check must
       // never be treated as an unproven first run again by a background poll.
       if (hash) store.setProbeGrantedHash(hash);
-      // Pinned on the very first successful grant this Headroom home has
+      // Pinned on the very first successful check this Headroom home has
       // ever recorded, and re-pinned whenever a stale pin was just replaced
       // above (pinnedPath === undefined while existingPin was set) -- every
       // later probe call (background polls included, see collector.ts) uses
       // exactly this path from here on, even if a second candidate binary
       // later appears on disk.
       if ((!existingPin || pinnedPath === undefined) && probePath) store.setProbePath(probePath);
-      console.log(`Keychain access granted for ${account.name}${probePath ? ` (probe: ${probePath})` : ""}`);
+      console.log(`${account.name}: credential readable, no dialog needed${probePath ? ` (probe: ${probePath})` : ""}`);
     }
   } finally { store.close(); }
   return failures ? 1 : 0;
@@ -1095,6 +1095,7 @@ export async function keychain(argv: string[]): Promise<number> {
 /** One line per top-level command for `headroom --help` / `headroom help`. */
 export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["status", "Print the current meters (the default; grouped for a terminal, one dense line per meter in a pipe)"],
+  ["dashboard (top)", "Live terminal dashboard from cached readings, with pause, events, and leases"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
   ["history <meter>", "List stored observations for one meter"],
@@ -1112,7 +1113,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config (--bundle [path] writes a redacted report for a GitHub issue)"],
   ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
-  ["keychain grant", "macOS: grant the Claude probe Keychain access"],
+  ["keychain grant", "macOS: check that the Claude credential is readable (no dialog)"],
   ["install-service", "Install the daemon as a launchd/systemd/Task Scheduler service"],
   ["uninstall-service", "Remove the installed daemon service"],
   ["uninstall", "Reverse setup: stop/remove the service, remove the Claude Code MCP registration, optionally delete the Headroom home (--home), and print the npm uninstall command"],
@@ -1121,7 +1122,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["engine install", "Install the optional native sensing engine"],
   ["engine status", "Show whether the native and upstream engines are installed"],
   ["logs", "Print the tail of the daemon log"],
-  ["notify", "Send a test notification to every configured channel, or show the delivery ledger"],
+  ["notify", "Configure notifications, send a test message, or show the delivery ledger"],
   ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar (--render for the full line)"],
   ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard)"],
   ["update", "Check the npm registry for a newer headroomd and install it (--notes, --dry-run)"],
@@ -1133,6 +1134,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
 export const COMMAND_HELP: Readonly<Record<string, string>> = {
   status: STATUS_HELP,
+  dashboard: "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose]",
   can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
   history: "Usage: headroom history <meter> [--since 24h]",
@@ -1166,7 +1168,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   mcp: "Usage: headroom mcp",
   engine: "Usage: headroom engine <install|status> [--pin]",
   logs: "Usage: headroom logs [--tail 50]",
-  notify: "Usage: headroom notify (--test | --last <n>)",
+  notify: NOTIFY_USAGE,
   statusline: "Usage: headroom statusline [--render] [--style compact|full] [--meters <m1,m2>] [--color] [--chain <command>]",
   usage: USAGE_PASTE_HELP,
   update: "Usage: headroom update [--notes] [--dry-run] [--yes]",
@@ -1201,6 +1203,7 @@ export async function main(argv: string[]): Promise<number> {
   // a statusLine command that fails to print at all blanks the user's status
   // bar. statusline() itself never throws for the same reason.
   if (argv[0] === "statusline") return statusline(argv.slice(1));
+  if (argv[0] === "dashboard" || argv[0] === "top") return (await import("./dashboard.js")).dashboardCommand(argv.slice(1));
   // Same reasoning as statusline just above: a shell completion pop-up runs
   // on every Tab press, and the legacy-home notice line printed a few lines
   // down would land inside the completion script's own stdout (fatal for

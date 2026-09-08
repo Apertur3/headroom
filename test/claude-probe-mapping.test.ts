@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeProbeError, claudeKeychainMetadata, claudeLoggedOutReason, grantClaudeKeychainAccess, isClaudeGrantIssue, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
+import { ClaudeProbeError, checkClaudeCredentialReadable, claudeKeychainMetadata, claudeLoggedOutReason, claudeSecurityToolFailureReason, isClaudeGrantIssue, isClaudeProbeDenialReason, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 
 const temporary: string[] = [];
@@ -39,7 +39,7 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
     const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
     const probe = await fakeProbe(root, "probe-interaction-not-allowed", "HEADROOM_PROBE_INTERACTION_NOT_ALLOWED", 3);
     await withProbePath(probe, async () => {
-      await expect(grantClaudeKeychainAccess("/nonexistent/.claude")).rejects.toMatchObject({ kind: "no_interaction", message: KEYCHAIN_INTERACTION_BLOCKED_MESSAGE });
+      await expect(checkClaudeCredentialReadable("/nonexistent/.claude")).rejects.toMatchObject({ kind: "no_interaction", message: KEYCHAIN_INTERACTION_BLOCKED_MESSAGE });
     });
   });
 
@@ -47,7 +47,7 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
     const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
     const probe = await fakeProbe(root, "probe-denied", "HEADROOM_PROBE_KEYCHAIN_DENIED", 3);
     await withProbePath(probe, async () => {
-      await expect(grantClaudeKeychainAccess("/nonexistent/.claude")).rejects.toMatchObject({ kind: "denied", message: "Keychain access denied" });
+      await expect(checkClaudeCredentialReadable("/nonexistent/.claude")).rejects.toMatchObject({ kind: "denied", message: "Keychain access denied" });
     });
   });
 
@@ -56,7 +56,7 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
     // The real probe's own catch-all: no marker printed, a bare nonzero exit.
     const probe = await fakeProbe(root, "probe-not-found", "", 1);
     await withProbePath(probe, async () => {
-      const error = await grantClaudeKeychainAccess("/nonexistent/.claude").catch((thrown: unknown) => thrown);
+      const error = await checkClaudeCredentialReadable("/nonexistent/.claude").catch((thrown: unknown) => thrown);
       expect(error).toBeInstanceOf(ClaudeProbeError);
       expect((error as ClaudeProbeError).kind).toBe("missing");
       expect((error as ClaudeProbeError).message).toBe("no credentials in Keychain for this config dir");
@@ -67,15 +67,57 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
     const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
     const probe = await fakeProbe(root, "probe-timeout", "HEADROOM_PROBE_TIMEOUT", 4);
     await withProbePath(probe, async () => {
-      await expect(grantClaudeKeychainAccess("/nonexistent/.claude")).rejects.toMatchObject({ kind: "timeout" });
+      await expect(checkClaudeCredentialReadable("/nonexistent/.claude")).rejects.toMatchObject({ kind: "timeout" });
     });
+  });
+
+  it("HEADROOM_PROBE_SECURITY_TOOL_FAILED -> the tool's own exit status, never a grant issue and never its output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
+    // The real probe prints the marker and the status only; its stdout (the
+    // secret) is never on this stream. The fake prints a fake secret next to
+    // the marker to prove the mapping ignores everything but the status.
+    const probe = await fakeProbe(root, "probe-security-failed", "HEADROOM_PROBE_SECURITY_TOOL_FAILED exit=51 sk-ant-not-a-real-token", 7);
+    await withProbePath(probe, async () => {
+      const error = await checkClaudeCredentialReadable("/nonexistent/.claude").catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(ClaudeProbeError);
+      expect((error as ClaudeProbeError).kind).toBe("unavailable");
+      const message = (error as ClaudeProbeError).message;
+      expect(message).toBe("the macOS security tool could not read the credential (exit 51)");
+      expect(message).not.toContain("sk-ant");
+      // Nothing here asks anyone to grant anything: the item's access list
+      // already admits the tool, so a failure is a broken tool, not a
+      // permission.
+      expect(isClaudeGrantIssue(message)).toBe(false);
+      expect(isClaudeProbeDenialReason(message)).toBe(false);
+    });
+  });
+
+  it("HEADROOM_PROBE_SECURITY_TOOL_FAILED timeout and unavailable each get their own wording", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
+    const timedOut = await fakeProbe(root, "probe-security-timeout", "HEADROOM_PROBE_SECURITY_TOOL_FAILED timeout", 7);
+    await withProbePath(timedOut, async () => {
+      await expect(checkClaudeCredentialReadable("/nonexistent/.claude")).rejects.toMatchObject({ kind: "unavailable", message: "the macOS security tool did not answer within 10s" });
+    });
+    const unusable = await fakeProbe(root, "probe-security-unavailable", "HEADROOM_PROBE_SECURITY_TOOL_FAILED unavailable", 7);
+    await withProbePath(unusable, async () => {
+      await expect(checkClaudeCredentialReadable("/nonexistent/.claude")).rejects.toMatchObject({ kind: "unavailable", message: "the macOS security tool could not be run" });
+    });
+  });
+
+  it("claudeSecurityToolFailureReason maps every suffix shape, and anything unrecognized, without inventing a status", () => {
+    expect(claudeSecurityToolFailureReason("exit=44")).toBe("the macOS security tool could not read the credential (exit 44)");
+    expect(claudeSecurityToolFailureReason("exit=-1")).toBe("the macOS security tool could not read the credential (exit -1)");
+    expect(claudeSecurityToolFailureReason("timeout")).toBe("the macOS security tool did not answer within 10s");
+    expect(claudeSecurityToolFailureReason("unavailable")).toBe("the macOS security tool could not be run");
+    expect(claudeSecurityToolFailureReason(undefined)).toBe("the macOS security tool could not be run");
+    expect(claudeSecurityToolFailureReason("exit=surprise")).toBe("the macOS security tool could not be run");
   });
 
   it("HEADROOM_PROBE_LOGGED_OUT (item present, no usable OAuth token) -> the logged-out reason, distinct from 'no credentials' and never a grant issue (issue #11)", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-probe-mapping-")); temporary.push(root);
     const probe = await fakeProbe(root, "probe-logged-out", "HEADROOM_PROBE_LOGGED_OUT", 6);
     await withProbePath(probe, async () => {
-      const error = await grantClaudeKeychainAccess("/nonexistent/.claude").catch((thrown: unknown) => thrown);
+      const error = await checkClaudeCredentialReadable("/nonexistent/.claude").catch((thrown: unknown) => thrown);
       expect(error).toBeInstanceOf(ClaudeProbeError);
       expect((error as ClaudeProbeError).kind).toBe("missing");
       const message = (error as ClaudeProbeError).message;

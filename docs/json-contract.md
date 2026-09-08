@@ -179,13 +179,18 @@ daemon) fallback.
 
 `{ contract, generated_at, allowed: boolean, reason: string, meters_checked:
 string[], not_enforced?: Array<"5h" | "wk">, unknown?: true,
-lanes_remaining_for_class?: number | null }`. `not_enforced` lists needs
-skipped because their window is not enforced on the deciding meter --
-informational, never a refusal on its own. `unknown: true` (present only on
+lanes_remaining_for_class?: number | null, notices: string[] }`. `not_enforced`
+lists needs skipped because their window is not enforced on the deciding meter
+-- informational, never a refusal on its own. `unknown: true` (present only on
 some refusals) means the refusal is because a needed window's usage could not
 be read at all, not because a known usage simply does not fit -- render it
 like an UNKNOWN reading, not a plain "no". `lanes_remaining_for_class` is
-present only with `--class`/`action_class` and a learned cost for it.
+present only with `--class`/`action_class` and a learned cost for it. `notices`
+is one line per meter this call checked (`meters_checked`) with an
+unscheduled reset (issue #20) in the last 24 hours -- `["unscheduled reset on
+codex-main:main at 2026-09-08T01:24:26Z; capacity appeared, re-plan"]` --
+empty when none; treat it like a free reset just landed, not like the
+scheduled boundary the rest of this result already accounts for.
 
 Exit codes: `2` when refused (`allowed: false`, `unknown` or not); `0` when
 allowed.
@@ -197,10 +202,12 @@ MCP `quota_gate` adds `source?: "direct"` over the same fields.
 Success: `{ contract, generated_at, meter: string, weekly_remaining_percent:
 number, reserve_percent: number, hours_per_window: number,
 remaining_5h_windows: number, points_per_5h_window: number,
-plan_line_percent_per_hour: number }`. Failure (the meter has no weekly
-window, or it is stale/failed/unpolled too long): `{ contract, generated_at,
-meter: string, error: string }` -- a data state, not a CLI failure; the CLI
-renders it as an UNKNOWN line and always exits `0`.
+plan_line_percent_per_hour: number, notices: string[] }`. Failure (the meter
+has no weekly window, or it is stale/failed/unpolled too long): `{ contract,
+generated_at, meter: string, error: string, notices: string[] }` -- a data
+state, not a CLI failure; the CLI renders it as an UNKNOWN line and always
+exits `0`. `notices` is the same unscheduled-reset line `gate` carries above
+(issue #20), scoped to this one meter; empty when none.
 
 Exit codes: always `0`.
 
@@ -213,15 +220,18 @@ points_used: number, reason: string } | null, lanes_error: string | null,
 classes: FillClassFit[], used_5h_percent: number | null,
 used_weekly_percent: number | null, resets_in_seconds: number | null,
 lane_cost_percent: number | null, lane_cost_source: "given" | "learned" |
-"unknown", allowance_basis: "full" | "pro_rata", window_used: string }`.
-`lanes` is `null` only with no `--lane-cost` and no learned cost for the
-meter yet (`lanes_error` then names why); the per-class `classes` list stands
-on its own either way. `FillClassFit` is `{ action_class: string, percent:
-number, duration_minutes: number, fits: number }`, one row per `routing.toml`
-`[cost.<class>]` section (or a learned per-class cost where one exists).
-Failure (no enforced window at all, or one that is stale/failed/unpolled too
-long): `{ contract, generated_at, meter: string, error: string,
-no_enforced_window?: true }` -- rendered as an UNKNOWN line, exit `0`.
+"unknown", allowance_basis: "full" | "pro_rata", window_used: string,
+notices: string[] }`. `lanes` is `null` only with no `--lane-cost` and no
+learned cost for the meter yet (`lanes_error` then names why); the per-class
+`classes` list stands on its own either way. `FillClassFit` is `{
+action_class: string, percent: number, duration_minutes: number, fits:
+number }`, one row per `routing.toml` `[cost.<class>]` section (or a learned
+per-class cost where one exists). `notices` is the same unscheduled-reset
+line `gate`/`plan` carry above (issue #20), scoped to this one meter; empty
+when none. Failure (no enforced window at all, or one that is stale/failed/
+unpolled too long): `{ contract, generated_at, meter: string, error: string,
+no_enforced_window?: true, notices: string[] }` -- rendered as an UNKNOWN
+line, exit `0`.
 
 Exit codes: `2` when `lanes` is `null` or `lanes.lanes` is `0`; `0` otherwise
 (including the UNKNOWN/error case above).
@@ -339,13 +349,21 @@ instead.
 | "inferred", confidence: number, evidence_observation_ids: number[],
 created_at: string, corrected_by: string | null, meter_id: string | null,
 principal_id: string | null, reason: string | null, last_seen_at: string |
-null }`. `EventKind` is `"reset_seen" | "free_reset_granted" |
+null, metadata?: { unscheduled?: boolean; window_minutes?: number | null;
+used_percent?: number; previous_used_percent?: number } | null }`.
+`EventKind` is `"reset_seen" | "free_reset_granted" |
 "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" |
 "source_recovered" | "lease_started" | "lease_ended" |
 "pace_projection_conserve" | "model_new"` -- an enumeration that only grows
 under the compatibility promise below. `last_seen_at` is set only on an open
 `source_failed` event (the most recent poll that still found the same
-failure); `null` on every other kind. Exit codes: always `0`.
+failure); `null` on every other kind. `metadata` is present only on a
+`reset_seen`: `window_minutes` names the window that reset on every one;
+`unscheduled: true` (issue #20) marks one that fired before its own scheduled
+instant, with `used_percent`/`previous_used_percent` -- the window's used
+percent right after and right before the reset -- present alongside it.
+Absent (not merely `undefined` fields) on a `reset_seen` that predates this
+field and on every other event kind. Exit codes: always `0`.
 
 MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct",
 events: HeadroomEvent[] }`; over a daemon, the bare `HeadroomEvent[]` instead.

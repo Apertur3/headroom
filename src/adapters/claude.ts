@@ -76,7 +76,40 @@ export const KEYCHAIN_INTERACTION_BLOCKED_MESSAGE = "the Keychain dialog cannot 
  * failure, the collector's gate, and doctor's FAIL line, so all three stay
  * in sync by construction rather than by convention. */
 export function claudeGrantNeededReason(principalId: string): string {
-  return `Keychain grant needed; run: headroom keychain grant --principal ${principalId}`;
+  return `${CLAUDE_GRANT_NEEDED_PREFIX} run: headroom keychain grant --principal ${principalId}`;
+}
+
+/** Static prefix of claudeGrantNeededReason() above, so a caller can
+ * recognize an explicit probe denial without reconstructing the principal
+ * name. */
+export const CLAUDE_GRANT_NEEDED_PREFIX = "Keychain grant needed;";
+
+/** True only for the explicit denial reason claudeGrantNeededReason()
+ * produces -- a probe that reported it could not read the item at all.
+ * collector.ts's gate keys on this alone: the credential is now read through
+ * the Apple security tool, which the item's own access list admits, so a
+ * readable credential can never produce this and can never mark a principal
+ * as needing anything. */
+export function isClaudeProbeDenialReason(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && reason.startsWith(CLAUDE_GRANT_NEEDED_PREFIX);
+}
+
+/** The marker the probe prints when `/usr/bin/security` -- the tool the
+ * Keychain item's access list actually admits, and so the read path the probe
+ * answers through -- failed for any reason other than an absent item. Its
+ * suffix is the tool's exit status (`exit=<n>`), `timeout`, or `unavailable`;
+ * the tool's own output never appears anywhere, since the only thing on that
+ * stream is the secret itself. */
+const SECURITY_TOOL_FAILED_PATTERN = /HEADROOM_PROBE_SECURITY_TOOL_FAILED(?:\s+(\S+))?/;
+
+/** The single wording for a failed `security` read, built from the marker's
+ * suffix alone. An absent item is not this: it keeps HEADROOM_PROBE_NO_CREDENTIALS
+ * and the "log in" fix it has always had. */
+export function claudeSecurityToolFailureReason(detail: string | undefined): string {
+  const status = /^exit=(-?\d+)$/.exec(detail ?? "");
+  if (status) return `the macOS security tool could not read the credential (exit ${status[1]})`;
+  if (detail === "timeout") return "the macOS security tool did not answer within 10s";
+  return "the macOS security tool could not be run";
 }
 
 /** Static prefix of claudeKeychainLapseReason()'s formatted text (below), so
@@ -92,7 +125,7 @@ export const CLAUDE_GRANT_LAPSED_PREFIX = "Keychain grant lapsed;";
  * (claudeKeychainLapseReason). Shared so collector.ts's gate recognizes both
  * by construction instead of restating either prefix. */
 export function isClaudeGrantIssue(reason: string | null | undefined): boolean {
-  return typeof reason === "string" && (reason.startsWith("Keychain grant needed;") || reason.startsWith(CLAUDE_GRANT_LAPSED_PREFIX));
+  return typeof reason === "string" && (reason.startsWith(CLAUDE_GRANT_NEEDED_PREFIX) || reason.startsWith(CLAUDE_GRANT_LAPSED_PREFIX));
 }
 
 /** The single wording for "the Keychain item exists but its JSON carries no
@@ -218,6 +251,13 @@ async function claudeProbe(configDir: string, pinnedPath?: string): Promise<stri
     // failure from a sandboxed agent shell.
     if (stderr.includes("HEADROOM_PROBE_INTERACTION_NOT_ALLOWED")) throw new ClaudeProbeError("no_interaction", KEYCHAIN_INTERACTION_BLOCKED_MESSAGE);
     if (stderr.includes("HEADROOM_PROBE_KEYCHAIN_DENIED")) throw new ClaudeProbeError("denied", "Keychain access denied");
+    // The probe reads the credential through /usr/bin/security, which the
+    // Keychain item's own access list admits. A failure there is a broken
+    // tool, not a permission the operator can hand over, so it never becomes
+    // a grant issue: it reports the tool's exit status and stops. An item
+    // that is simply not there stays HEADROOM_PROBE_NO_CREDENTIALS below.
+    const securityToolFailure = SECURITY_TOOL_FAILED_PATTERN.exec(stderr);
+    if (securityToolFailure) throw new ClaudeProbeError("unavailable", claudeSecurityToolFailureReason(securityToolFailure[1]));
     if (stderr.includes("HEADROOM_PROBE_TIMEOUT") || (error as NodeJS.ErrnoException).code === "ETIMEDOUT") throw new ClaudeProbeError("timeout", "Keychain access timed out");
     if (stderr.includes("HEADROOM_PROBE_EXPIRED")) throw new ClaudeProbeError("missing", `token expired; ${claudeCommandForDirectory(configDir)}`);
     // Parenthesized status code, matching ProviderHTTPError's own format:
@@ -240,13 +280,17 @@ async function claudeProbe(configDir: string, pinnedPath?: string): Promise<stri
   }
 }
 
-/** Interactive CLI entry point; its sole prompt is owned by the signed probe. */
-/** Returns the exact probe path this grant actually ran under, so the caller
- * (cli.ts's `keychain grant`) can pin it -- see store.ts's setProbePath() --
- * the first time a grant ever succeeds for this Headroom home. undefined
- * only if somehow no probe resolved at all despite claudeProbe() not
- * throwing, which should not happen in practice. */
-export async function grantClaudeKeychainAccess(configDir: string, pinnedPath?: string): Promise<{ probePath: string | undefined }> {
+/** Runs the probe once and throws whatever it reports. Nothing is granted and
+ * no dialog is involved: the credential is read through /usr/bin/security,
+ * which the Keychain item's own access list admits, so this is purely a
+ * readability check.
+ *
+ * Returns the exact probe path the check ran under, so the caller (cli.ts's
+ * `keychain grant`) can pin it -- see store.ts's setProbePath() -- the first
+ * time a check ever succeeds for this Headroom home. undefined only if
+ * somehow no probe resolved at all despite claudeProbe() not throwing, which
+ * should not happen in practice. */
+export async function checkClaudeCredentialReadable(configDir: string, pinnedPath?: string): Promise<{ probePath: string | undefined }> {
   const probePath = await resolveProbePath(pinnedPath);
   await claudeProbe(configDir, probePath ?? pinnedPath);
   return { probePath };
@@ -379,6 +423,11 @@ export interface ClaudeGrantStore {
    * pinned (see store.ts's probePath()/setProbePath()). undefined before the
    * first successful `headroom keychain grant`. */
   probePath(): string | undefined;
+  /** Every principal currently carrying a grant marker, and why. Optional so
+   * a store that predates it, or a test double, keeps working; used only by
+   * syncClaudeProbeState to retire markers no build writes any more. */
+  keychainGrantsNeeded?(): Array<{ principal_id: string; reason: string }>;
+  clearKeychainGrantNeeded?(principalId: string): void;
   setProbePath(path: string): void;
   /** The designated requirement the probe carried at the last sync (see
    * probeSigningIdentity above), or undefined for an ad-hoc probe. Optional
@@ -411,76 +460,58 @@ export function claudeGrantGate(store: ClaudeGrantStore): ClaudeGrantGate {
   };
 }
 
-/**
- * Decides whether a Claude principal has to be sent back through `headroom
- * keychain grant`, by asking the same question macOS's Keychain asks: is
- * this the code the ACL was granted to?
- *
- * macOS keys a Keychain item's ACL on the trusted application's DESIGNATED
- * REQUIREMENT, not on the binary's contents. A probe signed by the stable
- * local identity scripts/build-probe.sh maintains has the same requirement
- * after every rebuild, so an existing grant still covers it and demanding a
- * new one would be a dialog the operator never needed to see. That is why
- * the signing identity, not the binary hash, decides here whenever one is
- * available: a hash change under an unchanged identity is not a grant
- * problem.
- *
- * A fresh grant is demanded when the signing identity changed, when the
- * probe is ad-hoc signed (no stable identity to compare -- every ad-hoc
- * build really is new code to Keychain), or on a genuinely first-ever run
- * with no prior successful grant or probe recorded: a fresh install must
- * only ever pop its first Keychain dialog through `headroom keychain
- * grant`, never from a background daemon poll. An ACL that was reset on the
- * Keychain side while the identity stayed put is caught where it shows up
- * -- the probe's own denial, mapped to claudeGrantNeededReason -- not here.
- *
- * Once a binary has succeeded once (grantClaudeKeychainAccess or a
- * successful poll both call ClaudeGrantGate.markProbeSucceeded), further
- * syncs under the same hash -- including a store that lost its
- * probeBinaryHash but kept probeGrantedHash, e.g. a restore -- are not
- * marked again.
+/** Reasons the previous build's rebuild detection wrote into the grant marker
+ * ("probe binary rebuilt", "probe binary rebuilt (ad-hoc signed, ...)",
+ * "probe signing identity changed", "no successful probe recorded for this
+ * binary"). Every one of them describes the probe binary rather than a read
+ * the Keychain refused, and nothing writes them any more -- an upgraded home
+ * would otherwise keep a working principal gated forever behind a grant
+ * command that no longer grants anything. A real denial ("Keychain grant
+ * needed; ...", "Keychain access denied", "Keychain grant lapsed; ...") never
+ * matches and is left exactly where it is.
  */
-export async function syncClaudeGrantState(
+const PROBE_REBUILD_REASON_PATTERN = /^(probe |no successful probe )/;
+
+/**
+ * Records what probe binary this Headroom home is currently running: its
+ * SHA-256 and its designated requirement (undefined for an ad-hoc build).
+ * doctor reports from these; nothing else acts on them.
+ *
+ * It marks no principal, on a first run or on any other. It used to: macOS
+ * keys a Keychain item's ACL on the trusted application's designated
+ * requirement, so a rebuilt or re-signed probe was code the item had never
+ * admitted, and every such change sent every Claude principal back through
+ * `headroom keychain grant` before a background poll could touch the item.
+ * The credential is now read through /usr/bin/security, which the item's own
+ * access list admits whatever this binary is signed with, so there is no ACL
+ * to lose and nothing for anyone to grant. Marking on a rebuild would only
+ * block a working credential behind a dialog that never appears.
+ */
+export async function syncClaudeProbeState(
   store: ClaudeGrantStore,
-  claudePrincipalIds: string[],
   dependencies: {
     platform?: NodeJS.Platform;
     hash?: () => Promise<string | undefined>;
     signingIdentity?: () => Promise<string | undefined>;
   } = {},
-): Promise<boolean> {
+): Promise<void> {
   const platform = dependencies.platform ?? process.platform;
-  if (platform !== "darwin" || !claudePrincipalIds.length) return false;
+  if (platform !== "darwin") return;
+  // Retires markers left by the build that gated a principal whenever the
+  // probe binary changed. Idempotent, and never touches a denial marker.
+  for (const item of store.keychainGrantsNeeded?.() ?? []) {
+    if (PROBE_REBUILD_REASON_PATTERN.test(item.reason)) store.clearKeychainGrantNeeded?.(item.principal_id);
+  }
   // Hashes the pinned path once one exists, not just whatever the plain
   // resolution order would currently pick -- the same "use exactly one
-  // path" rule claudeProbe() itself follows once a grant has pinned one.
+  // path" rule claudeProbe() itself follows once a check has pinned one.
   const hash = await (dependencies.hash ?? (() => probeBinaryHash(store.probePath())))();
-  if (!hash) return false;
-  const previous = store.probeBinaryHash();
+  if (!hash) return;
   store.setProbeBinaryHash(hash);
-
   const identity = await (dependencies.signingIdentity ?? (() => probeSigningIdentity(store.probePath())))();
-  const previousIdentity = store.probeSigningIdentity?.();
-  // Recorded even when it is undefined (an ad-hoc probe), so going ad-hoc
-  // and back cannot look like an unbroken run under one identity.
+  // Recorded even when it is undefined (an ad-hoc probe), so a store never
+  // keeps claiming an identity the current binary does not carry.
   store.setProbeSigningIdentity?.(identity ?? "");
-
-  if (previous === hash) return false; // unchanged since the last sync; already resolved either way
-  if (store.probeGrantedHash() === hash) return false; // this exact binary already proved itself
-  if (identity !== undefined && identity === previousIdentity && store.probeGrantedHash() !== undefined) {
-    // Same signing identity as the binary the operator already granted, so
-    // the Keychain ACL still matches this rebuild. Record the new hash as
-    // proven rather than asking for a grant macOS does not require.
-    store.setProbeGrantedHash(hash);
-    return false;
-  }
-  const reason = previous === undefined
-    ? "no successful probe recorded for this binary"
-    : identity === undefined
-      ? "probe binary rebuilt (ad-hoc signed, so the previous grant does not carry over)"
-      : "probe signing identity changed";
-  for (const id of claudePrincipalIds) store.setKeychainGrantNeeded(id, reason);
-  return true;
 }
 
 interface Credential { token: string; expired: boolean; }

@@ -4,7 +4,8 @@ import { createHmac, randomBytes, timingSafeEqual, createHash } from "node:crypt
 import { userInfo } from "node:os";
 import { basename, join } from "node:path";
 import { readPolicy, readRouting } from "./config.js";
-import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
+import { readDashboardStore } from "./dashboard-data.js";
+import { claudeGrantGate, syncClaudeProbeState } from "./adapters/claude.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
@@ -406,6 +407,10 @@ export class HeadroomDaemon {
     try {
       let result: unknown;
       switch (request.method) {
+        case "dashboard": {
+          const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          result = readDashboardStore(this.store, new Date(), rows); break;
+        }
         case "status": {
           await this.poll(undefined, false);
           const now = new Date();
@@ -587,14 +592,11 @@ export class HeadroomDaemon {
     if (forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { rate_limited: true };
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
     const accounts = await this.currentAccounts();
-    const claudePrincipalIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
-    // A rebuilt probe binary marks every Claude principal before the poll
-    // below ever runs, so the gate skips the probe call this cycle instead of
-    // popping a fresh Keychain dialog with the new binary. Idempotent, so two
-    // concurrent poll() calls racing here (before the inFlight check/set pair
-    // right below, which must stay await-free to keep coalescing them into
-    // one poller call) doing this twice is harmless.
-    await syncClaudeGrantState(this.store, claudePrincipalIds);
+    // Records which probe binary this poll is about to run, before it runs.
+    // Idempotent, so two concurrent poll() calls racing here (before the
+    // inFlight check/set pair right below, which must stay await-free to keep
+    // coalescing them into one poller call) doing this twice is harmless.
+    await syncClaudeProbeState(this.store);
     const current = this.inFlight.get(key);
     if (current) return current;
     const task = this.poller(principal, {
@@ -715,7 +717,7 @@ async function socketExists(path: string): Promise<boolean> {
  * Probe health separately from a potentially slow request. A live daemon may
  * need to poll before answering `status`; that must not look like no daemon.
  */
-export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000): Promise<
+export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000): Promise<
   | { status: "available"; result: unknown }
   | { status: "absent" }
   | { status: "unresponsive" }
@@ -724,13 +726,13 @@ export async function daemonRequest(path: string, method: string, params: Json =
   // reply -- health included -- whose transcript proof does not check out
   // comes back as `undefined`, indistinguishable here from no daemon
   // answering at all. There is nothing left for daemonRequest to double-check.
-  const health = await rpc(path, "health", {}, healthTimeoutMs);
+  const health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS));
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
-  const result = await rpc(path, method, params, 30_000);
+  const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS));
   return result === undefined ? { status: "unresponsive" } : { status: "available", result };
 }
 
-export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000): Promise<unknown | undefined> {
+export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000, absoluteTimeoutMs = RPC_ABSOLUTE_DEADLINE_MS): Promise<unknown | undefined> {
   return new Promise((resolve) => {
     const socket = createConnection(path);
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
@@ -754,7 +756,7 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     // trickling data -- never enough to go idle, never a complete answer --
     // would otherwise never time out at all. This fires regardless of
     // activity.
-    const absoluteDeadline = setTimeout(() => done(undefined), RPC_ABSOLUTE_DEADLINE_MS);
+    const absoluteDeadline = setTimeout(() => done(undefined), absoluteTimeoutMs);
     absoluteDeadline.unref?.();
     const done = (value: unknown | undefined) => {
       if (finished) return;

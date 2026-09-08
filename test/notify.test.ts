@@ -67,6 +67,13 @@ describe("notify config", () => {
   it("takes an overridden ntfy server without its trailing slash", () => {
     expect(config('[notify]\n[notify.ntfy]\ntopic = "t"\nserver = "https://ntfy.example.com/"\n').ntfy.server).toBe("https://ntfy.example.com");
   });
+
+  it("defaults notify_scheduled_short to false and reads an explicit true or false", () => {
+    expect(config().notify_scheduled_short).toBe(false);
+    expect(config('[notify]\nnotify_scheduled_short = true\n[notify.ntfy]\ntopic = "t"\n').notify_scheduled_short).toBe(true);
+    expect(config('[notify]\nnotify_scheduled_short = false\n[notify.ntfy]\ntopic = "t"\n').notify_scheduled_short).toBe(false);
+    expect(() => parseNotifyConfig('[notify]\nnotify_scheduled_short = maybe\n')).toThrow(/notify_scheduled_short/);
+  });
 });
 
 describe("quiet hours", () => {
@@ -103,8 +110,8 @@ describe("message shaping", () => {
   });
 
   it("labels a single event and folds a batch into one message", () => {
-    expect(combineTexts(["reset_seen claude-main:all"])).toBe("Headroom: reset_seen claude-main:all");
-    expect(combineTexts(["one", "two"])).toBe("Headroom: 2 events\n- one\n- two");
+    expect(combineTexts(["reset_seen claude-main:all"])).toBe("reset_seen claude-main:all");
+    expect(combineTexts(["one", "two"])).toBe("🌙 Headroom: 2 events\none\ntwo");
   });
 });
 

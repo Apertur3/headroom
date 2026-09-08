@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
+import { decodeResetSeen, encodeResetSeen } from "./resets.js";
 import type { EventKind, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
@@ -21,6 +22,12 @@ import { redact } from "./security.js";
  * write. Long enough to cover a weekly window several times over, short
  * enough that the table stays a working set rather than an archive. */
 export const SPEND_LEDGER_RETENTION_DAYS = 30;
+
+/** How long an unscheduled reset (issue #20) stays called out: the status
+ * row's "(unscheduled)" note, the grouped view's own line, and gate/plan/
+ * fill's `notices` all share this one window, so a human and an
+ * orchestrator agree on how long "recent" means. */
+export const UNSCHEDULED_RESET_HOURS = 24;
 
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
  * than ordinary noise: a drop to zero, or a fall past half of what it was.
@@ -118,7 +125,7 @@ function observationFromRow(row: Row): StoredObservation {
 }
 
 function eventFromRow(row: Row): HeadroomEvent {
-  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at) };
+  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: row.metadata_json ? parseJson<HeadroomEvent["metadata"]>(row.metadata_json, undefined) : undefined };
 }
 
 function notifyFromRow(row: Row): NotifyDelivery {
@@ -408,13 +415,13 @@ export class HeadroomStore {
     return { ...observation, freshness: "failed", confidence: 0, reason: idleContradictionReason(evidence.quantity.used) };
   }
 
-  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null, createdAt?: string): void {
+  private addEvent(kind: EventKind, origin: HeadroomEvent["origin"], confidence: number, evidence: number[], current: StoredObservation, reason: string | null = null, lastSeenAt: string | null = null, createdAt?: string, metadata?: HeadroomEvent["metadata"]): void {
     const created = createdAt ?? current.fetched_at;
     const id = `${kind}:${current.id}`;
     // OR IGNORE keeps the reset-detection backfill idempotent: replaying it
     // over already-classified observations must not error on a repeat id.
-    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason, lastSeenAt);
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason, lastSeenAt, metadata ? JSON.stringify(metadata) : null);
   }
 
   private addSourceFailedEvent(evidence: number[], current: StoredObservation): void {
@@ -623,10 +630,11 @@ export class HeadroomStore {
     const staleHours = Math.floor(elapsedMs / 3_600_000);
     const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
     const freeReset = (): void => this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`));
+    const windowMinutes = current.window?.minutes ?? null;
     if (this.failedGapBetween(current.meter_id, current.window, baseline.id, current.id)) {
       if (previousReset > Date.parse(baseline.fetched_at) && previousReset <= Date.parse(current.fetched_at)) {
         const scheduledAt = new Date(previousReset).toISOString();
-        if (!this.resetSeenAtScheduledTime(current.meter_id, current.window, scheduledAt)) this.addEvent("reset_seen", "inferred", 0.8, evidence, current, suffix(null), null, scheduledAt);
+        if (!this.resetSeenAtScheduledTime(current.meter_id, current.window, scheduledAt)) this.addEvent("reset_seen", "inferred", 0.8, evidence, current, suffix(null), null, scheduledAt, { window_minutes: windowMinutes });
         return;
       }
       if (beforeScheduledReset) freeReset();
@@ -634,8 +642,26 @@ export class HeadroomStore {
     }
     const resetsAdvanced = resetDeltaMs > elapsedMs + toleranceMs;
     if (!resetsAdvanced && !beforeScheduledReset) return;
-    if (resetsAdvanced) this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null));
-    else freeReset();
+    if (resetsAdvanced) {
+      // Issue #20: a reset whose observation lands before the baseline's own
+      // scheduled instant fired ahead of schedule -- capacity appeared that
+      // the vendor's own timeline did not promise yet (the live Codex case:
+      // a weekly meter dropping 88% to 0% five days early). One at or after
+      // that instant is the ordinary scheduled reset, even though resets_at
+      // itself has already moved forward onto the next cycle by the time
+      // this poll saw it. No reset credit is consumed either way -- that
+      // mechanism is the vendor-reported `count`-window path below, entirely
+      // separate from this percent-window classification. window_minutes is
+      // carried on both branches (not just the unscheduled one) so the
+      // notifier can name the window on an ordinary scheduled reset too, and
+      // hold back a scheduled short-window one by default without a second
+      // lookup.
+      const unscheduled = Date.parse(current.fetched_at) < previousReset;
+      this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null), null, undefined, {
+        window_minutes: windowMinutes,
+        ...(unscheduled ? { unscheduled: true, used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : {}),
+      });
+    } else freeReset();
   }
 
   /** The most recent reset_seen event for this meter+window within
@@ -818,6 +844,18 @@ export class HeadroomStore {
       if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.addEvent("plan_changed", "vendor_reported", 1, evidence, current);
+  }
+
+  /** Fetch a notification batch's original facts in one query. */
+  eventObservations(events: HeadroomEvent[]): Map<string, StoredObservation[]> {
+    const ids = [...new Set(events.flatMap((event) => event.evidence_observation_ids))];
+    const observations = this.db.prepare("SELECT * FROM observations WHERE id IN (SELECT value FROM json_each(?)) ORDER BY fetched_at ASC, id ASC")
+      .all(JSON.stringify(ids)).map(observationFromRow);
+    const byId = new Map(observations.map((observation) => [observation.id, observation]));
+    return new Map(events.map((event) => [event.id, event.evidence_observation_ids.flatMap((id) => {
+      const observation = byId.get(id);
+      return observation ? [observation] : [];
+    }).sort((a, b) => a.fetched_at.localeCompare(b.fetched_at) || a.id - b.id)]));
   }
 
   history(meterId: string, since: string): StoredObservation[] {
@@ -1074,12 +1112,64 @@ export class HeadroomStore {
     });
   }
 
-  /** Latest reset evidence for each current meter/window, limited to that window. */
+  /**
+   * Latest reset evidence for each current meter/window. An ordinary
+   * scheduled reset stays limited to about one window's own duration, same
+   * as always; an unscheduled one (issue #20 -- metadata.unscheduled, see
+   * classifyUsageDrop) is visible for a flat UNSCHEDULED_RESET_HOURS
+   * regardless of the window's own duration, since the whole point of an
+   * unscheduled reset is that it broke the "roughly one window" assumption
+   * a short window's own bound would otherwise hide it behind within hours.
+   * The returned value is a plain ISO string for a scheduled reset, or that
+   * string plus resets.ts's marker for an unscheduled one -- see
+   * resets.ts's encodeResetSeen/decodeResetSeen for why the flag rides
+   * inside the string instead of widening this method's own Map<string,
+   * string> return type.
+   */
   resetSeenFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {
-    return this.eventEvidenceFor("reset_seen", observations, now);
+    const output = new Map<string, string>();
+    for (const observation of observations) {
+      const minutes = observation.window?.minutes;
+      if (!minutes) continue;
+      const found = this.latestApplicableResetSeen(observation.meter_id, minutes, observation.resets_at, now);
+      if (found) output.set(`${observation.meter_id}:${minutes}`, encodeResetSeen(found.at, found.unscheduled));
+    }
+    return output;
   }
 
-  /** Latest free-reset evidence for each current meter/window, limited to that window. */
+  /** The newest reset_seen event for this meter+window that is still within
+   * ITS OWN applicable visibility window: a flat UNSCHEDULED_RESET_HOURS for
+   * one flagged metadata.unscheduled, or the ordinary bound (about one
+   * window's own duration back from resets_at) for a plain scheduled one.
+   * Walks newest first so a scheduled event too old for its own short bound
+   * does not hide an older-but-still-visible unscheduled one underneath it
+   * -- the two rules have different lookback lengths, so "the single newest
+   * row" and "the newest row that is actually still visible" are not always
+   * the same row. */
+  private latestApplicableResetSeen(meterId: string, minutes: number, resetsAt: string | null | undefined, now: Date): { at: string; unscheduled: boolean } | undefined {
+    const reset = resetsAt ? Date.parse(resetsAt) : Number.NaN;
+    const boundedStart = Number.isFinite(reset) ? reset - minutes * 60_000 : now.getTime() - minutes * 60_000;
+    const flatStart = now.getTime() - UNSCHEDULED_RESET_HOURS * 3_600_000;
+    const since = new Date(Math.min(boundedStart, flatStart)).toISOString();
+    const rows = this.db.prepare(`SELECT e.created_at AS created_at, e.metadata_json AS metadata_json FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.kind = 'reset_seen' AND e.meter_id = ?
+        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) = ?
+        AND julianday(e.created_at) >= julianday(?) AND julianday(e.created_at) <= julianday(?)
+      ORDER BY e.created_at DESC LIMIT 50`).all(meterId, minutes, since, now.toISOString());
+    for (const row of rows) {
+      const at = String(row.created_at);
+      const unscheduled = parseJson<{ unscheduled?: boolean }>(row.metadata_json, {}).unscheduled === true;
+      const cutoff = unscheduled ? flatStart : boundedStart;
+      if (Date.parse(at) >= cutoff) return { at, unscheduled };
+    }
+    return undefined;
+  }
+
+  /** Latest free-reset evidence for each current meter/window, limited to
+   * that window -- unaffected by issue #20's unscheduled marker, which only
+   * ever applies to reset_seen (see classifyUsageDrop's own doc comment). */
   freeResetUsedFor(observations: Array<Pick<Observation, "meter_id" | "window" | "resets_at">>, now = new Date()): Map<string, string> {
     return this.eventEvidenceFor("free_reset_used", observations, now);
   }
@@ -1105,6 +1195,26 @@ export class HeadroomStore {
       if (row?.created_at && typeof row.created_at === "string") output.set(`${observation.meter_id}:${minutes}`, row.created_at);
     }
     return output;
+  }
+
+  /**
+   * The most recent unscheduled reset_seen event (metadata.unscheduled,
+   * issue #20) for each of the given meters, within the last
+   * UNSCHEDULED_RESET_HOURS -- what orchestrator-reads.ts's gate/plan/fill
+   * build their own `notices` from. One row per meter, not per meter+window:
+   * an orchestrator's own budgeting is per meter, and a meter with more than
+   * one unscheduled reset in range only needs the newest one named.
+   */
+  recentUnscheduledResets(meterIds: string[], now = new Date()): Array<{ meter_id: string; created_at: string }> {
+    if (!meterIds.length) return [];
+    const since = new Date(now.getTime() - UNSCHEDULED_RESET_HOURS * 3_600_000).toISOString();
+    const placeholders = meterIds.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT meter_id, MAX(created_at) AS created_at FROM events
+      WHERE kind = 'reset_seen' AND meter_id IN (${placeholders})
+        AND julianday(created_at) >= julianday(?)
+        AND json_extract(metadata_json, '$.unscheduled') = 1
+      GROUP BY meter_id ORDER BY meter_id ASC`).all(...meterIds, since);
+    return rows.map((row) => ({ meter_id: String(row.meter_id), created_at: String(row.created_at) }));
   }
 
   audit(caller: string, action: string, meterOrPrincipal: string | null, outcome: string): void {

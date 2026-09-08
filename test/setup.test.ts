@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsPath } from "../src/registry.js";
-import { isYes, runSetup } from "../src/setup.js";
+import { isYes, runSetup, stepNotifications } from "../src/setup.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -45,7 +45,7 @@ describe("headroom setup, non-interactive (vitest's own stdin is never a TTY)", 
     const output = logs.join("\n");
     expect(output).toContain("nothing will change");
     expect(output).toContain("Step 1: discover accounts");
-    expect(output).toContain("Step 6: final check");
+    expect(output).toContain("Step 5: final check");
     // Nothing changed: no accounts.toml, no policy/routing seed.
     expect(accountsExists).toBe(false);
     expect(await fileExists(join(headroomHome, "policy.toml"))).toBe(false);
@@ -59,7 +59,7 @@ describe("headroom setup, non-interactive (vitest's own stdin is never a TTY)", 
 });
 
 describe("headroom setup --dry-run", () => {
-  it("produces the full six-step plan against an empty temporary home and writes nothing", async () => {
+  it("produces the full five-step plan against an empty temporary home and writes nothing", async () => {
     const fakeHome = await mkdtemp(join(tmpdir(), "headroom-setup-userhome-"));
     const headroomHome = await mkdtemp(join(tmpdir(), "headroom-setup-home-"));
     temporary.push(fakeHome, headroomHome);
@@ -74,9 +74,15 @@ describe("headroom setup --dry-run", () => {
     });
     expect(code).toBe(0);
     const output = logs.join("\n");
-    for (const step of ["Step 1: discover accounts", "Step 2: run doctor", "Step 3: grant Keychain access", "Step 4: install the background service", "Step 5: register the MCP server", "Step 6: final check"]) {
+    for (const step of ["Step 1: discover accounts", "Step 2: run doctor", "Step 3: install the background service", "Step 4: register the MCP server", "Step 5: final check"]) {
       expect(output).toContain(step);
     }
+    // The Keychain grant step is gone entirely: nothing is granted any more,
+    // because the probe reads the credential through the Apple security tool
+    // the item already admits.
+    expect(output).not.toContain("grant Keychain access");
+    expect(output).not.toContain("headroom keychain grant");
+    if (process.platform === "darwin") expect(output).toContain("no Keychain dialog to answer");
     expect(output).toContain("Setup finished.");
     expect(accountsExists).toBe(false);
     expect(await fileExists(join(headroomHome, "Library", "LaunchAgents", "com.headroom.daemon.plist"))).toBe(false);
@@ -102,7 +108,7 @@ describe("headroom setup: empty-answer confirmation defaults to No", () => {
 });
 
 describe("headroom setup --yes", () => {
-  it("never runs the Keychain grant, even for a principal that needs one, and prints the command instead", async () => {
+  it("never asks about Keychain access, and never prints a grant command, for a principal an older build would have sent to one", async () => {
     const fakeHome = await mkdtemp(join(tmpdir(), "headroom-setup-userhome-"));
     const headroomHome = await mkdtemp(join(tmpdir(), "headroom-setup-home-"));
     temporary.push(fakeHome, headroomHome);
@@ -112,27 +118,20 @@ describe("headroom setup --yes", () => {
     // that can never collide with the real Keychain item for this machine's
     // own ~/.claude login.
     await mkdir(join(fakeHome, ".claude-setup-test"), { recursive: true });
-    const keychainGrant = vi.fn(async () => 0);
     const claudeOnPath = vi.fn(async () => false);
     let code = -1;
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { keychainGrant, claudeOnPath }));
+      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { claudeOnPath }));
       code = captured.result;
       logs = captured.logs;
     });
     expect(code).toBe(0);
-    expect(keychainGrant).not.toHaveBeenCalled();
     const output = logs.join("\n");
+    expect(output).not.toContain("headroom keychain grant");
     expect(output).not.toContain("Keychain access granted");
-    if (process.platform === "darwin") {
-      // The account discovered above has no real Keychain item under this
-      // hashed service name, so doctor reports it needs a grant, and setup's
-      // own --yes rule must print the fix command rather than run it.
-      expect(output).toMatch(/run this yourself: headroom keychain grant --principal \S+/);
-    } else {
-      expect(output).toContain("skipped; not macOS");
-    }
+    expect(output).not.toContain("credential readable, no dialog needed");
+    if (process.platform === "darwin") expect(output).toContain("no Keychain dialog to answer");
   });
 });
 
@@ -164,5 +163,30 @@ describe("headroom setup --skip-service --skip-mcp", () => {
 describe("headroom setup argument validation", () => {
   it("rejects an unknown flag", async () => {
     await expect(runSetup(["--bogus"])).rejects.toThrow(/Usage: headroom setup/);
+  });
+});
+
+
+describe("setup notifications step", () => {
+  it("offers the shared picker after an explicit yes and shares its question function", async () => {
+    const questions: string[] = [];
+    const rl = { question: async (question: string) => { questions.push(question); return "y"; } };
+    let configured = false;
+    await captureLog(() => stepNotifications({ yes: false, planOnly: false, rl }, {
+      configureNotify: async (ask) => { configured = true; expect(await ask("Channels? ")).toBe("y"); return 0; },
+    }));
+    expect(configured).toBe(true);
+    expect(questions).toEqual(["Notifications? [y/N] ", "Channels? "]);
+  });
+
+  it("skips on Enter, --yes and plan mode and names the command for later", async () => {
+    for (const flags of [{ yes: false, planOnly: false }, { yes: true, planOnly: false }, { yes: false, planOnly: true }]) {
+      const question = vi.fn(async () => "");
+      const configureNotify = vi.fn(async () => 0);
+      const { logs } = await captureLog(() => stepNotifications({ ...flags, rl: { question } }, { configureNotify }));
+      expect(configureNotify).not.toHaveBeenCalled();
+      expect(logs.join("\n")).toContain("headroom notify configure");
+      expect(question).toHaveBeenCalledTimes(flags.yes || flags.planOnly ? 0 : 1);
+    }
   });
 });

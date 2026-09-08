@@ -108,9 +108,25 @@ const BASELINE: Migration = {
   },
 };
 
+/**
+ * Adds `events.metadata_json`, mirroring `observations.metadata_json` --
+ * non-secret, structured facts about an event that are not part of its
+ * evidence. First user: `reset_seen`'s `unscheduled` marker (issue #20).
+ * `addColumnIfMissing` makes this a no-op for a database that somehow
+ * already has the column (there is no such database yet, but the same
+ * guard the baseline uses for every other ad hoc column costs nothing).
+ */
+const ADD_EVENT_METADATA: Migration = {
+  version: 2,
+  description: "events.metadata_json for non-secret event facts (reset_seen's unscheduled marker)",
+  up(db) {
+    addColumnIfMissing(db, "ALTER TABLE events ADD COLUMN metadata_json TEXT");
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

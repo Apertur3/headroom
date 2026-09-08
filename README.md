@@ -45,6 +45,8 @@ links its library for providers Headroom does not cover natively.
 
 ## What you get
 
+`headroom dashboard` (alias `top`) shows a live terminal dashboard with quota bars, burn history, events and leases, using cached readings only.
+
 | | |
 |---|---|
 | Meters | One row per account and limit family: Claude `all`, `fable`, `routines`; Codex `main`, `spark`; Antigravity `gemini`, `claude-gpt`; Grok `main`, `credits`; local `capacity` |
@@ -72,13 +74,13 @@ On macOS and Linux, `brew install apertur3/tap/headroom` installs the same packa
 `brew services start headroom` service.
 
 Already running Claude Code or another agent? Copy [skills/headroom/SKILL.md](skills/headroom/SKILL.md)
-into its skills directory and say "set up headroom": the agent runs discovery, the doctor, the one
-macOS Keychain prompt, the background service and the MCP registration for you.
+into its skills directory and say "set up headroom": the agent runs discovery, the doctor, the
+background service and the MCP registration for you.
 
 By hand, the same steps are one command:
 
 ```sh
-headroom setup                # discovery, doctor, Keychain grant, service, MCP registration -- asks before each change
+headroom setup                # discovery, doctor, service, MCP registration -- asks before each change
 ```
 
 `accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom
@@ -110,12 +112,11 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 ## Security
 
 No secret touches disk or output. On macOS `headroom-claude-probe` reads the Claude Keychain token
-and makes the usage request itself, so the token never enters Node or stdout. It ships inside the
-npm package as a universal binary, verified against a recorded SHA-256 before every use, and is
-ad-hoc signed rather than Developer ID signed -- fine for a beta, but it means each package update
-is a new signing identity to macOS. Run `headroom keychain grant` once and choose **Always Allow**;
-an updated probe binary prompts once again. Tokens are otherwise read at call time from the Keychain or the
-vendor's own credential file and dropped after the request. The daemon listens on a 0600 local
+through `/usr/bin/security`, which the Keychain item's own access list admits, and makes the usage
+request itself, so the token never enters Node or stdout and no dialog is ever involved. It ships
+inside the npm package as a universal binary, verified against a recorded SHA-256 before every use.
+Tokens are otherwise read at call time from the Keychain or the vendor's own credential file and
+dropped after the request. The daemon listens on a 0600 local
 socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry, the engine
 is pinned and checksum verified, and every query lands in an audit log. Details in [SECURITY.md](SECURITY.md).
 

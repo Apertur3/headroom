@@ -1,9 +1,9 @@
 import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { claudeGrantNeededReason, claudeLoggedOutFix, claudeLoggedOutReason } from "../src/adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeGrantNeededReason, claudeLoggedOutFix, claudeLoggedOutReason, isClaudeProbeDenialReason } from "../src/adapters/claude.js";
 import { pollAccounts } from "../src/collector.js";
 import { isMainModule as cliIsMainModule } from "../src/cli.js";
 import { doctorChecks, homeCheck, keychainGrantCheck } from "../src/doctor.js";
@@ -19,6 +19,26 @@ async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise
   process.env.HEADROOM_HOME = home;
   try { return await run(); }
   finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+}
+
+async function withProbePath<T>(path: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.HEADROOM_PROBE_PATH;
+  process.env.HEADROOM_PROBE_PATH = path;
+  try { return await run(); }
+  finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
+}
+
+/** A fake `security` earlier on PATH than /usr/bin/security, so doctor's
+ * metadata-only lookup answers from a synthetic attribute dump instead of the
+ * developer's real login Keychain. */
+async function withFakeSecurityOnPath<T>(dir: string, stdout: string[], run: () => Promise<T>): Promise<T> {
+  const path = join(dir, "security");
+  await writeFile(path, ["#!/bin/sh", "cat <<'HRM_EOF'", ...stdout, "HRM_EOF", ""].join("\n"), { mode: 0o755 });
+  await chmod(path, 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}${delimiter}${previous ?? ""}`;
+  try { return await run(); }
+  finally { if (previous === undefined) delete process.env.PATH; else process.env.PATH = previous; }
 }
 
 // Mirrors doctor.ts's homeCheck(): on win32 the detail always gets a note
@@ -63,6 +83,52 @@ describe("collector gate for a Claude principal awaiting a Keychain grant", () =
   // (a denied/timed-out probe producing the same claudeGrantNeededReason
   // text the collector matches on) is covered at the adapter level in
   // native-adapters.test.ts, via observeClaude's injectable `probe` seam.
+
+  // A fake probe binary substituted through HEADROOM_PROBE_PATH, exactly the
+  // seam claude-probe-mapping.test.ts uses, so nothing here touches a real
+  // Keychain item or a real probe. macOS only: the probe path itself only
+  // exists on darwin (elsewhere observeClaude reads a plain credential file).
+  it.skipIf(process.platform !== "darwin")("never marks a principal whose credential the probe read successfully", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-collector-readable-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "claude-main"',
+      'vendor = "claude"',
+      'location = "/nonexistent/.claude"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const probe = join(root, "probe-readable");
+    await writeFile(probe, `#!/bin/sh\necho '{"five_hour":{"utilization":12,"resets_at":"2026-09-04T00:00:00Z"}}'\n`, { mode: 0o755 });
+    await chmod(probe, 0o755);
+    let succeeded = false;
+    await withHeadroomHome(home, () => withProbePath(probe, async () => {
+      const result = await pollAccounts(undefined, {
+        claudeGrant: {
+          needsGrant: () => false,
+          markGrantNeeded: () => { throw new Error("must not be called: the credential was readable"); },
+          markProbeSucceeded: () => { succeeded = true; },
+          probePath: () => undefined,
+        },
+      });
+      const rows = result.observations.filter((item) => item.principal_id === "claude-main");
+      expect(rows.some((item) => item.meter_id === "claude-main:all" && item.freshness === "fresh")).toBe(true);
+    }));
+    expect(succeeded).toBe(true);
+  });
+
+  // The gate keys on an explicit probe denial alone (isClaudeProbeDenialReason).
+  // A "Keychain grant lapsed" reason -- which only the old, ACL-blocked read
+  // path could produce -- no longer stops the next poll from trying again.
+  it("does not mark a principal for a lapse-shaped failure reason, only for an explicit denial", () => {
+    const lapse = `${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at 2026-09-07 05:24:43; run: headroom keychain grant --principal claude-main`;
+    expect(isClaudeProbeDenialReason(claudeGrantNeededReason("claude-main"))).toBe(true);
+    expect(isClaudeProbeDenialReason(lapse)).toBe(false);
+    expect(isClaudeProbeDenialReason("no credentials in Keychain for this config dir")).toBe(false);
+    expect(isClaudeProbeDenialReason(null)).toBe(false);
+  });
 });
 
 describe("doctor home directory and keychain grant checks", () => {
@@ -225,6 +291,42 @@ describe("doctor home directory and keychain grant checks", () => {
         const path = credentialPath("claude", "/nonexistent/.claude");
         expect(credential).toMatchObject({ level: "FAIL", detail: `missing or unsafe credential file (${path})` });
       }
+    });
+  });
+
+  it.skipIf(process.platform !== "darwin")("reports an ungated Claude principal as readable through the Apple security tool, with the item's modification time", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-readable-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await withHeadroomHome(home, async () => {
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "accounts.toml"), [
+        "[[accounts]]",
+        'name = "claude-main"',
+        'vendor = "claude"',
+        'location = "/nonexistent/.claude"',
+        'adapter = "native-ts"',
+        "",
+      ].join("\n"), { mode: 0o600 });
+      // Same throwaway first call as the lapse test below: it lets
+      // syncClaudeGrantState's first-run marking settle, and the clear
+      // afterwards leaves the ungated state this line describes.
+      await doctorChecks();
+      const seed = await HeadroomStore.open(home);
+      seed.clearKeychainGrantNeeded("claude-main");
+      seed.close();
+      const checks = await withFakeSecurityOnPath(root, [
+        'keychain: "/x/login.keychain-db"',
+        'class: "genp"',
+        "attributes:",
+        '    "mdat"<timedate>=0x32303236303930373035323434335A00  "20260907052443Z\\000"',
+      ], () => doctorChecks());
+      const credential = checks.find((item) => item.check === "principal claude-main credential");
+      expect(credential?.level).toBe("OK");
+      // Local time, so only the shape is asserted; the exact instant is
+      // parseKeychainModifiedAt's own test in native-adapters.test.ts.
+      expect(credential?.detail).toMatch(/^credential readable through the Apple security tool, last modified \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+      expect(credential?.detail).not.toContain("grant");
+      expect(credential?.fix).toBe("no action needed");
     });
   });
 

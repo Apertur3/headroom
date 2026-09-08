@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
+import { eventText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
 import { HeadroomStore } from "./store.js";
 import type { EventKind, HeadroomEvent, NotifyDelivery } from "./types.js";
@@ -29,29 +30,39 @@ const EVENT_KINDS: readonly EventKind[] = [
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
  * latest reading of every hard window, once per window instance. */
-export const NOTIFY_EVENT_NAMES: readonly string[] = [...EVENT_KINDS, "threshold"];
+export const NOTIFY_EVENT_NAMES: readonly string[] = [...EVENT_KINDS, "threshold", "reset_unscheduled", "reset_scheduled_weekly", "reset_scheduled_short"];
 
-/** What a `[notify] events` list defaults to: the changes an operator wants to
- * hear about, without the per-poll bookkeeping kinds (lease start/end, credit
- * counts) that would turn a phone into a ticker. `grant_lapsed` is left out of
- * the default set on purpose: the same observation that trips it also trips
- * `source_failed` (already default), so an operator who wants the Keychain
- * lapse called out on its own -- distinct from an ordinary outage -- opts
- * into it explicitly. */
-export const DEFAULT_NOTIFY_EVENTS: readonly string[] = [
-  "reset_seen", "free_reset_granted", "source_failed", "source_recovered", "pace_projection_conserve", "model_new", "threshold",
-];
+export type NotifyPreset = "calm" | "quiet" | "everything";
+export const RESET_EVENT_NAMES = ["reset_unscheduled", "reset_scheduled_weekly", "reset_scheduled_short"] as const;
+export const PRESET_EVENTS: Record<NotifyPreset, readonly string[]> = {
+  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "threshold"],
+  quiet: ["reset_unscheduled", "source_failed", "threshold"],
+  everything: [...EVENT_KINDS.filter((kind) => kind !== "reset_seen"), ...RESET_EVENT_NAMES, "threshold"],
+};
+export const DEFAULT_NOTIFY_EVENTS = PRESET_EVENTS.calm;
+
+export function resolveNotifyEvents(preset: NotifyPreset, on: string[] = [], off: string[] = [], legacy?: string[]): string[] {
+  const events = new Set(legacy ?? PRESET_EVENTS[preset]);
+  for (const name of on) events.add(name);
+  for (const name of off) events.delete(name);
+  return [...events];
+}
 
 export interface QuietHours { start: number; end: number; }
 
 export interface NotifyConfig {
   channels: ChannelName[];
+  preset: NotifyPreset;
+  events_on: string[];
+  events_off: string[];
   events: string[];
   threshold_percent: number | null;
   quiet_hours: QuietHours | null;
   telegram: { chat_id: string | null };
   ntfy: { topic: string | null; server: string };
   webhook: { url: string | null };
+  /** Accepted for older policies; use events_on = ["reset_scheduled_short"] instead. */
+  notify_scheduled_short: boolean;
 }
 
 /** One queued notification: what the ledger stores, and what a channel renders. */
@@ -72,8 +83,10 @@ function stringValue(value: string): string | undefined {
 }
 
 function listValue(value: string): string[] | undefined {
-  const match = /^\[(.*)\]$/.exec(value);
-  return match ? [...match[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((item) => JSON.parse(`"${item[1]}"`) as string) : undefined;
+  try {
+    const parsed: unknown = JSON.parse(value.replace(/,\s*]$/, "]"));
+    return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : undefined;
+  } catch { return undefined; }
 }
 
 /** "23:00-07:00" as minutes past local midnight, wrapping allowed. */
@@ -107,26 +120,44 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   let present = false;
   let channels: string[] | undefined;
   let events: string[] | undefined;
-  let thresholdPercent: number | null = null;
+  let preset: NotifyPreset = "calm";
+  let eventsOn: string[] = [];
+  let eventsOff: string[] = [];
+  let thresholdPercent: number | null = 90;
   let quietHours: QuietHours | null = null;
   let chatId: string | null = null;
   let topic: string | null = null;
   let server = DEFAULT_NTFY_SERVER;
   let webhookUrl: string | null = null;
+  let notifyScheduledShort = false;
   for (const raw of text.split("\n")) {
-    const line = raw.replace(/#.*/, "").trim();
+    const line = raw.replace(/("(?:[^"\\]|\\.)*")|#.*/g, (match, quoted: string | undefined) => quoted ?? "").trim();
     if (!line) continue;
-    const header = /^\[([A-Za-z0-9_.]+)\]$/.exec(line);
-    if (header) { section = header[1]; if (section === "notify" || section.startsWith("notify.")) present = true; continue; }
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) { section = header[1].trim(); if (section === "notify" || section.startsWith("notify.")) present = true; continue; }
     if (section !== "notify" && !section.startsWith("notify.")) continue;
     const entry = /^([A-Za-z0-9_]+)\s*=\s*(.+)$/.exec(line);
     if (!entry) throw invalid(line);
     const [, key, value] = entry;
     if (section === "notify") {
+      if (key === "preset") {
+        const name = stringValue(value);
+        if (name !== "calm" && name !== "quiet" && name !== "everything") throw invalid("preset must be calm, quiet or everything");
+        preset = name;
+        continue;
+      }
+      if (key === "events_on") { eventsOn = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
+      if (key === "events_off") { eventsOff = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
       if (key === "channels") { channels = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
       if (key === "events") { events = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
       if (key === "threshold_percent") { thresholdPercent = Number(value); continue; }
       if (key === "quiet_hours") { quietHours = parseQuietHours(stringValue(value) ?? value); continue; }
+      if (key === "notify_scheduled_short") {
+        const trimmed = value.trim();
+        if (trimmed !== "true" && trimmed !== "false") throw invalid(`notify_scheduled_short must be true or false, got "${value}"`);
+        notifyScheduledShort = trimmed === "true";
+        continue;
+      }
       throw invalid(`unknown [notify] key "${key}"`);
     }
     const scalar = stringValue(value);
@@ -139,7 +170,7 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   }
   if (!present) return undefined;
   for (const channel of channels ?? []) if (!CHANNEL_NAMES.includes(channel as ChannelName)) throw invalid(`unknown channel "${channel}"`);
-  for (const event of events ?? []) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid(`unknown event "${event}"`);
+  for (const event of [...(events ?? []), ...eventsOn, ...eventsOff]) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid(`unknown event "${event}"`);
   if (thresholdPercent !== null && (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100)) throw invalid("threshold_percent must be above 0 and at most 100");
   if (topic !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw invalid("ntfy topic must be 1 to 64 characters of letters, digits, hyphen or underscore");
   if (chatId !== null && !/^-?[0-9]{1,32}$|^@[A-Za-z0-9_]{1,64}$/.test(chatId)) throw invalid("telegram chat_id must be a numeric id or an @name");
@@ -151,12 +182,14 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   }
   return {
     channels: (channels ?? []) as ChannelName[],
-    events: events ? [...events] : [...DEFAULT_NOTIFY_EVENTS],
+    preset, events_on: eventsOn, events_off: eventsOff,
+    events: resolveNotifyEvents(preset, eventsOn, eventsOff, events),
     threshold_percent: thresholdPercent,
     quiet_hours: quietHours,
     telegram: { chat_id: chatId },
     ntfy: { topic, server },
     webhook: { url: webhookUrl },
+    notify_scheduled_short: notifyScheduledShort,
   };
 }
 
@@ -228,7 +261,7 @@ export function secretStoreCommand(service: string, platform: NodeJS.Platform = 
 /** The command an operator runs once to put the credential in the store. */
 export function secretStoreHint(service: string, platform: NodeJS.Platform = process.platform): string {
   if (platform === "darwin") return `security add-generic-password -U -a headroom -s ${service} -w`;
-  if (platform === "win32") return `cmdkey /generic:${service} /user:headroom /pass`;
+  if (platform === "win32") return `powershell -NoProfile -Command "cmdkey /generic:${service} /user:headroom /pass"`;
   if (platform === "linux") return `secret-tool store --label=headroom service ${service}`;
   return `no OS secret store is supported on ${platform}`;
 }
@@ -318,9 +351,9 @@ export function chunkMessage(text: string, limit = CHUNK_LIMIT): string[] {
 
 /** One message for one event, or one batched message for everything a quiet
  * window held back. */
-export function combineTexts(texts: string[]): string {
-  if (texts.length === 1) return `Headroom: ${texts[0]}`;
-  return [`Headroom: ${texts.length} events`, ...texts.map((text) => `- ${text}`)].join("\n");
+export function combineTexts(texts: string[], digest = false): string {
+  if (texts.length === 1 && !digest) return texts[0];
+  return [`🌙 Headroom: ${texts.length} events`, ...texts.map((text) => text.replace(/\s*\n\s*/g, " "))].join("\n");
 }
 
 export interface ChannelStatus {
@@ -332,7 +365,7 @@ export interface ChannelStatus {
 
 interface PreparedChannel extends ChannelStatus {
   secrets: string[];
-  deliver(items: NotifyItem[]): Promise<void>;
+  deliver(items: NotifyItem[], digest?: boolean): Promise<void>;
 }
 
 export interface NotifyOptions {
@@ -372,8 +405,8 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
       const token = lookup.secret;
       prepared.push({
         channel, ready: true, detail: `chat ${chatId}`, secrets: [token],
-        deliver: async (items) => {
-          for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text)))) {
+        deliver: async (items, digest) => {
+          for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text), digest))) {
             await send(fetcher, `${TELEGRAM_ORIGIN}/bot${token}/sendMessage`, {
               method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text: chunk }),
             }, [TELEGRAM_ORIGIN]);
@@ -388,10 +421,10 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
       const url = `${config.ntfy.server}/${topic}`;
       prepared.push({
         channel, ready: true, detail: url, secrets: [],
-        deliver: async (items) => {
-          for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text)))) {
+        deliver: async (items, digest) => {
+          for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text), digest))) {
             await send(fetcher, url, {
-              method: "POST", headers: { "content-type": "text/plain; charset=utf-8", title: "Headroom" }, body: chunk,
+              method: "POST", headers: { "content-type": "text/plain; charset=utf-8", title: `=?UTF-8?B?${Buffer.from(combineTexts(items.map((item) => item.text), digest).split("\n")[0]).toString("base64")}?=` }, body: chunk,
             }, [config.ntfy.server]);
           }
         },
@@ -405,7 +438,7 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
     if (bearer.secret) headers.authorization = `Bearer ${bearer.secret}`;
     prepared.push({
       channel, ready: true, detail: `${url}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [bearer.secret] : [],
-      deliver: async (items) => {
+      deliver: async (items, digest) => {
         // One POST per event even inside a batch: a webhook consumer wants
         // one structured record per event, not several folded into one text.
         for (const item of items) {
@@ -436,17 +469,17 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
   return { id: row.event_id, kind: "event", meter: null, principal: null, at: row.created_at, text: row.text };
 }
 
-function windowLabel(minutes: number | null | undefined): string {
-  if (minutes === 300) return "5h";
-  if (minutes === 10_080) return "wk";
-  if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
-  if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
-  return minutes ? `${minutes}m` : "-";
-}
-
-function eventText(event: HeadroomEvent): string {
-  const subject = event.meter_id ?? event.principal_id ?? "-";
-  return `${event.kind} ${subject}${event.reason ? `: ${event.reason}` : ""}`;
+/** Overrides for a reset category take precedence over the reset_seen umbrella. */
+export function wantsEvent(event: HeadroomEvent, config: NotifyConfig): boolean {
+  if (event.kind !== "reset_seen") return config.events.includes(event.kind);
+  const category = event.metadata?.unscheduled ? "reset_unscheduled"
+    : event.metadata?.window_minutes === 300 ? "reset_scheduled_short"
+    : event.metadata?.window_minutes === 10_080 ? "reset_scheduled_weekly" : "reset_seen";
+  if (config.events_off.includes("reset_seen") || config.events_off.includes(category)) return false;
+  if (category === "reset_scheduled_short") {
+    return config.preset === "everything" || config.events_on.includes(category);
+  }
+  return config.events.includes(category) || config.events.includes("reset_seen") || category === "reset_seen" && config.preset === "everything";
 }
 
 /**
@@ -462,11 +495,10 @@ export function thresholdItems(store: HeadroomStore, threshold: number): NotifyI
     if (observation.freshness !== "fresh" || observation.quantity?.unit !== "percent") continue;
     if (observation.window?.enforcement !== "hard" || !observation.window.minutes) continue;
     if (observation.quantity.used < threshold) continue;
-    const label = windowLabel(observation.window.minutes);
     items.push({
       id: `threshold:${observation.meter_id}:${observation.window.minutes}:${observation.resets_at ?? "unknown"}`,
       kind: "threshold", meter: observation.meter_id, principal: observation.principal_id, at: observation.fetched_at,
-      text: `${observation.meter_id} ${label} at ${Math.round(observation.quantity.used)}% used (threshold ${threshold}%)`,
+      text: thresholdText(observation, threshold),
     });
   }
   return items;
@@ -474,9 +506,10 @@ export function thresholdItems(store: HeadroomStore, threshold: number): NotifyI
 
 function collectItems(store: HeadroomStore, config: NotifyConfig, since: string): NotifyItem[] {
   const wanted = new Set(config.events);
-  const items: NotifyItem[] = store.events(since)
-    .filter((event) => wanted.has(event.kind))
-    .map((event) => ({ id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event) }));
+  const siblings = store.latestPerWindow();
+  const events = store.events(since).filter((event) => wantsEvent(event, config));
+  const evidence = store.eventObservations(events);
+  const items: NotifyItem[] = events.map((event) => ({ id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence.get(event.id), siblings) }));
   if (wanted.has("threshold") && config.threshold_percent !== null) items.push(...thresholdItems(store, config.threshold_percent));
   return items;
 }
@@ -497,7 +530,8 @@ async function flushChannel(store: HeadroomStore, channel: PreparedChannel, log:
   if (!rows.length) return 0;
   const ids = rows.map((row) => row.id);
   try {
-    await channel.deliver(rows.map(decodeItem));
+    await channel.deliver(rows.map(decodeItem), store.daemonState(`notify_quiet:${channel.channel}`) === "true");
+    store.setDaemonState(`notify_quiet:${channel.channel}`, "false");
     store.notifyDelivered(ids, now.toISOString());
     return rows.length;
   } catch (error: unknown) {
@@ -555,7 +589,10 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   const items = watermark === undefined ? [] : collectItems(store, config, watermark);
   store.setDaemonState(WATERMARK_KEY, now.toISOString());
   for (const item of items) for (const channel of ready) store.notifyEnqueue(item.id, channel.channel, encodeItem(item), now.toISOString());
-  if (inQuietHours(config, now)) return { configured: true, queued: items.length, sent: 0, quiet: true, channels: status };
+  if (inQuietHours(config, now)) {
+    for (const channel of ready) if (items.length) store.setDaemonState(`notify_quiet:${channel.channel}`, "true");
+    return { configured: true, queued: items.length, sent: 0, quiet: true, channels: status };
+  }
   let sent = 0;
   for (const channel of ready) sent += await flushChannel(store, channel, log, now);
   return { configured: true, queued: items.length, sent, quiet: false, channels: status };
@@ -565,7 +602,7 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
  * CLI.
  * ---------------------------------------------------------------------- */
 
-export const NOTIFY_USAGE = "Usage: headroom notify (--test | --last <n>)";
+export const NOTIFY_USAGE = "Usage: headroom notify (configure [--dry-run] | --test | --last <n>)";
 
 /** Sends one message per configured channel and reports what happened.
  * Deliberately outside the ledger: a test message is not an event, and must
@@ -576,7 +613,7 @@ export async function notifyTest(options: NotifyOptions = {}): Promise<number> {
   if (!config || !config.channels.length) { console.log(`No [notify] channels in ${join(home, "policy.toml")}. See docs/notifications.md.`); return 1; }
   const now = options.now ?? new Date();
   const channels = await prepareChannelsInternal(config, options);
-  const item: NotifyItem = { id: `test:${now.toISOString()}`, kind: "test", meter: null, principal: null, at: now.toISOString(), text: "test notification" };
+  const item: NotifyItem = { id: `test:${now.toISOString()}`, kind: "test", meter: null, principal: null, at: now.toISOString(), text: "🔔 Headroom test\nNotifications are ready." };
   let failures = 0;
   for (const channel of channels) {
     if (!channel.ready) { console.log(`${channel.channel.padEnd(8)} disabled  ${channel.detail}`); failures += 1; continue; }
@@ -606,6 +643,7 @@ export async function notifyLast(limit: number, home?: string): Promise<number> 
 }
 
 export async function notifyCommand(argv: string[]): Promise<number> {
+  if (argv[0] === "configure") return (await import("./notify-configure.js")).configureNotifications(argv.slice(1));
   if (argv.includes("--test")) return notifyTest();
   const at = argv.indexOf("--last");
   if (at >= 0) {

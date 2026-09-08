@@ -10,6 +10,66 @@ import FoundationNetworking
 /// host a successful response is trusted to have come from.
 let anthropicUsageHost = "api.anthropic.com"
 
+/// The Apple-signed tool this probe reads the credential through.
+///
+/// Claude Code 2.1.263 rewrites `Claude Code-credentials` (and the
+/// per-profile `Claude Code-credentials-<hash>` items) with an access list
+/// that admits Apple-signed tools but not third-party applications. A direct
+/// `SecItemCopyMatching` with `kSecReturnData` from this probe therefore
+/// comes back `errSecItemNotFound` even from the user's own Terminal, with no
+/// dialog offered at all, while `/usr/bin/security find-generic-password -w`
+/// returns the secret with exit 0 and no dialog, even from a sandboxed shell.
+/// So the framework read stays only as a silent first attempt, and this is
+/// the path that actually answers. Absolute path, spawned with an argument
+/// vector and never through a shell.
+let securityToolPath = "/usr/bin/security"
+
+/// `security`'s own exit status for "The specified item could not be found in
+/// the keychain": the one failure that means a genuinely absent login rather
+/// than a tool that could not do its job.
+let securityToolItemNotFoundStatus: Int32 = 44
+
+/// How long `security` gets to answer before the probe gives up on it.
+let securityToolTimeoutSeconds = 10.0
+
+/// Nothing larger than this is a Claude credential; a `security` that streams
+/// more than this is not answering the question that was asked.
+let securityToolOutputCap = 1_048_576
+
+/// What one `security find-generic-password -w` run resolved to. `failed`
+/// carries the tool's exit status and nothing else: its output is discarded
+/// unread, because the only thing on that stream is the secret itself.
+enum SecurityToolOutcome: Equatable {
+    case credential(Data)
+    case absent
+    case failed(Int32)
+    case timedOut
+    case unusable
+}
+
+/// Holds the pipe's read end and the bytes taken from it, so the background
+/// read can be handed to a Sendable closure without capturing a FileHandle
+/// across the boundary. Stays in memory; nothing here is ever written to disk.
+final class SecurityToolOutput: @unchecked Sendable {
+    private let handle: FileHandle
+    private(set) var data = Data()
+    private(set) var overCap = false
+
+    init(_ handle: FileHandle) { self.handle = handle }
+
+    /// Drains the pipe, stopping once more than `cap` bytes have arrived.
+    /// Draining rather than waiting for the process first is what keeps a
+    /// full pipe buffer from deadlocking the wait below.
+    func drain(cap: Int) {
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty { return }
+            if data.count + chunk.count > cap { overCap = true; return }
+            data.append(chunk)
+        }
+    }
+}
+
 /// True only when `url`'s host is exactly `api.anthropic.com`. Used both to
 /// build the request and, after the fact, to check where the response
 /// actually came from once redirects are refused.
@@ -79,32 +139,21 @@ struct HeadroomClaudeProbe {
         let args = CommandLine.arguments
         guard args.count == 3, args[1] == "--config-dir" else { exit(2) }
         let directory = URL(fileURLWithPath: args[2]).standardizedFileURL.path
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword, kSecAttrAccount: NSUserName(),
-            kSecAttrService: serviceName(directory), kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let credentialData = result as? Data else {
-            // errSecInteractionNotAllowed (a sandboxed or otherwise
-            // non-interactive process, unable to show the Keychain access
-            // dialog at all) and a cancelled interaction both mean "the
-            // dialog could not be shown here", distinct from errSecAuthFailed
-            // (a real ACL denial) and from every other status, including
-            // errSecItemNotFound, which stays "no credentials" -- a genuinely
-            // absent login needs a different fix (`claude` to log in) than a
-            // shell that cannot show a dialog for an item that already exists.
-            if status == errSecInteractionNotAllowed || status == errSecUserCanceled { fail("HEADROOM_PROBE_INTERACTION_NOT_ALLOWED", 3) }
-            if status == errSecAuthFailed { fail("HEADROOM_PROBE_KEYCHAIN_DENIED", 3) }
-            fail("HEADROOM_PROBE_NO_CREDENTIALS", 1)
-        }
-        // credentialData decrypted fine (status == errSecSuccess): the item
-        // exists, distinct from the errSecItemNotFound case above. If its
+        let service = serviceName(directory)
+        let account = NSUserName()
+        // The framework read first, but only silently: it is the cheaper path
+        // on any machine whose item still admits this binary, and on one whose
+        // item does not it must fail immediately rather than sit on a dialog.
+        // Whatever status it returns is not an answer -- `security` gives the
+        // real one below.
+        let credentialData = silentKeychainRead(service: service, account: account)
+            ?? credentialThroughSecurityTool(service: service, account: account)
+        // The item exists and decrypted (either read returned bytes). If its
         // JSON carries no usable OAuth access token, that is Claude Code
         // logged out locally (issue #11) -- a different fix (sign back in)
-        // than a genuinely absent item (a Keychain grant or a first login),
-        // so it gets its own marker and exit status rather than folding into
-        // HEADROOM_PROBE_NO_CREDENTIALS above.
+        // than a genuinely absent item (a first login), so it gets its own
+        // marker and exit status rather than folding into
+        // HEADROOM_PROBE_NO_CREDENTIALS.
         guard let token = token(credentialData) else { fail("HEADROOM_PROBE_LOGGED_OUT", 6) }
         var request = URLRequest(url: URL(string: "https://\(anthropicUsageHost)/api/oauth/usage")!)
         request.httpMethod = "GET"; request.timeoutInterval = 10
@@ -141,6 +190,97 @@ struct HeadroomClaudeProbe {
     }
 
     private static func fail(_ marker: String, _ code: Int32) -> Never { fputs("\(marker)\n", stderr); exit(code) }
+
+    /// The silent first attempt through the Security framework.
+    /// `kSecUseAuthenticationUIFail` is what makes it silent: an item this
+    /// process may not read fails immediately with a status instead of
+    /// offering a dialog, so this can never block a background poll. The
+    /// constant is formally deprecated in favour of an LAContext, and is
+    /// still the working way to say "never prompt" for a plain
+    /// SecItemCopyMatching without linking LocalAuthentication for it. Any
+    /// failure at all -- restricted item, absent item, anything else --
+    /// simply returns nil and lets the `security` read decide.
+    static func silentKeychainRead(service: String, account: String) -> Data? {
+        // The legacy Keychain confirmation dialog ("... wants to use your
+        // confidential information stored in your keychain") is a different
+        // mechanism from kSecUseAuthenticationUI, and only this switches it
+        // off. Without it, a probe the item no longer admits does not fail --
+        // it hangs on a dialog that a daemon or a sandboxed shell has no way
+        // to answer. Left off for the rest of the process: nothing this probe
+        // does should ever wait on a person.
+        SecKeychainSetUserInteractionAllowed(false)
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword, kSecAttrAccount: account,
+            kSecAttrService: service, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne,
+            kSecUseAuthenticationUI: kSecUseAuthenticationUIFail,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    /// Reads the credential through `security` and turns anything but a
+    /// credential into an exit. An absent item keeps the marker and exit
+    /// status it has always had, since the fix (log in) has not changed; a
+    /// tool that failed for any other reason gets its own marker and exit
+    /// status, carrying `security`'s exit status and never its output.
+    static func credentialThroughSecurityTool(service: String, account: String) -> Data {
+        switch runSecurityTool(service: service, account: account) {
+        case .credential(let data): return data
+        case .absent: fail("HEADROOM_PROBE_NO_CREDENTIALS", 1)
+        case .failed(let status): fail("HEADROOM_PROBE_SECURITY_TOOL_FAILED exit=\(status)", 7)
+        case .timedOut: fail("HEADROOM_PROBE_SECURITY_TOOL_FAILED timeout", 7)
+        case .unusable: fail("HEADROOM_PROBE_SECURITY_TOOL_FAILED unavailable", 7)
+        }
+    }
+
+    /// Spawns `/usr/bin/security find-generic-password -s <service> -a
+    /// <account> -w` with an explicit argument vector, never a shell. Its
+    /// stdout is captured in memory only; stderr is discarded, so a message
+    /// that quoted the item back at us could never reach a log. A run that
+    /// has not finished within securityToolTimeoutSeconds is terminated.
+    static func runSecurityTool(service: String, account: String) -> SecurityToolOutcome {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: securityToolPath)
+        process.arguments = ["find-generic-password", "-s", service, "-a", account, "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return .unusable }
+        let output = SecurityToolOutput(pipe.fileHandleForReading)
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { output.drain(cap: securityToolOutputCap); drained.signal() }
+        guard exited.wait(timeout: .now() + securityToolTimeoutSeconds) == .success else {
+            process.terminate()
+            return .timedOut
+        }
+        // The pipe's writer is gone once the process has exited, so the drain
+        // above is already finishing; this only collects it.
+        _ = drained.wait(timeout: .now() + 2)
+        if output.overCap { return .unusable }
+        return outcome(status: process.terminationStatus, output: output.data)
+    }
+
+    /// Classifies one finished `security` run. Not private: the probe tests
+    /// exercise this and passwordFromSecurityOutput below directly, so the
+    /// parsing is covered without a real Keychain anywhere near it.
+    static func outcome(status: Int32, output: Data) -> SecurityToolOutcome {
+        guard status == 0 else { return status == securityToolItemNotFoundStatus ? .absent : .failed(status) }
+        guard let password = passwordFromSecurityOutput(output) else { return .absent }
+        return .credential(password)
+    }
+
+    /// `security ... -w` writes the password followed by one newline. Strips
+    /// the trailing line ending (CR and LF both, so a credential is never
+    /// corrupted by an unexpected one) and reports nothing usable as nil.
+    static func passwordFromSecurityOutput(_ output: Data) -> Data? {
+        var bytes = output
+        while let last = bytes.last, last == 0x0A || last == 0x0D { bytes.removeLast() }
+        return bytes.isEmpty ? nil : bytes
+    }
     // Not `private`: HeadroomClaudeProbeTests exercises this directly
     // (@testable import) to cover the HEADROOM_PROBE_LOGGED_OUT guard above
     // without spawning the real binary or touching a Keychain item.

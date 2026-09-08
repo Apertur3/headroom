@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
   claudeLoggedOutFix, claudeLoggedOutReason, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
-  isClaudeLoggedOutReason, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeGrantState,
+  isClaudeLoggedOutReason, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import {
@@ -611,6 +611,8 @@ function fakeGrantStore() {
     setProbeSigningIdentity: (value: string) => { signingIdentity = value ? value : undefined; },
     probePath: () => path,
     setProbePath: (value: string) => { path = value; },
+    keychainGrantsNeeded: () => [...grants].map(([principal_id, reason]) => ({ principal_id, reason })),
+    clearKeychainGrantNeeded: (id: string) => { grants.delete(id); },
     grants,
   };
 }
@@ -729,86 +731,34 @@ describe("Claude Keychain grant gate", () => {
     expect(store.grants.get("claude-main")).toBe("Keychain access denied");
   });
 
-  it("marks every Claude principal on a first-ever sync, with no prior successful probe or grant", async () => {
+  it("records the probe binary hash and its signing identity, and marks nobody -- not even on a first-ever sync", async () => {
     const store = fakeGrantStore();
-    // A fresh install (or a rebuilt probe) must only ever pop its first
-    // Keychain dialog through `headroom keychain grant`, never a background
-    // daemon poll -- so the very first sync, with nothing recorded yet, marks
-    // every given principal instead of trusting an unproven binary.
-    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: adhoc })).resolves.toBe(true);
-    expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
+    // A fresh install used to be marked here on principle: a rebuilt or
+    // re-signed probe was code the Keychain item's ACL had never admitted, so
+    // every principal was sent through `headroom keychain grant` first. The
+    // credential is now read through the Apple security tool, which the item
+    // admits whatever this binary is signed with, so there is nothing to
+    // grant and nothing to block.
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => "hash-a", signingIdentity: async () => localIdentity });
     expect(store.probeBinaryHash()).toBe("hash-a");
-  });
-
-  it("does not re-mark an unchanged hash, and does mark every principal again on an ad-hoc rebuild", async () => {
-    const store = fakeGrantStore();
-    await syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: adhoc });
-    store.grants.clear(); // simulate the operator clearing it via `headroom keychain grant`
-    // The same hash again, with nothing else changed, is not re-marked.
-    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: adhoc })).resolves.toBe(false);
+    expect(store.probeSigningIdentity()).toBe(localIdentity);
     expect(store.grants.size).toBe(0);
-    // A different hash with no signing identity behind it is a rebuild the
-    // Keychain ACL genuinely cannot recognize: every given principal is
-    // marked, in one pass.
-    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-b", signingIdentity: adhoc })).resolves.toBe(true);
-    expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
-    expect(store.probeBinaryHash()).toBe("hash-b");
   });
 
-  it("does not mark a first-ever sync when this exact hash already succeeded once", async () => {
+  it("marks nobody across a rebuild, a re-signing, or a drop to ad-hoc", async () => {
     const store = fakeGrantStore();
-    // A successful `headroom keychain grant` (or a successful poll) recorded
-    // this hash as granted; probeBinaryHash itself may be absent (e.g. a
-    // restored store), but the sync must still recognize the binary.
-    store.setProbeGrantedHash("hash-a");
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: adhoc })).resolves.toBe(false);
-    expect(store.grants.size).toBe(0);
-    // A different (rebuilt) ad-hoc binary is unproven even though some other hash was granted before.
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-b", signingIdentity: adhoc })).resolves.toBe(true);
-    expect(store.grants.get("claude-main")).toBe("probe binary rebuilt (ad-hoc signed, so the previous grant does not carry over)");
-  });
-
-  it("keeps the grant across a rebuild that kept the same signing identity", async () => {
-    const store = fakeGrantStore();
-    const signingIdentity = async () => localIdentity;
-    // First sync records the identity and asks for the one grant a fresh
-    // install owes; the operator grants it, which records the hash as proven.
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a", signingIdentity })).resolves.toBe(true);
-    store.grants.clear();
-    store.setProbeGrantedHash("hash-a");
-    // `npm run engine:build` again: a different binary, same identity. macOS
-    // keys the Keychain ACL on the designated requirement, which has not
-    // moved, so the existing grant still covers this binary and Headroom must
-    // not send the operator back through `headroom keychain grant`.
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-b", signingIdentity })).resolves.toBe(false);
-    expect(store.grants.size).toBe(0);
-    expect(store.probeBinaryHash()).toBe("hash-b");
-    expect(store.probeGrantedHash()).toBe("hash-b"); // the new binary is proven by inheritance, not re-asked
-  });
-
-  it("marks every principal when the signing identity itself changed", async () => {
-    const store = fakeGrantStore();
-    await syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: async () => localIdentity });
-    store.grants.clear();
-    store.setProbeGrantedHash("hash-a");
-    // A different certificate (a reset identity, a Developer ID, another
-    // machine's build) is a different designated requirement, so the ACL
-    // really does not cover it any more.
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => "hash-a", signingIdentity: async () => localIdentity });
     const other = 'designated => identifier "headroom-claude-probe" and certificate leaf = H"0000000000000000000000000000000000000000"';
-    await expect(syncClaudeGrantState(store, ["claude-main", "claude-2"], { platform: "darwin", hash: async () => "hash-b", signingIdentity: async () => other })).resolves.toBe(true);
-    expect([...store.grants.keys()].sort()).toEqual(["claude-2", "claude-main"]);
-    expect(store.grants.get("claude-main")).toBe("probe signing identity changed");
-  });
-
-  it("falls back to demanding a grant when a signed probe becomes ad-hoc", async () => {
-    const store = fakeGrantStore();
-    await syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-a", signingIdentity: async () => localIdentity });
-    store.grants.clear();
-    store.setProbeGrantedHash("hash-a");
-    // A build that could not use the local identity signs ad-hoc: there is no
-    // stable requirement behind it, so the previous grant does not carry over.
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => "hash-b", signingIdentity: adhoc })).resolves.toBe(true);
-    expect(store.grants.get("claude-main")).toBe("probe binary rebuilt (ad-hoc signed, so the previous grant does not carry over)");
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => "hash-b", signingIdentity: async () => other });
+    expect(store.probeBinaryHash()).toBe("hash-b");
+    expect(store.probeSigningIdentity()).toBe(other);
+    expect(store.grants.size).toBe(0);
+    // An ad-hoc build records no identity at all, rather than leaving the
+    // store claiming one the current binary does not carry.
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => "hash-c", signingIdentity: adhoc });
+    expect(store.probeBinaryHash()).toBe("hash-c");
+    expect(store.probeSigningIdentity()).toBeUndefined();
+    expect(store.grants.size).toBe(0);
   });
 
   it("records a successful grant or a successful probe as the granted hash", () => {
@@ -820,13 +770,25 @@ describe("Claude Keychain grant gate", () => {
     expect(store.probeGrantedHash()).toBe("hash-a");
   });
 
-  it("skips rebuild detection off macOS, with no probe binary, or with no Claude principals", async () => {
+  it("retires a marker the old rebuild detection left behind, and leaves a real denial alone", async () => {
     const store = fakeGrantStore();
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "linux", hash: async () => "hash-a" })).resolves.toBe(false);
+    // Every wording that build ever wrote, including the oldest.
+    store.grants.set("claude-1", "probe binary rebuilt");
+    store.grants.set("claude-2", "probe binary rebuilt (ad-hoc signed, so the previous grant does not carry over)");
+    store.grants.set("claude-3", "probe signing identity changed");
+    store.grants.set("claude-4", "no successful probe recorded for this binary");
+    // A read the Keychain actually refused is not this, and stays.
+    store.grants.set("claude-5", claudeGrantNeededReason("claude-5"));
+    store.grants.set("claude-6", "Keychain access denied");
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => "hash-a", signingIdentity: adhoc });
+    expect([...store.grants.keys()].sort()).toEqual(["claude-5", "claude-6"]);
+  });
+
+  it("records nothing off macOS or with no probe binary at all", async () => {
+    const store = fakeGrantStore();
+    await syncClaudeProbeState(store, { platform: "linux", hash: async () => "hash-a" });
     expect(store.probeBinaryHash()).toBeUndefined();
-    await expect(syncClaudeGrantState(store, ["claude-main"], { platform: "darwin", hash: async () => undefined })).resolves.toBe(false);
-    expect(store.probeBinaryHash()).toBeUndefined();
-    await expect(syncClaudeGrantState(store, [], { platform: "darwin", hash: async () => "hash-a" })).resolves.toBe(false);
+    await syncClaudeProbeState(store, { platform: "darwin", hash: async () => undefined });
     expect(store.probeBinaryHash()).toBeUndefined();
   });
 });
