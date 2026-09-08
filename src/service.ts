@@ -33,7 +33,17 @@ export function serviceContents(script: string, platform = process.platform, run
   return `[Unit]\nDescription=Headroom quota daemon\n[Service]\nEnvironment="PATH=${path}"\nExecStart=${JSON.stringify(runtime)} ${JSON.stringify(script)} daemon\nStandardOutput=append:${log}\nStandardError=append:${log}\nRestart=on-failure\n[Install]\nWantedBy=default.target\n`;
 }
 
-export async function installService(script = process.argv[1] ?? "headroom", platform = process.platform, home = homedir(), runtime = process.execPath, dryRun = false, env = process.env, username = userInfo().username): Promise<{ path: string; command: string; dryRun: boolean; contents: string }> {
+/**
+ * Writes the service definition pointing at the exact executable that runs
+ * it -- `runtime` (process.execPath by default) and `script` (the resolved
+ * entry point, process.argv[1] by default) -- so a maintainer who installs
+ * the service from a repo checkout gets a daemon bound to that checkout
+ * rather than to whatever `headroom` a global npm install happens to resolve
+ * to elsewhere on the machine. Both are echoed back on the result (alongside
+ * the existing `path`/`command`/`contents`) so a caller can print which
+ * binary the installed service will run.
+ */
+export async function installService(script = process.argv[1] ?? "headroom", platform = process.platform, home = homedir(), runtime = process.execPath, dryRun = false, env = process.env, username = userInfo().username): Promise<{ path: string; command: string; dryRun: boolean; contents: string; script: string; runtime: string }> {
   const path = servicePath(platform, home, env);
   const command = platform === "darwin" ? `launchctl bootstrap gui/$(id -u) ${path}` : platform === "win32" ? `schtasks /Create /TN "Headroom Daemon" /XML "${path}" /F` : "systemctl --user enable --now headroom.service";
   const contents = serviceContents(script, platform, runtime, username, home, env);
@@ -42,7 +52,7 @@ export async function installService(script = process.argv[1] ?? "headroom", pla
     await mkdir(dirname(daemonLogPath(headroomHome({ platform, home, env }), platform)), { recursive: true, mode: 0o700 });
     await writeFile(path, contents, { mode: 0o600 });
   }
-  return { path, command, dryRun, contents };
+  return { path, command, dryRun, contents, script, runtime };
 }
 
 export async function uninstallService(platform = process.platform, home = homedir(), dryRun = false, env = process.env): Promise<{ path: string; command: string; dryRun: boolean }> {

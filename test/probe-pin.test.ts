@@ -18,25 +18,36 @@ function fakeStore(pinned: string | undefined): HeadroomStore {
 
 // probePinCheck is a no-op off macOS by design (the probe concept is
 // macOS-only); every assertion below is about its darwin-only behavior.
-describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binary is granted vs which would otherwise resolve", () => {
+describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binary is granted vs which this CLI resolves", () => {
   it("reports INFO 'no probe granted yet' when nothing has ever been pinned", async () => {
     const result = await probePinCheck(fakeStore(undefined), ["claude-main"]);
-    expect(result).toMatchObject({ level: "INFO", detail: expect.stringContaining("no probe granted yet") });
+    expect(result).toMatchObject({ level: "INFO", check: "probe binary", detail: expect.stringContaining("no probe granted yet") });
   });
 
   it("reports OK when the pinned binary still resolves and no other candidate exists", async () => {
     (resolveProbePath as Mock).mockImplementation(async (pin?: string) => pin ?? undefined);
     const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
-    expect(result).toMatchObject({ level: "OK", detail: "granted: /pinned/headroom-claude-probe" });
+    expect(result).toMatchObject({ level: "OK", check: "probe binary", detail: "granted: /pinned/headroom-claude-probe" });
   });
 
-  it("reports INFO naming both binaries when a second, unused candidate also resolves -- never silently switching", async () => {
+  it("reports OK, naming both binaries, when a second candidate resolves but shares the pinned binary's signing identity (a rebuild under the same identity, not a mismatch)", async () => {
     (resolveProbePath as Mock).mockImplementation(async (pin?: string) => pin ?? "/other/headroom-claude-probe");
-    const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
-    expect(result?.level).toBe("INFO");
-    expect(result?.detail).toContain("granted: /pinned/headroom-claude-probe");
-    expect(result?.detail).toContain("not granted");
+    const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"], { signingIdentity: async () => 'designated => identifier "headroom-claude-probe"' });
+    expect(result?.level).toBe("OK");
+    expect(result?.check).toBe("probe binary");
+    expect(result?.detail).toContain("/pinned/headroom-claude-probe");
     expect(result?.detail).toContain("/other/headroom-claude-probe");
+  });
+
+  it("reports WARN naming both binaries and the fix when a second, differently-signed candidate resolves -- never silently switching", async () => {
+    (resolveProbePath as Mock).mockImplementation(async (pin?: string) => pin ?? "/other/headroom-claude-probe");
+    const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"], { signingIdentity: async () => undefined });
+    expect(result?.level).toBe("WARN");
+    expect(result?.check).toBe("probe binary");
+    expect(result?.detail).toContain("/pinned/headroom-claude-probe");
+    expect(result?.detail).toContain("/other/headroom-claude-probe");
+    expect(result?.fix).toContain("headroom keychain grant");
+    expect(result?.fix).toContain("headroom install-service");
   });
 
   it("reports WARN with the fallback path when the granted binary is gone but something else still resolves", async () => {
@@ -48,12 +59,14 @@ describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binar
     expect(result?.level).toBe("WARN");
     expect(result?.detail).toContain("granted binary is gone");
     expect(result?.detail).toContain("/fallback/headroom-claude-probe");
+    expect(result?.fix).toBe("headroom keychain grant --use-this-build");
   });
 
   it("reports FAIL when the granted binary is gone and nothing else resolves either", async () => {
     (resolveProbePath as Mock).mockResolvedValue(undefined);
     const result = await probePinCheck(fakeStore("/pinned/headroom-claude-probe"), ["claude-main"]);
     expect(result?.level).toBe("FAIL");
+    expect(result?.fix).toBe("headroom keychain grant --use-this-build");
   });
 
   it("reports nothing at all with no configured Claude principal", async () => {
@@ -61,4 +74,3 @@ describe.skipIf(process.platform !== "darwin")("probePinCheck: which probe binar
     expect(result).toBeUndefined();
   });
 });
-

@@ -119,6 +119,11 @@ describe("headroom install-service --dry-run", () => {
     const output = logs.join("\n");
     expect(output).toContain("would write");
     expect(output).toContain("To load it:");
+    // Names the exact runtime/script the service will run -- so a maintainer
+    // installing from a repo checkout can see up front which build the
+    // background daemon is bound to.
+    expect(output).toContain("The service will run:");
+    expect(output).toContain(process.execPath);
     // The service file body itself, not just the two summary lines --
     // whichever platform this test runs on.
     const hasUnixUnitBody = output.includes("[Unit]") || output.includes("<key>Label</key><string>com.headroom.daemon</string>");

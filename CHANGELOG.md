@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `headroom keychain grant` now always grants the exact probe binary the background daemon is
+  pinned to, refusing (with a named `--use-this-build` escape hatch) rather than silently granting
+  a different one when that pinned binary is gone; it prints which binary it granted, and
+  `headroom doctor`'s renamed "probe binary" check now WARNs (naming both paths and the fix) when
+  the CLI's own probe and the daemon's pinned probe differ and share no signing identity, instead
+  of the previous INFO -- the fix for the "grant from a global install, daemon runs a checkout
+  build" mismatch that left a daemon reporting "Keychain grant needed" after an operator-run grant.
+
 ## [0.1.0-beta.9] - 2026-09-08
 
 ### Fixed

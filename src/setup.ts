@@ -176,6 +176,7 @@ async function stepInstallService(options: SetupOptions): Promise<boolean> {
       const result = await installService(process.argv[1], process.platform, undefined, process.execPath, true);
       console.log(`  (dry run) would write ${result.path}`);
       console.log(`  (dry run) to load it: ${result.command}`);
+      console.log(`  (dry run) the service would run: ${result.runtime} ${result.script} daemon`);
     } catch (error) { return surviveStepError(options, error); }
     return true;
   }
@@ -187,6 +188,7 @@ async function stepInstallService(options: SetupOptions): Promise<boolean> {
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, false);
     console.log(`  wrote ${result.path}`);
     console.log(`  to load it: ${result.command}`);
+    console.log(`  the service will run: ${result.runtime} ${result.script} daemon`);
   } catch (error) { return surviveStepError(options, error); }
   return true;
 }

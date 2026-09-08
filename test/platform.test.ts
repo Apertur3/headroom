@@ -121,6 +121,10 @@ describe("service generators", () => {
     try {
     const result = await installService("/usr/bin/headroom", "linux", "/home/example", "/usr/bin/node", true);
     expect(result.command).toBe("systemctl --user enable --now headroom.service");
+    // The exact executable and script the service definition points at,
+    // echoed back so a caller (cli.ts's install-service, setup.ts) can print
+    // which binary the installed service will run.
+    expect(result).toMatchObject({ script: "/usr/bin/headroom", runtime: "/usr/bin/node" });
     const unit = serviceContents("/usr/bin/headroom", "linux", "/usr/bin/node", "example", "/home/example");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain("StandardOutput=append:/home/example/.headroom/logs/daemon.log");
