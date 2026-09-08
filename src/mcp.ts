@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { claudeGrantGate, syncClaudeGrantState } from "./adapters/claude.js";
+import { claudeGrantGate, syncClaudeProbeState } from "./adapters/claude.js";
 import { daemonRequest, socketPath } from "./daemon.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./collector.js";
 import { readPolicy, readRouting } from "./config.js";
@@ -16,7 +16,7 @@ import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount, type ProviderAccount } from "./types.js";
+import { isLocalAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
@@ -190,9 +190,7 @@ export async function directStatus(): Promise<DirectResult> {
     // without this, an MCP client polling directly (no daemon running) would
     // spawn the Claude probe on every call regardless of a keychain_grants
     // marker, popping a fresh dialog instead of respecting it.
-    const accounts = await readAccounts();
-    const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
-    await syncClaudeGrantState(store, claudeIds);
+    await syncClaudeProbeState(store);
     const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
     store.insertAll(polled.observations);
     for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);

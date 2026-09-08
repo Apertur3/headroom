@@ -34,10 +34,13 @@ update_check = true
 # Delivered by the daemon after each poll, once per event, over the channels
 # below. Credentials are never written here: the Telegram bot token and the
 # optional webhook bearer are read from the OS secret store at send time.
+# Run headroom notify configure for the interactive picker.
 # See docs/notifications.md for the store command on each platform.
 # [notify]
 # channels = ["telegram", "ntfy", "webhook"]
-# events = ["reset_seen", "free_reset_granted", "source_failed", "source_recovered", "pace_projection_conserve", "model_new", "threshold"]
+# preset = "calm" # quiet: urgent changes only; everything: every event
+# events_on = [] # add "reset_scheduled_short" to include scheduled 5h resets
+# events_off = [] # overrides win over the preset and events_on
 # # Also notify when any hard window crosses this used percent, once per window.
 # threshold_percent = 90
 # # Local time. Events inside the range are batched into one message at the end of it.

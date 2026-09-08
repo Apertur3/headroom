@@ -3,7 +3,7 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
-import { claudeGrantNeededObservations, isClaudeGrantIssue, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
+import { claudeGrantNeededObservations, isClaudeProbeDenialReason, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
@@ -180,10 +180,12 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
       if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();
-      // Either wording -- a plain denial or a detected Keychain ACL lapse
-      // (claude.ts's isClaudeGrantIssue) -- gates the same way: no further
-      // probe attempts for this principal until the operator re-grants.
-      const denied = result.find((item) => item.freshness === "failed" && isClaudeGrantIssue(item.reason));
+      // Only an explicit probe denial gates a principal (claude.ts's
+      // isClaudeProbeDenialReason). The probe reads the credential through
+      // the Apple security tool, which the Keychain item's access list
+      // admits, so a readable credential cannot produce a denial and no poll
+      // can mark a working principal as needing anything.
+      const denied = result.find((item) => item.freshness === "failed" && isClaudeProbeDenialReason(item.reason));
       if (denied) options.claudeGrant.markGrantNeeded(account.name, denied.reason ?? "Keychain access denied or timed out");
     }
     const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));

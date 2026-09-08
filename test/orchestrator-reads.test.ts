@@ -412,3 +412,56 @@ describe("fillFor: even pacing restricts the offer before the final stretch", ()
     } finally { store.close(); }
   });
 });
+
+describe("gateFor/planFor/fillFor: unscheduled-reset notices (issue #20)", () => {
+  it("carries one notice on gate, plan and fill for 24 hours after an unscheduled reset on a checked meter, then none", async () => {
+    const store = await open();
+    try {
+      // The exact live Codex incident: 88% to 0%, five days before the
+      // scheduled reset, no reset credit consumed.
+      store.insert(weekly(88, "2026-09-03T01:00:00Z", "2026-09-08T01:24:26Z", "codex-main:main"));
+      store.insert(weekly(0, "2026-09-03T01:24:26Z", "2026-09-15T01:24:26Z", "codex-main:main"));
+      store.insert(fiveHour(10, "2026-09-03T01:24:26Z", "2026-09-03T06:24:26Z", "codex-main:main"));
+      const resetEvent = store.events("2026-09-03T00:00:00Z").find((event) => event.kind === "reset_seen");
+      const expectedNotice = `unscheduled reset on codex-main:main at ${resetEvent!.created_at}; capacity appeared, re-plan`;
+
+      const soon = new Date("2026-09-03T01:30:00Z");
+      const plan = planFor(store, "codex-main:main", 10, soon);
+      expect(plan.notices).toEqual([expectedNotice]);
+      const gate = gateFor(store, [{ window: "5h", points: 1 }], "codex-main:main", 10, false, soon);
+      expect(gate.notices).toEqual([expectedNotice]);
+      const fill = await fillFor(store, "codex-main:main", 2, 10, soon);
+      expect(fill.notices).toEqual([expectedNotice]);
+
+      // 25 hours after the reset: past the flat 24h window, gone from all three.
+      const later = new Date("2026-09-04T02:30:00Z");
+      expect(planFor(store, "codex-main:main", 10, later, 15, {}).notices).toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("carries no notice for a scheduled reset", async () => {
+    const store = await open();
+    try {
+      store.insert(weekly(92, "2026-09-03T12:00:00Z", "2026-09-03T13:00:00Z", "claude-main:all"));
+      // Polled at, not before, the 13:00 scheduled instant.
+      store.insert(weekly(0, "2026-09-03T13:00:05Z", "2026-09-10T13:00:00Z", "claude-main:all"));
+      store.insert(fiveHour(10, "2026-09-03T13:00:05Z", "2026-09-03T18:00:05Z", "claude-main:all"));
+      const now = new Date("2026-09-03T13:05:00Z");
+      expect(planFor(store, "claude-main:all", 10, now).notices).toEqual([]);
+      expect(gateFor(store, [{ window: "5h", points: 1 }], "claude-main:all", 10, false, now).notices).toEqual([]);
+      expect((await fillFor(store, "claude-main:all", 2, 10, now)).notices).toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("does not carry a notice for a meter the call never touched", async () => {
+    const store = await open();
+    try {
+      store.insert(weekly(88, "2026-09-03T01:00:00Z", "2026-09-08T01:24:26Z", "codex-main:main"));
+      store.insert(weekly(0, "2026-09-03T01:24:26Z", "2026-09-15T01:24:26Z", "codex-main:main"));
+      store.insert(weekly(20, "2026-09-03T01:24:26Z", "2026-09-10T01:24:26Z", "claude-main:all"));
+      store.insert(fiveHour(10, "2026-09-03T01:24:26Z", "2026-09-03T06:24:26Z", "claude-main:all"));
+      const soon = new Date("2026-09-03T01:30:00Z");
+      expect(planFor(store, "claude-main:all", 10, soon).notices).toEqual([]);
+    } finally { store.close(); }
+  });
+});

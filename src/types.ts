@@ -201,4 +201,19 @@ export interface HeadroomEvent {
    * the same failure; updated in place instead of appending a new event
    * while a principal stays down. Null for every other event kind. */
   last_seen_at: string | null;
+  /** Non-secret facts about this event, not part of its evidence. Currently
+   * only set on `reset_seen` (issue #20): `unscheduled: true` when the drop
+   * happened before the window's own scheduled reset instant, with no reset
+   * credit consumed -- capacity appeared ahead of when the vendor said it
+   * would, which is worth a human and an orchestrator both noticing --
+   * alongside `window_minutes`, the window that reset (present on both a
+   * scheduled and an unscheduled reset_seen, so a reader can say "the
+   * weekly" or "the 5h", and the notifier can hold back a scheduled 5h
+   * reset by default, without dereferencing this event's own evidence
+   * observations), and, on an unscheduled reset only, `used_percent` /
+   * `previous_used_percent` -- the window's used percent right after and
+   * right before the reset, for the notification text's "(was N%)". Absent
+   * on every other event kind, so an older reader that has never heard of
+   * this field keeps working unchanged. */
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number } | null;
 }
