@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MAX_ATTEMPTS, deliverNotifications, formatLedger, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
+import { formatClockTime } from "../src/resets.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -67,11 +68,23 @@ function weekly(used: number, fetchedAt: string, resetsAt: string, meterId = "cl
   };
 }
 
+function fiveHour(used: number, fetchedAt: string, resetsAt: string, meterId = "claude-main:all"): Observation {
+  return {
+    principal_id: "claude-main", meter_id: meterId, window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+    quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: resetsAt,
+    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
+    confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+  };
+}
+
 /** A reset the detector classifies as reset_seen: the reset timestamp moved a
- * full week forward while a minute of real time passed. */
+ * full week forward while a minute of real time passed, days before the
+ * baseline's own scheduled reset (Sept 6) -- an unscheduled reset (issue
+ * #20), so its notification text is the "Unscheduled reset: ..." one. */
+const SEED_RESET_FETCHED_AT = "2026-09-03T12:01:00Z";
 function seedReset(store: HeadroomStore): void {
   store.insert(weekly(90, "2026-09-03T12:00:00Z", "2026-09-06T13:59:00Z"));
-  store.insert(weekly(3, "2026-09-03T12:01:00Z", "2026-09-13T13:59:00Z"));
+  store.insert(weekly(3, SEED_RESET_FETCHED_AT, "2026-09-13T13:59:00Z"));
 }
 
 function options(extra: Partial<NotifyOptions> = {}): NotifyOptions {
@@ -95,20 +108,21 @@ describe("notification delivery", () => {
       expect(second.sent).toBe(3);
       expect(calls).toHaveLength(3);
 
+      const resetText = `🔄 Unscheduled reset\nClaude main weekly is back to 3% (was 90%) at ${formatClockTime(new Date(SEED_RESET_FETCHED_AT))}.\nPlan again: a full week of capacity appeared.`;
       const telegram = calls.find((call) => call.url.startsWith("https://api.telegram.org"));
       expect(telegram?.url).toBe(`https://api.telegram.org/bot${TOKEN}/sendMessage`);
-      expect(JSON.parse(telegram?.body ?? "{}")).toEqual({ chat_id: "123456", text: "Headroom: reset_seen claude-main:all" });
+      expect(JSON.parse(telegram?.body ?? "{}")).toEqual({ chat_id: "123456", text: resetText });
       expect(telegram?.body).not.toContain("parse_mode");
 
       const ntfy = calls.find((call) => call.url === "https://ntfy.sh/headroom-example");
       expect(ntfy?.method).toBe("POST");
-      expect(ntfy?.headers.title).toBe("Headroom");
-      expect(ntfy?.body).toBe("Headroom: reset_seen claude-main:all");
+      expect(Buffer.from(ntfy!.headers.title.slice(10, -2), "base64").toString()).toBe("🔄 Unscheduled reset");
+      expect(ntfy?.body).toBe(resetText);
 
       const webhook = calls.find((call) => call.url === "https://example.com/hook");
       expect(JSON.parse(webhook?.body ?? "{}")).toEqual({
         event: "reset_seen", meter: "claude-main:all", principal: "claude-main",
-        at: "2026-09-03T12:01:00Z", text: "reset_seen claude-main:all",
+        at: SEED_RESET_FETCHED_AT, text: resetText,
       });
       expect(webhook?.headers.authorization).toBeUndefined();
     } finally { store.close(); }
@@ -141,8 +155,9 @@ describe("notification delivery", () => {
     const quiet = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], quiet_hours: { start: 23 * 60, end: 7 * 60 } };
     try {
       await deliverNotifications(store, options({ config: quiet, fetcher, now: new Date(night.getTime() - 3_600_000) }));
+      const resetFetchedAt = new Date(night.getTime() - 60_000);
       store.insert(weekly(90, new Date(night.getTime() - 120_000).toISOString(), "2026-09-06T13:59:00Z"));
-      store.insert(weekly(3, new Date(night.getTime() - 60_000).toISOString(), "2026-09-13T13:59:00Z"));
+      store.insert(weekly(3, resetFetchedAt.toISOString(), "2026-09-13T13:59:00Z"));
       store.insert(weekly(80, new Date(night.getTime() - 30_000).toISOString(), "2026-09-13T13:59:00Z", "claude-main:fable"));
       const held = await deliverNotifications(store, options({ config: quiet, fetcher, now: night }));
       expect(held).toMatchObject({ quiet: true, sent: 0 });
@@ -152,9 +167,80 @@ describe("notification delivery", () => {
       const sent = await deliverNotifications(store, options({ config: quiet, fetcher, now: morning }));
       expect(sent.sent).toBe(2);
       expect(calls).toHaveLength(1);
-      expect(calls[0].body).toContain("Headroom: 2 events");
-      expect(calls[0].body).toContain("- reset_seen claude-main:all");
-      expect(calls[0].body).toContain("- model_new claude-main:fable: fable");
+      expect(calls[0].body).toContain("🌙 Headroom: 2 events");
+      // Days before the Sept 6 scheduled reset -- unscheduled (issue #20).
+      expect(calls[0].body).toContain(`🔄 Unscheduled reset Claude main weekly is back to 3% (was 90%) at ${formatClockTime(resetFetchedAt)}.`);
+      expect(calls[0].body).toContain('🆕 New model bucket seen Claude main now reports "Fable" as its own meter.');
+    } finally { store.close(); }
+  });
+
+  it("names the window and the sibling window's own reading for a scheduled reset", async () => {
+    const store = await openStore("headroom-notify-scheduled-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"] };
+    try {
+      // A steady 5h sibling window, present before and after the weekly
+      // reset -- the "unchanged" reading the notification text names.
+      store.insert(fiveHour(46, "2026-09-03T12:00:00Z", "2026-09-03T17:00:00Z"));
+      store.insert(weekly(92, "2026-09-03T12:00:00Z", "2026-09-03T13:00:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:30:00Z") }));
+      const resetFetchedAt = new Date("2026-09-03T13:00:05Z"); // at, not before, the 13:00 scheduled instant
+      store.insert(weekly(0, resetFetchedAt.toISOString(), "2026-09-10T13:00:00Z"));
+      store.insert(fiveHour(46, "2026-09-03T13:05:00Z", "2026-09-03T18:05:00Z"));
+      const sent = await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T13:10:00Z") }));
+      expect(sent.sent).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toBe(`🗓️ Weekly reset\nClaude main weekly is at 0% again (reset ${formatClockTime(resetFetchedAt)}).\n5h is still at 46%. Plan with both windows in mind.`);
+    } finally { store.close(); }
+  });
+
+  it("holds back a scheduled 5h reset by default -- it happens five times a day", async () => {
+    const store = await openStore("headroom-notify-short-off-");
+    const { calls, fetcher } = recorder();
+    try {
+      store.insert(fiveHour(90, "2026-09-03T12:00:00Z", "2026-09-03T13:00:00Z"));
+      await deliverNotifications(store, options({ fetcher, now: new Date("2026-09-03T12:30:00Z") }));
+      store.insert(fiveHour(0, "2026-09-03T13:00:05Z", "2026-09-03T18:00:00Z"));
+      const result = await deliverNotifications(store, options({ fetcher, now: new Date("2026-09-03T13:05:00Z") }));
+      expect(result.sent).toBe(0);
+      expect(calls).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("delivers a scheduled 5h reset once events_on opts back in", async () => {
+    const store = await openStore("headroom-notify-short-on-");
+    const { calls, fetcher } = recorder();
+    const shortConfig = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events_on: ["reset_scheduled_short"] };
+    try {
+      store.insert(fiveHour(90, "2026-09-03T12:00:00Z", "2026-09-03T13:00:00Z"));
+      await deliverNotifications(store, options({ config: shortConfig, fetcher, now: new Date("2026-09-03T12:30:00Z") }));
+      store.insert(fiveHour(0, "2026-09-03T13:00:05Z", "2026-09-03T18:00:00Z"));
+      const result = await deliverNotifications(store, options({ config: shortConfig, fetcher, now: new Date("2026-09-03T13:05:00Z") }));
+      expect(result.sent).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toContain("Claude main 5h is at 0% again");
+      // An unscheduled reset on any window is never held back, regardless of
+      // notify_scheduled_short -- the toggle only ever affects a SCHEDULED
+      // short-window reset.
+    } finally { store.close(); }
+  });
+
+  it("never holds back an unscheduled reset on the short window either", async () => {
+    const store = await openStore("headroom-notify-short-unscheduled-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"] };
+    try {
+      store.insert(fiveHour(90, "2026-09-03T12:00:00Z", "2026-09-03T17:00:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:05:00Z") }));
+      // resets_at advanced a full window ahead while only 10 minutes of real
+      // time passed, well before the 17:00 scheduled instant: unscheduled,
+      // and default-delivered regardless of the 5h-window suppression rule
+      // that only ever applies to a SCHEDULED short-window reset.
+      store.insert(fiveHour(3, "2026-09-03T12:10:00Z", "2026-09-03T22:00:00Z"));
+      const result = await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:15:00Z") }));
+      expect(result.sent).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toContain("🔄 Unscheduled reset\nClaude main 5h is back to 3%");
     } finally { store.close(); }
   });
 
@@ -169,7 +255,7 @@ describe("notification delivery", () => {
 
       store.insert(weekly(93, "2026-09-03T12:06:00Z", "2026-09-06T13:59:00Z"));
       expect((await deliverNotifications(store, options({ config: only, fetcher, now: LATER }))).sent).toBe(1);
-      expect(calls[0].body).toBe("Headroom: claude-main:all wk at 93% used (threshold 90%)");
+      expect(calls[0].body).toBe(`🔥 Threshold\nClaude main weekly crossed 90% (now 93%); resets Sep 6 ${formatClockTime(new Date("2026-09-06T13:59:00Z"))}, in 3d 1h.\nCONSERVE until then.`);
 
       store.insert(weekly(95, "2026-09-03T12:11:00Z", "2026-09-06T13:59:00Z"));
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:15:00Z") }));
@@ -180,7 +266,7 @@ describe("notification delivery", () => {
       store.insert(weekly(91, "2026-09-06T14:05:00Z", "2026-09-13T13:59:00Z"));
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-06T14:06:00Z") }));
       expect(calls).toHaveLength(2);
-      expect(calls[1].body).toContain("91% used");
+      expect(calls[1].body).toContain("now 91%");
     } finally { store.close(); }
   });
 
@@ -325,8 +411,8 @@ describe("grant_lapsed", () => {
       expect(first.sent).toBe(1);
       expect(calls).toHaveLength(1);
       const telegram = JSON.parse(calls[0].body);
-      expect(telegram.text).toContain("grant_lapsed claude-main:all");
-      expect(telegram.text).toContain(LAPSE_REASON);
+      expect(telegram.text).toContain("🔑 Keychain grant lapsed\nClaude main.");
+      expect(telegram.text).toContain("Run: headroom keychain grant --principal claude-main");
 
       // Every later poll -- gated, per collector.ts -- reuses the shorter
       // generic wording, never the lapse prefix again: nothing new to send.
@@ -348,8 +434,8 @@ describe("grant_lapsed", () => {
       store.insert(failedClaude(LAPSE_REASON, "2026-09-03T20:05:00Z"));
       await deliverNotifications(store, options({ fetcher, now: AFTER }));
       const telegramCalls = calls.filter((call) => call.url.startsWith("https://api.telegram.org"));
-      expect(telegramCalls.map((call) => JSON.parse(call.body).text as string)).toEqual(expect.arrayContaining([expect.stringContaining("source_failed claude-main:all")]));
-      expect(telegramCalls.some((call) => (JSON.parse(call.body).text as string).startsWith("grant_lapsed"))).toBe(false);
+      expect(telegramCalls.map((call) => JSON.parse(call.body).text as string)).toEqual(expect.arrayContaining([expect.stringContaining("⚠️ Source failed\nClaude main")]));
+      expect(telegramCalls.some((call) => (JSON.parse(call.body).text as string).startsWith("🔑 Keychain grant lapsed"))).toBe(false);
     } finally { store.close(); }
   });
 });

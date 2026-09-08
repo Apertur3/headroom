@@ -51,3 +51,28 @@ export function resetsIn(resetsAt: string | null | undefined, now = new Date()):
 export function withResetsIn<T extends { resets_at: string | null }>(observations: T[], now = new Date()): Array<T & ResetsIn> {
   return observations.map((item) => ({ ...item, ...resetsIn(item.resets_at, now) }));
 }
+
+/**
+ * store.ts's `resetSeenFor` answers `Map<string, string>` (meter+window key
+ * to the reset_seen event's `created_at`), a shape callers across the CLI,
+ * the daemon RPC and status-view.ts all already forward as an opaque string
+ * with no room to add a second field. An unscheduled reset (issue #20) still
+ * needs to say so all the way through that same string, so the flag is
+ * encoded into it here instead of widening the map's value type -- every
+ * existing caller that just forwards or `new Date()`s the string keeps
+ * compiling and working unchanged; only status-view.ts, which renders the
+ * "(unscheduled)" note, needs to decode it. `UNSCHEDULED_SUFFIX` is not a
+ * valid ISO 8601 character sequence, so it can never collide with a real
+ * timestamp.
+ */
+const UNSCHEDULED_SUFFIX = "|unscheduled";
+
+export function encodeResetSeen(at: string, unscheduled: boolean): string {
+  return unscheduled ? `${at}${UNSCHEDULED_SUFFIX}` : at;
+}
+
+export interface DecodedResetSeen { at: string; unscheduled: boolean; }
+
+export function decodeResetSeen(value: string): DecodedResetSeen {
+  return value.endsWith(UNSCHEDULED_SUFFIX) ? { at: value.slice(0, -UNSCHEDULED_SUFFIX.length), unscheduled: true } : { at: value, unscheduled: false };
+}

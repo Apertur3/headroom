@@ -3,6 +3,9 @@
   "generated_at": "string",
   "hours_per_window": "number",
   "meter": "string",
+  "notices": [
+    "unknown (empty array in the fixture data)"
+  ],
   "plan_line_percent_per_hour": "number",
   "points_per_5h_window": "number",
   "remaining_5h_windows": "number",

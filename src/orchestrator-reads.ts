@@ -140,12 +140,25 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
   return lines;
 }
 
-export type PlanOutcome = ({ meter: string } & PlanResult) | { meter: string; error: string };
+type PlanCore = ({ meter: string } & PlanResult) | { meter: string; error: string };
+
+/** Adds gate/plan/fill's shared `notices` (issue #20): for
+ * UNSCHEDULED_RESET_HOURS after an unscheduled reset on any of the given
+ * meters, one line saying capacity appeared and to re-plan. Every caller of
+ * `gateFor`/`planFor`/`fillFor` -- the CLI's direct-read fallback, the
+ * daemon's own RPC handlers, and MCP's direct fallback -- goes through
+ * these three functions, so this is the single place the notice needs to be
+ * attached for it to reach every surface. */
+function unscheduledResetNotices(store: HeadroomStore, meterIds: string[], now: Date): string[] {
+  return store.recentUnscheduledResets(meterIds, now).map((item) => `unscheduled reset on ${item.meter_id} at ${item.created_at}; capacity appeared, re-plan`);
+}
+
+export type PlanOutcome = PlanCore & { notices: string[] };
 
 /** `reserves` is policy.toml's `[reserve]` table: the plan line is drawn
  * above the larger of the caller's own reserve percent and this meter's
  * protected floor, so `plan` never budgets points `gate` would then refuse. */
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}): PlanOutcome {
+function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>): PlanCore {
   const { short, long } = meterWindows(store, meter);
   if (!long || !long.resets_at) return { meter, error: meterUnknownReason(store, meter, `no weekly window for ${meter}`) };
   // Fail closed on a stale, failed, or long-unpolled weekly reading exactly
@@ -156,6 +169,11 @@ export function planFor(store: HeadroomStore, meter: string, reservePercent: num
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
   return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now) };
+}
+
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}): PlanOutcome {
+  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves);
+  return { ...result, notices: unscheduledResetNotices(store, [meter], now) };
 }
 
 export interface GateOptions {
@@ -182,11 +200,18 @@ export interface GateOptions {
   reserves?: Record<string, number>;
 }
 
-export interface GateOutcome extends GateResult {
+interface GateOutcomeCore extends GateResult {
   meters_checked: string[];
   /** Present only with actionClass and a learned cost for it: how many more
    * of that class fit in the deciding meter's remaining 5h percent. */
   lanes_remaining_for_class?: number | null;
+}
+
+export interface GateOutcome extends GateOutcomeCore {
+  /** unscheduledResetNotices() over every meter this call actually checked
+   * (`meters_checked`, present on every return path below including an
+   * early refusal) -- see PlanOutcome's own doc comment above. */
+  notices: string[];
 }
 
 /** Fail closed over every meter checked: with no --meter, every account meter
@@ -194,7 +219,7 @@ export interface GateOutcome extends GateResult {
  * does not stops the check (mirrors policy.ts's canConsume: one bad meter
  * blocks the whole gate). `meter` also accepts an explicit list (a --class
  * resolved through routing.toml to several meters), checked the same way. */
-export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
+function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now: Date, options: GateOptions): GateOutcomeCore {
   const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
@@ -302,6 +327,11 @@ export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string |
   return { allowed: true, reason: `fits${notEnforcedNote}`, meters_checked: checked, ...(lanesRemaining !== undefined ? { lanes_remaining_for_class: lanesRemaining } : {}) };
 }
 
+export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
+  const result = gateForCore(store, needs, meter, reservePercent, usePlan, now, options);
+  return { ...result, notices: unscheduledResetNotices(store, result.meters_checked, now) };
+}
+
 export interface FillOutcome {
   meter: string;
   /** Null with no --lane-cost and no learned cost for this meter yet: the
@@ -368,7 +398,9 @@ function windowShortLabel(minutes: number | null | undefined): string {
  * the owner's pro-rata allowance (planned share times elapsed fraction,
  * minus what that owner has already spent), the same line `gate` enforces.
  */
-export async function fillFor(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now = new Date(), options: FillOptions = {}): Promise<FillOutcome | { meter: string; error: string; no_enforced_window?: true }> {
+type FillCore = FillOutcome | { meter: string; error: string; no_enforced_window?: true };
+
+async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now: Date, options: FillOptions): Promise<FillCore> {
   // Deliberately the strict enforced-only list (not meterWindows' not_enforced-
   // aware one): a not_enforced window has no percent to spend against, so it
   // can never be "the tightest enforced window" fill counts lanes against.
@@ -450,6 +482,11 @@ export async function fillFor(store: HeadroomStore, meter: string, laneCostOverr
   const classes = fillClassFits(Math.max(0, remainingPercent), remainingMinutes, costs);
 
   return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis, window_used: windowUsed };
+}
+
+export async function fillFor(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now = new Date(), options: FillOptions = {}): Promise<FillCore & { notices: string[] }> {
+  const result = await fillForCore(store, meter, laneCostOverride, weeklyReservePercent, now, options);
+  return { ...result, notices: unscheduledResetNotices(store, [meter], now) };
 }
 
 export interface RouteCandidate {

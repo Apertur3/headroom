@@ -19,7 +19,7 @@
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
-import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import { decodeResetSeen, formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -94,6 +94,15 @@ function lastKnownCompact(lastKnown: NonNullable<Observation["last_known"]>): st
   return `last ${lastKnownWindowPrefix(lastKnown)}${Math.round(lastKnown.used_percent)}%, ${lastKnownAge(lastKnown)} ago`;
 }
 
+/** "weekly"/"5h" for the grouped view's own unscheduled-reset line ("the
+ * weekly is back to 0%") -- full words rather than labelForMinutes' terse
+ * column abbreviations, since this line is prose, not a table cell. */
+function windowNoun(minutes: number | null | undefined): string {
+  if (minutes === 10_080) return "weekly";
+  if (minutes === 300) return "5h";
+  return labelForMinutes(minutes);
+}
+
 function windowOrder(observation: Observation): number {
   const minutes = observation.window?.minutes;
   if (minutes === 300) return 0;
@@ -152,7 +161,12 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${formatDay(observation.resets_at)})` : "";
     return `credits ${available} available${expiry}`;
   }
-  const evidence = `${resetSeen ? ` reset seen ${formatReset(resetSeen, now)}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
+  // resetSeen may carry resets.ts's unscheduled marker (issue #20): a reset
+  // that fired before its own scheduled instant, worth flagging inline since
+  // it changes what a human or an agent reading this line should plan
+  // around, not just when it happened.
+  const decodedResetSeen = resetSeen ? decodeResetSeen(resetSeen) : undefined;
+  const evidence = `${decodedResetSeen ? ` reset seen ${formatReset(decodedResetSeen.at, now)}${decodedResetSeen.unscheduled ? " (unscheduled)" : ""}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -381,7 +395,10 @@ function detailLine(observation: Observation, reservePercent: number, resetSeen:
   }
   if (observation.empty_in_seconds !== null && observation.empty_in_seconds !== undefined) parts.push(`empty in ${formatResetsIn(observation.empty_in_seconds)}`);
   if (observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON) parts.push("idle, unverified");
-  if (resetSeen) parts.push(`reset seen ${formatReset(resetSeen, now)}`);
+  if (resetSeen) {
+    const decoded = decodeResetSeen(resetSeen);
+    parts.push(`reset seen ${formatReset(decoded.at, now)}${decoded.unscheduled ? " (unscheduled)" : ""}`);
+  }
   if (freeResetUsed) parts.push(`free reset ${formatReset(freeResetUsed, now)}`);
   parts.push(`${observation.truth} via ${observation.source}, read ${age(observation, now)} ago`);
   return [parts.join(", ")];
@@ -427,6 +444,11 @@ interface PrincipalBlock {
   /** Set when every UNKNOWN window under this principal is unknown for the
    * same reason, so the explanation is printed once instead of per window. */
   shared?: UnknownExplanation;
+  /** One line per meter with an unscheduled reset (issue #20) still inside
+   * resetSeen's own visibility window -- see buildBlocks. Printed under the
+   * principal even outside --verbose, since an unscheduled reset changes
+   * what a human reading this view should plan around, not just a detail. */
+  notices: string[];
 }
 
 function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
@@ -443,6 +465,11 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
     for (const item of metered) byMeter.set(item.meter_id, [...(byMeter.get(item.meter_id) ?? []), item]);
     const rows: Row[] = [];
     const explanations: UnknownExplanation[] = [];
+    // One notice per meter with an unscheduled reset (issue #20) still
+    // inside resetSeen's own visibility window, keyed by meter so a meter
+    // with more than one windowed row (5h and weekly both carrying the
+    // marker) only ever contributes its single most recent one.
+    const unscheduledByMeter = new Map<string, { at: string; windowMinutes: number | null; usedPercent: number | null }>();
     for (const [meterId, windows] of [...byMeter.entries()].sort(([a], [b]) => a.localeCompare(b))) {
       const ordered = orderWindows(windows);
       const active = leases.get(meterId) ?? [];
@@ -452,6 +479,14 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
         const countdown = seconds === null || decision.state === "UNKNOWN";
         const unknown = decision.state === "UNKNOWN" ? explainUnknown(observation.reason ?? decision.reason) : undefined;
         if (unknown) explanations.push(unknown);
+        const rawResetSeen = resetSeen.get(windowKey(observation));
+        const decodedResetSeen = rawResetSeen ? decodeResetSeen(rawResetSeen) : undefined;
+        if (decodedResetSeen?.unscheduled) {
+          const existing = unscheduledByMeter.get(meterId);
+          if (!existing || Date.parse(decodedResetSeen.at) > Date.parse(existing.at)) {
+            unscheduledByMeter.set(meterId, { at: decodedResetSeen.at, windowMinutes: observation.window?.minutes ?? null, usedPercent: observation.quantity?.unit === "percent" ? observation.quantity.used : null });
+          }
+        }
         // An UNKNOWN window has no countdown to show in the reset column, so
         // its last known reading (if any survived the 7-day lookback) takes
         // that column instead -- a trend beside the "-" used cell, not a
@@ -476,7 +511,9 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
     const plan = planOf(items);
     const header = metered.length ? `${name}  ${vendorOf(items, input.vendors)}${plan ? `  ${plan}` : ""}  ${freshnessWord(metered)} ${age(newest(metered), now)}` : "";
     const shared = explanations.length > 1 && new Set(explanations.map((item) => item.text)).size === 1 ? explanations[0] : undefined;
-    return { name, local, rows, header, unknownCount: explanations.length, causes: [...new Set(explanations.map((item) => item.cause))], shared };
+    const notices = [...unscheduledByMeter.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meterId, notice]) =>
+      `Unscheduled reset on ${meterId} at ${formatClockTime(new Date(notice.at))}: the ${windowNoun(notice.windowMinutes)} is back to ${notice.usedPercent === null ? "0" : Math.round(notice.usedPercent)}%, plan again.`);
+    return { name, local, rows, header, unknownCount: explanations.length, causes: [...new Set(explanations.map((item) => item.cause))], shared, notices };
   });
 }
 
@@ -541,6 +578,11 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
     // repeats an identical reason on every meter, which is the noise this
     // view exists to remove.
     if (block.shared) lines.push(...wrap(`UNKNOWN: ${block.shared.text}`, options.width, indent));
+    // An unscheduled reset (issue #20) changes what a human reading this
+    // view should plan around, so it gets its own line under the principal
+    // even outside --verbose, unlike the reset-seen detail wrap() folds into
+    // --verbose above.
+    for (const notice of block.notices) lines.push(...wrap(notice, options.width, indent));
     return lines;
   }).filter((lines) => lines.length);
 

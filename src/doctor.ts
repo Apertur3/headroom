@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -65,12 +65,20 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
     if (lastObservation?.freshness === "failed" && isClaudeLoggedOutReason(lastObservation.reason)) {
       return check("FAIL", `principal ${account.name} credential`, lastObservation.reason ?? "Claude Code is logged out", claudeLoggedOutFix(account.location));
     }
-    // Do not pass -w: doctor verifies Keychain metadata without ever reading a token.
+    // The same Apple-signed tool the probe reads the credential through, and
+    // the reason this line can call it readable: the item's access list
+    // admits `security`, so no dialog stands between Headroom and the
+    // credential. Still without -w -- doctor reads the item's metadata and
+    // never the token itself.
     const metadata = await claudeKeychainMetadata(claudeServiceName(account.location));
     store?.audit("doctor", "claude_probe", account.name, "called");
-    if (!metadata.found) return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", `headroom keychain grant --principal ${account.name}`);
+    // The fix is a login, not a grant: an item the metadata lookup cannot
+    // see is one Claude Code has not written here (or one `security` could
+    // not reach at all), and there is no permission left for anyone to hand
+    // over -- the tool doing the reading is already admitted.
+    if (!metadata.found) return check("FAIL", `principal ${account.name} credential`, "Claude Keychain item is unavailable", claudeLoggedOutFix(account.location));
     const modified = metadata.modifiedAt ? `, last modified ${formatLocalTimestamp(metadata.modifiedAt)}` : "";
-    return check("OK", `principal ${account.name} credential`, `Claude Keychain item present${modified}`, "no action needed");
+    return check("OK", `principal ${account.name} credential`, `credential readable through the Apple security tool${modified}`, "no action needed");
   }
   if (account.vendor === "grok") {
     // `location` may name the token file itself or the directory holding it.
@@ -132,9 +140,9 @@ export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, s
 /**
  * A machine that has both a packaged install and a repo checkout (or two
  * different global installs) can have more than one `headroom-claude-probe`
- * binary resolvable at once -- the exact shape of the "grant from the global
+ * binary resolvable at once -- the exact shape of the "checked the global
  * install, daemon runs the checkout" mismatch this check exists to surface.
- * Once a grant has pinned one (store.probePath()), claude.ts's own
+ * Once a successful credential check has pinned one (store.probePath()), claude.ts's own
  * resolution always prefers it over any other candidate; this check compares
  * that pinned (daemon) binary against whatever this CLI process would
  * resolve on its own, naming both rather than leaving an operator to wonder
@@ -143,9 +151,9 @@ export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, s
  * OK when they are the same file, or (a rebuild changes the file without
  * changing who signed it) when both carry the same codesign designated
  * requirement -- see claude.ts's probeSigningIdentity, the same identity
- * check syncClaudeGrantState uses to decide whether a rebuild needs a fresh
- * grant. WARN when they differ in both respects: the daemon may be enforcing
- * a Keychain grant against a binary this CLI never touches. Undefined when
+ * identity syncClaudeProbeState records. WARN when they differ in both
+ * respects: the daemon may be polling with a binary this CLI never touches.
+ * Undefined when
  * there is nothing to report: no Claude principal configured, or (non-macOS)
  * the probe concept does not apply.
  */
@@ -156,23 +164,26 @@ export async function probePinCheck(
 ): Promise<DoctorCheck | undefined> {
   if (process.platform !== "darwin" || !claudeIds.length) return undefined;
   const pinned = store.probePath();
-  if (!pinned) return check("INFO", "probe binary", "no probe granted yet for this Headroom home", "headroom keychain grant");
+  // Nothing to do about it: with no pin, claude.ts's ordinary resolution
+  // order picks the probe, and the first successful `headroom keychain grant`
+  // check pins whatever it ran.
+  if (!pinned) return check("INFO", "probe binary", "no probe pinned yet for this Headroom home", "no action needed");
   const resolvedWithPin = await resolveProbePath(pinned);
   if (resolvedWithPin !== pinned) {
     return check(resolvedWithPin ? "WARN" : "FAIL", "probe binary",
-      resolvedWithPin ? `granted binary is gone (${pinned}); currently falling back to ${resolvedWithPin} instead` : `granted binary is gone (${pinned}) and no other probe resolves`,
+      resolvedWithPin ? `pinned binary is gone (${pinned}); currently falling back to ${resolvedWithPin} instead` : `pinned binary is gone (${pinned}) and no other probe resolves`,
       "headroom keychain grant --use-this-build");
   }
   const cliProbe = await resolveProbePath();
-  if (!cliProbe || cliProbe === pinned) return check("OK", "probe binary", `granted: ${pinned}`, "no action needed");
+  if (!cliProbe || cliProbe === pinned) return check("OK", "probe binary", `pinned: ${pinned}`, "no action needed");
   const signingIdentity = dependencies.signingIdentity ?? probeSigningIdentity;
   const [pinnedIdentity, cliIdentity] = await Promise.all([signingIdentity(pinned), signingIdentity()]);
   if (pinnedIdentity !== undefined && pinnedIdentity === cliIdentity) {
-    return check("OK", "probe binary", `granted: ${pinned}; this CLI resolves ${cliProbe}, same signing identity`, "no action needed");
+    return check("OK", "probe binary", `pinned: ${pinned}; this CLI resolves ${cliProbe}, same signing identity`, "no action needed");
   }
   return check("WARN", "probe binary",
-    `the daemon's granted probe (${pinned}) differs from this CLI's own probe (${cliProbe}), and they do not share a signing identity`,
-    "headroom keychain grant now handles it, or reinstall the service from the binary you want with headroom install-service");
+    `the daemon's pinned probe (${pinned}) differs from this CLI's own probe (${cliProbe}), and they do not share a signing identity`,
+    "headroom keychain grant re-pins it, or reinstall the service from the binary you want with headroom install-service");
 }
 
 export function adapterCheck(account: Account): DoctorCheck {
@@ -223,13 +234,12 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       output.push(check(missing ? "WARN" : "FAIL", "principals", missing ? `missing ${accountsPath()}` : "accounts.toml is invalid", "headroom accounts discover"));
     }
     // Runs even when `headroom doctor` is the very first command ever
-    // invoked (no prior daemon poll or CLI observe()), so a fresh install or
-    // a freshly rebuilt probe binary is caught here too, before credentialCheck
-    // below ever touches the Keychain.
+    // invoked (no prior daemon poll or CLI observe()), so the probe binary
+    // this home is running is recorded before the checks below report on it.
     let probePin: DoctorCheck | undefined;
     if (store) {
       const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
-      await syncClaudeGrantState(store, claudeIds);
+      await syncClaudeProbeState(store);
       probePin = await probePinCheck(store, claudeIds);
     }
     const grantsNeeded = store ? new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])) : new Map<string, string>();
@@ -377,12 +387,11 @@ export async function isFreshInstall(checks: DoctorCheck[], home = headroomHome(
 }
 
 /** Exact commands for isFreshInstall()'s "Next steps" block, in run order.
- * Exported for tests; keychain grant is macOS-only, mirroring keychain
- * grant's own platform gate. */
-export function nextSteps(platform: NodeJS.Platform = process.platform): string[] {
-  const steps = platform === "darwin" ? ["headroom keychain grant"] : [];
-  steps.push("headroom install-service", "claude mcp add headroom -- npx headroomd mcp");
-  return steps;
+ * Exported for tests. The same list on every platform: a first run on macOS
+ * has nothing to grant, since the probe reads the Claude credential through
+ * the Apple security tool the Keychain item already admits. */
+export function nextSteps(_platform: NodeJS.Platform = process.platform): string[] {
+  return ["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"];
 }
 
 export async function doctor(argv: string[] = []): Promise<number> {
