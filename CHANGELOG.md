@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] - 2026-09-08
+
 ### Added
 - `headroom dashboard` (alias `top`): live terminal quota bars, burn sparklines, events, leases and reserves, with cached reads, pause/verbose keys and a script-safe single-frame mode.
 
