@@ -312,6 +312,25 @@ and scheduled moment is never duplicated. If no scheduled reset falls inside the
 recorded and the status line carries no note; the drop is left to the ordinary free-reset check,
 which still fires when the timestamp held still while usage fell.
 
+### Unscheduled resets
+
+A `reset_seen` fired before the window's own scheduled instant -- capacity appearing ahead of when
+the vendor said it would, with no reset credit consumed -- is marked `metadata.unscheduled: true`
+(and `metadata.window_minutes`, the window that reset). It changes what a human's or an
+orchestrator's plan for that meter is worth: budgeting that assumed the old schedule is now stale
+in the good direction. One dropped at or after the scheduled instant is an ordinary scheduled
+reset, even though `resets_at` has already rolled forward onto the next cycle by the time the poll
+sees it.
+
+This stays visible longer than an ordinary reset note: `headroom` shows `reset seen 03:24
+(unscheduled)` on the status row, and one line under the principal (`Unscheduled reset on
+codex-main:main at 03:24: the weekly is back to 0%, plan again.`), for a flat 24 hours regardless
+of the window's own duration -- a scheduled reset's own note stays bounded to about one window's
+length, same as always. `gate`, `plan` and `fill` all carry a `notices` array for the same 24 hours
+on any meter the call touched: `["unscheduled reset on codex-main:main at
+2026-09-08T01:24:26Z; capacity appeared, re-plan"]`. The notifier gives it its own text too --
+see [notifications.md](notifications.md).
+
 ## Export
 
 `headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind

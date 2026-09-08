@@ -72,32 +72,44 @@ cookies, which unlock paid subscriptions.
 8. **Dependencies pinned and audited.** Lockfile committed, `npm audit` in CI, minimal dependency
    set.
 9. **No telemetry.** Headroom phones home to nothing.
-10. **Keychain ACL identity.** On macOS, `headroom-claude-probe` reads the Keychain item and
+10. **Keychain read path.** On macOS, `headroom-claude-probe` reads the Claude credential and
     performs the Anthropic request itself. It prints only bounded usage JSON; tokens, refresh
-    tokens, and email never cross to Node. Run `headroom keychain grant` once interactively and
-    choose "Always Allow" for this probe. A rebuilt probe does *not* ask again: the ACL is keyed on
-    the designated requirement, and `scripts/build-probe.sh` signs every build with one stable
-    self-signed identity ("Headroom Local"), so the requirement is unchanged. A different identity,
-    or a build that fell back to ad-hoc signing, does ask again. That identity lives in its own
-    keychain, `~/Library/Keychains/headroom-local-signing.keychain-db` (mode 0600, empty
-    passphrase, appended to the user's keychain search list), deliberately not the login keychain:
-    a key imported into the login keychain cannot be given a partition list without the login
-    password, so `codesign` would stop on a confirmation dialog on every unattended build. What
-    that key can do is bounded -- it signs locally built copies of this one probe and anchors no
-    trust chain; what it would buy an attacker who already has read access to the user's home
-    directory is the ability to sign a binary carrying the same designated requirement, which is
-    why `headroom keychain grant` remains an explicit, interactive step and the probe's own
-    SHA-256 is verified on every use. Delete it with `bash scripts/build-probe.sh
-    --reset-identity`, or set `HEADROOM_CODESIGN_IDENTITY` / `git config
-    headroom.codesign-identity` to sign with a real Developer ID instead. There is no `security`
-    fallback for reading the token itself -- only the probe ever
-    sees it. macOS also resets an item's access control list every time its contents are rewritten,
-    and Claude Code rewrites `Claude Code-credentials` on every token refresh, so a grant lapses on
-    its own and needs `headroom keychain grant` again; Headroom tells this apart from a genuinely
-    absent login with one metadata-only lookup, `security find-generic-password -s <service>`
-    (never `-w`), which macOS permits without the ACL grant precisely because it never decrypts the
-    secret data -- it can confirm the item exists and read its modification time without ever
-    touching the credential.
+    tokens, and email never cross to Node, and nothing writes the token anywhere -- the probe
+    process holds it in memory for the length of one request and exits.
+
+    The probe reads it through `/usr/bin/security find-generic-password -s <service> -a <user>
+    -w`, spawned by absolute path with an explicit argument vector, never a shell; stdout is
+    captured in memory, stderr is discarded, and a run that has not finished within 10 seconds is
+    terminated. That tool is what the item's own access list admits: Claude Code 2.1.263 rewrites
+    `Claude Code-credentials` (and the per-profile `Claude Code-credentials-<hash>` items) with an
+    access list that admits Apple-signed tools and not third-party applications, so a direct
+    `SecItemCopyMatching` from the probe is refused while `security` returns the secret with no
+    dialog at all, even from a sandboxed shell. The framework call is still made first, with
+    `kSecUseAuthenticationUI: kSecUseAuthenticationUIFail` and
+    `SecKeychainSetUserInteractionAllowed(false)` so a restricted item fails immediately instead
+    of blocking on a dialog, and any failure falls through to `security`.
+
+    Headroom therefore never sees a Keychain dialog and there is nothing to grant: `headroom
+    keychain grant` is a check that runs the probe once and reports whether the credential is
+    readable. A `security` run that fails for any reason other than an absent item is reported
+    with the tool's exit status and nothing else -- its output is never read into a message, a log
+    or a file, because the only thing on that stream is the secret.
+
+    The probe binary is still signed and its SHA-256 is still verified on every use.
+    `scripts/build-probe.sh` signs each build with one stable self-signed identity ("Headroom
+    Local") living in its own keychain, `~/Library/Keychains/headroom-local-signing.keychain-db`
+    (mode 0600, empty passphrase, appended to the user's keychain search list), deliberately not
+    the login keychain: a key imported into the login keychain cannot be given a partition list
+    without the login password, so `codesign` would stop on a confirmation dialog on every
+    unattended build. What that key can do is bounded -- it signs locally built copies of this one
+    probe and anchors no trust chain. Since the read path no longer depends on any access list
+    matching that identity, ad-hoc signing is equally fine; the identity only keeps builds stable.
+    Delete it with `bash scripts/build-probe.sh --reset-identity`, or set
+    `HEADROOM_CODESIGN_IDENTITY` / `git config headroom.codesign-identity` to sign with a real
+    Developer ID instead.
+
+    Doctor never reads the token at all: it runs the same tool without `-w`, which confirms the
+    item exists and reads its modification time without decrypting the secret data.
 11. **Bounded vendor input.** Credential-backed responses are limited to 1 MiB, JSON depth 32,
     arrays of 10,000 items, and strings of 64 KiB. The byte cap is enforced while streaming, not
     after buffering a complete body: TypeScript's `vendorText`/`vendorJson` read and count decoded
@@ -168,9 +180,10 @@ cookies, which unlock paid subscriptions.
   `native-ts` where available if this matters to you.
 - **A compromised or malicious build dependency.** `npm audit` and lockfile pinning reduce, but do
   not eliminate, supply-chain risk in `node_modules` or in CodexBarCore's own dependency tree.
-- **The operating system's own credential stores.** Headroom trusts the macOS Keychain's ACL
-  prompt and the permission bits on `~/.codex/auth.json`/`~/.gemini/oauth_creds.json` to be honest;
-  it does not defend against a compromised OS or a modified Keychain daemon.
+- **The operating system's own credential stores.** Headroom trusts the macOS Keychain's access
+  list, `/usr/bin/security` itself, and the permission bits on
+  `~/.codex/auth.json`/`~/.gemini/oauth_creds.json` to be honest; it does not defend against a
+  compromised OS, a replaced `security` binary, or a modified Keychain daemon.
 
 ## Out of scope
 

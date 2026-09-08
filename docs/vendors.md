@@ -48,9 +48,9 @@ writes each snapshot through a uniquely named temporary file renamed into place,
 rather than following an existing symlink at the destination.
 
 The collector prefers a fresh snapshot over the probe outright -- for a Claude principal set up
-this way, Headroom never touches the Keychain at all, and a principal still waiting on
-`headroom keychain grant` reads normally anyway. A stale or missing snapshot falls back to the
-probe below, unchanged.
+this way, Headroom never touches the Keychain at all, so even a principal whose credential the
+probe cannot read reads normally. A stale or missing snapshot falls back to the probe below,
+unchanged.
 
 ### Vendor probe
 
@@ -65,36 +65,37 @@ other profile. Headroom never reads that token itself there: a signed helper bin
 so the token never reaches Node or Headroom's own output. On Linux and Windows, Headroom reads the
 token directly from `<config-dir>/.credentials.json` (default `~/.claude/.credentials.json`).
 
-**One grant survives every rebuild.** macOS keys a Keychain item's access control list on the
-trusted application's *designated requirement*, not on the binary's contents, and
-`scripts/build-probe.sh` signs the probe with one stable local identity ("Headroom Local") whose
-requirement is the same after every rebuild. So `npm run engine:build`, a reinstall, or a new
-release does not cost the operator another `headroom keychain grant`: Headroom compares the probe's
-signing identity, not its SHA-256, before deciding a grant is owed. A grant is asked for again only
-when the signing identity actually changed, when the probe fell back to ad-hoc signing (an ad-hoc
-requirement is a per-build hash, so it genuinely is new code to Keychain), or on a first-ever run
-that has never had a successful probe. The recorded SHA-256 next to the binary is still verified on
-every use; it is an integrity check, not the grant marker.
+**The probe reads through `/usr/bin/security`, and there is nothing to grant.** Claude Code
+2.1.263 rewrites its Keychain items with an access list that admits Apple-signed tools and not
+third-party applications. Measured on macOS 26.5 with that version: `SecItemCopyMatching` with
+`kSecReturnData` from the probe is refused (`errSecAuthFailed`, and `errSecItemNotFound` on other
+machines) even from the user's own Terminal, with no dialog offered at all, while `security
+find-generic-password -s "Claude Code-credentials" -a <user> -w` returns the token with exit 0 and
+no dialog, even from a sandboxed shell. So the probe now runs that tool -- absolute path, argument
+vector, never a shell, stdout captured in memory, stderr discarded, 10-second timeout -- and keeps
+the framework call only as a silent first attempt that fails immediately rather than blocking.
 
-**Keychain grants lapse on their own.** macOS resets an item's access control list every time
-its contents are rewritten, and Claude Code rewrites `Claude Code-credentials` on every token
-refresh -- so a grant `headroom keychain grant` gave the probe stops working again the next time
-Claude Code refreshes, with no action on Headroom's part. The probe itself cannot tell that apart
-from a genuinely absent login (both look like "no credentials" from inside it), so the adapter
-runs a second, metadata-only lookup (`security find-generic-password -s <service>`, never `-w`,
-which macOS permits without the ACL grant) to check whether the item exists. When it does, Headroom
-reports the real cause -- "Keychain grant lapsed; Claude Code rewrote its credentials at \<local
-time\>; run: headroom keychain grant --principal \<name\>" -- instead of the misleading "no
-credentials" message, and the daemon stops polling that principal until the grant is redone, the
-same as any other denial. A profile reading through the statusline snapshot (above) keeps its
-account-wide `:all` row alive through a lapse regardless, since that path never touches the
-Keychain at all; only the scoped meters (Fable, Routines) that need the probe go stale until the
-grant is redone.
+This replaces the whole Keychain grant design: the one-dialog "Always Allow" step, the marker that
+gated a principal after a denial, the rebuild detection that asked for a fresh grant whenever the
+probe's signing identity changed, and the "grant lapsed" report for an access list Claude Code had
+reset on token refresh. None of it applies to a read the item already admits, and all of it cost
+the operator a ceremony that no longer does anything. `headroom keychain grant` is kept as a check:
+it runs the probe once per principal and reports `credential readable, no dialog needed` or the
+real error. `headroom setup` has no Keychain step, and `headroom doctor` reports the credential as
+readable through the Apple security tool, with the item's modification time.
 
-A Keychain item that exists but carries no OAuth access token (Claude Code logged out locally, not
-an ACL lapse) is reported separately -- "Claude Code is logged out\[ for \<dir\>\]; run:
-\[CLAUDE_CONFIG_DIR=\<dir\>\] claude and sign in" -- and never gates the probe, since signing back
-in fixes it without a Keychain grant.
+The probe's recorded SHA-256 is still verified on every use, and `scripts/build-probe.sh` still
+signs each build with a stable local identity -- but only for build hygiene now, since no access
+list is keyed on it.
+
+A `security` run that fails is reported by its exit status alone, never its output (the only thing
+on that stream is the secret): an absent item keeps the existing "no credentials in Keychain for
+this config dir" wording and the login fix, and anything else reads "the macOS security tool could
+not read the credential (exit \<n\>)".
+
+A Keychain item that exists but carries no OAuth access token (Claude Code logged out locally) is
+reported separately -- "Claude Code is logged out\[ for \<dir\>\]; run:
+\[CLAUDE_CONFIG_DIR=\<dir\>\] claude and sign in" -- since signing back in is the fix.
 
 Meters emitted: `<principal>:all` (the 5-hour and 7-day windows from the response's `five_hour`
 and `seven_day` fields), `<principal>:fable`, `<principal>:routines`, and one

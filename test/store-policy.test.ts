@@ -283,6 +283,72 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("flags the exact Codex incident as an unscheduled reset_seen (issue #20): 88% to 0% five days before the scheduled reset, no reset credit consumed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-unscheduled-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const weekly = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      // The scheduled reset was Sept 8 01:24 UTC; the vendor reset the meter
+      // at 01:24:26 on Sept 3, five days early, and rolled resets_at forward
+      // onto the next cycle.
+      store.insert(weekly(88, "2026-09-03T01:00:00Z", "2026-09-08T01:24:26Z"));
+      store.insert(weekly(0, "2026-09-03T01:24:26Z", "2026-09-15T01:24:26Z"));
+      const events = store.events("2026-09-03T00:00:00Z").filter((event) => event.meter_id === "codex-main:main");
+      const resetEvent = events.find((event) => event.kind === "reset_seen");
+      expect(resetEvent).toMatchObject({
+        origin: "inferred", confidence: 0.9,
+        metadata: { unscheduled: true, window_minutes: 10_080, used_percent: 0, previous_used_percent: 88 },
+      });
+      // No reset credit consumed: this is the percent-window classification,
+      // not the vendor-reported credits path -- no free_reset_* event at all.
+      expect(events.filter((event) => event.kind === "free_reset_granted" || event.kind === "free_reset_used")).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("does not flag a reset that happens at or after its own scheduled instant, even though resets_at rolled forward", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-scheduled-not-flagged-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const weekly = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      store.insert(weekly(92, "2026-09-08T01:00:00Z", "2026-09-08T01:24:26Z"));
+      // Polled a few seconds AFTER the scheduled 01:24:26 instant.
+      store.insert(weekly(0, "2026-09-08T01:24:30Z", "2026-09-15T01:24:26Z"));
+      const resetEvent = store.events("2026-09-08T00:00:00Z").find((event) => event.kind === "reset_seen" && event.meter_id === "codex-main:main");
+      expect(resetEvent).toBeDefined();
+      expect(resetEvent!.metadata?.unscheduled).toBeFalsy();
+      expect(resetEvent!.metadata?.window_minutes).toBe(10_080);
+    } finally { store.close(); }
+  });
+
+  it("shows the unscheduled note for a flat 24 hours, longer than a short window's own bound, and drops it after", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-unscheduled-window-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const fiveHour = (used: number, fetched_at: string, resets_at: string) => observation({
+        principal_id: "codex-main", meter_id: "codex-main:main", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, fetched_at, observed_at: fetched_at,
+      });
+      store.insert(fiveHour(90, "2026-09-03T01:00:00Z", "2026-09-03T06:00:00Z"));
+      // Advanced a full window ahead of schedule, ten minutes later.
+      store.insert(fiveHour(0, "2026-09-03T01:10:00Z", "2026-09-03T11:00:00Z"));
+      const latest = store.latestPerWindow("codex-main:main");
+      // 20 hours later: a plain 5h window's own bound would have expired
+      // hours ago, but the unscheduled marker keeps it visible for a flat
+      // 24h.
+      const stillVisible = store.resetSeenFor(latest, new Date("2026-09-03T21:00:00Z"));
+      expect(stillVisible.get("codex-main:main:300")).toBe("2026-09-03T01:10:00Z|unscheduled");
+      // 25 hours later: past the flat 24h window, gone.
+      const expired = store.resetSeenFor(latest, new Date("2026-09-04T02:11:00Z"));
+      expect(expired.has("codex-main:main:300")).toBe(false);
+    } finally { store.close(); }
+  });
+
   it("lowers confidence and suffixes the reason when the baseline is more than 24h old", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-stale-baseline-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
@@ -805,12 +871,15 @@ describe("pace and consumes", () => {
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
       const first = observation({ window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 80, limit: 100, remaining: 20, unit: "percent" }, resets_at: "2026-09-03T13:00:00Z" });
-      const current = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z" };
+      // At (not before) the baseline's own scheduled 13:00 reset -- a
+      // scheduled reset (issue #20), so resetSeenFor's own marker-free string
+      // is exactly what this test's plain reset-evidence lookup expects.
+      const current = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z", fetched_at: "2026-09-03T13:05:00Z", observed_at: "2026-09-03T13:05:00Z" };
       store.insert(first);
       store.insert(current);
       const latest = store.latestPerWindow();
-      const seen = store.resetSeenFor(latest, new Date("2026-09-03T12:00:00Z"));
-      expect(seen.get("codex-main:main:300")).toBe("2026-09-03T12:00:00.000Z");
+      const seen = store.resetSeenFor(latest, new Date("2026-09-03T14:00:00Z"));
+      expect(seen.get("codex-main:main:300")).toBe("2026-09-03T13:05:00Z");
       expect(formatMeters(latest, defaultPolicy, seen)[0]).toContain("reset seen");
     } finally { store.close(); }
   });

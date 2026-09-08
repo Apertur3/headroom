@@ -125,6 +125,16 @@ describe("schema migrations", () => {
     raw.exec(`PRAGMA user_version = ${newerVersion}`);
     raw.close();
 
+    // A brand-new store's own bootstrap may already have migrated through
+    // more than one version above the baseline (whichever real migrations
+    // exist beyond it today), each backed up in the ordinary way -- that is
+    // not what this test is about. What matters here is that REFUSING a
+    // database newer than this binary understands writes nothing new at
+    // all, so the directory listing is snapshotted right before that
+    // refused open and compared after, rather than asserting no backup file
+    // exists anywhere ever.
+    const beforeRefusal = await readdir(home);
+
     await expect(HeadroomStore.open(home)).rejects.toThrow(NewerSchemaError);
     await expect(HeadroomStore.open(home)).rejects.toThrow(new RegExp(`${newerVersion}.*${CURRENT_SCHEMA_VERSION}.*headroom update`, "s"));
 
@@ -132,7 +142,7 @@ describe("schema migrations", () => {
     const version = after.prepare("PRAGMA user_version").get()?.user_version;
     after.close();
     expect(version).toBe(newerVersion);
-    expect(await readdir(home)).not.toEqual(expect.arrayContaining([expect.stringContaining(".bak-")]));
+    expect(await readdir(home)).toEqual(beforeRefusal);
   });
 
   it("is idempotent: opening an already-current database twice is a no-op", async () => {

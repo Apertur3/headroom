@@ -6,8 +6,8 @@ import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
 
 // Fake probe binaries (temporary shell scripts standing in for
-// headroom-claude-probe) and HEADROOM_PROBE_PATH stand in for a real grant
-// here -- exactly the seam claude-probe-mapping.test.ts uses -- so this suite
+// headroom-claude-probe) and HEADROOM_PROBE_PATH stand in for a real
+// credential check here -- exactly the seam claude-probe-mapping.test.ts uses -- so this suite
 // never touches a real Keychain item or a real probe binary.
 
 const temporary: string[] = [];
@@ -37,8 +37,8 @@ async function withProbePath<T>(path: string | undefined, run: () => Promise<T>)
   finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
 }
 
-/** A fake probe binary that "grants" successfully: exit 0, a JSON body small
- * enough to clear assertVendorResponseLimits (grantClaudeKeychainAccess never
+/** A fake probe binary that reads successfully: exit 0, a JSON body small
+ * enough to clear assertVendorResponseLimits (checkClaudeCredentialReadable never
  * inspects its shape, only that parsing succeeds). */
 async function fakeGrantingProbe(root: string, name: string): Promise<string> {
   const path = join(root, name);
@@ -70,7 +70,7 @@ describe.skipIf(process.platform === "win32")("headroom keychain grant: which pr
     await withHeadroomHome(home, () => withProbePath(probe, async () => {
       const { result, logs } = await captureConsole(() => main(["keychain", "grant", "--principal", "claude-main"]));
       expect(result).toBe(0);
-      expect(logs.join("\n")).toContain(`Keychain access granted for claude-main (probe: ${probe})`);
+      expect(logs.join("\n")).toContain(`claude-main: credential readable, no dialog needed (probe: ${probe})`);
       const store = await HeadroomStore.open(home);
       try { expect(store.probePath()).toBe(probe); } finally { store.close(); }
     }));
@@ -90,7 +90,7 @@ describe.skipIf(process.platform === "win32")("headroom keychain grant: which pr
     await withHeadroomHome(home, async () => {
       const { result, logs } = await captureConsole(() => main(["keychain", "grant", "--principal", "claude-main"]));
       expect(result).toBe(0);
-      expect(logs.join("\n")).toContain(`Keychain access granted for claude-main (probe: ${pinnedProbe})`);
+      expect(logs.join("\n")).toContain(`claude-main: credential readable, no dialog needed (probe: ${pinnedProbe})`);
       const store = await HeadroomStore.open(home);
       try { expect(store.probePath()).toBe(pinnedProbe); } finally { store.close(); }
     });
@@ -113,7 +113,7 @@ describe.skipIf(process.platform === "win32")("headroom keychain grant: which pr
       expect(text).toContain("no longer exists");
       expect(text).toContain("--use-this-build");
       expect(text).toContain(cliProbe);
-      expect(text).not.toContain("Keychain access granted");
+      expect(text).not.toContain("credential readable, no dialog needed");
       const store = await HeadroomStore.open(home);
       try { expect(store.probePath()).toBe(staleProbe); } finally { store.close(); } // unchanged
     }));
@@ -131,7 +131,7 @@ describe.skipIf(process.platform === "win32")("headroom keychain grant: which pr
     await withHeadroomHome(home, () => withProbePath(cliProbe, async () => {
       const { result, logs } = await captureConsole(() => main(["keychain", "grant", "--principal", "claude-main", "--use-this-build"]));
       expect(result).toBe(0);
-      expect(logs.join("\n")).toContain(`Keychain access granted for claude-main (probe: ${cliProbe})`);
+      expect(logs.join("\n")).toContain(`claude-main: credential readable, no dialog needed (probe: ${cliProbe})`);
       const store = await HeadroomStore.open(home);
       try { expect(store.probePath()).toBe(cliProbe); } finally { store.close(); } // re-pinned
     }));

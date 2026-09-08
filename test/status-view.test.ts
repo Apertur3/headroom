@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { defaultPolicy } from "../src/policy.js";
+import { encodeResetSeen, formatClockTime } from "../src/resets.js";
 import { explainUnknown, renderStatus, statusViewOptions, type StatusViewInput, type StatusViewOptions } from "../src/status-view.js";
 import type { Lease, Observation } from "../src/types.js";
 
@@ -125,6 +126,55 @@ describe("status view: the three forms", () => {
     expect(view).toContain("reset seen Sep 7 22:13");
     expect(view).toContain("free reset Sep 7 22:13");
     expect(render()).not.toContain("reset seen");
+  });
+
+  it("marks an unscheduled reset '(unscheduled)' in --verbose's reset-seen detail (issue #20)", () => {
+    const view = render(
+      { verbose: true },
+      { resetSeen: new Map([["claude-main:all:300", encodeResetSeen(at(-153), true)]]) },
+    );
+    // "reset seen Sep 7 22:13 (unscheduled)" -- checked as two substrings
+    // since the detail line can wrap between them at this render width.
+    expect(view).toContain("reset seen Sep 7 22:13");
+    expect(view).toContain("(unscheduled)");
+  });
+
+  it("marks an unscheduled reset '(unscheduled)' in the dense --plain form too", () => {
+    const view = render(
+      { form: "plain" },
+      { resetSeen: new Map([["claude-main:all:300", encodeResetSeen(at(-153), true)]]) },
+    );
+    expect(view).toContain("reset seen Sep 7 22:13 (unscheduled)");
+  });
+
+  it("never marks a scheduled reset as unscheduled", () => {
+    const view = render(
+      { verbose: true },
+      { resetSeen: new Map([["claude-main:all:300", at(-153)]]) },
+    );
+    expect(view).toContain("reset seen Sep 7 22:13");
+    expect(view).not.toContain("(unscheduled)");
+  });
+
+  it("adds one line under the principal for a meter with a recent unscheduled reset (issue #20), even outside --verbose", () => {
+    const view = render(
+      {},
+      { resetSeen: new Map([["claude-main:all:300", encodeResetSeen(at(-45), true)]]) },
+    );
+    expect(view).toContain(`Unscheduled reset on claude-main:all at ${formatClockTime(new Date(at(-45)))}: the 5h is back to 22%, plan again.`);
+  });
+
+  it("names the weekly window when that is the one that reset unscheduled", () => {
+    const view = render(
+      {},
+      { resetSeen: new Map([["claude-main:all:10080", encodeResetSeen(at(-45), true)]]) },
+    );
+    expect(view).toContain(`Unscheduled reset on claude-main:all at ${formatClockTime(new Date(at(-45)))}: the weekly is back to 32%, plan again.`);
+  });
+
+  it("adds no unscheduled-reset line for an ordinary scheduled reset_seen entry", () => {
+    const view = render({}, { resetSeen: new Map([["claude-main:all:300", at(-45)]]) });
+    expect(view).not.toContain("Unscheduled reset on");
   });
 
   it("prints the dense one-line-per-meter form under --plain, unchanged", () => {
