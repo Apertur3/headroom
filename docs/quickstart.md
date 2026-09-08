@@ -284,29 +284,52 @@ That resolves itself once you install the daemon in the next step.
 Run `headroom dashboard` (or `headroom top`) for an automatically updating terminal view.
 It refreshes every 5 seconds; `--interval 2` selects the minimum interval. Every frame reads
 cached data through the daemon socket with a 500 ms budget, then falls back to the store.
-It never polls a vendor. Here, `direct read` means reading the local cache.
+It never polls a vendor. Here, `direct read` means reading the local cache without an answering
+daemon. Older daemons that do not support the dashboard request use their local cache and
+still show `daemon fresh Ns ago`. All clocks use your local time zone.
 
 ```text
-Headroom 0.1.0 | daemon fresh 30 s ago | 12:00:00 UTC
+Headroom 0.1.0 | daemon fresh 0s ago | 14:00:00
 
+Burndown: solid used, dotted plan, │ now, ░ reserve
 account-a  claude  Max  fresh <1m
-  all        5h  [####................]  20% resets in 4h NORMAL  ·▁▂▃▄▅▆▇█▅▃▂
-  credits  12 available
+  all        5h  [########............]  38% ↗ resets in 2h 30m HARVEST
+100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░⡀░⠄░⠂⠈│
+    │                           │              ⡀ ⠄ ⠁       │
+    │                           │      ⡀ ⠄ ⠂ ⠁             │
+    │                           │⡀ ⠄ ⠁                     │
+    │                    ⡀ ⠄ ⠂ ⣁⡀                          │
+    │              ⡀ ⠄ ⣂⣀⠤⠤⠒⠒⠉⠉ │                          │
+    │        ⠄⢀⣂⣀⠥⠤⠒⠒⠉⠉         │                          │
+  0%│⣀⡠⠤⠤⠒⠒⠓⠉⠉⠁                 │                          │
+08/09, 11:30                              08/09, 16:30 reset
+38% used, 2h 30m left, under pace, HARVEST
 
-gpu-box  local
-  capacity  BUSY  model=local-27b  queue=1  running=2
+EVENTS (last 8)
+No events
 
-EVENTS (last 8)                              | LEASES / RESERVES / PACING
-11:50:00 !unscheduled reset_seen account-a:all | worker account-a:all 5% held
-                                            | reserve account-a:all: 10%
-q quit  p pause  v verbose  e events  ? help
+LEASES / RESERVES / PACING
+reserve account-a:all: 10%
+q quit  p pause  v verbose  e events  g graphs  ? help
 ```
 
-This example uses mock data. `p` pauses/resumes reads, `v` shows burn, sustainable pace, reset
-evidence and idle markers, `e` widens events, `?` shows key help, and `q` exits. The terminal is
-restored on exit or error. Below 80 columns the footer stacks; sparklines appear when space
-allows. Short terminals show an overflow notice. Colour requires a terminal; `NO_COLOR` or
-`--no-color` disables it. `--once`, or piping stdout, prints one grouped frame and exits.
+This example uses mock data. Each hard percent window gets an eight-row graph after three
+distinct readings in that window. Its vertical scale is always 0 to 100% used; the dotted
+plan runs from 0% at the window start to 100% at reset. Usage above that line is over even
+pace. The vertical marker is now, and the shaded top band protects the configured reserve.
+`--ascii` uses half blocks instead of braille dots, also selected automatically for `TERM=dumb`.
+
+At 100 columns, the account-wide weekly meter also shows a sparkline for the last seven days
+with local day ticks: `F` marks a free-reset grant or use, `!` an unscheduled reset, and `*`
+both in the same column. Gaps mean no reading. A three-row wordmark appears at 100 columns
+and 30 rows. Pace glyphs remain readable without colour: `●` NORMAL, `↗` HARVEST,
+`⚠` CONSERVE, `🛑` FREEZE, and `?` UNKNOWN.
+
+`g` toggles graphs to save rows, `p` pauses/resumes reads, `v` shows burn, sustainable pace,
+reset evidence and idle markers, `e` widens events, `?` shows key help, and `q` exits. The
+terminal is restored on exit or error. Below 80 columns the footer stacks. Short terminals
+show an overflow notice. Colour requires a terminal; `NO_COLOR` or `--no-color` disables it.
+`--once`, or piping stdout, prints one grouped frame and exits.
 
 ## 6. Install the daemon
 
