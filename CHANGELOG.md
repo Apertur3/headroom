@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] - 2026-09-08
+
 ### Fixed
 - `headroom keychain grant` now always grants the exact probe binary the background daemon is
   pinned to, refusing (with a named `--use-this-build` escape hatch) rather than silently granting
