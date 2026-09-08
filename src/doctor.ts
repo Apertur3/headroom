@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -132,29 +132,47 @@ export function keychainGrantCheck(account: Account, grantsNeeded: Map<string, s
 /**
  * A machine that has both a packaged install and a repo checkout (or two
  * different global installs) can have more than one `headroom-claude-probe`
- * binary resolvable at once. Once a grant has pinned one (store.probePath()),
- * claude.ts's own resolution always prefers it over any other candidate --
- * this check exists only to say so out loud, naming both the granted binary
- * and any other one that currently resolves but is deliberately not used,
- * rather than leaving an operator to wonder why a probe rebuild had no
- * effect. Undefined when there is nothing to report: no Claude principal
- * configured, or (non-macOS) the probe concept does not apply.
+ * binary resolvable at once -- the exact shape of the "grant from the global
+ * install, daemon runs the checkout" mismatch this check exists to surface.
+ * Once a grant has pinned one (store.probePath()), claude.ts's own
+ * resolution always prefers it over any other candidate; this check compares
+ * that pinned (daemon) binary against whatever this CLI process would
+ * resolve on its own, naming both rather than leaving an operator to wonder
+ * why a probe rebuild had no effect.
+ *
+ * OK when they are the same file, or (a rebuild changes the file without
+ * changing who signed it) when both carry the same codesign designated
+ * requirement -- see claude.ts's probeSigningIdentity, the same identity
+ * check syncClaudeGrantState uses to decide whether a rebuild needs a fresh
+ * grant. WARN when they differ in both respects: the daemon may be enforcing
+ * a Keychain grant against a binary this CLI never touches. Undefined when
+ * there is nothing to report: no Claude principal configured, or (non-macOS)
+ * the probe concept does not apply.
  */
-export async function probePinCheck(store: HeadroomStore, claudeIds: string[]): Promise<DoctorCheck | undefined> {
+export async function probePinCheck(
+  store: HeadroomStore,
+  claudeIds: string[],
+  dependencies: { signingIdentity?: (pinnedPath?: string) => Promise<string | undefined> } = {},
+): Promise<DoctorCheck | undefined> {
   if (process.platform !== "darwin" || !claudeIds.length) return undefined;
   const pinned = store.probePath();
-  if (!pinned) return check("INFO", "claude probe binary", "no probe granted yet for this Headroom home", "headroom keychain grant");
+  if (!pinned) return check("INFO", "probe binary", "no probe granted yet for this Headroom home", "headroom keychain grant");
   const resolvedWithPin = await resolveProbePath(pinned);
   if (resolvedWithPin !== pinned) {
-    return check(resolvedWithPin ? "WARN" : "FAIL", "claude probe binary",
+    return check(resolvedWithPin ? "WARN" : "FAIL", "probe binary",
       resolvedWithPin ? `granted binary is gone (${pinned}); currently falling back to ${resolvedWithPin} instead` : `granted binary is gone (${pinned}) and no other probe resolves`,
-      "headroom keychain grant");
+      "headroom keychain grant --use-this-build");
   }
-  const resolvedWithoutPin = await resolveProbePath();
-  if (resolvedWithoutPin && resolvedWithoutPin !== pinned) {
-    return check("INFO", "claude probe binary", `granted: ${pinned}; not granted (a second candidate exists but is not used): ${resolvedWithoutPin}`, "no action needed; run headroom keychain grant again only to switch to the other binary");
+  const cliProbe = await resolveProbePath();
+  if (!cliProbe || cliProbe === pinned) return check("OK", "probe binary", `granted: ${pinned}`, "no action needed");
+  const signingIdentity = dependencies.signingIdentity ?? probeSigningIdentity;
+  const [pinnedIdentity, cliIdentity] = await Promise.all([signingIdentity(pinned), signingIdentity()]);
+  if (pinnedIdentity !== undefined && pinnedIdentity === cliIdentity) {
+    return check("OK", "probe binary", `granted: ${pinned}; this CLI resolves ${cliProbe}, same signing identity`, "no action needed");
   }
-  return check("OK", "claude probe binary", `granted: ${pinned}`, "no action needed");
+  return check("WARN", "probe binary",
+    `the daemon's granted probe (${pinned}) differs from this CLI's own probe (${cliProbe}), and they do not share a signing identity`,
+    "headroom keychain grant now handles it, or reinstall the service from the binary you want with headroom install-service");
 }
 
 export function adapterCheck(account: Account): DoctorCheck {
