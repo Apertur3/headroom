@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Dashboard burndowns, weekly reset markers, header art, pace glyphs and a `g` graph toggle, with local clocks, older-daemon detection and shared UNKNOWN explanations.
+
 ## [0.1.0-beta.11] - 2026-09-08
 
 ### Added
