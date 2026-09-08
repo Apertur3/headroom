@@ -120,11 +120,23 @@ identity fails for any reason -- including a sign that has not finished within 3
 means a Keychain dialog with nobody to answer it -- `build-probe.sh` falls back to ad-hoc signing
 with a printed warning, and every rebuild after that will ask again, the same as headroomd versions
 before this one. `bash scripts/build-probe.sh --reset-identity` deletes the local identity and its
-keychain if you ever need to start over. Headroom also only ever
-uses the exact probe binary a grant actually succeeded under (see doctor's "claude probe binary"
-line) -- a second candidate appearing later (a repo checkout built alongside an existing global
-install, say) is reported, never silently substituted. If you run more than one Claude Code
-profile, repeat the grant once per profile:
+keychain if you ever need to start over.
+
+`keychain grant` always grants the exact probe binary the background daemon actually uses, not
+whichever one happens to resolve for the CLI process running the command: it reads the pinned
+probe path this Headroom home was granted under (set by the first successful grant) and runs that
+one, printing which binary it granted (`Keychain access granted for claude-main (probe:
+/path/to/headroom-claude-probe)`). This matters when the daemon runs a different install than the
+CLI you happen to be typing into -- a repo checkout's `install-service` pointed a launchd/systemd
+service at that checkout's binary, but you run `headroom keychain grant` from a separate global npm
+install -- since granting whatever this CLI resolves on its own would grant the wrong binary and
+leave the daemon still reporting "Keychain grant needed". If the pinned binary has been removed or
+replaced, `keychain grant` refuses rather than silently substituting a different one: it names the
+missing path and offers `headroom keychain grant --use-this-build`, which grants (and re-pins the
+daemon to) whatever probe this CLI build resolves on its own. `headroom doctor`'s "probe binary"
+line reports the same comparison ahead of time -- OK when the CLI's probe and the daemon's pinned
+probe are the same file or share a signing identity, WARN otherwise, naming both paths. If you run
+more than one Claude Code profile, repeat the grant once per profile:
 
 ```sh
 headroom keychain grant --principal claude-2

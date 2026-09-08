@@ -13,7 +13,7 @@ import { exportCommand, EXPORT_HELP } from "./export.js";
 import { engineStatus, installEngine, installNativeEngine } from "./engine/codexbar/install.js";
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
-import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, syncClaudeGrantState } from "./adapters/claude.js";
+import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, grantClaudeKeychainAccess, probeBinaryHash, resolveProbePath, syncClaudeGrantState } from "./adapters/claude.js";
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
@@ -1001,18 +1001,31 @@ export function noKeychainItemMessage(directory: string): string {
 }
 
 /** With no --principal this grants every Claude principal in the registry: one
- * Keychain dialog per principal, one printed confirmation line each. A grant
- * always clears that principal's keychain_grant_needed marker (set by a prior
- * denial/timeout, or by a probe binary rebuild), so the daemon resumes
- * probing it on its next poll. */
+ * Keychain dialog per principal, one printed confirmation line each, naming
+ * the exact probe binary that was granted. A grant always clears that
+ * principal's keychain_grant_needed marker (set by a prior denial/timeout, or
+ * by a probe binary rebuild), so the daemon resumes probing it on its next
+ * poll.
+ *
+ * The probe granted here is always the one the daemon actually uses: the
+ * pinned path (store.probePath()) is tried first, so a grant run from a
+ * different install than the one running the background daemon (the
+ * global-npm-vs-checkout mismatch this exists for) still grants the
+ * daemon's own binary rather than whichever one this CLI process would
+ * otherwise pick. If that pinned binary no longer exists on disk, this
+ * refuses to silently substitute a different one -- it says so and asks for
+ * `--use-this-build` before granting (and re-pinning to) whatever probe this
+ * CLI resolves on its own. */
 export async function keychain(argv: string[]): Promise<number> {
-  if (argv[0] !== "grant" || argv.length > 3 || (argv[1] && argv[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>]");
+  const useThisBuild = argv.includes("--use-this-build");
+  const parsed = argv.filter((arg) => arg !== "--use-this-build");
+  if (parsed[0] !== "grant" || parsed.length > 3 || (parsed[1] && parsed[1] !== "--principal")) throw new Error("Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]");
   // Printed unconditionally, before ever touching the Keychain: an agent
   // shell running this command has no way to learn why a dialog it cannot
   // see never appeared, and the dogfooded failure mode ("no credentials")
   // gave no hint that the real problem was the shell itself.
   if (process.platform === "darwin") console.log("Run this from your own terminal; macOS shows a Keychain dialog that cannot appear in a sandboxed or remote shell.");
-  const requested = option(argv, "--principal");
+  const requested = option(parsed, "--principal");
   const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
   if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
@@ -1020,11 +1033,27 @@ export async function keychain(argv: string[]): Promise<number> {
   let failures = 0;
   try {
     const existingPin = store.probePath();
-    const hash = process.platform === "darwin" ? await probeBinaryHash(existingPin) : undefined;
+    let pinnedPath = existingPin;
+    if (existingPin) {
+      const resolvedWithPin = await resolveProbePath(existingPin);
+      if (resolvedWithPin !== existingPin) {
+        if (!useThisBuild) {
+          console.error(`The daemon's granted probe (${existingPin}) no longer exists on disk.`);
+          console.error(resolvedWithPin
+            ? `This CLI would use a different probe instead (${resolvedWithPin}); re-run with --use-this-build to grant that one and re-pin the daemon to it.`
+            : "This CLI has no other probe available either; build one (npm run engine:build) or reinstall headroomd.");
+          return 1;
+        }
+        // The stale pin is ignored from here on; a fresh grant below resolves
+        // (and re-pins to) whatever probe this CLI build actually has.
+        pinnedPath = undefined;
+      }
+    }
+    const hash = process.platform === "darwin" ? await probeBinaryHash(pinnedPath) : undefined;
     for (const account of targets) {
       let probePath: string | undefined;
       try {
-        ({ probePath } = await grantClaudeKeychainAccess(account.location, existingPin));
+        ({ probePath } = await grantClaudeKeychainAccess(account.location, pinnedPath));
       } catch (error) {
         // Claude Code was never run against this config dir, so there is
         // nothing for the operator to grant access to yet: a distinct,
@@ -1050,12 +1079,14 @@ export async function keychain(argv: string[]): Promise<number> {
       // The binary that just proved itself under an operator-run grant must
       // never be treated as an unproven first run again by a background poll.
       if (hash) store.setProbeGrantedHash(hash);
-      // Pinned once, on the very first successful grant this Headroom home
-      // has ever recorded -- every later probe call (background polls
-      // included, see collector.ts) uses exactly this path from here on,
-      // even if a second candidate binary later appears on disk.
-      if (!existingPin && probePath) store.setProbePath(probePath);
-      console.log(`Keychain access granted for ${account.name}`);
+      // Pinned on the very first successful grant this Headroom home has
+      // ever recorded, and re-pinned whenever a stale pin was just replaced
+      // above (pinnedPath === undefined while existingPin was set) -- every
+      // later probe call (background polls included, see collector.ts) uses
+      // exactly this path from here on, even if a second candidate binary
+      // later appears on disk.
+      if ((!existingPin || pinnedPath === undefined) && probePath) store.setProbePath(probePath);
+      console.log(`Keychain access granted for ${account.name}${probePath ? ` (probe: ${probePath})` : ""}`);
     }
   } finally { store.close(); }
   return failures ? 1 : 0;
@@ -1127,7 +1158,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   accounts: "Usage: headroom accounts discover",
   doctor: "Usage: headroom doctor [--bundle [path]]",
   setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
-  keychain: "Usage: headroom keychain grant [--principal <claude-principal>]",
+  keychain: "Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]",
   "install-service": "Usage: headroom install-service [--dry-run]",
   "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
   uninstall: "Usage: headroom uninstall [--home] [--yes] [--dry-run]",
@@ -1213,6 +1244,11 @@ export async function main(argv: string[]): Promise<number> {
     if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom install-service [--dry-run]");
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
     console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`);
+    // Names the exact executable and script the service will run, so a
+    // maintainer installing from a repo checkout (rather than a global npm
+    // install) can see up front which build the background daemon is now
+    // bound to.
+    console.log(`The service will run: ${result.runtime} ${result.script} daemon`);
     if (result.dryRun) console.log(`\n${result.contents}`);
     return 0;
   }
