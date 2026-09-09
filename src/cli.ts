@@ -40,7 +40,7 @@ import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientPro
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
-import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
+import { HeadroomStore, safeHeadroomDirectory, type PlanDowngrade } from "./store.js";
 import { isLocalAccount, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
@@ -792,6 +792,7 @@ export async function observe(argv: string[]): Promise<number> {
   let resetSeen = new Map<string, string>();
   let freeResetUsed = new Map<string, string>();
   let leases: Lease[] = [];
+  let planDowngraded: PlanDowngrade[] = [];
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
     observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
@@ -813,6 +814,7 @@ export async function observe(argv: string[]): Promise<number> {
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);
+      planDowngraded = store.planDowngrades(new Set(observations.map((item) => item.principal_id)));
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
@@ -822,6 +824,7 @@ export async function observe(argv: string[]): Promise<number> {
     resetSeen = new Map(Object.entries(resetEvents));
     const freeResetEvents = unwrapRpc(await requestDaemon("free_reset_used", { windows })) as Record<string, string>;
     freeResetUsed = new Map(Object.entries(freeResetEvents));
+    planDowngraded = unwrapRpc(await requestDaemon("plan_downgrades")) as PlanDowngrade[];
   }
   const view = { ...statusViewOptions(argv, process.stdout.isTTY === true, process.env, process.stdout.columns), direct };
   // The grouped view's own footer already says where the numbers came from, so
@@ -830,12 +833,12 @@ export async function observe(argv: string[]): Promise<number> {
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases } : { observations: withResets, leases, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
     const vendors = new Map((await readAccounts().catch(() => [])).map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
-    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors }, view)) console.log(line);
+    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.

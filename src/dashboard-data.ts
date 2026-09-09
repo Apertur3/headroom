@@ -2,6 +2,7 @@ import { readPolicy } from "./config.js";
 import { withLastKnown, withPaceInfo } from "./pace.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
+import type { PlanDowngrade } from "./store.js";
 import { isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
 import type { Policy } from "./policy.js";
 import { headroomVersion } from "./version.js";
@@ -13,6 +14,7 @@ export interface DashboardSnapshot {
   resetSeen: Record<string, string>;
   burns: Record<string, Array<number | null>>;
   notices: string[];
+  planDowngraded: PlanDowngrade[];
 }
 
 export interface DashboardModel extends DashboardSnapshot {
@@ -56,6 +58,7 @@ export function readDashboardStore(store: HeadroomStore, now = new Date(), rows 
     observations, burns, events: store.events("1970-01-01T00:00:00.000Z").slice(-8),
     leases: store.leases(undefined, true, now), resetSeen: Object.fromEntries(store.resetSeenFor(rows, now)),
     notices: store.recentUnscheduledResets(meters, now).map((item) => `unscheduled reset on ${item.meter_id}; capacity appeared, re-plan`),
+    planDowngraded: store.planDowngrades(new Set(rows.map((row) => row.principal_id))),
   };
 }
 
@@ -68,7 +71,7 @@ export interface DashboardReader {
 export async function dashboardSnapshot(reader: DashboardReader): Promise<{ snapshot: DashboardSnapshot; direct: boolean }> {
   const reply = await reader.request().catch(() => undefined) as { status?: string; result?: { result?: DashboardSnapshot; error?: unknown } } | undefined;
   const snapshot = reply?.status === "available" && !reply.result?.error ? reply.result?.result : undefined;
-  if (snapshot && Array.isArray(snapshot.observations) && Array.isArray(snapshot.events) && Array.isArray(snapshot.leases) && snapshot.burns && snapshot.resetSeen && Array.isArray(snapshot.notices)) return { snapshot, direct: false };
+  if (snapshot && Array.isArray(snapshot.observations) && Array.isArray(snapshot.events) && Array.isArray(snapshot.leases) && snapshot.burns && snapshot.resetSeen && Array.isArray(snapshot.notices)) return { snapshot: { ...snapshot, planDowngraded: Array.isArray(snapshot.planDowngraded) ? snapshot.planDowngraded : [] }, direct: false };
   return { snapshot: await reader.fallback(), direct: true };
 }
 

@@ -11,7 +11,7 @@ and prints the command to run later.
 | --- | --- |
 | `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, source failures and recoveries, threshold crossings. |
 | `quiet` | Unscheduled resets, source failures and threshold crossings. |
-| `everything` | All event kinds, including scheduled 5h resets, projected stalls, new model buckets, Keychain grant lapses, credit and plan changes, and leases. |
+| `everything` | All event kinds, including scheduled 5h resets, projected stalls, new model buckets, historical Keychain grant-lapse events, credit and plan changes, and leases. |
 
 The picker asks one question at a time: channels and destinations, preset,
 individual event choices if wanted, quiet hours, then an optional test message.
@@ -70,7 +70,7 @@ name appears in both. Supported names:
 | `threshold` | A fresh hard window reached the used-percent threshold. |
 | `pace_projection_conserve` | Recent burn projects exhaustion before reset. |
 | `model_new` | A new model bucket on a known principal. A principal's first poll stays quiet. |
-| `grant_lapsed` | A detected Keychain grant lapse, with the command to check access. |
+| `grant_lapsed` | A historical Keychain grant lapse retained for existing event history. |
 | `lease_started`, `lease_ended` | Work reservations started or ended. |
 
 Scheduled 5h resets are delivered only with `preset = "everything"` or
@@ -158,3 +158,9 @@ If nothing arrives, check that the daemon is running, inspect `headroom logs`,
 and run `headroom notify --test`. A disabled channel reports its missing setting
 or secret-store problem. `headroom notify --last 20` shows pending, sent and failed
 deliveries; a failed row has exhausted its retries and waits for a new event.
+
+A vendor-reported paid-to-free plan downgrade is urgent: it is delivered in every
+preset and breaks through quiet hours once, with one reminder after 24 hours if it
+is still unacknowledged. Dispatches stay refused until `headroom ack plan <principal>`
+confirms an intended downgrade, or until the vendor reports the paid plan again.
+A reset credit spent while the plan is free is also delivered immediately.

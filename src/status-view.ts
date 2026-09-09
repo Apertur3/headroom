@@ -20,6 +20,7 @@
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -329,7 +330,12 @@ export interface StatusViewInput {
   /** principal id -> vendor, from accounts.toml. Falls back to the vendor
    * implied by an observation's `source` when a principal is missing. */
   vendors?: Map<string, string>;
+  planDowngraded?: PlanDowngrade[];
   now?: Date;
+}
+
+export function planDowngradeLine(downgrade: PlanDowngrade): string {
+  return `PLAN DOWNGRADED: ${downgrade.principal} ${downgrade.to} since ${formatClockTime(new Date(downgrade.since))} (ack: headroom ack plan ${downgrade.principal})`;
 }
 
 const SOURCE_VENDORS: Record<string, string> = { codexbar: "codex", "claude-statusline": "claude", paste: "claude", local: "local" };
@@ -593,6 +599,8 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
 /** The entry point cli.ts calls: one array of ready-to-print lines, in
  * whichever form the options selected. */
 export function renderStatus(input: StatusViewInput, options: StatusViewOptions): string[] {
-  if (options.form === "plain") return formatMeters(input.observations, input.policy, input.resetSeen, input.leases, input.freeResetUsed, input.now ?? new Date());
-  return groupedLines(input, options);
+  const warnings = (input.planDowngraded ?? []).map(planDowngradeLine);
+  if (options.form === "plain") return [...warnings, ...formatMeters(input.observations, input.policy, input.resetSeen, input.leases, input.freeResetUsed, input.now ?? new Date())];
+  const body = groupedLines(input, options);
+  return options.color ? [...warnings.map((line) => `${ANSI.red}${line}${ANSI.reset}`), ...body] : [...warnings, ...body];
 }

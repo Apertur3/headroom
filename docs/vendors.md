@@ -132,6 +132,9 @@ only when the response's `additional_rate_limits` includes a Spark entry), and
 `<principal>:credits`, a `count` window with no reset duration; it is informational and never
 gates `can`.
 
+Use Codex reset credits only while the account is on a paid plan. A free-plan credit spend is
+reported as an urgent warning because it can discard a saved paid-plan reset.
+
 Known limitation, verified live: on some plans the endpoint's `primary_window` (the 5-hour window)
 is absent from the response, and there's no recent session log to fall back to. Headroom
 reports that window `not_enforced` with reason "no 5-hour window from endpoint or session logs",
