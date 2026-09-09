@@ -10,6 +10,8 @@ name = "claude-main"
 vendor = "claude"
 location = "~/.claude"
 adapter = "native-ts"
+# Optional: match an external statusline snapshot's alias.
+# alias = "main"
 
 [[accounts]]
 name = "claude-2"
@@ -22,6 +24,8 @@ name = "antigravity"
 vendor = "antigravity"
 location = "~/.gemini/antigravity-cli"
 adapter = "native-ts"
+# Optional: explicit path to the agy executable for this principal.
+# agy_path = "/usr/local/bin/agy"
 
 # Grok reads the token `grok login` writes. `location` may name the token file
 # itself or the directory holding it; the default is ~/.grok, or GROK_HOME.
@@ -67,9 +71,11 @@ adapter = "native-ts"
 # kind = "local"
 # base_url = "http://192.0.2.20:8000"
 # adapter = "native"
+# wake = "systemctl --user start local-llm"
 
+# llama.cpp pools use the same local entry shape.
 # [[accounts]]
-# name = "workstation-vllm"
+# name = "local-llama"
 # kind = "local"
-# base_url = "http://192.0.2.20:8000"
+# base_url = "http://192.0.2.21:8080"
 # adapter = "native"

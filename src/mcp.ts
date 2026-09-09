@@ -181,10 +181,10 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [] };
+      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [] };
+      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -198,7 +198,7 @@ export async function directStatus(): Promise<DirectResult> {
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures };
+    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 
@@ -532,12 +532,14 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // of whether the decision came from the daemon (a raw CanDecision) or
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
-    const finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved as CanDecision, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true, typeof arguments_.owner === "string" ? arguments_.owner : "") : resolved;
-    // The contract envelope only fits an object result: a daemon-sourced
-    // list method (cost/rate/spend/leases/events/status) answers with the
-    // same bare JSON array the CLI's own --json prints for it, which has no
-    // place to carry named fields -- see json-contract.ts's own doc comment
-    // and docs/json-contract.md's "Array-shaped outputs" section.
+    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved as CanDecision, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true, typeof arguments_.owner === "string" ? arguments_.owner : "") : resolved;
+    if (method === "status" && Array.isArray(finalResult)) {
+      const downgrade = await call("plan_downgrades", {});
+      finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+    }
+    // The contract envelope fits object results. Status is deliberately an
+    // object so it can carry an active downgrade; the remaining daemon list
+    // methods still answer with bare arrays.
     const envelopedResult = isEnvelopable(finalResult) ? withContract(finalResult) : finalResult;
     return response(request.id, { content: [{ type: "text", text: JSON.stringify(envelopedResult) }], structuredContent: envelopedResult });
   } catch (error) {

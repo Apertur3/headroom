@@ -7,8 +7,8 @@
 
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 
-One daemon reads the real meters of every account you own: Claude and Codex today, any number of
-accounts per vendor, and local inference boxes. Google Antigravity is experimental: the adapter
+One daemon reads the real meters of every account you own: Claude, Codex, Antigravity, Gemini CLI,
+Grok, Kimi, and local vLLM or llama.cpp pools. Google Antigravity is experimental: the adapter
 reads the daemon-kept `agy` local quota summary and shows it as-is, with an idle window flagged
 rather than hidden -- only an availability-only payload or a reading that contradicts the last one
 reads UNKNOWN. It keeps history, notices resets and free
@@ -45,16 +45,13 @@ links its library for providers Headroom does not cover natively.
 
 ## What you get
 
-`headroom dashboard` (alias `top`) shows a live terminal dashboard with quota bars, burn history, events and leases, using cached readings only.
-
 | | |
 |---|---|
-| Meters | One row per account and limit family: Claude `all`, `fable`, `routines`; Codex `main`, `spark`; Antigravity `gemini`, `claude-gpt`; Grok `main`, `credits`; local `capacity` |
+| Vendors and meters | Claude `all`, `fable`, `routines` and reported scoped meters; Codex `main`, `spark`, `credits`; Antigravity `gemini`, `claude-gpt`; Gemini CLI, Grok, Kimi; and local vLLM or llama.cpp `capacity` pools |
 | Pace | HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset |
-| Memory | SQLite history plus `reset_seen`, `free_reset_granted`, `free_reset_used` and `source_failed` events, each with a confidence |
-| Go or no-go | `headroom can <action>` checks every meter the action draws from. A frozen Fable meter blocks a Fable call even when the account has room overall |
-| Surfaces | `headroom --json`, `headroom --threshold 90` (exit 2), a Unix socket daemon, an MCP server with `quota_status`, `quota_can`, `quota_events`, and a skill that tells an orchestrator how to use them |
-| Blocked meters | `headroom usage --paste` (or `--clipboard`) turns the text of Claude Code's `/usage` panel into real readings, so a figure only the human can see, such as a Fable weekly bar at 95%, still gates the next dispatch |
+| Decisions | `can`, `gate`, `route`, `plan`, `fill`, `wait`, leases, per-meter reserves, and a spend ledger coordinate shared capacity and pacing |
+| Views and automation | Terminal status, `dashboard`/`top`, `statusline --render`, `usage --paste` or `--clipboard`, JSON contract output, local daemon, and MCP tools |
+| Operations | Interactive `setup`; the `notify configure` picker with calm, quiet and everything presets; `inbox`; `export` as JSON or CSV; `doctor --bundle`; `update`; `uninstall`; and shell `completion` |
 
 Headroom is not a router. Which model is good at what is your opinion and changes monthly. Keep it
 in `~/.headroom/routing.toml`; Headroom only filters your fallback list by budget. It also never sits in
@@ -66,7 +63,7 @@ Node 22.13 or newer.
 
 ```sh
 npm install -g headroomd
-headroom accounts discover   # finds your Claude, Codex and Antigravity logins
+headroom accounts discover   # finds Claude, Codex, Antigravity, Gemini CLI, Grok and Kimi logins
 headroom                     # one line per meter
 ```
 
@@ -82,6 +79,10 @@ By hand, the same steps are one command:
 ```sh
 headroom setup                # discovery, doctor, service, MCP registration -- asks before each change
 ```
+
+Run `headroom notify configure` to choose notification channels, a preset and overrides. Run
+`headroom update` only when you choose to install a newer package; `headroom uninstall` reverses
+setup, and `headroom completion <bash|zsh|fish|pwsh>` prints a shell completion script.
 
 `accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom
 doctor`) and, the first time, seeds `~/.headroom/policy.toml` and `routing.toml` from `examples/` so
@@ -113,7 +114,7 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 
 No secret touches disk or output. On macOS `headroom-claude-probe` reads the Claude Keychain token
 through `/usr/bin/security`, which the Keychain item's own access list admits, and makes the usage
-request itself, so the token never enters Node or stdout and no dialog is ever involved. It ships
+request itself, so the token never enters Node or stdout and no dialog is needed. It ships
 inside the npm package as a universal binary, verified against a recorded SHA-256 before every use.
 Tokens are otherwise read at call time from the Keychain or the vendor's own credential file and
 dropped after the request. The daemon listens on a 0600 local
