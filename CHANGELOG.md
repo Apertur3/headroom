@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard daemon snapshots now retain their interactive request budget, and overview and new-period graph rows render local capacity, credits, and recent history correctly.
+
 ## [0.1.0-beta.15] - 2026-09-09
 
 ### Changed

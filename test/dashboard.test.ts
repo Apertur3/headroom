@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHmac } from "node:crypto";
@@ -8,7 +8,8 @@ import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
-import { burnBuckets, dashboardSnapshot, readDashboardStore } from "../src/dashboard-data.js";
+import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboard, readDashboardStore } from "../src/dashboard-data.js";
+import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
@@ -57,7 +58,7 @@ describe("dashboard frames (synthetic data)", () => {
       OVERVIEW█
       > account-a        [####################]  98% resets in 24h FREEZE stop█
         account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          [####................]  20% resets in 4h BUSY ok█
+        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
         mock-0           [####................]  20% resets in 4h NORMAL ok░
         mock-1           [####................]  20% resets in 4h NORMAL ok░"
     `);
@@ -66,7 +67,7 @@ describe("dashboard frames (synthetic data)", () => {
       OVERVIEW█
       > account-a        [####################]  98% resets in 24h FREEZE stop█
         account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          [####................]  20% resets in 4h BUSY ok█
+        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
         mock-0           [####................]  20% resets in 4h NORMAL ok░
         mock-1           [####................]  20% resets in 4h NORMAL ok░
         mock-10          [####................]  20% resets in 4h NORMAL ok░
@@ -107,7 +108,7 @@ describe("dashboard frames (synthetic data)", () => {
           last 41% at 13:30:00░
       ░
       gpu-box  local░
-        capacity  BUSY  model=local-27b  queue=1  running=2░
+        gpu-box  BUSY  local-27b  2 running, 1 waiting  busy░
       ░
       mock-0  claude  Max  fresh <1m░
         all        5h  [####................]  20% ● resets in 4h NORMAL░
@@ -135,7 +136,7 @@ describe("dashboard frames (synthetic data)", () => {
       OVERVIEW█
       > account-a        [####################]  98% resets in 24h FREEZE stop█
         account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          [####................]  20% resets in 4h BUSY ok█
+        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
       1 event in the last hour, 1 lease active, next reset account-a 5h in 4h█
       █
       account-a  claude  Max  fresh <1m█
@@ -157,6 +158,17 @@ describe("dashboard frames (synthetic data)", () => {
       q quit  p pause  v verbose  e events  g graphs  ? help░"
     `);
   });
+  it("uses compact local-pool and credit summaries instead of percentage bars", () => {
+    const model = fixedModel();
+    model.observations = [
+      row({ principal_id: "gpu-box", meter_id: "gpu-box:capacity", window: { kind: "state", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: null, unit: "requests" }, metadata: { state: "UP", model_ids: ["coder"], running: 0, waiting: 0 } }),
+      row({ principal_id: "credits", meter_id: "credits:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-10-05T12:00:00Z" }),
+    ];
+    const frame = renderDashboard(model, { width: 100, height: 30, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).toContain("gpu-box            UP  coder  0 running, 0 waiting  ok");
+    expect(frame).toMatch(/credits\s+1 available, expire (?:Oct 5|5 Oct)/);
+    expect(frame).not.toMatch(/gpu-box\s+\[[#.?]{20}\]|credits\s+\[[#.?]{20}\]/);
+  });
   it("renders the exact wide overview frame", () => {
     expect(renderDashboard(fixedModel(), { width: 145, height: 68, verbose: false, eventsWide: false }).join("\n")).toMatchInlineSnapshot(`
       "╷ ╷ ╭── ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭╮╭╮
@@ -165,7 +177,7 @@ describe("dashboard frames (synthetic data)", () => {
       OVERVIEW
       > account-a        [####################]  98% resets in 24h FREEZE stop
         account-b        [????????????????????]   - resets in ? UNKNOWN unknown
-        gpu-box          [####................]  20% resets in 4h BUSY ok
+        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy
       1 event in the last hour, 1 lease active, next reset account-a 5h in 4h
 
       account-a  claude  Max  fresh <1m
@@ -184,7 +196,7 @@ describe("dashboard frames (synthetic data)", () => {
           last 41% at 13:30:00
 
       gpu-box  local
-        capacity  BUSY  model=local-27b  queue=1  running=2
+        gpu-box  BUSY  local-27b  2 running, 1 waiting  busy
 
       EVENTS (last 8)                                                        | LEASES / RESERVES / PACING
       13:50:00 !unscheduled reset_seen account-a:all                         | worker account-a:all 5% held, 1.0% spent, 20m left
@@ -328,6 +340,39 @@ describe("dashboard cached data", () => {
     for (const reply of [{ status: "absent" }, { status: "unresponsive" }, { status: "available", result: { error: { message: "Method not found" } } }]) expect((await dashboardSnapshot({ request: async () => reply, fallback })).direct).toBe(true);
     expect(fallback).toHaveBeenCalledTimes(3);
   });
+  it.skipIf(process.platform === "win32")("uses a real daemon snapshot within the interactive budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-live-"));
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "account-a"',
+      'vendor = "codex"',
+      'location = "/nonexistent/.codex"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const daemon = await HeadroomDaemon.create({ home: root, poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+        throw error;
+      }
+      const store = await HeadroomStore.open(root);
+      store.insert(row({ observed_at: new Date().toISOString(), fetched_at: new Date().toISOString(), resets_at: new Date(Date.now() + 4 * 3_600_000).toISOString() }));
+      store.close();
+      await expect(daemonRequest(socketPath(root), "status", {}, 50, 50)).resolves.toMatchObject({ status: "available" });
+      await expect(daemonRequest(socketPath(root), "dashboard", {}, 50, 500)).resolves.toMatchObject({ status: "available", result: { observations: [expect.objectContaining({ meter_id: "account-a:all" })] } });
+      const model = await gatherCachedDashboard(root);
+      expect(model.direct).toBe(false);
+      expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false })[0]).toMatch(/daemon fresh \d+s ago/);
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it("does not interpret reset drops or failures as burn", () => {
     const reading = (minute: number, used: number, freshness: Observation["freshness"] = "fresh") => row({ fetched_at: new Date(now.getTime() - (60 - minute) * 60_000).toISOString(), freshness, quantity: { used, remaining: 100 - used, limit: 100, unit: "percent" } });
     const buckets = burnBuckets([reading(0, 20), reading(5, 25), reading(10, 0), reading(15, 4, "failed"), reading(20, 6)], now);
@@ -410,6 +455,15 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(graph).toContain("new period, 1 reading");
     expect(graph).not.toContain("collecting readings");
   });
+  it("dims a prior-period graph while the new period is collecting", async () => {
+    const model = graphModel(), current = model.observations[0];
+    model.now = new Date("2026-09-08T15:35:00Z");
+    model.observations[0] = { ...current, resets_at: "2026-09-08T15:30:00Z", observed_at: "2026-09-08T15:34:00Z", fetched_at: "2026-09-08T15:34:00Z", quantity: { used: 1, remaining: 99, limit: 100, unit: "percent" } };
+    const fake = terminal(); fake.io.gather = async () => model;
+    await dashboardCommand(["--once"], fake.io);
+    expect(fake.writes.join("")).toContain("new period, 1 reading so far");
+    expect(fake.writes.join("")).toContain("\x1b[2m100%│");
+  });
   it("does not count refetches, other windows, old resets, failed or future readings", () => {
     const model = graphModel(), current = model.observations[0];
     model.history![current.meter_id] = [current, { ...current, fetched_at: now.toISOString() },
@@ -418,7 +472,7 @@ describe("dashboard graphs (synthetic data)", () => {
       { ...current, freshness: "failed", observed_at: "2026-09-08T10:30:00Z" },
       { ...current, observed_at: "2026-09-08T12:01:00Z" },
     ];
-    expect(renderBurndown(current, model, 60)).toEqual(["  collecting readings"]);
+    expect(renderBurndown(current, model, 60)).toEqual(["  new period, 1 reading so far"]);
   });
   it("uses the earliest reading when duration is unavailable", () => {
     const model = graphModel();
@@ -602,7 +656,7 @@ describe("dashboard graph gathering", () => {
       vi.useFakeTimers(); vi.setSystemTime(now);
       const gathered = await gatherDashboard();
       expect(gathered.direct).toBe(false); expect(gathered.history!["account-a:all"]).toHaveLength(3);
-      expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$|^\\\\\.\\pipe\\headroom-/), "dashboard", {}, 1_000, 1_000);
+      expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$|^\\\\\.\\pipe\\headroom-/), "dashboard", {}, 50, 500);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
   });
