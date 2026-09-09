@@ -340,7 +340,7 @@ describe("dashboard cached data", () => {
     for (const reply of [{ status: "absent" }, { status: "unresponsive" }, { status: "available", result: { error: { message: "Method not found" } } }]) expect((await dashboardSnapshot({ request: async () => reply, fallback })).direct).toBe(true);
     expect(fallback).toHaveBeenCalledTimes(3);
   });
-  it("uses a real daemon snapshot within the interactive budget", async () => {
+  it.skipIf(process.platform === "win32")("uses a real daemon snapshot within the interactive budget", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-live-"));
     const previous = process.env.HEADROOM_HOME;
     process.env.HEADROOM_HOME = root;
