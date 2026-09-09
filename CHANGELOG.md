@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.17] - 2026-09-09
+
 ### Added
 - `headroom report --recovered <meter>` clears an exhausted mark by hand; a fresh reading with headroom left clears it automatically.
 
