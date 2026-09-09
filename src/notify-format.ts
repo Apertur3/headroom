@@ -88,6 +88,7 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
       const reset = dateText(current?.resets_at ?? (typeof event.metadata?.resets_at === "string" ? event.metadata.resets_at : undefined));
       return `🛑 ${name} reports its limit reached${reset ? `; resets ${reset}` : ""}. Dispatches to ${name} are refused until then.`;
     }
+    case "exhausted_cleared": return `✅ ${name} exhausted report cleared. Fresh capacity is available for dispatch again.`;
     case "window_retired": return message("🧹 Window retired", `${meter} is no longer reported by the vendor.`, "It no longer participates in dispatch decisions.");
     case "source_failed": {
       const duration = Math.max(0, Math.floor((Date.parse(event.last_seen_at ?? event.created_at) - Date.parse(event.created_at)) / 60_000));

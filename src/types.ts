@@ -92,6 +92,10 @@ export interface Observation {
      * calls it inactive. */
     vendor_active?: boolean;
     exhausted?: boolean;
+    /** A synthetic exhausted report that has been superseded or explicitly
+     * cleared stays in history but must never win a current-window read. */
+    exhausted_ignored?: boolean;
+    exhausted_report_id?: string;
     retired?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
@@ -135,7 +139,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed";
 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `headroom report --recovered <meter>` clears an exhausted mark by hand; a fresh reading with headroom left clears it automatically.
+
+### Changed
+- Vendor "limit reached" detection is stricter, so a transient error no longer marks a meter exhausted.
+- An exhausted mark without an `until` now expires on its own instead of blocking dispatch forever.
+
 ## [0.1.0-beta.16] - 2026-09-09
 
 ### Fixed

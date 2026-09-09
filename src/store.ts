@@ -172,6 +172,7 @@ export class HeadroomStore {
     await store.migrate(resolve(path, ".."));
     const legacy = await legacyDatabasePath(resolve(path, ".."));
     if (legacy) await store.mergePriorDatabase(legacy, resolve(path, ".."));
+    store.normalizeExhaustedReportExpiry();
     if (process.platform !== "win32") for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
       try { await chmod(candidate, 0o600); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
@@ -179,6 +180,29 @@ export class HeadroomStore {
   }
 
   close(): void { this.db.close(); }
+
+  /** Upgrade old `{ until: null }` exhausted markers in place. The original
+   * report implementation treated those as permanent, so do this at open
+   * time as well as for newly created reports: status immediately shows the
+   * expiry, even before any caller happens to run a dispatch check. */
+  private normalizeExhaustedReportExpiry(now = new Date()): void {
+    const rows = this.db.prepare("SELECT key, value FROM daemon_state WHERE key LIKE 'exhausted:%'").all();
+    for (const row of rows) {
+      const meterId = String(row.key).slice("exhausted:".length);
+      let state: { active?: boolean; until?: string | null; note?: string | null; report_id?: string; binding_window_minutes?: number };
+      try { state = JSON.parse(String(row.value)) as typeof state; } catch { continue; }
+      if (state.active === false || (state.until && Number.isFinite(Date.parse(state.until)))) continue;
+      const binding = this.latestPerWindow(meterId)
+        .filter((item) => item.window?.minutes && item.quantity?.unit === "percent")
+        .sort((left, right) => left.window!.minutes! - right.window!.minutes!)[0];
+      const expiresAt = binding?.resets_at && Number.isFinite(Date.parse(binding.resets_at))
+        ? new Date(binding.resets_at).toISOString()
+        : new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
+      this.db.prepare("UPDATE observations SET resets_at = ? WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1 AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0")
+        .run(expiresAt, meterId);
+      this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ ...state, active: true, until: expiresAt, binding_window_minutes: state.binding_window_minutes ?? binding?.window?.minutes }));
+    }
+  }
 
   /** The schema version this open connection is on, read live from
    * `PRAGMA user_version` -- see migrations.ts. `headroom doctor` shows this
@@ -364,6 +388,10 @@ export class HeadroomStore {
       resolved.observed_at ?? null, resolved.fetched_at ?? null, resolved.source, resolved.truth, resolved.freshness, resolved.confidence,
       resolved.adapter_version, resolved.upstream_schema_version, reason, json(metadata));
     const stored: StoredObservation = { ...resolved, reason, metadata, id: Number(result.lastInsertRowid) };
+    // This must run on the raw vendor observation before any read-side gate
+    // can see it. A fresh, sub-100 binding-window reading with a new reset is
+    // proof that the previous exhausted report belongs to an old window.
+    this.clearExhaustedFromVendor(stored);
     if (newBucket) this.addEvent("model_new", "vendor_reported", 1, [stored.id], stored, newBucket);
     if (previous) this.detectEvents(previous, stored);
     else if (stored.freshness === "failed") this.recordFailure([stored.id], stored);
@@ -405,23 +433,82 @@ export class HeadroomStore {
   reportExhausted(meterId: string, until: string | null, note: string | null, now = new Date()): void {
     const rows = this.latestPerWindow(meterId).filter((row) => row.window?.minutes && row.quantity?.unit === "percent");
     if (!rows.length) throw new Error(`no reported percent window for ${meterId}`);
-    const reset = until && Number.isFinite(Date.parse(until)) ? new Date(until).toISOString() : null;
+    const requestedReset = until && Number.isFinite(Date.parse(until)) ? new Date(until).toISOString() : null;
+    // A report is bound to the vendor window which owns its reset. When the
+    // vendor message did not include one, bind to the shortest real window:
+    // that is the first allowance a dispatch can actually exhaust.
+    const ordered = [...rows].sort((a, b) => a.window!.minutes! - b.window!.minutes!);
+    const binding = requestedReset
+      ? ordered.find((row) => row.resets_at && new Date(row.resets_at).toISOString() === requestedReset) ?? ordered[0]!
+      : ordered[0]!;
+    const bindingReset = binding.resets_at && Number.isFinite(Date.parse(binding.resets_at)) ? new Date(binding.resets_at).toISOString() : null;
+    // A missing reset must not turn a mistaken report into a permanent
+    // refusal. Preserve the vendor's binding reset when we have it; otherwise
+    // make the report explicitly expire in 24 hours.
+    const expiresAt = requestedReset ?? bindingReset ?? new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
+    const reportId = randomUUID();
     for (const row of rows) {
       const { id: _id, ...observation } = row;
-      const current = this.insert({ ...observation, quantity: { ...row.quantity!, used: 100, remaining: 0 }, resets_at: reset ?? row.resets_at, observed_at: now.toISOString(), fetched_at: now.toISOString(), freshness: "fresh", confidence: 0.9, reason: "vendor reports the limit reached", metadata: { ...row.metadata, exhausted: true } });
+      const current = this.insert({ ...observation, quantity: { ...row.quantity!, used: 100, remaining: 0 }, resets_at: expiresAt, observed_at: now.toISOString(), fetched_at: now.toISOString(), freshness: "fresh", confidence: 0.9, reason: "vendor reports the limit reached", metadata: { ...row.metadata, exhausted: true, exhausted_report_id: reportId } });
       this.addEvent("exhausted_reported", "inferred", 0.9, [current.id], current, note ?? "vendor reports the limit reached", null, undefined, { resets_at: current.resets_at ?? undefined });
     }
-    this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ until: reset, note }));
+    this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ active: true, until: expiresAt, note, report_id: reportId, binding_window_minutes: binding.window!.minutes }));
+  }
+
+  /** Explicitly clear an exhausted report. Its synthetic observations remain
+   * auditable, but are excluded from all current reads so a manual recovery
+   * genuinely reopens dispatch rather than leaving a false 100% window. */
+  recoverExhausted(meterId: string, note: string | null, now = new Date()): boolean {
+    const state = this.exhaustedState(meterId);
+    if (!state || state.active === false) return false;
+    const current = this.latestPerWindow(meterId).find((row) => row.metadata?.exhausted && !row.metadata.exhausted_ignored);
+    this.ignoreExhaustedRows(meterId, state.report_id);
+    this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ ...state, active: false, cleared_at: now.toISOString(), cleared_note: note }));
+    if (current) this.addEvent("exhausted_cleared", "inferred", 1, [current.id], current, note ?? "exhausted report cleared by operator", null, now.toISOString());
+    return true;
+  }
+
+  private exhaustedState(meterId: string): { active?: boolean; until?: string | null; note?: string | null; report_id?: string; binding_window_minutes?: number } | undefined {
+    const raw = this.daemonState(`exhausted:${meterId}`);
+    if (!raw) return undefined;
+    try { return JSON.parse(raw) as { active?: boolean; until?: string | null; note?: string | null; report_id?: string; binding_window_minutes?: number }; }
+    catch { return undefined; }
+  }
+
+  private ignoreExhaustedRows(meterId: string, reportId?: string): void {
+    const rows = this.db.prepare("SELECT id, metadata_json FROM observations WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1").all(meterId);
+    for (const row of rows) {
+      const metadata = parseJson<Observation["metadata"]>(row.metadata_json, undefined);
+      // Legacy reports had no id. They are safe to clear as a group because a
+      // meter can only have one active exhausted marker at a time.
+      if (reportId && metadata?.exhausted_report_id && metadata.exhausted_report_id !== reportId) continue;
+      this.db.prepare("UPDATE observations SET metadata_json = ? WHERE id = ?").run(JSON.stringify({ ...metadata, exhausted_ignored: true }), row.id);
+    }
+  }
+
+  private clearExhaustedFromVendor(current: StoredObservation): void {
+    const state = this.exhaustedState(current.meter_id);
+    if (!state || state.active === false || current.freshness !== "fresh" || current.quantity?.unit !== "percent" || !(current.quantity.used < 100)) return;
+    if (state.binding_window_minutes !== current.window?.minutes || !state.until || !current.resets_at) return;
+    const reportedReset = Date.parse(state.until);
+    const vendorReset = Date.parse(current.resets_at);
+    if (!Number.isFinite(reportedReset) || !Number.isFinite(vendorReset) || reportedReset === vendorReset) return;
+    this.ignoreExhaustedRows(current.meter_id, state.report_id);
+    this.setDaemonState(`exhausted:${current.meter_id}`, JSON.stringify({ ...state, active: false, cleared_at: current.fetched_at, cleared_by: "vendor" }));
+    this.addEvent("exhausted_cleared", "vendor_reported", 1, [current.id], current, "fresh vendor reading superseded exhausted report", null, current.fetched_at);
   }
 
   dispatchBlockForMeter(meterId: string, now = new Date()): string | undefined {
-    const raw = this.daemonState(`exhausted:${meterId}`);
-    if (!raw) return undefined;
-    try {
-      const state = JSON.parse(raw) as { until?: string | null };
-      if (!state.until || Date.parse(state.until) > now.getTime()) return `vendor reports the limit reached${state.until ? `; resets ${state.until}` : ""}`;
+    const state = this.exhaustedState(meterId);
+    if (!state) return this.daemonState(`exhausted:${meterId}`) ? "vendor reports the limit reached" : undefined;
+    if (state.active === false) return undefined;
+    const until = state.until ? Date.parse(state.until) : Number.NaN;
+    if (Number.isFinite(until) && until <= now.getTime()) {
+      this.ignoreExhaustedRows(meterId, state.report_id);
+      this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ ...state, active: false, expired_at: now.toISOString() }));
       return undefined;
-    } catch { return "vendor reports the limit reached"; }
+    }
+    return `vendor reports the limit reached${state.until ? `; resets ${state.until}` : ""}`;
   }
 
   dispatchBlockForPrincipal(principal: string): string | undefined {
@@ -985,7 +1072,9 @@ export class HeadroomStore {
    * still the same current 5h allowance.
    */
   latestPerWindow(meterId?: string): StoredObservation[] {
-    const filter = meterId === undefined ? "" : "WHERE meter_id = ?";
+    const filter = meterId === undefined
+      ? "WHERE COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0"
+      : "WHERE meter_id = ? AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0";
     return this.db.prepare(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')

@@ -332,9 +332,31 @@ function vendorLimitSeen(text: string): boolean {
   return /You've hit your usage limit|\brate limit\b|usage limit reached|HEADROOM_EXHAUSTED_UNTIL=/i.test(text);
 }
 
+/** A child can print its own usage-limit documentation or echo a prompt that
+ * happens to contain these words. Treat a match as evidence only when the
+ * command failed, and then only from stderr or the final output lines where a
+ * CLI conventionally prints its terminal error. */
+export function vendorLimitEvidence(exitCode: number, stdout: string, stderr: string): string | undefined {
+  if (exitCode === 0) return undefined;
+  if (vendorLimitSeen(stderr)) return stderr;
+  const tail = stdout.trimEnd().split(/\r?\n/).slice(-12).join("\n");
+  return vendorLimitSeen(tail) ? tail : undefined;
+}
+
 async function report(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
-  if (!meter || !argv.includes("--exhausted")) throw new Error("Usage: headroom report --meter <meter_id> --exhausted [--until <iso or vendor date>] [--note <text>]");
+  const exhausted = argv.includes("--exhausted");
+  const recovered = argv.includes("--recovered");
+  if (!meter || exhausted === recovered) throw new Error("Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]");
+  if (recovered && option(argv, "--until")) throw new Error("--until only applies to --exhausted");
+  if (recovered) {
+    const store = await HeadroomStore.open();
+    let cleared: boolean;
+    try { cleared = store.recoverExhausted(meter, option(argv, "--note") ?? null); store.audit("cli", "report_recovered", meter, cleared ? "ok" : "already_clear"); }
+    finally { store.close(); }
+    console.log(cleared ? `${meter} exhausted report cleared` : `${meter} has no active exhausted report`);
+    return 0;
+  }
   const rawUntil = option(argv, "--until");
   const until = rawUntil && Number.isFinite(Date.parse(rawUntil)) ? new Date(rawUntil).toISOString() : rawUntil ? (() => { throw new Error("--until must be an ISO timestamp or a vendor date"); })() : null;
   const store = await HeadroomStore.open();
@@ -390,9 +412,10 @@ async function run(argv: string[]): Promise<number> {
     if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: lease.id })));
   } finally { store.close(); }
   const child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env });
-  let transcript = "";
-  child.stdout.on("data", (chunk: Buffer) => { const text = chunk.toString(); transcript += text; process.stdout.write(text); });
-  child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); transcript += text; process.stderr.write(text); });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { const text = chunk.toString(); stdout += text; process.stdout.write(text); });
+  child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); stderr += text; process.stderr.write(text); });
   const forward = (signal: NodeJS.Signals): void => { if (!child.killed) child.kill(signal); };
   const onInt = (): void => forward("SIGINT"); const onTerm = (): void => forward("SIGTERM");
   process.once("SIGINT", onInt); process.once("SIGTERM", onTerm);
@@ -401,7 +424,8 @@ async function run(argv: string[]): Promise<number> {
   const ending = await HeadroomStore.open();
   try {
     if (lease) ending.endLease(lease.id, owner, true);
-    if (vendorLimitSeen(transcript)) ending.reportExhausted(lease?.meter_id ?? meter!, vendorResetFromOutput(transcript), "vendor reports the limit reached");
+    const evidence = vendorLimitEvidence(code, stdout, stderr);
+    if (evidence) ending.reportExhausted(lease?.meter_id ?? meter!, vendorResetFromOutput(evidence), "vendor reports the limit reached");
   } finally { ending.close(); }
   return code;
 }
@@ -1207,7 +1231,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
   ["run", "Gate, lease, and launch one command as an atomic dispatch"],
-  ["report", "Record a vendor-reported exhausted meter"],
+  ["report", "Record or clear a vendor-reported exhausted meter"],
   ["ack plan", "Acknowledge a principal plan downgrade before dispatching again"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
@@ -1257,7 +1281,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   ].join("\n"),
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
-  report: "Usage: headroom report --meter <meter_id> --exhausted [--until <iso or vendor date>] [--note <text>]",
+  report: "Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]",
   ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
