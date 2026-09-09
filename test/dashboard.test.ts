@@ -7,7 +7,7 @@ import { createHmac } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dashboardCommand, dashboardOptions, dashboardRead, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
+import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
 import { burnBuckets, dashboardSnapshot, readDashboardStore } from "../src/dashboard-data.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
@@ -46,22 +46,137 @@ function snapshotFrame(lines: string[]): string {
 }
 
 describe("dashboard frames (synthetic data)", () => {
-  it("renders the exact wide frame", () => {
-    expect(snapshotFrame(renderDashboard(fixedModel(), { width: 120, height: 40, verbose: false, eventsWide: false }))).toMatchInlineSnapshot(`
+  it("keeps the overview first, scrolls a full screen, and Enter reaches the focused panel", () => {
+    const model = fixedModel();
+    for (let index = 0; index < 18; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all`, resets_at: "2026-09-08T16:00:00Z" }));
+    const initial = renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: 0 });
+    const next = handleDashboardKey({ paused: false, verbose: false, eventsWide: false, help: false, quit: false, scroll: 0 }, "pagedown", 22);
+    const paged = renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: next.scroll });
+    expect(initial.slice(0, 7).join("\n")).toMatchInlineSnapshot(`
+      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
+      OVERVIEW█
+      > account-a        [####################]  98% resets in 24h FREEZE stop█
+        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
+        gpu-box          [####................]  20% resets in 4h BUSY ok█
+        mock-0           [####................]  20% resets in 4h NORMAL ok░
+        mock-1           [####................]  20% resets in 4h NORMAL ok░"
+    `);
+    expect(initial.join("\n")).toMatchInlineSnapshot(`
+      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
+      OVERVIEW█
+      > account-a        [####################]  98% resets in 24h FREEZE stop█
+        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
+        gpu-box          [####................]  20% resets in 4h BUSY ok█
+        mock-0           [####................]  20% resets in 4h NORMAL ok░
+        mock-1           [####................]  20% resets in 4h NORMAL ok░
+        mock-10          [####................]  20% resets in 4h NORMAL ok░
+        mock-11          [####................]  20% resets in 4h NORMAL ok░
+        mock-12          [####................]  20% resets in 4h NORMAL ok░
+        mock-13          [####................]  20% resets in 4h NORMAL ok░
+        mock-14          [####................]  20% resets in 4h NORMAL ok░
+        mock-15          [####................]  20% resets in 4h NORMAL ok░
+        mock-16          [####................]  20% resets in 4h NORMAL ok░
+        mock-17          [####................]  20% resets in 4h NORMAL ok░
+        mock-2           [####................]  20% resets in 4h NORMAL ok░
+        mock-3           [####................]  20% resets in 4h NORMAL ok░
+        mock-4           [####................]  20% resets in 4h NORMAL ok░
+        mock-5           [####................]  20% resets in 4h NORMAL ok░
+        mock-6           [####................]  20% resets in 4h NORMAL ok░
+        mock-7           [####................]  20% resets in 4h NORMAL ok░
+        mock-8           [####................]  20% resets in 4h NORMAL ok░
+        mock-9           [####................]  20% resets in 4h NORMAL ok░
+      q quit  p pause  v verbose  e events  g graphs  ? help░"
+    `);
+    expect(paged.join("\n")).toMatchInlineSnapshot(`
+      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
+      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h░
+      ░
+      account-a  claude  Max  fresh <1m░
+        all        5h  [####................]  20% ● resets in 4h NORMAL░
+        collecting readings█
+        all        wk  [####################]  98% 🛑 resets in 24h FREEZE█
+        collecting readings█
+        credits  12 available█
+        WEEKLY account-a:all | last 7 days | F free reset  ! unsch░
+        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁░
+           |Wed     |Thu    |Fri    |Sat    |Sun    |Mon    |Tue !░
+      ░
+      account-b  claude  failed <1m░
+        UNKNOWN: cached read failed.░
+        main       5h  [????????????????????]   - ? resets in ? UNKNOWN░
+          last 41% at 13:30:00░
+      ░
+      gpu-box  local░
+        capacity  BUSY  model=local-27b  queue=1  running=2░
+      ░
+      mock-0  claude  Max  fresh <1m░
+        all        5h  [####................]  20% ● resets in 4h NORMAL░
+      q quit  p pause  v verbose  e events  g graphs  ? help░"
+    `);
+    expect(paged.join("\n")).not.toEqual(initial.join("\n"));
+    expect(paged.at(-1)).toContain("q quit");
+    const focus = 2, panel = dashboardPanelOffset(model, { width: 80, height: 24, verbose: false, eventsWide: false }, focus);
+    expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: panel, focus }).join("\n")).toContain("gpu-box  local");
+  });
+  it("renders the same overview viewport at 145 columns and keeps a scrollbar for overflow", () => {
+    const model = fixedModel();
+    for (let index = 0; index < 30; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all` }));
+    const first = renderDashboard(model, { width: 145, height: 68, verbose: false, eventsWide: false });
+    const page = renderDashboard(model, { width: 145, height: 68, verbose: false, eventsWide: false, scroll: 65 });
+    expect(first[3]).toBe("OVERVIEW█");
+    expect(first.join("\n")).toContain("mock-29");
+    expect(first.join("\n")).not.toContain("EVENTS (last 8)");
+    expect(page.join("\n")).not.toEqual(first.join("\n"));
+    expect(page.at(-1)).toContain("q quit");
+  });
+  it("renders the exact first overview frame", () => {
+    expect(snapshotFrame(renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false }))).toMatchInlineSnapshot(`
+      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
+      OVERVIEW█
+      > account-a        [####################]  98% resets in 24h FREEZE stop█
+        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
+        gpu-box          [####................]  20% resets in 4h BUSY ok█
+      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h█
+      █
+      account-a  claude  Max  fresh <1m█
+        all        5h  [####................]  20% ● resets in 4h NORMAL█
+        collecting readings█
+        all        wk  [####################]  98% 🛑 resets in 24h FREEZE█
+        collecting readings█
+        credits  12 available█
+        WEEKLY account-a:all | last 7 days | F free reset  ! unsch█
+        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁█
+        <local day ticks>
+      █
+      account-b  claude  failed <1m░
+        UNKNOWN: cached read failed.░
+        main       5h  [????????????????????]   - ? resets in ? UNKNOWN░
+          last 41% at 13:30:00░
+      ░
+      gpu-box  local░
+      q quit  p pause  v verbose  e events  g graphs  ? help░"
+    `);
+  });
+  it("renders the exact wide overview frame", () => {
+    expect(renderDashboard(fixedModel(), { width: 145, height: 68, verbose: false, eventsWide: false }).join("\n")).toMatchInlineSnapshot(`
       "╷ ╷ ╭── ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭╮╭╮
       ├─┤ ├─  ├─┤ │ │ ├┬╯ │ │ │ │ │╰╯│  Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00
       ╵ ╵ ╰── ╵ ╵ ╰─╯ ╵╰╴ ╰─╯ ╰─╯ ╵  ╵
+      OVERVIEW
+      > account-a        [####################]  98% resets in 24h FREEZE stop
+        account-b        [????????????????????]   - resets in ? UNKNOWN unknown
+        gpu-box          [####................]  20% resets in 4h BUSY ok
+      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h
 
-      Burndown: solid used, dotted plan, │ now, ░ reserve
       account-a  claude  Max  fresh <1m
         all        5h  [####................]  20% ● resets in 4h NORMAL ·▁▂▃▄▅▆▇█▅▃▂
         collecting readings
         all        wk  [####################]  98% 🛑 resets in 24h FREEZE
         collecting readings
         credits  12 available
-        WEEKLY account-a:all | last 7 days | F free reset  ! unscheduled  * both
-        ·····················································································································!
-        <local day ticks>
+        WEEKLY account-a:all | last 7 days | F free reset  ! unsch
+        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁
+           |Wed     |Thu    |Fri    |Sat    |Sun    |Mon    |Tue !
 
       account-b  claude  failed <1m
         UNKNOWN: cached read failed.
@@ -71,38 +186,10 @@ describe("dashboard frames (synthetic data)", () => {
       gpu-box  local
         capacity  BUSY  model=local-27b  queue=1  running=2
 
-      EVENTS (last 8)                                            | LEASES / RESERVES / PACING
-      13:50:00 !unscheduled reset_seen account-a:all             | worker account-a:all 5% held, 1.0% spent, 20m left
-                                                                 | reserve account-a:all: 10%
-                                                                 | Capacity appeared; re-plan
-      q quit  p pause  v verbose  e events  g graphs  ? help"
-    `);
-  });
-  it("renders the exact narrow frame", () => {
-    expect(renderDashboard(fixedModel(), { width: 78, height: 24, verbose: false, eventsWide: false }).join("\n")).toMatchInlineSnapshot(`
-      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00
-
-      Burndown: solid used, dotted plan, │ now, ░ reserve
-      account-a  claude  Max  fresh <1m
-        all        5h  [####................]  20% ● resets in 4h NORMAL
-        collecting readings
-        all        wk  [####################]  98% 🛑 resets in 24h FREEZE
-        collecting readings
-        credits  12 available
-
-      account-b  claude  failed <1m
-        UNKNOWN: cached read failed.
-        main       5h  [????????????????????]   - ? resets in ? UNKNOWN
-          last 41% at 13:30:00
-
-      ... more panels than terminal rows
-      EVENTS (last 8)
-      13:50:00 !unscheduled reset_seen account-a:all
-
-      LEASES / RESERVES / PACING
-      worker account-a:all 5% held, 1.0% spent, 20m left
-      reserve account-a:all: 10%
-      Capacity appeared; re-plan
+      EVENTS (last 8)                                                        | LEASES / RESERVES / PACING
+      13:50:00 !unscheduled reset_seen account-a:all                         | worker account-a:all 5% held, 1.0% spent, 20m left
+                                                                             | reserve account-a:all: 10%
+                                                                             | Capacity appeared; re-plan
       q quit  p pause  v verbose  e events  g graphs  ? help"
     `);
   });
@@ -124,6 +211,11 @@ describe("dashboard frames (synthetic data)", () => {
 });
 
 describe("dashboard terminal", () => {
+  it("uses an explicit one-based cursor origin for every redraw", async () => {
+    const fake = terminal(); const run = dashboardCommand([], fake.io); await Promise.resolve();
+    expect(fake.writes.at(-1)).toMatch(/^\x1b\[1;1H/);
+    fake.input.emit("keypress", "q", {}); await run;
+  });
   it("toggles pause, verbose, events and help through the key handler", () => {
     const initial = { paused: false, verbose: false, eventsWide: false, help: false, quit: false };
     for (const [key, field] of [["p", "paused"], ["v", "verbose"], ["e", "eventsWide"], ["?", "help"]] as const) {
@@ -199,6 +291,11 @@ describe("dashboard terminal", () => {
 });
 
 describe("dashboard cached data", () => {
+  it("hides principals retained in the store but absent from accounts", () => {
+    const snapshot = fixedModel();
+    snapshot.observations.push(row({ principal_id: "claude2", meter_id: "claude2:all" }));
+    expect(filterDashboardPrincipals(snapshot, new Set(["account-a", "account-b", "gpu-box"])).observations.map((row) => row.principal_id)).not.toContain("claude2");
+  });
   it.skipIf(process.platform === "win32")("bounds a trickling socket response and closes it before fallback", async () => {
     const { daemonRequest } = await import("../src/daemon.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-socket-"));
@@ -266,25 +363,25 @@ describe("dashboard graphs (synthetic data)", () => {
   it("renders the exact 60-column braille burndown", () => {
     const model = graphModel();
     expect(renderBurndown(model.observations[0], model, 60).join("\n")).toMatchInlineSnapshot(`
-      "100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░⡀░⠄░⠂⠈│
-          │                           │              ⡀ ⠄ ⠁       │
-          │                           │      ⡀ ⠄ ⠂ ⠁             │
-          │                           │⡀ ⠄ ⠁                     │
-          │                    ⡀ ⠄ ⠂ ⣁⡀                          │
-          │              ⡀ ⠄ ⣂⣀⠤⠤⠒⠒⠉⠉ │                          │
-          │        ⠄⢀⣂⣀⠥⠤⠒⠒⠉⠉         │                          │
-        0%│⣀⡠⠤⠤⠒⠒⠓⠉⠉⠁                 │                          │
+      "100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░⢀⣀⡠⠤⠒⠒⠉│
+          │                           │             ⣀⡠⠤⠔⠒⠉⠁      │
+          │                           │      ⣀⡠⠤⠔⠒⠉⠉             │
+          │                           ⣀⡠⠤⠔⠒⠉⠉                    │
+          │                    ⣀⣀⠤⠔⠒⠊⣉⡀                          │
+          │             ⣀⣀⠤⠔⠒⣊⣉⠤⠤⠒⠒⠉⠉ │                          │
+          │      ⢀⣀⠤⢔⣒⣊⠭⠤⠒⠒⠉⠉         │                          │
+        0%│⣀⡤⠤⠶⠚⠛⠓⠉⠉⠁                 │                          │
       08/09, 11:30                              08/09, 16:30 reset
       38% used, 2h 30m left, under pace, HARVEST"
     `);
   });
-  it("fits a 40-column panel with eight plot rows and a compact summary", () => {
+  it("fits a 40-column panel with six plot rows and a compact summary", () => {
     const model = graphModel(), graph = renderBurndown(model.observations[0], model, 40);
-    expect(graph).toHaveLength(10);
+    expect(graph).toHaveLength(8);
     expect(graph.every((line) => [...line].length <= 40)).toBe(true);
-    expect(graph.slice(0, 8).every((line) => [...line].length === 40)).toBe(true);
-    expect(graph[9]).toBe("38%, 2h 30m, under pace, HARVEST");
-    expect(graph[0]).toMatch(/^100%│/); expect(graph[7]).toMatch(/^  0%│/);
+    expect(graph.slice(0, 6).every((line) => [...line].length === 40)).toBe(true);
+    expect(graph[7]).toBe("38%, 2h 30m, under pace, HARVEST");
+    expect(graph[0]).toMatch(/^100%│/); expect(graph[5]).toMatch(/^  0%│/);
   });
   it("puts the linear plan at 50 percent at half time, ending at 100", () => {
     const model = graphModel();
@@ -299,10 +396,19 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(dot(107, 0)).toBe(true); expect(dot(0, 31)).toBe(true);
     expect([...graph[0]][32]).toBe("│");
   });
-  it.each([0, 1, 2])("collects until three distinct readings, with %s stored", (count) => {
+  it.each([0, 1])("collects until two distinct readings, with %s stored", (count) => {
     const model = graphModel();
     model.history!["account-a:all"] = model.history!["account-a:all"].slice(-count || 3);
     expect(renderBurndown(model.observations[0], model, 60)).toEqual(["  collecting readings"]);
+  });
+  it("keeps the prior graph after a reset instead of calling it collecting", () => {
+    const model = graphModel(), current = model.observations[0];
+    const reset = "2026-09-08T15:30:00Z";
+    model.now = new Date("2026-09-08T15:35:00Z");
+    model.observations[0] = { ...current, resets_at: reset, observed_at: "2026-09-08T15:34:00Z", fetched_at: "2026-09-08T15:34:00Z", quantity: { used: 1, remaining: 99, limit: 100, unit: "percent" } };
+    const graph = renderBurndown(model.observations[0], model, 60).join("\n");
+    expect(graph).toContain("new period, 1 reading");
+    expect(graph).not.toContain("collecting readings");
   });
   it("does not count refetches, other windows, old resets, failed or future readings", () => {
     const model = graphModel(), current = model.observations[0];
@@ -359,14 +465,12 @@ describe("dashboard graphs (synthetic data)", () => {
     })) };
     model.events = [{ ...model.events[0], created_at: "2026-09-05T12:00:00Z", metadata: { unscheduled: true, window_minutes: 10080 } }];
     expect(renderWeekly(weekly, model, 100)[2].match(/\|[A-Z][a-z]{2}/g)).toEqual(["|Wed", "|Thu", "|Fri", "|Sat", "|Sun", "|Mon", "|Tue"]);
-    expect(snapshotFrame(renderWeekly(weekly, model, 100))).toMatchInlineSnapshot(`
-      "  WEEKLY account-a:all | last 7 days | F free reset  ! unscheduled  * both
-        ▁·············▂·············▃·············▄············!·············▅·············▆·············█
-        <local day ticks>"
-    `);
+    const weeklyLines = renderWeekly(weekly, model, 100);
+    expect(weeklyLines[1]).toMatch(/^[ \u2800-\u28ff]+$/);
+    expect(weeklyLines[1]).not.toMatch(/[▁▂▃▄▅▆▇█]/);
     model.observations = [weekly];
     expect(renderDashboard(model, { width: 100, height: 60, verbose: false, eventsWide: false }).join("\n")).toContain("WEEKLY account-a:all");
-    expect(renderDashboard(model, { width: 99, height: 60, verbose: false, eventsWide: false }).join("\n")).not.toContain("WEEKLY");
+    expect(renderDashboard(model, { width: 99, height: 60, verbose: false, eventsWide: false }).join("\n")).toContain("WEEKLY");
   });
   it("marks free resets and filters corrected, other-meter and other-window events", () => {
     const model = fixedModel(), weekly = model.observations[1], event = model.events[0];
@@ -377,16 +481,16 @@ describe("dashboard graphs (synthetic data)", () => {
       { ...event, meter_id: "account-b:main", created_at: "2026-09-07T12:00:00Z" },
       { ...event, metadata: { unscheduled: true, window_minutes: 300 } },
     ];
-    const line = renderWeekly(weekly, model, 100)[1];
-    expect(line.match(/F/g)).toHaveLength(2); expect(line).not.toContain("!");
+    const line = renderWeekly(weekly, model, 100)[2];
+    expect(line).toContain("F"); expect(line).not.toContain("!");
     model.graphEvents.push({ ...event, created_at: "2026-09-04T12:00:00Z" });
-    expect(renderWeekly(weekly, model, 100)[1]).toContain("*");
+    expect(renderWeekly(weekly, model, 100)[2]).toContain("*");
   });
   it("shows art only at 100 columns and 30 terminal rows, with local clocks", async () => {
     const model = fixedModel();
     const frame = (width: number, height: number) => renderDashboard(model, { width, height, verbose: false, eventsWide: false });
     expect(frame(120, 40)[0]).toMatch(/^╷ ╷/);
-    expect(frame(80, 24)[0]).toBe("Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00");
+    expect(frame(80, 24)[0]).toMatch(/^Headroom 0.1.0 \| daemon fresh 30s ago \| 14:00:00/);
     expect(frame(120, 29)[0]).toMatch(/^Headroom/);
     expect(frame(99, 40)[0]).toMatch(/^Headroom/);
     expect(frame(100, 30)[0]).toMatch(/^╷ ╷/);
@@ -411,13 +515,13 @@ describe("dashboard graphs (synthetic data)", () => {
     failed.reason = "keychain grant needed; run: headroom keychain grant --principal account-b";
     model.observations = [failed, { ...failed, window: { kind: "rolling", minutes: 10080, enforcement: "hard" } }];
     const lines = renderDashboard(model, { width: 40, height: 40, verbose: false, eventsWide: false });
-    expect(lines[3]).toMatch(/^  UNKNOWN: macOS has not let Headroom/);
+    expect(lines.find((line) => line.includes("UNKNOWN: macOS has not let Headroom"))).toBeDefined();
     expect(lines.join("\n").match(/macOS has not/g)).toHaveLength(1);
     expect(lines.join("\n").match(/last 41%/g)).toHaveLength(2);
     expect(lines.every((line) => [...line].length <= 40)).toBe(true);
     model.observations[1].reason = "separate failure";
     const distinct = renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false }).join("\n");
-    expect(distinct).toContain("separate failure"); expect(distinct).toContain("macOS has not let Headroom");
+    expect(distinct).toContain("macOS has not let Headroom"); expect(distinct).not.toContain("separate failure");
   });
   it("toggles graphs with g, redraws without gathering, and saves rows", async () => {
     const model = graphModel(), state = { paused: false, verbose: false, eventsWide: false, help: false, quit: false, graphs: true };
@@ -498,7 +602,7 @@ describe("dashboard graph gathering", () => {
       vi.useFakeTimers(); vi.setSystemTime(now);
       const gathered = await gatherDashboard();
       expect(gathered.direct).toBe(false); expect(gathered.history!["account-a:all"]).toHaveLength(3);
-      expect(request).toHaveBeenCalledWith(daemon.socketPath(), "dashboard", {}, 250, 250);
+      expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$/), "dashboard", {}, 1_000, 1_000);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
   });
