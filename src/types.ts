@@ -91,6 +91,8 @@ export interface Observation {
      * that carries a real percent is never dropped just because the vendor
      * calls it inactive. */
     vendor_active?: boolean;
+    exhausted?: boolean;
+    retired?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the
@@ -133,7 +135,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed";
 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by
@@ -215,5 +217,5 @@ export interface HeadroomEvent {
    * right before the reset, for the notification text's "(was N%)". Absent
    * on every other event kind, so an older reader that has never heard of
    * this field keeps working unchanged. */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number } | null;
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; resets_at?: string } | null;
 }

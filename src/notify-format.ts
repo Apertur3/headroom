@@ -61,7 +61,21 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
       count == null ? `${principal} received a reset credit.` : `${principal} now has ${Math.round(count)}${expiry ? ` (expire ${expiry})` : ""}.`, "Use a credit when you need more capacity.");
     case "free_reset_used": return message("🎟️ Free reset used", `${name}${count == null ? " used a reset" : ` now has ${Math.round(count)} reset credits left`}.`, "Check the refreshed allowance before planning more work.");
     case "credits_changed": return message("🪙 Credits changed", count == null ? `${principal}'s credit balance changed.` : `${principal} now has ${Math.round(count)} reset credits.`, "Check the balance before using another credit.");
-    case "plan_changed": return message("📋 Plan changed", current?.metadata?.plan ? `${principal} is now on ${clean(current.metadata.plan)}${previous?.metadata?.plan ? ` (was ${clean(previous.metadata.plan)})` : ""}.` : `${principal}'s plan changed.`, "Check your new limits before planning work.");
+    case "plan_changed": {
+      if (event.metadata?.downgrade === undefined) return message("📋 Plan changed", current?.metadata?.plan ? `${principal} is now on ${clean(current.metadata.plan)}${previous?.metadata?.plan ? ` (was ${clean(previous.metadata.plan)})` : ""}.` : `${principal}'s plan changed.`, "Check your new limits before planning work.");
+      const from = typeof event.metadata?.from_plan === "string" ? clean(event.metadata.from_plan) : previous?.metadata?.plan ? clean(previous.metadata.plan) : "previous plan";
+      const to = typeof event.metadata?.to_plan === "string" ? clean(event.metadata.to_plan) : current?.metadata?.plan ? clean(current.metadata.plan) : "new plan";
+      const at = formatClockTime(new Date(event.created_at));
+      const downgrade = event.metadata?.downgrade === true;
+      return downgrade
+        ? message("📉 Plan changed", `${principal} plan changed: ${from} to ${to} at ${at}.`, `Allowances are now the ${to} plan's; dispatches are refused until you acknowledge with: headroom ack plan ${clean(event.principal_id ?? "unknown")}`)
+        : message("📈 Plan changed", `${principal} plan changed: ${from} to ${to} at ${at}.`, "Allowances may have increased; check the new limits before planning work.");
+    }
+    case "exhausted_reported": {
+      const reset = dateText(current?.resets_at ?? (typeof event.metadata?.resets_at === "string" ? event.metadata.resets_at : undefined));
+      return `🛑 ${name} reports its limit reached${reset ? `; resets ${reset}` : ""}. Dispatches to ${name} are refused until then.`;
+    }
+    case "window_retired": return message("🧹 Window retired", `${meter} is no longer reported by the vendor.`, "It no longer participates in dispatch decisions.");
     case "source_failed": {
       const duration = Math.max(0, Math.floor((Date.parse(event.last_seen_at ?? event.created_at) - Date.parse(event.created_at)) / 60_000));
       const reason = clean(event.reason ?? current?.reason ?? "");
