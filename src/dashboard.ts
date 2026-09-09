@@ -10,7 +10,7 @@ import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatResetsIn, resetsIn } from "./resets.js";
 import { safeError } from "./security.js";
-import { explainUnknown, formatRatePercent, label, renderStatus, statusViewOptions } from "./status-view.js";
+import { explainUnknown, formatRatePercent, label, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
 import { isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
 
 export interface DashboardModel extends CachedDashboardModel {
@@ -256,6 +256,8 @@ export function renderDashboard(model: DashboardModel, options: DashboardView): 
   const lines = width >= 100 && (view.terminalHeight ?? height) >= 30
     ? ["╷ ╷ ╭── ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭╮╭╮", `├─┤ ├─  ├─┤ │ │ ├┬╯ │ │ │ │ │╰╯│  ${title}`, "╵ ╵ ╰── ╵ ╵ ╰─╯ ╵╰╴ ╰─╯ ╰─╯ ╵  ╵", ""]
     : [title, ""];
+  const downgrades = model.planDowngraded ?? [];
+  lines.unshift(...downgrades.map(planDowngradeLine), ...(downgrades.length ? [""] : []));
   if (view.graphs !== false && model.observations.some((row) => hasBurndown(row, model))) lines.push(clip(`Burndown: solid used, dotted plan, ${view.ascii ? "|" : "│"} now, ${view.ascii ? ":" : "░"} reserve`, width));
   const principals = [...new Set(model.observations.map((row) => row.principal_id))].sort();
   for (const principal of principals) {
@@ -321,6 +323,7 @@ export function dashboardOptions(argv: string[], isTTY: boolean, environment: No
 function paint(lines: string[], color: boolean): string[] {
   if (!color) return lines;
   return lines.map((line) => {
+    if (line.startsWith("PLAN DOWNGRADED:")) return `\x1b[31m${line}\x1b[0m`;
     const state = /\b(NORMAL|HARVEST|CONSERVE|FREEZE|UNKNOWN|UP|BUSY|DOWN)\b/.exec(line)?.[1];
     const code = state === "UNKNOWN" ? 90 : state === "FREEZE" || state === "DOWN" ? 31 : state === "CONSERVE" || state === "BUSY" ? 33 : 32;
     if (!state) return line;

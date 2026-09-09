@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
-import { eventText, thresholdText } from "./notify-format.js";
+import { eventText, planDowngradeText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
 import { HeadroomStore } from "./store.js";
 import type { EventKind, HeadroomEvent, NotifyDelivery } from "./types.js";
@@ -471,7 +471,7 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
 
 /** Overrides for a reset category take precedence over the reset_seen umbrella. */
 export function wantsEvent(event: HeadroomEvent, config: NotifyConfig): boolean {
-  if (event.kind === "plan_changed" || event.kind === "exhausted_reported") return true;
+  if (event.kind === "plan_changed" || event.kind === "exhausted_reported" || event.metadata?.credit_spent_on_free_plan === true) return true;
   if (event.kind !== "reset_seen") return config.events.includes(event.kind);
   const category = event.metadata?.unscheduled ? "reset_unscheduled"
     : event.metadata?.window_minutes === 300 ? "reset_scheduled_short"
@@ -515,6 +515,24 @@ function collectItems(store: HeadroomStore, config: NotifyConfig, since: string)
   return items;
 }
 
+function downgradeReminderItems(store: HeadroomStore, now: Date): NotifyItem[] {
+  return store.planDowngrades().flatMap((downgrade) => {
+    if (downgrade.acknowledged || now.getTime() < Date.parse(downgrade.since) + 24 * 3_600_000) return [];
+    return [{
+      id: `plan_downgrade_reminder:${downgrade.principal}:${downgrade.since}`,
+      kind: "plan_downgrade_reminder", meter: `${downgrade.principal}:main`, principal: downgrade.principal, at: now.toISOString(),
+      text: planDowngradeText(downgrade.principal, downgrade.from, downgrade.to, downgrade.since, true),
+    }];
+  });
+}
+
+function bypassesQuietHours(item: NotifyItem): boolean {
+  return item.kind === "plan_changed" && item.text.startsWith("🚨 PLAN DOWNGRADED:")
+    || item.kind === "plan_changed" && item.text.startsWith("📈 plan restored")
+    || item.kind === "plan_downgrade_reminder"
+    || item.kind === "free_reset_used" && item.text === "🚨 A reset credit was just spent on the free plan";
+}
+
 async function logDisabledOnce(store: HeadroomStore, log: (message: string) => Promise<void>, channel: ChannelStatus): Promise<void> {
   const key = `notify_disabled:${channel.channel}`;
   if (store.daemonState(key) === channel.detail) return;
@@ -526,12 +544,11 @@ async function logDisabledOnce(store: HeadroomStore, log: (message: string) => P
  * event for a webhook), then marks the rows. A failure costs every row in the
  * batch one attempt and is logged on the first failure and on the give-up,
  * never once per poll for as long as the outage lasts. */
-async function flushChannel(store: HeadroomStore, channel: PreparedChannel, log: (message: string) => Promise<void>, now: Date): Promise<number> {
-  const rows = store.notifyPending(channel.channel, MAX_ATTEMPTS);
+async function flushChannel(store: HeadroomStore, channel: PreparedChannel, log: (message: string) => Promise<void>, now: Date, rows = store.notifyPending(channel.channel, MAX_ATTEMPTS), quiet = store.daemonState(`notify_quiet:${channel.channel}`) === "true"): Promise<number> {
   if (!rows.length) return 0;
   const ids = rows.map((row) => row.id);
   try {
-    await channel.deliver(rows.map(decodeItem), store.daemonState(`notify_quiet:${channel.channel}`) === "true");
+    await channel.deliver(rows.map(decodeItem), quiet);
     store.setDaemonState(`notify_quiet:${channel.channel}`, "false");
     store.notifyDelivered(ids, now.toISOString());
     return rows.length;
@@ -587,12 +604,17 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   const status = channels.map(({ channel, ready: isReady, detail }) => ({ channel, ready: isReady, detail }));
   if (!ready.length) return { configured: true, queued: 0, sent: 0, quiet: false, channels: status };
   const watermark = store.daemonState(WATERMARK_KEY);
-  const items = watermark === undefined ? [] : collectItems(store, config, watermark);
+  const items = watermark === undefined ? [] : [...collectItems(store, config, watermark), ...downgradeReminderItems(store, now)];
   store.setDaemonState(WATERMARK_KEY, now.toISOString());
   for (const item of items) for (const channel of ready) store.notifyEnqueue(item.id, channel.channel, encodeItem(item), now.toISOString());
   if (inQuietHours(config, now)) {
-    for (const channel of ready) if (items.length) store.setDaemonState(`notify_quiet:${channel.channel}`, "true");
-    return { configured: true, queued: items.length, sent: 0, quiet: true, channels: status };
+    let sent = 0;
+    for (const channel of ready) {
+      const urgent = store.notifyPending(channel.channel, MAX_ATTEMPTS).filter((row) => bypassesQuietHours(decodeItem(row)));
+      sent += await flushChannel(store, channel, log, now, urgent, false);
+      if (store.notifyPending(channel.channel, MAX_ATTEMPTS).length) store.setDaemonState(`notify_quiet:${channel.channel}`, "true");
+    }
+    return { configured: true, queued: items.length, sent, quiet: true, channels: status };
   }
   let sent = 0;
   for (const channel of ready) sent += await flushChannel(store, channel, log, now);

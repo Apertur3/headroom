@@ -217,5 +217,5 @@ export interface HeadroomEvent {
    * right before the reset, for the notification text's "(was N%)". Absent
    * on every other event kind, so an older reader that has never heard of
    * this field keeps working unchanged. */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; resets_at?: string } | null;
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string } | null;
 }

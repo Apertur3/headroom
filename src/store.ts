@@ -132,6 +132,14 @@ function notifyFromRow(row: Row): NotifyDelivery {
   return { id: Number(row.id), event_id: String(row.event_id), channel: String(row.channel), status: row.status as NotifyDelivery["status"], attempts: Number(row.attempts), text: String(row.text), detail: string(row.detail), created_at: String(row.created_at), updated_at: String(row.updated_at) };
 }
 
+export interface PlanDowngrade {
+  principal: string;
+  from: string;
+  to: string;
+  since: string;
+  acknowledged: boolean;
+}
+
 function leaseFromRow(row: Row): Lease {
   return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
 }
@@ -417,17 +425,40 @@ export class HeadroomStore {
   }
 
   dispatchBlockForPrincipal(principal: string): string | undefined {
-    const raw = this.daemonState(`plan_drop:${principal}`);
-    if (!raw) return undefined;
-    try { const state = JSON.parse(raw) as { acknowledged?: boolean; to?: string }; return state.acknowledged ? undefined : `plan changed to ${state.to ?? "a lower plan"}; acknowledge with: headroom ack plan ${principal}`; }
-    catch { return `plan changed; acknowledge with: headroom ack plan ${principal}`; }
+    const downgrade = this.planDowngrade(principal);
+    if (!downgrade) return undefined;
+    return downgrade.acknowledged ? undefined : `plan downgraded to ${downgrade.to}; dispatches are refused until you run: headroom ack plan ${principal}`;
   }
 
   acknowledgePlan(principal: string): void {
     const raw = this.daemonState(`plan_drop:${principal}`);
     if (!raw) return;
-    const state = JSON.parse(raw) as Record<string, unknown>;
-    this.setDaemonState(`plan_drop:${principal}`, JSON.stringify({ ...state, acknowledged: true }));
+    try {
+      const state = JSON.parse(raw) as Record<string, unknown>;
+      this.setDaemonState(`plan_drop:${principal}`, JSON.stringify({ ...state, acknowledged: true }));
+    } catch { /* A malformed legacy marker remains safely blocking. */ }
+  }
+
+  planDowngrade(principal: string): PlanDowngrade | undefined {
+    const state = this.planDropState(principal);
+    if (!state || state.active === false || typeof state.from !== "string" || typeof state.to !== "string" || typeof state.at !== "string") return undefined;
+    return { principal, from: state.from, to: state.to, since: state.at, acknowledged: state.acknowledged === true };
+  }
+
+  private planDropState(principal: string): { from?: string; to?: string; at?: string; acknowledged?: boolean; active?: boolean; restored_at?: string } | undefined {
+    const raw = this.daemonState(`plan_drop:${principal}`);
+    if (!raw) return undefined;
+    try { return JSON.parse(raw) as { from?: string; to?: string; at?: string; acknowledged?: boolean; active?: boolean; restored_at?: string }; }
+    catch { return undefined; }
+  }
+
+  planDowngrades(principals?: Iterable<string>): PlanDowngrade[] {
+    const allowed = principals ? new Set(principals) : undefined;
+    return this.db.prepare("SELECT key FROM daemon_state WHERE key LIKE 'plan_drop:%'").all().flatMap((row) => {
+      const principal = String(row.key).slice("plan_drop:".length);
+      const downgrade = this.planDowngrade(principal);
+      return downgrade && (!allowed || allowed.has(principal)) ? [downgrade] : [];
+    }).sort((a, b) => a.principal.localeCompare(b.principal));
   }
 
   private previous(observation: Observation): StoredObservation | undefined {
@@ -896,7 +927,7 @@ export class HeadroomStore {
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
       if (currentCredits > previousCredits) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
-      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current);
+      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current, null, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
       if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.recordPlanChange(previous, current, evidence);
@@ -907,8 +938,21 @@ export class HeadroomStore {
     const to = current.metadata!.plan!;
     const downgrade = to === "free" && from !== "free";
     const main = current.meter_id.endsWith(":main") ? current : this.latestPerWindow(`${current.principal_id}:main`)[0] ?? current;
-    this.addEvent("plan_changed", "vendor_reported", 1, evidence.includes(main.id) ? evidence : [...evidence, main.id], main, null, null, undefined, { from_plan: from, to_plan: to, downgrade });
-    if (downgrade) this.setDaemonState(`plan_drop:${current.principal_id}`, JSON.stringify({ from, to, acknowledged: false, at: current.fetched_at }));
+    const state = this.planDropState(current.principal_id);
+    const prior = this.planDowngrade(current.principal_id);
+    if (downgrade) {
+      if (prior?.to === to) return;
+      this.addEvent("plan_changed", "vendor_reported", 1, evidence.includes(main.id) ? evidence : [...evidence, main.id], main, null, null, undefined, { from_plan: from, to_plan: to, downgrade: true });
+      this.setDaemonState(`plan_drop:${current.principal_id}`, JSON.stringify({ from, to, acknowledged: false, at: current.fetched_at, active: true }));
+      return;
+    }
+    if (prior) {
+      this.addEvent("plan_changed", "vendor_reported", 1, evidence.includes(main.id) ? evidence : [...evidence, main.id], main, null, null, undefined, { from_plan: prior.to, to_plan: to, restored: true });
+      this.setDaemonState(`plan_drop:${current.principal_id}`, JSON.stringify({ from: prior.from, to: prior.to, acknowledged: prior.acknowledged, at: prior.since, active: false, restored_at: current.fetched_at }));
+      return;
+    }
+    if (state?.active === false && state.restored_at === current.fetched_at) return;
+    this.addEvent("plan_changed", "vendor_reported", 1, evidence.includes(main.id) ? evidence : [...evidence, main.id], main, null, null, undefined, { from_plan: from, to_plan: to, downgrade: false });
   }
 
   /** Fetch a notification batch's original facts in one query. */

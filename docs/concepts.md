@@ -301,6 +301,15 @@ of record.
 Example: `codex-main` shows `reset seen 14:00 (inferred, 62%)` when usage drops sharply without a
 vendor-confirmed reset timestamp yet.
 
+### Plan downgrades
+
+When a vendor reports a paid principal changed to the free plan, Headroom records `plan_changed`,
+shows the downgrade in status and the dashboard, and refuses dispatches for that principal. This
+is not a normal capacity warning: do not spend a reset credit while the account is free. The
+refusal ends when the vendor reports a paid plan again, or after the human explicitly confirms an
+intended downgrade with `headroom ack plan <principal>`. Notifications send the initial downgrade
+immediately and one unacknowledged reminder after 24 hours.
+
 When that drop is first noticed across a gap of failed readings (a stretch of UNKNOWN rows
 between the last fresh sample and the next one), Headroom does not trust the raw delta the way it
 would for two readings taken back to back: a gap long enough to hide a scheduled reset always
