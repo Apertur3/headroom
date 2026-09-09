@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.14] - 2026-09-09
+
 ### Added
 - Urgent plan-downgrade alarms, dispatch refusal, restoration notices, and free-plan reset-credit warnings.
 
