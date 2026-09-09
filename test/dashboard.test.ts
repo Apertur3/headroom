@@ -602,7 +602,7 @@ describe("dashboard graph gathering", () => {
       vi.useFakeTimers(); vi.setSystemTime(now);
       const gathered = await gatherDashboard();
       expect(gathered.direct).toBe(false); expect(gathered.history!["account-a:all"]).toHaveLength(3);
-      expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$/), "dashboard", {}, 1_000, 1_000);
+      expect(request).toHaveBeenCalledWith(daemon.socketPath(), "dashboard", {}, 1_000, 1_000);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
   });
