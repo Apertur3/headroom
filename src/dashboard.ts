@@ -2,7 +2,7 @@ import { emitKeypressEvents } from "node:readline";
 import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
-import { dashboardSnapshot, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
+import { DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS, dashboardSnapshot, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
@@ -60,9 +60,9 @@ export async function gatherDashboard(): Promise<DashboardModel> {
   // same path here matters when HEADROOM_HOME itself is a filesystem alias.
   const home = await safeHeadroomDirectory();
   const [reply, policy, accounts, version] = await Promise.all([
-    // Dashboard snapshots can include a busy SQLite read. One second still
-    // keeps an interactive refresh snappy while avoiding a false fallback.
-    daemonRequest(socketPath(home), "dashboard", {}, 1_000, 1_000).catch(() => undefined),
+    // The probe needs to be quick, while the snapshot gets the full
+    // interactive budget for a brief SQLite handoff.
+    daemonRequest(socketPath(home), "dashboard", {}, DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS).catch(() => undefined),
     readPolicy(), readAccounts().catch(() => []), headroomVersion(),
   ]);
   const store = await HeadroomStore.open(home);
@@ -164,9 +164,11 @@ export function renderBurndown(row: Observation, model: DashboardModel, width: n
   let points = current;
   // A reset naturally leaves one fresh point in the new period. Keep the
   // useful previous line visible until this period has a second point.
-  const prior = [...new Set(all.map((point) => point.reset).filter((value) => Number.isFinite(value) && value !== reset))].sort((a, b) => b - a)[0];
-  const showingPrior = current.length < 2 && Number.isFinite(prior) && all.filter((point) => point.reset === prior).length >= 2;
+  const prior = [...new Set(all.map((point) => point.reset).filter((value) => Number.isFinite(value) && value !== reset))]
+    .sort((a, b) => b - a).find((value) => all.filter((point) => point.reset === value).length >= 2);
+  const showingPrior = current.length < 2 && prior !== undefined;
   if (showingPrior) { graphReset = prior; points = all.filter((point) => point.reset === prior); }
+  if (current.length < 2 && all.length >= 2 && !showingPrior) return [clip(`  new period, ${current.length} reading${current.length === 1 ? "" : "s"} so far`, width)];
   const start = row.window?.minutes ? graphReset - row.window.minutes * 60_000 : points[0]?.at;
   points = points.filter((point) => point.at >= start && point.at <= graphReset);
   if (width < 12 || !Number.isFinite(start) || !Number.isFinite(graphReset) || graphReset <= start || all.length < 2 || points.length < 2) return [clip("  collecting readings", width)];
@@ -220,7 +222,7 @@ export function renderBurndown(row: Observation, model: DashboardModel, width: n
   const minutes = Math.max(0, Math.floor((reset - model.now.getTime()) / 60_000));
   const summary = `${used === null ? "?" : Math.round(used)}% used, ${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m left, ${pace}`;
   const compact = `${used === null ? "?" : Math.round(used)}%, ${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m, ${pace}`;
-  const period = showingPrior ? `new period, ${current.length} reading${current.length === 1 ? "" : "s"}` : "";
+  const period = showingPrior ? `new period, ${current.length} reading${current.length === 1 ? "" : "s"} so far` : "";
   return [...plot, axis, clip(period || (length(summary) <= width ? summary : compact), width)];
 }
 
@@ -269,8 +271,12 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
   const decision = paceDecision(row, model.policy, model.now);
   const meter = row.meter_id.startsWith(`${row.principal_id}:`) ? row.meter_id.slice(row.principal_id.length + 1) : row.meter_id;
   const key = `${row.meter_id}:${row.window?.minutes ?? "none"}`;
-  if (row.window?.kind === "state") return [`  ${meter}  ${row.metadata?.state ?? "DOWN"}  model=${row.metadata?.model_ids?.join(",") || "?"}  queue=${row.metadata?.waiting ?? 0}  running=${row.metadata?.running ?? row.quantity?.used ?? 0}${row.reason ? ` (${row.reason})` : ""}`];
-  if (row.quantity?.unit === "credits") return [`  credits  ${row.quantity.remaining ?? "?"} available${row.resets_at ? `, expires ${row.resets_at.slice(0, 10)}` : ""}`];
+  if (row.window?.kind === "state") {
+    const state = row.metadata?.state ?? "DOWN";
+    const status = state === "UP" ? "ok" : state === "BUSY" ? "busy" : "down";
+    return [`  ${row.principal_id}  ${state}  ${row.metadata?.model_ids?.join(",") || "?"}  ${row.metadata?.running ?? row.quantity?.used ?? 0} running, ${row.metadata?.waiting ?? 0} waiting  ${status}${row.reason && row.reason !== "down" ? ` (${row.reason})` : ""}`];
+  }
+  if (row.quantity?.unit === "credits") return [`  credits  ${row.quantity.remaining ?? "?"} available${creditExpiry(row.resets_at)}`];
   const unknown = decision.state === "UNKNOWN";
   const used = !unknown && row.quantity?.unit === "percent" ? row.quantity.used : null;
   const filled = used === null ? 0 : Math.round(Math.max(0, Math.min(100, used)) / 5);
@@ -306,12 +312,25 @@ function tightest(rows: Observation[], model: DashboardModel): Observation {
   })[0]!;
 }
 
+function creditExpiry(value: string | null | undefined): string {
+  if (!value || Number.isNaN(new Date(value).getTime())) return "";
+  return `, expire ${new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(value))}`;
+}
+
 function summaryLine(principal: string, rows: Observation[], model: DashboardModel, focused: boolean): string {
-  const row = tightest(rows, model), decision = paceDecision(row, model.policy, model.now), used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" ? Math.round(row.quantity.used) : null;
+  const row = tightest(rows, model);
+  const prefix = `${focused ? ">" : " "} ${clip(principal, 16).padEnd(16)}`;
+  if (row.window?.kind === "state") {
+    const state = row.metadata?.state ?? "DOWN";
+    const status = state === "UP" ? "ok" : state === "BUSY" ? "busy" : "down";
+    return `${prefix} ${state}  ${row.metadata?.model_ids?.[0] ?? "?"}  ${row.metadata?.running ?? row.quantity?.used ?? 0} running, ${row.metadata?.waiting ?? 0} waiting  ${status}`;
+  }
+  if (row.quantity?.unit === "credits") return `${prefix} ${row.quantity.remaining ?? "?"} available${creditExpiry(row.resets_at)}`;
+  const decision = paceDecision(row, model.policy, model.now), used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" ? Math.round(row.quantity.used) : null;
   const bar = used === null ? "?".repeat(20) : "#".repeat(Math.round(used / 5)) + ".".repeat(20 - Math.round(used / 5));
   const seconds = resetsIn(row.resets_at, model.now).resets_in_seconds;
   const status = decision.state === "FREEZE" ? "stop" : decision.state === "CONSERVE" ? "watch" : decision.state === "UNKNOWN" ? "unknown" : "ok";
-  return `${focused ? ">" : " "} ${clip(principal, 16).padEnd(16)} [${bar}] ${used === null ? "  -" : `${used}%`.padStart(4)} resets in ${seconds === null || decision.state === "UNKNOWN" ? "?" : formatResetsIn(seconds)} ${decision.state} ${status}`;
+  return `${prefix} [${bar}] ${used === null ? "  -" : `${used}%`.padStart(4)} resets in ${seconds === null || decision.state === "UNKNOWN" ? "?" : formatResetsIn(seconds)} ${decision.state} ${status}`;
 }
 
 function dashboardContent(model: DashboardModel, view: DashboardView): DashboardContent {
@@ -401,7 +420,7 @@ export function dashboardOptions(argv: string[], isTTY: boolean, environment: No
 
 function paint(lines: string[], color: boolean): string[] {
   if (!color) return lines;
-  return lines.map((line) => {
+  const painted = lines.map((line) => {
     if (line.startsWith("PLAN DOWNGRADED:")) return `\x1b[31m${line}\x1b[0m`;
     if (line.startsWith("  UNKNOWN:")) return `\x1b[2m${line}\x1b[0m`;
     const match = /(\[[#.?]{20}\]).*?\b(NORMAL|HARVEST|CONSERVE|FREEZE|UNKNOWN)\b/.exec(line);
@@ -410,6 +429,14 @@ function paint(lines: string[], color: boolean): string[] {
     if (!state) return line;
     return line.replace(/\[[#.?]{20}\]/, (bar) => `\x1b[${code}m${bar}\x1b[0m`).replace(new RegExp(`\\b${state}\\b`), `\x1b[${code}m${state}\x1b[0m`);
   });
+  for (let index = 0; index < painted.length; index++) {
+    if (!/^\s*new period, \d+ readings? so far[█░]?$/.test(lines[index])) continue;
+    for (let prior = index; prior >= 0; prior--) {
+      painted[prior] = `\x1b[2m${painted[prior]}\x1b[0m`;
+      if (/^100%(?:│|\|)/.test(lines[prior])) break;
+    }
+  }
+  return painted;
 }
 
 export interface DashboardIO {

@@ -1,7 +1,7 @@
 import { readPolicy } from "./config.js";
 import { withLastKnown, withPaceInfo } from "./pace.js";
 import { readAccounts } from "./registry.js";
-import { HeadroomStore } from "./store.js";
+import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import type { PlanDowngrade } from "./store.js";
 import { isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
 import type { Policy } from "./policy.js";
@@ -24,6 +24,10 @@ export interface DashboardModel extends DashboardSnapshot {
   policy: Policy;
   vendors: Map<string, string>;
 }
+
+/** Health is cheap; leave the interactive budget for the snapshot itself. */
+export const DASHBOARD_HEALTH_TIMEOUT_MS = 50;
+export const DASHBOARD_REQUEST_TIMEOUT_MS = 500;
 
 /** Twelve five-minute buckets. Drops and gaps are unknown, never negative burn. */
 export function burnBuckets(rows: Observation[], now: Date): Array<number | null> {
@@ -67,21 +71,32 @@ export interface DashboardReader {
   fallback: () => Promise<DashboardSnapshot>;
 }
 
+function isDashboardSnapshot(value: unknown): value is DashboardSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Partial<DashboardSnapshot>;
+  return Array.isArray(snapshot.observations) && Array.isArray(snapshot.events) && Array.isArray(snapshot.leases)
+    && Boolean(snapshot.burns) && Boolean(snapshot.resetSeen) && Array.isArray(snapshot.notices);
+}
+
 /** Old daemons reject the new method and use the same fallback as an absent socket. */
 export async function dashboardSnapshot(reader: DashboardReader): Promise<{ snapshot: DashboardSnapshot; direct: boolean }> {
-  const reply = await reader.request().catch(() => undefined) as { status?: string; result?: { result?: DashboardSnapshot; error?: unknown } } | undefined;
-  const snapshot = reply?.status === "available" && !reply.result?.error ? reply.result?.result : undefined;
-  if (snapshot && Array.isArray(snapshot.observations) && Array.isArray(snapshot.events) && Array.isArray(snapshot.leases) && snapshot.burns && snapshot.resetSeen && Array.isArray(snapshot.notices)) return { snapshot: { ...snapshot, planDowngraded: Array.isArray(snapshot.planDowngraded) ? snapshot.planDowngraded : [] }, direct: false };
+  const reply = await reader.request().catch(() => undefined) as { status?: string; result?: DashboardSnapshot | { result?: DashboardSnapshot; error?: unknown } } | undefined;
+  const result = reply?.result;
+  const snapshot = reply?.status === "available" && !(result && typeof result === "object" && "error" in result)
+    ? isDashboardSnapshot(result) ? result : isDashboardSnapshot(result?.result) ? result.result : undefined
+    : undefined;
+  if (snapshot) return { snapshot: { ...snapshot, planDowngraded: Array.isArray(snapshot.planDowngraded) ? snapshot.planDowngraded : [] }, direct: false };
   return { snapshot: await reader.fallback(), direct: true };
 }
 
-export async function gatherDashboard(): Promise<DashboardModel> {
+export async function gatherDashboard(home?: string): Promise<DashboardModel> {
   const { daemonRequest, socketPath } = await import("./daemon.js");
+  const directory = await safeHeadroomDirectory(home);
   const [{ snapshot, direct }, policy, accounts, version] = await Promise.all([
     dashboardSnapshot({
-      request: () => daemonRequest(socketPath(), "dashboard", {}, 250, 250),
+      request: () => daemonRequest(socketPath(directory), "dashboard", {}, DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS),
       fallback: async () => {
-        const store = await HeadroomStore.open();
+        const store = await HeadroomStore.open(directory);
         try { return readDashboardStore(store); } finally { store.close(); }
       },
     }),
