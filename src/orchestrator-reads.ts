@@ -8,7 +8,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { readRouting } from "./config.js";
-import { computeFill, computePlan, evaluateBurst, evaluateGate, evaluateProRataLine, fillClassFits, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
+import { computeFill, computePlan, evaluateBurst, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
 import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
@@ -113,13 +113,14 @@ export interface RateLine {
  * carries that owner's ledger-attributed share of the same lookback, so
  * "the meter is burning 22%/h" and "9%/h of that is mine" are read together
  * rather than from two separate commands. */
-export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date(), owner?: string): RateLine[] {
+export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date(), owner?: string, needWindow?: string): RateLine[] {
   const meterIds = meter ? [meter] : [...new Set(store.latestPerWindow().map((row) => row.meter_id))];
   const sinceIso = new Date(now.getTime() - lookbackMinutes * 60_000).toISOString();
   const lines: RateLine[] = [];
   for (const id of meterIds) {
     const rows = enforcedPercentWindows(store, id);
-    const targets = meter ? rows : rows.slice(0, 1);
+    const requestedMinutes = needWindow ? windowNeedMinutes(needWindow) : undefined;
+    const targets = (meter ? rows : rows.slice(0, 1)).filter((row) => requestedMinutes === undefined || row.window?.minutes === requestedMinutes);
     if (meter && !targets.length) {
       const reason = meterUnknownReason(store, id, "");
       if (reason) lines.push({ meter: id, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason });
@@ -158,21 +159,22 @@ export type PlanOutcome = PlanCore & { notices: string[] };
 /** `reserves` is policy.toml's `[reserve]` table: the plan line is drawn
  * above the larger of the caller's own reserve percent and this meter's
  * protected floor, so `plan` never budgets points `gate` would then refuse. */
-function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>): PlanCore {
+function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>, needWindow?: string): PlanCore {
   const { short, long } = meterWindows(store, meter);
-  if (!long || !long.resets_at) return { meter, error: meterUnknownReason(store, meter, `no weekly window for ${meter}`) };
+  const target = needWindow ? knownPercentWindows(store, meter).find((row) => row.window?.minutes === windowNeedMinutes(needWindow)) : long;
+  if (!target || !target.resets_at) return { meter, error: meterUnknownReason(store, meter, `no ${needWindow ?? "weekly"} window for ${meter}`) };
   // Fail closed on a stale, failed, or long-unpolled weekly reading exactly
   // like gateFor/fillFor do: the plan line is computed straight from
   // long.quantity.used, so an unusable reading there must never turn into a
   // confident-looking plan.
-  const freshness = freshnessGate(long, staleMinutes, now);
+  const freshness = freshnessGate(target, staleMinutes, now);
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
-  return { meter, ...computePlan(long.quantity!.used, long.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now) };
+  return { meter, ...computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now) };
 }
 
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}): PlanOutcome {
-  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves);
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}, needWindow?: string): PlanOutcome {
+  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves, needWindow);
   return { ...result, notices: unscheduledResetNotices(store, [meter], now) };
 }
 
@@ -224,11 +226,11 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
   const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
-  const need5h = needs.some((need) => need.window === "5h");
-  const needWk = needs.some((need) => need.window === "wk");
   let lastShort: StoredObservation | undefined;
   let lastResult: GateResult | undefined;
   for (const id of candidates) {
+    const blocked = store.dispatchBlockForMeter(id, now) ?? store.dispatchBlockForPrincipal(id.split(":")[0]);
+    if (blocked) return { allowed: false, reason: blocked, meters_checked: checked };
     const { short, long } = meterWindows(store, id);
     if (!short && !long) {
       // A meter with zero readings of ANY kind is treated the same as a
@@ -256,23 +258,33 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     // the same rule paceDecision applies before computing a pace state. A
     // vendor-confirmed not_enforced window is never rejected here;
     // evaluateGate below already skips its need instead of failing it.
-    if (need5h && short) {
-      const freshness = freshnessGate(short, staleMinutes, now);
-      if (!freshness.ok) return { allowed: false, reason: `5h ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
+    const reported = knownPercentWindows(store, id);
+    const notEnforced: string[] = [];
+    for (const need of needs) {
+      const minutes = windowNeedMinutes(need.window);
+      const label = minutes === undefined ? need.window : windowNeedLabel(minutes);
+      const row = reported.find((item) => item.window?.minutes === minutes);
+      if (!row) {
+        const available = reported.map((item) => windowNeedLabel(item.window!.minutes!)).join(", ") || "none";
+        return { allowed: false, reason: (need.window === "5h" || need.window === "wk") ? `${label} usage unknown` : `${label} usage unknown; vendor reports: ${available}`, meters_checked: checked, unknown: true };
+      }
+      if (row.freshness === "not_enforced") { notEnforced.push(label); continue; }
+      const freshness = freshnessGate(row, staleMinutes, now);
+      if (!freshness.ok) return { allowed: false, reason: `${label} ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
+      const used = row.quantity?.used;
+      if (used === undefined) return { allowed: false, reason: `${label} usage unknown`, meters_checked: checked, unknown: true };
+      const meterReserve = reserveFor(options.reserves ?? {}, id);
+      const reserve = Math.max(reservePercent, meterReserve);
+      if (used + need.points > 100 - reserve) {
+        const left = Math.max(0, 100 - reserve - used);
+        const reserveReason = meterReserve >= reservePercent && meterReserve > 0 ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left: that would use the ${meterReserve}% reserve on ${id}` : `${label} needs ${need.points} more but only ${left.toFixed(1)} left before the ${reserve}% reserve`;
+        return { allowed: false, reason: reserveReason, meters_checked: checked };
+      }
+      if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
+        const plan = computePlan(long.quantity.used, long.resets_at, row.window!.minutes! / 60, reserve, now);
+        if (used + need.points > plan.points_per_5h_window) return { allowed: false, reason: `5h needs ${need.points} more but the plan line allows only ${plan.points_per_5h_window.toFixed(1)} points this window`, meters_checked: checked };
+      }
     }
-    if ((needWk || usePlan) && long) {
-      const freshness = freshnessGate(long, staleMinutes, now);
-      if (!freshness.ok) return { allowed: false, reason: `wk ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
-    }
-
-    const usage = {
-      used5h: short?.quantity?.used ?? null,
-      usedWk: long?.quantity?.used ?? null,
-      weeklyResetsAt: long?.resets_at ?? null,
-      hoursPer5hWindow: short?.window?.minutes ? short.window.minutes / 60 : 5,
-      freshness5h: short?.freshness ?? null,
-      freshnessWk: long?.freshness ?? null,
-    };
     // The meter's own protected reserve (policy.toml [reserve]) is checked
     // before the plain ceiling so the refusal can name it: a caller reading
     // "would use the 10% reserve on claude-main:fable" knows to stop
@@ -280,21 +292,9 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     // larger of the two reserves then applies to everything else the gate
     // checks, including the plan line.
     const meterReserve = reserveFor(options.reserves ?? {}, id);
-    for (const need of meterReserve > 0 ? needs : []) {
-      const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
-      if (freshness === "not_enforced") continue;
-      const used = need.window === "5h" ? usage.used5h : usage.usedWk;
-      if (used === null) continue; // evaluateGate below reports the unknown window
-      if (used + need.points > 100 - meterReserve) {
-        const left = Math.max(0, 100 - meterReserve - used);
-        return { allowed: false, reason: `${need.window} needs ${need.points} more but only ${left.toFixed(1)} left: that would use the ${meterReserve}% reserve on ${id}`, meters_checked: checked };
-      }
-    }
-    const result = evaluateGate(needs, usage, Math.max(reservePercent, meterReserve), usePlan, now);
-    if (!result.allowed) return { ...result, meters_checked: checked };
-    lastResult = result;
+    lastResult = { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 
-    const fiveHourNeed = needs.find((need) => need.window === "5h");
+    const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
     if (pacing === "even" && fiveHourNeed && short?.resets_at && short.window?.minutes && options.owner) {
       const windowStart = new Date(Date.parse(short.resets_at) - short.window.minutes * 60_000);
       const windowHours = short.window.minutes / 60;
@@ -368,6 +368,8 @@ export interface FillOptions {
    * meter's protected floor. The larger of that floor and the caller's own
    * weekly reserve applies. */
   reserves?: Record<string, number>;
+  /** Select the vendor-reported window fill works against. */
+  needWindow?: string;
 }
 
 const EVEN_PACING_FULL_BURST_MINUTES = 45;
@@ -406,7 +408,9 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   // can never be "the tightest enforced window" fill counts lanes against.
   const enforced = enforcedPercentWindows(store, meter);
   if (!enforced.length) return { meter, error: meterUnknownReason(store, meter, `no enforced window for ${meter}`), no_enforced_window: true };
-  const tight = enforced[0];
+  const requested = options.needWindow ? windowNeedMinutes(options.needWindow) : undefined;
+  const tight = requested === undefined ? enforced[0] : enforced.find((row) => row.window?.minutes === requested);
+  if (!tight) return { meter, error: `${options.needWindow} usage unknown` };
   const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
   // Fail closed on the tightest window's own freshness/age -- the same rule
   // paceDecision applies before computing a pace state -- before spending
@@ -560,7 +564,8 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
     const burn = store.burnRateFor(rows, now);
     const enriched = new Map([...observationMap].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
     const reserved = withOtherOwnerReservations(enriched, leases, owner);
-    const decision = canConsume(principalMeters, reserved, policy, allowUnknown, now);
+    const block = principalMeters.map((meter) => store.dispatchBlockForMeter(meter, now)).find(Boolean) ?? store.dispatchBlockForPrincipal(principal);
+    const decision = block ? { state: "FREEZE" as const, reason: block } : canConsume(principalMeters, reserved, policy, allowUnknown, now);
     const reservedRows = [...reserved.values()].flat() as Observation[];
     const deciding = pickDecidingObservation(reservedRows.length ? reservedRows : rows);
     const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? Math.max(0, 100 - deciding.quantity.used) : null;

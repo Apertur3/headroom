@@ -14,7 +14,7 @@ import { canRouteWithLeases, unknownMeterPrincipals, type Policy } from "./polic
 import { withResetsIn } from "./resets.js";
 import { withLastKnown, withPaceInfo } from "./pace.js";
 import { fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
-import type { GateNeed } from "./pacing.js";
+import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications } from "./notify.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
@@ -446,6 +446,8 @@ export class HeadroomDaemon {
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
           await this.poll(undefined, false);
+          const blocked = meters.map((meter) => this.store.dispatchBlockForMeter(meter) ?? this.store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+          if (blocked) { result = { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] }; break; }
           const policy = await readPolicy();
           const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
           const allMeters = [...new Set([...meters, ...localMeters])];
@@ -493,7 +495,7 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : undefined;
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
           const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
-          result = rateLines(this.store, meter, minutes, new Date(), owner); break;
+          result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined); break;
         }
         case "spend": {
           const meter = typeof params.meter === "string" && params.meter.trim() ? params.meter.trim() : undefined;
@@ -506,7 +508,7 @@ export class HeadroomDaemon {
           if (!meter) return reject(-32602, "meter is required");
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -515,7 +517,7 @@ export class HeadroomDaemon {
           const rawNeeds = Array.isArray(params.needs) ? params.needs : [];
           const needs: GateNeed[] = rawNeeds.flatMap((item) => {
             const candidate = item as { window?: unknown; points?: unknown };
-            return (candidate.window === "5h" || candidate.window === "wk") && typeof candidate.points === "number" ? [{ window: candidate.window, points: candidate.points }] : [];
+            return typeof candidate.window === "string" && windowNeedMinutes(candidate.window) !== undefined && typeof candidate.points === "number" ? [{ window: candidate.window, points: candidate.points }] : [];
           });
           if (!needs.length) return reject(-32602, "needs is required");
           await this.poll(undefined, false);
@@ -534,7 +536,7 @@ export class HeadroomDaemon {
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
-          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
         }
         case "health": result = {
           socket: this.path,
@@ -607,7 +609,7 @@ export class HeadroomDaemon {
     }).then((result) => {
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
-      this.store.insertAll(result.observations);
+      this.store.insertPoll(result.observations);
       this.store.leases();
       // Human-facing delivery of the events the inserts above just detected.
       // Deliberately not awaited: a slow or failing notification channel must
