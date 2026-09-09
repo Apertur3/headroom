@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.15] - 2026-09-09
+
 ### Changed
 - Dashboard now opens with a scrollable overview, fixed-size braille charts, and configured-principal filtering.
 
