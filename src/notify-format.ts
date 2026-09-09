@@ -4,6 +4,17 @@ import type { HeadroomEvent, Observation } from "./types.js";
 
 function clean(value: string): string { return redact(value).replace(/[\r\n\t]+/g, " ").trim(); }
 
+function planVendor(principal: string): string {
+  return principal.split("-")[0].replace(/^./, (letter) => letter.toUpperCase()) || humanName(principal);
+}
+
+export function planDowngradeText(principal: string, from: string, to: string, since: string, reminder = false): string {
+  const vendor = planVendor(principal);
+  const at = formatClockTime(new Date(since));
+  const prefix = reminder ? "🚨 PLAN DOWNGRADED REMINDER:" : "🚨 PLAN DOWNGRADED:";
+  return `${prefix} ${vendor} is now on the ${clean(to)} plan (was ${clean(from)}) since ${at}. Do NOT use a reset credit. Dispatches are refused until you run: headroom ack plan ${clean(principal)}`;
+}
+
 export function humanName(value: string): string {
   const words = clean(value).replace(/[-_:]+/g, " ");
   return words.charAt(0).toUpperCase() + words.slice(1);
@@ -59,17 +70,19 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
     }
     case "free_reset_granted": return message("🎁 Free reset credit granted",
       count == null ? `${principal} received a reset credit.` : `${principal} now has ${Math.round(count)}${expiry ? ` (expire ${expiry})` : ""}.`, "Use a credit when you need more capacity.");
-    case "free_reset_used": return message("🎟️ Free reset used", `${name}${count == null ? " used a reset" : ` now has ${Math.round(count)} reset credits left`}.`, "Check the refreshed allowance before planning more work.");
+    case "free_reset_used": return event.metadata?.credit_spent_on_free_plan === true
+      ? "🚨 A reset credit was just spent on the free plan"
+      : message("🎟️ Free reset used", `${name}${count == null ? " used a reset" : ` now has ${Math.round(count)} reset credits left`}.`, "Check the refreshed allowance before planning more work.");
     case "credits_changed": return message("🪙 Credits changed", count == null ? `${principal}'s credit balance changed.` : `${principal} now has ${Math.round(count)} reset credits.`, "Check the balance before using another credit.");
     case "plan_changed": {
-      if (event.metadata?.downgrade === undefined) return message("📋 Plan changed", current?.metadata?.plan ? `${principal} is now on ${clean(current.metadata.plan)}${previous?.metadata?.plan ? ` (was ${clean(previous.metadata.plan)})` : ""}.` : `${principal}'s plan changed.`, "Check your new limits before planning work.");
       const from = typeof event.metadata?.from_plan === "string" ? clean(event.metadata.from_plan) : previous?.metadata?.plan ? clean(previous.metadata.plan) : "previous plan";
       const to = typeof event.metadata?.to_plan === "string" ? clean(event.metadata.to_plan) : current?.metadata?.plan ? clean(current.metadata.plan) : "new plan";
       const at = formatClockTime(new Date(event.created_at));
       const downgrade = event.metadata?.downgrade === true;
-      return downgrade
-        ? message("📉 Plan changed", `${principal} plan changed: ${from} to ${to} at ${at}.`, `Allowances are now the ${to} plan's; dispatches are refused until you acknowledge with: headroom ack plan ${clean(event.principal_id ?? "unknown")}`)
-        : message("📈 Plan changed", `${principal} plan changed: ${from} to ${to} at ${at}.`, "Allowances may have increased; check the new limits before planning work.");
+      if (event.metadata?.restored === true) return `📈 plan restored\n${planVendor(event.principal_id ?? "") } is now on the ${to} plan. Dispatches are allowed again.`;
+      if (event.metadata?.downgrade === undefined) return message("📋 Plan changed", current?.metadata?.plan ? `${principal} is now on ${clean(current.metadata.plan)}${previous?.metadata?.plan ? ` (was ${clean(previous.metadata.plan)})` : ""}.` : `${principal}'s plan changed.`, "Check your new limits before planning work.");
+      if (downgrade) return planDowngradeText(event.principal_id ?? "unknown", from, to, event.created_at);
+      return message("📈 Plan changed", `${principal} plan changed: ${from} to ${to} at ${at}.`, "Allowances may have increased; check the new limits before planning work.");
     }
     case "exhausted_reported": {
       const reset = dateText(current?.resets_at ?? (typeof event.metadata?.resets_at === "string" ? event.metadata.resets_at : undefined));

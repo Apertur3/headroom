@@ -48,9 +48,10 @@ After the service step, setup optionally offers notification channels, presets a
 headroom accounts discover
 ```
 
-This scans your home directory for `~/.claude*` and `~/.codex*` directories and an Antigravity
-CLI install, writes what it finds to `~/.headroom/accounts.toml` (mode 0600), and prints the same
-TOML to stdout so you can check it before trusting it, followed by a confirmation line:
+This scans for `~/.claude*` and `~/.codex*` directories; Antigravity's `agy`; Gemini CLI OAuth
+credentials; and the credential locations used by `grok login` and `kimi login`. It writes what it
+finds to `~/.headroom/accounts.toml` (mode 0600), and prints the same TOML to stdout so you can
+check it before trusting it, followed by a confirmation line:
 
 ```
 Wrote /Users/you/.headroom/accounts.toml (4 accounts). Next: headroom doctor
@@ -122,8 +123,8 @@ Register `headroom statusline` as that command and Headroom reads it as a zero-a
 ```
 
 Add this to `~/.claude/settings.json` for the default profile, or `<CLAUDE_CONFIG_DIR>/settings.json`
-for any other profile (e.g. `~/.claude2/settings.json` for `claude-2`) -- one line per profile,
-same as `keychain grant --principal <name>`. Claude Code only supports one `statusLine` command; if you
+for any other profile (e.g. `~/.claude2/settings.json` for `claude-2`) -- one line per profile.
+Claude Code only supports one `statusLine` command; if you
 already have one, chain it instead of replacing it:
 
 ```json
@@ -258,6 +259,21 @@ claude-main:all  5h 3% ↻17:10 (in 4h 12m) HARVEST | wk 61% ↻Sat 14:00 (in 1d
 first and `--agent` second; the grouped view above is for people, and `--human` forces it in a
 pipe when you want to read one.
 
+### Reserve capacity for supervision
+
+Put a protected floor in `policy.toml` when the account running your orchestrator must retain
+capacity for supervision. `[reserve]` applies to decisions, not pace states: `can`, `gate`,
+`fill`, and `route` do not spend below it, while the displayed vendor usage and pace remain
+unchanged. A meter-specific value wins over `"*"`, the default for other meters:
+
+```toml
+[reserve]
+"claude-main:fable" = 10
+"*" = 5
+```
+
+This is separate from `freeze_reserve_pct`, which changes a window to FREEZE near its limit.
+
 Every window's countdown (`resets_in_seconds`/`resets_in` in `--json`, the daemon status, and the
 MCP `quota_status` result) is computed fresh at response time, not stored. `headroom can` reasons
 carry the same information, more tersely: `wk 61% CONSERVE, resets in 26h`.
@@ -371,8 +387,8 @@ For every extra Claude Code profile, point at its config directory:
 CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
 ```
 
-This registers Headroom's MCP server (stdio; `quota_status`, `quota_can`, `quota_events`, and
-three lease tools) for that Claude Code session. See [mcp-and-agents.md](mcp-and-agents.md) for
+This registers Headroom's MCP server (stdio; all sixteen `quota_*` tools) for that Claude Code
+session. See [mcp-and-agents.md](mcp-and-agents.md) for
 the full tool list and how an orchestrator should call them.
 
 ## 8. Copy the skill

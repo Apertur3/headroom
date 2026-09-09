@@ -38,6 +38,7 @@
       }
     }
   ],
+  "plan_downgraded": "null",
   "threshold": {
     "any_blocking": "boolean",
     "any_crossed": "boolean",

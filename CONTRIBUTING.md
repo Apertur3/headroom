@@ -32,6 +32,9 @@ npm run engine:build   # optional, macOS or Linux with a Swift toolchain
 Run `headroom` against your own accounts before opening a pull request and paste the redacted
 output in the description.
 
+When a change affects documented behavior, verify the built CLI help for the affected command,
+keep the JSON contract and examples aligned, and check relative documentation links.
+
 ## Reporting a problem
 
 Run `headroom doctor --bundle` before opening an issue. It writes one redacted text file

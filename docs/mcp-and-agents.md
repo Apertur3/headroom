@@ -1,12 +1,12 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes fourteen tools, defined in `src/mcp.ts`: three read status, three manage
-leases, six pace a window, one routes an action class to an account, and one ingests a pasted
-`/usage` panel. Every tool but `quota_wait`, `quota_route` and `quota_usage_paste` tries the daemon
+SDK dependency. It exposes sixteen tools, defined in `src/mcp.ts`: status, action checks, events,
+three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, and pasted
+`/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
 first, over its local socket or named pipe, and falls back to
 a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`,
-`quota_route` and `quota_usage_paste` always read directly, since none has a daemon RPC case at
+`quota_route`, `quota_inbox`, and `quota_usage_paste` always read directly, since none has a daemon RPC case at
 all -- `quota_wait` because it never blocks (it just reports the reset time), `quota_route` because
 it's a deliberate, occasional call, not a hot path worth a daemon round trip, and
 `quota_usage_paste` because it is a rare, human-triggered write.
@@ -35,7 +35,8 @@ about.
   "id": 1,
   "result": {
     "content": [{ "type": "text", "text": "[{\"principal_id\":\"claude-main\", ...}]" }],
-    "structuredContent": [
+  "structuredContent": {
+    "observations": [
       {
         "principal_id": "claude-main",
         "meter_id": "claude-main:all",
@@ -45,13 +46,14 @@ about.
         "freshness": "fresh",
         "truth": "official"
       }
-    ]
+    ],
+    "plan_downgraded": null
   }
 }
 ```
 
-Behind a daemon, `structuredContent` is the raw observation array. Without one, it's
-`{ "source": "direct", "observations": [...], "failures": [...] }`.
+`structuredContent` is always an object with `observations` and `plan_downgraded`. A direct read
+also has `source: "direct"` and `failures`.
 
 ### `quota_can`
 
@@ -233,14 +235,16 @@ from the same store the CLI uses. Percentages are whole vendor percents; times a
 
 ### `quota_rate`
 
-`meter`, optional `minutes` (default 30). Returns the burn in percent per hour over that period,
+Optional `meter`, `minutes` (> 0, default 30), `owner`, and `need`. `need` selects a
+vendor-reported window. Returns the burn in percent per hour over that period,
 the sustainable pace to reach the reset with nothing to spare, and the projected time at which
 the window would hit its limit at the current burn (`null` when the burn is zero or unknown).
 CLI: `headroom rate --meter M`.
 
 ### `quota_plan`
 
-`meter`, optional `reserve_percent` (0-100). Returns the weekly points available per remaining 5h
+`meter` (required), optional `reserve_percent` (0-100) and `need`. `need` selects a
+vendor-reported window. Returns the weekly points available per remaining 5h
 window before the weekly reset, and the plan line (linear budget) to hold. Fails UNKNOWN if the
 weekly window's own reading is stale, failed, or older than `staleness_minutes`. CLI: `headroom
 plan`.
@@ -264,8 +268,8 @@ caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
 
 ### `quota_fill`
 
-`meter`, optional `lane_cost_percent` (> 0), `weekly_reserve_percent` (0-100), `owner`,
-`plan_share_percent` (>= 0). How many more lanes fit before the 5h window's unspent points are
+`meter` (required), optional `lane_cost_percent` (> 0), `weekly_reserve_percent` (0-100), `owner`,
+`plan_share_percent` (>= 0), and `need`. `need` selects a vendor-reported window. How many more lanes fit before the 5h window's unspent points are
 lost at reset, and which `routing.toml` action classes still fit the remaining points and minutes.
 Fails UNKNOWN if the tightest enforced window (or the weekly one, when both are enforced) is stale,
 failed, or older than `staleness_minutes`. CLI: `headroom fill`.

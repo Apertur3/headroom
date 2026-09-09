@@ -248,6 +248,13 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       const grant = keychainGrantCheck(account, grantsNeeded);
       if (grant) output.push(grant);
       output.push(adapterCheck(account));
+      if (store) {
+        const downgrade = store.planDowngrade(account.name);
+        const plan = store.latestPerWindow().find((row) => row.principal_id === account.name && typeof row.metadata?.plan === "string")?.metadata?.plan;
+        output.push(downgrade && !downgrade.acknowledged
+          ? check("FAIL", `principal ${account.name} plan`, `DOWNGRADED: ${downgrade.from} to ${downgrade.to} since ${downgrade.since}`, `headroom ack plan ${account.name}`)
+          : check("OK", `principal ${account.name} plan`, downgrade ? `${downgrade.to} downgrade acknowledged` : plan ? String(plan) : "unknown (not read yet)", "no action needed"));
+      }
     }
     if (probePin) output.push(probePin);
     await doctorChecksTail(output, home, accounts, keepaliveEnabled);

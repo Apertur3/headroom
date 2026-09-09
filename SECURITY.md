@@ -95,7 +95,9 @@ cookies, which unlock paid subscriptions.
     with the tool's exit status and nothing else -- its output is never read into a message, a log
     or a file, because the only thing on that stream is the secret.
 
-    The probe binary is still signed and its SHA-256 is still verified on every use.
+    The probe binary is still signed and its SHA-256 is still verified on every use. Its signing
+    identity establishes code identity only; it grants no Keychain access and is not part of the
+    credential read path.
     `scripts/build-probe.sh` signs each build with one stable self-signed identity ("Headroom
     Local") living in its own keychain, `~/Library/Keychains/headroom-local-signing.keychain-db`
     (mode 0600, empty passphrase, appended to the user's keychain search list), deliberately not

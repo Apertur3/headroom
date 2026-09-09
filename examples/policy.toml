@@ -18,6 +18,9 @@ pacing = "even"
 update_check = true
 # Proxy environment variables are ignored. Set this explicitly when a proxy is required.
 # proxy = "http://127.0.0.1:8080"
+# Extra safe directories to scan for statusline snapshots. The default is
+# ~/.headroom/statusline only. Paths are expanded from ~ when read.
+# statusline_snapshot_dirs = ["~/.headroom/statusline", "~/.collector/state"]
 # Per-principal intervals override the default:
 # [principal.claude-main]
 # interval_minutes = 5
@@ -41,6 +44,11 @@ update_check = true
 # preset = "calm" # quiet: urgent changes only; everything: every event
 # events_on = [] # add "reset_scheduled_short" to include scheduled 5h resets
 # events_off = [] # overrides win over the preset and events_on
+# Legacy replacement for a preset's base list. New configurations should use
+# preset plus events_on/events_off instead.
+# events = ["reset_unscheduled", "threshold"]
+# Accepted for older policies only; use events_on above instead.
+# notify_scheduled_short = false
 # # Also notify when any hard window crosses this used percent, once per window.
 # threshold_percent = 90
 # # Local time. Events inside the range are batched into one message at the end of it.

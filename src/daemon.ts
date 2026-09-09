@@ -425,6 +425,10 @@ export class HeadroomDaemon {
           result = withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now)));
           break;
         }
+        case "plan_downgrades": {
+          result = this.store.planDowngrades(this.accounts.map((account) => account.name));
+          break;
+        }
         case "history": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();

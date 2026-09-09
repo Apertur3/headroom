@@ -255,9 +255,9 @@ describe("MCP JSON-RPC", () => {
     expect(await handleMcp('{"jsonrpc":"2.0","id":1,"method":"initialize"}')).toMatchObject({ result: { capabilities: { tools: {} } } });
     expect(await handleMcp('{"jsonrpc":"2.0","id":2,"method":"tools/list"}')).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "quota_status" }), expect.objectContaining({ name: "quota_lease_start" }), expect.objectContaining({ name: "quota_lease_end" }), expect.objectContaining({ name: "quota_leases" })]) } });
     const response = await handleMcp('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async (method) => {
-      expect(method).toBe("status"); return [fixture()];
+      return method === "status" ? [fixture()] : [];
     });
-    expect(response).toMatchObject({ result: { structuredContent: [expect.objectContaining({ meter_id: "codex-main:main" })] } });
+    expect(response).toMatchObject({ result: { structuredContent: { observations: [expect.objectContaining({ meter_id: "codex-main:main" })], plan_downgraded: null } } });
   });
 
   it("uses a direct marked result when the daemon is absent", async () => {

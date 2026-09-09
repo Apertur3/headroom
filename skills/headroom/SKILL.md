@@ -15,14 +15,12 @@ first one that fails, showing its output:
 
 1. `headroom version`; if the command is missing, `npm install -g headroomd` (Node 22.13 or newer).
    If the user agrees, run `headroom setup --yes --skip-mcp` to do accounts discovery, doctor and
-   the background service install in one pass -- it answers yes to each of those on its own, shows
-   its output, and never touches the Keychain itself (see the next step).
-2. macOS only: tell the user to run `headroom keychain grant` themselves in a terminal, because it
-   opens one Keychain dialog that must be answered with Always Allow. Never run it for them.
-3. Register the MCP server in the agent that will use it, for example
+   the background service install in one pass -- it answers yes to each of those on its own and
+   shows its output.
+2. Register the MCP server in the agent that will use it, for example
    `claude mcp add headroom -- headroom mcp`, and confirm with a `quota_status` call.
-4. `headroom doctor` once more; every non-OK line names the next command.
-5. Show `headroom` once and explain the pace state on each row.
+3. `headroom doctor` once more; every non-OK line names the next command.
+4. Show `headroom --json` or `headroom --agent` once and explain the pace state on each row.
 
 ## Keep the budget in sight
 
@@ -78,6 +76,9 @@ into a real reading instead of dispatching blind.
    An UNKNOWN window may still show `last_known` (the newest fresh reading of that meter from the
    last 7 days, with its age) so you can see the trend behind it -- read that as history, never as
    a green light: `can`/`gate`/`route` already ignore it and answer NO the same as if it weren't there.
+9. **A plan downgrade notice is a hard stop.** Stop all work on that vendor and tell the
+   human. Do not use a reset credit. Dispatches stay refused until the human either restores
+   the paid plan or explicitly runs `headroom ack plan <principal>` for an intended downgrade.
 
 ## Commands
 
@@ -95,7 +96,7 @@ into a real reading instead of dispatching blind.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
-- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_route` (plus `quota_lease_start`, `quota_lease_end`, `quota_leases`) expose the same from a daemon (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
+- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, and `quota_route` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
 
 ## Leases
 

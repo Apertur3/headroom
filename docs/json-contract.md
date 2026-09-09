@@ -105,7 +105,8 @@ below.
 ### `status` (`headroom --json` / `--threshold N --json`, MCP `quota_status`)
 
 CLI: `{ contract, generated_at, observations: Observation[], leases: Lease[],
-threshold?: {...} }`. `threshold` is present only with `--threshold N`:
+plan_downgraded: { principal, from, to, since, acknowledged } | null, threshold?: {...} }`.
+`threshold` is present only with `--threshold N`:
 `{ percent: number, windows: ThresholdWindow[], any_crossed: boolean,
 any_blocking: boolean }`, where each `ThresholdWindow` is `{ meter_id: string,
 window_minutes: number | null, used_percent: number | null, crossed: boolean,
@@ -133,7 +134,7 @@ non-null only when this observation's own `freshness` is `failed` or `stale`
 within the last 7 days; the newest such reading, so a fail-closed caller can
 still see the trend behind an UNKNOWN. For a windowed observation this is the
 newest fresh reading of that same meter and window. For a windowless one
-(`window: null`, what a Keychain grant or transport failure produces --
+(`window: null`, what a credential-read or transport failure produces --
 the failure speaks for the whole meter, not one window of it) it is instead
 the newest fresh reading from the tightest window of that meter (smallest
 minutes, i.e. nearest reset) that still has one in range, and `window_minutes`
@@ -147,12 +148,10 @@ Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at
 least one source failed and there are no observations at all; `0` otherwise.
 
-MCP `quota_status` (direct, no daemon): `{ contract, generated_at, source:
-"direct", observations: Observation[], failures: string[] }` -- note the
-different top level from the CLI (`failures` instead of `leases`/`threshold`;
-no `--threshold` equivalent). **Over a daemon**, `quota_status` answers with
-the same bare `Observation[]` array the daemon's own `status` RPC method
-returns -- not enveloped; see "CLI vs MCP: daemon vs direct" below.
+MCP `quota_status`: `{ contract, generated_at, source?: "direct",
+observations: Observation[], plan_downgraded: { principal, from, to, since,
+acknowledged } | null, failures?: string[] }`. Direct reads carry `source` and
+`failures`; daemon reads omit them. There is no `--threshold` equivalent.
 
 ### `can` (`headroom can <class> --owner X --json`, MCP `quota_can`)
 
@@ -320,8 +319,8 @@ number | null, burn_percent_per_hour: number | null, empty_in_seconds: number
 | null, resets_at: string | null, reason?: string | null, attributed_owner?:
 string, attributed_percent?: number, attributed_confidence?: number }`.
 `reason` is set only on the synthetic line used when a specifically requested
-meter has no enforced window at all (its own latest reason, e.g. a pending
-Keychain grant) -- absent on every real per-window line. The three
+meter has no enforced window at all (its own latest reason, e.g. a credential
+read failure) -- absent on every real per-window line. The three
 `attributed_*` fields are set only when `--owner`/`owner` was given: that
 owner's ledger-attributed share of the same lookback window. Exit codes:
 always `0` for a real reading; a genuine usage error (e.g. `--minutes` not a
@@ -350,20 +349,24 @@ instead.
 created_at: string, corrected_by: string | null, meter_id: string | null,
 principal_id: string | null, reason: string | null, last_seen_at: string |
 null, metadata?: { unscheduled?: boolean; window_minutes?: number | null;
-used_percent?: number; previous_used_percent?: number } | null }`.
+used_percent?: number; previous_used_percent?: number; from_plan?: string;
+to_plan?: string; downgrade?: boolean; restored?: boolean;
+credit_spent_on_free_plan?: boolean; resets_at?: string } | null }`.
 `EventKind` is `"reset_seen" | "free_reset_granted" |
-"free_reset_used" | "credits_changed" | "plan_changed" | "source_failed" |
+"free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" |
+"window_retired" | "source_failed" |
 "source_recovered" | "lease_started" | "lease_ended" |
-"pace_projection_conserve" | "model_new"` -- an enumeration that only grows
+"pace_projection_conserve" | "model_new" | "grant_lapsed"` -- an enumeration that only grows
 under the compatibility promise below. `last_seen_at` is set only on an open
 `source_failed` event (the most recent poll that still found the same
-failure); `null` on every other kind. `metadata` is present only on a
-`reset_seen`: `window_minutes` names the window that reset on every one;
-`unscheduled: true` (issue #20) marks one that fired before its own scheduled
-instant, with `used_percent`/`previous_used_percent` -- the window's used
-percent right after and right before the reset -- present alongside it.
-Absent (not merely `undefined` fields) on a `reset_seen` that predates this
-field and on every other event kind. Exit codes: always `0`.
+failure); `null` on every other kind. On a `reset_seen`, `window_minutes`
+names the window and `unscheduled: true` marks a reset before its scheduled
+instant; `used_percent`/`previous_used_percent` are then the percentages
+after and before it. On a `plan_changed`, `from_plan`, `to_plan`, `downgrade`,
+or `restored` explain the vendor-reported change. `credit_spent_on_free_plan`
+marks a free-plan reset-credit use. `resets_at` may accompany an exhausted
+report. Metadata is absent when an event has no such fact. Exit codes: always
+`0`.
 
 MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct",
 events: HeadroomEvent[] }`; over a daemon, the bare `HeadroomEvent[]` instead.
@@ -450,10 +453,10 @@ differently depending on the command:
   outputs").
 - **MCP**, every tool's result is enveloped only when it is already an
   object. A **direct** answer always is (the `source: "direct"` wrapper).
-  A **daemon** answer for `quota_status`, `quota_cost`, `quota_rate`,
-  `quota_spend`, and `quota_leases` is the same bare array the daemon
-  returns over its own RPC -- not enveloped. `quota_events` daemon answers
-  the same way. Every other MCP tool (`quota_can`, `quota_gate`,
+  `quota_status` is always an object so it can carry an active plan downgrade.
+  A **daemon** answer for `quota_cost`, `quota_rate`, `quota_spend`, and
+  `quota_leases` is the same bare array the daemon returns over its own RPC
+  and `quota_events` daemon answers the same way. Every other MCP tool (`quota_can`, `quota_gate`,
   `quota_plan`, `quota_fill`, `quota_route`, `quota_wait`,
   `quota_lease_start`, `quota_lease_end`, `quota_inbox`,
   `quota_usage_paste`) is always an object from either source, so it is

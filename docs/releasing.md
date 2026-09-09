@@ -35,9 +35,9 @@ Release candidates, if ever needed, use `-rc.N` the same way.
 ## Signing the Claude probe
 
 `scripts/build-probe.sh` runs from `prepack` and `release:check` and signs `headroom-claude-probe`
-with one stable self-signed identity, "Headroom Local", so a user's macOS Keychain grant survives
-every rebuild (macOS keys the ACL on the signing identity's designated requirement, not on the
-binary's contents). The identity is created once, in its own keychain
+with one stable self-signed identity, "Headroom Local", to give locally built probes a stable code
+identity. It does not grant Keychain access: the probe reads through `/usr/bin/security`, which
+the Claude Keychain item already admits without a dialog. The identity is created once, in its own keychain
 (`~/Library/Keychains/headroom-local-signing.keychain-db`), and reused after that; the private key
 is never left on disk outside that keychain and the PKCS#12 passphrase is random per run. To sign
 with a real Developer ID instead, set `HEADROOM_CODESIGN_IDENTITY` in the environment or run
