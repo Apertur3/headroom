@@ -496,10 +496,10 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
           meter: index === 0 ? shortMeter(observation) : "",
           ...(isCredits(observation) ? { text: creditsCell(observation) } : {}),
           window: label(observation),
-          used: usedCell(observation, decision.state),
+          used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),
           reset: countdown ? known : `resets in ${formatResetsIn(seconds as number)}`,
           resetCoarse: countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`,
-          state: isCredits(observation) ? "" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
+          state: isCredits(observation) ? "" : observation.metadata?.exhausted ? "FREEZE" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
           detail: detailLine(observation, reserveFor(policy.reserve, observation.meter_id), resetSeen.get(windowKey(observation)), freeResetUsed.get(windowKey(observation)), now),
           unknown,
           // The lease belongs to the meter, not to one of its windows, so it

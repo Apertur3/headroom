@@ -25,7 +25,7 @@ export type ChannelName = "telegram" | "ntfy" | "webhook";
 const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
 
 const EVENT_KINDS: readonly EventKind[] = [
-  "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed",
+  "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed", "exhausted_reported", "window_retired",
   "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed",
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
@@ -471,6 +471,7 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
 
 /** Overrides for a reset category take precedence over the reset_seen umbrella. */
 export function wantsEvent(event: HeadroomEvent, config: NotifyConfig): boolean {
+  if (event.kind === "plan_changed" || event.kind === "exhausted_reported") return true;
   if (event.kind !== "reset_seen") return config.events.includes(event.kind);
   const category = event.metadata?.unscheduled ? "reset_unscheduled"
     : event.metadata?.window_minutes === 300 ? "reset_scheduled_short"

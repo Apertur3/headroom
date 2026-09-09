@@ -78,7 +78,7 @@ describe("parseGateNeed", () => {
   });
 
   it("throws on anything else", () => {
-    expect(() => parseGateNeed("5d:15")).toThrow("Invalid --need value");
+    expect(() => parseGateNeed("sometime:15")).toThrow("Invalid --need value");
     expect(() => parseGateNeed("5h:-1")).toThrow("Invalid --need value");
     expect(() => parseGateNeed("5h")).toThrow("Invalid --need value");
   });

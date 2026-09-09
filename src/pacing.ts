@@ -31,17 +31,36 @@ export function computePlan(weeklyUsedPercent: number, weeklyResetsAt: string, h
   };
 }
 
-export interface GateNeed { window: "5h" | "wk"; points: number; }
+/** A vendor window requested by its familiar alias or by its exact duration.
+ * The store resolves it against the windows the meter actually reports. */
+export interface GateNeed { window: string; points: number; }
 
 /** Parses one `--need` value like `5h:15` or `wk:3` into a GateNeed. Throws
  * with the offending text on anything else, so a typo fails the dispatch
  * loudly instead of silently gating on nothing. */
 export function parseGateNeed(value: string): GateNeed {
-  const match = /^(5h|wk):([0-9]+(?:\.[0-9]+)?)$/.exec(value.trim());
-  if (!match) throw new Error(`Invalid --need value: ${value} (use 5h:N or wk:N)`);
+  const match = /^(5h|wk|30d|[1-9][0-9]*[mhd]):([0-9]+(?:\.[0-9]+)?)$/.exec(value.trim());
+  if (!match) throw new Error(`Invalid --need value: ${value} (use 5h:N, wk:N, 30d:N, or <n>m|h|d:N)`);
   const points = Number(match[2]);
-  if (!Number.isFinite(points) || points < 0) throw new Error(`Invalid --need value: ${value} (use 5h:N or wk:N)`);
-  return { window: match[1] as "5h" | "wk", points };
+  if (!Number.isFinite(points) || points < 0) throw new Error(`Invalid --need value: ${value} (use 5h:N, wk:N, 30d:N, or <n>m|h|d:N)`);
+  return { window: match[1], points };
+}
+
+export function windowNeedMinutes(window: string): number | undefined {
+  if (window === "5h") return 300;
+  if (window === "wk") return 10_080;
+  const match = /^(\d+)(m|h|d)$/.exec(window);
+  if (!match) return undefined;
+  const unit = match[2] === "m" ? 1 : match[2] === "h" ? 60 : 1440;
+  return Number(match[1]) * unit;
+}
+
+export function windowNeedLabel(minutes: number): string {
+  if (minutes === 300) return "5h";
+  if (minutes === 10_080) return "wk";
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
 }
 export interface GateUsage {
   used5h: number | null;
@@ -60,7 +79,7 @@ export interface GateResult {
   reason: string;
   /** Present only when at least one need was skipped because its window is
    * not enforced on this meter -- informational, never a refusal on its own. */
-  not_enforced?: Array<"5h" | "wk">;
+  not_enforced?: string[];
   /** True when the refusal is because a needed window's usage could not be
    * read at all (a failed, never-seen, or unreadable meter/window) rather
    * than because a known usage simply does not fit the request. Callers
@@ -75,7 +94,7 @@ export interface GateResult {
  * stricter bar than just staying under the freeze reserve. */
 export function evaluateGate(needs: GateNeed[], usage: GateUsage, reservePercent: number, usePlan: boolean, now = new Date()): GateResult {
   if (!needs.length) return { allowed: false, reason: "no --need given" };
-  const notEnforced: Array<"5h" | "wk"> = [];
+  const notEnforced: string[] = [];
   for (const need of needs) {
     const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
     if (freshness === "not_enforced") { notEnforced.push(need.window); continue; }

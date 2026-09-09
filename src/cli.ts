@@ -165,10 +165,14 @@ async function can(argv: string[]): Promise<number> {
       const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
       const allMeters = [...new Set([...meters, ...localMeters])];
       const now = new Date();
+      const blocked = meters.map((item) => directStore.dispatchBlockForMeter(item, now) ?? directStore.dispatchBlockForPrincipal(item.split(":")[0])).find(Boolean);
+      if (blocked) decision = { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+      else {
       const rows = new Map(allMeters.map((meter) => [meter, directStore.latestPerWindow(meter)]));
       const burn = directStore.burnRateFor([...rows.values()].flat(), now);
       const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
       decision = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, argv.includes("--allow-unknown"), directStore.leases(undefined, true), owner, now);
+      }
       directStore.audit("cli", "can", action, decision.allowed ? "yes" : "no");
     } finally { directStore.close(); }
   }
@@ -290,14 +294,16 @@ async function rate(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
   const owner = option(argv, "--owner");
   const minutes = rateLookbackMinutes(argv);
+  const need = option(argv, "--need");
+  if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
-  const request = await requestDaemon("rate", { meter, minutes, owner });
+  const request = await requestDaemon("rate", { meter, minutes, owner, need });
   let lines: RateLine[];
   if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
   else {
     directReadNotice();
     const store = await HeadroomStore.open();
-    try { lines = rateLines(store, meter, minutes, new Date(), owner); store.audit("cli", "rate", meter ?? null, "ok"); }
+    try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
     finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
@@ -311,6 +317,93 @@ async function rate(argv: string[]): Promise<number> {
     console.log(`${line.meter}  ${windowLabel} ${usedText}  burn ${formatRatePercent(line.burn_percent_per_hour)}, ${stall}${attributedSegment(line)}`);
   }
   return 0;
+}
+
+function vendorResetFromOutput(text: string): string | null {
+  const explicit = /HEADROOM_EXHAUSTED_UNTIL=([^\s]+)/.exec(text)?.[1];
+  if (explicit && Number.isFinite(Date.parse(explicit))) return new Date(explicit).toISOString();
+  const codex = /You've hit your usage limit[\s\S]{0,240}?try again at ([^\n\r]+)/i.exec(text)?.[1];
+  const claude = /(?:rate limit|usage limit reached)[\s\S]{0,160}?resets at ([^\n\r]+)/i.exec(text)?.[1];
+  const value = codex ?? claude;
+  return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
+}
+
+function vendorLimitSeen(text: string): boolean {
+  return /You've hit your usage limit|\brate limit\b|usage limit reached|HEADROOM_EXHAUSTED_UNTIL=/i.test(text);
+}
+
+async function report(argv: string[]): Promise<number> {
+  const meter = option(argv, "--meter");
+  if (!meter || !argv.includes("--exhausted")) throw new Error("Usage: headroom report --meter <meter_id> --exhausted [--until <iso or vendor date>] [--note <text>]");
+  const rawUntil = option(argv, "--until");
+  const until = rawUntil && Number.isFinite(Date.parse(rawUntil)) ? new Date(rawUntil).toISOString() : rawUntil ? (() => { throw new Error("--until must be an ISO timestamp or a vendor date"); })() : null;
+  const store = await HeadroomStore.open();
+  try { store.reportExhausted(meter, until, option(argv, "--note") ?? null); store.audit("cli", "report_exhausted", meter, "ok"); }
+  finally { store.close(); }
+  console.log(`${meter} exhausted${until ? `; resets ${until}` : ""}`);
+  return 0;
+}
+
+async function ack(argv: string[]): Promise<number> {
+  if (argv[0] !== "plan" || !argv[1]) throw new Error("Usage: headroom ack plan <principal>");
+  const store = await HeadroomStore.open();
+  try { store.acknowledgePlan(argv[1]); store.audit("cli", "ack_plan", argv[1], "ok"); }
+  finally { store.close(); }
+  console.log(`acknowledged plan change for ${argv[1]}`);
+  return 0;
+}
+
+async function run(argv: string[]): Promise<number> {
+  const separator = argv.indexOf("--");
+  const command = separator >= 0 ? argv.slice(separator + 1) : [];
+  const flags = separator >= 0 ? argv.slice(0, separator) : argv;
+  const meter = option(flags, "--meter");
+  const owner = option(flags, "--owner");
+  const actionClass = option(flags, "--class");
+  if (!owner || !command.length || (!meter && !actionClass)) throw new Error("Usage: headroom run --meter <meter> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] -- <command> [args...]");
+  const needs: GateNeed[] = [];
+  for (let index = 0; index < flags.length; index += 1) if (flags[index] === "--need") needs.push(parseGateNeed(flags[index + 1] ?? ""));
+  const policy = await readPolicy();
+  const store = await HeadroomStore.open();
+  let lease: Lease | undefined;
+  try {
+    let target: string | string[] = meter ?? [];
+    if (!meter && actionClass) {
+      const routing = await readRouting();
+      const meters = routing.consumes[actionClass];
+      if (!meters?.length) throw new Error(`Unknown action class: ${actionClass}`);
+      target = meters;
+      const learned = store.learnedCost(actionClass)[0];
+      if (!needs.length && learned) needs.push({ window: "5h", points: learned.median_percent });
+      if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
+    }
+    if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
+    const decision = gateFor(store, needs, target, policy.freeze_reserve_pct, false, new Date(), { owner, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve });
+    if (!decision.allowed) {
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null })));
+      else console.error(decision.reason);
+      return 2;
+    }
+    const leaseMeter = meter ?? decision.meters_checked[0];
+    const expected = needs.reduce((sum, need) => sum + need.points, 0);
+    lease = store.startLease(owner, leaseMeter, expected, ttl(option(flags, "--ttl") ?? "3h"), "run", new Date(), actionClass ?? null);
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: lease.id })));
+  } finally { store.close(); }
+  const child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env });
+  let transcript = "";
+  child.stdout.on("data", (chunk: Buffer) => { const text = chunk.toString(); transcript += text; process.stdout.write(text); });
+  child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); transcript += text; process.stderr.write(text); });
+  const forward = (signal: NodeJS.Signals): void => { if (!child.killed) child.kill(signal); };
+  const onInt = (): void => forward("SIGINT"); const onTerm = (): void => forward("SIGTERM");
+  process.once("SIGINT", onInt); process.once("SIGTERM", onTerm);
+  const code = await new Promise<number>((resolve) => child.on("exit", (value, signal) => resolve(value ?? (signal === "SIGINT" ? 130 : 143))));
+  process.removeListener("SIGINT", onInt); process.removeListener("SIGTERM", onTerm);
+  const ending = await HeadroomStore.open();
+  try {
+    if (lease) ending.endLease(lease.id, owner, true);
+    if (vendorLimitSeen(transcript)) ending.reportExhausted(lease?.meter_id ?? meter!, vendorResetFromOutput(transcript), "vendor reports the limit reached");
+  } finally { ending.close(); }
+  return code;
 }
 
 const SPEND_HELP = "Usage: headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]";
@@ -430,7 +523,9 @@ async function plan(argv: string[]): Promise<number> {
   const reserveValue = option(argv, "--reserve");
   if (reserveValue !== undefined && (!Number.isFinite(Number(reserveValue)) || Number(reserveValue) < 0 || Number(reserveValue) > 100)) throw new Error("--reserve must be 0 through 100");
   const asJson = argv.includes("--json");
-  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue) });
+  const need = option(argv, "--need");
+  if (need) parseGateNeed(`${need}:0`);
+  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need });
   let result: ({ meter: string } & PlanResult) | { meter: string; error: string };
   if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
   else {
@@ -438,7 +533,7 @@ async function plan(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
     const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
@@ -556,7 +651,8 @@ async function fill(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
-  const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent });
+  const need = option(argv, "--need"); if (need) parseGateNeed(`${need}:0`);
+  const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
   let result: Awaited<ReturnType<typeof fillFor>>;
   if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
   else {
@@ -564,7 +660,7 @@ async function fill(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
     const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -708,7 +804,7 @@ export async function observe(argv: string[]): Promise<number> {
       await syncClaudeProbeState(store);
       const polled = await pollAccounts(principal, { claudeGrant: claudeGrantGate(store), noDaemon: true });
       failures = polled.failures;
-      store.insertAll(polled.observations);
+      store.insertPoll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
@@ -1107,6 +1203,9 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["inbox", "Read this session's hand-off messages, or send one to another session"],
   ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
+  ["run", "Gate, lease, and launch one command as an atomic dispatch"],
+  ["report", "Record a vendor-reported exhausted meter"],
+  ["ack plan", "Acknowledge a principal plan downgrade before dispatching again"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
@@ -1154,6 +1253,9 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     `  import: ${PLAN_IMPORT_HELP}`,
   ].join("\n"),
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
+  run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
+  report: "Usage: headroom report --meter <meter_id> --exhausted [--until <iso or vendor date>] [--note <text>]",
+  ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
@@ -1274,6 +1376,9 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "inbox") return inbox(argv.slice(1));
   if (argv[0] === "plan") return plan(argv.slice(1));
   if (argv[0] === "gate") return gate(argv.slice(1));
+  if (argv[0] === "run") return run(argv.slice(1));
+  if (argv[0] === "report") return report(argv.slice(1));
+  if (argv[0] === "ack") return ack(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));
   if (argv[0] === "fill") return fill(argv.slice(1));
   if (argv[0] === "route") return route(argv.slice(1));

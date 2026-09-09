@@ -374,6 +374,62 @@ export class HeadroomStore {
 
   insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
 
+  /** Record a complete vendor poll and retire windows omitted by that poll.
+   * A later vendor response for the same duration supersedes the retirement. */
+  insertPoll(observations: Observation[]): StoredObservation[] {
+    const stored = this.insertAll(observations);
+    const byMeter = new Map<string, StoredObservation[]>();
+    for (const row of stored) if (row.freshness === "fresh" && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
+    for (const [meter, rows] of byMeter) {
+      const present = new Set(rows.map((row) => row.window!.minutes));
+      for (const old of this.latestPerWindow(meter)) {
+        const minutes = old.window?.minutes;
+        if (!minutes || present.has(minutes) || old.metadata?.retired) continue;
+        const at = rows.reduce((latest, row) => Date.parse(row.fetched_at) > Date.parse(latest.fetched_at) ? row : latest);
+        const { id: _id, ...oldObservation } = old;
+        const retired = this.insert({ ...oldObservation, observed_at: at.observed_at, fetched_at: at.fetched_at, freshness: "stale", confidence: 1, reason: "vendor no longer reports this window", metadata: { ...old.metadata, retired: true } });
+        this.addEvent("window_retired", "inferred", 0.9, [old.id, retired.id], retired, "vendor no longer reports this window");
+      }
+    }
+    return stored;
+  }
+
+  reportExhausted(meterId: string, until: string | null, note: string | null, now = new Date()): void {
+    const rows = this.latestPerWindow(meterId).filter((row) => row.window?.minutes && row.quantity?.unit === "percent");
+    if (!rows.length) throw new Error(`no reported percent window for ${meterId}`);
+    const reset = until && Number.isFinite(Date.parse(until)) ? new Date(until).toISOString() : null;
+    for (const row of rows) {
+      const { id: _id, ...observation } = row;
+      const current = this.insert({ ...observation, quantity: { ...row.quantity!, used: 100, remaining: 0 }, resets_at: reset ?? row.resets_at, observed_at: now.toISOString(), fetched_at: now.toISOString(), freshness: "fresh", confidence: 0.9, reason: "vendor reports the limit reached", metadata: { ...row.metadata, exhausted: true } });
+      this.addEvent("exhausted_reported", "inferred", 0.9, [current.id], current, note ?? "vendor reports the limit reached", null, undefined, { resets_at: current.resets_at ?? undefined });
+    }
+    this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ until: reset, note }));
+  }
+
+  dispatchBlockForMeter(meterId: string, now = new Date()): string | undefined {
+    const raw = this.daemonState(`exhausted:${meterId}`);
+    if (!raw) return undefined;
+    try {
+      const state = JSON.parse(raw) as { until?: string | null };
+      if (!state.until || Date.parse(state.until) > now.getTime()) return `vendor reports the limit reached${state.until ? `; resets ${state.until}` : ""}`;
+      return undefined;
+    } catch { return "vendor reports the limit reached"; }
+  }
+
+  dispatchBlockForPrincipal(principal: string): string | undefined {
+    const raw = this.daemonState(`plan_drop:${principal}`);
+    if (!raw) return undefined;
+    try { const state = JSON.parse(raw) as { acknowledged?: boolean; to?: string }; return state.acknowledged ? undefined : `plan changed to ${state.to ?? "a lower plan"}; acknowledge with: headroom ack plan ${principal}`; }
+    catch { return `plan changed; acknowledge with: headroom ack plan ${principal}`; }
+  }
+
+  acknowledgePlan(principal: string): void {
+    const raw = this.daemonState(`plan_drop:${principal}`);
+    if (!raw) return;
+    const state = JSON.parse(raw) as Record<string, unknown>;
+    this.setDaemonState(`plan_drop:${principal}`, JSON.stringify({ ...state, acknowledged: true }));
+  }
+
   private previous(observation: Observation): StoredObservation | undefined {
     const window = observation.window ? JSON.stringify(observation.window) : null;
     const row = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?) ORDER BY id DESC LIMIT 1")
@@ -843,7 +899,16 @@ export class HeadroomStore {
       if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current);
       if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
     }
-    if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.addEvent("plan_changed", "vendor_reported", 1, evidence, current);
+    if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.recordPlanChange(previous, current, evidence);
+  }
+
+  private recordPlanChange(previous: StoredObservation, current: StoredObservation, evidence: number[]): void {
+    const from = previous.metadata!.plan!;
+    const to = current.metadata!.plan!;
+    const downgrade = to === "free" && from !== "free";
+    const main = current.meter_id.endsWith(":main") ? current : this.latestPerWindow(`${current.principal_id}:main`)[0] ?? current;
+    this.addEvent("plan_changed", "vendor_reported", 1, evidence.includes(main.id) ? evidence : [...evidence, main.id], main, null, null, undefined, { from_plan: from, to_plan: to, downgrade });
+    if (downgrade) this.setDaemonState(`plan_drop:${current.principal_id}`, JSON.stringify({ from, to, acknowledged: false, at: current.fetched_at }));
   }
 
   /** Fetch a notification batch's original facts in one query. */
@@ -885,6 +950,13 @@ export class HeadroomStore {
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current
       WHERE current.row_number = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM observations AS retired
+          WHERE retired.meter_id = current.meter_id
+            AND COALESCE(CAST(json_extract(retired.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
+            AND json_extract(retired.metadata_json, '$.retired') = 1
+            AND (retired.fetched_at > current.fetched_at OR (retired.fetched_at = current.fetched_at AND retired.id >= current.id))
+        )
         -- A transport/auth failure has no vendor window. It replaces an older
         -- successful read for the whole meter; an older failure must not add a
         -- spurious '-' window beside a newer vendor response. This supersession

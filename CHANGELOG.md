@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Dispatch guarding with `headroom run`, vendor limit reports, arbitrary vendor-reported windows, plan downgrade acknowledgement, retired-window handling, and quieter source-failure notifications.
+
 ## [0.1.0-beta.12] - 2026-09-08
 
 ### Added
