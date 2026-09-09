@@ -54,6 +54,9 @@ into a real reading instead of dispatching blind.
    table. Headroom has no opinion on model quality and never will.
 2. **Ask Headroom if that pool can afford it.** `headroom can <action-class>` returns YES or NO with the
    limiting meter and its pace state. Exit code 0 means yes, 2 means no.
+   Dispatch through `headroom run` so the gate and lease bracket the launched lane, or call
+   `quota_gate` and `quota_lease_start` yourself over MCP. Never launch a lane on a meter you have
+   not gated.
 3. **On NO, walk your fallback list** for that action class, in your order. Headroom only filters
    the list by budget; it never reorders it by capability.
 4. **Harvest only fungible work.** HARVEST means a meter is under its straight-line burn and the
