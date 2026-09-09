@@ -299,7 +299,7 @@ That resolves itself once you install the daemon in the next step.
 
 Run `headroom dashboard` (or `headroom top`) for an automatically updating terminal view.
 It refreshes every 5 seconds; `--interval 2` selects the minimum interval. Every frame reads
-cached data through the daemon socket with a 500 ms budget, then falls back to the store.
+cached data through the daemon socket with a one-second budget, then falls back to the store.
 It never polls a vendor. Here, `direct read` means reading the local cache without an answering
 daemon. Older daemons that do not support the dashboard request use their local cache and
 still show `daemon fresh Ns ago`. All clocks use your local time zone.
@@ -307,35 +307,31 @@ still show `daemon fresh Ns ago`. All clocks use your local time zone.
 ```text
 Headroom 0.1.0 | daemon fresh 0s ago | 14:00:00
 
-Burndown: solid used, dotted plan, │ now, ░ reserve
+OVERVIEW
+> account-a        [########............]  38% resets in 2h 30m HARVEST ok
+0 events in the last hour, 0 leases active, next reset account-a 5h in 2h 30m
+
 account-a  claude  Max  fresh <1m
   all        5h  [########............]  38% ↗ resets in 2h 30m HARVEST
-100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░⡀░⠄░⠂⠈│
-    │                           │              ⡀ ⠄ ⠁       │
-    │                           │      ⡀ ⠄ ⠂ ⠁             │
-    │                           │⡀ ⠄ ⠁                     │
-    │                    ⡀ ⠄ ⠂ ⣁⡀                          │
-    │              ⡀ ⠄ ⣂⣀⠤⠤⠒⠒⠉⠉ │                          │
-    │        ⠄⢀⣂⣀⠥⠤⠒⠒⠉⠉         │                          │
-  0%│⣀⡠⠤⠤⠒⠒⠓⠉⠉⠁                 │                          │
+100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│⢀⣀⡠⠤⠒⠒⠉│
+    │                           │⣀⡠⠤⠔⠒⠉   │
+  0%│⣀⡠⠤⠤⠒⠒⠓⠉⠉⠁                 │
 08/09, 11:30                              08/09, 16:30 reset
-38% used, 2h 30m left, under pace, HARVEST
 
-EVENTS (last 8)
-No events
-
-LEASES / RESERVES / PACING
-reserve account-a:all: 10%
 q quit  p pause  v verbose  e events  g graphs  ? help
 ```
 
-This example uses mock data. Each hard percent window gets an eight-row graph after three
-distinct readings in that window. Its vertical scale is always 0 to 100% used; the dotted
-plan runs from 0% at the window start to 100% at reset. Usage above that line is over even
-pace. The vertical marker is now, and the shaded top band protects the configured reserve.
+This example uses mock data. The compact overview is first; press Tab to choose a principal and
+Enter to jump to its panel. Arrow keys or `j`/`k` scroll one line, PageUp/PageDown or space
+scroll a screen, and Home/End move to the ends. The right edge shows the scroll position.
+Each hard percent window gets a fixed 60-column, eight-row graph (40 by 6 below 100 columns)
+after two distinct readings in that window. Its vertical scale is always 0 to 100% used; the
+used and plan lines are continuous. Immediately after a reset, the prior period stays visible
+until the new period has two readings. The vertical marker is now, and the shaded top band
+protects the configured reserve.
 `--ascii` uses half blocks instead of braille dots, also selected automatically for `TERM=dumb`.
 
-At 100 columns, the account-wide weekly meter also shows a sparkline for the last seven days
+At 100 columns, the account-wide weekly meter also shows a braille sparkline for the last seven days
 with local day ticks: `F` marks a free-reset grant or use, `!` an unscheduled reset, and `*`
 both in the same column. Gaps mean no reading. A three-row wordmark appears at 100 columns
 and 30 rows. Pace glyphs remain readable without colour: `●` NORMAL, `↗` HARVEST,
@@ -344,8 +340,8 @@ and 30 rows. Pace glyphs remain readable without colour: `●` NORMAL, `↗` HAR
 `g` toggles graphs to save rows, `p` pauses/resumes reads, `v` shows burn, sustainable pace,
 reset evidence and idle markers, `e` widens events, `?` shows key help, and `q` exits. The
 terminal is restored on exit or error. Below 80 columns the footer stacks. Short terminals
-show an overflow notice. Colour requires a terminal; `NO_COLOR` or `--no-color` disables it.
-`--once`, or piping stdout, prints one grouped frame and exits.
+scroll the same content stream. Colour requires a terminal; `NO_COLOR` or `--no-color` disables it.
+`--once`, or piping stdout, prints the whole dashboard and exits.
 
 ## 6. Install the daemon
 

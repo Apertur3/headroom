@@ -11,3 +11,7 @@ process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
 process.env.HEADROOM_HOME = join(isolatedHome, ".headroom");
 delete process.env.CLAUDE_CONFIG_DIR;
+
+// Rendered clocks and day ticks appear in snapshot tests; pin the zone so a
+// runner in UTC and a developer in Europe agree on every frame.
+process.env.TZ = "Europe/Amsterdam";
