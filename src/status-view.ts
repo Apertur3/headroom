@@ -155,6 +155,12 @@ function paceSegment(observation: Observation): string {
   return ` burn ${formatRatePercent(burn)}, ok ${sustainableText}`;
 }
 
+function vendorWindowNote(observation: Observation): string {
+  if (observation.metadata?.vendor_inconsistent) return "vendor readings inconsistent, holding";
+  if (observation.metadata?.vendor_window_held) return "new window unconfirmed, holding";
+  return "";
+}
+
 function formatWindow(observation: Observation, state: PaceState, reason: string, resetSeen?: string, freeResetUsed?: string, reservePercent = 0, now = new Date()): string {
   if (isCredits(observation)) {
     const available = observation.quantity?.remaining ?? 0;
@@ -168,7 +174,8 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // around, not just when it happened.
   const decodedResetSeen = resetSeen ? decodeResetSeen(resetSeen) : undefined;
   const evidence = `${decodedResetSeen ? ` reset seen ${formatReset(decodedResetSeen.at, now)}${decodedResetSeen.unscheduled ? " (unscheduled)" : ""}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
-  const inconsistent = observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : "";
+  const vendorWindow = vendorWindowNote(observation);
+  const inconsistent = vendorWindow ? ` (${vendorWindow})` : "";
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -375,8 +382,10 @@ interface Row {
 }
 
 function usedCell(observation: Observation, state: PaceState): string {
-  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return `-${observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : ""}`;
-  return `${Math.round(observation.quantity.used)}% used${observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : ""}`;
+  const vendorWindow = vendorWindowNote(observation);
+  const note = vendorWindow ? ` (${vendorWindow})` : "";
+  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return `-${note}`;
+  return `${Math.round(observation.quantity.used)}% used${note}`;
 }
 
 /** A credit balance is a count with an expiry, not a window with a pace, so
@@ -402,7 +411,8 @@ function detailLine(observation: Observation, reservePercent: number, resetSeen:
   }
   if (observation.empty_in_seconds !== null && observation.empty_in_seconds !== undefined) parts.push(`empty in ${formatResetsIn(observation.empty_in_seconds)}`);
   if (observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON) parts.push("idle, unverified");
-  if (observation.metadata?.vendor_inconsistent) parts.push("vendor readings inconsistent, holding");
+  const vendorWindow = vendorWindowNote(observation);
+  if (vendorWindow) parts.push(vendorWindow);
   if (resetSeen) {
     const decoded = decodeResetSeen(resetSeen);
     parts.push(`reset seen ${formatReset(decoded.at, now)}${decoded.unscheduled ? " (unscheduled)" : ""}`);
