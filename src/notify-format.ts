@@ -108,6 +108,7 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
     }
     case "exhausted_cleared": return `✅ ${name} exhausted report cleared. Fresh capacity is available for dispatch again.`;
     case "window_retired": return message("🧹 Window retired", `${meter} is no longer reported by the vendor.`, "It no longer participates in dispatch decisions.");
+    case "vendor_inconsistent": return `⚠️ ${meter} readings flip-flopped between two windows; holding the earlier one`;
     case "source_failed": {
       const duration = Math.max(0, Math.floor((Date.parse(event.last_seen_at ?? event.created_at) - Date.parse(event.created_at)) / 60_000));
       const reason = clean(event.reason ?? current?.reason ?? "");
