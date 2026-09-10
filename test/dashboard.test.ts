@@ -47,6 +47,17 @@ function snapshotFrame(lines: string[]): string {
 }
 
 describe("dashboard frames (synthetic data)", () => {
+  it("distinguishes an unconfirmed new window from a confirmed vendor flip-flop", () => {
+    const model = fixedModel();
+    model.observations = [row({ metadata: { vendor_window_held: true } })];
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+      .toContain("new window unconfirmed, holding");
+
+    model.observations = [row({ metadata: { vendor_inconsistent: true } })];
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+      .toContain("vendor readings inconsistent, holding");
+  });
+
   it("keeps the overview first, scrolls a full screen, and Enter reaches the focused panel", () => {
     const model = fixedModel();
     for (let index = 0; index < 18; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all`, resets_at: "2026-09-08T16:00:00Z" }));

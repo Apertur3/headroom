@@ -71,6 +71,7 @@ interface VendorWindowSuspect {
 
 type VendorWindowTransition =
   | { kind: "normal" }
+  | { kind: "rollover"; baseline: StoredObservation }
   | { kind: "suspect"; baseline: StoredObservation }
   | { kind: "accepted"; suspect: VendorWindowSuspect }
   | { kind: "flip"; suspect: VendorWindowSuspect };
@@ -398,9 +399,11 @@ export class HeadroomStore {
     // output is redacted, so a token or cookie that leaked into a failure
     // reason or a metadata string never lands in the database either.
     const reason = resolved.reason ? redact(resolved.reason) : resolved.reason ?? null;
-    const metadata = redactDeep(transition.kind === "suspect" || transition.kind === "flip"
-      ? { ...resolved.metadata, vendor_inconsistent: true }
-      : resolved.metadata) as Observation["metadata"] | undefined;
+    const metadata = redactDeep(transition.kind === "suspect"
+      ? { ...resolved.metadata, vendor_window_held: true }
+      : transition.kind === "flip"
+        ? { ...resolved.metadata, vendor_inconsistent: true }
+        : resolved.metadata) as Observation["metadata"] | undefined;
     const result = this.db.prepare(`INSERT INTO observations
       (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
@@ -423,6 +426,8 @@ export class HeadroomStore {
       const baseline = this.observationById(transition.suspect.baseline_id);
       const suspect = this.observationById(transition.suspect.suspect_id);
       if (baseline && suspect) this.classifyUsageDrop(baseline, suspect, suspect.fetched_at);
+    } else if (transition.kind === "rollover") {
+      this.clearVendorWindowSuspect(stored);
     }
     // This must run on the raw vendor observation before any read-side gate
     // can see it. A fresh, sub-100 binding-window reading with a new reset is
@@ -433,7 +438,8 @@ export class HeadroomStore {
     // credit movement, spend and pace must all wait until the vendor has
     // supplied the same new window on the next ordinary poll.
     const held = transition.kind === "suspect" || transition.kind === "flip" || transition.kind === "accepted";
-    if (!held && previous) this.detectEvents(previous, stored);
+    const scheduledRolloverAt = transition.kind === "rollover" ? transition.baseline.resets_at ?? undefined : undefined;
+    if (!held && previous) this.detectEvents(previous, stored, scheduledRolloverAt);
     else if (held && previous?.freshness === "failed" && stored.freshness === "fresh") {
       const inferred = isInferredFailureReason(previous.reason);
       this.addEvent("source_recovered", inferred ? "inferred" : "vendor_reported", inferred ? 0.8 : 1, [previous.id, stored.id], stored);
@@ -442,7 +448,7 @@ export class HeadroomStore {
     // The first reading ever stored under this exact meter id has no immediate
     // previous row, even though the legacy doubled-principal form of the same
     // meter does; the baseline lookup below checks that form on its own.
-    else if (!held && stored.freshness === "fresh") { const baseline = this.freshBaseline(stored); if (baseline) this.classifyUsageDrop(baseline, stored); }
+    else if (!held && stored.freshness === "fresh") { const baseline = this.freshBaseline(stored); if (baseline) this.classifyUsageDrop(baseline, stored, undefined, scheduledRolloverAt); }
     // Independent of the window-scoped previous()/detectEvents() path above:
     // a windowless failure is only ever closed by this separate check.
     if (stored.freshness === "fresh") this.recoverWindowlessFailure(stored);
@@ -639,6 +645,7 @@ export class HeadroomStore {
     const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ?
       AND freshness = 'fresh' AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) IS ?
       AND COALESCE(json_extract(metadata_json, '$.vendor_inconsistent'), 0) = 0
+      AND COALESCE(json_extract(metadata_json, '$.vendor_window_held'), 0) = 0
       ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(observation.meter_id, minutes);
     return row ? observationFromRow(row) : undefined;
   }
@@ -649,15 +656,28 @@ export class HeadroomStore {
   private vendorWindowTransition(observation: Observation): VendorWindowTransition {
     if (observation.freshness !== "fresh" || observation.window?.kind !== "fixed" || !observation.window.minutes) return { kind: "normal" };
     const state = this.vendorWindowSuspect(observation);
+    const baseline = state
+      ? this.observationById(state.baseline_id) ?? this.acceptedWindowBaseline(observation)
+      : this.acceptedWindowBaseline(observation);
+    // A fixed window gets a new identity at its scheduled boundary. Permit a
+    // small early clock skew so its first new-period poll stays immediately
+    // usable rather than looking like issue #29's pre-boundary flip-flop.
+    // A missing previous reset cannot prove the old window still had time.
+    if (baseline && !this.sameReset(observation.resets_at, baseline.resets_at) && this.windowHasEnded(baseline, observation)) return { kind: "rollover", baseline };
     if (state) {
       if (this.sameReset(observation.resets_at, state.suspect_resets_at)) return { kind: "accepted", suspect: state };
       if (this.sameReset(observation.resets_at, state.baseline_resets_at)) return { kind: "flip", suspect: state };
-      const baseline = this.observationById(state.baseline_id) ?? this.acceptedWindowBaseline(observation);
       return baseline ? { kind: "suspect", baseline } : { kind: "normal" };
     }
-    const baseline = this.acceptedWindowBaseline(observation);
     if (!baseline || this.sameReset(observation.resets_at, baseline.resets_at)) return { kind: "normal" };
     return { kind: "suspect", baseline };
+  }
+
+  private windowHasEnded(baseline: StoredObservation, observation: Observation): boolean {
+    if (!baseline.resets_at) return true;
+    const resetAt = Date.parse(baseline.resets_at);
+    const fetchedAt = Date.parse(observation.fetched_at);
+    return Number.isFinite(resetAt) && Number.isFinite(fetchedAt) && fetchedAt >= resetAt - 2 * 60_000;
   }
 
   private setVendorWindowSuspect(suspect: StoredObservation, baseline: StoredObservation): void {
@@ -923,7 +943,7 @@ export class HeadroomStore {
    * one's 0.6. No scheduled reset inside the gap means this rule stays
    * silent and defers entirely to the ordinary beforeScheduledReset check
    * below (a vendor correction or a free reset fired ahead of schedule). */
-  private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation, createdAt?: string): void {
+  private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation, createdAt?: string, scheduledRolloverAt?: string): void {
     if (current.window?.kind === "state" || current.window?.kind === "count") return;
     if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
     const oldUsed = baseline.quantity.used;
@@ -969,7 +989,8 @@ export class HeadroomStore {
       // hold back a scheduled short-window one by default without a second
       // lookup.
       const unscheduled = Date.parse(current.fetched_at) < previousReset;
-      this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null), null, createdAt, {
+      const eventAt = unscheduled ? createdAt : scheduledRolloverAt;
+      this.addEvent("reset_seen", "inferred", stale ? 0.6 : 0.9, evidence, current, suffix(null), null, eventAt, {
         window_minutes: windowMinutes,
         ...(unscheduled ? { unscheduled: true, used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : {}),
       });
@@ -1036,7 +1057,7 @@ export class HeadroomStore {
       const rows = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND freshness = 'fresh' AND julianday(fetched_at) >= julianday(?) AND julianday(fetched_at) <= julianday(?) ORDER BY fetched_at ASC, id ASC")
         .all(observation.meter_id, since, nowIso)
         .map(observationFromRow)
-        .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent" && !row.metadata?.vendor_inconsistent);
+        .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent" && !row.metadata?.vendor_inconsistent && !row.metadata?.vendor_window_held);
       let samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
 
       const eventBoundary = this.lastResetEventAt(observation.meter_id, minutes, since, nowIso);
@@ -1133,7 +1154,7 @@ export class HeadroomStore {
     return summarizeLearnedCost(meterId, rows.map((row) => Number(row.spent)));
   }
 
-  private detectEvents(previous: StoredObservation, current: StoredObservation): void {
+  private detectEvents(previous: StoredObservation, current: StoredObservation, scheduledRolloverAt?: string): void {
     const evidence = [previous.id, current.id];
     if (current.freshness === "failed") {
       this.recordFailure(evidence, current);
@@ -1144,12 +1165,12 @@ export class HeadroomStore {
       const inferred = isInferredFailureReason(previous.reason);
       this.addEvent("source_recovered", inferred ? "inferred" : "vendor_reported", inferred ? 0.8 : 1, evidence, current);
       const baseline = this.freshBaseline(current);
-      if (baseline) this.classifyUsageDrop(baseline, current);
+      if (baseline) this.classifyUsageDrop(baseline, current, undefined, scheduledRolloverAt);
       return;
     }
     if (current.freshness === "fresh") {
       const baseline = this.freshBaseline(current);
-      if (baseline) this.classifyUsageDrop(baseline, current);
+      if (baseline) this.classifyUsageDrop(baseline, current, undefined, scheduledRolloverAt);
     }
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
@@ -1266,7 +1287,7 @@ export class HeadroomStore {
         const state = this.vendorWindowSuspect(current);
         if (!state || state.suspect_id !== current.id) return current;
         const earlier = this.observationById(state.baseline_id);
-        return earlier ? { ...earlier, metadata: { ...earlier.metadata, vendor_inconsistent: true } } : current;
+        return earlier ? { ...earlier, metadata: { ...earlier.metadata, vendor_window_held: true } } : current;
       });
   }
 

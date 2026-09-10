@@ -100,6 +100,9 @@ export interface Observation {
     /** This raw vendor reading disagreed with the adjacent window identity.
      * It is kept for auditability but never contributes to burn or pace. */
     vendor_inconsistent?: boolean;
+    /** A new vendor window identity seen once while the prior window still
+     * had time remaining. It is held pending the next ordinary poll. */
+    vendor_window_held?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the
