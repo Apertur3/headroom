@@ -68,7 +68,7 @@ name appears in both. Supported names:
 | `credits_changed`, `plan_changed` | Credit balance or subscription plan changes. |
 | `source_failed`, `source_recovered` | A source stopped answering or is reading again. |
 | `threshold` | A fresh hard window reached the used-percent threshold. |
-| `pace_projection_conserve` | Recent burn projects exhaustion before reset. |
+| `pace_projection_conserve` | Recent burn projects exhaustion before reset. Phone alerts fire once per window instance, with at most one materially worse escalation. |
 | `model_new` | A new model bucket on a known principal. A principal's first poll stays quiet. |
 | `grant_lapsed` | A historical Keychain grant lapse retained for existing event history. |
 | `lease_started`, `lease_ended` | Work reservations started or ended. |

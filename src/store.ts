@@ -949,7 +949,10 @@ export class HeadroomStore {
     const decision = paceDecision(enriched, defaultPolicy, new Date(current.fetched_at));
     if (decision.state !== "CONSERVE" || !decision.reason.startsWith("burning ")) return;
     if (this.recentPaceProjectionEvent(current.meter_id, minutes, current.fetched_at)) return;
-    this.addEvent("pace_projection_conserve", "inferred", 0.7, [current.id], current, decision.reason);
+    this.addEvent("pace_projection_conserve", "inferred", 0.7, [current.id], current, decision.reason, null, undefined, {
+      window_minutes: minutes, resets_at: current.resets_at ?? undefined,
+      burn_percent_per_hour: burn.burn_percent_per_hour, empty_in_seconds: burn.empty_in_seconds,
+    });
   }
 
   /**
@@ -1150,6 +1153,13 @@ export class HeadroomStore {
   notifyEnqueue(eventId: string, channel: string, text: string, at: string): void {
     this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'pending',0,?,NULL,?,?)")
       .run(eventId, channel, text, at, at);
+  }
+
+  /** Lookup for a deterministic notification identity. Projection delivery
+   * uses this ledger state to allow one plain alert and one escalation. */
+  notifyDelivery(eventId: string, channel: string): NotifyDelivery | undefined {
+    const row = this.db.prepare("SELECT * FROM notify_ledger WHERE event_id = ? AND channel = ?").get(eventId, channel);
+    return row ? notifyFromRow(row) : undefined;
   }
 
   /** Queued rows for one channel, oldest first: a single new event, or every

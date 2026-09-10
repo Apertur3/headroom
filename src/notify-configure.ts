@@ -25,7 +25,7 @@ const EVENT_LABELS: Record<string, string> = {
   reset_scheduled_short: "Scheduled 5h resets", free_reset_granted: "Free reset credits granted",
   free_reset_used: "Free resets used", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
   source_failed: "Source failures", source_recovered: "Source recoveries", threshold: "Threshold crossings",
-  pace_projection_conserve: "Projected stalls", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
+  pace_projection_conserve: "Projected stalls (once per window, plus one escalation)", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
   lease_started: "Leases started", lease_ended: "Leases ended", reset_seen: "Other scheduled resets",
 };
 

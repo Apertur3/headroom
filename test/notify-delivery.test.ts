@@ -95,6 +95,14 @@ const START = new Date("2026-09-03T11:00:00Z");
 const AFTER = new Date("2026-09-03T12:05:00Z");
 const LATER = new Date("2026-09-03T12:10:00Z");
 
+function projectedConfig(): NotifyConfig {
+  return { ...config(), channels: ["ntfy"], events: ["pace_projection_conserve"] };
+}
+
+async function startProjectedPass(store: HeadroomStore, fetcher: typeof fetch): Promise<void> {
+  await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T10:59:00Z") }));
+}
+
 describe("notification delivery", () => {
   it("sends nothing on the first pass, then one message per channel for a new event", async () => {
     const store = await openStore("headroom-notify-first-");
@@ -267,6 +275,101 @@ describe("notification delivery", () => {
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-06T14:06:00Z") }));
       expect(calls).toHaveLength(2);
       expect(calls[1].body).toContain("now 91%");
+    } finally { store.close(); }
+  });
+
+  it("notifies a meaningful projected stall once per window and ignores noisy estimates", async () => {
+    const store = await openStore("headroom-notify-projection-once-");
+    const { calls, fetcher } = recorder();
+    const resetsAt = "2026-09-07T15:00:00Z";
+    try {
+      await startProjectedPass(store, fetcher);
+      // About 32h to empty, then 29h and 34h. None is <6h or below half
+      // of the original alert, even though each hourly event is retained.
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", resetsAt));
+      store.insert(weekly(2.9, "2026-09-03T12:00:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      store.insert(weekly(4.5, "2026-09-03T12:30:00Z", resetsAt));
+      store.insert(weekly(6.17, "2026-09-03T13:01:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T13:02:00Z") }));
+      store.insert(weekly(7.5, "2026-09-03T13:31:00Z", resetsAt));
+      store.insert(weekly(8.88, "2026-09-03T14:02:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T14:03:00Z") }));
+      expect(calls).toHaveLength(1);
+      const events = store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "pace_projection_conserve");
+      expect(events).toHaveLength(3);
+      expect(events.map((event) => event.reason)).toEqual(expect.arrayContaining([expect.stringContaining("empty in 33h"), expect.stringContaining("empty in 29h"), expect.stringContaining("empty in 34h")]));
+    } finally { store.close(); }
+  });
+
+  it("allows exactly one projected-stall escalation below six hours", async () => {
+    const store = await openStore("headroom-notify-projection-escalate-");
+    const { calls, fetcher } = recorder();
+    const resetsAt = "2026-09-07T15:00:00Z";
+    try {
+      await startProjectedPass(store, fetcher);
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", resetsAt));
+      store.insert(weekly(3, "2026-09-03T12:00:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      // This new projection is well under six hours, so it gets the one
+      // allowed escalation. A later sub-six-hour event remains history only.
+      store.insert(weekly(5, "2026-09-03T12:30:00Z", resetsAt));
+      store.insert(weekly(80, "2026-09-03T13:01:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T13:02:00Z") }));
+      store.insert(weekly(80.5, "2026-09-03T13:31:00Z", resetsAt));
+      store.insert(weekly(81, "2026-09-03T14:02:00Z", resetsAt));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T14:03:00Z") }));
+      expect(calls).toHaveLength(2);
+      expect(calls[1].body).toContain("🐢 Projected stall");
+    } finally { store.close(); }
+  });
+
+  it("keeps a near-reset projected stall off the phone", async () => {
+    const store = await openStore("headroom-notify-projection-meaningful-");
+    const { calls, fetcher } = recorder();
+    try {
+      await startProjectedPass(store, fetcher);
+      // Emptying in roughly 79h with about 101h until reset is a real event,
+      // but not the clear-before-reset warning a phone alert should carry.
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", "2026-09-07T16:00:00Z"));
+      store.insert(weekly(1.25, "2026-09-03T12:00:00Z", "2026-09-07T16:00:00Z"));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      expect(store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "pace_projection_conserve")).toHaveLength(1);
+      expect(calls).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("notifies projected stalls again after resets_at changes", async () => {
+    const store = await openStore("headroom-notify-projection-new-reset-");
+    const { calls, fetcher } = recorder();
+    const firstReset = "2026-09-07T15:00:00Z";
+    const nextReset = "2026-09-09T15:00:00Z";
+    try {
+      await startProjectedPass(store, fetcher);
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", firstReset));
+      store.insert(weekly(3, "2026-09-03T12:00:00Z", firstReset));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      store.insert(weekly(0, "2026-09-03T13:00:00Z", nextReset));
+      store.insert(weekly(3, "2026-09-03T14:00:00Z", nextReset));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T14:01:00Z") }));
+      expect(calls).toHaveLength(2);
+    } finally { store.close(); }
+  });
+
+  it("coalesces same-principal projected stalls from two meters into one message", async () => {
+    const store = await openStore("headroom-notify-projection-coalesce-");
+    const { calls, fetcher } = recorder();
+    const resetsAt = "2026-09-07T15:00:00Z";
+    try {
+      await startProjectedPass(store, fetcher);
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", resetsAt));
+      store.insert(weekly(0, "2026-09-03T11:00:00Z", resetsAt, "claude-main:fable"));
+      store.insert(weekly(3, "2026-09-03T12:00:00Z", resetsAt));
+      store.insert(weekly(3, "2026-09-03T12:00:00Z", resetsAt, "claude-main:fable"));
+      await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toContain("🐢 Projected stall on Claude main: weekly");
+      expect(calls[0].body).toContain("Fable weekly");
     } finally { store.close(); }
   });
 

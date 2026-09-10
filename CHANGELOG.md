@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Projected-stall notifications fire once per window (plus one escalation when the projection gets materially worse) and only when the stall lands well before the reset; several meters of one account share one message.
+
 ## [0.1.0-beta.18] - 2026-09-10
 
 ### Fixed

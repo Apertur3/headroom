@@ -76,6 +76,7 @@ describe("scripted picker", () => {
     const next = await pickNotifications(current, answers, () => undefined);
     expect(next).toEqual(current);
     expect(answers.mock.calls.some(([question]) => question.includes("New model buckets (preset: no) [Y/n]"))).toBe(true);
+    expect(answers.mock.calls.some(([question]) => question.includes("Projected stalls (once per window, plus one escalation)"))).toBe(true);
   });
 
   it("writes choices using scripted answers and never reads a secret or sends when testing is declined", async () => {
