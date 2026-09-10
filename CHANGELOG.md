@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.21] - 2026-09-10
+
 ### Fixed
 
 - A scheduled window rollover is accepted immediately; the two-poll hold only applies to an unexpected window change.
