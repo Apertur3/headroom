@@ -20,6 +20,24 @@ export function humanName(value: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+export interface ProjectionSummary {
+  meter: string;
+  window_minutes: number;
+  burn_percent_per_hour: number;
+  empty_in_seconds: number;
+  reset_in_seconds: number;
+}
+
+/** Compact multi-meter form for one principal's projected stalls. */
+export function projectionBatchText(principal: string, projections: ProjectionSummary[]): string {
+  const facts = projections.map((projection) => {
+    const bucket = projection.meter.split(":").slice(1).join(":");
+    const label = `${bucket && bucket !== "all" ? `${humanName(bucket)} ` : ""}${windowName(projection.window_minutes) || "window"}`;
+    return `${label} ${Math.round(projection.burn_percent_per_hour)}%/h → empty in ${formatResetsIn(projection.empty_in_seconds)} (reset ${formatResetsIn(projection.reset_in_seconds)})`;
+  });
+  return `🐢 Projected stall on ${humanName(principal)}: ${facts.join("; ")}`;
+}
+
 function subject(principal: string | null, meter: string | null): string {
   const parts = meter?.split(":") ?? [];
   const name = humanName(principal ?? parts[0] ?? "Source");
