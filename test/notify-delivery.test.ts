@@ -85,6 +85,7 @@ const SEED_RESET_FETCHED_AT = "2026-09-03T12:01:00Z";
 function seedReset(store: HeadroomStore): void {
   store.insert(weekly(90, "2026-09-03T12:00:00Z", "2026-09-06T13:59:00Z"));
   store.insert(weekly(3, SEED_RESET_FETCHED_AT, "2026-09-13T13:59:00Z"));
+  store.insert(weekly(3, "2026-09-03T12:02:00Z", "2026-09-13T13:59:00Z"));
 }
 
 function options(extra: Partial<NotifyOptions> = {}): NotifyOptions {
@@ -166,6 +167,7 @@ describe("notification delivery", () => {
       const resetFetchedAt = new Date(night.getTime() - 60_000);
       store.insert(weekly(90, new Date(night.getTime() - 120_000).toISOString(), "2026-09-06T13:59:00Z"));
       store.insert(weekly(3, resetFetchedAt.toISOString(), "2026-09-13T13:59:00Z"));
+      store.insert(weekly(3, new Date(night.getTime() - 45_000).toISOString(), "2026-09-13T13:59:00Z"));
       store.insert(weekly(80, new Date(night.getTime() - 30_000).toISOString(), "2026-09-13T13:59:00Z", "claude-main:fable"));
       const held = await deliverNotifications(store, options({ config: quiet, fetcher, now: night }));
       expect(held).toMatchObject({ quiet: true, sent: 0 });
@@ -194,6 +196,7 @@ describe("notification delivery", () => {
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:30:00Z") }));
       const resetFetchedAt = new Date("2026-09-03T13:00:05Z"); // at, not before, the 13:00 scheduled instant
       store.insert(weekly(0, resetFetchedAt.toISOString(), "2026-09-10T13:00:00Z"));
+      store.insert(weekly(0, "2026-09-03T13:00:30Z", "2026-09-10T13:00:00Z"));
       store.insert(fiveHour(46, "2026-09-03T13:05:00Z", "2026-09-03T18:05:00Z"));
       const sent = await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T13:10:00Z") }));
       expect(sent.sent).toBe(1);
@@ -272,6 +275,7 @@ describe("notification delivery", () => {
       // The window reset and filled up again: a new window instance, so a new
       // crossing is worth a message.
       store.insert(weekly(91, "2026-09-06T14:05:00Z", "2026-09-13T13:59:00Z"));
+      store.insert(weekly(91, "2026-09-06T14:05:30Z", "2026-09-13T13:59:00Z"));
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-06T14:06:00Z") }));
       expect(calls).toHaveLength(2);
       expect(calls[1].body).toContain("now 91%");
@@ -350,6 +354,7 @@ describe("notification delivery", () => {
       store.insert(weekly(3, "2026-09-03T12:00:00Z", firstReset));
       await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T12:01:00Z") }));
       store.insert(weekly(0, "2026-09-03T13:00:00Z", nextReset));
+      store.insert(weekly(1, "2026-09-03T13:30:00Z", nextReset));
       store.insert(weekly(3, "2026-09-03T14:00:00Z", nextReset));
       await deliverNotifications(store, options({ config: projectedConfig(), fetcher, now: new Date("2026-09-03T14:01:00Z") }));
       expect(calls).toHaveLength(2);
