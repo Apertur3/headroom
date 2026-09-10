@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Dashboard scrolls with the mouse wheel and reports how many rows are below the fold.
+
 ## [0.1.0-beta.17] - 2026-09-09
 
 ### Added

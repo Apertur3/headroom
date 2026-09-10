@@ -7,7 +7,7 @@ import { createHmac } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
+import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, decodeDashboardKeys, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
 import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboard, readDashboardStore } from "../src/dashboard-data.js";
 import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
@@ -85,8 +85,8 @@ describe("dashboard frames (synthetic data)", () => {
         mock-6           [####................]  20% resets in 4h NORMAL ok░
         mock-7           [####................]  20% resets in 4h NORMAL ok░
         mock-8           [####................]  20% resets in 4h NORMAL ok░
-        mock-9           [####................]  20% resets in 4h NORMAL ok░
-      q quit  p pause  v verbose  e events  g graphs  ? help░"
+      ▼ 100 more rows  scroll: wheel / ↑↓ / PgDn░
+      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
     `);
     expect(paged.join("\n")).toMatchInlineSnapshot(`
       "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
@@ -111,8 +111,8 @@ describe("dashboard frames (synthetic data)", () => {
         gpu-box  BUSY  local-27b  2 running, 1 waiting  busy░
       ░
       mock-0  claude  Max  fresh <1m░
-        all        5h  [####................]  20% ● resets in 4h NORMAL░
-      q quit  p pause  v verbose  e events  g graphs  ? help░"
+      ▼ 78 more rows  scroll: wheel / ↑↓ / PgDn░
+      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
     `);
     expect(paged.join("\n")).not.toEqual(initial.join("\n"));
     expect(paged.at(-1)).toContain("q quit");
@@ -148,14 +148,14 @@ describe("dashboard frames (synthetic data)", () => {
         WEEKLY account-a:all | last 7 days | F free reset  ! unsch█
         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁█
         <local day ticks>
-      █
+      ░
       account-b  claude  failed <1m░
         UNKNOWN: cached read failed.░
         main       5h  [????????????????????]   - ? resets in ? UNKNOWN░
           last 41% at 13:30:00░
       ░
-      gpu-box  local░
-      q quit  p pause  v verbose  e events  g graphs  ? help░"
+      ▼ 10 more rows  scroll: wheel / ↑↓ / PgDn░
+      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
     `);
   });
   it("uses compact local-pool and credit summaries instead of percentage bars", () => {
@@ -202,7 +202,7 @@ describe("dashboard frames (synthetic data)", () => {
       13:50:00 !unscheduled reset_seen account-a:all                         | worker account-a:all 5% held, 1.0% spent, 20m left
                                                                              | reserve account-a:all: 10%
                                                                              | Capacity appeared; re-plan
-      q quit  p pause  v verbose  e events  g graphs  ? help"
+      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help"
     `);
   });
   it("bounds tiny, short and unicode frames without terminal controls", () => {
@@ -223,6 +223,26 @@ describe("dashboard frames (synthetic data)", () => {
 });
 
 describe("dashboard terminal", () => {
+  it("decodes terminal cursor and mouse input, including batched wheel reports", () => {
+    expect(decodeDashboardKeys("\x1b[A\x1bOA\x1b[B\x1bOB")).toEqual(["up", "up", "down", "down"]);
+    expect(decodeDashboardKeys("\x1b[5~\x1b[6~\x1b[H\x1b[1~\x1bOH\x1b[F\x1b[4~\x1bOF")).toEqual(["pageup", "pagedown", "home", "home", "home", "end", "end", "end"]);
+    expect(decodeDashboardKeys("\x1b[<65;10;4M\x1b[<65;10;5M\x1b[<65;10;6M")).toEqual(["wheeldown", "wheeldown", "wheeldown"]);
+    expect(decodeDashboardKeys("\x1b[<0;10;4M\x1b[<64;10;4m\x1b[Mabc")).toEqual([]);
+    expect(handleDashboardKey({ paused: false, verbose: false, eventsWide: false, help: false, quit: false, scroll: 10 }, "wheelup").scroll).toBe(7);
+  });
+  it("advertises scroll controls and the rows below the fold in the default footer", () => {
+    const top = renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false });
+    expect(top.join("\n")).toMatch(/▼ \d+ more rows  scroll: wheel \/ ↑↓ \/ PgDn/);
+    expect(top.at(-1)).toContain("↑↓/PgDn scroll");
+    expect(top.at(-1)).toContain("? help");
+    const bottom = renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false, scroll: Number.MAX_SAFE_INTEGER });
+    expect(bottom.join("\n")).toContain("▲ back to top: Home");
+    expect(renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false, ascii: true }).join("\n")).toMatch(/v \d+ more rows  scroll: wheel \/ up\/down \/ PgDn/);
+  });
+  it("enables SGR mouse reporting on entry and disables it on exit", () => {
+    expect(ENTER_DASHBOARD).toContain("\x1b[?1000h\x1b[?1006h");
+    expect(LEAVE_DASHBOARD).toContain("\x1b[?1006l\x1b[?1000l");
+  });
   it("uses an explicit one-based cursor origin for every redraw", async () => {
     const fake = terminal(); const run = dashboardCommand([], fake.io); await Promise.resolve();
     expect(fake.writes.at(-1)).toMatch(/^\x1b\[1;1H/);

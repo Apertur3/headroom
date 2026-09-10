@@ -322,8 +322,9 @@ q quit  p pause  v verbose  e events  g graphs  ? help
 ```
 
 This example uses mock data. The compact overview is first; press Tab to choose a principal and
-Enter to jump to its panel. Arrow keys or `j`/`k` scroll one line, PageUp/PageDown or space
-scroll a screen, and Home/End move to the ends. The right edge shows the scroll position.
+Enter to jump to its panel. Use the mouse wheel to scroll too; Arrow keys or `j`/`k` scroll one
+line, PageUp/PageDown or space scroll a screen, and Home/End move to the ends. The right edge
+shows the scroll position and the footer reports rows below the fold.
 Each hard percent window gets a fixed 60-column, eight-row graph (40 by 6 below 100 columns)
 after two distinct readings in that window. Its vertical scale is always 0 to 100% used; the
 used and plan lines are continuous. Immediately after a reset, the prior period stays visible
