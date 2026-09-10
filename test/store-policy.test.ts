@@ -158,6 +158,7 @@ describe("SQLite observations and event detector", () => {
       // First fresh reading after the day of failures: 40% used, the weekly
       // window rolled forward to next week.
       store.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-09T14:16:00Z"));
+      store.insert(fable(40, "2026-09-04T00:00:00Z", "2026-09-09T14:16:00Z"));
       const events = store.events("2026-09-02T00:00:00Z").filter((event) => event.meter_id === "claude-main:fable");
       const resetEvents = events.filter((event) => event.kind === "reset_seen");
       expect(resetEvents).toHaveLength(1);
@@ -239,6 +240,7 @@ describe("SQLite observations and event detector", () => {
       withStore.insert(failed("2026-09-02T20:00:00Z"));
       withStore.insert(failed("2026-09-03T10:00:00Z"));
       withStore.insert(fable(40, "2026-09-03T23:45:00Z", "2026-09-09T14:16:00Z"));
+      withStore.insert(fable(40, "2026-09-04T00:00:00Z", "2026-09-09T14:16:00Z"));
       const latest = withStore.latestPerWindow("claude-main:fable");
       const seen = withStore.resetSeenFor(latest, new Date("2026-09-04T00:00:00Z"));
       const line = formatMeters(latest, defaultPolicy, seen)[0];
@@ -271,6 +273,7 @@ describe("SQLite observations and event detector", () => {
       // The window's own reset fired: resets_at moved forward by a full week,
       // far more than the minute that actually passed between polls.
       store.insert(weekly(3, "2026-09-03T12:01:00Z", "2026-09-13T13:59:00Z"));
+      store.insert(weekly(3, "2026-09-03T12:02:00Z", "2026-09-13T13:59:00Z"));
       const advanced = store.events("2026-09-03T00:00:00Z").find((event) => event.kind === "reset_seen");
       expect(advanced).toMatchObject({ origin: "inferred", confidence: 0.9 });
 
@@ -296,6 +299,7 @@ describe("SQLite observations and event detector", () => {
       // onto the next cycle.
       store.insert(weekly(88, "2026-09-03T01:00:00Z", "2026-09-08T01:24:26Z"));
       store.insert(weekly(0, "2026-09-03T01:24:26Z", "2026-09-15T01:24:26Z"));
+      store.insert(weekly(0, "2026-09-03T01:25:00Z", "2026-09-15T01:24:26Z"));
       const events = store.events("2026-09-03T00:00:00Z").filter((event) => event.meter_id === "codex-main:main");
       const resetEvent = events.find((event) => event.kind === "reset_seen");
       expect(resetEvent).toMatchObject({
@@ -319,6 +323,7 @@ describe("SQLite observations and event detector", () => {
       store.insert(weekly(92, "2026-09-08T01:00:00Z", "2026-09-08T01:24:26Z"));
       // Polled a few seconds AFTER the scheduled 01:24:26 instant.
       store.insert(weekly(0, "2026-09-08T01:24:30Z", "2026-09-15T01:24:26Z"));
+      store.insert(weekly(0, "2026-09-08T01:25:00Z", "2026-09-15T01:24:26Z"));
       const resetEvent = store.events("2026-09-08T00:00:00Z").find((event) => event.kind === "reset_seen" && event.meter_id === "codex-main:main");
       expect(resetEvent).toBeDefined();
       expect(resetEvent!.metadata?.unscheduled).toBeFalsy();

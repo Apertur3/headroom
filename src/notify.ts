@@ -26,7 +26,7 @@ const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
 
 const EVENT_KINDS: readonly EventKind[] = [
   "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed", "exhausted_reported", "exhausted_cleared", "window_retired",
-  "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed",
+  "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed", "vendor_inconsistent",
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
  * latest reading of every hard window, once per window instance. */
@@ -35,7 +35,7 @@ export const NOTIFY_EVENT_NAMES: readonly string[] = [...EVENT_KINDS, "threshold
 export type NotifyPreset = "calm" | "quiet" | "everything";
 export const RESET_EVENT_NAMES = ["reset_unscheduled", "reset_scheduled_weekly", "reset_scheduled_short"] as const;
 export const PRESET_EVENTS: Record<NotifyPreset, readonly string[]> = {
-  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "threshold"],
+  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold"],
   quiet: ["reset_unscheduled", "source_failed", "threshold"],
   everything: [...EVENT_KINDS.filter((kind) => kind !== "reset_seen"), ...RESET_EVENT_NAMES, "threshold"],
 };
