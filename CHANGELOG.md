@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A vendor window that flips between two states no longer produces reset or free-reset events; the new window must persist for two polls, and a flip-flop is reported once as vendor-inconsistent.
+
 ## [0.1.0-beta.19] - 2026-09-10
 
 ### Fixed

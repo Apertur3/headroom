@@ -97,6 +97,9 @@ export interface Observation {
     exhausted_ignored?: boolean;
     exhausted_report_id?: string;
     retired?: boolean;
+    /** This raw vendor reading disagreed with the adjacent window identity.
+     * It is kept for auditability but never contributes to burn or pace. */
+    vendor_inconsistent?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the
@@ -139,7 +142,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent";
 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by

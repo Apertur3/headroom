@@ -21,7 +21,7 @@ function script(answers: string[]) {
 
 describe("notification presets", () => {
   it("resolves all three presets with off winning a conflicting override", () => {
-    expect(config().events).toEqual(["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "threshold"]);
+    expect(config().events).toEqual(["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold"]);
     expect(config('preset = "quiet"').events).toEqual(["reset_unscheduled", "source_failed", "threshold"]);
     expect(config('preset = "everything"').events).toContain("grant_lapsed");
     expect(config().threshold_percent).toBe(90);

@@ -168,6 +168,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // around, not just when it happened.
   const decodedResetSeen = resetSeen ? decodeResetSeen(resetSeen) : undefined;
   const evidence = `${decodedResetSeen ? ` reset seen ${formatReset(decodedResetSeen.at, now)}${decodedResetSeen.unscheduled ? " (unscheduled)" : ""}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
+  const inconsistent = observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : "";
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -176,7 +177,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     // A windowless row's borrowed reading names its source window first
     // ("last wk 41% at ...") the same way the compact form does.
     const known = observation.last_known ? `; last ${lastKnownWindowPrefix(observation.last_known)}${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
-    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${evidence}`;
+    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${inconsistent}${evidence}`;
   }
   const seconds = resetsIn(observation.resets_at, now).resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
@@ -188,7 +189,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // The protected reserve (policy.toml [reserve]) follows the numbers so a
   // reader can see why a healthy-looking percentage still produced a NO from
   // gate/fill/route/can. It never changes the pace state beside it.
-  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)} ↻${formatReset(observation.resets_at, now)}${countdown} ${state}${doubt}${evidence}${paceSegment(observation)}`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)} ↻${formatReset(observation.resets_at, now)}${countdown} ${state}${doubt}${inconsistent}${evidence}${paceSegment(observation)}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -374,8 +375,8 @@ interface Row {
 }
 
 function usedCell(observation: Observation, state: PaceState): string {
-  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return "-";
-  return `${Math.round(observation.quantity.used)}% used`;
+  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return `-${observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : ""}`;
+  return `${Math.round(observation.quantity.used)}% used${observation.metadata?.vendor_inconsistent ? " (vendor readings inconsistent, holding)" : ""}`;
 }
 
 /** A credit balance is a count with an expiry, not a window with a pace, so
@@ -401,6 +402,7 @@ function detailLine(observation: Observation, reservePercent: number, resetSeen:
   }
   if (observation.empty_in_seconds !== null && observation.empty_in_seconds !== undefined) parts.push(`empty in ${formatResetsIn(observation.empty_in_seconds)}`);
   if (observation.truth === "estimated" && observation.reason === IDLE_WINDOW_REASON) parts.push("idle, unverified");
+  if (observation.metadata?.vendor_inconsistent) parts.push("vendor readings inconsistent, holding");
   if (resetSeen) {
     const decoded = decodeResetSeen(resetSeen);
     parts.push(`reset seen ${formatReset(decoded.at, now)}${decoded.unscheduled ? " (unscheduled)" : ""}`);

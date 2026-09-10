@@ -26,7 +26,7 @@ const EVENT_LABELS: Record<string, string> = {
   free_reset_used: "Free resets used", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
   source_failed: "Source failures", source_recovered: "Source recoveries", threshold: "Threshold crossings",
   pace_projection_conserve: "Projected stalls (once per window, plus one escalation)", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
-  lease_started: "Leases started", lease_ended: "Leases ended", reset_seen: "Other scheduled resets",
+  lease_started: "Leases started", lease_ended: "Leases ended", vendor_inconsistent: "Vendor readings inconsistent", reset_seen: "Other scheduled resets",
 };
 
 function clock(minutes: number): string { return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`; }

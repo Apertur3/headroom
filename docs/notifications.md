@@ -9,9 +9,9 @@ and prints the command to run later.
 
 | Preset | What reaches your phone |
 | --- | --- |
-| `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, source failures and recoveries, threshold crossings. |
+| `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, vendor-inconsistent readings, source failures and recoveries, threshold crossings. |
 | `quiet` | Unscheduled resets, source failures and threshold crossings. |
-| `everything` | All event kinds, including scheduled 5h resets, projected stalls, new model buckets, historical Keychain grant-lapse events, credit and plan changes, and leases. |
+| `everything` | All event kinds, including vendor-inconsistent readings, scheduled 5h resets, projected stalls, new model buckets, historical Keychain grant-lapse events, credit and plan changes, and leases. |
 
 The picker asks one question at a time: channels and destinations, preset,
 individual event choices if wanted, quiet hours, then an optional test message.
@@ -65,6 +65,7 @@ name appears in both. Supported names:
 | `reset_scheduled_short` | A scheduled 5h reset. |
 | `reset_seen` | All resets, subject to the short-window rule below. Turning it off disables all resets. |
 | `free_reset_granted`, `free_reset_used` | Reset credits granted or consumed. |
+| `vendor_inconsistent` | Vendor readings flipped between two window identities; Headroom is holding the earlier reading. |
 | `credits_changed`, `plan_changed` | Credit balance or subscription plan changes. |
 | `source_failed`, `source_recovered` | A source stopped answering or is reading again. |
 | `threshold` | A fresh hard window reached the used-percent threshold. |

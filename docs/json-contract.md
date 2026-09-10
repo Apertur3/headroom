@@ -123,7 +123,11 @@ stored); `observed_at`, `fetched_at` (both ISO strings); `source` (string,
 free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 `adapter_version`, `upstream_schema_version` (both strings); `reason?: string
 | null`; `metadata?: {...}` (optional, vendor facts -- see `types.ts`, never
-credentials or prompt content); `burn_percent_per_hour?: number | null`,
+credentials or prompt content). `metadata.vendor_inconsistent?: boolean` is
+`true` when adjacent vendor reads disagreed about the window identity; status
+then keeps showing the earlier window while Headroom waits for a second
+matching poll. Flagged raw rows remain available in history but do not affect
+burn or pace. `burn_percent_per_hour?: number | null`,
 `empty_in_seconds?: number | null`, `sustainable_percent_per_hour?: number |
 null` (present once pace-enriched, which every `status`/`can`/`gate`/`rate`
 read is); `last_known?: { used_percent: number, resets_at: string | null,

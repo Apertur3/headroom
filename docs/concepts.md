@@ -340,6 +340,18 @@ on any meter the call touched: `["unscheduled reset on codex-main:main at
 2026-09-08T01:24:26Z; capacity appeared, re-plan"]`. The notifier gives it its own text too --
 see [notifications.md](notifications.md).
 
+### Inconsistent vendor windows
+
+When a fresh vendor reading names a different reset time for the same meter
+and window length, Headroom holds it as suspect instead of immediately
+recording a reset or a reset-credit change. The new window becomes current
+only after the next ordinary poll agrees; its inferred event is timestamped at
+the first suspect reading. If the next poll returns to the earlier window,
+both conflicting raw rows are marked `metadata.vendor_inconsistent: true`, no
+reset event is recorded, and status keeps the earlier reading with a holding
+note. A `vendor_inconsistent` notification is emitted at most once per meter
+per six hours. Flagged rows never contribute to burn-rate or pace calculations.
+
 ## Export
 
 `headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind
