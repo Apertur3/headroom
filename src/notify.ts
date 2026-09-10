@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
-import { eventText, planDowngradeText, thresholdText } from "./notify-format.js";
+import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
 import { HeadroomStore } from "./store.js";
-import type { EventKind, HeadroomEvent, NotifyDelivery } from "./types.js";
+import type { EventKind, HeadroomEvent, NotifyDelivery, Observation } from "./types.js";
 
 /** Telegram rejects a message body over 4096 characters. 3800 leaves room for
  * the batch header a combined quiet-hours message adds. */
@@ -73,6 +73,19 @@ export interface NotifyItem {
   principal: string | null;
   at: string;
   text: string;
+  /** Stored in the ledger payload so a later noisy projection can compare
+   * itself with the first alert for this window instance. */
+  projection?: ProjectionDetails;
+}
+
+export interface ProjectionDetails {
+  meter: string;
+  principal: string;
+  window_minutes: number;
+  resets_at: string;
+  burn_percent_per_hour: number;
+  empty_in_seconds: number;
+  reset_in_seconds: number;
 }
 
 function invalid(detail: string): Error { return new Error(`Invalid Headroom notify config: ${detail}`); }
@@ -463,10 +476,48 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
   try {
     const parsed = JSON.parse(row.text) as Partial<NotifyItem>;
     if (parsed && typeof parsed.text === "string") {
-      return { id: row.event_id, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text };
+      return { id: row.event_id, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text, projection: projectionDetails(parsed.projection) };
     }
   } catch { /* A row written by an older build is still deliverable as text. */ }
   return { id: row.event_id, kind: "event", meter: null, principal: null, at: row.created_at, text: row.text };
+}
+
+function projectionDetails(value: unknown): ProjectionDetails | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Partial<ProjectionDetails>;
+  if (typeof item.meter !== "string" || typeof item.principal !== "string" || typeof item.resets_at !== "string") return undefined;
+  if (![item.window_minutes, item.burn_percent_per_hour, item.empty_in_seconds, item.reset_in_seconds].every((number) => typeof number === "number" && Number.isFinite(number))) return undefined;
+  return item as ProjectionDetails;
+}
+
+function projectionSeconds(value: string): number | undefined {
+  const matches = [...value.matchAll(/(\d+)\s*([dhms])/g)];
+  if (!matches.length) return undefined;
+  const scale: Record<string, number> = { d: 86_400, h: 3_600, m: 60, s: 1 };
+  return matches.reduce((total, match) => total + Number(match[1]) * scale[match[2]]!, 0);
+}
+
+function projectionForEvent(event: HeadroomEvent, evidence: Observation[]): ProjectionDetails | undefined {
+  const current = evidence.at(-1);
+  const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
+  const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
+  const reset = resetsAt ? Date.parse(resetsAt) : Number.NaN;
+  const created = Date.parse(event.created_at);
+  const fallback = /^burning (\d+)%\/h, empty in (.+), reset in (.+)$/.exec(event.reason ?? "");
+  const empty = event.metadata?.empty_in_seconds ?? (fallback ? projectionSeconds(fallback[2]) : undefined);
+  const burn = event.metadata?.burn_percent_per_hour ?? (fallback ? Number(fallback[1]) : undefined);
+  if (!event.meter_id || !event.principal_id || !minutes || !resetsAt || !Number.isFinite(reset) || !Number.isFinite(created) || empty === undefined || burn === undefined) return undefined;
+  const resetIn = (reset - created) / 1_000;
+  if (!Number.isFinite(empty) || !Number.isFinite(burn) || resetIn <= 0) return undefined;
+  return { meter: event.meter_id, principal: event.principal_id, window_minutes: minutes, resets_at: resetsAt, burn_percent_per_hour: burn, empty_in_seconds: empty, reset_in_seconds: resetIn };
+}
+
+function projectionItem(event: HeadroomEvent, evidence: Observation[], siblings: Observation[]): NotifyItem | undefined {
+  const projection = projectionForEvent(event, evidence);
+  // A stall close to the reset remains visible in status and event history,
+  // but is not worth a phone interruption. Strictly under 75% leaves a gap.
+  if (!projection || projection.empty_in_seconds >= projection.reset_in_seconds * 0.75) return undefined;
+  return { id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence, siblings), projection };
 }
 
 /** Overrides for a reset category take precedence over the reset_seen umbrella. */
@@ -510,9 +561,51 @@ function collectItems(store: HeadroomStore, config: NotifyConfig, since: string)
   const siblings = store.latestPerWindow();
   const events = store.events(since).filter((event) => wantsEvent(event, config));
   const evidence = store.eventObservations(events);
-  const items: NotifyItem[] = events.map((event) => ({ id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence.get(event.id), siblings) }));
+  const items: NotifyItem[] = events.flatMap<NotifyItem>((event) => event.kind === "pace_projection_conserve"
+    ? (projectionItem(event, evidence.get(event.id) ?? [], siblings) ?? [])
+    : [{ id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence.get(event.id), siblings) }]);
   if (wanted.has("threshold") && config.threshold_percent !== null) items.push(...thresholdItems(store, config.threshold_percent));
   return items;
+}
+
+function projectionLedgerId(projection: ProjectionDetails, stage: "plain" | "escalation"): string {
+  return `pace_projection:${projection.meter}:${projection.window_minutes}:${projection.resets_at}:${stage}`;
+}
+
+/** Admit a projection to the usual notification ledger only once per window
+ * instance, then once more if it becomes materially worse. Source events are
+ * intentionally never removed or deduplicated. */
+function projectionDeliveryItems(store: HeadroomStore, channel: ChannelName, items: NotifyItem[]): NotifyItem[] {
+  return items.flatMap((item) => {
+    const projection = item.projection;
+    if (!projection) return [item];
+    const plain = store.notifyDelivery(projectionLedgerId(projection, "plain"), channel);
+    if (!plain) return [{ ...item, id: projectionLedgerId(projection, "plain") }];
+    const escalation = store.notifyDelivery(projectionLedgerId(projection, "escalation"), channel);
+    const previous = decodeItem(plain).projection;
+    const materiallyWorse = projection.empty_in_seconds < 6 * 3_600
+      || previous !== undefined && projection.empty_in_seconds < previous.empty_in_seconds / 2;
+    return !escalation && materiallyWorse ? [{ ...item, id: projectionLedgerId(projection, "escalation") }] : [];
+  });
+}
+
+/** Fold simultaneous projected-stall notices from separate meters of one
+ * account into one concise phone message. */
+function coalesceProjectionItems(items: NotifyItem[]): NotifyItem[] {
+  const groups = new Map<string, NotifyItem[]>();
+  for (const item of items) if (item.projection) groups.set(item.projection.principal, [...(groups.get(item.projection.principal) ?? []), item]);
+  const grouped = new Set<string>();
+  const result: NotifyItem[] = [];
+  for (const item of items) {
+    const projection = item.projection;
+    const group = projection ? groups.get(projection.principal) : undefined;
+    const meters = new Set(group?.map((candidate) => candidate.projection!.meter));
+    if (!projection || !group || meters.size < 2) { result.push(item); continue; }
+    if (grouped.has(projection.principal)) continue;
+    grouped.add(projection.principal);
+    result.push({ ...item, meter: null, text: projectionBatchText(projection.principal, group.map((candidate) => candidate.projection!)) });
+  }
+  return result;
 }
 
 function downgradeReminderItems(store: HeadroomStore, now: Date): NotifyItem[] {
@@ -548,7 +641,7 @@ async function flushChannel(store: HeadroomStore, channel: PreparedChannel, log:
   if (!rows.length) return 0;
   const ids = rows.map((row) => row.id);
   try {
-    await channel.deliver(rows.map(decodeItem), quiet);
+    await channel.deliver(coalesceProjectionItems(rows.map(decodeItem)), quiet);
     store.setDaemonState(`notify_quiet:${channel.channel}`, "false");
     store.notifyDelivered(ids, now.toISOString());
     return rows.length;
@@ -606,7 +699,7 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   const watermark = store.daemonState(WATERMARK_KEY);
   const items = watermark === undefined ? [] : [...collectItems(store, config, watermark), ...downgradeReminderItems(store, now)];
   store.setDaemonState(WATERMARK_KEY, now.toISOString());
-  for (const item of items) for (const channel of ready) store.notifyEnqueue(item.id, channel.channel, encodeItem(item), now.toISOString());
+  for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) store.notifyEnqueue(item.id, channel.channel, encodeItem(item), now.toISOString());
   if (inQuietHours(config, now)) {
     let sent = 0;
     for (const channel of ready) {
