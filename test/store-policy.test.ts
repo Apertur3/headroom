@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { endedLeaseMessage, formatMeters, printEventsOutput, thresholdReport } from "../src/cli.js";
@@ -10,7 +10,7 @@ import { IDLE_WINDOW_REASON, idleContradictionReason } from "../src/engine/obser
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 function observation(overrides: Partial<Observation> = {}): Observation {
   const now = new Date("2026-09-03T12:00:00Z");
@@ -495,6 +495,10 @@ describe("SQLite observations and event detector", () => {
   });
 
   it("backfills a missing reset event across a failure gap and removes false local-pool reset events, once per database", async () => {
+    // The backfill deliberately only replays its latest seven days. Keep this
+    // fixture inside that window rather than letting its fixed dates age out.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-10T19:00:00Z"));
     const root = await mkdtemp(join(tmpdir(), "headroom-store-backfill-")); temporary.push(root);
     const home = join(root, ".headroom");
     const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: new (path: string) => { exec(sql: string): void; close(): void } };
