@@ -1,4 +1,3 @@
-import { emitKeypressEvents } from "node:readline";
 import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
@@ -77,8 +76,8 @@ export async function gatherDashboard(): Promise<DashboardModel> {
 }
 
 export const DASHBOARD_HELP = "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose] [--ascii]";
-export const ENTER_DASHBOARD = "\x1b[?1049h\x1b[?25l";
-export const LEAVE_DASHBOARD = "\x1b[0m\x1b[?25h\x1b[?1049l";
+export const ENTER_DASHBOARD = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h";
+export const LEAVE_DASHBOARD = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 const KEYS = "q quit  p pause  v verbose  e events  g graphs  arrows/jk scroll  PgUp/PgDn/space page  Home/End  Tab focus  Enter panel  ? help";
 const GRAPH_LEGEND = "Burndown: solid used and plan, │ now, ░ reserve";
 
@@ -94,12 +93,54 @@ export function handleDashboardKey(state: DashboardState, key: string, pageRows 
   if (key === "?") return { ...state, help: !state.help };
   if (key === "up" || key === "k") return { ...state, scroll: Math.max(0, (state.scroll ?? 0) - 1) };
   if (key === "down" || key === "j") return { ...state, scroll: (state.scroll ?? 0) + 1 };
+  if (key === "wheelup") return { ...state, scroll: Math.max(0, (state.scroll ?? 0) - 3) };
+  if (key === "wheeldown") return { ...state, scroll: (state.scroll ?? 0) + 3 };
   if (key === "pageup") return { ...state, scroll: Math.max(0, (state.scroll ?? 0) - pageRows) };
   if (key === "pagedown" || key === " ") return { ...state, scroll: (state.scroll ?? 0) + pageRows };
   if (key === "home") return { ...state, scroll: 0 };
   if (key === "end") return { ...state, scroll: Number.MAX_SAFE_INTEGER };
   if (key === "tab") return { ...state, focus: (state.focus ?? 0) + 1 };
   return state;
+}
+
+/** Decode raw terminal input without letting mouse reports become keyboard input. */
+export function decodeDashboardKeys(chunk: string): string[] {
+  const keys: string[] = [];
+  const sequences: Record<string, string> = {
+    "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+    "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
+    "\x1b[H": "home", "\x1b[1~": "home", "\x1bOH": "home",
+    "\x1b[F": "end", "\x1b[4~": "end", "\x1bOF": "end",
+  };
+  for (let index = 0; index < chunk.length;) {
+    const rest = chunk.slice(index);
+    const sequence = Object.keys(sequences).find((value) => rest.startsWith(value));
+    if (sequence) { keys.push(sequences[sequence]); index += sequence.length; continue; }
+    // X10 reports are six bytes. Consume them, including non-UTF-8 coordinate bytes.
+    if (rest.startsWith("\x1b[M")) { index += Math.min(6, rest.length); continue; }
+    const sgr = /^\x1b\[<(\d+);\d+;\d+([Mm])/.exec(rest);
+    if (sgr) {
+      if (sgr[2] === "M" && sgr[1] === "64") keys.push("wheelup");
+      if (sgr[2] === "M" && sgr[1] === "65") keys.push("wheeldown");
+      index += sgr[0].length;
+      continue;
+    }
+    // Ignore every other complete CSI or SS3 sequence rather than treating its
+    // final bytes as ordinary keys.
+    if (rest.startsWith("\x1b[")) {
+      const final = rest.slice(2).search(/[\x40-\x7e]/);
+      index += final >= 0 ? final + 3 : rest.length;
+      continue;
+    }
+    if (rest.startsWith("\x1bO")) { index += Math.min(3, rest.length); continue; }
+    if (rest[0] === "\x1b") { index++; continue; }
+    const char = rest[0];
+    if (char === "\r" || char === "\n") keys.push("enter");
+    else if (char === "\t") keys.push("tab");
+    else keys.push(char);
+    index++;
+  }
+  return keys;
 }
 
 function clean(text: string): string { return stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " "); }
@@ -377,30 +418,58 @@ function dashboardContent(model: DashboardModel, view: DashboardView): Dashboard
   return { lines, panels, principals };
 }
 
-/** A deterministic dashboard frame with a fixed header and a scrollable content viewport. */
-export function renderDashboard(model: DashboardModel, options: DashboardView): string[] {
+function dashboardControls(width: number, ascii = false): string {
+  const scroll = ascii ? "up/down/PgDn scroll" : "↑↓/PgDn scroll";
+  const full = `q quit  p pause  v verbose  e events  g graphs  ${scroll}  ? help`;
+  const withoutGraphs = `q quit  p pause  v verbose  e events  ${scroll}  ? help`;
+  const compact = `q p v e  ${scroll}  ? help`;
+  return length(full) <= width ? full : length(withoutGraphs) <= width ? withoutGraphs : compact;
+}
+
+interface DashboardLayout {
+  header: string[];
+  content: DashboardContent;
+  footer: string[];
+  room: number;
+  maxScroll: number;
+  scroll: number;
+}
+
+function dashboardLayout(model: DashboardModel, options: DashboardView): DashboardLayout {
   const width = Math.max(1, Math.floor(options.width) || 80), height = Math.max(1, Math.floor(options.height) || 24);
   const latest = Math.max(...model.observations.map((row) => Date.parse(row.fetched_at)).filter(Number.isFinite));
   const source = model.direct ? "direct read" : Number.isFinite(latest) ? `daemon fresh ${Math.max(0, Math.floor((model.now.getTime() - latest) / 1000))}s ago` : "daemon, no readings yet";
   const title = `Headroom ${model.version} | ${source} | ${clock(model.now)}`;
   const art = width >= 100 && (options.terminalHeight ?? height) >= 30;
-  const titleLines = art ? ["╷ ╷ ╭── ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭╮╭╮", `├─┤ ├─  ├─┤ │ │ ├┬╯ │ │ │ │ │╰╯│  ${title}`, "╵ ╵ ╰── ╵ ╵ ╰─╯ ╵╰╴ ╰─╯ ╰─╯ ╵  ╵"] : [title];
-  const header = [...(model.planDowngraded ?? []).map(planDowngradeLine), ...titleLines];
-  const help = options.help ? [KEYS, GRAPH_LEGEND] : ["q quit  p pause  v verbose  e events  g graphs  ? help"];
+  const header = [...(model.planDowngraded ?? []).map(planDowngradeLine), ...(art ? ["╷ ╷ ╭── ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭─╮ ╭╮╭╮", `├─┤ ├─  ├─┤ │ │ ├┬╯ │ │ │ │ │╰╯│  ${title}`, "╵ ╵ ╰── ╵ ╵ ╰─╯ ╵╰╴ ╰─╯ ╰─╯ ╵  ╵"] : [title])];
   const bodyWidth = width > 1 ? width - 1 : 1;
   const content = dashboardContent(model, { ...options, width: bodyWidth, height });
-  const room = Math.max(0, height - header.length - help.length);
+  const baseFooter = options.help ? [KEYS, GRAPH_LEGEND] : [dashboardControls(bodyWidth, options.ascii)];
+  const baseRoom = Math.max(0, height - header.length - baseFooter.length);
+  const overflows = content.lines.length > baseRoom;
+  const room = Math.max(0, height - header.length - baseFooter.length - (overflows ? 1 : 0));
   const maxScroll = Math.max(0, content.lines.length - room);
   const scroll = Math.min(maxScroll, Math.max(0, options.scroll ?? 0));
-  const visible = room ? content.lines.slice(scroll, scroll + room) : [];
+  const overflow = !overflows ? [] : [scroll < maxScroll
+    ? `${options.ascii ? "v" : "▼"} ${maxScroll - scroll} more rows  scroll: wheel / ${options.ascii ? "up/down" : "↑↓"} / PgDn`
+    : `${options.ascii ? "^" : "▲"} back to top: Home`];
+  return { header, content, footer: [...overflow, ...baseFooter], room, maxScroll, scroll };
+}
+
+/** A deterministic dashboard frame with a fixed header and a scrollable content viewport. */
+export function renderDashboard(model: DashboardModel, options: DashboardView): string[] {
+  const width = Math.max(1, Math.floor(options.width) || 80), height = Math.max(1, Math.floor(options.height) || 24);
+  const bodyWidth = width > 1 ? width - 1 : 1;
+  const layout = dashboardLayout(model, options);
+  const visible = layout.room ? layout.content.lines.slice(layout.scroll, layout.scroll + layout.room) : [];
   const thumb = (index: number): string => {
-    if (width <= 1 || maxScroll === 0 || room === 0) return "";
-    const thumbSize = Math.max(1, Math.round(room * room / content.lines.length));
-    const start = Math.round(scroll / maxScroll * Math.max(0, room - thumbSize));
+    if (width <= 1 || layout.maxScroll === 0 || layout.room === 0) return "";
+    const thumbSize = Math.max(1, Math.round(layout.room * layout.room / layout.content.lines.length));
+    const start = Math.round(layout.scroll / layout.maxScroll * Math.max(0, layout.room - thumbSize));
     return index >= start && index < start + thumbSize ? "█" : "░";
   };
-  const frame = [...header, ...visible, ...help];
-  return frame.slice(0, height).map((line, index) => clip(line, bodyWidth) + thumb(index - header.length));
+  const frame = [...layout.header, ...visible, ...layout.footer];
+  return frame.slice(0, height).map((line, index) => clip(line, bodyWidth) + thumb(index - layout.header.length));
 }
 
 export function dashboardPanelOffset(model: DashboardModel, options: DashboardView, focus: number): number {
@@ -466,7 +535,7 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
     const restore = (): void => {
       if (timer) clearInterval(timer);
       signals.removeListener("SIGINT", quit); signals.removeListener("SIGTERM", quit); signals.removeListener("exit", restore);
-      input.removeListener("keypress", keypress); input.removeListener("error", fail); input.removeListener("end", quit);
+      input.removeListener("keypress", keypress); input.removeListener("data", inputData); input.removeListener("error", fail); input.removeListener("end", quit);
       output.removeListener("resize", resize); output.removeListener("error", fail);
       try { input.setRawMode(wasRaw); } catch { /* The input may already be closed. */ }
       if (!wasFlowing) input.pause();
@@ -482,10 +551,13 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
     const fail = (error: unknown): void => finish(error);
     const draw = (): void => {
       if (!model || stopped) return;
+      const layout = dashboardLayout(model, { ...view(), scroll: state.scroll, focus: state.focus, help: state.help });
+      state.scroll = layout.scroll;
       const lines = renderDashboard(model, { ...view(), scroll: state.scroll, focus: state.focus, help: state.help });
-      if (!state.help && state.paused) lines[lines.length - 1] = clip(`PAUSED | q quit  p pause  v verbose  e events  g graphs  ? help`, view().width);
-      const frameRows = Math.max(1, view().height - (state.help ? 5 : 3));
-      state.scroll = Math.min(Math.max(0, state.scroll ?? 0), Math.max(0, dashboardContent(model, { ...view(), width: Math.max(1, view().width - 1) }).lines.length - frameRows));
+      if (!state.help && state.paused) {
+        const bodyWidth = Math.max(1, view().width - 1);
+        lines[lines.length - 1] = clip(`PAUSED | ${dashboardControls(bodyWidth - length("PAUSED | "), options.ascii)}`, bodyWidth);
+      }
       // CUP uses one-based terminal coordinates. An explicit 1;1 avoids
       // terminals that interpret the compact home form as a zero column.
       output.write("\x1b[1;1H" + paint(lines, options.color).map((line) => line + "\x1b[K").join("\r\n") + "\x1b[J");
@@ -498,20 +570,31 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
       finally { busy = false; }
     };
     const resize = (): void => { try { draw(); } catch (error) { fail(error); } };
-    const keypress = (text: string | undefined, key: { name?: string; ctrl?: boolean }): void => {
+    const applyKey = (raw: string): void => {
       const paused = state.paused;
-      const raw = key?.ctrl && key.name === "c" ? "\x03" : key?.name === "return" ? "enter" : key?.name ?? text ?? "";
       if (raw === "enter" && model) state = { ...state, scroll: dashboardPanelOffset(model, view(), state.focus ?? 0) };
-      else state = handleDashboardKey(state, raw === "space" ? " " : raw, Math.max(1, view().height - (state.help ? 5 : 3)));
+      else {
+        const pageRows = model ? dashboardLayout(model, { ...view(), scroll: state.scroll, focus: state.focus, help: state.help }).room : Math.max(1, view().height - (state.help ? 3 : 2));
+        state = handleDashboardKey(state, raw === "space" ? " " : raw, Math.max(1, pageRows));
+      }
       if (raw === "tab" && model) state.focus = (state.focus ?? 0) % Math.max(1, new Set(model.observations.map((row) => row.principal_id)).size);
       if (state.quit) { quit(); return; }
       resize();
       if (paused && !state.paused) void refresh();
     };
+    // Kept as a narrow test seam; real terminal input is decoded from raw bytes
+    // below so mouse reports never enter Node's generic keypress decoder.
+    const keypress = (text: string | undefined, key: { name?: string; ctrl?: boolean }): void => {
+      applyKey(key?.ctrl && key.name === "c" ? "\x03" : key?.name === "return" ? "enter" : key?.name ?? text ?? "");
+    };
+    const inputData = (chunk: string | Buffer): void => {
+      const raw = typeof chunk === "string" ? chunk : chunk.toString("latin1");
+      for (const key of decodeDashboardKeys(raw)) applyKey(key);
+    };
     try {
       signals.on("SIGINT", quit); signals.on("SIGTERM", quit); signals.on("exit", restore);
       input.on("error", fail); input.on("end", quit); output.on("error", fail); output.on("resize", resize);
-      emitKeypressEvents(input); input.on("keypress", keypress);
+      input.on("keypress", keypress); input.on("data", inputData);
       entered = true; output.write(ENTER_DASHBOARD); input.setRawMode(true); input.resume();
       timer = setInterval(() => { void refresh(); }, options.interval);
       void refresh();
