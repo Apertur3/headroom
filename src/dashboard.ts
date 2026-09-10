@@ -326,6 +326,7 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
   const glyph = { NORMAL: "●", HARVEST: "↗", CONSERVE: "⚠", FREEZE: "🛑", UNKNOWN: "?", NOT_ENFORCED: "", UP: "●", BUSY: "⚠", DOWN: "🛑" }[decision.state];
   let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} [${bar}] ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}`;
   if (row.metadata?.vendor_inconsistent) text += " (vendor readings inconsistent, holding)";
+  else if (row.metadata?.vendor_window_held) text += " (new window unconfirmed, holding)";
   if (decision.state === "NOT_ENFORCED") text = `  ${meter} ${label(row)} n/a (not enforced)`;
   if (view.graphs !== false && view.width >= 100 && !unknown && model.burns[key]?.length) text += ` ${spark(model.burns[key])}`;
   const lines = [text];
