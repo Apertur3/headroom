@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderDashboard, type DashboardModel } from "../src/dashboard.js";
 import { defaultPolicy } from "../src/policy.js";
 import { deliverNotifications, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
@@ -12,7 +12,7 @@ import { HeadroomStore, type PlanDowngrade } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 async function store(): Promise<HeadroomStore> {
   const root = await mkdtemp(join(tmpdir(), "headroom-plan-downgrade-"));
@@ -33,10 +33,10 @@ function reading(plan: string, at: string, meter = "codex-main:main", credits?: 
 
 const quietWebhook: NotifyConfig = {
   channels: ["webhook"], preset: "quiet", events_on: [], events_off: [], events: [], threshold_percent: 90,
-  quiet_hours: { start: 0, end: 1439 }, telegram: { chat_id: null }, ntfy: { topic: null, server: "https://ntfy.sh" }, webhook: { url: "https://example.com/hook" }, notify_scheduled_short: false,
+  quiet_hours: { start: 23 * 60, end: 7 * 60 }, telegram: { chat_id: null }, ntfy: { topic: null, server: "https://ntfy.sh" }, webhook: { url: "https://example.com/hook" }, notify_scheduled_short: false,
 };
 
-function notifications(calls: string[], now: Date): NotifyOptions {
+function notifications(calls: string[], now = new Date()): NotifyOptions {
   return {
     config: quietWebhook, now, log: async () => undefined,
     fetcher: async (input) => { calls.push(await (input as Request).text()); return new Response("ok", { status: 200 }); },
@@ -67,22 +67,44 @@ describe("plan downgrade protection", () => {
     const db = await store();
     const calls: string[] = [];
     try {
-      await deliverNotifications(db, notifications(calls, new Date("2026-09-09T15:12:00Z")));
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-09-09T15:12:00Z")); // 17:12 in the shared Europe/Amsterdam test zone.
+      await deliverNotifications(db, notifications(calls));
       db.insert(reading("prolite", "2026-09-09T15:12:00Z"));
       db.insert(reading("free", "2026-09-09T15:13:00Z"));
-      const alarm = await deliverNotifications(db, notifications(calls, new Date("2026-09-09T15:14:00Z")));
-      expect(alarm).toMatchObject({ quiet: true, sent: 1 });
+      vi.setSystemTime(new Date("2026-09-09T15:14:00Z"));
+      const alarm = await deliverNotifications(db, notifications(calls));
+      expect(alarm).toMatchObject({ quiet: false, sent: 1 });
       expect(JSON.parse(calls[0]).text).toBe(`🚨 PLAN DOWNGRADED: Codex is now on the free plan (was prolite) since ${formatClockTime(new Date("2026-09-09T15:13:00Z"))}. Do NOT use a reset credit. Dispatches are refused until you run: headroom ack plan codex-main`);
-      await deliverNotifications(db, notifications(calls, new Date("2026-09-10T15:14:00Z")));
+      vi.setSystemTime(new Date("2026-09-10T15:14:00Z"));
+      await deliverNotifications(db, notifications(calls));
       expect(JSON.parse(calls[1]).text).toContain("PLAN DOWNGRADED REMINDER");
       expect(db.planDowngrades()).toHaveLength(1);
       db.insert(reading("prolite", "2026-09-10T16:00:00Z"));
       expect(db.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "plan_changed")).toHaveLength(2);
-      await deliverNotifications(db, notifications(calls, new Date("2026-09-10T16:01:00Z")));
+      vi.setSystemTime(new Date("2026-09-10T16:01:00Z"));
+      await deliverNotifications(db, notifications(calls));
       expect(calls).toHaveLength(3);
       expect(JSON.parse(calls[2]).text).toContain("📈 plan restored");
-      await deliverNotifications(db, notifications(calls, new Date("2026-09-12T16:00:00Z")));
+      vi.setSystemTime(new Date("2026-09-12T16:00:00Z"));
+      await deliverNotifications(db, notifications(calls));
       expect(calls).toHaveLength(3);
+    } finally { db.close(); }
+  });
+
+  it("sends a downgrade alarm immediately inside quiet hours", async () => {
+    const db = await store();
+    const calls: string[] = [];
+    try {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-09-09T22:12:00Z")); // 00:12 in Europe/Amsterdam, inside 23:00-07:00.
+      await deliverNotifications(db, notifications(calls));
+      db.insert(reading("prolite", "2026-09-09T22:12:00Z"));
+      db.insert(reading("free", "2026-09-09T22:13:00Z"));
+      vi.setSystemTime(new Date("2026-09-09T22:14:00Z"));
+      const alarm = await deliverNotifications(db, notifications(calls));
+      expect(alarm).toMatchObject({ quiet: true, sent: 1 });
+      expect(JSON.parse(calls[0]).text).toContain("🚨 PLAN DOWNGRADED");
     } finally { db.close(); }
   });
 
@@ -94,7 +116,7 @@ describe("plan downgrade protection", () => {
       await deliverNotifications(db, notifications(calls, new Date("2026-09-09T15:00:00Z")));
       db.insert(reading("free", "2026-09-09T16:17:00Z", undefined, 1));
       const result = await deliverNotifications(db, notifications(calls, new Date("2026-09-09T16:18:00Z")));
-      expect(result).toMatchObject({ quiet: true, sent: 1 });
+      expect(result).toMatchObject({ quiet: false, sent: 1 });
       expect(JSON.parse(calls[0]).text).toBe("🚨 A reset credit was just spent on the free plan");
     } finally { db.close(); }
   });

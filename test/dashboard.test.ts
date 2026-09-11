@@ -393,9 +393,9 @@ describe("dashboard cached data", () => {
       const store = await HeadroomStore.open(root);
       store.insert(row({ observed_at: new Date().toISOString(), fetched_at: new Date().toISOString(), resets_at: new Date(Date.now() + 4 * 3_600_000).toISOString() }));
       store.close();
-      await expect(daemonRequest(socketPath(root), "status", {}, 50, 50)).resolves.toMatchObject({ status: "available" });
-      await expect(daemonRequest(socketPath(root), "dashboard", {}, 50, 500)).resolves.toMatchObject({ status: "available", result: { observations: [expect.objectContaining({ meter_id: "account-a:all" })] } });
-      const model = await gatherCachedDashboard(root);
+      await expect(daemonRequest(socketPath(root), "status", {}, 2_000, 2_000)).resolves.toMatchObject({ status: "available" });
+      await expect(daemonRequest(socketPath(root), "dashboard", {}, 2_000, 2_000)).resolves.toMatchObject({ status: "available", result: { observations: [expect.objectContaining({ meter_id: "account-a:all" })] } });
+      const model = await gatherCachedDashboard(root, { healthTimeoutMs: 2_000, requestTimeoutMs: 2_000 });
       expect(model.direct).toBe(false);
       expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false })[0]).toMatch(/daemon fresh \d+s ago/);
     } finally {

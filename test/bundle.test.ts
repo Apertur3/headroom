@@ -1,11 +1,11 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseBundleFlag, writeDoctorBundle } from "../src/bundle.js";
 
 const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 async function tempDir(prefix: string): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), prefix));
@@ -114,10 +114,12 @@ describe("headroom doctor --bundle", () => {
   });
 
   it("defaults to headroom-bundle-<date>.txt in the current directory, and reports its size", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-11T12:00:00Z"));
     const headroomHome = await tempDir("headroom-bundle-home-");
     const outputDir = await tempDir("headroom-bundle-output-");
     const result = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(undefined, outputDir));
-    const today = new Date().toISOString().slice(0, 10);
+    const today = "2026-09-11";
     expect(result.path).toBe(join(outputDir, `headroom-bundle-${today}.txt`));
     expect(result.bytes).toBeGreaterThan(0);
     const stat = await readFile(result.path, "utf8");
@@ -125,6 +127,8 @@ describe("headroom doctor --bundle", () => {
   });
 
   it("writes into an explicit path when one is given, and into a directory (with the default name) when that path already exists as one", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-11T12:00:00Z"));
     const headroomHome = await tempDir("headroom-bundle-home-");
     const outputDir = await tempDir("headroom-bundle-output-");
     const explicit = join(outputDir, "my-report.txt");
@@ -133,7 +137,7 @@ describe("headroom doctor --bundle", () => {
 
     const targetDir = await tempDir("headroom-bundle-target-dir-");
     const dirResult = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(targetDir, outputDir));
-    const today = new Date().toISOString().slice(0, 10);
+    const today = "2026-09-11";
     expect(dirResult.path).toBe(join(targetDir, `headroom-bundle-${today}.txt`));
   });
 

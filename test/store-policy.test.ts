@@ -693,15 +693,13 @@ describe("SQLite observations and event detector", () => {
   it("shows an idle vendor-reported window with a doubt marker instead of failing it closed", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-idle-doubt-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
-    // fetched_at is "now" (not a fixed past date) so formatMeters' own
-    // staleness check -- which only applies to a genuinely fresh reading, not
-    // a failed one -- never fires here regardless of when this test runs.
-    const fetchedAt = new Date().toISOString();
+    const current = new Date("2026-09-03T12:00:00Z");
+    const fetchedAt = current.toISOString();
     const fiveHour = observation({
       principal_id: "antigravity", meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 300, enforcement: "hard" },
-      quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, fetched_at: fetchedAt, observed_at: fetchedAt, resets_at: new Date(Date.now() + 300 * 60_000).toISOString(),
+      quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, fetched_at: fetchedAt, observed_at: fetchedAt, resets_at: new Date(current.getTime() + 300 * 60_000).toISOString(),
     });
-    const weekly = { ...fiveHour, window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const }, resets_at: new Date(Date.now() + 10_080 * 60_000).toISOString() };
+    const weekly = { ...fiveHour, window: { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const }, resets_at: new Date(current.getTime() + 10_080 * 60_000).toISOString() };
     try {
       // No prior history exists for either window, so there is nothing to
       // contradict this idle reading: it is shown, not failed.
@@ -712,9 +710,9 @@ describe("SQLite observations and event detector", () => {
       ]));
       // The vendor's own 0% is on the line, with the doubt marker appended --
       // never "UNKNOWN" for a reading Headroom was actually given.
-      expect(formatMeters(rows, defaultPolicy)[0]).toContain("antigravity:gemini  5h 0%");
-      expect(formatMeters(rows, defaultPolicy)[0]).toContain("(idle, unverified)");
-      expect(formatMeters(rows, defaultPolicy)[0]).not.toContain("UNKNOWN");
+      expect(formatMeters(rows, defaultPolicy, new Map(), new Map(), new Map(), current)[0]).toContain("antigravity:gemini  5h 0%");
+      expect(formatMeters(rows, defaultPolicy, new Map(), new Map(), new Map(), current)[0]).toContain("(idle, unverified)");
+      expect(formatMeters(rows, defaultPolicy, new Map(), new Map(), new Map(), current)[0]).not.toContain("UNKNOWN");
       // A shown-with-doubt reading is not fail-closed the way a genuinely
       // failed/UNKNOWN one is: it reads as a normal (idle) window.
       expect(canConsume(["antigravity:gemini"], new Map([["antigravity:gemini", rows]]), defaultPolicy, false, new Date(fetchedAt)).state).not.toBe("UNKNOWN");
@@ -817,10 +815,10 @@ describe("pace and consumes", () => {
   });
 
   it("formats each latest window once, with reasons only once", () => {
-    const now = new Date();
+    const now = new Date("2026-09-03T12:00:00Z");
     const failed = observation({ meter_id: "claude-main:fable", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, freshness: "failed", reason: "Claude OAuth usage unavailable", fetched_at: now.toISOString() });
     const absent = observation({ meter_id: "claude-main:fable", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, freshness: "not_enforced", reason: "no scoped limit in response", fetched_at: now.toISOString() });
-    expect(formatMeters([failed, absent], defaultPolicy)).toMatchInlineSnapshot(`
+    expect(formatMeters([failed, absent], defaultPolicy, new Map(), new Map(), new Map(), now)).toMatchInlineSnapshot(`
       [
         "claude-main:fable  5h UNKNOWN (Claude OAuth usage unavailable) | wk n/a (no scoped limit in response)  (failed <1m)",
       ]
@@ -844,22 +842,25 @@ describe("pace and consumes", () => {
   });
 
   it("renders credit counts as availability and excludes them from can decisions", () => {
-    const credit = observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-21T12:00:00Z", fetched_at: new Date().toISOString() });
-    expect(formatMeters([credit], defaultPolicy)[0]).toContain("credits 1 available (expires Sep 21)");
+    const now = new Date("2026-09-03T12:00:00Z");
+    const credit = observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-21T12:00:00Z", fetched_at: now.toISOString() });
+    expect(formatMeters([credit], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 available (expires Sep 21)");
     expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy)).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
   });
 
   it("labels a multi-window meter fresh when any enforced window is fresh", () => {
-    const fresh = observation({ meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, fetched_at: new Date().toISOString() });
-    const absent = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "not_enforced", quantity: null, fetched_at: new Date().toISOString() });
-    expect(formatMeters([fresh, absent], defaultPolicy)[0]).toContain("(fresh <1m)");
-    expect(formatMeters([absent], defaultPolicy)[0]).toContain("(not enforced <1m)");
+    const now = new Date("2026-09-03T12:00:00Z");
+    const fresh = observation({ meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, fetched_at: now.toISOString() });
+    const absent = observation({ meter_id: "claude-main:all", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "not_enforced", quantity: null, fetched_at: now.toISOString() });
+    expect(formatMeters([fresh, absent], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("(fresh <1m)");
+    expect(formatMeters([absent], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("(not enforced <1m)");
   });
 
   it("prints a reset countdown next to the absolute reset time, and omits it when the window has no reset", () => {
-    const resetsAt = new Date(Date.now() + 5 * 3_600_000);
-    const fresh = observation({ meter_id: "codex-main:main", fetched_at: new Date().toISOString(), resets_at: resetsAt.toISOString() });
-    expect(formatMeters([fresh], defaultPolicy)[0]).toContain("(in 5h)");
+    const now = new Date("2026-09-03T12:00:00Z");
+    const resetsAt = new Date(now.getTime() + 5 * 3_600_000);
+    const fresh = observation({ meter_id: "codex-main:main", fetched_at: now.toISOString(), resets_at: resetsAt.toISOString() });
+    expect(formatMeters([fresh], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("(in 5h)");
     const unknown = observation({ meter_id: "codex-main:main", freshness: "failed", quantity: null, reason: "boom" });
     expect(formatMeters([unknown], defaultPolicy)[0]).not.toContain("(in ");
   });
