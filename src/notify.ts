@@ -57,6 +57,9 @@ export interface NotifyConfig {
   events_off: string[];
   events: string[];
   threshold_percent: number | null;
+  /** Optional ascending threshold ladder. `threshold_percent` remains the
+   * compatible single-threshold spelling. */
+  thresholds?: number[];
   quiet_hours: QuietHours | null;
   telegram: { chat_id: string | null };
   ntfy: { topic: string | null; server: string };
@@ -73,6 +76,10 @@ export interface NotifyItem {
   principal: string | null;
   at: string;
   text: string;
+  /** Canonical window scope used for content-level duplicate detection. */
+  window_key?: string;
+  /** Stable kind + meter + canonical-window identity for the delivery guard. */
+  delivery_identity?: string;
   /** Stored in the ledger payload so a later noisy projection can compare
    * itself with the first alert for this window instance. */
   projection?: ProjectionDetails;
@@ -83,6 +90,7 @@ export interface ProjectionDetails {
   principal: string;
   window_minutes: number;
   resets_at: string;
+  window_key: string;
   burn_percent_per_hour: number;
   empty_in_seconds: number;
   reset_in_seconds: number;
@@ -137,6 +145,7 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   let eventsOn: string[] = [];
   let eventsOff: string[] = [];
   let thresholdPercent: number | null = 90;
+  let thresholds: number[] | undefined;
   let quietHours: QuietHours | null = null;
   let chatId: string | null = null;
   let topic: string | null = null;
@@ -164,6 +173,14 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
       if (key === "channels") { channels = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
       if (key === "events") { events = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
       if (key === "threshold_percent") { thresholdPercent = Number(value); continue; }
+      if (key === "thresholds") {
+        try {
+          const parsed: unknown = JSON.parse(value.replace(/,\s*]$/, "]"));
+          if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "number" && Number.isFinite(item))) throw new Error("not numbers");
+          thresholds = parsed;
+        } catch { throw invalid("thresholds must be an array of percentages"); }
+        continue;
+      }
       if (key === "quiet_hours") { quietHours = parseQuietHours(stringValue(value) ?? value); continue; }
       if (key === "notify_scheduled_short") {
         const trimmed = value.trim();
@@ -185,6 +202,7 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   for (const channel of channels ?? []) if (!CHANNEL_NAMES.includes(channel as ChannelName)) throw invalid(`unknown channel "${channel}"`);
   for (const event of [...(events ?? []), ...eventsOn, ...eventsOff]) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid(`unknown event "${event}"`);
   if (thresholdPercent !== null && (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100)) throw invalid("threshold_percent must be above 0 and at most 100");
+  if (thresholds?.some((threshold) => threshold <= 0 || threshold > 100)) throw invalid("thresholds must contain percentages above 0 and at most 100");
   if (topic !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw invalid("ntfy topic must be 1 to 64 characters of letters, digits, hyphen or underscore");
   if (chatId !== null && !/^-?[0-9]{1,32}$|^@[A-Za-z0-9_]{1,64}$/.test(chatId)) throw invalid("telegram chat_id must be a numeric id or an @name");
   for (const [label, candidate] of [["ntfy server", server], ["webhook url", webhookUrl]] as const) {
@@ -198,6 +216,7 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
     preset, events_on: eventsOn, events_off: eventsOff,
     events: resolveNotifyEvents(preset, eventsOn, eventsOff, events),
     threshold_percent: thresholdPercent,
+    thresholds: thresholds && [...new Set(thresholds)].sort((left, right) => left - right),
     quiet_hours: quietHours,
     telegram: { chat_id: chatId },
     ntfy: { topic, server },
@@ -366,7 +385,7 @@ export function chunkMessage(text: string, limit = CHUNK_LIMIT): string[] {
  * window held back. */
 export function combineTexts(texts: string[], digest = false): string {
   if (texts.length === 1 && !digest) return texts[0];
-  return [`🌙 Headroom: ${texts.length} events`, ...texts.map((text) => text.replace(/\s*\n\s*/g, " "))].join("\n");
+  return [`${digest ? "🌙 " : ""}Headroom: ${texts.length} events`, ...texts.map((text) => text.replace(/\s*\n\s*/g, " "))].join("\n");
 }
 
 export interface ChannelStatus {
@@ -476,7 +495,7 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
   try {
     const parsed = JSON.parse(row.text) as Partial<NotifyItem>;
     if (parsed && typeof parsed.text === "string") {
-      return { id: row.event_id, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text, projection: projectionDetails(parsed.projection) };
+      return { id: row.event_id, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text, window_key: typeof parsed.window_key === "string" ? parsed.window_key : undefined, delivery_identity: typeof parsed.delivery_identity === "string" ? parsed.delivery_identity : undefined, projection: projectionDetails(parsed.projection) };
     }
   } catch { /* A row written by an older build is still deliverable as text. */ }
   return { id: row.event_id, kind: "event", meter: null, principal: null, at: row.created_at, text: row.text };
@@ -485,7 +504,7 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
 function projectionDetails(value: unknown): ProjectionDetails | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Partial<ProjectionDetails>;
-  if (typeof item.meter !== "string" || typeof item.principal !== "string" || typeof item.resets_at !== "string") return undefined;
+  if (typeof item.meter !== "string" || typeof item.principal !== "string" || typeof item.resets_at !== "string" || typeof item.window_key !== "string") return undefined;
   if (![item.window_minutes, item.burn_percent_per_hour, item.empty_in_seconds, item.reset_in_seconds].every((number) => typeof number === "number" && Number.isFinite(number))) return undefined;
   return item as ProjectionDetails;
 }
@@ -497,7 +516,7 @@ function projectionSeconds(value: string): number | undefined {
   return matches.reduce((total, match) => total + Number(match[1]) * scale[match[2]]!, 0);
 }
 
-function projectionForEvent(event: HeadroomEvent, evidence: Observation[]): ProjectionDetails | undefined {
+function projectionForEvent(store: HeadroomStore, event: HeadroomEvent, evidence: Observation[]): ProjectionDetails | undefined {
   const current = evidence.at(-1);
   const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
   const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
@@ -509,15 +528,15 @@ function projectionForEvent(event: HeadroomEvent, evidence: Observation[]): Proj
   if (!event.meter_id || !event.principal_id || !minutes || !resetsAt || !Number.isFinite(reset) || !Number.isFinite(created) || empty === undefined || burn === undefined) return undefined;
   const resetIn = (reset - created) / 1_000;
   if (!Number.isFinite(empty) || !Number.isFinite(burn) || resetIn <= 0) return undefined;
-  return { meter: event.meter_id, principal: event.principal_id, window_minutes: minutes, resets_at: resetsAt, burn_percent_per_hour: burn, empty_in_seconds: empty, reset_in_seconds: resetIn };
+  return { meter: event.meter_id, principal: event.principal_id, window_minutes: minutes, resets_at: resetsAt, window_key: store.windowKey(event.meter_id, minutes, resetsAt), burn_percent_per_hour: burn, empty_in_seconds: empty, reset_in_seconds: resetIn };
 }
 
-function projectionItem(event: HeadroomEvent, evidence: Observation[], siblings: Observation[]): NotifyItem | undefined {
-  const projection = projectionForEvent(event, evidence);
+function projectionItem(store: HeadroomStore, event: HeadroomEvent, evidence: Observation[], siblings: Observation[]): NotifyItem | undefined {
+  const projection = projectionForEvent(store, event, evidence);
   // A stall close to the reset remains visible in status and event history,
   // but is not worth a phone interruption. Strictly under 75% leaves a gap.
   if (!projection || projection.empty_in_seconds >= projection.reset_in_seconds * 0.75) return undefined;
-  return { id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence, siblings), projection };
+  return { id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, window_key: projection.window_key, delivery_identity: `pace_projection_conserve:${projection.window_key}:plain`, text: eventText(event, evidence, siblings), projection };
 }
 
 /** Overrides for a reset category take precedence over the reset_seen umbrella. */
@@ -536,20 +555,32 @@ export function wantsEvent(event: HeadroomEvent, config: NotifyConfig): boolean 
 
 /**
  * A synthetic item per hard window already at or above the threshold. The id
- * carries the window's own reset timestamp, so the ledger's dedupe makes this
- * fire once per window instance: the next crossing only notifies after the
- * window has reset into a new one. A window whose reset is unknown notifies
+ * fires once at the first configured threshold per window, then at only the
+ * next higher configured threshold. A window whose reset is unknown notifies
  * once and then stays quiet, which is the safe direction.
  */
-export function thresholdItems(store: HeadroomStore, threshold: number): NotifyItem[] {
+export function thresholdItems(store: HeadroomStore, configured: number | readonly number[]): NotifyItem[] {
+  const thresholds = [...new Set(typeof configured === "number" ? [configured] : configured)].sort((left, right) => left - right);
   const items: NotifyItem[] = [];
   for (const observation of store.latestPerWindow()) {
-    if (observation.freshness !== "fresh" || observation.quantity?.unit !== "percent") continue;
+    const quantity = observation.quantity;
+    if (observation.freshness !== "fresh" || quantity?.unit !== "percent") continue;
     if (observation.window?.enforcement !== "hard" || !observation.window.minutes) continue;
-    if (observation.quantity.used < threshold) continue;
+    const windowKey = store.windowKey(observation.meter_id, observation.window.minutes, observation.resets_at);
+    const stateKey = `threshold_state:${observation.meter_id}:${observation.window.minutes}`;
+    let state: { window?: string; last?: number } = {};
+    try { state = JSON.parse(store.daemonState(stateKey) ?? "{}") as typeof state; } catch { /* replace malformed old state */ }
+    if (state.window !== windowKey) state = { window: windowKey };
+    const threshold = thresholds.find((candidate) => candidate > (state.last ?? -Infinity) && quantity.used >= candidate);
+    if (threshold === undefined) { store.setDaemonState(stateKey, JSON.stringify(state)); continue; }
+    store.setDaemonState(stateKey, JSON.stringify({ ...state, last: threshold }));
     items.push({
-      id: `threshold:${observation.meter_id}:${observation.window.minutes}:${observation.resets_at ?? "unknown"}`,
+      // The per-window state normally prevents another item at this level.
+      // Keeping the observation instant in the ID means the content guard is
+      // still exercised if a future producer accidentally re-emits one.
+      id: `threshold:${windowKey}:${threshold}:${observation.fetched_at}`,
       kind: "threshold", meter: observation.meter_id, principal: observation.principal_id, at: observation.fetched_at,
+      window_key: windowKey, delivery_identity: `threshold:${windowKey}:${threshold}`,
       text: thresholdText(observation, threshold),
     });
   }
@@ -562,14 +593,28 @@ function collectItems(store: HeadroomStore, config: NotifyConfig, since: string)
   const events = store.events(since).filter((event) => wantsEvent(event, config));
   const evidence = store.eventObservations(events);
   const items: NotifyItem[] = events.flatMap<NotifyItem>((event) => event.kind === "pace_projection_conserve"
-    ? (projectionItem(event, evidence.get(event.id) ?? [], siblings) ?? [])
-    : [{ id: event.id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, text: eventText(event, evidence.get(event.id), siblings) }]);
-  if (wanted.has("threshold") && config.threshold_percent !== null) items.push(...thresholdItems(store, config.threshold_percent));
+    ? (projectionItem(store, event, evidence.get(event.id) ?? [], siblings) ?? [])
+    : [eventItem(store, event, evidence.get(event.id), siblings)]);
+  const thresholds = config.thresholds ?? (config.threshold_percent === null ? [] : [config.threshold_percent]);
+  if (wanted.has("threshold") && thresholds.length) items.push(...thresholdItems(store, thresholds));
   return items;
 }
 
+function eventItem(store: HeadroomStore, event: HeadroomEvent, evidence: Observation[] | undefined, siblings: Observation[]): NotifyItem {
+  const current = evidence?.at(-1);
+  const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
+  const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
+  const window = event.meter_id && minutes ? store.windowKey(event.meter_id, minutes, resetsAt) : undefined;
+  const planStage = event.kind === "plan_changed" ? event.metadata?.downgrade ? "downgrade" : event.metadata?.restored ? "restored" : "changed" : undefined;
+  const identity = `${event.kind}:${event.meter_id ?? event.principal_id ?? "none"}:${window ?? "none"}${planStage ? `:${planStage}` : ""}`;
+  // A plan transition without a vendor reset is not a windowed alert: its
+  // event identity must preserve a later restoration as a distinct message.
+  const id = event.meter_id && minutes && resetsAt ? `${event.kind}:${window}${planStage ? `:${planStage}` : ""}` : event.id;
+  return { id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, window_key: window, delivery_identity: identity, text: eventText(event, evidence, siblings) };
+}
+
 function projectionLedgerId(projection: ProjectionDetails, stage: "plain" | "escalation"): string {
-  return `pace_projection:${projection.meter}:${projection.window_minutes}:${projection.resets_at}:${stage}`;
+  return `pace_projection:${projection.window_key}:${stage}`;
 }
 
 /** Admit a projection to the usual notification ledger only once per window
@@ -580,12 +625,12 @@ function projectionDeliveryItems(store: HeadroomStore, channel: ChannelName, ite
     const projection = item.projection;
     if (!projection) return [item];
     const plain = store.notifyDelivery(projectionLedgerId(projection, "plain"), channel);
-    if (!plain) return [{ ...item, id: projectionLedgerId(projection, "plain") }];
+    if (!plain) return [{ ...item, id: projectionLedgerId(projection, "plain"), window_key: projection.window_key, delivery_identity: `pace_projection_conserve:${projection.window_key}:plain` }];
     const escalation = store.notifyDelivery(projectionLedgerId(projection, "escalation"), channel);
     const previous = decodeItem(plain).projection;
     const materiallyWorse = projection.empty_in_seconds < 6 * 3_600
       || previous !== undefined && projection.empty_in_seconds < previous.empty_in_seconds / 2;
-    return !escalation && materiallyWorse ? [{ ...item, id: projectionLedgerId(projection, "escalation") }] : [];
+    return !escalation && materiallyWorse ? [{ ...item, id: projectionLedgerId(projection, "escalation"), window_key: projection.window_key, delivery_identity: `pace_projection_conserve:${projection.window_key}:escalation` }] : [];
   });
 }
 
@@ -614,9 +659,59 @@ function downgradeReminderItems(store: HeadroomStore, now: Date): NotifyItem[] {
     return [{
       id: `plan_downgrade_reminder:${downgrade.principal}:${downgrade.since}`,
       kind: "plan_downgrade_reminder", meter: `${downgrade.principal}:main`, principal: downgrade.principal, at: now.toISOString(),
+      delivery_identity: `plan_downgrade_reminder:${downgrade.principal}:none`,
       text: planDowngradeText(downgrade.principal, downgrade.from, downgrade.to, downgrade.since, true),
     }];
   });
+}
+
+function deliveryIdentity(item: NotifyItem): string {
+  return item.delivery_identity ?? `${item.kind}:${item.meter ?? item.principal ?? "none"}:none`;
+}
+
+const DELIVERY_GUARD_MS = 6 * 3_600_000;
+
+/** Remove values that tick without adding a fact. The resulting text remains
+ * human-readable, which makes the ledger useful when investigating a hold. */
+export function stableNotificationText(text: string, stripUnchangedNow = false): string {
+  return text
+    .replace(/\bin\s+\d+(?:\s*(?:days?|hours?|minutes?|seconds?|[dhms]))(?:\s+\d+(?:\s*(?:days?|hours?|minutes?|seconds?|[dhms])))*\b/gi, "")
+    .replace(/\b\d+\s+(?:seconds?|minutes?|hours?|days?)\s+ago\b/gi, "")
+    .replace(/(\d{2}:\d{2}:\d{2})\.\d+(?=(?:Z|[+-]\d{2}:?\d{2})?\b)/g, "$1")
+    .replace(stripUnchangedNow ? /\bnow\s+\d+(?:\.\d+)?%/gi : /$^/, "now <unchanged>%")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/([,;])\s*(?=\.|$)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function noNewInformation(previous: string, current: string): boolean {
+  const nowPercent = /\bnow\s+(\d+(?:\.\d+)?)%/gi;
+  const prior = [...previous.matchAll(nowPercent)].map((match) => match[1]);
+  const next = [...current.matchAll(nowPercent)].map((match) => match[1]);
+  const sameNow = prior.length === next.length && prior.every((value, index) => value === next[index]);
+  return stableNotificationText(previous, sameNow) === stableNotificationText(current, sameNow);
+}
+
+/** Queue only a semantic first delivery. Event IDs are still the primary
+ * dedupe mechanism; this is deliberately a second, time-bounded guard for
+ * callers that accidentally manufacture different IDs for the same alert. */
+function enqueueWithSafetyNet(store: HeadroomStore, channel: ChannelName, item: NotifyItem, now: Date): void {
+  if (store.notifyDelivery(item.id, channel)) return;
+  const prepared = { ...item, delivery_identity: deliveryIdentity(item) };
+  const prior = prepared.meter && prepared.window_key
+    ? store.notifyLastSentForWindow(channel, prepared.meter, prepared.window_key)
+    : undefined;
+  if (prior && noNewInformation(decodeItem(prior).text, prepared.text)) {
+    store.notifySuppress(`suppressed:${item.id}`, channel, encodeItem(prepared), "no new information", now.toISOString());
+    return;
+  }
+  const since = new Date(now.getTime() - DELIVERY_GUARD_MS).toISOString();
+  if (store.notifySentSince(channel, prepared.delivery_identity!, since)) {
+    store.notifySuppress(`suppressed:${item.id}`, channel, encodeItem(prepared), "suppressed: same event kind, meter and window was delivered within 6 hours", now.toISOString());
+    return;
+  }
+  store.notifyEnqueue(item.id, channel, encodeItem(prepared), now.toISOString());
 }
 
 function bypassesQuietHours(item: NotifyItem): boolean {
@@ -699,7 +794,7 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   const watermark = store.daemonState(WATERMARK_KEY);
   const items = watermark === undefined ? [] : [...collectItems(store, config, watermark), ...downgradeReminderItems(store, now)];
   store.setDaemonState(WATERMARK_KEY, now.toISOString());
-  for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) store.notifyEnqueue(item.id, channel.channel, encodeItem(item), now.toISOString());
+  for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) enqueueWithSafetyNet(store, channel.channel, item, now);
   if (inQuietHours(config, now)) {
     let sent = 0;
     for (const channel of ready) {

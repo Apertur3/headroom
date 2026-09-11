@@ -60,8 +60,13 @@ describe("notify config", () => {
     expect(() => parseNotifyConfig('[notify]\nevents = ["reset_seeen"]\n')).toThrow(/unknown event/);
     expect(() => parseNotifyConfig("[notify]\nthreshold_pct = 90\n")).toThrow(/unknown \[notify\] key/);
     expect(() => parseNotifyConfig("[notify]\nthreshold_percent = 140\n")).toThrow(/threshold_percent/);
+    expect(() => parseNotifyConfig("[notify]\nthresholds = [90, 140]\n")).toThrow(/thresholds/);
     expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "ftp://example.com/hook"\n')).toThrow(/http or https/);
     expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "not a topic!"\n')).toThrow(/ntfy topic/);
+  });
+
+  it("reads a configured ascending threshold ladder", () => {
+    expect(config("[notify]\nthresholds = [100, 90, 95, 95]\n").thresholds).toEqual([90, 95, 100]);
   });
 
   it("takes an overridden ntfy server without its trailing slash", () => {
@@ -111,7 +116,7 @@ describe("message shaping", () => {
 
   it("labels a single event and folds a batch into one message", () => {
     expect(combineTexts(["reset_seen claude-main:all"])).toBe("reset_seen claude-main:all");
-    expect(combineTexts(["one", "two"])).toBe("🌙 Headroom: 2 events\none\ntwo");
+    expect(combineTexts(["one", "two"])).toBe("Headroom: 2 events\none\ntwo");
   });
 });
 

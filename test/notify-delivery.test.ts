@@ -77,6 +77,12 @@ function fiveHour(used: number, fetchedAt: string, resetsAt: string, meterId = "
   };
 }
 
+function failed(at: string): Observation {
+  return { principal_id: "claude-main", meter_id: "claude-main:all", window: null, quantity: null, resets_at: null,
+    observed_at: at, fetched_at: at, source: "fixture", truth: "estimated", freshness: "failed", confidence: 0,
+    adapter_version: "fixture", upstream_schema_version: "fixture", reason: "fixture unavailable" };
+}
+
 /** A reset the detector classifies as reset_seen: the reset timestamp moved a
  * full week forward while a minute of real time passed, days before the
  * baseline's own scheduled reset (Sept 6) -- an unscheduled reset (issue
@@ -279,6 +285,101 @@ describe("notification delivery", () => {
       await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-06T14:06:00Z") }));
       expect(calls).toHaveLength(2);
       expect(calls[1].body).toContain("now 91%");
+    } finally { store.close(); }
+  });
+
+  it("keeps jittering vendor reset instants in one threshold window, then opens a genuinely new one", async () => {
+    const store = await openStore("headroom-notify-jitter-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["threshold"] };
+    const jitter = ["513788", "801081", "867083", "314239", "692617", "079729"];
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      for (const [index, fraction] of jitter.entries()) {
+        const at = new Date(START.getTime() + (index + 1) * 5 * 60_000).toISOString();
+        store.insert(fiveHour(93, at, `2026-09-13T12:00:00.${fraction}+00:00`, "claude-main:fable"));
+        await deliverNotifications(store, options({ config: only, fetcher, now: new Date(START.getTime() + (index + 2) * 5 * 60_000) }));
+      }
+      expect(calls).toHaveLength(1);
+      expect(store.notifyLedger(20).filter((row) => row.status === "sent")).toHaveLength(1);
+
+      store.insert(fiveHour(93, "2026-09-10T12:00:00Z", "2026-09-20T12:00:00.100000+00:00", "claude-main:fable"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-10T12:05:00Z") }));
+      expect(calls).toHaveLength(2);
+    } finally { store.close(); }
+  });
+
+  it("only advances a threshold announcement to the next configured level", async () => {
+    const store = await openStore("headroom-notify-threshold-ladder-");
+    const { calls, fetcher } = recorder();
+    const ladder = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["threshold"], thresholds: [90, 95] };
+    try {
+      await deliverNotifications(store, options({ config: ladder, fetcher, now: START }));
+      store.insert(weekly(93, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: ladder, fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+      store.insert(weekly(94, "2026-09-03T12:05:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: ladder, fetcher, now: new Date("2026-09-03T12:06:00Z") }));
+      expect(calls).toHaveLength(1);
+      store.insert(weekly(96, "2026-09-03T12:10:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: ladder, fetcher, now: new Date("2026-09-03T12:11:00Z") }));
+      expect(calls).toHaveLength(2);
+      expect(calls[0].body).toContain("crossed 90%");
+      expect(calls[1].body).toContain("crossed 95%");
+    } finally { store.close(); }
+  });
+
+  it("suppresses a repeated rendered threshold when only its countdown changed", async () => {
+    const store = await openStore("headroom-notify-content-backstop-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["threshold"] };
+    const reset = "2026-09-13T12:00:00Z";
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      store.insert(weekly(93, "2026-09-03T12:00:00Z", reset));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:01:00Z") }));
+
+      // Simulate a future event producer forgetting its own window guard. The
+      // content guard still sees the same meter/window and suppresses the
+      // second render, whose only reader-visible difference is "in …".
+      const windowKey = store.windowKey("claude-main:all", 10_080, reset);
+      store.setDaemonState("threshold_state:claude-main:all:10080", JSON.stringify({ window: windowKey }));
+      store.insert(weekly(93, "2026-09-03T12:06:00Z", reset));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:07:00Z") }));
+
+      expect(calls).toHaveLength(1);
+      const ledger = store.notifyLedger(20);
+      expect(ledger.filter((row) => row.status === "sent")).toHaveLength(1);
+      expect(ledger).toEqual(expect.arrayContaining([expect.objectContaining({ status: "suppressed", detail: "no new information" })]));
+    } finally { store.close(); }
+  });
+
+  it("persists a canonical window key across a daemon restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-window-key-restart-"));
+    temporary.push(root);
+    const home = join(root, ".headroom");
+    const first = await HeadroomStore.open(home);
+    const key = first.windowKey("claude-main:fable", 10_080, "2026-09-13T12:00:00.513788+00:00");
+    first.close();
+    const restarted = await HeadroomStore.open(home);
+    try {
+      expect(restarted.windowKey("claude-main:fable", 10_080, "2026-09-13T12:02:00.079729+00:00")).toBe(key);
+    } finally { restarted.close(); }
+  });
+
+  it("records a six-hour duplicate safety-net suppression", async () => {
+    const store = await openStore("headroom-notify-safety-net-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed"] };
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
+      store.insert(failed("2026-09-03T12:05:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:06:00Z") }));
+      store.insert(weekly(10, "2026-09-03T12:10:00Z", "2026-09-13T12:00:00Z"));
+      store.insert(failed("2026-09-03T12:15:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:16:00Z") }));
+      expect(calls).toHaveLength(1);
+      expect(store.notifyLedger(20).some((row) => row.status === "suppressed" && row.detail?.includes("within 6 hours"))).toBe(true);
     } finally { store.close(); }
   });
 
