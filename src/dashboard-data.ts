@@ -89,12 +89,17 @@ export async function dashboardSnapshot(reader: DashboardReader): Promise<{ snap
   return { snapshot: await reader.fallback(), direct: true };
 }
 
-export async function gatherDashboard(home?: string): Promise<DashboardModel> {
+export interface DashboardRequestTimeouts {
+  healthTimeoutMs?: number;
+  requestTimeoutMs?: number;
+}
+
+export async function gatherDashboard(home?: string, timeouts: DashboardRequestTimeouts = {}): Promise<DashboardModel> {
   const { daemonRequest, socketPath } = await import("./daemon.js");
   const directory = await safeHeadroomDirectory(home);
   const [{ snapshot, direct }, policy, accounts, version] = await Promise.all([
     dashboardSnapshot({
-      request: () => daemonRequest(socketPath(directory), "dashboard", {}, DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS),
+      request: () => daemonRequest(socketPath(directory), "dashboard", {}, timeouts.healthTimeoutMs ?? DASHBOARD_HEALTH_TIMEOUT_MS, timeouts.requestTimeoutMs ?? DASHBOARD_REQUEST_TIMEOUT_MS),
       fallback: async () => {
         const store = await HeadroomStore.open(directory);
         try { return readDashboardStore(store); } finally { store.close(); }
