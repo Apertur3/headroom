@@ -35,7 +35,8 @@ function quietText(config: NotifyConfig): string { return config.quiet_hours ? `
 export function notifyTable(config: NotifyConfig): string {
   const lines = ["[notify]", `channels = ${JSON.stringify(config.channels)}`, `preset = ${JSON.stringify(config.preset)}`,
     `events_on = ${JSON.stringify(config.events_on)}`, `events_off = ${JSON.stringify(config.events_off)}`];
-  if (config.threshold_percent !== null) lines.push(`threshold_percent = ${config.threshold_percent}`);
+  if (config.thresholds) lines.push(`thresholds = ${JSON.stringify(config.thresholds)}`);
+  else if (config.threshold_percent !== null) lines.push(`threshold_percent = ${config.threshold_percent}`);
   if (config.quiet_hours) lines.push(`quiet_hours = ${JSON.stringify(quietText(config))}`);
   if (config.telegram.chat_id) lines.push("", "[notify.telegram]", `chat_id = ${JSON.stringify(config.telegram.chat_id)}`);
   if (config.ntfy.topic) lines.push("", "[notify.ntfy]", `topic = ${JSON.stringify(config.ntfy.topic)}`, `server = ${JSON.stringify(config.ntfy.server)}`);

@@ -150,12 +150,13 @@ export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by
  * quiet hours, or a retriable failure), `sent` is delivered and never resent,
- * `failed` gave up after the attempt cap. */
+ * `failed` gave up after the attempt cap. `suppressed` records a delivery
+ * stopped by the independent duplicate safety net. */
 export interface NotifyDelivery {
   id: number;
   event_id: string;
   channel: string;
-  status: "pending" | "sent" | "failed";
+  status: "pending" | "sent" | "failed" | "suppressed";
   attempts: number;
   text: string;
   detail: string | null;
