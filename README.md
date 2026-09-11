@@ -123,7 +123,7 @@ is pinned and checksum verified, and every query lands in an audit log. Details 
 
 ## Status
 
-Beta. Used daily on one macOS machine with two Claude config dirs, one Codex home, one
+Stable since 0.1.0 (2026-09-11). Used daily on one macOS machine with two Claude config dirs, one Codex home, one
 Antigravity account and two local inference boxes. Every release is installed from the npm
 registry into a fresh home on Linux (a Raspberry Pi 5) and Windows 11 (a VM) and walked through
 the quickstart by script; CI runs the suite on all three platforms. Vendor endpoints are private and change without notice; Headroom pins, records
