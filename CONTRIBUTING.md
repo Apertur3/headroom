@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for taking a look. Headroom is in beta and moves quickly; small, focused pull requests
-land fastest.
+Thanks for taking a look. Headroom is at 0.1.x and moves quickly; small, focused pull requests
+land fastest. Bug fixes bump the patch version, new features the minor version.
 
 ## Ground rules
 
