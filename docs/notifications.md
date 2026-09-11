@@ -42,6 +42,7 @@ preset = "calm"
 events_on = ["model_new"]
 events_off = ["source_recovered"]
 threshold_percent = 90
+# thresholds = [90, 95, 100] # optional threshold ladder
 quiet_hours = "23:00-07:00"
 
 [notify.telegram]
@@ -88,8 +89,31 @@ to a preset and overrides. The old `notify_scheduled_short` setting is accepted
 but no longer enables delivery: use `events_on = ["reset_scheduled_short"]`.
 
 `threshold_percent` defaults to 90 and accepts values above 0 through 100.
-Threshold notifications fire once per window instance, then wait for a new reset
-timestamp. Disable `threshold` in `events_off` to turn them off.
+`thresholds` is an optional ascending ladder. Threshold notifications fire at
+the first crossed level in a window, then only at the next higher configured
+level; they never re-fire at the same level before the reset. Disable
+`threshold` in `events_off` to turn them off.
+
+Headroom gives each meter/window a persisted, minute-granular identity, so small
+vendor reset-time jitter cannot re-open an alert after a daemon restart. As a
+separate safety net, the same event kind for one meter/window is delivered at
+most once per six hours; suppressed attempts remain visible in `headroom notify
+--last`. Before delivery, Headroom also removes volatile countdowns and
+fractional timestamps and suppresses an otherwise identical message as `no new
+information`.
+
+## When Headroom speaks
+
+| Kind | Announcement rule |
+| --- | --- |
+| Threshold | First crossing per window, then only the next higher configured level (for example 90 → 95 → 100). |
+| Projected stall | Once per window, with at most one materially worse escalation. |
+| Reset | Once, when it actually happened. |
+| Source failed / recovered | One failure/recovery pair, with hysteresis. |
+| Plan downgrade | One alarm and one 24-hour reminder while unacknowledged. |
+| Free reset | When granted and when used. |
+
+Anything outside these rules is a bug.
 
 ## Phone messages
 
@@ -146,7 +170,10 @@ webhook sends without an Authorization header. Keep credentials out of URLs.
 
 The daemon delivers after each poll. A ledger deduplicates each event/channel
 pair. Its first notification pass records a watermark and skips old backlog.
-Tests send outside the ledger and cannot suppress real events.
+For the same meter and window, the last delivered rendered message is also a
+content backstop: countdown-only, "N minutes ago", fractional-time, and
+unchanged-`now NN%` differences are suppressed and logged as `no new
+information`. Tests send outside the ledger and cannot suppress real events.
 
 Quiet hours use local wall-clock time and may wrap midnight. Events are queued
 until the first poll outside the range, then arrive under a `🌙 Headroom` headline

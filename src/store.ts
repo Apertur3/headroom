@@ -1312,6 +1312,27 @@ export class HeadroomStore {
   }
 
   /**
+   * A vendor reset instant is presentation data, not a reliable identity:
+   * some endpoints calculate it relative to each read. Keep one canonical,
+   * minute-granular instant for the active meter/window in durable daemon
+   * state. A nearby report is the same window; a report more than five
+   * minutes away starts the next one.
+   */
+  windowKey(meterId: string, windowMinutes: number | null | undefined, resetsAt: string | null | undefined): string {
+    const minutes = windowMinutes ?? 0;
+    if (!resetsAt || !Number.isFinite(Date.parse(resetsAt))) return `${meterId}:${minutes}:unknown`;
+    const stateKey = `window_key:${meterId}:${minutes}`;
+    const reported = Math.floor(Date.parse(resetsAt) / 60_000) * 60_000;
+    const prior = this.daemonState(stateKey);
+    const priorAt = prior ? Date.parse(prior) : Number.NaN;
+    const canonical = Number.isFinite(priorAt) && Math.abs(reported - priorAt) <= 5 * 60_000
+      ? priorAt : reported;
+    const iso = new Date(canonical).toISOString();
+    if (iso !== prior) this.setDaemonState(stateKey, iso);
+    return `${meterId}:${minutes}:${iso}`;
+  }
+
+  /**
    * Notification delivery ledger (src/notify.ts). One row per event per
    * channel, so an event that was already delivered is never delivered twice
    * however often the daemon re-reads it: the (event_id, channel) uniqueness
@@ -1320,6 +1341,37 @@ export class HeadroomStore {
   notifyEnqueue(eventId: string, channel: string, text: string, at: string): void {
     this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'pending',0,?,NULL,?,?)")
       .run(eventId, channel, text, at, at);
+  }
+
+  /** A visible audit row for a notification that the delivery safety net
+   * deliberately held back. */
+  notifySuppress(eventId: string, channel: string, text: string, detail: string, at: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'suppressed',0,?,?,?,?)")
+      .run(eventId, channel, text, detail, at, at);
+  }
+
+  /** The payload contains the stable semantic delivery identity. Keeping this
+   * lookup in the store makes the six-hour guard independent of event IDs. */
+  notifySentSince(channel: string, deliveryIdentity: string, since: string): boolean {
+    const rows = this.db.prepare("SELECT text FROM notify_ledger WHERE channel = ? AND status = 'sent' AND updated_at >= ?").all(channel, since);
+    return rows.some((row) => {
+      try { return (JSON.parse(String(row.text)) as { delivery_identity?: unknown }).delivery_identity === deliveryIdentity; }
+      catch { return false; }
+    });
+  }
+
+  /** The latest delivered rendered message for exactly one meter/window.
+   * Payload fields are intentionally inspected here instead of adding another
+   * schema column, so older ledgers stay readable during upgrades. */
+  notifyLastSentForWindow(channel: string, meter: string, windowKey: string): NotifyDelivery | undefined {
+    const rows = this.db.prepare("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'sent' ORDER BY updated_at DESC, id DESC").all(channel);
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(String(row.text)) as { meter?: unknown; window_key?: unknown };
+        if (payload.meter === meter && payload.window_key === windowKey) return notifyFromRow(row);
+      } catch { /* Legacy plain-text rows have no window scope. */ }
+    }
+    return undefined;
   }
 
   /** Lookup for a deterministic notification identity. Projection delivery
