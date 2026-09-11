@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-11
+
 ### Fixed
 
 - Alerts no longer repeat every poll: the reset timestamp vendors report drifts by fractions of a second, and it was part of every de-duplication key. Windows now have a stable identity, thresholds advance only to higher configured levels, and no alert kind repeats for one meter and window within 6 hours.
