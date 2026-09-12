@@ -55,15 +55,7 @@ adapter = "native-ts"
 # location = "~/.kimi/auth.token"
 # adapter = "native-ts"
 
-# The Gemini CLI subscription (Gemini Code Assist quota). `location` is the
-# Gemini home holding oauth_creds.json: ~/.gemini, or the .gemini under a
-# GEMINI_CLI_HOME override. Discovery names an override principal
-# gemini-<home basename>. See docs/vendors.md.
-# [[accounts]]
-# name = "gemini"
-# vendor = "gemini"
-# location = "~/.gemini"
-# adapter = "native-ts"
+# Gemini CLI consumer access is retired. Configure Antigravity above instead.
 
 # Local pools are probed only; a wake command is reported when down and never run.
 # [[accounts]]

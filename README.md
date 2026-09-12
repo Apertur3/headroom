@@ -7,7 +7,7 @@
 
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 
-One daemon reads quota across Claude, Codex, Antigravity, Gemini CLI, Grok, Kimi, and local
+One daemon reads quota across Claude, Codex, Antigravity, Grok, Kimi, and local
 vLLM or llama.cpp pools. It keeps history, detects resets, and gives cooperating agents a budget
 check before they start work. Stale or failed readings stay UNKNOWN. Antigravity support is
 experimental; provider-specific limits are described below.
@@ -43,24 +43,22 @@ that use Headroom; they cannot stop unrelated tools from consuming the subscript
   <img alt="How Headroom fits together" src="docs/assets/headroom-flow-light.svg">
 </picture>
 
-Headroom reads each vendor itself, in TypeScript, on macOS, Linux and Windows: the Claude Code
-token from the Keychain or credentials file, the Codex token from its auth file, the Grok token from the file
-`grok login` writes, and, experimentally, the Antigravity
-token from the agy CLI. For Antigravity the daemon keeps an agy process warm and reads its local
-quota summary: a summary with real fractions is shown as-is, and an idle window whose reset equals
-fetch time plus window length is shown too, with a doubt marker, rather than replaced with UNKNOWN
-on a heuristic -- only an availability-only payload or a reading that contradicts the previous one
-becomes UNKNOWN. Google's remote quota endpoint answers 403 for free-tier accounts, so it serves as
-diagnosis there, not as a usable reading. Each call goes straight to the vendor's usage endpoint
-and the token is dropped afterwards. The endpoint contracts were learned from
-[CodexBar](https://github.com/steipete/codexbar) (MIT); an optional engine
-links its library for providers Headroom does not cover natively.
+Headroom reads Claude, Codex, Grok and Kimi through native TypeScript adapters.
+Antigravity is experimental: it requires a logged-in `agy`, a running Headroom daemon,
+and the native Swift reader built from source. The npm package currently has no pinned
+native reader download. Gemini CLI is not required or supported for consumer subscriptions;
+Google retired that access on June 18, 2026.
+
+For Antigravity, Headroom reads agy's local quota summary without reading its token.
+Missing or failed summaries stay UNKNOWN. An idle window with real fractions may carry
+a doubt marker when its reset time looks synthetic. The endpoint contracts and native
+reader build on [CodexBar](https://github.com/steipete/codexbar) (MIT).
 
 ## What you get
 
 | | |
 |---|---|
-| Vendors and meters | Claude `all`, `fable`, `routines` and reported scoped meters; Codex `main`, `spark`, `credits`; Antigravity `gemini`, `claude-gpt`; Gemini CLI, Grok, Kimi; and local vLLM or llama.cpp `capacity` pools |
+| Vendors and meters | Claude `all`, `fable`, `routines` and reported scoped meters; Codex `main`, `spark`, `credits`; Antigravity `gemini`, `claude-gpt`; Grok, Kimi; and local vLLM or llama.cpp `capacity` pools |
 | Pace | HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset |
 | Decisions | `can`, `gate`, `route`, `plan`, `fill`, `wait`, leases, per-meter reserves, and a spend ledger coordinate shared capacity and pacing |
 | Views and automation | Terminal status, `dashboard`/`top`, `statusline --render`, `usage --paste` or `--clipboard`, JSON contract output, local daemon, and MCP tools |
@@ -76,7 +74,7 @@ Node 22.13 or newer.
 
 ```sh
 npm install -g headroomd
-headroom accounts discover   # finds Claude, Codex, Antigravity, Gemini CLI, Grok and Kimi logins
+headroom accounts discover   # finds Claude, Codex, Antigravity, Grok and Kimi logins
 headroom                     # one line per meter
 ```
 
@@ -140,8 +138,7 @@ Stable since 0.1.0 (2026-09-11). Used daily on one macOS machine with two Claude
 Antigravity account and two local inference boxes. Every release is installed from the npm
 registry into a fresh home on Linux (a Raspberry Pi 5) and Windows 11 (a VM) and walked through
 the quickstart by script; CI runs the suite on all three platforms. Vendor endpoints are private and change without notice; Headroom pins, records
-fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Google can
-reject the remote Antigravity fallback for unsupported Gemini Code Assist tiers (for example
-`UNSUPPORTED_CLIENT`); keep the daemon running so its warm `agy` source remains available.
+fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Antigravity requires
+the source-built native reader and a daemon-kept `agy`; see [vendor setup](docs/vendors.md#antigravity).
 
 MIT. Third party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

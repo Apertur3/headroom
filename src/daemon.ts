@@ -205,23 +205,13 @@ export class HeadroomDaemon {
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
-    // Keepalive is secondary now that the remote quota endpoint can answer
-    // directly: it is never started here at boot, only lazily by
-    // maybeStartKeepalive() below, the first time a poll's remote read for
-    // an Antigravity principal comes back short of real buckets. A daemon
-    // whose remote reads are always real spawns agy exactly never.
+    // Start agy lazily after the first Antigravity poll. Only its local
+    // summary supplies consumer quota; Gemini CLI OAuth is retired.
     await this.schedulePrincipals();
     this.schedulingStarted = true;
   }
 
-  /**
-   * Starts the daemon-owned warm `agy` only when it isn't already running
-   * and policy/platform allow it -- called after a poll's remote Antigravity
-   * read comes back without real buckets (availability-only, a 403, or a
-   * transport failure), never unconditionally at daemon startup. No-op once
-   * agy is already running: keepalive, once started, keeps running the way
-   * it always has, rather than stopping and restarting as remote recovers.
-   */
+  /** Start the owned agy PTY once an Antigravity poll needs it. */
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
     if (!policy.antigravity_keepalive || process.platform === "win32") return;
@@ -668,19 +658,8 @@ export class HeadroomDaemon {
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
-      // Keepalive is secondary: only start the warm agy once a real poll
-      // cycle (this.schedulingStarted, set at the end of start() -- never
-      // true for a daemon a test drives directly through poll()/handleLine()
-      // without ever starting it) shows the remote quota endpoint fell short
-      // of real buckets for an Antigravity principal. A no-op once agy is
-      // already running.
-      if (this.schedulingStarted && !this.keepalive?.running) {
-        const antigravityAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity");
-        const remoteFellShort = antigravityAccounts.some((account) => {
-          const remoteRows = result.observations.filter((item) => item.principal_id === account.name && item.source === "remote:antigravity");
-          return remoteRows.length === 0 || remoteRows.some((item) => item.freshness !== "fresh");
-        });
-        if (antigravityAccounts.length && remoteFellShort) void this.maybeStartKeepalive(accounts, policy);
+      if (this.schedulingStarted && !this.keepalive?.running && accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+        void this.maybeStartKeepalive(accounts, policy);
       }
       // A gate-blocked skip renders the exact same failed observation reason
       // as a real denial on purpose (see PollResult.claudeProbeOutcomes), so

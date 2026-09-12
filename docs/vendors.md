@@ -142,123 +142,51 @@ printed as `n/a`, rather than guessing.
 
 ## Antigravity
 
-The remote quota endpoint is the primary source; the daemon-kept local `agy` process is a
-fallback, used only when remote can't answer.
+Headroom reads the local quota summary of a logged-in Antigravity CLI (`agy`).
+It does not need Gemini CLI, read its OAuth credentials, or call the retired
+consumer Code Assist path. The daemon owns a hidden agy process on macOS/Linux;
+agy owns authentication and token refresh.
 
-The remote path reads Gemini CLI's Google OAuth credentials, refreshing the token first if it's
-expired, then follows the same sequence CodexBar's Antigravity provider does against
-`cloudcode-pa.googleapis.com`: `v1internal:loadCodeAssist` (metadata `ideType: "ANTIGRAVITY"`) for
-the account's current tier and project id; finally `v1internal:retrieveUserQuota` with that project
-id. Headroom reads usage, it does not provision Code Assist accounts or pick a billing tier on the
-caller's behalf: there is no `onboardUser` call anywhere in this path. If neither the stored
-credential nor `loadCodeAssist` names a project, the read comes back `failed` with reason "no Code
-Assist project; finish setup in the Gemini CLI" rather than onboarding one. Never persists anything
-it learns (project id included) -- every poll re-resolves it, so a failed write can never leave a
-stale or wrong value on disk.
+Setup:
 
-Token refresh needs the Gemini CLI's own OAuth client id/secret, which Headroom never hardcodes:
-it checks `GEMINI_OAUTH_CLIENT_ID`/`GEMINI_OAUTH_CLIENT_SECRET`, then `GEMINI_OAUTH2_JS_PATH`, then
-the installed Gemini CLI package (the `gemini` binary's real path, walked upward for
-`oauth2.js`/`bundle/gemini.js` under an npm-global or Homebrew layout). A Homebrew-published
-`gemini-cli`'s `bundle/gemini.js` is only a small bootstrap that dynamically imports the real code
-from content-hashed sibling files (`bundle/chunk-<hash>.js`), so on that layout none of the fixed
-candidate paths ever contain the client -- the last resort is a scan of every `.js` file directly
-in the bundle directory. `headroom doctor`'s "Antigravity OAuth client" check reports which layout
-actually matched (never the id/secret themselves). Every file this discovery reads -- the fixed
-candidates, the environment override, and the chunk scan alike -- must be a regular file (never a
-symlink) and is charged against one shared 16 MiB / 200-file budget for the whole attempt; an
-oversized or otherwise unsafe bundle is treated as unavailable rather than read.
+1. Install [Antigravity CLI](https://antigravity.google/docs/cli/) and run `agy` to sign in.
+2. Build the native reader from a Headroom source checkout with `npm run engine:build`.
+3. From that checkout, run `npm run build`, then `node dist/cli.js install-service`. Run the load command it prints to start the service.
+4. Check `node dist/cli.js doctor` and `node dist/cli.js --principal antigravity --refresh --json`.
+   If the account is not configured, add it to `accounts.toml` as below. Discovery also
+   finds agy, but rerunning discovery replaces the account file, including manual entries.
 
-Only when the daemon owns a warmed `agy` pseudo-terminal (started under `script -q /dev/null agy`
-on macOS and Linux only; never on Windows, and never merely because a principal is configured --
-see keepalive below) does a poll also ask the native Swift engine for agy's own local quota
-summary, used only once remote comes back short of real buckets.
+```toml
+[[accounts]]
+name = "antigravity"
+vendor = "antigravity"
+location = "agy"
+adapter = "native-ts"
+```
 
-Credential location: the remote path reads `~/.gemini/oauth_creds.json` on every platform, the
-same file the Gemini CLI itself writes. There's no Keychain path for Antigravity.
+The npm package currently has no pinned native reader download: `headroom engine install`
+cannot install this reader yet. A source-built service is a development setup; running
+`headroom install-service` from a global npm installation replaces it with the packaged
+service, which cannot find the checkout's reader. Check doctor after changing installations.
+Windows does not support the local reader.
 
-Meters emitted: `<principal>:gemini` and `<principal>:claude-gpt`, each with a 5-hour and a weekly
-window, with `used` computed as `(1 - remainingFraction) * 100` from the vendor's quota buckets.
-`headroom --principal <name> --shape` prints the key/kind shape of every response the sequence
-made (`loadCodeAssist`, `retrieveUserQuota`), plus `loadCodeAssist`'s own tier and any
-`ineligibleTiers[].reasonCode` it reported, so a denied tier is visible without guessing at
-Google's response shape.
+Meters are `<principal>:gemini` and `<principal>:claude-gpt`, each with five-hour and
+weekly windows. Missing readers, login failures and unavailable summaries remain UNKNOWN.
+Idle windows with real fractions can carry a doubt marker when their reset time matches
+fetch time plus window length; availability alone is never reported as unused capacity.
+`headroom doctor` distinguishes the native reader, login state and successful quota read.
+`--shape` is not available for this local source; use status JSON and doctor.
 
-Keepalive is secondary: a poll's remote read is always tried first, and the daemon starts `agy`
-lazily -- only the first time a poll shows remote fell short (availability-only, a 403, or a
-transport failure) for an Antigravity principal, never unconditionally at daemon startup. A daemon
-whose remote reads are always real spawns agy exactly never. Once started it keeps running the
-same way it always has; a failed read's `reason` names both outcomes (e.g. "quota endpoint
-returned availability only; agy keepalive not running" or "...; agy quota summary not ready").
+## Gemini CLI (retired in Headroom)
 
-Known limitations, verified live:
+[Google ended consumer Gemini CLI access on June 18, 2026](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/),
+including free, Google AI Pro and Ultra subscriptions. Google still supports some enterprise
+and paid API use, but Headroom does not support those Gemini CLI configurations.
 
-- Google's remote quota endpoint answers 403 for the free Gemini Code Assist tier, or otherwise
-  returns a response with no `remainingFraction` on any bucket. Either is availability-only, not
-  usage, and Headroom reports every window `failed` with reason "quota endpoint returned
-  availability only" rather than showing it as 0% used -- there is no number to show.
-- The daemon-kept local `agy` read can report a window that looks the same shape as that
-  availability response: zero or unknown usage with a reset that lands within 90 seconds of
-  "fetch time plus window length" (`detectPlaceholder` in `src/engine/observation.ts`). Per the
-  repository owner's decision, Headroom no longer discards this as a heuristic false positive --
-  a genuinely idle rolling window is shaped exactly the same way, and Google's own Antigravity app
-  shows the vendor's own 100% in that case. The reading is shown as-is (freshness, quantity and
-  reset all vendor-reported), downgraded to `truth: "estimated"` at half confidence with reason
-  "vendor reports an idle window; reset equals fetch time plus window length, so this may be a
-  placeholder"; `headroom` status appends `(idle, unverified)` to the line. It is only escalated to
-  a real `failed` reading when the store's own history contradicts it: a fresh reading for the
-  same meter and window, within the last 2 hours, already showed real usage whose reset has not
-  happened yet -- a vendor cannot legitimately go idle without a reset in between, so that reading
-  is demoted with reason "idle reading contradicts the previous fresh reading (N% used, reset not
-  yet due)".
-- Windows has no daemon-kept `agy` and no native engine path for it, so an Antigravity principal
-  on Windows is remote-only, and inherits the free-tier 403 above without a local fallback.
-
-## Gemini CLI
-
-The Gemini CLI subscription (Gemini Code Assist quota) is a plain remote read: no daemon, no local
-process, no fallback source. It shares its whole transport with Antigravity above --
-`src/adapters/google-code-assist.ts` holds the credential read, the in-memory token refresh, the
-bundled OAuth client discovery and both Code Assist calls, and the two adapters import it -- so
-everything said above about bounded reads, the 16 MiB / 200-file bundle scan budget and never
-persisting a resolved project id applies here unchanged.
-
-What differs is the client identity: this path sends `metadata.ideType: "GEMINI_CLI"` (with
-`pluginType: "GEMINI"`, and no product `User-Agent`) on `v1internal:loadCodeAssist`, which is what
-tells Google whose quota is being asked about, then posts the resolved project id to
-`v1internal:retrieveUserQuota`. There is no `onboardUser` call: when neither the stored credential
-nor `loadCodeAssist` names a project, the read is `failed` with reason "no Code Assist project;
-finish setup in the Gemini CLI".
-
-Credential location: `~/.gemini/oauth_creds.json` on every platform, the file the Gemini CLI itself
-writes. The CLI's own `GEMINI_CLI_HOME` overrides the home it looks under, so a principal's
-`location` is that `<home>/.gemini` directory. `headroom accounts discover` adds a `gemini`
-principal when that credential exists, named `gemini-<home basename>` for a `GEMINI_CLI_HOME`
-override so two Gemini logins on one machine stay distinguishable; `doctor` reports the credential
-file's presence and permissions like every other file-backed vendor. An Antigravity principal reads
-the same file for a different product's quota, so both can exist side by side.
-
-Meters emitted: one per model family the quota buckets carry, `<principal>:<model family>` from the
-bucket's own `modelId` (e.g. `gemini:gemini-2.5-pro`), plus `<principal>:all` for a bucket that
-names no model. `used` is `(1 - remainingFraction) * 100`; when one family reports several buckets
-for the same window (Google splits input and output token types) the lowest remaining fraction
-wins, since that is the one that will actually stop the account. A window length is taken only from
-a bucket that names its own period (an explicit `windowMinutes`, or wording like weekly/daily/
-5-hour/hourly) -- nothing infers a duration from a reset time, so a bucket that names no period
-gets a reset with a null window length rather than an invented one.
-
-Known limitations:
-
-- An account tier without quota entitlement gets 403 from `retrieveUserQuota` (the same refusal the
-  Antigravity path sees on the free Code Assist tier). That is an answer about the account, not a
-  transport error, so it becomes one `failed` reading with reason "quota endpoint not permitted for
-  this account tier (403)" -- inside the shared protected-status backoff, so the next poll holds off
-  instead of re-asking a settled question. There is no local fallback source to rescue it.
-- A 200 response whose buckets carry no `remainingFraction` is availability, not usage: reported as
-  `failed` with reason "quota endpoint returned availability only" rather than as 0% used.
-- A failed read carries a single `<principal>:all` row. Model families are only known from a
-  response that answered, so a read that got none reports no per-family meters rather than
-  inventing ones this account may not have.
+Old Gemini credential files are ignored by discovery. Existing `vendor = "gemini"`
+accounts remain parseable for compatibility and return UNKNOWN with migration guidance;
+they make no network calls. Remove those entries from `accounts.toml` and configure
+Antigravity instead. Historical Gemini observations remain in the database.
 
 ## Grok
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { geminiResponseShape } from "./adapters/gemini.js";
+import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { existsSync, realpathSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
@@ -18,7 +18,6 @@ import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile }
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { codexResponseShape } from "./adapters/codex.js";
-import { antigravityResponseShape } from "./adapters/antigravity.js";
 import { pollAccounts } from "./collector.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
@@ -936,13 +935,13 @@ export async function observe(argv: string[]): Promise<number> {
 async function responseShape(argv: string[]): Promise<number> {
   if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
-  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude, Codex, Antigravity or Gemini principal");
+  if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  if (account.vendor === "gemini") throw new Error(GEMINI_RETIRED_REASON);
+  if (account.vendor === "antigravity") throw new Error("Antigravity uses agy local quota summaries; inspect headroom doctor and headroom --principal <id> --json instead");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
     : account.vendor === "claude" ? { usage: await claudeResponseShape(account) }
-    : account.vendor === "antigravity" ? await antigravityResponseShape(account)
-    : account.vendor === "gemini" ? await geminiResponseShape(account)
     : undefined;
-  if (!responses) throw new Error("--shape requires a native TypeScript Claude, Codex, Antigravity or Gemini principal");
+  if (!responses) throw new Error("--shape requires a native TypeScript Claude or Codex principal");
   console.log(JSON.stringify({ principal_id: account.name, vendor: account.vendor, responses }));
   return 0;
 }

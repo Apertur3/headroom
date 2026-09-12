@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
-import { discoverGeminiOAuthClientDetail } from "./adapters/antigravity.js";
+import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
@@ -80,6 +80,8 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
     const modified = metadata.modifiedAt ? `, last modified ${formatLocalTimestamp(metadata.modifiedAt)}` : "";
     return check("OK", `principal ${account.name} credential`, `credential readable through the Apple security tool${modified}`, "no action needed");
   }
+  if (account.vendor === "gemini") return check("WARN", `principal ${account.name} credential`, GEMINI_RETIRED_REASON, "use: agy");
+  if (account.vendor === "antigravity") return check("INFO", `principal ${account.name} credential`, "authentication is owned by agy; see keepalive login state below", "run: agy if not logged in");
   if (account.vendor === "grok") {
     // `location` may name the token file itself or the directory holding it.
     const grokPath = grokAuthPath(account.location);
@@ -102,10 +104,10 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
       ? check("OK", `principal ${account.name} credential`, `${label} present (${kimiPath})`, "no action needed")
       : check("FAIL", `principal ${account.name} credential`, shared ? `${label} is readable by group or other (${kimiPath})` : `missing or unsafe ${label} (${kimiPath})`, fix);
   }
-  const path = credentialPath(account.vendor, account.vendor === "antigravity" ? undefined : account.location);
+  const path = credentialPath(account.vendor, account.location);
   return (await doctorFileStatus(path)) === "present"
     ? check("OK", `principal ${account.name} credential`, `credential file present (${path})`, "no action needed")
-    : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, account.vendor === "antigravity" ? "run: gemini" : `run: ${account.vendor}`);
+    : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, `run: ${account.vendor}`);
 }
 
 /** Opening the store creates ~/.headroom at 0700 on a fresh machine (the same
@@ -272,15 +274,9 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     : check("INFO", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
 
   if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-    // Best-effort and never blocking: env overrides always resolve
-    // instantly, and the real Homebrew/npm-global candidate paths are a
-    // bounded, local filesystem walk. Never reads or logs the client id or
-    // secret themselves, only which layout matched.
-    let detail: Awaited<ReturnType<typeof discoverGeminiOAuthClientDetail>>;
-    try { detail = await discoverGeminiOAuthClientDetail(); } catch { detail = undefined; }
-    output.push(detail
-      ? check("OK", "Antigravity OAuth client", `resolved via ${detail.layout}`, "no action needed")
-      : check("WARN", "Antigravity OAuth client", "could not locate the Gemini CLI's bundled OAuth client", "install the Gemini CLI, or set GEMINI_OAUTH_CLIENT_ID/GEMINI_OAUTH_CLIENT_SECRET"));
+    output.push(native
+      ? check("OK", "Antigravity local reader", "native reader available; Gemini CLI is not required", "no action needed")
+      : check("FAIL", "Antigravity local reader", "native reader missing; the npm package has no pinned native release asset", "build Headroom from source with npm run engine:build and run its daemon"));
   }
 
   const daemon = await daemonRequest(socketPath(), "health");
@@ -297,15 +293,11 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       const uptime = keepalive.uptime_ms === undefined || keepalive.uptime_ms === null ? "?" : `${Math.floor(keepalive.uptime_ms / 1000)}s`;
       const read = local ? `; local ${local.outcome ?? "unknown"} (${local.payload_kind ?? "unknown"})` : "; local read not recorded yet";
       const state = keepalive.login_state === "logged_in" ? "logged in" : keepalive.login_state === "not_logged_in" ? "not logged in" : "login state pending";
-      const level: DoctorLevel = keepalive.login_state === "not_logged_in" ? "WARN" : "OK";
-      const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : "no action needed";
+      const level: DoctorLevel = keepalive.login_state !== "logged_in" || local?.outcome !== "fresh" ? "WARN" : "OK";
+      const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : local?.outcome === "fresh" ? "no action needed" : "check the Antigravity local reader above and headroom logs";
       output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
     }
-    // Not a FAIL: keepalive is secondary now that the remote quota endpoint
-    // can answer directly (see the Antigravity OAuth client check above) --
-    // the daemon starts agy lazily, only once a poll shows remote fell
-    // short, so "not running yet" is the common, healthy state.
-    else output.push(check("OK", "Antigravity keepalive", "agy is not running; the remote quota endpoint is the primary source", "run: agy (only needed if remote returns availability-only or a 403)"));
+    else output.push(check("WARN", "Antigravity keepalive", "agy is not running; its local summary is required", "run: agy and check headroom logs"));
   } else {
     // A missing daemon never blocks reading a configured principal -- every
     // CLI/MCP entry point falls back to a direct read -- so it is a WARN, not

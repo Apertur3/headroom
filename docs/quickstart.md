@@ -48,8 +48,7 @@ After the service step, setup optionally offers notification channels, presets a
 headroom accounts discover
 ```
 
-This scans for `~/.claude*` and `~/.codex*` directories; Antigravity's `agy`; Gemini CLI OAuth
-credentials; and the credential locations used by `grok login` and `kimi login`. It writes what it
+This scans for `~/.claude*` and `~/.codex*` directories; Antigravity's `agy`; and the credential locations used by `grok login` and `kimi login`. It writes what it
 finds to `~/.headroom/accounts.toml` (mode 0600), and prints the same TOML to stdout so you can
 check it before trusting it, followed by a confirmation line:
 

@@ -7,8 +7,8 @@ import { claudeGrantNeededObservations, isClaudeProbeDenialReason, observeClaude
 import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
-import { noDaemonObservations, observeAntigravity } from "./adapters/antigravity.js";
-import { observeGemini } from "./adapters/gemini.js";
+import { failedAntigravityObservations, noDaemonObservations } from "./adapters/antigravity.js";
+import { retiredGeminiObservations } from "./adapters/gemini.js";
 import { observeGrok } from "./adapters/grok.js";
 import { observeKimi } from "./adapters/kimi.js";
 import { observeLocal } from "./engine/local.js";
@@ -207,16 +207,14 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
   }
-  // The Gemini CLI subscription reads its own Code Assist quota over the same
-  // Google endpoints Antigravity uses, but with no local process behind it: it
-  // is a plain remote read, with no daemon or warm probe involved.
+  // Preserve old account IDs as UNKNOWN with migration guidance, without polling.
   for (const account of providerAccounts.filter((item) => item.vendor === "gemini")) {
-    const result = await observeGemini(account);
+    const result = retiredGeminiObservations(account);
     observations.push(...result);
     const protectedFailure = result.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
     if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
   }
-  // A one-shot CLI/MCP read is intentionally remote-only. The Swift local
+  // A one-shot CLI/MCP read requires a daemon for Antigravity. The Swift local
   // probe is called exclusively by the daemon after it has started `agy`.
   const antigravityAccounts = providerAccounts.filter((account) => account.vendor === "antigravity");
   let localAntigravity = new Map<string, Observation[]>();
@@ -244,31 +242,17 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   for (const account of antigravityAccounts) {
     const local = localAntigravity.get(account.name) ?? [];
     if (options.noDaemon) { observations.push(...noDaemonObservations(account)); continue; }
-    if (options.skipRemoteAntigravity) {
-      // A remote failure must never suppress the next daemon-owned warm read.
-      observations.push(...local);
-      continue;
-    }
-    // Remote is the primary source: agy's warm local summary is a fallback
-    // for when the remote quota endpoint can't answer at all (the free-tier
-    // availability-only response, a 403, or a transport failure), not the
-    // default path. A poll that gets real remote buckets never needs a
-    // running agy at all.
-    const remote = await observeAntigravity(account);
-    const remoteReal = remote.length > 0 && remote.every((item) => item.freshness === "fresh");
-    const protectedFailure = remote.find((item) => item.freshness === "failed" && PROTECTED_STATUS_PATTERN.test(item.reason ?? ""));
-    if (protectedFailure) failures.push(`${account.name} source failed: ${protectedFailure.reason}`);
-    if (remoteReal) { observations.push(...remote); continue; }
-    const chosen = selectAntigravitySource(local, remote, account.name);
-    if (chosen === remote) {
-      // Local didn't rescue this read either: name why, alongside remote's
-      // own reason, so a failed observation never explains only one side.
-      const note = antigravityFallbackNote(options.daemonOwnsAntigravity === true, local, options.antigravityLoginState);
-      observations.push(...chosen.map((item) => item.freshness === "failed" && item.reason ? { ...item, reason: `${item.reason}; ${note}` } : item));
-    } else {
-      observations.push(...chosen);
-    }
+    // Consumer quotas come from agy's own local summary. Never fall back
+    // to Gemini CLI OAuth: Google retired consumer access in June 2026.
+    if (local.length) { observations.push(...local); continue; }
+    const reason = process.platform === "win32" ? "Antigravity local quota reader is not available on Windows"
+      : !native ? "Antigravity native reader missing; build Headroom from source with npm run engine:build and run its daemon"
+      : !options.daemonOwnsAntigravity ? "agy keepalive not running; enable antigravity_keepalive and run: agy"
+      : "agy local quota read failed; check headroom doctor and headroom logs";
+    observations.push(...failedAntigravityObservations(account, reason, new Date().toISOString()).map((row) => ({ ...row, source: "local:antigravity:warm" })));
+    antigravityLocal[account.name] ??= { outcome: "failed", payload_kind: "none", at: new Date().toISOString() };
   }
+
   if (native && engineAccounts.length) {
     try { observations.push(...await runNativeEngine(native, engineAccounts)); }
     catch (error) { failures.push(`native engine source failed: ${safeError(error)}`); }

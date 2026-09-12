@@ -223,3 +223,9 @@ export async function geminiResponseShape(account: ProviderAccount, dependencies
   }
   return result;
 }
+
+/** Compatibility for old accounts.toml entries; no credential read or network call. */
+export const GEMINI_RETIRED_REASON = "Gemini CLI consumer access ended on 2026-06-18; Headroom no longer polls this provider. Use Antigravity (agy) and remove this legacy account from accounts.toml";
+export function retiredGeminiObservations(account: ProviderAccount, now = new Date()): Observation[] {
+  return failed(account, GEMINI_RETIRED_REASON, now.toISOString());
+}

@@ -33,7 +33,7 @@ function base(account: ProviderAccount, meter: string, now: string): Omit<Observ
   return { principal_id: account.name, meter_id: `${account.name}:${meter}`, observed_at: now, fetched_at: now, source: SOURCE, truth: "official", confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4" };
 }
 
-function failed(account: ProviderAccount, reason: string, now: string): Observation[] {
+export function failedAntigravityObservations(account: ProviderAccount, reason: string, now: string): Observation[] {
   return METERS.flatMap((meter) => WINDOWS.map((window) => ({
     ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" as const }, quantity: null, resets_at: null,
     freshness: "failed" as const, truth: "estimated" as const, confidence: 0, reason: redact(reason),
@@ -49,7 +49,7 @@ function failed(account: ProviderAccount, reason: string, now: string): Observat
  * unavailable" error instead of the one actionable fix.
  */
 export function noDaemonObservations(account: ProviderAccount, now = new Date()): Observation[] {
-  return failed(account, "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service", now.toISOString());
+  return failedAntigravityObservations(account, "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service", now.toISOString());
 }
 
 interface QuotaBucket { meter?: typeof METERS[number]; minutes?: number; remaining?: number; resetsAt: string | null; }
@@ -100,23 +100,23 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const codeAssist = await loadCodeAssist(fetcher, credentials.token, CODE_ASSIST_METADATA, USER_AGENT);
     const parsed = parseCodeAssist(codeAssist);
     const projectId = resolveProjectId(credentials.projectId, codeAssist);
-    if (!projectId) return failed(account, NO_PROJECT_REASON, timestamp);
+    if (!projectId) return failedAntigravityObservations(account, NO_PROJECT_REASON, timestamp);
     const quota = await postUserQuota(fetcher, credentials.token, projectId, USER_AGENT);
     if (!quota.ok) throw await codeAssistHTTPError(quota);
     const body: unknown = await vendorJson(quota);
     if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) {
       const tier = parsed.reasonCode ? `; tier ${parsed.tierId ?? parsed.tierName ?? "unknown"} (${parsed.reasonCode})` : "";
-      return failed(account, `quota endpoint returned availability only${tier}`, timestamp);
+      return failedAntigravityObservations(account, `quota endpoint returned availability only${tier}`, timestamp);
     }
     return observationsFromAntigravityQuota(body, account, now);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    if (message === "expired") return failed(account, "token expired; run: gemini", timestamp);
-    if (message === "unavailable" || message === "invalid") return failed(account, "no Gemini CLI OAuth credentials; run: gemini", timestamp);
+    if (message === "expired") return failedAntigravityObservations(account, "token expired; run: gemini", timestamp);
+    if (message === "unavailable" || message === "invalid") return failedAntigravityObservations(account, "no Gemini CLI OAuth credentials; run: gemini", timestamp);
     // Keep a sanitized transport/adapter diagnostic. The prior generic label
     // hid actionable local daemon failures such as a missing agy binary.
     const reason = error instanceof CodeAssistHTTPError ? error.message : message ? redact(message).slice(0, 512) : "Antigravity usage unavailable";
-    return failed(account, reason, timestamp);
+    return failedAntigravityObservations(account, reason, timestamp);
   }
 }
 
