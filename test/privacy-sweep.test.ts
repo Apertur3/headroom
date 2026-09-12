@@ -11,10 +11,10 @@ const scriptPath = join(__dirname, "..", "scripts", "privacy-sweep.sh");
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-async function checkFile(contents: string, opts: { denylist?: string } = {}): Promise<{ code: number; stdout: string }> {
+async function checkFile(contents: string, opts: { denylist?: string; filename?: string } = {}): Promise<{ code: number; stdout: string }> {
   const root = await mkdtemp(join(tmpdir(), "headroom-privacy-sweep-"));
   temporary.push(root);
-  const target = join(root, "fixture.txt");
+  const target = join(root, opts.filename ?? "fixture.txt");
   await writeFile(target, contents, "utf8");
   const args = ["--check", target];
   if (opts.denylist) args.push("--denylist", opts.denylist);
@@ -51,6 +51,15 @@ const realHomePath = ["/Users", realUsername, ".headroom/accounts.toml"].join("/
 const denylistWord = ["Synthetic", "Host"].join("");
 
 describe("scripts/privacy-sweep.sh --check", () => {
+  it("does not exempt package author metadata from source or packed scans", async () => {
+    const result = await checkFile(JSON.stringify({ name: "fixture", author: "Example Maintainer" }), { filename: "package.json" });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toContain("package author metadata belongs in LICENSE");
+    expect(result.stdout).not.toContain("Example Maintainer");
+    const clean = await checkFile(JSON.stringify({ name: "fixture", license: "MIT" }), { filename: "package.json" });
+    expect(clean.code).toBe(0);
+  });
+
   it("fails on a private IPv4 address", async () => {
     const ip = privateIps.split(" ")[0];
     const { code, stdout } = await checkFile(`internal box at ${ip} for testing\n`);

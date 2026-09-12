@@ -372,11 +372,11 @@ export function canRoute(
 /** Reserve active capacity claimed by other callers before evaluating pace. */
 export function canRouteWithLeases(
   subscriptionMeters: string[], localMeters: string[], observations: Map<string, Observation | Observation[] | undefined>,
-  localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, leases: Lease[], owner?: string, now = new Date(),
+  localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, leases: Lease[], owner?: string, now = new Date(), includeOwnerReservations = false,
 ): CanDecision {
   const reserved = new Map<string, { percent: number; owners: string[]; originals: Map<number | null, number> }>();
   for (const lease of leases) {
-    if (lease.owner === owner || lease.expected_percent === null || lease.expected_percent <= 0) continue;
+    if ((!includeOwnerReservations && lease.owner === owner) || lease.expected_percent === null || lease.expected_percent <= 0) continue;
     const current = reserved.get(lease.meter_id) ?? { percent: 0, owners: [] as string[], originals: new Map<number | null, number>() };
     current.percent += lease.expected_percent;
     if (!current.owners.includes(lease.owner)) current.owners.push(lease.owner);

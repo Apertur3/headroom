@@ -4,11 +4,11 @@ import { daemonRequest, socketPath } from "./daemon.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./collector.js";
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
-import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withLastKnown, withPaceInfo } from "./pace.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
-import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { resetsIn, withResetsIn } from "./resets.js";
@@ -25,7 +25,7 @@ interface ToolDefinition { name: string; description: string; inputSchema: { typ
 
 const tools: ToolDefinition[] = [
   { name: "quota_status", description: "Return the latest quota windows for every Headroom meter.", inputSchema: { type: "object", properties: {} } },
-  { name: "quota_can", description: "Check whether an action class can consume all of its meters. With no expect_percent, reports the learned cost and confidence for this action class; lease reserves the deciding meter for the learned (or given) expectation so the next call learns too.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" }, expect_percent: { type: "number", minimum: 0, maximum: 100 }, lease: { type: "boolean" } }, required: ["action_class", "owner"] } },
+  { name: "quota_can", description: "Check whether an action class can consume all of its meters. With no expect_percent, reports the learned cost and confidence for this action class; lease atomically reserves every consumed meter for the learned (or given) expectation so the next call learns too.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" }, expect_percent: { type: "number", minimum: 0, maximum: 100 }, lease: { type: "boolean" } }, required: ["action_class", "owner"] } },
   { name: "quota_events", description: "Return Headroom events since an ISO timestamp or duration resolved by the caller.", inputSchema: { type: "object", properties: { since: { type: "string" } } } },
   { name: "quota_lease_start", description: "Reserve a meter for an orchestrator. owner defaults to this MCP session's client name and session id when omitted.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number", minimum: 0, maximum: 100 }, ttl_ms: { type: "number", exclusiveMinimum: 0 }, note: { type: "string" }, action_class: { type: "string" } }, required: ["meter_id"] } },
   { name: "quota_lease_end", description: "End a meter lease. A different owner must set force plus confirm_force and a reason, both of which are audited.", inputSchema: { type: "object", properties: { id: { type: "string" }, owner: { type: "string" }, force: { type: "boolean" }, confirm_force: { type: "boolean" }, reason: { type: "string" } }, required: ["id", "owner"] } },
@@ -83,7 +83,13 @@ function validateToolArguments(toolName: string, rawArguments: unknown): Record<
       if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
       if (key === "needs") {
         for (const item of value) {
-          if (typeof item !== "string" || !/^(5h|wk):[0-9]+(?:\.[0-9]+)?$/.test(item.trim())) throw new Error(`needs contains an invalid entry: ${JSON.stringify(item)} (use "5h:N" or "wk:N")`);
+          // Keep the MCP boundary on the same parser as --need. The tool
+          // schema deliberately advertises 30d and arbitrary durations;
+          // duplicating a smaller regex here used to reject valid calls
+          // before either the daemon or direct path could see them.
+          if (typeof item !== "string") throw new Error(`needs contains an invalid entry: ${JSON.stringify(item)}`);
+          try { parseGateNeed(item); }
+          catch { throw new Error(`needs contains an invalid entry: ${JSON.stringify(item)} (use 5h:N, wk:N, 30d:N, or <n>m|h|d:N)`); }
         }
       } else if (spec.items?.type === "string") {
         for (const item of value) if (typeof item !== "string") throw new Error(`${key} must be an array of strings`);
@@ -215,40 +221,56 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
     const localAccounts = accounts.filter(isLocalAccount);
     store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
     const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
-    const allMeters = [...new Set([...meters, ...localMeters])];
     const now = new Date();
-    const blocked = meters.map((meter) => store.dispatchBlockForMeter(meter, now) ?? store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
-    if (blocked) return { source: "direct", decision: { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] }, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
-    const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
-    const burn = store.burnRateFor([...rows.values()].flat(), now);
-    const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
-    const raw = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, allowUnknown, store.leases(undefined, true), owner, now);
-    const { decision, cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, raw, now, policy.reserve);
+    const decide = (includeOwnerReservations = false): CanDecision => directCanDecision(store, meters, localMeters, routing.local_preference, policy, allowUnknown, owner, now, includeOwnerReservations);
+    const raw = decide();
+    const learned = store.learnedCost(action)[0];
+    const expected = buildCostEstimate(action, expectOverride, learned, null).expected_percent;
+    const leaseMeters = (decision: CanDecision): string[] => localMeters.includes(decision.meter) ? [decision.meter] : meters;
+    let decision = admitCanCost(store, raw, leaseMeters(raw), policy, expected, now);
+    let leases: ReturnType<HeadroomStore["leases"]> = [];
+    if (leaseFlag && expected !== null) {
+      // The capacity decision and every resulting meter reservation share one
+      // SQLite write lock. Re-read with this owner's existing reservations
+      // included, so retries cannot stack leases past the actual capacity.
+      const admitted = store.admitAndStartLeases(
+        () => {
+          const current = decide(true);
+          return admitCanCost(store, current, leaseMeters(current), policy, expected, now);
+        },
+        owner,
+        leaseMeters,
+        expected,
+        30 * 60_000,
+        `can:${action}`,
+        now,
+        action,
+      );
+      decision = admitted.decision;
+      leases = admitted.leases;
+      if (leases.length) store.audit("mcp", "lease_start", `${owner}:${meters.join(",")}`, "ok");
+    }
+    const cost = buildCostEstimate(action, expectOverride, learned, remainingForDecision(store, decision));
     store.audit("mcp", "can", action, decision.allowed ? "yes" : "no");
-    return { source: "direct", decision, cost, leased_id: leasedId ?? null };
+    return { source: "direct", decision, cost, leased_id: leases[0]?.id ?? null };
   } finally { store.close(); }
 }
 
-/** Learned cost, confidence, "max more before reset" and (with lease) a new
- * lease for the deciding meter -- the same annotation whether the decision
- * came from the daemon or from directCan's own read, so quota_can's cost
- * report never depends on whether a daemon happens to be running. */
-function annotateCanCost(store: HeadroomStore, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string, decision: CanDecision, now: Date, reserves: Record<string, number>): { decision: CanDecision; cost: ReturnType<typeof buildCostEstimate>; leasedId?: string } {
-  const learned = store.learnedCost(action)[0];
+/** The direct counterpart of HeadroomDaemon#canDecision. It stays synchronous
+ * because it is also evaluated inside admitAndStartLeases' write lock. */
+function directCanDecision(store: HeadroomStore, meters: string[], localMeters: string[], localPreference: "fallback" | "prefer" | "never", policy: Awaited<ReturnType<typeof readPolicy>>, allowUnknown: boolean, owner: string, now: Date, includeOwnerReservations = false): CanDecision {
+  const blocked = meters.map((meter) => store.dispatchBlockForMeter(meter, now) ?? store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+  if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+  const allMeters = [...new Set([...meters, ...localMeters])];
+  const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+  const burn = store.burnRateFor([...rows.values()].flat(), now);
+  const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+  return canRouteWithLeases(meters, localMeters, enriched, localPreference, policy, allowUnknown, store.leases(undefined, true, now), owner, now, includeOwnerReservations);
+}
+
+function remainingForDecision(store: HeadroomStore, decision: CanDecision): number | null {
   const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
-  const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
-  const cost = buildCostEstimate(action, expectOverride, learned, remaining);
-  // The expected cost is only known here, so the meter's protected reserve
-  // (policy.toml [reserve]) is applied here too -- before any lease is
-  // started, so a refused call never reserves capacity it may not spend.
-  const decided = reserveOnCan(decision, reserves, remaining, cost.expected_percent);
-  let leasedId: string | undefined;
-  if (leaseFlag && decided.allowed && cost.expected_percent !== null) {
-    const lease = store.startLease(owner, decided.meter, cost.expected_percent, 30 * 60_000, `can:${action}`, now, action);
-    store.audit("mcp", "lease_start", `${owner}:${decided.meter}`, "ok");
-    leasedId = lease.id;
-  }
-  return { decision: decided, cost, leasedId };
+  return deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
 }
 
 async function directEvents(since: unknown): Promise<DirectResult> {
@@ -463,6 +485,37 @@ async function daemonCall(method: string, params: Record<string, unknown>): Prom
   return undefined;
 }
 
+/**
+ * Daemon RPC predates MCP structuredContent and returns bare arrays for a
+ * few read methods. MCP requires structuredContent to be a JSON object, and
+ * the direct fallback has always exposed named object wrappers. Normalize at
+ * the protocol boundary so daemon presence cannot change a tool's shape.
+ */
+function normalizeDaemonResult(method: string, result: unknown, arguments_: Record<string, unknown>): unknown {
+  if (!Array.isArray(result)) return result;
+  if (method === "events") return { source: "daemon", events: result };
+  if (method === "leases") return { source: "daemon", leases: result };
+  if (method === "cost") return { source: "daemon", items: result };
+  if (method === "rate") return { source: "daemon", lines: result };
+  if (method === "spend") {
+    const since = typeof arguments_.since === "string" && arguments_.since.trim()
+      ? arguments_.since.trim()
+      : new Date(Date.now() - 86_400_000).toISOString();
+    return { source: "daemon", since, rows: result };
+  }
+  return result;
+}
+
+/** This stdio server implements the current compatibility generation while
+ * retaining the two earlier releases clients still negotiate. */
+function negotiatedProtocolVersion(params: unknown): string {
+  const requested = params && typeof params === "object" && !Array.isArray(params)
+    ? (params as Record<string, unknown>).protocolVersion : undefined;
+  return requested === "2025-06-18" || requested === "2025-03-26" || requested === "2024-11-05" || requested === "2024-10-07"
+    ? requested
+    : "2025-06-18";
+}
+
 export async function handleMcp(line: string, call = daemonCall, fallback = directResult): Promise<Record<string, unknown> | undefined> {
   let request: Request;
   try { request = JSON.parse(line) as Request; } catch { return failure(null, -32700, "Parse error"); }
@@ -481,9 +534,10 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     const clientInfo = request.params && typeof request.params === "object" ? (request.params as Record<string, unknown>).clientInfo : undefined;
     const declaredName = clientInfo && typeof clientInfo === "object" ? (clientInfo as Record<string, unknown>).name : undefined;
     mcpClientName = typeof declaredName === "string" && declaredName.trim() ? declaredName.trim().slice(0, 80) : "mcp-client";
-    return response(request.id, { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "headroom", version: "0.1.0" } });
+    return response(request.id, { protocolVersion: negotiatedProtocolVersion(request.params), capabilities: { tools: {} }, serverInfo: { name: "headroom", version: "0.1.0" } });
   }
   if (request.method === "notifications/initialized") return undefined;
+  if (request.method === "ping") return response(request.id, {});
   if (request.method === "tools/list") return response(request.id, { tools });
   if (request.method !== "tools/call") return failure(request.id, -32601, "Method not found");
   const params = request.params ?? {};
@@ -510,6 +564,12 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   // action class, a daemon socket error, ...) must become a JSON-RPC error
   // response, never an uncaught rejection out of this stdio loop.
   try {
+    // `can_lease` needs the learned/overridden expected cost before it can
+    // enter the daemon's atomic admission transaction. Reading that model is
+    // local bookkeeping; the daemon remains the sole owner of the decision
+    // plus lease write when it is available.
+    const atomicCanLease = method === "can" && arguments_.lease === true;
+    const requestedCost = atomicCanLease ? await expectedCanCost(typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null) : undefined;
     const params_ = method === "can" ? { action_class: arguments_.action_class, allow_unknown: arguments_.allow_unknown === true, owner: arguments_.owner }
       : method === "events" ? { since: arguments_.since }
       : method === "lease_start" ? arguments_ : method === "lease_end" ? arguments_
@@ -522,24 +582,28 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }
       : {};
+    const daemonMethod = atomicCanLease && requestedCost?.expected_percent !== null
+      ? "can_lease"
+      : method;
+    if (daemonMethod === "can_lease") Object.assign(params_, { expected_percent: requestedCost!.expected_percent });
     // quota_wait must never block, and quota_route is a direct read only
     // (see routeFor's own doc comment: an infrequent, deliberate call, not a
     // hot path worth a daemon RPC case) -- both skip the daemon `call` step
     // every other tool takes.
-    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" ? undefined : await call(method, params_);
+    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" ? undefined : await call(daemonMethod, params_);
     const resolved = result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
-    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved as CanDecision, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true, typeof arguments_.owner === "string" ? arguments_.owner : "") : resolved;
+    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
     if (method === "status" && Array.isArray(finalResult)) {
       const downgrade = await call("plan_downgrades", {});
       finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
     }
-    // The contract envelope fits object results. Status is deliberately an
-    // object so it can carry an active downgrade; the remaining daemon list
-    // methods still answer with bare arrays.
+    // The contract envelope fits object results. Array-shaped daemon reads
+    // have already been normalized above, since MCP structuredContent itself
+    // must always be an object.
     const envelopedResult = isEnvelopable(finalResult) ? withContract(finalResult) : finalResult;
     return response(request.id, { content: [{ type: "text", text: JSON.stringify(envelopedResult) }], structuredContent: envelopedResult });
   } catch (error) {
@@ -547,13 +611,30 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   }
 }
 
-/** Wraps a daemon-sourced CanDecision with the same cost/lease annotation
- * directCan() already bundles for its own (no-daemon) result. */
-async function annotateDaemonCan(raw: CanDecision, action: string, expectOverride: number | null, leaseFlag: boolean, owner: string): Promise<Record<string, unknown>> {
-  const policy = await readPolicy();
+/** Reads the cost model once before dispatching a daemon `can_lease` call. */
+async function expectedCanCost(action: string, expectOverride: number | null): Promise<ReturnType<typeof buildCostEstimate>> {
   const store = await HeadroomStore.open();
   try {
-    const { decision, cost, leasedId } = annotateCanCost(store, action, expectOverride, leaseFlag, owner, raw, new Date(), policy.reserve);
-    return { ...decision, cost, leased_id: leasedId ?? null };
+    return buildCostEstimate(action, expectOverride, store.learnedCost(action)[0], null);
+  } finally { store.close(); }
+}
+
+/** Wrap daemon `can` and `can_lease` replies in the MCP result shape without
+ * ever starting a second lease outside the daemon's transaction. */
+async function annotateDaemonCan(raw: unknown, action: string, expectOverride: number | null, requestedCost: ReturnType<typeof buildCostEstimate> | undefined): Promise<Record<string, unknown>> {
+  const atomicAdmission = !!raw && typeof raw === "object" && !Array.isArray(raw) && "decision" in raw;
+  const admitted = atomicAdmission
+    ? raw as { decision: CanDecision; leases?: ReturnType<HeadroomStore["leases"]> }
+    : { decision: raw as CanDecision, leases: [] as ReturnType<HeadroomStore["leases"]> };
+  const store = await HeadroomStore.open();
+  try {
+    const cost = buildCostEstimate(action, expectOverride, store.learnedCost(action)[0], remainingForDecision(store, admitted.decision));
+    const leases = admitted.leases ?? [];
+    // requestedCost is deliberately kept in the call signature: its expected
+    // value is what the daemon admitted atomically, while the returned cost
+    // below recomputes max_more from the final deciding meter for parity with
+    // the direct fallback.
+    if (requestedCost?.expected_percent !== undefined && cost.expected_percent !== requestedCost.expected_percent) cost.expected_percent = requestedCost.expected_percent;
+    return { ...admitted.decision, cost, leased_id: leases[0]?.id ?? null };
   } finally { store.close(); }
 }

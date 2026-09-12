@@ -32,7 +32,7 @@ import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.j
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
-import { fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
@@ -191,17 +191,47 @@ async function can(argv: string[]): Promise<number> {
     const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
     const remaining = deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
     cost = buildCostEstimate(action, expectOverride, learned as LearnedCost | undefined, remaining);
-    // The expected cost is only known once the estimate above exists, so the
-    // deciding meter's protected reserve (policy.toml [reserve]) is applied
-    // here -- before any lease starts, so a refused call never reserves
-    // capacity it may not spend.
-    decision = reserveOnCan(decision, canPolicy.reserve, remaining, cost.expected_percent);
-    if (leaseFlag && decision.allowed && cost.expected_percent !== null) {
-      const lease = store.startLease(owner, decision.meter, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, new Date(), action);
-      store.audit("cli", "lease_start", `${owner}:${decision.meter}`, "ok");
-      leasedId = lease.id;
+    if (leaseFlag && cost.expected_percent !== null && request === undefined) {
+      // No daemon is present, so make the direct decision and its leases one
+      // SQLite transaction. The first advisory `can` above may be stale by
+      // now; only this recomputation decides whether a lease is created.
+      const admissionNow = new Date();
+      const admitted = store.admitAndStartLeases(() => {
+        const localAccounts = accounts.filter(isLocalAccount);
+        const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+        const allMeters = [...new Set([...meters, ...localMeters])];
+        const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+        const burn = store.burnRateFor([...rows.values()].flat(), admissionNow);
+        const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, admissionNow)]));
+        const blocked = meters.map((meter) => store.dispatchBlockForMeter(meter, admissionNow) ?? store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+        const raw = blocked
+          ? { allowed: false, meter: meters[0], state: "FREEZE" as const, reason: blocked, meters: [{ meter: meters[0], state: "FREEZE" as const, reason: blocked }] }
+          : canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, canPolicy, argv.includes("--allow-unknown"), store.leases(undefined, true, admissionNow), owner, admissionNow, true);
+        return admitCanCost(store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, canPolicy, cost.expected_percent, admissionNow);
+      }, owner, (admittedDecision) => {
+        const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+        return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
+      }, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, admissionNow, action);
+      decision = admitted.decision;
+      leasedId = admitted.leases[0]?.id;
+      if (admitted.leases.length) store.audit("cli", "lease_start", `${owner}:${admitted.leases.map((lease) => lease.meter_id).join(",")}`, "ok");
+    } else if (!leaseFlag) {
+      // A plain advisory can does not write a lease, but its expected action
+      // still must fit above the deciding meter's protected reserve.
+      decision = reserveOnCan(decision, canPolicy.reserve, remaining, cost.expected_percent);
     }
   } finally { store.close(); }
+
+  if (leaseFlag && cost.expected_percent !== null && request !== undefined) {
+    // A daemon-backed can must reserve in the daemon's own connection. Do
+    // not fall back to a second local write if it disappears: that would turn
+    // a failed atomic admission into the old check-then-lease race.
+    const admitted = await requestDaemon("can_lease", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner, expected_percent: cost.expected_percent, ttl_ms: ttl(option(argv, "--ttl")) });
+    if (admitted === undefined) throw new Error("Headroom daemon became unavailable while reserving capacity; retry can --lease");
+    const payload = unwrapRpc(admitted) as { decision: CanDecision; leases: Lease[] };
+    decision = payload.decision;
+    leasedId = payload.leases[0]?.id;
+  }
 
   printCan(decision, cost, leasedId, argv.includes("--json"));
   return decision.allowed ? 0 : 2;
@@ -387,7 +417,7 @@ async function run(argv: string[]): Promise<number> {
   for (let index = 0; index < flags.length; index += 1) if (flags[index] === "--need") needs.push(parseGateNeed(flags[index + 1] ?? ""));
   const policy = await readPolicy();
   const store = await HeadroomStore.open();
-  let lease: Lease | undefined;
+  let leases: Lease[] = [];
   try {
     let target: string | string[] = meter ?? [];
     if (!meter && actionClass) {
@@ -400,33 +430,63 @@ async function run(argv: string[]): Promise<number> {
       if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
     }
     if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
-    const decision = gateFor(store, needs, target, policy.freeze_reserve_pct, false, new Date(), { owner, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve });
+    const now = new Date();
+    // Gate and reservation are one admission. A previous implementation
+    // checked first and inserted the lease later, so two CLI processes could
+    // both see the same capacity. This also includes the caller's existing
+    // open leases: a single owner must not bypass shared-account protection by
+    // launching several jobs in parallel.
+    const admitted = store.admitAndStartLeases(
+      () => gateFor(store, needs, target, policy.freeze_reserve_pct, false, now, { owner, actionClass, includeOwnerReservations: true, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }),
+      owner,
+      Array.isArray(target) ? target : [target],
+      needs.reduce((sum, need) => sum + need.points, 0),
+      ttl(option(flags, "--ttl") ?? "3h"),
+      "run",
+      now,
+      actionClass ?? null,
+    );
+    const decision = admitted.decision;
     if (!decision.allowed) {
       if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null })));
       else console.error(decision.reason);
       return 2;
     }
-    const leaseMeter = meter ?? decision.meters_checked[0];
-    const expected = needs.reduce((sum, need) => sum + need.points, 0);
-    lease = store.startLease(owner, leaseMeter, expected, ttl(option(flags, "--ttl") ?? "3h"), "run", new Date(), actionClass ?? null);
-    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: lease.id })));
+    leases = admitted.leases;
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: leases[0]?.id ?? null })));
   } finally { store.close(); }
-  const child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env });
+  let child: ReturnType<typeof spawn>;
+  try { child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env }); }
+  catch (error) {
+    const ending = await HeadroomStore.open();
+    try { for (const lease of leases) ending.endLease(lease.id, owner, true); } finally { ending.close(); }
+    console.error(`failed to start ${command[0]}: ${safeError(error)}`);
+    return 1;
+  }
   let stdout = "";
   let stderr = "";
-  child.stdout.on("data", (chunk: Buffer) => { const text = chunk.toString(); stdout += text; process.stdout.write(text); });
-  child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); stderr += text; process.stderr.write(text); });
+  const appendDiagnosticTail = (current: string, chunk: Buffer): string => `${current}${chunk.toString()}`.slice(-64 * 1024);
+  child.stdout?.on("data", (chunk: Buffer) => { stdout = appendDiagnosticTail(stdout, chunk); process.stdout.write(chunk); });
+  child.stderr?.on("data", (chunk: Buffer) => { stderr = appendDiagnosticTail(stderr, chunk); process.stderr.write(chunk); });
   const forward = (signal: NodeJS.Signals): void => { if (!child.killed) child.kill(signal); };
   const onInt = (): void => forward("SIGINT"); const onTerm = (): void => forward("SIGTERM");
   process.once("SIGINT", onInt); process.once("SIGTERM", onTerm);
-  const code = await new Promise<number>((resolve) => child.on("exit", (value, signal) => resolve(value ?? (signal === "SIGINT" ? 130 : 143))));
+  let launchError: Error | undefined;
+  const code = await new Promise<number>((resolve) => {
+    child.once("error", (error) => { launchError = error; });
+    // close follows exit only after stdout/stderr close, so the bounded tails
+    // below include the child's final diagnostic line before limit evidence
+    // is inspected and the reservation is released.
+    child.once("close", (value, signal) => resolve(launchError ? 1 : value ?? (signal === "SIGINT" ? 130 : 143)));
+  });
   process.removeListener("SIGINT", onInt); process.removeListener("SIGTERM", onTerm);
   const ending = await HeadroomStore.open();
   try {
-    if (lease) ending.endLease(lease.id, owner, true);
+    for (const lease of leases) ending.endLease(lease.id, owner, true);
     const evidence = vendorLimitEvidence(code, stdout, stderr);
-    if (evidence) ending.reportExhausted(lease?.meter_id ?? meter!, vendorResetFromOutput(evidence), "vendor reports the limit reached");
+    if (evidence) ending.reportExhausted(leases[0]?.meter_id ?? meter!, vendorResetFromOutput(evidence), "vendor reports the limit reached");
   } finally { ending.close(); }
+  if (launchError) console.error(`failed to start ${command[0]}: ${safeError(launchError)}`);
   return code;
 }
 
@@ -1366,6 +1426,10 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (argv[0] === "doctor") return doctor(argv.slice(1));
+  // `headroom` has always rendered status, and the help text documents the
+  // explicit spelling too. Dispatch it before observe() so `status` is never
+  // interpreted as a principal name.
+  if (argv[0] === "status") return observe(argv.slice(1));
   if (argv[0] === "setup") return runSetup(argv.slice(1));
   if (argv[0] === "logs") return logs(argv.slice(1));
   if (argv[0] === "notify") return notifyCommand(argv.slice(1));

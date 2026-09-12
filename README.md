@@ -7,21 +7,34 @@
 
 Headroom tells your agents how much of each AI subscription is left before they spend it.
 
-One daemon reads the real meters of every account you own: Claude, Codex, Antigravity, Gemini CLI,
-Grok, Kimi, and local vLLM or llama.cpp pools. Google Antigravity is experimental: the adapter
-reads the daemon-kept `agy` local quota summary and shows it as-is, with an idle window flagged
-rather than hidden -- only an availability-only payload or a reading that contradicts the last one
-reads UNKNOWN. It keeps history, notices resets and free
-reset grants, and turns the numbers into a go or no-go an orchestrator can act on.
+One daemon reads quota across Claude, Codex, Antigravity, Gemini CLI, Grok, Kimi, and local
+vLLM or llama.cpp pools. It keeps history, detects resets, and gives cooperating agents a budget
+check before they start work. Stale or failed readings stay UNKNOWN. Antigravity support is
+experimental; provider-specific limits are described below.
 
 ![headroom output](docs/assets/headroom-terminal.svg)
 
 ## The problem
 
-Menu bar meters and log estimators show you the number. They don't answer the question an agent
-has to ask before it fans out ten subagents: can this account afford the job right now, and if
-not, who is next? Headroom answers that. When a reading is stale or failed it says UNKNOWN, and
+Before an agent starts several jobs, it needs to know whether the account can afford them and
+which other jobs have already reserved capacity. Headroom combines the vendor readings with
+cooperative reservations to answer that question. When a reading is stale or failed it says UNKNOWN, and
 UNKNOWN never counts as capacity.
+
+## A budget check before a job
+
+This synthetic example has 20% usage and another owner reserving 75%. The remaining capacity
+cannot cover another 10-point job, so the child command never starts:
+
+```text
+$ headroom run --meter claude-main:all --need wk:10 --owner builder -- codex exec "Run the tests"
+wk needs 10 more but only 0.0 left after 75.0% already leased before the 10% reserve
+```
+
+When there is enough capacity, `run` reserves it, starts the command, and releases the reservation
+when it finishes. The check and reservation are atomic across processes. A plain `can` or `gate`
+is advisory; use `run` or `can --lease` when starting work. These reservations coordinate agents
+that use Headroom; they cannot stop unrelated tools from consuming the subscription.
 
 ## How it fits together
 

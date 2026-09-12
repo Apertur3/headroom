@@ -1050,6 +1050,56 @@ describe("Keychain grant marker lifecycle", () => {
 });
 
 describe("pasted readings and failed polls", () => {
+  it("immediately holds a high pasted reading, then keeps it through an old-identity poll", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-paste-high-")); temporary.push(root);
+    const store = await HeadroomStore.open(root);
+    try {
+      const now = Date.now();
+      const baselineReset = new Date(now + 2 * 3_600_000).toISOString();
+      const pastedReset = new Date(now + 9 * 24 * 3_600_000).toISOString();
+      const baselineAt = new Date(now - 60_000).toISOString();
+      const pasteAt = new Date(now).toISOString();
+      const later = new Date(now + 1_000).toISOString();
+      store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: baselineReset, observed_at: baselineAt, fetched_at: baselineAt }));
+      store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 95, limit: 100, remaining: 5, unit: "percent" }, resets_at: pastedReset, observed_at: pasteAt, fetched_at: pasteAt, source: "paste", confidence: 0.9 }));
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ source: "paste", quantity: { used: 95 } });
+      store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: baselineReset, observed_at: later, fetched_at: later, source: "native:claude" }));
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ source: "paste", quantity: { used: 95 } });
+    } finally { store.close(); }
+  });
+
+  it("lets a high paste replace an already pending lower identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-paste-pending-high-")); temporary.push(root);
+    const store = await HeadroomStore.open(root);
+    try {
+      const now = Date.now();
+      const resetA = new Date(now + 2 * 3_600_000).toISOString();
+      const resetB = new Date(now + 9 * 24 * 3_600_000).toISOString();
+      const resetC = new Date(now + 16 * 24 * 3_600_000).toISOString();
+      const insert = (used: number, resets_at: string, source = "fixture", offset = 0) => store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at, observed_at: new Date(now + offset).toISOString(), fetched_at: new Date(now + offset).toISOString(), source }));
+      insert(20, resetA, "native:claude", -1_000);
+      insert(5, resetB, "native:claude"); // held pending a second vendor poll
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ quantity: { used: 20 } });
+      insert(95, resetC, "paste", 1_000);
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ source: "paste", quantity: { used: 95 } });
+      insert(20, resetA, "native:claude", 2_000);
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ source: "paste", quantity: { used: 95 } });
+    } finally { store.close(); }
+  });
+
+  it("does not let a lower pasted reading with a different reset reopen capacity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-paste-low-")); temporary.push(root);
+    const store = await HeadroomStore.open(root);
+    try {
+      const now = Date.now();
+      const baselineAt = new Date(now - 60_000).toISOString();
+      const pasteAt = new Date(now).toISOString();
+      store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 95, limit: 100, remaining: 5, unit: "percent" }, resets_at: new Date(now + 2 * 3_600_000).toISOString(), observed_at: baselineAt, fetched_at: baselineAt }));
+      store.insert(observation({ meter_id: "claude-main:fable", principal_id: "claude-main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 5, limit: 100, remaining: 95, unit: "percent" }, resets_at: new Date(now + 9 * 24 * 3_600_000).toISOString(), observed_at: pasteAt, fetched_at: pasteAt, source: "paste", confidence: 0.9 }));
+      expect(store.latestPerWindow("claude-main:fable")[0]).toMatchObject({ quantity: { used: 95 } });
+    } finally { store.close(); }
+  });
+
   it("keeps a fresh pasted reading visible when a newer windowless poll failure arrives", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-paste-vs-failure-")); temporary.push(root);
     const store = await HeadroomStore.open(root);

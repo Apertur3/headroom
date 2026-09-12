@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Everything a maintainer needs before cutting a release, in one command:
-# lint, test, build, a cold-install smoke test, a prod-dependency audit, and a
+# lint, test, build, a cold-install smoke test, a dependency audit, and a
 # canary scan of the actual packed tarball for anything secret-shaped or an
 # email address that has no business shipping to npm.
 set -euo pipefail
@@ -25,8 +25,8 @@ npm run build
 step "smoke-cold"
 bash scripts/smoke-cold.sh
 
-step "npm audit (production dependencies, high+)"
-npm audit --omit=dev --audit-level=high
+step "npm audit (all dependencies, high+)"
+npm audit --audit-level=high
 
 step "packed tarball canary scan"
 root="$(mktemp -d "${TMPDIR:-/tmp}/headroom-release-check.XXXXXX")"

@@ -1,6 +1,6 @@
 {
   "name": "headroomd",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your agents know their budget: live quota, resets and pace states for every AI subscription and account, over CLI, daemon and MCP.",
   "keywords": [
     "claude",
@@ -57,6 +57,6 @@
   "devDependencies": {
     "@types/node": "20.19.43",
     "typescript": "5.9.3",
-    "vitest": "2.1.9"
+    "vitest": "4.1.11"
   }
 }

@@ -58,6 +58,9 @@ const DatabaseSync = (createRequire(import.meta.url)("node:sqlite") as { Databas
 
 type Row = Record<string, unknown>;
 
+const NOTIFY_DISCOVERY_READY = "notify_discovery_ready";
+const UNDISCOVERED_EVENT = "COALESCE(json_extract(metadata_json, '$._notify_seen'), 0) = 0";
+
 /** A vendor window change is not trusted until the next poll agrees. The
  * marker deliberately lives in daemon_state rather than memory: a daemon
  * restart in the ordinary poll interval must not turn the second reading back
@@ -143,7 +146,9 @@ function observationFromRow(row: Row): StoredObservation {
 }
 
 function eventFromRow(row: Row): HeadroomEvent {
-  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: row.metadata_json ? parseJson<HeadroomEvent["metadata"]>(row.metadata_json, undefined) : undefined };
+  const metadata = row.metadata_json ? parseJson<(HeadroomEvent["metadata"] & { _notify_seen?: number }) | undefined>(row.metadata_json, undefined) : undefined;
+  if (metadata) delete metadata._notify_seen;
+  return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: metadata && Object.keys(metadata).length ? metadata : undefined };
 }
 
 function notifyFromRow(row: Row): NotifyDelivery {
@@ -159,7 +164,28 @@ export interface PlanDowngrade {
 }
 
 function leaseFromRow(row: Row): Lease {
-  return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: string(row.note), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+  return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: displayLeaseNote(string(row.note)), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+}
+
+const ATOMIC_LEASE_GROUP_PREFIX = "headroom:atomic:";
+
+/** An atomic multi-meter admission remains compatible with the original
+ * single `leased_id`: every member stores the same opaque marker in note, so
+ * ending the primary id ends its siblings too. The marker stays internal to
+ * the SQLite row; normal CLI/MCP Lease objects expose only the caller note. */
+function atomicLeaseGroupNote(groupId: string, note: string | null): string {
+  return `${ATOMIC_LEASE_GROUP_PREFIX}${groupId}|${note ?? ""}`;
+}
+
+function atomicLeaseGroup(note: string | null): string | undefined {
+  if (!note?.startsWith(ATOMIC_LEASE_GROUP_PREFIX)) return undefined;
+  const separator = note.indexOf("|", ATOMIC_LEASE_GROUP_PREFIX.length);
+  const id = separator < 0 ? "" : note.slice(ATOMIC_LEASE_GROUP_PREFIX.length, separator);
+  return /^[0-9a-f-]{36}$/i.test(id) ? id : undefined;
+}
+
+function displayLeaseNote(note: string | null): string | null {
+  return atomicLeaseGroup(note) ? (note?.slice(note.indexOf("|") + 1) || null) : note;
 }
 
 export class HeadroomStore {
@@ -393,7 +419,21 @@ export class HeadroomStore {
     const resolved = this.resolveIdleContradiction(observation);
     const newBucket = this.newBucketName(resolved);
     const previous = this.previous(resolved);
-    const transition = this.vendorWindowTransition(resolved);
+    let transition = this.vendorWindowTransition(resolved);
+    // A current panel paste is an explicit human observation of the vendor's
+    // own UI. If it reports at least as much consumption as the accepted
+    // baseline, accepting it cannot create capacity, and holding it behind a
+    // stale lower probe result hides the urgent condition it was pasted to
+    // communicate. A lower paste with a different reset remains suspect and
+    // therefore cannot reopen capacity on one unconfirmed reading.
+    const pastedHighUsage = resolved.source === "paste" && resolved.freshness === "fresh"
+      && resolved.quantity?.unit === "percent" && resolved.quantity.used !== undefined
+      && (() => {
+        const baseline = this.acceptedWindowBaseline(resolved);
+        return baseline?.quantity?.unit === "percent" && baseline.quantity.used !== undefined
+          && resolved.quantity.used >= baseline.quantity.used;
+      })();
+    if (pastedHighUsage) transition = { kind: "normal" };
     // Reasons and metadata come from vendor responses (or their diagnostics)
     // and are persisted; redact them the same way any other vendor-adjacent
     // output is redacted, so a token or cookie that leaked into a failure
@@ -411,7 +451,12 @@ export class HeadroomStore {
       resolved.observed_at ?? null, resolved.fetched_at ?? null, resolved.source, resolved.truth, resolved.freshness, resolved.confidence,
       resolved.adapter_version, resolved.upstream_schema_version, reason, json(metadata));
     const stored: StoredObservation = { ...resolved, reason, metadata, id: Number(result.lastInsertRowid) };
-    if (transition.kind === "suspect") {
+    if (pastedHighUsage) {
+      // Drop a prior unresolved identity hold so the paste becomes the new
+      // baseline. A subsequent old-identity poll will be held against this
+      // higher reading instead of immediately restoring stale capacity.
+      this.clearVendorWindowSuspect(stored);
+    } else if (transition.kind === "suspect") {
       this.setVendorWindowSuspect(stored, transition.baseline);
     } else if (transition.kind === "flip") {
       this.markVendorInconsistent(transition.suspect.suspect_id);
@@ -1299,9 +1344,41 @@ export class HeadroomStore {
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
 
+  /** Bootstrap before the daemon's first poll, without credentials or network.
+   * Existing events are history; new events from that first poll are eligible.
+   * Repeated initialization must not consume undiscovered events. */
+  initializeNotificationEvents(): void {
+    if (this.daemonState(NOTIFY_DISCOVERY_READY) !== undefined) return;
+    this.enqueueNotificationEvents(() => 0, true);
+  }
+
+  /** Discover inserted facts independently of vendor clocks. A private marker
+   * survives deletion and VACUUM (events has no INTEGER PRIMARY KEY, so rowid
+   * is not durable). Marking and ledger enqueue share one transaction. This
+   * scans event metadata, like the prior timestamp-in-metadata query did.
+   * The callback is synchronous; transport runs only after commit. Undefined
+   * means first use, when historical backlog is intentionally skipped. */
+  enqueueNotificationEvents(enqueue: (events: HeadroomEvent[] | undefined) => number, initializeOnly = false): number {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const initialized = this.daemonState(NOTIFY_DISCOVERY_READY) !== undefined;
+      if (initializeOnly && initialized) { this.db.exec("COMMIT"); return 0; }
+      const events = initialized ? this.db.prepare(`SELECT * FROM events WHERE ${UNDISCOVERED_EVENT} ORDER BY rowid`).all().map(eventFromRow) : undefined;
+      const queued = enqueue(events);
+      if (!Number.isFinite(queued)) throw new Error("notification enqueue callback must return a synchronous count");
+      this.db.prepare(`UPDATE events SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$._notify_seen', 1) WHERE ${UNDISCOVERED_EVENT}`).run();
+      this.setDaemonState(NOTIFY_DISCOVERY_READY, "true");
+      this.db.exec("COMMIT");
+      return queued;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
+  }
+
   /** Free-form daemon-owned key/value state, backed by the same daemon_state
    * table the Claude probe hashes and the MCP backoff already use. The
-   * notifier keeps its delivery watermark here. */
+   * notifier keeps its initialization state here. */
   daemonState(key: string): string | undefined {
     const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = ?").get(key);
     return row ? String(row.value) : undefined;
@@ -1420,7 +1497,7 @@ export class HeadroomStore {
   private addLeaseEvent(kind: Extract<EventKind, "lease_started" | "lease_ended">, lease: Lease): void {
     const at = lease.ended_at ?? lease.started_at;
     this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
-      .run(`${kind}:${lease.id}:${at}`, kind, "vendor_reported", 1, "[]", at, null, lease.meter_id, null, lease.ended_reason ?? lease.note);
+      .run(`${kind}:${lease.id}:${at}`, kind, "vendor_reported", 1, "[]", at, null, lease.meter_id, null, lease.ended_reason ?? displayLeaseNote(lease.note));
   }
 
   /** actionClass is appended last (not inserted before `now`) so every
@@ -1437,18 +1514,81 @@ export class HeadroomStore {
     return lease;
   }
 
+  /**
+   * Re-evaluate an admission decision and create every resulting meter lease
+   * under one SQLite write lock. `can`/`gate` are useful advice by themselves,
+   * but a separate check followed by `startLease` lets two processes both see
+   * the same capacity and both reserve it. Callers must keep `evaluate`
+   * synchronous and read only this store, so the whole decision observes one
+   * lease set while BEGIN IMMEDIATE excludes a competing admission.
+   *
+   * A denied decision rolls back rather than committing incidental expiry
+   * cleanup. Expired rows are still ignored by every read through their
+   * expires_at predicate, and the next successful write records their normal
+   * lease-ended event.
+   */
+  admitAndStartLeases<T extends { allowed: boolean }>(
+    evaluate: () => T,
+    owner: string,
+    meterIds: string[] | ((decision: T) => string[]),
+    expectedPercent: number | null,
+    ttlMs: number,
+    note: string | null,
+    now = new Date(),
+    actionClass: string | null = null,
+  ): { decision: T; leases: Lease[] } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const decision = evaluate();
+      if (decision.allowed !== true) {
+        this.db.exec("ROLLBACK");
+        return { decision, leases: [] };
+      }
+      const selectedMeters = typeof meterIds === "function" ? meterIds(decision) : meterIds;
+      const uniqueMeters = [...new Set(selectedMeters.map((meter) => meter.trim()).filter(Boolean))];
+      if (!uniqueMeters.length) throw new Error("at least one meter is required");
+      const groupedNote = atomicLeaseGroupNote(randomUUID(), note);
+      const leases = uniqueMeters.map((meterId) => this.startLease(owner, meterId, expectedPercent, ttlMs, groupedNote, now, actionClass));
+      this.db.exec("COMMIT");
+      return { decision, leases: leases.map((lease) => ({ ...lease, note: displayLeaseNote(lease.note) })) };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* The failed BEGIN/COMMIT already closed it. */ }
+      throw error;
+    }
+  }
+
   endLease(id: string, owner: string, force = false, now = new Date()): Lease {
     if (!owner.trim()) throw new Error("owner is required");
-    this.expireLeases(now);
-    const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
-    if (!row) throw new Error("lease not found");
-    const lease = leaseFromRow(row);
-    if (lease.ended_at) return { ...lease, already_ended: true };
-    if (owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
-    const ended = { ...lease, ended_at: now.toISOString(), ended_reason: "ended" };
-    this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ?").run(ended.ended_at, ended.ended_reason, id);
-    this.addLeaseEvent("lease_ended", ended);
-    return ended;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.expireLeases(now);
+      const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
+      if (!row) throw new Error("lease not found");
+      const lease = leaseFromRow(row);
+      if (lease.ended_at) {
+        this.db.exec("COMMIT");
+        return { ...lease, already_ended: true };
+      }
+      if (owner !== lease.owner && !force) throw new Error("refusing another owner's lease; pass --force");
+      const rawNote = string(row.note);
+      const group = atomicLeaseGroup(rawNote);
+      const members = group
+        ? this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.note = ? AND l.owner = ? AND l.ended_at IS NULL GROUP BY l.id").all(rawNote, lease.owner).map(leaseFromRow)
+        : [lease];
+      const at = now.toISOString();
+      let returned: Lease | undefined;
+      for (const member of members) {
+        const ended = { ...member, ended_at: at, ended_reason: "ended" };
+        this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL").run(ended.ended_at, ended.ended_reason, member.id);
+        this.addLeaseEvent("lease_ended", ended);
+        if (member.id === id) returned = ended;
+      }
+      this.db.exec("COMMIT");
+      return returned ?? { ...lease, ended_at: at, ended_reason: "ended" };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
   }
 
   leases(meterId?: string, activeOnly = false, now = new Date()): Lease[] {

@@ -19,7 +19,6 @@ const RESPONSE_CAP_BYTES = 8 * 1024;
 export const MAX_ATTEMPTS = 3;
 const TELEGRAM_ORIGIN = "https://api.telegram.org";
 const DEFAULT_NTFY_SERVER = "https://ntfy.sh";
-const WATERMARK_KEY = "notify_watermark";
 
 export type ChannelName = "telegram" | "ntfy" | "webhook";
 const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
@@ -587,10 +586,10 @@ export function thresholdItems(store: HeadroomStore, configured: number | readon
   return items;
 }
 
-function collectItems(store: HeadroomStore, config: NotifyConfig, since: string): NotifyItem[] {
+function collectItems(store: HeadroomStore, config: NotifyConfig, discovered: HeadroomEvent[]): NotifyItem[] {
   const wanted = new Set(config.events);
   const siblings = store.latestPerWindow();
-  const events = store.events(since).filter((event) => wantsEvent(event, config));
+  const events = discovered.filter((event) => wantsEvent(event, config));
   const evidence = store.eventObservations(events);
   const items: NotifyItem[] = events.flatMap<NotifyItem>((event) => event.kind === "pace_projection_conserve"
     ? (projectionItem(store, event, evidence.get(event.id) ?? [], siblings) ?? [])
@@ -761,9 +760,9 @@ export interface NotifyRun {
 
 /**
  * The daemon's per-poll notification pass. Events are read from the store
- * once, past a watermark the store itself keeps, and every (event, channel)
+ * once, using durable discovery markers, and every (event, channel)
  * pair goes through the ledger, so nothing is delivered twice however often
- * this runs. The very first pass on a fresh install only sets the watermark:
+ * this runs. Initialization skips existing history:
  * an operator who turns notifications on does not want a week of backlog.
  */
 export function deliverNotifications(store: HeadroomStore, options: NotifyOptions = {}): Promise<NotifyRun> {
@@ -791,10 +790,11 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   const ready = channels.filter((channel) => channel.ready);
   const status = channels.map(({ channel, ready: isReady, detail }) => ({ channel, ready: isReady, detail }));
   if (!ready.length) return { configured: true, queued: 0, sent: 0, quiet: false, channels: status };
-  const watermark = store.daemonState(WATERMARK_KEY);
-  const items = watermark === undefined ? [] : [...collectItems(store, config, watermark), ...downgradeReminderItems(store, now)];
-  store.setDaemonState(WATERMARK_KEY, now.toISOString());
-  for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) enqueueWithSafetyNet(store, channel.channel, item, now);
+  const queued = store.enqueueNotificationEvents((events) => {
+    const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now)];
+    for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) enqueueWithSafetyNet(store, channel.channel, item, now);
+    return items.length;
+  });
   if (inQuietHours(config, now)) {
     let sent = 0;
     for (const channel of ready) {
@@ -802,11 +802,11 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
       sent += await flushChannel(store, channel, log, now, urgent, false);
       if (store.notifyPending(channel.channel, MAX_ATTEMPTS).length) store.setDaemonState(`notify_quiet:${channel.channel}`, "true");
     }
-    return { configured: true, queued: items.length, sent, quiet: true, channels: status };
+    return { configured: true, queued, sent, quiet: true, channels: status };
   }
   let sent = 0;
   for (const channel of ready) sent += await flushChannel(store, channel, log, now);
-  return { configured: true, queued: items.length, sent, quiet: false, channels: status };
+  return { configured: true, queued, sent, quiet: false, channels: status };
 }
 
 /* -------------------------------------------------------------------------
