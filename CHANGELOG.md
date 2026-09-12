@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-09-12
+
+### Fixed
+
+- `headroom update` finds the installed background service under the operating-system user home, even when Headroom stores its data elsewhere, so an upgrade restarts the running daemon.
+- Homebrew synchronization waits through npm package processing with up to sixty registry checks, ten seconds apart, while still refusing mismatched release bytes immediately.
+
 ## [0.1.1] - 2026-09-12
 
 ### Fixed
