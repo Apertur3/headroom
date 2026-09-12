@@ -29,6 +29,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Select Swift 6.2 toolchain
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -39,6 +42,16 @@ jobs:
       - run: npm run build
       - run: npm pack --dry-run
       - run: bash scripts/smoke-cold.sh
+      - name: Archive the verified native reader
+        if: runner.os == 'macOS'
+        run: tar -C bin/engine -czf native-engine-darwin.tgz darwin
+      - name: Upload the verified native reader
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-engine-darwin
+          path: native-engine-darwin.tgz
+          retention-days: 1
 
   tarball:
     name: build npm tarball
@@ -55,12 +68,25 @@ jobs:
       filename: ${{ steps.pack.outputs.filename }}
     steps:
       - uses: actions/checkout@v4
+      - name: Select Swift 6.2 toolchain
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Restore the verified native reader
+        uses: actions/download-artifact@v4
+        with:
+          name: native-engine-darwin
+          path: native-engine-artifact
+      - name: Extract the verified native reader
+        run: |
+          mkdir -p bin/engine
+          tar -xzf native-engine-artifact/native-engine-darwin.tgz -C bin/engine
       - run: npm run build
+      - name: Verify the packaged native reader cache
+        run: bash scripts/build-native-engine.sh
       - name: Build the packaged Claude probe (universal macOS binary)
         run: bash scripts/build-probe.sh
       - name: Resolve release version
@@ -80,6 +106,22 @@ jobs:
           mkdir -p dist-release
           filename="$(npm pack --silent --pack-destination dist-release)"
           echo "filename=$filename" >> "$GITHUB_OUTPUT"
+      - name: Verify native reader in the tarball
+        run: |
+          tarball="dist-release/${{ steps.pack.outputs.filename }}"
+          check_dir="$(mktemp -d)"
+          trap 'rm -rf "$check_dir"' EXIT
+          tar -xzf "$tarball" -C "$check_dir"
+          reader="$check_dir/package/bin/engine/darwin/headroom-engine"
+          sha_file="$check_dir/package/bin/engine/darwin/SHA256"
+          [[ -f "$reader" && -f "$sha_file" ]]
+          recorded="$(<"$sha_file")"
+          actual="$(shasum -a 256 "$reader" | awk '{print $1}')"
+          [[ "$(wc -c < "$sha_file" | tr -d ' ')" == "65" ]]
+          [[ "$recorded" =~ ^[0-9a-f]{64}$ && "$recorded" == "$actual" ]]
+          architectures="$(lipo -archs "$reader")"
+          [[ " $architectures " == *" arm64 "* && " $architectures " == *" x86_64 "* ]]
+          [[ "$(wc -w <<<"$architectures" | tr -d ' ')" == "2" ]]
       - uses: actions/upload-artifact@v4
         with:
           name: npm-tarball

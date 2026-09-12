@@ -82,7 +82,8 @@ sensing engine's hash, the daemon socket, the Antigravity `agy` keepalive, and
 `policy.toml`/`routing.toml`. Nothing it checks reads a token's contents. FAIL is reserved for
 things that actually block reading a configured principal (an unresponsive daemon socket, an
 invalid `accounts.toml`); a daemon that was simply never installed, or optional pieces like the
-native sensing engine, show as WARN or INFO instead. On a brand-new install (no daemon has ever
+upstream sensing engine, show as WARN or INFO instead. A configured Antigravity account requires
+the native reader, so a missing or corrupt packaged reader is a FAIL. On a brand-new install (no daemon has ever
 started) the checks end with an ordered punch list:
 
 ```
@@ -429,11 +430,10 @@ implementations: `%LOCALAPPDATA%\headroom` (or `HEADROOM_HOME`) instead of `~/.h
 pipe (`\\.\pipe\headroom-<username>-<home digest>`) instead of a Unix socket, and a Task Scheduler XML instead of
 launchd or systemd. Claude and Codex read normally, straight from their credential files.
 
-Antigravity is not available on Windows yet. The daemon's warm `agy` keepalive needs a POSIX
-pseudo-terminal (`script`), which Windows doesn't have, and the native sensing engine that reads
-that warm session isn't built for Windows either. An Antigravity principal on Windows only gets
-the remote OAuth path, which Google can reject for the free Gemini Code Assist tier; see
-[vendors.md](vendors.md).
+Antigravity quota reading is currently supported on macOS 14 or later. Its universal native
+reader is bundled with npm and Homebrew; Windows and Linux do not include this reader.
+Those platforms report Antigravity as UNKNOWN rather than trying the retired Gemini CLI
+consumer OAuth path. See [vendors.md](vendors.md#antigravity).
 
 CI runs lint, the full test suite and a build on `ubuntu-latest`, `windows-latest` and
 `macos-latest` on every push, and every release is installed from the npm registry into a fresh

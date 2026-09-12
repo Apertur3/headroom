@@ -1,8 +1,15 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { doctor, doctorChecks, isFreshInstall, nextSteps } from "../src/doctor.js";
+
+// These tests model a fresh installation with no optional native reader.
+// Packaged reader availability and integrity have separate artifact tests.
+vi.mock("../src/engine/native/run.js", async (original) => ({
+  ...await original<typeof import("../src/engine/native/run.js")>(),
+  nativeEnginePath: vi.fn(async () => undefined),
+}));
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });

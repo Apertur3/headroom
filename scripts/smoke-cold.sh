@@ -104,6 +104,39 @@ printf '[[accounts]]\nname = "fixture-local"\nkind = "local"\nbase_url = "http:/
 export HOME="$user_home"
 export HEADROOM_HOME="$headroom_home"
 
+# Execute the reader resolved from the installed package, with no principals
+# or credentials. A checkout binary can never satisfy this assertion.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if HEADROOM_NATIVE_PACKAGE_ROOT="$prefix/lib/node_modules/headroomd" node --input-type=module <<'JS'
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { readFile, realpath, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
+const root = process.env.HEADROOM_NATIVE_PACKAGE_ROOT;
+const { nativeEnginePath, NativeEngineVerificationError } = await import(pathToFileURL(join(root, "dist/engine/native/run.js")).href);
+const binary = await nativeEnginePath();
+assert.equal(binary, await realpath(join(root, "bin/engine/darwin/headroom-engine")));
+const principals = join(process.env.HEADROOM_HOME, "empty-principals.json");
+await writeFile(principals, "[]", { mode: 0o600 });
+// The native reader uses exit 3 when no fresh observations exist, including [].
+const { stdout } = await promisify(execFile)(binary, ["observe", "--principals", principals], { timeout: 30_000 }).catch((error) => {
+  assert.equal(error.code, 3);
+  return { stdout: error.stdout };
+});
+assert.deepEqual(JSON.parse(stdout), []);
+const original = await readFile(binary);
+try {
+  await writeFile(binary, "corrupt reader");
+  await assert.rejects(nativeEnginePath, NativeEngineVerificationError);
+} finally { await writeFile(binary, original); }
+assert.equal(await nativeEnginePath(), binary);
+JS
+  then pass "installed native reader resolves, executes and rejects corruption"
+  else fail "installed native reader" "resolution, execution or corruption check failed"; fi
+fi
+
 # run_headroom NAME [ARGS...] -- runs the installed binary with the given
 # args, capturing stdout and stderr separately (both into their own files
 # under $root, and into NAME_out/NAME_err for the fail() message) so a

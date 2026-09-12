@@ -220,7 +220,11 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   let localAntigravity = new Map<string, Observation[]>();
   const antigravityLocal: Record<string, AntigravityLocalRead> = {};
   const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && account.vendor !== "claude" && (account.adapter === "engine" || account.adapter === "native"));
-  const native = process.platform === "win32" ? undefined : await nativeEnginePath();
+  let nativeFailure: string | undefined;
+  const native = process.platform === "win32" ? undefined : await nativeEnginePath().catch((error: unknown) => {
+    nativeFailure = safeError(error);
+    return undefined;
+  });
   if (options.daemonOwnsAntigravity && native && antigravityAccounts.length) {
     try {
       const local = await runNativeEngine(native, antigravityAccounts);
@@ -245,10 +249,10 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     // Consumer quotas come from agy's own local summary. Never fall back
     // to Gemini CLI OAuth: Google retired consumer access in June 2026.
     if (local.length) { observations.push(...local); continue; }
-    const reason = process.platform === "win32" ? "Antigravity local quota reader is not available on Windows"
-      : !native ? "Antigravity native reader missing; build Headroom from source with npm run engine:build and run its daemon"
+    const reason = nativeFailure ?? (process.platform !== "darwin" && !native ? "Antigravity local quota reader is not available on this platform; use macOS"
+      : !native ? "Antigravity native reader missing; reinstall headroomd"
       : !options.daemonOwnsAntigravity ? "agy keepalive not running; enable antigravity_keepalive and run: agy"
-      : "agy local quota read failed; check headroom doctor and headroom logs";
+      : "agy local quota read failed; check headroom doctor and headroom logs");
     observations.push(...failedAntigravityObservations(account, reason, new Date().toISOString()).map((row) => ({ ...row, source: "local:antigravity:warm" })));
     antigravityLocal[account.name] ??= { outcome: "failed", payload_kind: "none", at: new Date().toISOString() };
   }

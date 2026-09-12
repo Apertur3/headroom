@@ -18,6 +18,7 @@ import { HeadroomStore } from "./store.js";
 import { updateNoticeLine } from "./update.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 import { headroomVersion } from "./version.js";
+import { safeError } from "./security.js";
 
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
 export interface DoctorCheck { level: DoctorLevel; check: string; detail: string; fix: string; }
@@ -265,18 +266,22 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
 }
 
 async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: Account[], keepaliveEnabled: boolean): Promise<void> {
-  const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]);
+  let nativeFailure: string | undefined;
+  const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath().catch((error: unknown) => {
+    nativeFailure = safeError(error); return undefined;
+  })]);
+  const verifiedNative = native && !native.includes("/.build/");
   output.push(upstream.present
     ? check("OK", "engine upstream hash", `${upstream.tag} verified (${upstream.path})`, "no action needed")
     : check("INFO", "engine upstream hash", `${upstream.tag} absent or hash mismatch; optional, needed only for providers without a native adapter`, "headroom engine install"));
   output.push(native
-    ? check(native.includes(`${home}/engine/native/`) ? "OK" : "INFO", "engine native hash", native.includes(`${home}/engine/native/`) ? `verified (${native})` : `development binary (${native}) is not release-pinned`, native.includes(`${home}/engine/native/`) ? "no action needed" : "build a pinned native release or run headroom engine install")
-    : check("INFO", "engine native hash", "no verified native engine", "npm run engine:build or headroom engine install"));
+    ? check(verifiedNative ? "OK" : "INFO", "engine native hash", verifiedNative ? `verified (${native})` : `development binary (${native}) is not release-pinned`, verifiedNative ? "no action needed" : "install the published macOS package for a verified reader")
+    : check(nativeFailure ? "FAIL" : "INFO", "engine native hash", nativeFailure ?? "no native reader for this installation", "reinstall headroomd on macOS"));
 
   if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
     output.push(native
       ? check("OK", "Antigravity local reader", "native reader available; Gemini CLI is not required", "no action needed")
-      : check("FAIL", "Antigravity local reader", "native reader missing; the npm package has no pinned native release asset", "build Headroom from source with npm run engine:build and run its daemon"));
+      : check("FAIL", "Antigravity local reader", nativeFailure ?? (process.platform === "darwin" ? "packaged native reader missing" : "packaged Antigravity reader is macOS-only"), process.platform === "darwin" ? "reinstall headroomd" : "use Antigravity with Headroom on macOS"));
   }
 
   const daemon = await daemonRequest(socketPath(), "health");

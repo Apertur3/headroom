@@ -4,9 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.1.3] - 2026-09-12
 
 ### Fixed
+- Include a universal, checksum-verified macOS native reader in npm and Homebrew packages.
+- Warm agy when the daemon starts so the first scheduled poll can read local quota.
 - Read Antigravity consumer quota from agy's local summary without Gemini CLI OAuth.
 - Report a missing native reader and unsuccessful local reads in doctor.
 

@@ -205,8 +205,10 @@ export class HeadroomDaemon {
     await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
-    // Start agy lazily after the first Antigravity poll. Only its local
-    // summary supplies consumer quota; Gemini CLI OAuth is retired.
+    // Warm the local source before the first scheduled poll. It supplies
+    // consumer quota without the retired Gemini CLI OAuth path.
+    try { await this.maybeStartKeepalive(await readAccounts(), startupPolicy); }
+    catch (error) { void appendDaemonLog(`antigravity startup: ${safeError(error)}`, this.home); }
     await this.schedulePrincipals();
     this.schedulingStarted = true;
   }
