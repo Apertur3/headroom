@@ -7,7 +7,7 @@ cookies, which unlock paid subscriptions.
 ## Rules the code must satisfy
 
 1. **No secret on disk in plaintext, ever.** Credentials are read at call time from each account's
-   own store (macOS Keychain, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`) and dropped
+   own store (macOS Keychain, `~/.codex/auth.json`) and dropped
    after the request. Headroom has no credential store of its own and never mirrors tokens into
    config files (CodexBar's `tokenAccounts` path is deliberately not used).
 2. **No secret in output.** Logs, crash dumps, JSON output and history redact tokens (including an
@@ -61,6 +61,11 @@ cookies, which unlock paid subscriptions.
    review and commit to the lock file. A native-engine asset lock entry marked `status: "unpinned"`
    is refused even if a (necessarily crafted) local marker file's `sha256` field happens to match
    its `null` placeholder.
+   The packaged macOS native reader is part of the npm artifact, whose integrity and provenance
+   cover both binary and digest. Each resolution checks the digest, regular file types, ownership
+   and permissions under the package root. A missing digest, changed binary or unsafe path fails
+   closed; it never falls through to an unverified development build. Antigravity uses agy
+   through its local quota summary and does not read Gemini CLI OAuth credentials.
 6. **No debug surfaces in release.** No debug endpoints, no source maps (disabled in the build,
    `sourceMap`/`declarationMap` both false), no verbose stack traces to clients.
 7. **Audit log.** Every query to the daemon, every scheduled vendor poll (Claude's own probe

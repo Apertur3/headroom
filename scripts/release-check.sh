@@ -71,6 +71,28 @@ file_count="$(find "$pkg_dir" -type f | wc -l | tr -d ' ')"
 echo "PASS packed tarball canary scan ($tarball_name, $file_count files, none suspicious)"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
+  step "packaged native reader (macOS)"
+  reader="$pkg_dir/bin/engine/darwin/headroom-engine"
+  reader_sha_file="$pkg_dir/bin/engine/darwin/SHA256"
+  if [[ ! -f "$reader" || ! -f "$reader_sha_file" ]]; then
+    echo "FAIL packaged native reader missing from the tarball (expected $reader and $reader_sha_file)"
+    exit 1
+  fi
+  reader_recorded="$(<"$reader_sha_file")"
+  reader_actual="$(shasum -a 256 "$reader" | awk '{print $1}')"
+  reader_arches="$(lipo -archs "$reader")"
+  if [[ "$(wc -c < "$reader_sha_file" | tr -d ' ')" != "65" \
+    || ! "$reader_recorded" =~ ^[0-9a-f]{64}$ || "$reader_recorded" != "$reader_actual" ]]; then
+    echo "FAIL packaged native reader SHA-256 mismatch"
+    exit 1
+  fi
+  if [[ " $reader_arches " != *" arm64 "* || " $reader_arches " != *" x86_64 "* || \
+    "$(wc -w <<<"$reader_arches" | tr -d ' ')" != "2" ]]; then
+    echo "FAIL packaged native reader is not universal arm64+x86_64"
+    exit 1
+  fi
+  echo "PASS packaged native reader present, verified, and universal ($reader)"
+
   step "packaged Claude probe (macOS)"
   probe="$pkg_dir/bin/probe/darwin/headroom-claude-probe"
   sha_file="$pkg_dir/bin/probe/darwin/SHA256"

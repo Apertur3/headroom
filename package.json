@@ -1,6 +1,6 @@
 {
   "name": "headroomd",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Your agents know their budget: live quota, resets and pace states for every AI subscription and account, over CLI, daemon and MCP.",
   "keywords": [
     "claude",
@@ -34,6 +34,7 @@
     "dist",
     "bin",
     "bin/probe/**",
+    "bin/engine/**",
     "engine.lock.json",
     "README.md",
     "LICENSE",
@@ -47,7 +48,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepack": "(npm run build && bash scripts/build-probe.sh) 1>&2",
+    "prepack": "(npm run build && bash scripts/build-probe.sh && bash scripts/build-native-engine.sh) 1>&2",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "engine:build": "bash scripts/build-engine.sh",

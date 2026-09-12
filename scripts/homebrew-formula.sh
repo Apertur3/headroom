@@ -46,8 +46,8 @@ class Headroom < Formula
   # Homebrew repacks the staged package with "npm pack --ignore-scripts", so the
   # package's own prepack hook never runs here and nothing reads the macOS
   # Keychain during installation. The published tarball already carries the
-  # compiled JavaScript and the prebuilt Claude probe, which makes this a plain
-  # file install on both macOS and Linux; the probe is only ever used on macOS.
+  # compiled JavaScript, Claude probe and Antigravity native reader. Installation
+  # needs no compiler; the native binaries are only used on macOS.
   def install
     system "npm", "install", *std_npm_args
     bin.install_symlink Dir["#{libexec}/bin/*"]
@@ -62,8 +62,8 @@ class Headroom < Formula
         headroom doctor
         brew services start headroom
 
-      On macOS the first read of the Claude Code token asks for Keychain access
-      once, and only once:
+      On macOS you can check that the Claude credential is readable.
+      No Keychain dialog is involved:
 
         headroom keychain grant
     EOS

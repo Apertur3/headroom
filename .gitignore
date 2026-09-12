@@ -23,3 +23,6 @@ bin/probe/
 .claude/
 *.swp
 .gstack/
+
+# Generated native reader and digest
+bin/engine/

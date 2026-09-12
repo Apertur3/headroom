@@ -1408,9 +1408,18 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "engine" && argv[1] === "install") {
     const pin = argv.includes("--pin");
     if (argv.some((item) => item !== "engine" && item !== "install" && item !== "--pin")) throw new Error("Usage: headroom engine install [--pin]");
-    const native = await installNativeEngine();
-    if (native.installed) { console.log(`native engine ${native.tag} installed at ${native.path} (sha256 ${native.sha256})`); return 0; }
-    console.log(`${native.hint} Falling back to the pinned upstream engine.`);
+    const needsUpstream = (await readAccounts().catch(() => [])).some((account) => account.adapter === "codexbar");
+    const available = await nativeEnginePath();
+    if (available) {
+      console.log(`native engine already available at ${available}; no native download needed`);
+      if (!needsUpstream && !pin) return 0;
+    } else {
+      const native = await installNativeEngine();
+      if (native.installed) {
+        console.log(`native engine ${native.tag} installed at ${native.path} (sha256 ${native.sha256})`);
+        if (!needsUpstream && !pin) return 0;
+      } else console.log(`${native.hint} Falling back to the pinned upstream engine.`);
+    }
     const result = await installEngine({ pin });
     if (result.firstPin) { console.log(`SHA-256 for ${result.tag}: ${result.sha256}\nAdd this hash to engine.lock.json and commit it; no engine was installed.`); return 0; }
     console.log(`upstream engine ${result.tag} installed at ${result.path} (sha256 ${result.sha256})`); return 0;

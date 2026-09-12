@@ -52,16 +52,16 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - **Engine (primary).** `CodexBarCore` is an MIT SwiftPM library building on macOS 14+ and
   Linux. `engine/` holds `headroom-engine`, a thin Swift CLI that depends on it at a pinned tag,
   enables Keychain reads for every Claude config dir (the upstream CLI disables them), loops over
-  principals in-process, and prints observations in Headroom's schema. Prebuilt macOS and Linux
-  binaries ship in Headroom's releases; the TypeScript side downloads, checksum-verifies, and, when
-  upstream publishes attestations, signature-verifies them. Updating = bump the tag, rebuild,
+  principals in-process, and prints observations in Headroom's schema. The npm artifact carries
+  a universal macOS reader and its SHA-256 record; runtime verifies it before use. Linux and
+  Windows do not ship this reader. Updating = bump the tag, rebuild,
   run conformance fixtures. Upstream drift breaks a test, not a user.
 - **Engine (fallback).** The runner for the upstream CodexBarCLI stays as a fallback and as
   the conformance oracle.
 - **Antigravity.** `agy` has no server mode but bootstraps its local HTTPS server when started
   under a pseudo-terminal (`script -q /dev/null agy`), verified 2026-09-03 with real numbers.
-  The daemon keeps its owned `agy` warm after the first poll. Consumer quotas come only from
-  its local summary, using the source-built native reader. Gemini CLI discovery and polling
+  The daemon warms its owned `agy` at startup. Consumer quotas come only from
+  its local summary, using the packaged macOS native reader. Gemini CLI discovery and polling
   are retired; legacy configuration returns UNKNOWN with migration guidance.
 - **Local pools.** `kind = "local"` principals with `base_url`, optional `wake` command that Headroom
   reports and never runs. State `UP | BUSY | DOWN`, model id, vLLM queue depth.

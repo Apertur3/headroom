@@ -558,7 +558,7 @@ describe("MCP direct status shares a persisted backoff across calls", () => {
   });
 });
 
-describe("Antigravity keepalive: lazy, secondary start", () => {
+describe("Antigravity keepalive startup", () => {
   async function keepaliveTestHome(): Promise<{ root: string; agyPath: string }> {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-keepalive-lazy-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
@@ -604,7 +604,7 @@ describe("Antigravity keepalive: lazy, secondary start", () => {
     });
   });
 
-  it("starts keepalive lazily once a real start()ed daemon's poll shows remote fell short for Antigravity", async () => {
+  it("starts configured keepalive before the first poll", async () => {
     const { root } = await keepaliveTestHome();
     await withHeadroomHome(root, async () => {
       const started = vi.fn();
@@ -617,14 +617,8 @@ describe("Antigravity keepalive: lazy, secondary start", () => {
         home: root, path: testSocketPath(root, "keepalive"), keepalive,
         poller: async () => ({ observations: [failedRemote], failures: [] }),
       });
-      const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
       try {
         await daemon.start();
-        await internal.poll(undefined, true);
-        // maybeStartKeepalive() is fire-and-forget (`void`) from inside the
-        // poll's own .then(); give its awaited executablePath() a tick to
-        // resolve before asserting.
-        await new Promise((resolve) => setTimeout(resolve, 50));
         // The Antigravity keepalive (a `script`-owned PTY around agy) is
         // POSIX-only -- daemon.ts's maybeStartKeepalive() short-circuits on
         // win32 before ever calling start(), by design (no `script`/PTY

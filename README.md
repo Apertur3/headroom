@@ -44,9 +44,9 @@ that use Headroom; they cannot stop unrelated tools from consuming the subscript
 </picture>
 
 Headroom reads Claude, Codex, Grok and Kimi through native TypeScript adapters.
-Antigravity is experimental: it requires a logged-in `agy`, a running Headroom daemon,
-and the native Swift reader built from source. The npm package currently has no pinned
-native reader download. Gemini CLI is not required or supported for consumer subscriptions;
+Antigravity is experimental and supported on macOS 14 or later: it requires a logged-in
+`agy` and a running Headroom daemon. The npm and Homebrew packages include a universal
+macOS reader, verified by SHA-256 before use. Gemini CLI is not required or supported for consumer subscriptions;
 Google retired that access on June 18, 2026.
 
 For Antigravity, Headroom reads agy's local quota summary without reading its token.
@@ -139,6 +139,6 @@ Antigravity account and two local inference boxes. Every release is installed fr
 registry into a fresh home on Linux (a Raspberry Pi 5) and Windows 11 (a VM) and walked through
 the quickstart by script; CI runs the suite on all three platforms. Vendor endpoints are private and change without notice; Headroom pins, records
 fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Antigravity requires
-the source-built native reader and a daemon-kept `agy`; see [vendor setup](docs/vendors.md#antigravity).
+macOS and a daemon-kept `agy`; see [vendor setup](docs/vendors.md#antigravity).
 
 MIT. Third party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

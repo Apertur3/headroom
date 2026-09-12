@@ -147,14 +147,22 @@ It does not need Gemini CLI, read its OAuth credentials, or call the retired
 consumer Code Assist path. The daemon owns a hidden agy process on macOS/Linux;
 agy owns authentication and token refresh.
 
-Setup:
+The npm and Homebrew packages include the reader for macOS 14 or later, on both Apple
+silicon and Intel. Headroom verifies its bundled SHA-256 record before every use. No Swift
+toolchain or separate engine download is needed. Linux and Windows packages do not supply
+an Antigravity reader.
+
+Setup on macOS:
 
 1. Install [Antigravity CLI](https://antigravity.google/docs/cli/) and run `agy` to sign in.
-2. Build the native reader from a Headroom source checkout with `npm run engine:build`.
-3. From that checkout, run `npm run build`, then `node dist/cli.js install-service`. Run the load command it prints to start the service.
-4. Check `node dist/cli.js doctor` and `node dist/cli.js --principal antigravity --refresh --json`.
-   If the account is not configured, add it to `accounts.toml` as below. Discovery also
-   finds agy, but rerunning discovery replaces the account file, including manual entries.
+2. Install or update Headroom, then run `headroom setup` on a new installation. This discovers
+   accounts and installs the daemon. For an existing installation, preserve your account file
+   and add the entry below if it is missing.
+3. If no service is installed, run `headroom install-service`, then the load command it prints.
+   Homebrew service users can run `brew services start headroom` instead.
+4. Check `headroom doctor` and `headroom --principal antigravity --refresh --json`.
+   The daemon warms agy at startup. An initial reading can remain UNKNOWN until its quota
+   summary is ready; subsequent scheduled polls retry it.
 
 ```toml
 [[accounts]]
@@ -164,11 +172,15 @@ location = "agy"
 adapter = "native-ts"
 ```
 
-The npm package currently has no pinned native reader download: `headroom engine install`
-cannot install this reader yet. A source-built service is a development setup; running
-`headroom install-service` from a global npm installation replaces it with the packaged
-service, which cannot find the checkout's reader. Check doctor after changing installations.
-Windows does not support the local reader.
+Keep `antigravity_keepalive = true` in policy.toml (the macOS default). Discovery finds
+agy on PATH or its installation directory. An optional `agy_path` in the account entry
+selects an explicit executable when the service cannot find it. Rerunning discovery replaces
+the account file, including manually configured entries.
+
+`headroom engine install` reports the packaged reader as already available. If doctor reports
+an integrity failure, reinstall Headroom; it never bypasses a damaged reader by selecting an
+unverified development build. Source checkouts can still use `npm run engine:build` when no
+packaged reader exists.
 
 Meters are `<principal>:gemini` and `<principal>:claude-gpt`, each with five-hour and
 weekly windows. Missing readers, login failures and unavailable summaries remain UNKNOWN.

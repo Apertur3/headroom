@@ -72,6 +72,23 @@ keychain; the next build creates one fresh. Check a build with
    until a stable line exists.
 5. A published version is never changed; a mistake gets the next number.
 
+## Packaged Antigravity reader
+
+`prepack` builds `headroom-engine` from the pinned Swift dependency graph and packages it at
+`bin/engine/darwin/headroom-engine`, with `SHA256` alongside it. The macOS binary contains
+arm64 and x86_64 slices and targets macOS 14. Release builds strip debug information before
+ad-hoc signing; source paths must not appear in the shipped binary. No signing key is exported.
+The tarball build must fail if the native build or integrity checks fail, rather than publishing
+an installation that can start agy but cannot read it. Linux and Windows do not execute this
+Mach-O binary. Native Linux support is not claimed by this release.
+
+`release:check` verifies the packaged reader, not just the checkout's development binary.
+Test a release by installing the exact npm tarball into a fresh prefix, resolving the reader
+from that prefix, and running both architecture slices with an empty principal list. On a
+logged-in macOS machine, verify actual Antigravity quota through the packaged daemon, CLI and
+MCP. Include a corrupt-reader check: a modified binary must produce an integrity failure and
+UNKNOWN capacity. `headroom engine install` should report the bundled reader already available.
+
 ## The Homebrew tap
 
 `brew install apertur3/tap/headroom` installs the published npm tarball through Homebrew and adds

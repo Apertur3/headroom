@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,7 +16,42 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine");
 
+export class NativeEngineVerificationError extends Error {}
+
+/** The immutable npm artifact supplies both the reader and its digest. A
+ * present but corrupt reader must never fall through to an unverified build. */
+export async function verifiedPackagedNativeEngine(root = repoRoot, platform: NodeJS.Platform = process.platform): Promise<string | undefined> {
+  if (platform !== "darwin") return undefined;
+  const packageRoot = await realpath(root);
+  const directory = join(packageRoot, "bin", "engine", "darwin");
+  try { await lstat(directory); }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  const binary = join(directory, "headroom-engine");
+  const digest = join(directory, "SHA256");
+  try {
+    for (const path of [packageRoot, join(packageRoot, "bin"), join(packageRoot, "bin", "engine"), directory, binary, digest]) {
+      const info = await lstat(path);
+      const file = path === binary || path === digest;
+      if (info.isSymbolicLink() || (file ? !info.isFile() : !info.isDirectory())) throw new Error("unsafe file type");
+      if (typeof process.getuid === "function" && info.uid !== process.getuid() && info.uid !== 0) throw new Error("foreign owner");
+      if ((info.mode & 0o022) !== 0) throw new Error("writable by others");
+      if (path === digest && info.size > 128) throw new Error("oversized digest");
+      if (path === binary && (info.size > 128 * 1024 * 1024 || !(info.mode & 0o111))) throw new Error("invalid executable");
+    }
+    // Global npm installs may be root-owned. The package-specific checks
+    // above admit root as well as the current user, unlike development paths.
+    const verified = await realpath(binary);
+    const recorded = (await readFile(digest, "utf8")).trim();
+    if (!/^[a-f0-9]{64}$/.test(recorded) || recorded !== await hash(verified)) throw new Error("digest mismatch");
+    return verified;
+  } catch {
+    throw new NativeEngineVerificationError("Packaged native reader failed integrity or permission checks; reinstall headroomd");
+  }
+}
+
 export async function nativeEnginePath(): Promise<string | undefined> {
+  const packaged = await verifiedPackagedNativeEngine();
+  if (packaged) return packaged;
   const lock = await readEngineLock();
   const installedBinary = join(headroomHome(), "engine", "native", lock.native?.binary ?? "headroom-engine");
   if (lock.native) try {
