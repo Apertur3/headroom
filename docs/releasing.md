@@ -84,7 +84,7 @@ it, runs `scripts/homebrew-formula.sh <version> <npm-tarball-url> <sha256>` and 
 to the tap's default branch as a commit named `headroom <version>`, authored by `headroom-release`
 at a GitHub noreply address. The job needs a repository secret `HOMEBREW_TAP_TOKEN`: a fine-grained
 personal access token with contents write on `Apertur3/homebrew-tap` and nothing else.
-The job retries an unpublished version up to twelve times, ten seconds apart, to allow npm's
+The job retries an unpublished version up to sixty times, ten seconds apart, to allow npm's
 registry to propagate the release. A checksum mismatch, missing token, unavailable version after
 the retry budget, or failed push fails the job visibly.
 

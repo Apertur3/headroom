@@ -9,8 +9,8 @@ const exec = promisify(execFile);
 const script = join(__dirname, "..", "scripts", "wait-npm-release.sh");
 
 it.each([
-  ["delayed", 0, 3],
-  ["missing", 1, 12],
+  ["delayed", 0, 14],
+  ["missing", 1, 60],
   ["mismatch", 1, 1],
 ] as const)("registry %s: retries absence, fails closed on different bytes", async (mode, expectedCode, attempts) => {
   const home = await mkdtemp(join(tmpdir(), "headroom-registry-test-"));
@@ -21,7 +21,7 @@ count=0
 count=$((count + 1))
 printf '%s\\n' "$count" > "$REGISTRY_COUNT"
 if [[ "$REGISTRY_MODE" == mismatch ]]; then echo sha512-d3Jvbmc=; exit 0; fi
-if [[ "$REGISTRY_MODE" == missing || "$count" -lt 3 ]]; then exit 1; fi
+if [[ "$REGISTRY_MODE" == missing || "$count" -lt 14 ]]; then exit 1; fi
 echo sha512-Zml4dHVyZQ==
 `, { mode: 0o700 });
     let code = 0;

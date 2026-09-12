@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { lstat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { vendorJson } from "./limits.js";
 import { appendDaemonLog } from "./logs.js";
@@ -181,8 +182,8 @@ export async function installedBinaryVersion(platform: NodeJS.Platform = process
 
 // ---- restarting the service update installed on top of ----
 
-async function serviceExists(platform: NodeJS.Platform, home: string, env: NodeJS.ProcessEnv): Promise<boolean> {
-  try { return (await lstat(servicePath(platform, home, env))).isFile(); }
+async function serviceExists(platform: NodeJS.Platform, userHome: string, env: NodeJS.ProcessEnv, lstatFn: typeof lstat = lstat): Promise<boolean> {
+  try { return (await lstatFn(servicePath(platform, userHome, env))).isFile(); }
   catch { return false; }
 }
 
@@ -195,8 +196,8 @@ function restartServiceCommand(platform: NodeJS.Platform): { command: string; ar
 /** Only touches a service Headroom itself installed (servicePath() existing
  * as a file); a machine that never ran `install-service` gets no restart
  * attempt at all, matching install-service/uninstall-service's own scope. */
-async function restartServiceIfPresent(platform: NodeJS.Platform, home: string, env: NodeJS.ProcessEnv, spawnFn: typeof spawn): Promise<"restarted" | "failed" | "absent"> {
-  if (!(await serviceExists(platform, home, env))) return "absent";
+async function restartServiceIfPresent(platform: NodeJS.Platform, userHome: string, env: NodeJS.ProcessEnv, spawnFn: typeof spawn, lstatFn: typeof lstat = lstat): Promise<"restarted" | "failed" | "absent"> {
+  if (!(await serviceExists(platform, userHome, env, lstatFn))) return "absent";
   const { command, args } = restartServiceCommand(platform);
   const result = await runCommand(command, args, spawnFn);
   return result.code === 0 ? "restarted" : "failed";
@@ -295,7 +296,12 @@ async function defaultAskYesNo(question: string): Promise<boolean> {
 export interface RunUpdateDependencies {
   fetch?: typeof fetch;
   spawnFn?: typeof spawn;
+  /** Headroom state directory, including the database and local settings. */
   home?: string;
+  /** OS user home directory, used to find a service installed for that user. */
+  userHome?: string;
+  /** Test seam for checking an installed service path. */
+  lstatFn?: typeof lstat;
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   /** Enter means No, same as setup.ts's own confirm(); overridden in tests so
@@ -320,8 +326,11 @@ export async function runUpdate(argv: string[], deps: RunUpdateDependencies = {}
   const wantsNotes = argv.includes("--notes");
   const skipQuestion = argv.includes("--yes");
   const platform = deps.platform ?? process.platform;
-  const home = deps.home ?? headroomHome({ platform });
   const env = deps.env ?? process.env;
+  const userHome = deps.userHome ?? homedir();
+  const home = deps.home ?? headroomHome({ platform, home: userHome, env });
+  const serviceEnv = { ...env, HEADROOM_HOME: home };
+  const lstatFn = deps.lstatFn ?? lstat;
   const doFetch = deps.fetch ?? fetch;
   const spawnFn = deps.spawnFn ?? spawn;
 
@@ -352,7 +361,7 @@ export async function runUpdate(argv: string[], deps: RunUpdateDependencies = {}
 
   if (dryRun) {
     console.log(`would run: ${npmCommand(platform)} ${npmInstallArgs(latest).join(" ")}`);
-    if (await serviceExists(platform, home, env)) console.log("would restart the Headroom service");
+    if (await serviceExists(platform, userHome, serviceEnv, lstatFn)) console.log("would restart the Headroom service");
     return 0;
   }
 
@@ -365,7 +374,7 @@ export async function runUpdate(argv: string[], deps: RunUpdateDependencies = {}
     return 1;
   }
 
-  const restart = await restartServiceIfPresent(platform, home, env, spawnFn);
+  const restart = await restartServiceIfPresent(platform, userHome, serviceEnv, spawnFn, lstatFn);
   if (restart === "restarted") console.log("restarted the Headroom service");
   else if (restart === "failed") console.error("could not restart the Headroom service; restart it yourself");
 
