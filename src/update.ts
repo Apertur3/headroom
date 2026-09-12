@@ -198,6 +198,11 @@ function restartServiceCommand(platform: NodeJS.Platform): { command: string; ar
  * attempt at all, matching install-service/uninstall-service's own scope. */
 async function restartServiceIfPresent(platform: NodeJS.Platform, userHome: string, env: NodeJS.ProcessEnv, spawnFn: typeof spawn, lstatFn: typeof lstat = lstat): Promise<"restarted" | "failed" | "absent"> {
   if (!(await serviceExists(platform, userHome, env, lstatFn))) return "absent";
+  // Headroom's Windows task uses IgnoreNew, so /Run alone reports success
+  // while an old daemon keeps running. /End is intentionally best-effort: a
+  // stopped task has nothing to end, and the following /Run is still the
+  // authoritative result. Both commands use fixed argument vectors.
+  if (platform === "win32") await runCommand("schtasks", ["/End", "/TN", "Headroom Daemon"], spawnFn);
   const { command, args } = restartServiceCommand(platform);
   const result = await runCommand(command, args, spawnFn);
   return result.code === 0 ? "restarted" : "failed";

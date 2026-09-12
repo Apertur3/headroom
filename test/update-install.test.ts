@@ -177,27 +177,16 @@ describe("headroom update: service restart", () => {
   for (const [platform, serviceParts, restart] of [
     ["darwin", ["Library", "LaunchAgents", "com.headroom.daemon.plist"], { command: "launchctl", args: ["kickstart", "-k", `gui/${typeof process.getuid === "function" ? process.getuid() : 0}/com.headroom.daemon`] }],
     ["linux", [".config", "systemd", "user", "headroom.service"], { command: "systemctl", args: ["--user", "restart", "headroom.service"] }],
-    ["win32", undefined, { command: "schtasks", args: ["/Run", "/TN", "Headroom Daemon"] }],
   ] as const) {
     it(`finds and restarts the ${platform} service from the OS home, not the state directory`, async () => {
       const root = await mkdtemp(join(tmpdir(), "headroom-update-service-"));
       temporary.push(root);
-      const home = platform === "win32" ? "D:\\headroom-state" : join(root, "state");
-      const userHome = platform === "win32" ? "C:\\Users\\headroom-update" : join(root, "user");
-      let lstatFn: typeof lstat | undefined;
-      let mockedLstat: ReturnType<typeof vi.fn> | undefined;
-      if (serviceParts) {
-        const service = join(userHome, ...serviceParts);
-        await mkdir(home, { recursive: true, mode: 0o700 });
-        await mkdir(dirname(service), { recursive: true, mode: 0o700 });
-        await writeFile(service, "service", { mode: 0o600 });
-      } else {
-        mockedLstat = vi.fn(async (path: string) => {
-          expect(path).toBe("D:\\headroom-state\\headroom-daemon.xml");
-          return { isFile: () => true };
-        });
-        lstatFn = mockedLstat as unknown as typeof lstat;
-      }
+      const home = join(root, "state");
+      const userHome = join(root, "user");
+      const service = join(userHome, ...serviceParts);
+      await mkdir(home, { recursive: true, mode: 0o700 });
+      await mkdir(dirname(service), { recursive: true, mode: 0o700 });
+      await writeFile(service, "service", { mode: 0o600 });
       const spy = spySpawn([
         { code: 0, stdout: "", stderr: "" }, // npm install
         { code: 0, stdout: "", stderr: "" }, // service restart
@@ -210,7 +199,6 @@ describe("headroom update: service restart", () => {
         home,
         userHome,
         platform,
-        lstatFn,
       });
 
       expect(code).toBe(0);
@@ -219,7 +207,39 @@ describe("headroom update: service restart", () => {
         restart,
         { command: platform === "win32" ? "headroom.cmd" : "headroom", args: ["--version"] },
       ]);
-      if (mockedLstat) expect(mockedLstat).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  for (const [state, endCode] of [["running", 0], ["stopped", 1]] as const) {
+    it(`ends a ${state} Windows task before starting the updated daemon`, async () => {
+      const lstatFn = vi.fn(async (path: string) => {
+        expect(path).toBe("D:\\headroom-state\\headroom-daemon.xml");
+        return { isFile: () => true };
+      });
+      const spy = spySpawn([
+        { code: 0, stdout: "", stderr: "" }, // npm install
+        { code: endCode, stdout: "", stderr: "" }, // /End: succeeds only while running
+        { code: 0, stdout: "", stderr: "" }, // /Run starts the updated task
+        { code: 0, stdout: "1.2.3\n", stderr: "" }, // installed binary
+      ]);
+
+      const code = await runUpdate([], {
+        fetch: registryFetch("999.0.0"),
+        spawnFn: spy.spawnFn,
+        home: "D:\\headroom-state",
+        userHome: "C:\\Users\\headroom-update",
+        platform: "win32",
+        lstatFn: lstatFn as unknown as typeof lstat,
+      });
+
+      expect(code).toBe(0);
+      expect(lstatFn).toHaveBeenCalledTimes(1);
+      expect(spy.calls).toEqual([
+        { command: "npm.cmd", args: ["install", "-g", "headroomd@999.0.0"] },
+        { command: "schtasks", args: ["/End", "/TN", "Headroom Daemon"] },
+        { command: "schtasks", args: ["/Run", "/TN", "Headroom Daemon"] },
+        { command: "headroom.cmd", args: ["--version"] },
+      ]);
     });
   }
 });
