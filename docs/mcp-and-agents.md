@@ -348,7 +348,7 @@ already follows:
 
 ## CLI equivalents
 
-For agents that call a shell instead of MCP, such as Codex or Gemini CLI sessions:
+For agents that call a shell instead of MCP, such as Codex or Antigravity CLI sessions:
 
 | MCP tool | CLI equivalent |
 |---|---|

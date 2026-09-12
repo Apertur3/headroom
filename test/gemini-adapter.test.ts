@@ -118,20 +118,16 @@ describe("Gemini CLI adapter", () => {
 });
 
 describe("Gemini CLI discovery", () => {
-  it("adds a gemini principal for the default home, and a named one for a GEMINI_CLI_HOME override", async () => {
+  it("ignores retired consumer credentials, including GEMINI_CLI_HOME", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-gemini-registry-")); temporary.push(root);
-    await mkdir(join(root, ".gemini"), { recursive: true });
-    await writeFile(join(root, ".gemini", "oauth_creds.json"), credential, { mode: 0o600 });
-    expect(await discoverAccounts(root, { PATH: "" })).toContainEqual(expect.objectContaining({
-      name: "gemini", vendor: "gemini", location: join(root, ".gemini"), adapter: "native-ts",
-    }));
-
     const alternate = join(root, "work");
-    await mkdir(join(alternate, ".gemini"), { recursive: true });
-    await writeFile(join(alternate, ".gemini", "oauth_creds.json"), credential, { mode: 0o600 });
-    expect(await discoverAccounts(root, { PATH: "", GEMINI_CLI_HOME: alternate })).toContainEqual(expect.objectContaining({
-      name: "gemini-work", vendor: "gemini", location: join(alternate, ".gemini"),
-    }));
+    for (const home of [root, alternate]) {
+      await mkdir(join(home, ".gemini"), { recursive: true });
+      await writeFile(join(home, ".gemini", "oauth_creds.json"), credential, { mode: 0o600 });
+    }
+    for (const environment of [{ PATH: "" }, { PATH: "", GEMINI_CLI_HOME: alternate }]) {
+      expect((await discoverAccounts(root, environment)).some((account) => "vendor" in account && account.vendor === "gemini")).toBe(false);
+    }
   });
 
   it("adds nothing when the Gemini CLI has never logged in", async () => {
@@ -142,7 +138,7 @@ describe("Gemini CLI discovery", () => {
 });
 
 describe("pollAccounts: Gemini dispatch", () => {
-  it("collects a configured gemini principal through its own adapter", async () => {
+  it("reports a legacy gemini principal as retired without network calls", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-gemini-poll-")); temporary.push(root);
     const home = join(root, ".headroom");
     await mkdir(home, { recursive: true, mode: 0o700 });
@@ -154,13 +150,16 @@ describe("pollAccounts: Gemini dispatch", () => {
     ].join("\n"), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME;
     process.env.HEADROOM_HOME = home;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
     try {
       const result = await pollAccounts();
       expect(result.observations).toEqual([expect.objectContaining({
         principal_id: "gemini", meter_id: "gemini:all", source: "remote:gemini",
-        freshness: "failed", reason: "no Gemini CLI OAuth credentials; run: gemini",
+        freshness: "failed", reason: expect.stringContaining("Headroom no longer polls this provider"),
       })]);
+      expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
+      fetchSpy.mockRestore();
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
   });

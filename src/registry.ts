@@ -1,6 +1,6 @@
 import { constants, promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
 import { expandHome, headroomHome, vendorHome } from "./paths.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -27,15 +27,6 @@ async function agyOnPath(pathValue: string | undefined): Promise<boolean> {
   }))).some(Boolean);
 }
 
-/** `gemini` for the Gemini CLI's default home, `gemini-<basename>` for a
- * GEMINI_CLI_HOME override, so two Gemini logins on one machine stay
- * distinguishable in accounts.toml and in every meter id. */
-function geminiPrincipalName(geminiRoot: string, home: string): string {
-  if (resolve(geminiRoot) === resolve(home)) return "gemini";
-  const label = basename(geminiRoot).replace(/^\.+/, "").replace(/[^A-Za-z0-9._-]+/g, "-");
-  return label ? `gemini-${label}` : "gemini";
-}
-
 export async function discoverAccounts(home = homedir(), environment = process.env): Promise<Account[]> {
   const entries = await fs.readdir(home, { withFileTypes: true });
   const candidates = entries.filter((entry) => entry.isDirectory() && (/^\.codex(?:\d+|[-_].+)?$/.test(entry.name) || /^\.claude(?:\d+|[-_].+)?$/.test(entry.name))).map((entry) => entry.name).sort();
@@ -56,16 +47,8 @@ export async function discoverAccounts(home = homedir(), environment = process.e
   if (await exists(antigravityCLI) || await agyOnPath(environment.PATH)) {
     accounts.push({ name: "antigravity", vendor: "antigravity", location: await exists(antigravityCLI) ? antigravityCLI : "agy", adapter: "native-ts" });
   }
-  // The Gemini CLI keeps its own subscription credential in `<home>/.gemini`,
-  // where `home` is GEMINI_CLI_HOME when that is set (the CLI's own home
-  // override) and the OS home otherwise. Antigravity above reads the same
-  // credential file for a different product's quota, so both principals can
-  // legitimately exist side by side on one machine.
-  const geminiRoot = environment.GEMINI_CLI_HOME ? expandHome(environment.GEMINI_CLI_HOME) : home;
-  const geminiDirectory = environment.GEMINI_CLI_HOME ? join(geminiRoot, ".gemini") : vendorHome("gemini", { home });
-  if (await exists(join(geminiDirectory, "oauth_creds.json"))) {
-    accounts.push({ name: geminiPrincipalName(geminiRoot, home), vendor: "gemini", location: geminiDirectory, adapter: "native-ts" });
-  }
+  // Gemini CLI consumer subscriptions were retired on 2026-06-18.
+  // Old OAuth files must not create a second, unusable subscription.
   // `grok login` writes its token under GROK_HOME, defaulting to ~/.grok.
   const grokHome = environment.GROK_HOME ? expandHome(environment.GROK_HOME) : join(home, ".grok");
   if (await exists(grokAuthPath(grokHome, home))) {

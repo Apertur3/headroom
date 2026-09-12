@@ -60,7 +60,9 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   the conformance oracle.
 - **Antigravity.** `agy` has no server mode but bootstraps its local HTTPS server when started
   under a pseudo-terminal (`script -q /dev/null agy`), verified 2026-09-03 with real numbers.
-  The daemon supervises a hidden `agy` only while polling, then stops it; cold start ~20s.
+  The daemon keeps its owned `agy` warm after the first poll. Consumer quotas come only from
+  its local summary, using the source-built native reader. Gemini CLI discovery and polling
+  are retired; legacy configuration returns UNKNOWN with migration guidance.
 - **Local pools.** `kind = "local"` principals with `base_url`, optional `wake` command that Headroom
   reports and never runs. State `UP | BUSY | DOWN`, model id, vLLM queue depth.
 - **Registry.** `~/.headroom/accounts.toml`, auto-discovered from `~/.claude*`, `~/.codex*`,
