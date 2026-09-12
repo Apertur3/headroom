@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -117,7 +117,10 @@ it("keeps discovery durable across event cleanup and VACUUM without exposing its
 });
 
 it.each([true, false])("delivers the first daemon reset after startup or enabling notifications (configured at startup: %s)", async (configuredAtStartup) => {
-  const home = await mkdtemp(join(tmpdir(), "headroom-reset-startup-"));
+  // The daemon canonicalizes its home before deriving the Windows pipe name
+  // and notification coalescing key. Use the same spelling on the client:
+  // Windows TEMP can contain an 8.3 alias such as RUNNER~1.
+  const home = await realpath(await mkdtemp(join(tmpdir(), "headroom-reset-startup-")));
   const previousHome = process.env.HEADROOM_HOME;
   const priorSighup = process.listeners("SIGHUP");
   const store = await HeadroomStore.open(home);
@@ -138,11 +141,15 @@ it.each([true, false])("delivers the first daemon reset after startup or enablin
     if (configuredAtStartup) await configure();
     store.insert(reading(82, now - 120_000, now - 60_000));
     store.setDaemonState("notify_watermark", new Date(now - 100_000).toISOString());
-    daemon = await HeadroomDaemon.create({ home, poller: async () => ({ observations: [reading(0, now, now + 7 * 86_400_000)], failures: [] }) });
+    const poller = vi.fn(async () => ({ observations: [reading(0, now, now + 7 * 86_400_000)], failures: [] }));
+    daemon = await HeadroomDaemon.create({ home, poller });
     await daemon.start();
     expect(fetcher).not.toHaveBeenCalled();
     if (!configuredAtStartup) await configure();
-    await rpc(socketPath(home), "refresh");
+    expect(await rpc(socketPath(home), "refresh")).toMatchObject({
+      observations: [expect.objectContaining({ quantity: expect.objectContaining({ used: 0 }) })], failures: [],
+    });
+    expect(poller).toHaveBeenCalledOnce();
     // Join the daemon's in-flight delivery; no real transport or credentials.
     await deliverNotifications(store, { home });
     expect(fetcher).toHaveBeenCalledOnce();

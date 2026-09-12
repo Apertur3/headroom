@@ -97,7 +97,7 @@ run_grep() {
 }
 
 is_license_file() { case "$1" in LICENSE|LICENSE.*|*/LICENSE|*/LICENSE.*) return 0 ;; *) return 1 ;; esac; }
-is_package_json() { case "$1" in package.json|*/package.json) return 0 ;; *) return 1 ;; esac; }
+is_package_json() { case "${1//\\//}" in package.json|*/package.json) return 0 ;; *) return 1 ;; esac; }
 
 # Validates every denylist expression exactly once (a dry match against
 # empty input) and returns the path to a filtered copy containing only the
