@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
-import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type Policy } from "./policy.js";
+import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type CanDecision, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import type { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
@@ -180,6 +180,11 @@ export function planFor(store: HeadroomStore, meter: string, reservePercent: num
 
 export interface GateOptions {
   owner?: string;
+  /** A new reservation must account for work the same owner already has in
+   * flight. Ordinary advisory checks retain the historical owner-self
+   * exception, but admission paths set this so one owner cannot over-admit
+   * several concurrent jobs against the same meter. */
+  includeOwnerReservations?: boolean;
   /** Overrides the owner's planned share of the 5h window (see
    * evaluateProRataLine); when absent, the owner's active leases' expected
    * percent on the meter plus the 5h request itself stands in for it. */
@@ -227,6 +232,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   const pacing = options.pacing ?? "even";
   const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
   let lastShort: StoredObservation | undefined;
+  let lastReservedPercent = 0;
   let lastResult: GateResult | undefined;
   for (const id of candidates) {
     const blocked = store.dispatchBlockForMeter(id, now) ?? store.dispatchBlockForPrincipal(id.split(":")[0]);
@@ -251,6 +257,16 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     }
     checked.push(id);
     lastShort = short ?? lastShort;
+    // A lease reserves capacity on the meter, rather than on one particular
+    // vendor window. Apply it to every enforced percent window that the gate
+    // evaluates: the same action consumes both a 5h and a weekly allowance.
+    // This mirrors canRouteWithLeases, whose adjusted observations already
+    // make another owner's reservation visible to `can`.
+    const reservedPercent = store.leases(id, true, now)
+      .filter((lease) => (options.includeOwnerReservations || lease.owner !== options.owner) && lease.expected_percent !== null && lease.expected_percent > 0)
+      .reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
+    lastReservedPercent = reservedPercent;
+    const reservedSuffix = reservedPercent > 0 ? ` after ${reservedPercent.toFixed(1)}% already leased` : "";
 
     // Fail closed on any window this gate actually consumes (a requested 5h
     // or wk need, or the weekly reading usePlan folds into a 5h check) that
@@ -271,17 +287,18 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       if (row.freshness === "not_enforced") { notEnforced.push(label); continue; }
       const freshness = freshnessGate(row, staleMinutes, now);
       if (!freshness.ok) return { allowed: false, reason: `${label} ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
-      const used = row.quantity?.used;
+      const observedUsed = row.quantity?.used;
+      const used = observedUsed === undefined ? undefined : Math.min(100, observedUsed + reservedPercent);
       if (used === undefined) return { allowed: false, reason: `${label} usage unknown`, meters_checked: checked, unknown: true };
       const meterReserve = reserveFor(options.reserves ?? {}, id);
       const reserve = Math.max(reservePercent, meterReserve);
       if (used + need.points > 100 - reserve) {
         const left = Math.max(0, 100 - reserve - used);
-        const reserveReason = meterReserve >= reservePercent && meterReserve > 0 ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left: that would use the ${meterReserve}% reserve on ${id}` : `${label} needs ${need.points} more but only ${left.toFixed(1)} left before the ${reserve}% reserve`;
+        const reserveReason = meterReserve >= reservePercent && meterReserve > 0 ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id}` : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve`;
         return { allowed: false, reason: reserveReason, meters_checked: checked };
       }
       if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
-        const plan = computePlan(long.quantity.used, long.resets_at, row.window!.minutes! / 60, reserve, now);
+        const plan = computePlan(Math.min(100, long.quantity.used + reservedPercent), long.resets_at, row.window!.minutes! / 60, reserve, now);
         if (used + need.points > plan.points_per_5h_window) return { allowed: false, reason: `5h needs ${need.points} more but the plan line allows only ${plan.points_per_5h_window.toFixed(1)} points this window`, meters_checked: checked };
       }
     }
@@ -304,7 +321,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       const proRata = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: fiveHourNeed.points, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now });
       if (!proRata.allowed) return { allowed: false, reason: proRata.reason, meters_checked: checked };
       const burst10m = store.burnRateFor([short], now, 10).get(`${id}:${short.window.minutes}`);
-      const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: short.quantity!.used, windowStart });
+      const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: Math.min(100, short.quantity!.used + reservedPercent), windowStart });
       if (!burst.allowed) return { allowed: false, reason: burst.reason, meters_checked: checked };
     }
   }
@@ -320,7 +337,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   }
   const lanesRemaining = options.actionClass && lastShort?.quantity?.unit === "percent" ? (() => {
     const learned = store.learnedCost(options.actionClass)[0];
-    const remaining = lastShort!.quantity!.remaining ?? (100 - lastShort!.quantity!.used);
+    const remaining = Math.max(0, (lastShort!.quantity!.remaining ?? (100 - lastShort!.quantity!.used)) - lastReservedPercent);
     return learned ? maxMoreBeforeReset(remaining, learned.median_percent) : null;
   })() : undefined;
   const notEnforcedNote = lastResult?.not_enforced?.length ? ` (${lastResult.not_enforced.join(", ")} not enforced on ${checked[checked.length - 1]})` : "";
@@ -330,6 +347,35 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
 export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
   const result = gateForCore(store, needs, meter, reservePercent, usePlan, now, options);
   return { ...result, notices: unscheduledResetNotices(store, result.meters_checked, now) };
+}
+
+/**
+ * `can` chooses a limiting pace state, which is not necessarily the meter
+ * with the least residual space for a newly learned cost. Admission therefore
+ * checks the requested cost against every consumed percent window, including
+ * active reservations and both the global freeze floor and a meter-specific
+ * reserve. Call this inside HeadroomStore.admitAndStartLeases.
+ */
+export function admitCanCost(store: HeadroomStore, decision: CanDecision, meters: string[], policy: Policy, expectedPercent: number | null, now = new Date()): CanDecision {
+  if (!decision.allowed || expectedPercent === null) return decision;
+  for (const meter of meters) {
+    const reserved = store.leases(meter, true, now).reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
+    const reserve = Math.max(policy.freeze_reserve_pct, reserveFor(policy.reserve, meter));
+    for (const row of enforcedPercentWindows(store, meter)) {
+      if (row.freshness === "not_enforced") continue;
+      const remaining = Math.max(0, (row.quantity!.remaining ?? (100 - row.quantity!.used)) - reserved);
+      const usable = Math.max(0, remaining - reserve);
+      if (expectedPercent > usable) {
+        return {
+          ...decision,
+          allowed: false,
+          meter,
+          reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${meter} (${usable.toFixed(1)}% usable of ${remaining.toFixed(1)}% remaining)`,
+        };
+      }
+    }
+  }
+  return decision;
 }
 
 export interface FillOutcome {
@@ -358,6 +404,9 @@ export interface FillOutcome {
 
 export interface FillOptions {
   owner?: string;
+  /** See GateOptions.includeOwnerReservations. Set by admission-oriented
+   * callers that need a new lane offer to include the caller's own open work. */
+  includeOwnerReservations?: boolean;
   planSharePercent?: number;
   pacing?: "even" | "none";
   /** Same as GateOptions.staleness_minutes: defaults to defaultPolicy's own
@@ -426,14 +475,17 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
     const widerFreshness = freshnessGate(wider, staleMinutes, now);
     if (!widerFreshness.ok) return { meter, error: widerFreshness.reason };
   }
-  const used5h = tight.quantity!.used;
+  const reservedPercent = store.leases(meter, true, now)
+    .filter((lease) => (options.includeOwnerReservations || lease.owner !== options.owner) && lease.expected_percent !== null && lease.expected_percent > 0)
+    .reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
+  const used5h = Math.min(100, tight.quantity!.used + reservedPercent);
   // With no distinct weekly window, the tight window IS the weekly boundary
   // too when it isn't the 5h one (Codex's main pool with 5h not enforced):
   // its own usage stands in directly rather than defaulting to an unspent 0
   // that would let the (nonexistent) separate weekly cap never bind. A
   // genuinely 5h-only meter (weekly just not read yet) keeps the old
   // "unknown, don't block on it" default of 0.
-  const usedWeekly = wider ? wider.quantity!.used : (isFiveHour ? 0 : used5h);
+  const usedWeekly = wider ? Math.min(100, wider.quantity!.used + reservedPercent) : (isFiveHour ? 0 : used5h);
   const windowUsed = windowShortLabel(tight.window?.minutes);
   const secondsLeft = tight.resets_at ? Math.max(0, (Date.parse(tight.resets_at) - now.getTime()) / 1000) : null;
   const learned = laneCostOverride === undefined ? store.learnedCostForMeter(meter) : undefined;

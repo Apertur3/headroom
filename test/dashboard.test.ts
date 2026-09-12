@@ -38,7 +38,9 @@ function terminal(tty = true) {
 const dateTimeFormat = Intl.DateTimeFormat;
 beforeEach(() => {
   // Fix the ambient locale and local zone so frames are portable across hosts.
-  vi.spyOn(Intl, "DateTimeFormat").mockImplementation((_locale, options) => new dateTimeFormat("en-GB", { timeZone: "Europe/Amsterdam", ...options }));
+  vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (_locale, options) {
+    return new dateTimeFormat("en-GB", { timeZone: "Europe/Amsterdam", ...options });
+  });
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -176,7 +178,7 @@ describe("dashboard frames (synthetic data)", () => {
       row({ principal_id: "credits", meter_id: "credits:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-10-05T12:00:00Z" }),
     ];
     const frame = renderDashboard(model, { width: 100, height: 30, verbose: false, eventsWide: false }).join("\n");
-    expect(frame).toContain("gpu-box            UP  coder  0 running, 0 waiting  ok");
+    expect(frame).toContain("gpu-box          UP  coder  0 running, 0 waiting  ok");
     expect(frame).toMatch(/credits\s+1 available, expire (?:Oct 5|5 Oct)/);
     expect(frame).not.toMatch(/gpu-box\s+\[[#.?]{20}\]|credits\s+\[[#.?]{20}\]/);
   });

@@ -83,10 +83,20 @@ registry carries those same bytes (npm's `dist.integrity` against a sha512 of th
 it, runs `scripts/homebrew-formula.sh <version> <npm-tarball-url> <sha256>` and pushes the result
 to the tap's default branch as a commit named `headroom <version>`, authored by `headroom-release`
 at a GitHub noreply address. The job needs a repository secret `HOMEBREW_TAP_TOKEN`: a fine-grained
-personal access token with contents write on `Apertur3/homebrew-tap` and nothing else. Without that
-secret the job prints a notice and stops, so a missing or expired token never fails a release, it
-only leaves the tap on the previous version; the same happens when the version is not on the npm
-registry yet.
+personal access token with contents write on `Apertur3/homebrew-tap` and nothing else.
+The job retries an unpublished version up to twelve times, ten seconds apart, to allow npm's
+registry to propagate the release. A checksum mismatch, missing token, unavailable version after
+the retry budget, or failed push fails the job visibly.
+
+Rerun the failed Homebrew job once the cause is resolved. A manual release dispatch also updates
+the tap. Every six hours, the workflow reconciles the tap against npm's `latest` tag without
+republishing npm. It checks the GitHub release checksum and refuses to replace the tap with an
+older release. Synchronization jobs run one at a time. Scheduled GitHub Actions runs may be delayed;
+they provide recovery, not a guarantee of an exact update time.
+
+The tap update makes the version available. Existing users install it with
+`brew update && brew upgrade apertur3/tap/headroom` and restart their running service with
+`brew services restart headroom`.
 
 The tap has to be seeded by hand once, because a workflow cannot create the repository's first
 commit for you. `docs/homebrew-tap-seed/` holds exactly what that first push contains, generated

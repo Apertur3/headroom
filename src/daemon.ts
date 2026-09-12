@@ -10,12 +10,12 @@ import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type Antigr
 import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
-import { canRouteWithLeases, unknownMeterPrincipals, type Policy } from "./policy.js";
+import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { withResetsIn } from "./resets.js";
 import { withLastKnown, withPaceInfo } from "./pace.js";
-import { fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
-import { deliverNotifications } from "./notify.js";
+import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -188,6 +188,9 @@ export class HeadroomDaemon {
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
     stripAmbientProxyEnvironment(startupPolicy.proxy);
+    // Establish notification history before any socket-triggered or scheduled
+    // poll can insert new events. No token lookup or transport runs at startup.
+    if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents();
     // The session token always lives under the daemon's own resolved home
     // (this.home), never derived from this.path: this.path is a named pipe
     // in production (nothing to write a token file relative to) and, in
@@ -244,6 +247,20 @@ export class HeadroomDaemon {
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
     if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }
+  }
+
+  /** Build a capacity decision from the current SQLite snapshot. The caller
+   * may invoke this inside HeadroomStore.admitAndStartLeases, where its lease
+   * reads and the following reservation are protected by one write lock. */
+  private canDecision(meters: string[], accounts: Account[], localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, owner: string, now: Date, includeOwnerReservations = false): CanDecision {
+    const blocked = meters.map((meter) => this.store.dispatchBlockForMeter(meter, now) ?? this.store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+    if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const allMeters = [...new Set([...meters, ...localMeters])];
+    const rows = new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)]));
+    const burn = this.store.burnRateFor([...rows.values()].flat(), now);
+    const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+    return canRouteWithLeases(meters, localMeters, enriched, localPreference, policy, allowUnknown, this.store.leases(undefined, true, now), owner, now, includeOwnerReservations);
   }
 
   private async prepareSocket(): Promise<void> {
@@ -450,16 +467,40 @@ export class HeadroomDaemon {
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
           await this.poll(undefined, false);
-          const blocked = meters.map((meter) => this.store.dispatchBlockForMeter(meter) ?? this.store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
-          if (blocked) { result = { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] }; break; }
           const policy = await readPolicy();
-          const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
-          const allMeters = [...new Set([...meters, ...localMeters])];
           const now = new Date();
-          const rows = new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)]));
-          const burn = this.store.burnRateFor([...rows.values()].flat(), now);
-          const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
-          result = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, params.allow_unknown === true, this.store.leases(undefined, true), params.owner, now);
+          result = this.canDecision(meters, accounts, routing.local_preference, policy, params.allow_unknown === true, params.owner, now);
+          break;
+        }
+        case "can_lease": {
+          const action = typeof params.action_class === "string" ? params.action_class : "";
+          const owner = typeof params.owner === "string" ? params.owner.trim() : "";
+          const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
+          const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
+          if (!owner) return reject(-32602, "owner is required");
+          if (expected === null || !Number.isFinite(expected) || expected < 0 || expected > 100) return reject(-32602, "expected_percent must be 0 through 100");
+          const routing = await readRouting();
+          if (!routing.present) return reject(-32602, "No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
+          const meters = routing.consumes[action];
+          if (!meters) return reject(-32602, `Unknown action class: ${action || "(missing)"}`, action || null);
+          const accounts = await this.currentAccounts();
+          const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+          if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
+          // Refreshes may happen before the transaction; the transaction is
+          // deliberately only the local decision plus lease write, never a
+          // credential-backed network request.
+          await this.poll(undefined, false);
+          const policy = await readPolicy();
+          const now = new Date();
+          const admitted = this.store.admitAndStartLeases(() => {
+            const raw = this.canDecision(meters, accounts, routing.local_preference, policy, params.allow_unknown === true, owner, now, true);
+            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            return admitCanCost(this.store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, policy, expected, now);
+          }, owner, (admittedDecision) => {
+            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
+          }, expected, ttl, `can:${action}`, now, action);
+          result = { decision: admitted.decision, leases: admitted.leases };
           break;
         }
         case "lease_start": {
@@ -583,6 +624,9 @@ export class HeadroomDaemon {
     const key = principal ?? "all";
     const now = Date.now();
     const policy = await readPolicy(); // mtime/reload safe: no cached config survives a request or SIGHUP.
+    // Settings can enable notifications without restarting the daemon. Take
+    // the history boundary before this poll creates its first eligible event.
+    if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents();
     const interval = (policy.principal_intervals[principal ?? ""] ?? policy.poll_interval_minutes) * 60_000;
     const blocked = this.backoff.get(key);
     // Keepalive's local source has no vendor request budget. It is deliberately

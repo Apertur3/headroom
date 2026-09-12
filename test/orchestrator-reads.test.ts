@@ -2,7 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { fillFor, gateFor, planFor, rateLines } from "../src/orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "../src/orchestrator-reads.js";
+import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -127,6 +128,31 @@ describe("gateFor: plain reserve and plan-line checks", () => {
       const now = new Date("2026-09-03T12:00:00Z");
       expect(gateFor(store, [{ window: "5h", points: 5 }], "claude-main:all", 10, false, now)).toMatchObject({ allowed: true });
       expect(gateFor(store, [{ window: "5h", points: 15 }], "claude-main:all", 10, false, now)).toMatchObject({ allowed: false });
+    } finally { store.close(); }
+  });
+
+  it("counts another owner's active reservation before allowing a gate", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      store.insert(fiveHour(20, now.toISOString(), "2026-09-03T17:00:00Z"));
+      store.insert(weekly(20, now.toISOString(), "2026-09-10T12:00:00Z"));
+      store.startLease("owner-a", "claude-main:all", 75, 60 * 60_000, "other work", now);
+      const result = gateFor(store, [{ window: "wk", points: 10 }], "claude-main:all", 0, false, now, { owner: "owner-b", pacing: "none" });
+      expect(result).toMatchObject({ allowed: false, meters_checked: ["claude-main:all"] });
+      expect(result.reason).toContain("75.0% already leased");
+    } finally { store.close(); }
+  });
+
+  it("checks a requested can cost against every consumed meter, not only the pace limiter", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      store.insert(fiveHour(20, now.toISOString(), "2026-09-03T17:00:00Z", "claude-main:all"));
+      store.insert(fiveHour(89, now.toISOString(), "2026-09-03T17:00:00Z", "claude-main:fable"));
+      const decision = admitCanCost(store, { allowed: true, meter: "claude-main:all", state: "NORMAL", reason: "fits", meters: [] }, ["claude-main:all", "claude-main:fable"], defaultPolicy, 2, now);
+      expect(decision).toMatchObject({ allowed: false, meter: "claude-main:fable" });
+      expect(decision.reason).toContain("10% reserve");
     } finally { store.close(); }
   });
 
@@ -328,6 +354,21 @@ describe("rate/plan/gate/fill surface a meter's own reason instead of a generic 
 });
 
 describe("fillFor: falls back to the tightest enforced window", () => {
+  it("subtracts another owner's reservation from the lane offer", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      store.insert(fiveHour(20, now.toISOString(), "2026-09-03T17:00:00Z"));
+      store.insert(weekly(20, now.toISOString(), "2026-09-10T12:00:00Z"));
+      store.startLease("owner-a", "claude-main:all", 75, 60 * 60_000, "other work", now);
+      const result = await fillFor(store, "claude-main:all", 5, 0, now, { owner: "owner-b", pacing: "none" });
+      if ("error" in result) throw new Error("expected a fill result");
+      expect(result.used_5h_percent).toBe(95);
+      expect(result.used_weekly_percent).toBe(95);
+      expect(result.lanes?.lanes).toBe(0);
+    } finally { store.close(); }
+  });
+
   it("uses the weekly window (and says so) when the 5h window is not enforced", async () => {
     const store = await open();
     try {

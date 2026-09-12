@@ -153,6 +153,68 @@ describe("gate against a reserve", () => {
     } finally { restore(); }
     expect(logs.join("\n")).toContain("would use the 10% reserve on claude-main:fable");
   });
+
+  it("admits only one competing reservation after recomputing under the write lock", async () => {
+    const home = await seedHome('pacing = "none"\n', [window5h("claude-main:fable", 20), weekly("claude-main:fable", 20)]);
+    const now = new Date();
+    const first = await HeadroomStore.open(home);
+    const second = await HeadroomStore.open(home);
+    try {
+      const admit = (store: HeadroomStore, owner: string) => store.admitAndStartLeases(
+        () => gateFor(store, [{ window: "wk", points: 10 }], "claude-main:fable", 0, false, now, { owner, includeOwnerReservations: true, pacing: "none" }),
+        owner, ["claude-main:fable"], 75, 60 * 60_000, "competing work", now,
+      );
+      expect(admit(first, "owner-a").decision.allowed).toBe(true);
+      const denied = admit(second, "owner-b");
+      expect(denied.decision.allowed).toBe(false);
+      expect(denied.leases).toEqual([]);
+      expect(second.leases("claude-main:fable", true, now)).toHaveLength(1);
+    } finally { first.close(); second.close(); }
+  });
+
+  it("lets the original single lease id end every meter in an atomic admission", async () => {
+    const home = await seedHome('pacing = "none"\n', []);
+    const store = await HeadroomStore.open(home);
+    try {
+      const now = new Date();
+      const admitted = store.admitAndStartLeases(() => ({ allowed: true }), "owner-a", ["claude-main:all", "claude-main:fable"], 5, 60 * 60_000, "review", now, "review");
+      expect(admitted.leases).toHaveLength(2);
+      expect(admitted.leases.every((lease) => lease.note === "review")).toBe(true);
+      store.endLease(admitted.leases[0].id, "owner-a", false, now);
+      expect(store.leases(undefined, true, now)).toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("rolls back every group member if ending one atomic lease handle fails midway", async () => {
+    const home = await seedHome('pacing = "none"\n', []);
+    const store = await HeadroomStore.open(home);
+    try {
+      const now = new Date();
+      const admitted = store.admitAndStartLeases(() => ({ allowed: true }), "owner-a", ["claude-main:all", "claude-main:fable"], 5, 60 * 60_000, "review", now, "review");
+      const db = (store as unknown as { db: { exec(sql: string): void } }).db;
+      // An aborting trigger is a deterministic stand-in for a failed second
+      // update. The first member must roll back with it, preserving the one
+      // opaque-handle promise for a retry.
+      db.exec(`CREATE TRIGGER abort_group_end BEFORE UPDATE OF ended_at ON leases WHEN NEW.id = '${admitted.leases[1].id}' BEGIN SELECT RAISE(ABORT, 'fixture group end'); END`);
+      expect(() => store.endLease(admitted.leases[0].id, "owner-a", false, now)).toThrow("fixture group end");
+      expect(store.leases(undefined, true, now)).toHaveLength(2);
+      db.exec("DROP TRIGGER abort_group_end");
+      store.endLease(admitted.leases[0].id, "owner-a", false, now);
+      expect(store.leases(undefined, true, now)).toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("releases every run reservation when the executable cannot start", async () => {
+    const home = await seedHome('pacing = "none"\n', [window5h("claude-main:fable", 20)]);
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", "headroom-command-that-does-not-exist"])).toBe(1);
+      });
+      const store = await HeadroomStore.open(home);
+      try { expect(store.leases("claude-main:fable", true)).toEqual([]); }
+      finally { store.close(); }
+    } finally { /* seedHome cleanup is handled afterEach */ }
+  });
 });
 
 describe("fill above a reserve", () => {
@@ -215,6 +277,21 @@ describe("can against a reserve", () => {
     } finally { restore(); }
     expect(logs[0]).toContain("YES claude-main:fable");
     expect(logs.join("\n")).toContain("would use the 10% reserve on claude-main:fable");
+  });
+
+  it("includes the owner's earlier lease and the requested cost when admitting another can --lease", async () => {
+    const home = await seedHome(RESERVE_POLICY, [window5h("claude-main:fable", 85)]);
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["can", "claude-fable", "--owner", "owner-a", "--expect", "3", "--lease"])).toBe(0);
+        // 85% used + the first 3% lease leaves only 2% above this meter's
+        // 10% reserve, so a second 3% admission must be refused.
+        expect(await main(["can", "claude-fable", "--owner", "owner-a", "--expect", "3", "--lease"])).toBe(2);
+      });
+      const store = await HeadroomStore.open(home);
+      try { expect(store.leases("claude-main:fable", true)).toHaveLength(1); }
+      finally { store.close(); }
+    } finally { /* seedHome cleanup is handled afterEach */ }
   });
 });
 

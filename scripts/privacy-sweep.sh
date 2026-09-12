@@ -19,7 +19,7 @@
 set -u
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+cd "$repo_root" || exit 1
 
 # Every temp file this script creates is appended here and removed on exit --
 # a single trap, since a later `trap ... EXIT` call would silently replace
@@ -125,13 +125,22 @@ prepare_denylist() {
 }
 
 # Runs every check against a single file, reporting hits under $2. Used only
-# for package.json's own filtered (author-stripped) temp copy -- one file, so
+# for package.json and single-file checks -- one file, so
 # a plain per-check grep call is cheap and needs no path relabeling.
 scan_one_labeled_file() {
   local path="$1" label="$2" lineno match raw pattern grep_flags
   if [[ ! -f "$path" || ! -r "$path" ]]; then
     error_out "$label is missing or unreadable"
     return 1
+  fi
+
+  # Personal attribution belongs in LICENSE. Do not exempt an author line
+  # from the scan: npm includes it in the published artifact.
+  if is_package_json "$label"; then
+    while IFS=: read -r lineno _rest; do
+      [[ -z "$lineno" ]] && continue
+      flag "$label" "$lineno" "package author metadata belongs in LICENSE"
+    done < <(run_grep -nIE '"author"[[:space:]]*:' "$path")
   fi
 
   while IFS=: read -r lineno match; do
@@ -221,10 +230,7 @@ scan_source_tree() {
   done < <(git ls-files -z)
   scan_files "" "" ${files[@]+"${files[@]}"}
   if [[ -n "$pkgjson_rel" ]]; then
-    local tmp; tmp="$(mktemp)"
-    grep -v '"author"' "$pkgjson_rel" > "$tmp" 2>/dev/null
-    scan_one_labeled_file "$tmp" "$pkgjson_rel"
-    rm -f "$tmp"
+    scan_one_labeled_file "$pkgjson_rel" "$pkgjson_rel"
   fi
 }
 
@@ -247,10 +253,7 @@ scan_packed_tarball() {
   done < <(find "$pkg_dir" -type f -print0)
   scan_files "packed/" "$pkg_dir/" ${files[@]+"${files[@]}"}
   if [[ -n "$pkgjson_file" ]]; then
-    local tmp; tmp="$(mktemp)"
-    grep -v '"author"' "$pkgjson_file" > "$tmp" 2>/dev/null
-    scan_one_labeled_file "$tmp" "packed/package.json"
-    rm -f "$tmp"
+    scan_one_labeled_file "$pkgjson_file" "packed/package.json"
   fi
   rm -rf "$root"
 }

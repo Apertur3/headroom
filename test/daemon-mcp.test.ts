@@ -252,12 +252,32 @@ describe("daemon JSON-RPC", () => {
 
 describe("MCP JSON-RPC", () => {
   it("handles initialize, tools/list, and a fixture-backed quota_status call", async () => {
-    expect(await handleMcp('{"jsonrpc":"2.0","id":1,"method":"initialize"}')).toMatchObject({ result: { capabilities: { tools: {} } } });
+    expect(await handleMcp('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')).toMatchObject({ result: { protocolVersion: "2025-06-18", capabilities: { tools: {} } } });
     expect(await handleMcp('{"jsonrpc":"2.0","id":2,"method":"tools/list"}')).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "quota_status" }), expect.objectContaining({ name: "quota_lease_start" }), expect.objectContaining({ name: "quota_lease_end" }), expect.objectContaining({ name: "quota_leases" })]) } });
     const response = await handleMcp('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async (method) => {
       return method === "status" ? [fixture()] : [];
     });
     expect(response).toMatchObject({ result: { structuredContent: { observations: [expect.objectContaining({ meter_id: "codex-main:main" })], plan_downgraded: null } } });
+  });
+
+  it("implements MCP ping", async () => {
+    await expect(handleMcp('{"jsonrpc":"2.0","id":4,"method":"ping"}')).resolves.toEqual({ jsonrpc: "2.0", id: 4, result: {} });
+  });
+
+  it.each([
+    ["quota_events", "events", [], "events"],
+    ["quota_leases", "leases", [], "leases"],
+    ["quota_cost", "cost", [], "items"],
+    ["quota_rate", "rate", [], "lines"],
+    ["quota_spend", "spend", [], "rows"],
+  ])("normalizes daemon-backed %s structuredContent to the direct object shape", async (tool, daemonMethod, daemonResult, field) => {
+    const response = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: tool, arguments: {} } }), async (method) => {
+      expect(method).toBe(daemonMethod);
+      return daemonResult;
+    });
+    const content = (response as { result: { structuredContent: Record<string, unknown> } }).result.structuredContent;
+    expect(Array.isArray(content)).toBe(false);
+    expect(content).toMatchObject({ source: "daemon", [field]: daemonResult, contract: expect.any(String), generated_at: expect.any(String) });
   });
 
   it("uses a direct marked result when the daemon is absent", async () => {
@@ -266,6 +286,37 @@ describe("MCP JSON-RPC", () => {
       return { source: "direct", observations: [fixture()], failures: [] };
     });
     expect(response).toMatchObject({ result: { structuredContent: { source: "direct", observations: [expect.objectContaining({ meter_id: "codex-main:main" })] } } });
+  });
+
+  it("uses the daemon's atomic can_lease admission when quota_can asks for a lease", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-can-lease-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_can","arguments":{"action_class":"review","owner":"sdk","expect_percent":7,"lease":true}}}', async (method, params) => {
+        expect(method).toBe("can_lease");
+        expect(params).toMatchObject({ action_class: "review", owner: "sdk", expected_percent: 7 });
+        return { decision: { allowed: true, meter: "codex-main:main", state: "NORMAL", reason: "fits", meters: [] }, leases: [{ id: "atomic-lease", meter_id: "codex-main:main" }] };
+      });
+      expect(response).toMatchObject({ result: { structuredContent: { allowed: true, leased_id: "atomic-lease" } } });
+    });
+  });
+
+  it("admits direct quota_can leases atomically against the caller's active reservations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-can-lease-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "routing.toml"), '[consumes]\nreview = ["codex-main:main"]\n', { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), ['[[accounts]]', 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      try {
+        const now = new Date().toISOString();
+        store.insert({ ...fixture(), resets_at: new Date(Date.now() + 4 * 60 * 60_000).toISOString(), observed_at: now, fetched_at: now });
+      } finally { store.close(); }
+      const request = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_can","arguments":{"action_class":"review","owner":"sdk","expect_percent":65,"lease":true}}}';
+      const first = await handleMcp(request, async () => undefined);
+      const second = await handleMcp(request, async () => undefined);
+      expect(first).toMatchObject({ result: { structuredContent: { source: "direct", decision: { allowed: true }, leased_id: expect.any(String) } } });
+      expect(second).toMatchObject({ result: { structuredContent: { source: "direct", decision: { allowed: false }, leased_id: null } } });
+    });
   });
 
   it("never spawns the Claude probe from a direct (no-daemon) MCP status read once a keychain grant marker exists", async () => {
@@ -327,6 +378,15 @@ describe("MCP tool arguments are validated against their own schema before dispa
     const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:1",7],"meter":"claude-main:all","owner":"cadence"}}}', neverDispatch);
     expect(response).toMatchObject({ error: { code: -32602 } });
     expect((response as { error: { message: string } }).error.message).toContain("needs");
+  });
+
+  it("accepts every duration form advertised by quota_gate and forwards the shared parser result", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["30d:1","90m:2","48h:3"],"meter":"claude-main:all"}}}', async (method, params) => {
+      expect(method).toBe("gate");
+      expect(params.needs).toEqual([{ window: "30d", points: 1 }, { window: "90m", points: 2 }, { window: "48h", points: 3 }]);
+      return { allowed: true, reason: "fits", meters_checked: ["claude-main:all"] };
+    });
+    expect(response).toMatchObject({ result: { structuredContent: { allowed: true } } });
   });
 
   it("rejects a negative reserve_percent the same way the CLI's --reserve does", async () => {

@@ -4,7 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.1] - 2026-09-12
+
+### Fixed
+
+- Confirmed resets reach the notification queue even when their original occurrence precedes the last delivery pass or a provider poll finishes late. Discovery tracks stored events independently of their timestamps, with queueing and discovery committed together; history retains the original timestamp.
+- Shared-budget gates and lane estimates include other owners' reservations. Dispatch admission and creation of reservations happen atomically across processes, including capacity already reserved by the same owner.
+- `headroom run` reserves every consumed meter, releases reservations when an executable cannot start, and bounds its captured diagnostic output.
+- MCP gate validation accepts the same duration syntax as the CLI. Structured results use consistent object wrappers with or without a daemon, and the server answers `ping`.
+- A fresh manual reading that raises usage takes effect immediately. Lower readings with an unexpected reset remain subject to confirmation.
+- The explicit `headroom status` command accepts the same flags as the default status view.
+- Homebrew synchronization retries delayed npm visibility, reports failed synchronization, supports manual repair, and reconciles npm latest every six hours.
+- Updated the development test runner and its lockfile to patched versions; the full dependency audit is clean and CI checks development dependencies too.
+- Public fixtures use synthetic names, package metadata omits personal author information, and source/package scans no longer exempt the author field.
 
 ## [0.1.0] - 2026-09-11
 

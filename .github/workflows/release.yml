@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  schedule:
+    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       tag:
@@ -163,7 +165,7 @@ jobs:
           name: npm-tarball
           path: dist-release
       - name: Validate the dispatched tag
-       : inputs.tag is an unrestricted workflow_dispatch string. It
+        # inputs.tag is an unrestricted workflow_dispatch string. It
         # must never be interpolated directly into a `run:` script (double
         # quotes do not stop command substitution) -- pass it through env and
         # check it against the release-tag grammar before anything uses it.
@@ -214,12 +216,18 @@ jobs:
   homebrew:
     name: update the Homebrew tap
     needs: [tarball, publish]
-    # Tag pushes only. A workflow_dispatch re-publish is a repair of an npm
-    # publish that did not take; the tap already points at the same tarball.
+    # Scheduled reconciliation also repairs a delayed npm publication or a
+    # failed tap push. Manual release repairs must update the tap as well.
     if: >-
-      github.repository == 'Apertur3/headroom' &&
-      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      always() && github.repository == 'Apertur3/headroom' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && needs.publish.result == 'success') ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+        needs.tarball.result == 'success' && needs.publish.result == 'success'))
     runs-on: ubuntu-latest
+    concurrency:
+      group: headroom-homebrew-tap
+      cancel-in-progress: false
     # Read-only here. The write happens in the tap repository, with a token
     # scoped to that repository alone.
     permissions:
@@ -231,18 +239,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Resolve the version to synchronize
+        id: target
+        env:
+          RELEASE_VERSION: ${{ needs.tarball.outputs.version }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          version="$RELEASE_VERSION"
+          if [[ -z "$version" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="${RELEASE_TAG#v}"
+          fi
+          if [[ -z "$version" && "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            version="$(npm view headroomd dist-tags.latest --prefer-online)"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Cannot resolve a valid Headroom version to synchronize"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Generate Formula/headroom.rb from the released tarball
         id: formula
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.tarball.outputs.version }}
+          VERSION: ${{ steps.target.outputs.version }}
           # Only whether the secret exists, never the secret itself.
           TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
         run: |
           if [[ "$TAP_TOKEN_PRESENT" != "true" ]]; then
-            echo "::notice title=Homebrew tap left alone::HOMEBREW_TAP_TOKEN is not set on this repository, so $TAP_REPOSITORY keeps the formula it already has. The npm release itself is unaffected. docs/releasing.md says how to create the token."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::HOMEBREW_TAP_TOKEN is missing; the Homebrew tap cannot be updated. See docs/releasing.md."
+            exit 1
           fi
           # The asset the release job attached, not a rebuild: hashing anything
           # else would pin the formula to bytes nobody published.
@@ -253,12 +278,13 @@ jobs:
           # correct if the registry carries these exact bytes. npm's own
           # dist.integrity is a sha512 of them, which makes that checkable.
           # It also catches the case where the publish step was skipped.
-          registry_integrity="$(npm view "headroomd@$VERSION" dist.integrity 2>/dev/null || true)"
           asset_integrity="sha512-$(openssl dgst -sha512 -binary "$tarball" | openssl base64 -A)"
-          if [[ "$registry_integrity" != "$asset_integrity" ]]; then
-            echo "::notice title=Homebrew tap left alone::headroomd@$VERSION is not on the npm registry as the same bytes as the release asset (registry reported '${registry_integrity:-nothing}'), so no formula was generated. Publish the version first, then re-run this workflow."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          bash scripts/wait-npm-release.sh "$VERSION" "$asset_integrity"
+          # A rerun of an older release must never roll the tap backwards.
+          latest="$(npm view headroomd dist-tags.latest --prefer-online)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "::error::npm latest is $latest, not $VERSION; refusing to overwrite the tap. The scheduled run will reconcile npm latest."
+            exit 1
           fi
           bash scripts/homebrew-formula.sh \
             "$VERSION" \
@@ -269,7 +295,7 @@ jobs:
         if: ${{ steps.formula.outputs.ready == 'true' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ needs.tarball.outputs.version }}
+          VERSION: ${{ steps.target.outputs.version }}
         run: |
           tap="$(mktemp -d)"
           # Cloned anonymously (the tap is public), so no credential is written
@@ -294,6 +320,7 @@ jobs:
           # The token is handed to git through a one-shot credential helper on
           # this command alone: it is never written to a config file and never
           # becomes part of a URL that could be echoed by a later git command.
+          # shellcheck disable=SC2016
           git -C "$tap" \
             -c credential.helper= \
             -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$HOMEBREW_TAP_TOKEN"; }; f' \

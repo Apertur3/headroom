@@ -5,6 +5,11 @@ channels. The same picker is offered after the service step in `headroom setup`.
 Notifications stay off until you choose a channel. `setup --yes` skips this step
 and prints the command to run later.
 
+A reset may need a second vendor reading before Headroom confirms it. Headroom tracks which
+stored events have reached the notification queue, so a slow poll or a backdated confirmation
+cannot fall behind the last delivery pass. Event history retains the original occurrence time.
+Queueing and recording discovery commit together; the ledger prevents repeated delivery.
+
 ## Pick a preset
 
 | Preset | What reaches your phone |
