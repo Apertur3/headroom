@@ -13,6 +13,9 @@
  */
 import { COMMAND_HELP, COMMAND_LIST } from "./cli.js";
 import { daemonRequest, socketPath } from "./daemon.js";
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
+import { headroomHome } from "./paths.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 
@@ -292,7 +295,26 @@ function isRpcError(value: unknown): boolean {
 
 const COMPLETION_DEADLINE_MS = 200;
 
-async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback: () => Promise<string[]>, signal: AbortSignal): Promise<string[]> {
+/** A completion read must not initialize a new SQLite database just to learn
+ * that it has no meter IDs. Besides being needless disk I/O on every Tab,
+ * Windows can retain a just-closed SQLite file handle briefly, which makes a
+ * fresh no-store completion look like it leaked a resource. */
+async function existingStoreMeterIds(signal: AbortSignal): Promise<string[]> {
+  if (signal.aborted) return [];
+  try {
+    const info = await lstat(join(headroomHome(), "headroom.db"));
+    if (!info.isFile() || info.isSymbolicLink()) return [];
+  } catch { return []; }
+  if (signal.aborted) return [];
+  const store = await HeadroomStore.open();
+  try {
+    if (signal.aborted) return [];
+    return [...new Set(store.latestPerWindow().map((item) => item.meter_id))];
+  }
+  finally { store.close(); }
+}
+
+async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback: (signal: AbortSignal) => Promise<string[]>, signal: AbortSignal): Promise<string[]> {
   if (signal.aborted) return [];
   const request = await daemonRequest(socketPath(), "status", {}, 150, 30_000, signal);
   // Do not start a fallback after the completion budget has expired. On
@@ -302,7 +324,7 @@ async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback:
     return [...new Set((request.result as Record<string, unknown>[]).map((item) => String(item[field])))];
   }
   if (signal.aborted) return [];
-  return fallback();
+  return fallback(signal);
 }
 
 /** Every meter id `headroom` currently knows about, for `--meter` completion:
@@ -312,11 +334,7 @@ async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback:
 export async function completionMeterIds(deadlineMs = COMPLETION_DEADLINE_MS): Promise<string[]> {
   const ids = await withDeadline(
     (signal) =>
-      idsFromDaemonOrElse("meter_id", async () => {
-        const store = await HeadroomStore.open();
-        try { return [...new Set(store.latestPerWindow().map((item) => item.meter_id))]; }
-        finally { store.close(); }
-      }, signal),
+      idsFromDaemonOrElse("meter_id", existingStoreMeterIds, signal),
     deadlineMs,
   );
   return ids ?? [];
@@ -330,6 +348,7 @@ export async function completionPrincipalIds(deadlineMs = COMPLETION_DEADLINE_MS
   const ids = await withDeadline(
     (signal) =>
       idsFromDaemonOrElse("principal_id", async () => {
+        if (signal.aborted) return [];
         const accounts = await readAccounts();
         return [...new Set(accounts.map((item) => item.name))];
       }, signal),
