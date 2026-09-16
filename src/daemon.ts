@@ -748,22 +748,25 @@ async function socketExists(path: string): Promise<boolean> {
  * Probe health separately from a potentially slow request. A live daemon may
  * need to poll before answering `status`; that must not look like no daemon.
  */
-export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000): Promise<
+export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000, signal?: AbortSignal): Promise<
   | { status: "available"; result: unknown }
   | { status: "absent" }
   | { status: "unresponsive" }
 > {
+  if (signal?.aborted) return { status: "absent" };
   // Mutual auth (win32 only) is verified entirely inside rpc() itself now: a
   // reply -- health included -- whose transcript proof does not check out
   // comes back as `undefined`, indistinguishable here from no daemon
   // answering at all. There is nothing left for daemonRequest to double-check.
-  const health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS));
+  const health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
+  if (signal?.aborted) return { status: "absent" };
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
-  const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS));
+  const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
   return result === undefined ? { status: "unresponsive" } : { status: "available", result };
 }
 
-export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000, absoluteTimeoutMs = RPC_ABSOLUTE_DEADLINE_MS): Promise<unknown | undefined> {
+export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000, absoluteTimeoutMs = RPC_ABSOLUTE_DEADLINE_MS, signal?: AbortSignal): Promise<unknown | undefined> {
+  if (signal?.aborted) return undefined;
   return new Promise((resolve) => {
     const socket = createConnection(path);
     socket.setEncoding("utf8"); socket.setTimeout(timeoutMs);
@@ -782,6 +785,7 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
     const clientNonce = isWin32 ? randomBytes(16).toString("hex") : undefined;
     let token: string | undefined;
     let finished = false;
+    const onAbort = (): void => done(undefined);
     // An absolute deadline independent of the inactivity timer above: that
     // timer resets on every byte received, so a connection that keeps
     // trickling data -- never enough to go idle, never a complete answer --
@@ -793,15 +797,21 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
       if (finished) return;
       finished = true;
       clearTimeout(absoluteDeadline);
+      signal?.removeEventListener("abort", onAbort);
       socket.destroy();
       resolve(value);
     };
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) { onAbort(); return; }
+    }
     const send = (): void => {
       void (async () => {
         // The session token is read locally from the 0600 token file and used
         // only to compute HMAC proofs; the token itself is never written to
         // the socket.
         if (isWin32) token = await sessionToken();
+        if (finished) return;
         const proof = isWin32 && nonce && token && method !== "health" ? pipeAuthProof(token, nonce) : undefined;
         sentLine = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { ...params, ...(proof ? { _proof: proof } : {}), ...(clientNonce ? { _client_nonce: clientNonce } : {}), _caller: { pid: process.pid, process: process.argv[1] ?? "headroom" } } });
         socket.write(`${sentLine}\n`);
