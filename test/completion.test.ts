@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -121,12 +121,13 @@ describe("headroom _complete-meters (hidden)", () => {
   });
 
   it("prints nothing, and still exits 0, with no store and no daemon within the completion budget", async () => {
-    await withHeadroomHome(async () => {
+    await withHeadroomHome(async (home) => {
       const started = performance.now();
       const { logs, restore } = captureLog();
       try { expect(await main(["_complete-meters"])).toBe(0); }
       finally { restore(); }
       expect(logs).toEqual([]);
+      await expect(lstat(join(home, "headroom.db"))).rejects.toMatchObject({ code: "ENOENT" });
       // The helper's deadline is 200ms. Leave room for a loaded Windows CI
       // worker to schedule the timer, while still catching the old 5s pipe
       // handle leak that made this test impossible to run there.
