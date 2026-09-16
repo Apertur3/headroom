@@ -9,7 +9,7 @@ import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatResetsIn, resetsIn } from "./resets.js";
 import { safeError } from "./security.js";
-import { explainUnknown, formatRatePercent, label, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
+import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
 import { isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
 
 export interface DashboardModel extends CachedDashboardModel {
@@ -79,7 +79,7 @@ export const DASHBOARD_HELP = "Usage: headroom dashboard (alias: top) [--interva
 export const ENTER_DASHBOARD = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h";
 export const LEAVE_DASHBOARD = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 const KEYS = "q quit  p pause  v verbose  e events  g graphs  arrows/jk scroll  PgUp/PgDn/space page  Home/End  Tab focus  Enter panel  ? help";
-const GRAPH_LEGEND = "Burndown: solid used and plan, │ now, ░ reserve";
+const GRAPH_LEGEND = "Burndown: remaining capacity, dotted plan guide, │ now, ░ reserve at bottom";
 
 export interface DashboardView { width: number; height: number; verbose: boolean; eventsWide: boolean; graphs?: boolean; ascii?: boolean; terminalHeight?: number; scroll?: number; focus?: number; help?: boolean; }
 export interface DashboardState { paused: boolean; verbose: boolean; eventsWide: boolean; help: boolean; quit: boolean; graphs?: boolean; scroll?: number; focus?: number; }
@@ -177,14 +177,52 @@ function spark(values: Array<number | null>): string {
 interface GraphPoint { at: number; used: number; reset: number; }
 const clamp = (value: number, max: number): number => Math.max(0, Math.min(max, value));
 
+function isTrustworthy(reading: Observation): boolean {
+  if (reading.freshness !== "fresh") return false;
+  if (reading.quantity?.unit !== "percent" || !Number.isFinite(reading.quantity.used)) return false;
+  if (reading.metadata?.vendor_window_held || reading.metadata?.vendor_inconsistent) return false;
+  if (reading.truth === "estimated" && reading.reason === IDLE_WINDOW_REASON) return false;
+  return true;
+}
+
 function graphPoints(row: Observation, model: DashboardModel): GraphPoint[] {
   const points = new Map<number, GraphPoint>();
   for (const reading of [...(model.history?.[row.meter_id] ?? []), row]) {
     const at = Date.parse(reading.observed_at);
-    if (reading.principal_id !== row.principal_id || reading.meter_id !== row.meter_id || reading.window?.minutes !== row.window?.minutes || reading.window?.enforcement !== "hard" || reading.freshness !== "fresh" || reading.quantity?.unit !== "percent" || !Number.isFinite(reading.quantity.used) || !Number.isFinite(at) || at > model.now.getTime()) continue;
-    points.set(at, { at, used: clamp(reading.quantity.used, 100), reset: Date.parse(reading.resets_at ?? "") });
+    if (reading.principal_id !== row.principal_id || reading.meter_id !== row.meter_id || reading.window?.minutes !== row.window?.minutes || reading.window?.enforcement !== "hard") continue;
+    if (!Number.isFinite(at) || at > model.now.getTime()) continue;
+    if (!isTrustworthy(reading)) continue;
+    points.set(at, { at, used: clamp(reading.quantity!.used, 100), reset: Date.parse(reading.resets_at ?? "") });
   }
   return [...points.values()].sort((a, b) => a.at - b.at);
+}
+
+export function sameResetTime(left: number, right: number): boolean {
+  if (left === right) return true;
+  return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= 60_000;
+}
+
+export function usableCurrentPoints(row: Observation, model: DashboardModel): GraphPoint[] {
+  const reset = Date.parse(row.resets_at ?? "");
+  if (!Number.isFinite(reset)) return [];
+  const start = row.window?.minutes ? reset - row.window.minutes * 60_000 : 0;
+  const all = graphPoints(row, model);
+  return all.filter((point) => sameResetTime(point.reset, reset) && point.at >= start && point.at <= reset);
+}
+
+export function canConnect(prev: GraphPoint, cur: GraphPoint, target: Observation, allHistory: Observation[] = []): boolean {
+  if (!sameResetTime(prev.reset, cur.reset)) return false;
+  if (cur.used < prev.used) return false;
+  if (cur.at - prev.at > 15 * 60_000) return false;
+  for (const item of allHistory) {
+    if (item.principal_id !== target.principal_id || item.meter_id !== target.meter_id) continue;
+    if (item.window?.minutes != null && target.window?.minutes != null && item.window.minutes !== target.window.minutes) continue;
+    const t = Date.parse(item.observed_at);
+    if (t > prev.at && t < cur.at) {
+      if (!isTrustworthy(item)) return false;
+    }
+  }
+  return true;
 }
 
 function hasBurndown(row: Observation, model: DashboardModel): boolean {
@@ -196,28 +234,24 @@ function ends(left: string, right: string, width: number): string {
   return clip(left, Math.max(0, width - length(right))) + " ".repeat(Math.max(0, width - length(left) - length(right))) + clip(right, width);
 }
 
-/** Eight plot rows, with 2 by 4 dots per cell, or 1 by 2 half blocks. */
+/** Eight plot rows, with 2 by 4 dots per cell (braille), or 1 by 1 pure ASCII. */
 export function renderBurndown(row: Observation, model: DashboardModel, width: number, ascii = false): string[] {
   const reset = Date.parse(row.resets_at ?? "");
+  const allHistory = model.history?.[row.meter_id] ?? [];
   const all = graphPoints(row, model);
-  const current = all.filter((point) => point.reset === reset);
-  let graphReset = reset;
-  let points = current;
-  // A reset naturally leaves one fresh point in the new period. Keep the
-  // useful previous line visible until this period has a second point.
-  const prior = [...new Set(all.map((point) => point.reset).filter((value) => Number.isFinite(value) && value !== reset))]
-    .sort((a, b) => b - a).find((value) => all.filter((point) => point.reset === value).length >= 2);
-  const showingPrior = current.length < 2 && prior !== undefined;
-  if (showingPrior) { graphReset = prior; points = all.filter((point) => point.reset === prior); }
-  if (current.length < 2 && all.length >= 2 && !showingPrior) return [clip(`  new period, ${current.length} reading${current.length === 1 ? "" : "s"} so far`, width)];
-  const start = row.window?.minutes ? graphReset - row.window.minutes * 60_000 : points[0]?.at;
-  points = points.filter((point) => point.at >= start && point.at <= graphReset);
-  if (width < 12 || !Number.isFinite(start) || !Number.isFinite(graphReset) || graphReset <= start || all.length < 2 || points.length < 2) return [clip("  collecting readings", width)];
-  const columns = Math.floor(width) - 6, rows = width < 60 ? 6 : 8, sx = ascii ? 1 : 2, sy = ascii ? 2 : 4;
+  const current = all.filter((point) => sameResetTime(point.reset, reset));
+  if (current.length < 2 && all.length >= 2) return [clip(`  new period, ${current.length} reading${current.length === 1 ? "" : "s"} so far`, width)];
+  if (current.length < 2) return [clip("  collecting readings", width)];
+  const start = row.window?.minutes ? reset - row.window.minutes * 60_000 : current[0]?.at;
+  const points = current.filter((point) => point.at >= start && point.at <= reset);
+  if (width < 12 || !Number.isFinite(start) || !Number.isFinite(reset) || reset <= start || all.length < 2 || points.length < 2) return [clip("  collecting readings", width)];
+  const columns = Math.floor(width) - 6, rows = width < 60 ? 6 : 8;
+  const sx = ascii ? 1 : 2, sy = ascii ? 1 : 4;
   const pixelWidth = columns * sx, pixelHeight = rows * sy;
   const actual = new Uint8Array(pixelWidth * pixelHeight), plan = new Uint8Array(pixelWidth * pixelHeight);
-  const x = (at: number): number => Math.round(clamp((at - start) / (graphReset - start), 1) * (pixelWidth - 1));
-  const y = (used: number): number => Math.round((1 - used / 100) * (pixelHeight - 1));
+  const x = (at: number): number => Math.round(clamp((at - start) / (reset - start), 1) * (pixelWidth - 1));
+  // Burndown of remaining capacity: 100% capacity at top (y=0), 0% at bottom (y=pixelHeight-1)
+  const y = (remaining: number): number => Math.round((1 - clamp(remaining, 100) / 100) * (pixelHeight - 1));
   const line = (target: Uint8Array, x1: number, y1: number, x2: number, y2: number, dotted = false): void => {
     const steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1), 1);
     for (let step = 0; step <= steps; step++) {
@@ -226,15 +260,21 @@ export function renderBurndown(row: Observation, model: DashboardModel, width: n
       target[py * pixelWidth + px] = 1;
     }
   };
-  line(plan, 0, pixelHeight - 1, pixelWidth - 1, 0);
+  // Guide line: linear straight-line plan starts at 100% remaining capacity at start (0, 0), burns down to 0% at reset (pixelWidth - 1, pixelHeight - 1)
+  line(plan, 0, 0, pixelWidth - 1, pixelHeight - 1, true);
+
+  // Plot actual recorded history samples of remaining capacity:
   for (let i = 0; i < points.length; i++) {
-    const current = points[i], previous = points[i - 1];
-    // A decrease is a reset or correction, not negative consumption.
-    if (previous && current.used >= previous.used) line(actual, x(previous.at), y(previous.used), x(current.at), y(current.used));
-    else line(actual, x(current.at), y(current.used), x(current.at), y(current.used));
+    const cur = points[i], prev = points[i - 1];
+    const curRemaining = 100 - cur.used;
+    if (prev && canConnect(prev, cur, row, allHistory)) {
+      line(actual, x(prev.at), y(100 - prev.used), x(cur.at), y(curRemaining));
+    } else {
+      line(actual, x(cur.at), y(curRemaining), x(cur.at), y(curRemaining));
+    }
   }
   const nowColumn = Math.floor(x(model.now.getTime()) / sx);
-  const reserve = reserveFor(model.policy.reserve, row.meter_id);
+  const reserve = Math.max(model.policy.freeze_reserve_pct, reserveFor(model.policy.reserve, row.meter_id));
   const bits = [[1, 8], [2, 16], [4, 32], [64, 128]];
   const plot = Array.from({ length: rows }, (_, cellY) => {
     let text = "";
@@ -242,34 +282,45 @@ export function renderBurndown(row: Observation, model: DashboardModel, width: n
       let usedMask = 0, planMask = 0;
       for (let dy = 0; dy < sy; dy++) for (let dx = 0; dx < sx; dx++) {
         const index = (cellY * sy + dy) * pixelWidth + cellX * sx + dx;
-        const bit = ascii ? 1 << dy : bits[dy][dx];
+        const bit = ascii ? 1 : bits[dy][dx];
         if (actual[index]) usedMask |= bit;
         if (plan[index]) planMask |= bit;
       }
-      const shaded = reserve > 0 && cellY * sy / (pixelHeight - 1) * 100 < reserve;
-      if (usedMask || planMask) text += ascii ? usedMask ? [" ", "▀", "▄", "█"][usedMask] : "." : String.fromCodePoint(0x2800 + (usedMask | planMask));
-      else if (cellX === nowColumn) text += ascii ? "|" : "│";
-      else text += shaded ? ascii ? ":" : "░" : " ";
+      // Reserve zone: at bottom of remaining capacity (remaining <= reserve)
+      const cellRemaining = (1 - (cellY + 1) / rows) * 100;
+      const shaded = reserve > 0 && cellRemaining < reserve;
+      if (ascii) {
+        if (usedMask) text += "*";
+        else if (planMask) text += ".";
+        else if (cellX === nowColumn) text += "|";
+        else if (shaded) text += ":";
+        else text += " ";
+      } else {
+        if (usedMask || planMask) text += String.fromCodePoint(0x2800 + (usedMask | planMask));
+        else if (cellX === nowColumn) text += "│";
+        else if (shaded) text += "░";
+        else text += " ";
+      }
     }
     return `${cellY === 0 ? "100%" : cellY === rows - 1 ? "  0%" : "    "}${ascii ? "|" : "│"}${text}${ascii ? "|" : "│"}`;
   });
   const dayTime = (at: number): string => new Intl.DateTimeFormat(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(at));
-  const axis = ends(dayTime(start), `${dayTime(graphReset)} reset`, width);
+  const axis = ends(dayTime(start), `${dayTime(reset)} reset`, width);
   const decision = paceDecision(row, model.policy, model.now);
-  const used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" ? row.quantity.used : null;
-  const planned = clamp((model.now.getTime() - start) / (graphReset - start), 1) * 100;
+  const used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" && row.freshness === "fresh" ? row.quantity.used : null;
+  const planned = clamp((model.now.getTime() - start) / (reset - start), 1) * 100;
   const difference = used === null ? 0 : Math.round(used - planned);
   const pace = used === null ? "pace unknown" : difference > 0 ? `over pace by ${difference} points` : difference < 0 ? `under pace${decision.state === "HARVEST" ? ", HARVEST" : ""}` : "on pace";
   const minutes = Math.max(0, Math.floor((reset - model.now.getTime()) / 60_000));
   const summary = `${used === null ? "?" : Math.round(used)}% used, ${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m left, ${pace}`;
   const compact = `${used === null ? "?" : Math.round(used)}%, ${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m, ${pace}`;
-  const period = showingPrior ? `new period, ${current.length} reading${current.length === 1 ? "" : "s"} so far` : "";
-  return [...plot, axis, clip(period || (length(summary) <= width ? summary : compact), width)];
+  return [...plot, axis, clip(length(summary) <= width ? summary : compact, width)];
 }
 
 /** Seven elapsed days, using weekly readings and local calendar day ticks. */
 export function renderWeekly(row: Observation, model: DashboardModel, width: number): string[] {
   const end = model.now.getTime(), start = end - 7 * 86_400_000;
+  const allHistory = model.history?.[row.meter_id] ?? [];
   const points = graphPoints(row, model).filter((point) => point.at >= start);
   if (!points.length) return [];
   const columns = Math.max(7, Math.min(60, Math.floor(width) - 2));
@@ -278,7 +329,7 @@ export function renderWeekly(row: Observation, model: DashboardModel, width: num
   const put = (x: number, used: number): void => { pixels[(7 - Math.round(clamp(used / 100, 1) * 7)) * columns + x] = 1; };
   for (let i = 0; i < points.length; i++) {
     const previous = points[i - 1], current = points[i];
-    if (!previous) put(position(current.at), current.used);
+    if (!previous || !canConnect(previous, current, row, allHistory)) put(position(current.at), current.used);
     else {
       const x1 = position(previous.at), y1 = 7 - Math.round(clamp(previous.used / 100, 1) * 7), x2 = position(current.at), y2 = 7 - Math.round(clamp(current.used / 100, 1) * 7);
       for (let step = 0, count = Math.max(1, Math.abs(x2 - x1)); step <= count; step++) pixels[Math.round(y1 + (y2 - y1) * step / count) * columns + Math.round(x1 + (x2 - x1) * step / count)] = 1;
@@ -290,7 +341,6 @@ export function renderWeekly(row: Observation, model: DashboardModel, width: num
     const marker = event.kind.startsWith("free_reset_") ? "F" : event.kind === "reset_seen" && event.metadata?.unscheduled ? "!" : undefined;
     if (!marker) continue;
     const index = position(at);
-    // Markers occupy the tick line so the plot remains a braille sparkline.
     ticks[index] = ticks[index] === " " || ticks[index] === marker ? marker : "*";
   }
   const day = new Date(start); day.setHours(0, 0, 0, 0); day.setDate(day.getDate() + 1);
@@ -308,7 +358,7 @@ export function renderWeekly(row: Observation, model: DashboardModel, width: num
   return [clip(`  WEEKLY ${row.meter_id} | last 7 days | F free reset  ! unscheduled  * both`, width), `  ${chart}`, `  ${ticks.join("").trimEnd()}`];
 }
 
-function windowLines(row: Observation, model: DashboardModel, view: DashboardView, sharedReason = false): string[] {
+function windowLines(row: Observation, model: DashboardModel, view: DashboardView, sharedReason = false, showBurndown = false): string[] {
   const decision = paceDecision(row, model.policy, model.now);
   const meter = row.meter_id.startsWith(`${row.principal_id}:`) ? row.meter_id.slice(row.principal_id.length + 1) : row.meter_id;
   const key = `${row.meter_id}:${row.window?.minutes ?? "none"}`;
@@ -320,27 +370,36 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
   if (row.quantity?.unit === "credits") return [`  credits  ${row.quantity.remaining ?? "?"} available${creditExpiry(row.resets_at)}`];
   const unknown = decision.state === "UNKNOWN";
   const used = !unknown && row.quantity?.unit === "percent" ? row.quantity.used : null;
-  const filled = used === null ? 0 : Math.round(Math.max(0, Math.min(100, used)) / 5);
-  const bar = unknown ? "?".repeat(20) : "#".repeat(filled) + ".".repeat(20 - filled);
+  const narrowStack = view.width < 70;
+  const bar = barFor(row, decision.state, view.ascii);
   const seconds = resetsIn(row.resets_at, model.now).resets_in_seconds;
   const glyph = { NORMAL: "●", HARVEST: "↗", CONSERVE: "⚠", FREEZE: "🛑", UNKNOWN: "?", NOT_ENFORCED: "", UP: "●", BUSY: "⚠", DOWN: "🛑" }[decision.state];
-  let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} [${bar}] ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}`;
-  if (row.metadata?.vendor_inconsistent) text += " (vendor readings inconsistent, holding)";
-  else if (row.metadata?.vendor_window_held) text += " (new window unconfirmed, holding)";
-  if (decision.state === "NOT_ENFORCED") text = `  ${meter} ${label(row)} n/a (not enforced)`;
-  if (view.graphs !== false && view.width >= 100 && !unknown && model.burns[key]?.length) text += ` ${spark(model.burns[key])}`;
-  const lines = [text];
+  let note = "";
+  if (row.metadata?.vendor_inconsistent) note = " (vendor readings inconsistent, holding)";
+  else if (row.metadata?.vendor_window_held) note = " (new window unconfirmed, holding)";
+  const lines: string[] = [];
+  if (decision.state === "NOT_ENFORCED") {
+    lines.push(`  ${meter} ${label(row)} n/a (not enforced)`);
+  } else if (narrowStack) {
+    lines.push(`  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)}`);
+    lines.push(`      ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}${note}`);
+  } else {
+    let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}${note}`;
+    if (view.graphs !== false && view.width >= 100 && !unknown && model.burns[key]?.length) text += ` ${spark(model.burns[key])}`;
+    lines.push(text);
+  }
   if (unknown) {
     const known = row.last_known ?? (row.quantity?.unit === "percent" ? { used_percent: row.quantity.used, observed_at: row.observed_at, window_minutes: undefined } : null);
     const knownWindow = known?.window_minutes !== undefined ? `${label({ ...row, window: { kind: "fixed", minutes: known.window_minutes, enforcement: "hard" } })} ` : "";
-    lines.push(...wrap(`    ${sharedReason ? "" : `${explainUnknown(row.reason ?? decision.reason).text} `}last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}`, view.width));
+    const diag = (sharedReason || !view.verbose) ? "" : `${explainUnknown(row.reason ?? decision.reason).text} `;
+    lines.push(...wrap(`    ${diag}last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}`, view.width));
   }
   if (view.verbose) {
     const rate = (value: number | null | undefined): string => value == null ? "?" : formatRatePercent(value);
     const seen = model.resetSeen[key] ? decodeResetSeen(model.resetSeen[key]) : undefined;
     lines.push(...wrap(`    burn ${rate(row.burn_percent_per_hour)}, sustainable ${rate(row.sustainable_percent_per_hour)}, reset seen ${seen ? `${clock(seen.at)}${seen.unscheduled ? " (unscheduled)" : ""}` : "-"}, idle ${row.truth === "estimated" && row.reason === IDLE_WINDOW_REASON ? "unverified" : "no"}`, view.width));
   }
-  if (view.graphs !== false && hasBurndown(row, model)) {
+  if (view.graphs !== false && showBurndown && hasBurndown(row, model)) {
     lines.push(...renderBurndown(row, model, Math.min(view.width, view.width < 100 ? 40 : 60), view.ascii));
   }
   return lines;
@@ -360,63 +419,206 @@ function creditExpiry(value: string | null | undefined): string {
   return `, expire ${new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(value))}`;
 }
 
-function summaryLine(principal: string, rows: Observation[], model: DashboardModel, focused: boolean): string {
-  const row = tightest(rows, model);
-  const prefix = `${focused ? ">" : " "} ${clip(principal, 16).padEnd(16)}`;
-  if (row.window?.kind === "state") {
-    const state = row.metadata?.state ?? "DOWN";
-    const status = state === "UP" ? "ok" : state === "BUSY" ? "busy" : "down";
-    return `${prefix} ${state}  ${row.metadata?.model_ids?.[0] ?? "?"}  ${row.metadata?.running ?? row.quantity?.used ?? 0} running, ${row.metadata?.waiting ?? 0} waiting  ${status}`;
+function findBestBurndownRow(rows: Observation[], model: DashboardModel): Observation | undefined {
+  const burndownCandidates = rows.filter((r) => hasBurndown(r, model));
+  if (!burndownCandidates.length) return undefined;
+  return [...burndownCandidates].sort((a, b) => {
+    const aPoints = usableCurrentPoints(a, model).length;
+    const bPoints = usableCurrentPoints(b, model).length;
+    if ((aPoints > 1) !== (bPoints > 1)) return (bPoints > 1 ? 1 : 0) - (aPoints > 1 ? 1 : 0);
+    const aFresh = a.freshness === "fresh" ? 1 : 0;
+    const bFresh = b.freshness === "fresh" ? 1 : 0;
+    if (aFresh !== bFresh) return bFresh - aFresh;
+    if (aPoints !== bPoints) return bPoints - aPoints;
+    return (a.window?.minutes ?? Infinity) - (b.window?.minutes ?? Infinity);
+  })[0];
+}
+
+export function defaultFocusedMeterIndex(model: DashboardModel, meters: string[]): number {
+  const index = meters.findIndex((meterId) => {
+    const rows = model.observations.filter((r) => r.meter_id === meterId);
+    const candidate = findBestBurndownRow(rows, model);
+    return candidate && usableCurrentPoints(candidate, model).length >= 2;
+  });
+  return index >= 0 ? index : 0;
+}
+
+function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedMeterIndex: number): { lines: string[]; panels: number[]; meters: string[] } {
+  const meters = [...new Set(model.observations.map((row) => row.meter_id))].sort();
+  const lines: string[] = [];
+  const panels: number[] = [];
+  const longestMeter = Math.max(0, ...meters.map((m) => m.length));
+  const meterColWidth = Math.max(10, Math.min(24, longestMeter));
+  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && paceDecision(row, model.policy, model.now).state !== "UNKNOWN");
+
+  for (let i = 0; i < meters.length; i++) {
+    const meterId = meters[i];
+    panels.push(lines.length);
+    const isFocused = i === focusedMeterIndex;
+    const prefix = isFocused ? "> " : "  ";
+    const rows = model.observations.filter((row) => row.meter_id === meterId);
+
+    if (rows[0]?.window?.kind === "state") {
+      const state = rows[0].metadata?.state ?? "DOWN";
+      const status = state === "UP" ? "ok" : state === "BUSY" ? "busy" : "down";
+      lines.push(`${prefix}${meterId.padEnd(meterColWidth)}  ${state}  ${rows[0].metadata?.model_ids?.[0] ?? "?"}  ${rows[0].metadata?.running ?? rows[0].quantity?.used ?? 0} running, ${rows[0].metadata?.waiting ?? 0} waiting  ${status}`);
+      continue;
+    }
+
+    if (rows[0]?.quantity?.unit === "credits") {
+      lines.push(`${prefix}${meterId.padEnd(meterColWidth)}  ${rows[0].quantity.remaining ?? "?"} available${creditExpiry(rows[0].resets_at)}`);
+      continue;
+    }
+
+    const ordered = [...rows].sort((a, b) => {
+      const order = (m: number | null | undefined) => m === 300 ? 0 : m === 10080 ? 1 : 2;
+      return order(a.window?.minutes) - order(b.window?.minutes) || (a.window?.minutes ?? 0) - (b.window?.minutes ?? 0);
+    });
+
+    const tightestRow = tightest(rows, model);
+    const overallDecision = paceDecision(tightestRow, model.policy, model.now);
+    const rawState = overallDecision.state;
+    const displayState = rawState === "NOT_ENFORCED" ? "n/a" : rawState;
+    const isUnknownOnly = rows.every((r) => paceDecision(r, model.policy, model.now).state === "UNKNOWN");
+
+    const resettingWindows = rows.filter((r) => isTrustworthy(r) && r.resets_at && resetsIn(r.resets_at, model.now).resets_in_seconds !== null);
+    const earliestResetRow = resettingWindows.sort((a, b) => (resetsIn(a.resets_at, model.now).resets_in_seconds ?? Infinity) - (resetsIn(b.resets_at, model.now).resets_in_seconds ?? Infinity))[0];
+
+    const windowParts: string[] = [];
+    for (const w of ordered) {
+      const wDecision = paceDecision(w, model.policy, model.now);
+      const isHeld = Boolean(w.metadata?.vendor_window_held || w.metadata?.vendor_inconsistent);
+      const isUnknown = wDecision.state === "UNKNOWN" || isHeld;
+      const wLabel = label(w);
+      const wBar = barFor(w, isUnknown ? "UNKNOWN" : wDecision.state, view.ascii);
+      const usedVal = (w.quantity?.unit === "percent" && !isUnknown)
+        ? `${Math.round(w.quantity.used)}%`
+        : wDecision.state === "NOT_ENFORCED" ? "n/a" : "-";
+      let countdownStr = "";
+      if (w === earliestResetRow) {
+        const sec = resetsIn(w.resets_at, model.now).resets_in_seconds;
+        if (sec !== null && !isUnknown) {
+          const glyph = view.ascii ? "~" : "↻";
+          countdownStr = ` ${glyph}${formatResetsIn(sec).replace(/\s+/g, "")}`;
+        }
+      }
+      windowParts.push(`${wLabel}: ${wBar} ${usedVal}${countdownStr}`);
+    }
+
+    let note = "";
+    if (rows.some((r) => r.metadata?.vendor_inconsistent)) note = " (vendor readings inconsistent, holding)";
+    else if (rows.some((r) => r.metadata?.vendor_window_held)) note = " (new window unconfirmed, holding)";
+    if (isUnknownOnly && !view.verbose) note = "";
+
+    const wideLine = `${prefix}${meterId.padEnd(meterColWidth)}  ${windowParts.join("  ")}  ${displayState}${note}`;
+    if (view.width >= 80 && length(wideLine) <= view.width) {
+      lines.push(wideLine);
+    } else {
+      lines.push(`${prefix}${meterId}  ${displayState}${note}`);
+      for (const part of windowParts) {
+        lines.push(`    ${part}`);
+      }
+    }
+
+    if (!view.verbose && !hasFreshInModel) {
+      const unknownRows = rows.filter((r) => paceDecision(r, model.policy, model.now).state === "UNKNOWN" || r.metadata?.vendor_window_held || r.metadata?.vendor_inconsistent);
+      for (const u of unknownRows) {
+        const known = u.last_known ?? (u.quantity?.unit === "percent" ? { used_percent: u.quantity.used, observed_at: u.observed_at, window_minutes: undefined } : null);
+        const knownWindow = known?.window_minutes !== undefined ? `${labelForMinutes(known.window_minutes)} ` : "";
+        lines.push(...wrap(`    last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}`, view.width));
+      }
+    }
   }
-  if (row.quantity?.unit === "credits") return `${prefix} ${row.quantity.remaining ?? "?"} available${creditExpiry(row.resets_at)}`;
-  const decision = paceDecision(row, model.policy, model.now), used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" ? Math.round(row.quantity.used) : null;
-  const bar = used === null ? "?".repeat(20) : "#".repeat(Math.round(used / 5)) + ".".repeat(20 - Math.round(used / 5));
-  const seconds = resetsIn(row.resets_at, model.now).resets_in_seconds;
-  const status = decision.state === "FREEZE" ? "stop" : decision.state === "CONSERVE" ? "watch" : decision.state === "UNKNOWN" ? "unknown" : "ok";
-  return `${prefix} [${bar}] ${used === null ? "  -" : `${used}%`.padStart(4)} resets in ${seconds === null || decision.state === "UNKNOWN" ? "?" : formatResetsIn(seconds)} ${decision.state} ${status}`;
+  return { lines, panels, meters };
 }
 
 function dashboardContent(model: DashboardModel, view: DashboardView): DashboardContent {
   const width = view.width;
   const lines: string[] = [];
   const principals = [...new Set(model.observations.map((row) => row.principal_id))].sort();
+  const meters = [...new Set(model.observations.map((row) => row.meter_id))].sort();
+  const defaultFocus = defaultFocusedMeterIndex(model, meters);
+  const focusedMeterIndex = view.focus !== undefined
+    ? ((view.focus % Math.max(1, meters.length)) + meters.length) % Math.max(1, meters.length)
+    : defaultFocus;
   const active = model.leases.filter((lease) => !lease.ended_at && Date.parse(lease.expires_at) > model.now.getTime());
   const hourAgo = model.now.getTime() - 3_600_000;
-  const next = model.observations.filter((row) => row.resets_at && Date.parse(row.resets_at) >= model.now.getTime()).sort((a, b) => Date.parse(a.resets_at!) - Date.parse(b.resets_at!))[0];
+  const next = model.observations
+    .filter((row) => isTrustworthy(row) && row.resets_at && Date.parse(row.resets_at) > model.now.getTime())
+    .sort((a, b) => Date.parse(a.resets_at!) - Date.parse(b.resets_at!))[0];
+
+  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && paceDecision(row, model.policy, model.now).state !== "UNKNOWN");
+  const unknownDecisions = model.observations
+    .map((row) => paceDecision(row, model.policy, model.now))
+    .filter((decision) => decision.state === "UNKNOWN");
+  const uniqueReasons = [...new Set(unknownDecisions.map((d) => explainUnknown(d.reason).text))];
+  const allSameReason = uniqueReasons.length === 1;
+
   lines.push("OVERVIEW");
-  principals.forEach((principal, index) => lines.push(summaryLine(principal, model.observations.filter((row) => row.principal_id === principal), model, index === (view.focus ?? 0) % Math.max(1, principals.length))));
+  if ((!hasFreshInModel || view.verbose) && unknownDecisions.length > 0) {
+    if (allSameReason) {
+      lines.push(...wrap(`  UNKNOWN: ${uniqueReasons[0]}`, width));
+    } else if (principals.length === 1) {
+      lines.push(...wrap(`  UNKNOWN: ${explainUnknown(unknownDecisions[0].reason).text}`, width));
+    }
+  }
+  const overview = meterOverviewLines(model, view, focusedMeterIndex);
+  lines.push(...overview.lines);
+  const panels: number[] = [...overview.panels];
+
   const recent = model.events.filter((event) => Date.parse(event.created_at) >= hourAgo).length;
   lines.push(`${recent} event${recent === 1 ? "" : "s"} in the last hour, ${active.length} lease${active.length === 1 ? "" : "s"} active${next ? `, next reset ${next.principal_id} ${label(next)} in ${formatResetsIn(Math.max(0, (Date.parse(next.resets_at!) - model.now.getTime()) / 1000))}` : ""}`);
-  lines.push("");
-  const panels: number[] = [];
-  for (const principal of principals) {
-    panels.push(lines.length);
-    const rows = model.observations.filter((row) => row.principal_id === principal).sort((a, b) => a.meter_id.localeCompare(b.meter_id) || (a.window?.minutes ?? 0) - (b.window?.minutes ?? 0));
-    const metered = rows.filter((row) => row.window?.kind !== "state");
-    const header = metered.length ? renderStatus({ observations: metered, policy: model.policy, vendors: model.vendors, now: model.now }, { form: "grouped", width: 10_000, verbose: false, color: false, direct: model.direct })[0] : `${principal}  local`;
-    const reason = metered.map((row) => paceDecision(row, model.policy, model.now)).find((decision) => decision.state === "UNKNOWN");
-    lines.push(header);
-    if (reason) lines.push(...wrap(`  UNKNOWN: ${explainUnknown(reason.reason).text}`, width));
-    lines.push(...rows.flatMap((row) => windowLines(row, model, view, Boolean(reason))));
-    if (view.graphs !== false) {
-      const weekly = rows.find((row) => [ `${principal}:all`, `${principal}:main` ].includes(row.meter_id) && row.window?.minutes === 10080 && row.window.enforcement === "hard" && row.freshness !== "not_enforced");
-      if (weekly) lines.push(...renderWeekly(weekly, model, Math.min(60, width)));
+
+  for (const notice of model.notices) {
+    lines.push(notice);
+  }
+
+  if (view.graphs !== false && meters.length) {
+    const selectedMeter = meters[focusedMeterIndex];
+    const meterRows = model.observations.filter((r) => r.meter_id === selectedMeter);
+    const burndownRow = findBestBurndownRow(meterRows, model);
+    if (burndownRow) {
+      lines.push("");
+      lines.push(`BURNDOWN ${burndownRow.meter_id} (${label(burndownRow)})`);
+      const chartWidth = Math.min(view.width, view.width < 100 ? 40 : 60);
+      lines.push(...renderBurndown(burndownRow, model, chartWidth, view.ascii));
     }
+  }
+
+  if (view.verbose) {
     lines.push("");
+    for (const principal of principals) {
+      const rows = model.observations.filter((row) => row.principal_id === principal).sort((a, b) => a.meter_id.localeCompare(b.meter_id) || (a.window?.minutes ?? 0) - (b.window?.minutes ?? 0));
+      const metered = rows.filter((row) => row.window?.kind !== "state");
+      const header = metered.length ? renderStatus({ observations: metered, policy: model.policy, vendors: model.vendors, now: model.now }, { form: "grouped", width: 10_000, verbose: false, color: false, direct: model.direct })[0] : `${principal}  local`;
+      const principalUnknowns = metered.map((row) => paceDecision(row, model.policy, model.now)).filter((decision) => decision.state === "UNKNOWN");
+      lines.push(header);
+      if (!allSameReason && principalUnknowns.length > 0) {
+        lines.push(...wrap(`  UNKNOWN: ${explainUnknown(principalUnknowns[0].reason).text}`, width));
+      }
+      lines.push(...rows.flatMap((row) => windowLines(row, model, view, true, false)));
+      if (view.graphs !== false) {
+        const weekly = rows.find((row) => [ `${principal}:all`, `${principal}:main` ].includes(row.meter_id) && row.window?.minutes === 10080 && row.window.enforcement === "hard" && row.freshness !== "not_enforced");
+        if (weekly) lines.push(...renderWeekly(weekly, model, Math.min(60, width)));
+      }
+      lines.push("");
+    }
   }
+
   if (!principals.length) lines.push("No cached readings yet. Start the daemon to collect them.", "");
-  const events = ["EVENTS (last 8)", ...[...model.events].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 8).map((event) => `${clock(event.created_at)} ${event.metadata?.unscheduled ? "!unscheduled " : ""}${event.kind} ${event.meter_id ?? event.principal_id ?? "-"}`)];
-  if (events.length === 1) events.push("No events");
-  const right = ["LEASES / RESERVES / PACING", ...active.map((lease) => `${lease.owner} ${lease.meter_id} ${lease.expected_percent ?? "?"}% held, ${lease.spent_percent.toFixed(1)}% spent, ${formatResetsIn(Math.max(0, (Date.parse(lease.expires_at) - model.now.getTime()) / 1000))} left`)];
-  if (!active.length) right.push("No active leases");
-  for (const meter of [...new Set(model.observations.map((row) => row.meter_id))]) { const reserve = reserveFor(model.policy.reserve, meter); if (reserve > 0) right.push(`reserve ${meter}: ${reserve}%`); }
-  if (model.policy.pacing === "none") right.push("Even pacing disabled; hard limits still apply");
-  right.push(...model.notices);
-  if (width < 80 || view.eventsWide) lines.push(...events.flatMap((line) => wrap(line, width)), "", ...right.flatMap((line) => wrap(line, width)));
-  else {
-    const leftWidth = Math.floor((width - 3) / 2), rightWidth = width - leftWidth - 3, left = events.flatMap((line) => wrap(line, leftWidth)), rhs = right.flatMap((line) => wrap(line, rightWidth));
-    lines.push(...Array.from({ length: Math.max(left.length, rhs.length) }, (_, i) => `${left[i] ?? ""}${" ".repeat(Math.max(0, leftWidth - length(left[i] ?? "")))} | ${rhs[i] ?? ""}`.trimEnd()));
+
+  if (view.eventsWide) {
+    lines.push("");
+    const events = ["EVENTS (last 8)", ...[...model.events].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 8).map((event) => `${clock(event.created_at)} ${event.metadata?.unscheduled ? "!unscheduled " : ""}${event.kind} ${event.meter_id ?? event.principal_id ?? "-"}`)];
+    if (events.length === 1) events.push("No events");
+    const right = ["LEASES / RESERVES / PACING", ...active.map((lease) => `${lease.owner} ${lease.meter_id} ${lease.expected_percent ?? "?"}% held, ${lease.spent_percent.toFixed(1)}% spent, ${formatResetsIn(Math.max(0, (Date.parse(lease.expires_at) - model.now.getTime()) / 1000))} left`)];
+    if (!active.length) right.push("No active leases");
+    for (const meter of [...new Set(model.observations.map((row) => row.meter_id))]) { const reserve = reserveFor(model.policy.reserve, meter); if (reserve > 0) right.push(`reserve ${meter}: ${reserve}%`); }
+    if (model.policy.pacing === "none") right.push("Even pacing disabled; hard limits still apply");
+    right.push(...model.notices);
+    lines.push(...events.flatMap((line) => wrap(line, width)), "", ...right.flatMap((line) => wrap(line, width)));
   }
+
   return { lines, panels, principals };
 }
 
@@ -491,23 +693,37 @@ export function dashboardOptions(argv: string[], isTTY: boolean, environment: No
 
 function paint(lines: string[], color: boolean): string[] {
   if (!color) return lines;
-  const painted = lines.map((line) => {
+  return lines.map((line) => {
     if (line.startsWith("PLAN DOWNGRADED:")) return `\x1b[31m${line}\x1b[0m`;
     if (line.startsWith("  UNKNOWN:")) return `\x1b[2m${line}\x1b[0m`;
-    const match = /(\[[#.?]{20}\]).*?\b(NORMAL|HARVEST|CONSERVE|FREEZE|UNKNOWN)\b/.exec(line);
-    const state = match?.[2];
-    const code = state === "UNKNOWN" ? 90 : state === "FREEZE" || state === "DOWN" ? 31 : state === "CONSERVE" || state === "BUSY" ? 33 : 32;
-    if (!state) return line;
-    return line.replace(/\[[#.?]{20}\]/, (bar) => `\x1b[${code}m${bar}\x1b[0m`).replace(new RegExp(`\\b${state}\\b`), `\x1b[${code}m${state}\x1b[0m`);
+
+    let res = line;
+
+    // Color bars individually:
+    res = res.replace(/\[([#.?█░─-]{10,20})\](\s*(\d+)%)?/g, (_fullMatch, inner, percentStr, percentNum) => {
+      if (inner.includes("?") || inner.includes("─") || inner.includes("-")) {
+        return `\x1b[90m[${inner}]\x1b[0m${percentStr ?? ""}`;
+      }
+      if (percentNum !== undefined) {
+        const used = Number(percentNum);
+        const code = used >= 90 ? 31 : used >= 70 ? 33 : 32;
+        return `\x1b[${code}m[${inner}]\x1b[0m${percentStr ?? ""}`;
+      }
+      const filledCount = [...inner].filter((c) => c === "█" || c === "#").length;
+      const ratio = filledCount / inner.length;
+      const code = ratio >= 0.9 ? 31 : ratio >= 0.7 ? 33 : 32;
+      return `\x1b[${code}m[${inner}]\x1b[0m${percentStr ?? ""}`;
+    });
+
+    // Color states individually:
+    res = res
+      .replace(/\b(HARVEST|NORMAL|UP)\b/g, "\x1b[32m$1\x1b[0m")
+      .replace(/\b(CONSERVE|BUSY)\b/g, "\x1b[33m$1\x1b[0m")
+      .replace(/\b(FREEZE|DOWN)\b/g, "\x1b[31m$1\x1b[0m")
+      .replace(/\b(UNKNOWN)\b/g, "\x1b[90m$1\x1b[0m");
+
+    return res;
   });
-  for (let index = 0; index < painted.length; index++) {
-    if (!/^\s*new period, \d+ readings? so far[█░]?$/.test(lines[index])) continue;
-    for (let prior = index; prior >= 0; prior--) {
-      painted[prior] = `\x1b[2m${painted[prior]}\x1b[0m`;
-      if (/^100%(?:│|\|)/.test(lines[prior])) break;
-    }
-  }
-  return painted;
 }
 
 export interface DashboardIO {
@@ -523,8 +739,8 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
   const { input, output, errors, signals } = io;
   if (argv.includes("--help")) { output.write(DASHBOARD_HELP + "\n"); return 0; }
   const options = dashboardOptions(argv, output.isTTY === true, io.environment, output.columns);
-  const view = (): DashboardView => ({ width: output.columns || options.width, height: output.rows || 24, verbose: state.verbose, eventsWide: state.eventsWide, graphs: state.graphs, ascii: options.ascii, terminalHeight: output.rows || 24 });
-  let state: DashboardState = { paused: false, verbose: options.verbose, eventsWide: false, help: false, quit: false, graphs: true, scroll: 0, focus: 0 };
+  const view = (): DashboardView => ({ width: output.columns || options.width, height: output.rows || 24, verbose: state.verbose, eventsWide: state.eventsWide, graphs: state.graphs, ascii: options.ascii, terminalHeight: output.rows || 24, focus: state.focus });
+  let state: DashboardState = { paused: false, verbose: options.verbose, eventsWide: false, help: false, quit: false, graphs: true, scroll: 0, focus: undefined };
   if (options.once || !input.isTTY) {
     const model = await io.gather();
     output.write(paint(renderDashboard(model, { ...view(), height: Number.MAX_SAFE_INTEGER }), options.color).join("\n") + "\n");
@@ -567,7 +783,17 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
     const refresh = async (): Promise<void> => {
       if (stopped || busy || state.paused) return;
       busy = true;
-      try { const next = await io.gather(); if (!state.paused && !stopped) { model = next; draw(); } }
+      try {
+        const next = await io.gather();
+        if (!state.paused && !stopped) {
+          model = next;
+          if (state.focus === undefined) {
+            const meters = [...new Set(next.observations.map((row) => row.meter_id))].sort();
+            state.focus = defaultFocusedMeterIndex(next, meters);
+          }
+          draw();
+        }
+      }
       catch (error) { if (!stopped) fail(error); }
       finally { busy = false; }
     };
@@ -579,7 +805,10 @@ export async function dashboardCommand(argv: string[], io: DashboardIO = { input
         const pageRows = model ? dashboardLayout(model, { ...view(), scroll: state.scroll, focus: state.focus, help: state.help }).room : Math.max(1, view().height - (state.help ? 3 : 2));
         state = handleDashboardKey(state, raw === "space" ? " " : raw, Math.max(1, pageRows));
       }
-      if (raw === "tab" && model) state.focus = (state.focus ?? 0) % Math.max(1, new Set(model.observations.map((row) => row.principal_id)).size);
+      if (raw === "tab" && model) {
+        const count = Math.max(1, new Set(model.observations.map((row) => row.meter_id)).size);
+        state.focus = ((state.focus ?? 0) % count + count) % count;
+      }
       if (state.quit) { quit(); return; }
       resize();
       if (paused && !state.paused) void refresh();
