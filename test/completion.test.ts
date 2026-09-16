@@ -1,10 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMAND_LIST, main } from "../src/cli.js";
-import { completionCommand, generateBashScript, generateFishScript, generatePwshScript, generateZshScript } from "../src/completion.js";
+import { completionCommand, completionMeterIds, generateBashScript, generateFishScript, generatePwshScript, generateZshScript } from "../src/completion.js";
+import { socketPath } from "../src/daemon.js";
 import { HeadroomStore } from "../src/store.js";
 import { writeDiscoveredAccounts } from "../src/registry.js";
 import type { Observation } from "../src/types.js";
@@ -118,12 +120,59 @@ describe("headroom _complete-meters (hidden)", () => {
     });
   });
 
-  it.skipIf(process.platform === "win32")("prints nothing, and still exits 0, with no store and no daemon (Windows: see issue 8, the bound is not yet proven on the pipe path)", async () => {
+  it("prints nothing, and still exits 0, with no store and no daemon within the completion budget", async () => {
     await withHeadroomHome(async () => {
+      const started = performance.now();
       const { logs, restore } = captureLog();
       try { expect(await main(["_complete-meters"])).toBe(0); }
       finally { restore(); }
       expect(logs).toEqual([]);
+      // The helper's deadline is 200ms. Leave room for a loaded Windows CI
+      // worker to schedule the timer, while still catching the old 5s pipe
+      // handle leak that made this test impossible to run there.
+      expect(performance.now() - started).toBeLessThan(800);
+    });
+  });
+
+  it("cancels a stalled daemon socket when its completion deadline expires", async () => {
+    await withHeadroomHome(async (home) => {
+      let clientClosed!: () => void;
+      const closed = new Promise<void>((resolve) => { clientClosed = resolve; });
+      let client: Socket | undefined;
+      const server = createServer((socket) => {
+        // Deliberately never answer: completionMeterIds must abort the client
+        // connection itself instead of merely returning while its socket keeps
+        // the process alive. This is a real named-pipe listener on Windows.
+        client = socket;
+        // A net.Socket starts paused. Consume the health request so the
+        // client can finish its shutdown handshake instead of leaving this
+        // deliberately unresponsive test server with a paused read buffer.
+        socket.resume();
+        socket.once("close", clientClosed);
+      });
+      try {
+        await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath(home), resolve));
+      } catch (error: unknown) {
+        // Some restricted test sandboxes forbid Unix-socket bind(2). Windows
+        // CI uses a named pipe here and exercises the real regression path.
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { console.log("skipping stalled completion socket check: sandbox forbids listen(2)"); return; }
+        throw error;
+      }
+      try {
+        const started = performance.now();
+        await expect(completionMeterIds(30)).resolves.toEqual([]);
+        expect(performance.now() - started).toBeLessThan(300);
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("completion left its stalled daemon socket open")), 300);
+          closed.then(() => { clearTimeout(timer); resolve(); });
+        });
+      } finally {
+        // If an assertion above failed, do not let the test fixture's open
+        // client conceal the original failure by hanging server.close().
+        client?.destroy();
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 });

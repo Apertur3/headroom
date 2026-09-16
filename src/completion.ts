@@ -264,11 +264,13 @@ export async function completionCommand(argv: string[]): Promise<number> {
 }
 
 /** Runs `work`, but resolves to `undefined` the moment `ms` elapses even if
- * `work` is still pending -- the caller (a completion helper) must return in
- * time for a shell's completion timeout regardless of how a slow daemon or a
- * locked store file behaves. */
-function withDeadline<T>(work: () => Promise<T>, ms: number): Promise<T | undefined> {
+ * `work` is still pending. The signal lets cancellable work (especially a
+ * pending Windows named-pipe connection) release its handles at that same
+ * deadline, rather than merely letting this wrapper return while Node keeps
+ * the completion process alive. */
+function withDeadline<T>(work: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T | undefined> {
   return new Promise<T | undefined>((resolve) => {
+    const controller = new AbortController();
     let settled = false;
     const finish = (value: T | undefined): void => {
       if (settled) return;
@@ -276,8 +278,8 @@ function withDeadline<T>(work: () => Promise<T>, ms: number): Promise<T | undefi
       clearTimeout(timer);
       resolve(value);
     };
-    const timer = setTimeout(() => finish(undefined), ms);
-    work().then(finish).catch(() => finish(undefined));
+    const timer = setTimeout(() => { controller.abort(); finish(undefined); }, ms);
+    work(controller.signal).then(finish).catch(() => finish(undefined));
   });
 }
 
@@ -290,11 +292,16 @@ function isRpcError(value: unknown): boolean {
 
 const COMPLETION_DEADLINE_MS = 200;
 
-async function idsFromDaemonOrElse<T>(field: "meter_id" | "principal_id", fallback: () => Promise<string[]>): Promise<string[]> {
-  const request = await daemonRequest(socketPath(), "status", {}, 150);
+async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback: () => Promise<string[]>, signal: AbortSignal): Promise<string[]> {
+  if (signal.aborted) return [];
+  const request = await daemonRequest(socketPath(), "status", {}, 150, 30_000, signal);
+  // Do not start a fallback after the completion budget has expired. On
+  // Windows this is also what turns an aborted pipe probe into a clean exit.
+  if (signal.aborted) return [];
   if (request.status === "available" && !isRpcError(request.result)) {
     return [...new Set((request.result as Record<string, unknown>[]).map((item) => String(item[field])))];
   }
+  if (signal.aborted) return [];
   return fallback();
 }
 
@@ -304,12 +311,12 @@ async function idsFromDaemonOrElse<T>(field: "meter_id" | "principal_id", fallba
  * timeout rather than ever throwing or hanging a shell's Tab key. */
 export async function completionMeterIds(deadlineMs = COMPLETION_DEADLINE_MS): Promise<string[]> {
   const ids = await withDeadline(
-    () =>
+    (signal) =>
       idsFromDaemonOrElse("meter_id", async () => {
         const store = await HeadroomStore.open();
         try { return [...new Set(store.latestPerWindow().map((item) => item.meter_id))]; }
         finally { store.close(); }
-      }),
+      }, signal),
     deadlineMs,
   );
   return ids ?? [];
@@ -321,11 +328,11 @@ export async function completionMeterIds(deadlineMs = COMPLETION_DEADLINE_MS): P
  * completionMeterIds. */
 export async function completionPrincipalIds(deadlineMs = COMPLETION_DEADLINE_MS): Promise<string[]> {
   const ids = await withDeadline(
-    () =>
+    (signal) =>
       idsFromDaemonOrElse("principal_id", async () => {
         const accounts = await readAccounts();
         return [...new Set(accounts.map((item) => item.name))];
-      }),
+      }, signal),
     deadlineMs,
   );
   return ids ?? [];
