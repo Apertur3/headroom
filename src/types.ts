@@ -103,6 +103,9 @@ export interface Observation {
     /** A new vendor window identity seen once while the prior window still
      * had time remaining. It is held pending the next ordinary poll. */
     vendor_window_held?: boolean;
+    /** Codex endpoint idle zero: reset is fetch time plus the window, so the
+     * timestamp moves each poll and is not a durable window identity. */
+    codex_idle_window?: boolean;
   };
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the

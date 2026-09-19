@@ -74,6 +74,10 @@ interface VendorWindowSuspect {
 
 type VendorWindowTransition =
   | { kind: "normal" }
+  | { kind: "idle" }
+  | { kind: "repeat" }
+  | { kind: "idle-confirmed"; suspect: VendorWindowSuspect }
+  | { kind: "activation" }
   | { kind: "rollover"; baseline: StoredObservation }
   | { kind: "suspect"; baseline: StoredObservation }
   | { kind: "accepted"; suspect: VendorWindowSuspect }
@@ -480,7 +484,7 @@ export class HeadroomStore {
     // output is redacted, so a token or cookie that leaked into a failure
     // reason or a metadata string never lands in the database either.
     const reason = resolved.reason ? redact(resolved.reason) : resolved.reason ?? null;
-    const metadata = redactDeep(transition.kind === "suspect"
+    const metadata = redactDeep(transition.kind === "suspect" || transition.kind === "repeat"
       ? { ...resolved.metadata, vendor_window_held: true }
       : transition.kind === "flip"
         ? { ...resolved.metadata, vendor_inconsistent: true }
@@ -506,13 +510,13 @@ export class HeadroomStore {
         this.addEvent("vendor_inconsistent", "vendor_reported", 1, [transition.suspect.suspect_id, stored.id], stored,
           "vendor readings flip-flopped between two windows; holding the earlier one");
       }
-    } else if (transition.kind === "accepted") {
+    } else if (transition.kind === "accepted" || transition.kind === "idle-confirmed") {
       this.clearVendorWindowSuspect(stored);
       this.clearVendorInconsistent(transition.suspect.suspect_id);
       const baseline = this.observationById(transition.suspect.baseline_id);
       const suspect = this.observationById(transition.suspect.suspect_id);
       if (baseline && suspect) this.classifyUsageDrop(baseline, suspect, suspect.fetched_at);
-    } else if (transition.kind === "rollover") {
+    } else if (transition.kind === "rollover" || transition.kind === "idle" || transition.kind === "activation") {
       this.clearVendorWindowSuspect(stored);
     }
     // This must run on the raw vendor observation before any read-side gate
@@ -523,7 +527,7 @@ export class HeadroomStore {
     // A held reading is deliberately inert: reset/free-reset inference,
     // credit movement, spend and pace must all wait until the vendor has
     // supplied the same new window on the next ordinary poll.
-    const held = transition.kind === "suspect" || transition.kind === "flip" || transition.kind === "accepted";
+    const held = transition.kind === "suspect" || transition.kind === "repeat" || transition.kind === "flip" || transition.kind === "accepted" || transition.kind === "idle-confirmed";
     const scheduledRolloverAt = transition.kind === "rollover" ? transition.baseline.resets_at ?? undefined : undefined;
     if (!held && previous) this.detectEvents(previous, stored, scheduledRolloverAt);
     else if (held && previous?.freshness === "failed" && stored.freshness === "fresh") {
@@ -736,6 +740,34 @@ export class HeadroomStore {
     return row ? observationFromRow(row) : undefined;
   }
 
+  /** Codex's live endpoint makes an idle zero-use window's reset equal its
+   * fetch time plus the window duration. It advances on every poll, so it is
+   * not a second, contradictory fixed-window identity. The adapter alone
+   * supplies this provider-specific marker; similar shapes from other sources
+   * retain the normal two-poll vendor-window guard. */
+  private isCodexIdleWindow(observation: Observation): boolean {
+    const fetchedAt = Date.parse(observation.fetched_at);
+    const resetsAt = observation.resets_at ? Date.parse(observation.resets_at) : Number.NaN;
+    const minutes = observation.window?.minutes;
+    return observation.source === "native:codex" && observation.metadata?.codex_idle_window === true
+      && observation.freshness === "fresh" && observation.quantity?.unit === "percent" && observation.quantity.used === 0
+      && typeof minutes === "number" && Number.isFinite(minutes)
+      && Number.isFinite(fetchedAt) && Number.isFinite(resetsAt)
+      && Math.abs(resetsAt - (fetchedAt + minutes * 60_000)) <= 90_000;
+  }
+
+  private isCodexIdleActivation(observation: Observation, baseline: StoredObservation | undefined): boolean {
+    if (!baseline || !this.isCodexIdleWindow(baseline) || observation.source !== "native:codex" || observation.freshness !== "fresh" || observation.quantity?.unit !== "percent" || !(observation.quantity.used > 0)) return false;
+    const minutes = observation.window?.minutes;
+    const start = observation.resets_at ? Date.parse(observation.resets_at) - (minutes ?? 0) * 60_000 : Number.NaN;
+    const before = Date.parse(baseline.fetched_at);
+    const now = Date.parse(observation.fetched_at);
+    // A real use window starts when use first appears; accept only an anchor
+    // between the prior idle poll and this one (with endpoint second rounding).
+    return typeof minutes === "number" && Number.isFinite(start) && Number.isFinite(before) && Number.isFinite(now)
+      && start >= before - 1_000 && start <= now + 1_000;
+  }
+
   /** Only fixed timestamps can be a durable vendor window identity. Rolling
    * windows conventionally move their reset timestamp forward on every poll,
    * so treating that ordinary movement as a flip would hold them forever. */
@@ -745,6 +777,43 @@ export class HeadroomStore {
     const baseline = state
       ? this.observationById(state.baseline_id) ?? this.acceptedWindowBaseline(observation)
       : this.acceptedWindowBaseline(observation);
+    if (this.isCodexIdleActivation(observation, baseline)) return { kind: "activation" };
+    if (this.isCodexIdleWindow(observation)) {
+      // The first idle reading after a real scheduled boundary is still the
+      // rollover evidence and must retain that scheduled-reset event. Later
+      // moving idle timestamps are ordinary updates, not candidates for a
+      // new vendor identity or duplicate reset event.
+      if (baseline && !this.sameReset(observation.resets_at, baseline.resets_at) && this.windowHasEnded(baseline, observation)) return { kind: "rollover", baseline };
+      // A zero use reading before a nonzero baseline's reset is still an
+      // unexpected capacity increase. Keep the normal two-poll guard for it;
+      // only an already accepted idle reading may make a moving idle reset
+      // routine before that boundary.
+      if (baseline && baseline.quantity?.used !== 0 && !this.isCodexIdleWindow(baseline)) {
+        // A second independently moving idle response confirms an unexpected
+        // reset. Its first timestamp is the reset evidence; equality would be
+        // impossible because idle timestamps intentionally drift with fetch.
+        const firstIdle = state ? this.observationById(state.suspect_id) : undefined;
+        if (state && firstIdle && this.isCodexIdleWindow(firstIdle)) {
+          // Confirmation means a later poll, never a retry of the same row or
+          // an old observation replayed out of order. Do not fall through to
+          // sameReset's generic accepted path: duplicate idle timestamps are
+          // equal precisely because they are not independent evidence.
+          const currentAt = Date.parse(observation.fetched_at);
+          const firstAt = Date.parse(firstIdle.fetched_at);
+          if (currentAt > firstAt) return { kind: "idle-confirmed", suspect: state };
+          // A duplicate has the same poll timestamp but a new append-only id;
+          // keep it as the selected held row. Older replays must not move the
+          // state backward, because the newest held row would then surface.
+          if (currentAt === firstAt) return baseline ? { kind: "suspect", baseline } : { kind: "repeat" };
+          return { kind: "repeat" };
+        }
+        // Fall through into the standard fixed-window consistency path.
+      } else {
+        // An earlier non-idle suspect must not survive an idle window; its
+        // moving timestamp cannot confirm either identity on a later poll.
+        return { kind: "idle" };
+      }
+    }
     // A fixed window gets a new identity at its scheduled boundary. Permit a
     // small early clock skew so its first new-period poll stays immediately
     // usable rather than looking like issue #29's pre-boundary flip-flop.
