@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Export a standalone browser report with `headroom dashboard --html <path>`, including meter and window selection, recorded capacity charts, sample details, and light/dark themes.
+
+### Changed
+- Show compact per-meter dashboard rows with usage bars, reset countdowns, and an optional detailed view.
+- Plot remaining capacity from recorded readings in terminal and browser views; break charts across resets, missing readings, and untrusted vendor responses.
+
+### Fixed
+- Match quota windows by their fields, so reordered vendor JSON cannot select an older baseline and overcount attributed spend. Existing observations are supported; previously recorded ledger totals are not rewritten.
+- Cancel unfinished daemon requests at the shell-completion deadline, and avoid creating database state when completing an empty installation.
+
 ## [0.1.3] - 2026-09-12
 
 ### Fixed

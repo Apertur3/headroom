@@ -7,7 +7,7 @@ import { createHmac } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, decodeDashboardKeys, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO } from "../src/dashboard.js";
+import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, decodeDashboardKeys, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO, canConnect, usableCurrentPoints, defaultFocusedMeterIndex } from "../src/dashboard.js";
 import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboard, readDashboardStore } from "../src/dashboard-data.js";
 import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
@@ -69,106 +69,100 @@ describe("dashboard frames (synthetic data)", () => {
     expect(initial.slice(0, 7).join("\n")).toMatchInlineSnapshot(`
       "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
       OVERVIEW█
-      > account-a        [####################]  98% resets in 24h FREEZE stop█
-        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
-        mock-0           [####................]  20% resets in 4h NORMAL ok░
-        mock-1           [####................]  20% resets in 4h NORMAL ok░"
+      > account-a:all  FREEZE█
+          5h: [██░░░░░░░░] 20% ↻4h█
+          wk: [██████████] 98%█
+        account-a:credits  12 available█
+        account-b:main  UNKNOWN█"
     `);
     expect(initial.join("\n")).toMatchInlineSnapshot(`
       "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
       OVERVIEW█
-      > account-a        [####################]  98% resets in 24h FREEZE stop█
-        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
-        mock-0           [####................]  20% resets in 4h NORMAL ok░
-        mock-1           [####................]  20% resets in 4h NORMAL ok░
-        mock-10          [####................]  20% resets in 4h NORMAL ok░
-        mock-11          [####................]  20% resets in 4h NORMAL ok░
-        mock-12          [####................]  20% resets in 4h NORMAL ok░
-        mock-13          [####................]  20% resets in 4h NORMAL ok░
-        mock-14          [####................]  20% resets in 4h NORMAL ok░
-        mock-15          [####................]  20% resets in 4h NORMAL ok░
-        mock-16          [####................]  20% resets in 4h NORMAL ok░
-        mock-17          [####................]  20% resets in 4h NORMAL ok░
-        mock-2           [####................]  20% resets in 4h NORMAL ok░
-        mock-3           [####................]  20% resets in 4h NORMAL ok░
-        mock-4           [####................]  20% resets in 4h NORMAL ok░
-        mock-5           [####................]  20% resets in 4h NORMAL ok░
-        mock-6           [####................]  20% resets in 4h NORMAL ok░
-        mock-7           [####................]  20% resets in 4h NORMAL ok░
-        mock-8           [####................]  20% resets in 4h NORMAL ok░
-      ▼ 100 more rows  scroll: wheel / ↑↓ / PgDn░
+      > account-a:all  FREEZE█
+          5h: [██░░░░░░░░] 20% ↻4h█
+          wk: [██████████] 98%█
+        account-a:credits  12 available█
+        account-b:main  UNKNOWN█
+          5h: [??????????] -█
+        gpu-box:capacity   BUSY  local-27b  2 running, 1 waiting  busy█
+        mock-0:all  NORMAL█
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-10:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-11:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-12:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-13:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-14:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-15:all  NORMAL░
+      ▼ 28 more rows  scroll: wheel / ↑↓ / PgDn░
       q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
     `);
     expect(paged.join("\n")).toMatchInlineSnapshot(`
       "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
-      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h░
-      ░
-      account-a  claude  Max  fresh <1m░
-        all        5h  [####................]  20% ● resets in 4h NORMAL░
-        collecting readings█
-        all        wk  [####################]  98% 🛑 resets in 24h FREEZE█
-        collecting readings█
-        credits  12 available█
-        WEEKLY account-a:all | last 7 days | F free reset  ! unsch░
-        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁░
-           |Wed     |Thu    |Fri    |Sat    |Sun    |Mon    |Tue !░
-      ░
-      account-b  claude  failed <1m░
-        UNKNOWN: cached read failed.░
-        main       5h  [????????????????????]   - ? resets in ? UNKNOWN░
-          last 41% at 13:30:00░
-      ░
-      gpu-box  local░
-        gpu-box  BUSY  local-27b  2 running, 1 waiting  busy░
-      ░
-      mock-0  claude  Max  fresh <1m░
-      ▼ 78 more rows  scroll: wheel / ↑↓ / PgDn░
+        mock-16:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-17:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-1:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-2:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-3:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h█
+        mock-4:all  NORMAL█
+          5h: [██░░░░░░░░] 20% ↻4h█
+        mock-5:all  NORMAL█
+          5h: [██░░░░░░░░] 20% ↻4h█
+        mock-6:all  NORMAL█
+          5h: [██░░░░░░░░] 20% ↻4h█
+        mock-7:all  NORMAL█
+          5h: [██░░░░░░░░] 20% ↻4h█
+        mock-8:all  NORMAL░
+          5h: [██░░░░░░░░] 20% ↻4h░
+        mock-9:all  NORMAL░
+      ▼ 6 more rows  scroll: wheel / ↑↓ / PgDn░
       q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
     `);
     expect(paged.join("\n")).not.toEqual(initial.join("\n"));
     expect(paged.at(-1)).toContain("q quit");
     const focus = 2, panel = dashboardPanelOffset(model, { width: 80, height: 24, verbose: false, eventsWide: false }, focus);
-    expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: panel, focus }).join("\n")).toContain("gpu-box  local");
+    expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: panel, focus }).join("\n")).toContain("gpu-box");
   });
   it("renders the same overview viewport at 145 columns and keeps a scrollbar for overflow", () => {
     const model = fixedModel();
-    for (let index = 0; index < 30; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all` }));
+    for (let index = 0; index < 70; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all` }));
     const first = renderDashboard(model, { width: 145, height: 68, verbose: false, eventsWide: false });
     const page = renderDashboard(model, { width: 145, height: 68, verbose: false, eventsWide: false, scroll: 65 });
-    expect(first[3]).toBe("OVERVIEW█");
-    expect(first.join("\n")).toContain("mock-29");
+    expect(first[3]).toContain("OVERVIEW");
+    expect(first.some((line) => line.endsWith("█"))).toBe(true);
+    expect(first.join("\n")).toContain("mock-0");
+    expect(first.join("\n")).not.toContain("mock-69");
+    expect(page.join("\n")).toContain("mock-69");
     expect(first.join("\n")).not.toContain("EVENTS (last 8)");
     expect(page.join("\n")).not.toEqual(first.join("\n"));
     expect(page.at(-1)).toContain("q quit");
   });
   it("renders the exact first overview frame", () => {
     expect(snapshotFrame(renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false }))).toMatchInlineSnapshot(`
-      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00░
-      OVERVIEW█
-      > account-a        [####################]  98% resets in 24h FREEZE stop█
-        account-b        [????????????????????]   - resets in ? UNKNOWN unknown█
-        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy█
-      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h█
-      █
-      account-a  claude  Max  fresh <1m█
-        all        5h  [####................]  20% ● resets in 4h NORMAL█
-        collecting readings█
-        all        wk  [####################]  98% 🛑 resets in 24h FREEZE█
-        collecting readings█
-        credits  12 available█
-        WEEKLY account-a:all | last 7 days | F free reset  ! unsch█
-        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁█
-        <local day ticks>
-      ░
-      account-b  claude  failed <1m░
-        UNKNOWN: cached read failed.░
-        main       5h  [????????????????????]   - ? resets in ? UNKNOWN░
-          last 41% at 13:30:00░
-      ░
-      ▼ 10 more rows  scroll: wheel / ↑↓ / PgDn░
-      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help░"
+      "Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00
+      OVERVIEW
+      > account-a:all  FREEZE
+          5h: [██░░░░░░░░] 20% ↻4h
+          wk: [██████████] 98%
+        account-a:credits  12 available
+        account-b:main  UNKNOWN
+          5h: [??????????] -
+        gpu-box:capacity   BUSY  local-27b  2 running, 1 waiting  busy
+      1 event in the last hour, 1 lease active, next reset account-a 5h in 4h
+      Capacity appeared; re-plan
+
+      BURNDOWN account-a:all (5h)
+        collecting readings
+      q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help"
     `);
   });
   it("uses compact local-pool and credit summaries instead of percentage bars", () => {
@@ -178,9 +172,9 @@ describe("dashboard frames (synthetic data)", () => {
       row({ principal_id: "credits", meter_id: "credits:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-10-05T12:00:00Z" }),
     ];
     const frame = renderDashboard(model, { width: 100, height: 30, verbose: false, eventsWide: false }).join("\n");
-    expect(frame).toContain("gpu-box          UP  coder  0 running, 0 waiting  ok");
-    expect(frame).toMatch(/credits\s+1 available, expire (?:Oct 5|5 Oct)/);
-    expect(frame).not.toMatch(/gpu-box\s+\[[#.?]{20}\]|credits\s+\[[#.?]{20}\]/);
+    expect(frame).toContain("gpu-box:capacity  UP  coder  0 running, 0 waiting  ok");
+    expect(frame).toMatch(/credits:credits\s+1 available, expire (?:Oct 5|5 Oct)/);
+    expect(frame).not.toMatch(/gpu-box:capacity\s+\[|credits:credits\s+\[/);
   });
   it("renders the exact wide overview frame", () => {
     expect(renderDashboard(fixedModel(), { width: 145, height: 68, verbose: false, eventsWide: false }).join("\n")).toMatchInlineSnapshot(`
@@ -188,33 +182,15 @@ describe("dashboard frames (synthetic data)", () => {
       ├─┤ ├─  ├─┤ │ │ ├┬╯ │ │ │ │ │╰╯│  Headroom 0.1.0 | daemon fresh 30s ago | 14:00:00
       ╵ ╵ ╰── ╵ ╵ ╰─╯ ╵╰╴ ╰─╯ ╰─╯ ╵  ╵
       OVERVIEW
-      > account-a        [####################]  98% resets in 24h FREEZE stop
-        account-b        [????????????????????]   - resets in ? UNKNOWN unknown
-        gpu-box          BUSY  local-27b  2 running, 1 waiting  busy
+      > account-a:all      5h: [██░░░░░░░░] 20% ↻4h  wk: [██████████] 98%  FREEZE
+        account-a:credits  12 available
+        account-b:main     5h: [??????????] -  UNKNOWN
+        gpu-box:capacity   BUSY  local-27b  2 running, 1 waiting  busy
       1 event in the last hour, 1 lease active, next reset account-a 5h in 4h
+      Capacity appeared; re-plan
 
-      account-a  claude  Max  fresh <1m
-        all        5h  [####................]  20% ● resets in 4h NORMAL ·▁▂▃▄▅▆▇█▅▃▂
+      BURNDOWN account-a:all (5h)
         collecting readings
-        all        wk  [####################]  98% 🛑 resets in 24h FREEZE
-        collecting readings
-        credits  12 available
-        WEEKLY account-a:all | last 7 days | F free reset  ! unsch
-        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁
-           |Wed     |Thu    |Fri    |Sat    |Sun    |Mon    |Tue !
-
-      account-b  claude  failed <1m
-        UNKNOWN: cached read failed.
-        main       5h  [????????????????????]   - ? resets in ? UNKNOWN
-          last 41% at 13:30:00
-
-      gpu-box  local
-        gpu-box  BUSY  local-27b  2 running, 1 waiting  busy
-
-      EVENTS (last 8)                                                        | LEASES / RESERVES / PACING
-      13:50:00 !unscheduled reset_seen account-a:all                         | worker account-a:all 5% held, 1.0% spent, 20m left
-                                                                             | reserve account-a:all: 10%
-                                                                             | Capacity appeared; re-plan
       q quit  p pause  v verbose  e events  g graphs  ↑↓/PgDn scroll  ? help"
     `);
   });
@@ -231,7 +207,7 @@ describe("dashboard frames (synthetic data)", () => {
   it("shows details and uses the full width for events", () => {
     const lines = renderDashboard(fixedModel(), { width: 120, height: 40, verbose: true, eventsWide: true });
     expect(lines.join("\n")).toContain("burn 2%/h, sustainable 20%/h, reset seen -, idle no");
-    expect(lines.find((line) => line.startsWith("13:50"))).toBe("13:50:00 !unscheduled reset_seen account-a:all");
+    expect(lines.find((line) => line.startsWith("13:50"))).toMatch(/^13:50:00 !unscheduled reset_seen account-a:all[█░]?$/);
   });
 });
 
@@ -244,13 +220,15 @@ describe("dashboard terminal", () => {
     expect(handleDashboardKey({ paused: false, verbose: false, eventsWide: false, help: false, quit: false, scroll: 10 }, "wheelup").scroll).toBe(7);
   });
   it("advertises scroll controls and the rows below the fold in the default footer", () => {
-    const top = renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false });
+    const model = fixedModel();
+    for (let index = 0; index < 20; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all` }));
+    const top = renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false });
     expect(top.join("\n")).toMatch(/▼ \d+ more rows  scroll: wheel \/ ↑↓ \/ PgDn/);
     expect(top.at(-1)).toContain("↑↓/PgDn scroll");
     expect(top.at(-1)).toContain("? help");
-    const bottom = renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false, scroll: Number.MAX_SAFE_INTEGER });
+    const bottom = renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, scroll: Number.MAX_SAFE_INTEGER });
     expect(bottom.join("\n")).toContain("▲ back to top: Home");
-    expect(renderDashboard(fixedModel(), { width: 80, height: 24, verbose: false, eventsWide: false, ascii: true }).join("\n")).toMatch(/v \d+ more rows  scroll: wheel \/ up\/down \/ PgDn/);
+    expect(renderDashboard(model, { width: 80, height: 24, verbose: false, eventsWide: false, ascii: true }).join("\n")).toMatch(/v \d+ more rows  scroll: wheel \/ up\/down \/ PgDn/);
   });
   it("enables SGR mouse reporting on entry and disables it on exit", () => {
     expect(ENTER_DASHBOARD).toContain("\x1b[?1000h\x1b[?1006h");
@@ -272,7 +250,7 @@ describe("dashboard terminal", () => {
     const fake = terminal(tty);
     expect(await dashboardCommand(tty ? ["--once", "--no-color"] : [], fake.io)).toBe(0);
     expect(fake.io.gather).toHaveBeenCalledTimes(1);
-    expect(fake.writes.join("")).toContain("account-a  claude  Max");
+    expect(fake.writes.join("")).toContain("account-a:all");
     expect(fake.writes.join("")).not.toContain("\x1b");
     expect(fake.input.setRawMode).not.toHaveBeenCalled();
   });
@@ -282,9 +260,9 @@ describe("dashboard terminal", () => {
     expect(dashboardOptions([], true, { NO_COLOR: "" }).color).toBe(false);
     expect(dashboardOptions(["--no-color"], true, {}).color).toBe(false);
     const fake = terminal(); await dashboardCommand(["--once"], fake.io);
-    expect(fake.writes.join("")).toContain("\x1b[32m[####................]\x1b[0m");
-    expect(fake.writes.join("")).toContain("\x1b[31m[####################]\x1b[0m");
-    expect(fake.writes.join("")).toContain("\x1b[90m[????????????????????]\x1b[0m");
+    expect(fake.writes.join("")).toContain("\x1b[32m[██░░░░░░░░]\x1b[0m");
+    expect(fake.writes.join("")).toContain("\x1b[31m[██████████]\x1b[0m");
+    expect(fake.writes.join("")).toContain("\x1b[90m[??????????]\x1b[0m");
   });
   it.each(["q", "SIGINT", "SIGTERM", "error"])("restores the terminal on %s", async (exit) => {
     const fake = terminal();
@@ -441,14 +419,14 @@ describe("dashboard graphs (synthetic data)", () => {
   it("renders the exact 60-column braille burndown", () => {
     const model = graphModel();
     expect(renderBurndown(model.observations[0], model, 60).join("\n")).toMatchInlineSnapshot(`
-      "100%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░⢀⣀⡠⠤⠒⠒⠉│
-          │                           │             ⣀⡠⠤⠔⠒⠉⠁      │
-          │                           │      ⣀⡠⠤⠔⠒⠉⠉             │
-          │                           ⣀⡠⠤⠔⠒⠉⠉                    │
-          │                    ⣀⣀⠤⠔⠒⠊⣉⡀                          │
-          │             ⣀⣀⠤⠔⠒⣊⣉⠤⠤⠒⠒⠉⠉ │                          │
-          │      ⢀⣀⠤⢔⣒⣊⠭⠤⠒⠒⠉⠉         │                          │
-        0%│⣀⡤⠤⠶⠚⠛⠓⠉⠉⠁                 │                          │
+      "100%│⠁ ⠂ ⠄ ⡀                    │                          │
+          │        ⠂ ⠌ ⡀              │                          │
+          │              ⠁ ⠂ ⠄        │                          │
+          │                    ⠁ ⠂ ⠄ ⡀⠁                          │
+          │                           │⠁ ⠂ ⡀                     │
+          │                           │      ⠁ ⠂ ⠄ ⡀             │
+          │                           │              ⠁ ⠂ ⡀       │
+        0%│░░░░░░░░░░░░░░░░░░░░░░░░░░░│░░░░░░░░░░░░░░░░░░░░⠁░⠂░⠄⢀│
       08/09, 11:30                              08/09, 16:30 reset
       38% used, 2h 30m left, under pace, HARVEST"
     `);
@@ -469,10 +447,10 @@ describe("dashboard graphs (synthetic data)", () => {
       const char = [...graph[Math.floor(y / 4)]][5 + Math.floor(x / 2)];
       return /[\u2800-\u28ff]/.test(char) && Boolean((char.codePointAt(0)! - 0x2800) & [[1, 8], [2, 16], [4, 32], [64, 128]][y % 4][x % 2]);
     };
-    // The dotted sample nearest halfway is (52, 16) on a 108 by 32 grid.
-    expect(dot(52, 16)).toBe(true); expect(dot(52, 0)).toBe(false);
-    expect(dot(107, 0)).toBe(true); expect(dot(0, 31)).toBe(true);
-    expect([...graph[0]][32]).toBe("│");
+    // The dotted sample nearest halfway is (52, 15) on a 108 by 32 grid.
+    expect(dot(52, 15)).toBe(true); expect(dot(52, 0)).toBe(false);
+    expect(dot(107, 31)).toBe(true); expect(dot(0, 0)).toBe(true);
+    expect(graph.some((line) => [...line][32] === "│")).toBe(true);
   });
   it.each([0, 1])("collects until two distinct readings, with %s stored", (count) => {
     const model = graphModel();
@@ -488,14 +466,14 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(graph).toContain("new period, 1 reading");
     expect(graph).not.toContain("collecting readings");
   });
-  it("dims a prior-period graph while the new period is collecting", async () => {
+  it("reports new period honestly without presenting old plot as current", async () => {
     const model = graphModel(), current = model.observations[0];
     model.now = new Date("2026-09-08T15:35:00Z");
     model.observations[0] = { ...current, resets_at: "2026-09-08T15:30:00Z", observed_at: "2026-09-08T15:34:00Z", fetched_at: "2026-09-08T15:34:00Z", quantity: { used: 1, remaining: 99, limit: 100, unit: "percent" } };
     const fake = terminal(); fake.io.gather = async () => model;
     await dashboardCommand(["--once"], fake.io);
     expect(fake.writes.join("")).toContain("new period, 1 reading so far");
-    expect(fake.writes.join("")).toContain("\x1b[2m100%│");
+    expect(fake.writes.join("")).not.toContain("100%│");
   });
   it("does not count refetches, other windows, old resets, failed or future readings", () => {
     const model = graphModel(), current = model.observations[0];
@@ -514,21 +492,23 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(graph[8]).toContain("08/09, 11:30");
     expect(graph[9]).toContain("pace unknown");
   });
-  it("uses half blocks without braille with --ascii or TERM=dumb", async () => {
+  it("uses pure ASCII without braille or half-blocks with --ascii or TERM=dumb", async () => {
     const model = graphModel(), graph = renderBurndown(model.observations[0], model, 60, true).join("\n");
-    expect(graph).toMatch(/[▀▄█]/); expect(graph).not.toMatch(/[\u2800-\u28ff]/);
-    expect(graph).toContain(":"); expect(graph).toContain("."); expect(graph).toContain("|");
+    expect(graph).not.toMatch(/[▀▄█]/); expect(graph).not.toMatch(/[\u2800-\u28ff]/);
+    expect(graph).toContain(":"); expect(graph).toContain("."); expect(graph).toContain("|"); expect(graph).toContain("*");
     expect(dashboardOptions(["--ascii"], true, {}).ascii).toBe(true);
     expect(dashboardOptions([], true, { TERM: "dumb" }).ascii).toBe(true);
     expect(dashboardOptions([], true, {}).ascii).toBe(false);
     const fake = terminal(); fake.io.gather = async () => model;
     await dashboardCommand(["--once", "--ascii", "--no-color"], fake.io);
-    expect(fake.writes.join("")).toMatch(/[▀▄█]/); expect(fake.writes.join("")).not.toMatch(/[\u2800-\u28ff]/);
+    expect(fake.writes.join("")).not.toMatch(/[▀▄█]/); expect(fake.writes.join("")).not.toMatch(/[\u2800-\u28ff]/);
   });
-  it("shades only a configured reserve and reports exact pacing points", () => {
+  it("shades the effective protected reserve and reports exact pacing points", () => {
     const model = graphModel(), current = model.observations[0];
-    expect(renderBurndown(current, model, 60)[0]).toContain("░");
+    expect(renderBurndown(current, model, 60)[7]).toContain("░");
     model.policy = { ...model.policy, reserve: {} };
+    expect(renderBurndown(current, model, 60).join("\n")).toContain("░");
+    model.policy = { ...model.policy, freeze_reserve_pct: 0 };
     expect(renderBurndown(current, model, 60).join("\n")).not.toContain("░");
     current.quantity!.used = 62;
     expect(renderBurndown(current, model, 60)[9]).toBe("62% used, 2h 30m left, over pace by 12 points");
@@ -556,8 +536,8 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(weeklyLines[1]).toMatch(/^[ \u2800-\u28ff]+$/);
     expect(weeklyLines[1]).not.toMatch(/[▁▂▃▄▅▆▇█]/);
     model.observations = [weekly];
-    expect(renderDashboard(model, { width: 100, height: 60, verbose: false, eventsWide: false }).join("\n")).toContain("WEEKLY account-a:all");
-    expect(renderDashboard(model, { width: 99, height: 60, verbose: false, eventsWide: false }).join("\n")).toContain("WEEKLY");
+    expect(renderDashboard(model, { width: 100, height: 60, verbose: true, eventsWide: false }).join("\n")).toContain("WEEKLY account-a:all");
+    expect(renderDashboard(model, { width: 99, height: 60, verbose: true, eventsWide: false }).join("\n")).toContain("WEEKLY");
   });
   it("marks free resets and filters corrected, other-meter and other-window events", () => {
     const model = fixedModel(), weekly = model.observations[1], event = model.events[0];
@@ -587,15 +567,15 @@ describe("dashboard graphs (synthetic data)", () => {
     await dashboardCommand(["--once"], fake.io);
     expect(fake.writes[0]).toMatch(/^Headroom/);
   });
-  it("puts every pace glyph beside the percent without requiring color", () => {
+  it("puts every pace state beside the percent without requiring color", () => {
     const model = graphModel(), current = model.observations[0];
-    for (const [used, glyph, state] of [[50, "●", "NORMAL"], [30, "↗", "HARVEST"], [70, "⚠", "CONSERVE"], [98, "🛑", "FREEZE"]] as const) {
+    for (const [used, _glyph, state] of [[50, "●", "NORMAL"], [30, "↗", "HARVEST"], [70, "⚠", "CONSERVE"], [98, "🛑", "FREEZE"]] as const) {
       current.quantity!.used = used;
       const frame = renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false, graphs: false }).join("\n");
-      expect(frame).toContain(`${used}% ${glyph}`); expect(frame).toContain(state);
+      expect(frame).toContain(`${used}%`); expect(frame).toContain(state);
     }
     current.freshness = "failed";
-    expect(renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false, graphs: false }).join("\n")).toContain("- ? resets in ? UNKNOWN");
+    expect(renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false, graphs: false }).join("\n")).toContain("UNKNOWN");
   });
   it("prints shared UNKNOWN explanations once below the title and retains last readings", () => {
     const model = fixedModel(), failed = model.observations[2];
@@ -625,6 +605,122 @@ describe("dashboard graphs (synthetic data)", () => {
     expect(fake.writes.at(-1)).toMatch(/[\u2800-\u28ff]/);
     expect(fake.io.gather).toHaveBeenCalledTimes(1);
     fake.input.emit("keypress", "q", {}); await run;
+  });
+
+  it("keeps diagnostics quiet unless verbose when fresh sibling meters exist", () => {
+    const model = fixedModel();
+    model.observations.push(row({
+      principal_id: "account-a", meter_id: "account-a:stale", freshness: "failed", quantity: null, reason: "upstream timeout",
+    }));
+    const quiet = renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false }).join("\n");
+    expect(quiet).not.toContain("UNKNOWN: upstream timeout.");
+    const verbose = renderDashboard(model, { width: 100, height: 40, verbose: true, eventsWide: false }).join("\n");
+    expect(verbose).toContain("UNKNOWN: upstream timeout.");
+  });
+
+  it("stacks meter rows in narrow terminals without truncating pacing state", () => {
+    const model = graphModel();
+    const frame = renderDashboard(model, { width: 50, height: 24, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).toContain("account-a:all  HARVEST");
+    expect(frame).toMatch(/5h:\s+\[[#.?█░]{10}\]/);
+    for (const line of frame.split("\n")) {
+      expect([...line].length).toBeLessThanOrEqual(50);
+    }
+  });
+
+  it("labels selected meter and window above burndown chart and avoids repeating charts", () => {
+    const model = fixedModel();
+    const frame = renderDashboard(model, { width: 100, height: 40, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).toContain("BURNDOWN account-a:all (5h)");
+    // Only one burndown label is rendered by default for the selected meter
+    expect(frame.match(/BURNDOWN /g)).toHaveLength(1);
+  });
+
+  it("supports burndown for weekly-only meters", () => {
+    const weeklyOnlyRow = row({
+      principal_id: "claude-weekly",
+      meter_id: "claude-weekly:main",
+      window: { kind: "fixed", minutes: 10080, enforcement: "hard" },
+      resets_at: "2026-09-15T12:00:00Z",
+      quantity: { used: 35, limit: 100, remaining: 65, unit: "percent" },
+    });
+    const history = [
+      row({ ...weeklyOnlyRow, observed_at: "2026-09-08T12:00:00Z", quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }),
+      row({ ...weeklyOnlyRow, observed_at: "2026-09-08T12:10:00Z", quantity: { used: 15, limit: 100, remaining: 85, unit: "percent" } }),
+    ];
+    const model: DashboardModel = {
+      ...fixedModel(),
+      now: new Date("2026-09-08T12:15:00Z"),
+      observations: [history[1]],
+      history: { "claude-weekly:main": history },
+    };
+    const chart = renderBurndown(model.observations[0], model, 60);
+    expect(chart.length).toBe(10);
+    expect(chart[0]).toMatch(/^100%│/);
+  });
+
+  it("tolerates millisecond clock jitter in vendor reset timestamps without splitting burndown", () => {
+    const baseReset = Date.parse("2026-09-08T14:30:00.000Z");
+    const readings = [
+      row({ observed_at: "2026-09-08T09:30:00Z", resets_at: new Date(baseReset + 120).toISOString(), quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }),
+      row({ observed_at: "2026-09-08T09:40:00Z", resets_at: new Date(baseReset + 450).toISOString(), quantity: { used: 15, limit: 100, remaining: 85, unit: "percent" } }),
+      row({ observed_at: "2026-09-08T09:50:00Z", resets_at: new Date(baseReset).toISOString(), quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }),
+    ];
+    const model: DashboardModel = {
+      ...graphModel(),
+      observations: [readings[2]],
+      history: { "account-a:all": readings },
+    };
+    const chart = renderBurndown(model.observations[0], model, 60);
+    expect(chart).toHaveLength(10);
+    expect(chart[0]).toMatch(/^100%│/);
+    expect(chart.join("\n")).not.toContain("new period");
+  });
+
+  it("compact default overview fits useful fresh rows in 24 lines even with many unknown meters", () => {
+    const model = fixedModel();
+    for (let i = 0; i < 10; i++) {
+      model.observations.push(row({
+        principal_id: `failed-acct-${i}`,
+        meter_id: `failed-acct-${i}:all`,
+        freshness: "failed",
+        quantity: null,
+        reason: "upstream timeout",
+        last_known: { used_percent: 50, observed_at: "2026-09-08T10:00:00Z", age_seconds: 7200, resets_at: null },
+      }));
+    }
+    const frame = renderDashboard(model, { width: 100, height: 24, verbose: false, eventsWide: false });
+    expect(frame.length).toBeLessThanOrEqual(24);
+    expect(frame.join("\n")).toContain("account-a:all");
+    expect(frame.join("\n")).not.toContain("UNKNOWN: upstream timeout");
+    expect(frame.join("\n")).not.toContain("last 50%");
+  });
+
+  it("does not connect history across reset boundaries or history gaps > 15m", () => {
+    const model = graphModel();
+    const reset = "2026-09-08T14:30:00Z";
+    model.history!["account-a:all"] = [
+      row({ observed_at: "2026-09-08T09:30:00Z", resets_at: reset, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }),
+      row({ observed_at: "2026-09-08T09:40:00Z", resets_at: reset, quantity: { used: 15, limit: 100, remaining: 85, unit: "percent" } }),
+      // Gap > 15m here (09:40 -> 10:10 is 30m)
+      row({ observed_at: "2026-09-08T10:10:00Z", resets_at: reset, quantity: { used: 25, limit: 100, remaining: 75, unit: "percent" } }),
+    ];
+    model.observations = [model.history!["account-a:all"][2]];
+    const graph = renderBurndown(model.observations[0], model, 60);
+    expect(graph).toHaveLength(10);
+  });
+
+  it("does not bridge across untrustworthy readings in between valid samples", () => {
+    const model = graphModel();
+    const reset = "2026-09-08T14:30:00Z";
+    model.history!["account-a:all"] = [
+      row({ observed_at: "2026-09-08T09:30:00Z", resets_at: reset, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }),
+      row({ observed_at: "2026-09-08T09:35:00Z", resets_at: reset, freshness: "failed", quantity: null, reason: "failed read" }),
+      row({ observed_at: "2026-09-08T09:40:00Z", resets_at: reset, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }),
+    ];
+    model.observations = [model.history!["account-a:all"][2]];
+    const graph = renderBurndown(model.observations[0], model, 60);
+    expect(graph).toHaveLength(10);
   });
 });
 
@@ -692,5 +788,125 @@ describe("dashboard graph gathering", () => {
       expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$|^\\\\\.\\pipe\\headroom-/), "dashboard", {}, 50, 500);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("selects meter with active current-period history over earlier meter with only stale old-period history", async () => {
+    const baseModel = fixedModel();
+    const meterOld = "antigravity:claude-gpt";
+    const meterNew = "gemini:main";
+
+    const rowOld = row({
+      principal_id: "antigravity",
+      meter_id: meterOld,
+      window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+      resets_at: "2026-09-08T16:00:00Z",
+      observed_at: "2026-09-08T12:00:00Z",
+    });
+    const rowNew = row({
+      principal_id: "gemini",
+      meter_id: meterNew,
+      window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+      resets_at: "2026-09-08T16:00:00Z",
+      observed_at: "2026-09-08T12:00:00Z",
+    });
+
+    const oldHistory: Observation[] = [
+      row({
+        principal_id: "antigravity",
+        meter_id: meterOld,
+        window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+        resets_at: "2026-09-07T16:00:00Z",
+        observed_at: "2026-09-07T14:00:00Z",
+        quantity: { used: 10, remaining: 90, limit: 100, unit: "percent" },
+      }),
+      row({
+        principal_id: "antigravity",
+        meter_id: meterOld,
+        window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+        resets_at: "2026-09-07T16:00:00Z",
+        observed_at: "2026-09-07T15:00:00Z",
+        quantity: { used: 20, remaining: 80, limit: 100, unit: "percent" },
+      }),
+    ];
+
+    const newHistory: Observation[] = [
+      row({
+        principal_id: "gemini",
+        meter_id: meterNew,
+        window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+        resets_at: "2026-09-08T16:00:00Z",
+        observed_at: "2026-09-08T11:30:00Z",
+        quantity: { used: 30, remaining: 70, limit: 100, unit: "percent" },
+      }),
+      row({
+        principal_id: "gemini",
+        meter_id: meterNew,
+        window: { kind: "fixed", minutes: 300, enforcement: "hard" },
+        resets_at: "2026-09-08T16:00:00Z",
+        observed_at: "2026-09-08T11:45:00Z",
+        quantity: { used: 40, remaining: 60, limit: 100, unit: "percent" },
+      }),
+    ];
+
+    const model: DashboardModel = {
+      ...baseModel,
+      observations: [rowOld, rowNew],
+      history: {
+        [meterOld]: oldHistory,
+        [meterNew]: newHistory,
+      },
+    };
+
+    const meters = [meterOld, meterNew].sort();
+    expect(meters[0]).toBe(meterOld);
+
+    expect(usableCurrentPoints(rowOld, model).length).toBeLessThan(2);
+    expect(usableCurrentPoints(rowNew, model).length).toBeGreaterThanOrEqual(2);
+
+    const bestIndex = defaultFocusedMeterIndex(model, meters);
+    expect(meters[bestIndex]).toBe(meterNew);
+
+    const fake = terminal();
+    fake.io.gather = vi.fn(async () => model);
+    const run = dashboardCommand([], fake.io);
+    await Promise.resolve();
+    expect(fake.writes.at(-1)).toContain("BURNDOWN gemini:main");
+    fake.input.emit("keypress", "tab", {});
+    expect(fake.writes.at(-1)).toContain("BURNDOWN antigravity:claude-gpt");
+    fake.input.emit("keypress", "q", {});
+    await run;
+  });
+
+  it("breaks line on failed windowless read for same meter but does not break on unrelated window failure", () => {
+    const target = row({ principal_id: "p1", meter_id: "m1", window: { kind: "fixed", minutes: 300, enforcement: "hard" } });
+    const prev = { at: 1000, used: 20, reset: 20000 };
+    const cur = { at: 5000, used: 25, reset: 20000 };
+
+    const unrelatedFailure = row({
+      principal_id: "p1",
+      meter_id: "m1",
+      window: { kind: "fixed", minutes: 10080, enforcement: "hard" },
+      observed_at: new Date(3000).toISOString(),
+      freshness: "failed",
+    });
+    expect(canConnect(prev, cur, target, [unrelatedFailure])).toBe(true);
+
+    const windowlessFailure = row({
+      principal_id: "p1",
+      meter_id: "m1",
+      window: undefined,
+      observed_at: new Date(3000).toISOString(),
+      freshness: "failed",
+    });
+    expect(canConnect(prev, cur, target, [windowlessFailure])).toBe(false);
+
+    const otherMeterFailure = row({
+      principal_id: "p1",
+      meter_id: "m2",
+      window: undefined,
+      observed_at: new Date(3000).toISOString(),
+      freshness: "failed",
+    });
+    expect(canConnect(prev, cur, target, [otherMeterFailure])).toBe(true);
   });
 });

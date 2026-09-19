@@ -14,7 +14,7 @@ apps or single-account CLIs. Headroom owns the second and third and keeps the fi
 - Not a menu-bar meter (CodexBar owns that; Headroom builds on it and aims for its ecosystem list).
 - Not a proxy or load balancer. Headroom never sits in the request path.
 - Not a capability router. Which model is good at what is the user's opinion in `routing.toml`.
-- No UI, no TCP listener, no telemetry in v1.
+- No hosted dashboard, TCP listener, or telemetry. Human views use cached local readings.
 
 ## Concepts
 
@@ -87,6 +87,14 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - No TCP listener in v1. Removed until a real need exists.
 
 ## Surfaces
+
+- `headroom dashboard` (alias `top`): cached terminal overview with per-meter usage bars,
+  reset countdowns, selected-meter remaining-capacity charts, and optional diagnostics.
+- `headroom dashboard --html <path>`: standalone local browser snapshot with subscription
+  overview, meter/window selection and recorded-history charts. No external requests.
+  Existing output is preserved unless `--force` is explicit.
+- Both chart views use recorded observations only. Reset periods tolerate up to 60 seconds
+  of vendor timestamp jitter; resets, usage drops, gaps and untrusted readings break lines.
 
 - `headroom` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`

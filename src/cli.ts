@@ -844,7 +844,7 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
 }
 
 /** Usage for the default command, shared by `--help` and the argument check. */
-export const STATUS_HELP = "Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models] [--human|--plain|--agent] [--verbose] [--color|--no-color]";
+export const STATUS_HELP = "Usage: headroom [--json] [--principal X] [--threshold N] [--refresh] [--ttl 0] [--models] [--human|--plain|--agent] [--verbose] [--color|--no-color] [--ascii]";
 
 export async function observe(argv: string[]): Promise<number> {
   const valueless = new Set(["--json", "--refresh", "--models", ...STATUS_VIEW_FLAGS]);
@@ -1277,7 +1277,7 @@ export async function keychain(argv: string[]): Promise<number> {
 /** One line per top-level command for `headroom --help` / `headroom help`. */
 export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["status", "Print the current meters (the default; grouped for a terminal, one dense line per meter in a pipe)"],
-  ["dashboard (top)", "Live terminal dashboard from cached readings, with pause, events, and leases"],
+  ["dashboard (top)", "Live terminal dashboard from cached readings, with pause, events, and leases (--html <path> writes standalone HTML report)"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
   ["history <meter>", "List stored observations for one meter"],
@@ -1319,7 +1319,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
 /** Usage text for `headroom <command> --help`, keyed by the command's first token. */
 export const COMMAND_HELP: Readonly<Record<string, string>> = {
   status: STATUS_HELP,
-  dashboard: "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose]",
+  dashboard: "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose] [--ascii] [--html <path>] [--force]",
   can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
   history: "Usage: headroom history <meter> [--since 24h]",
@@ -1391,7 +1391,10 @@ export async function main(argv: string[]): Promise<number> {
   // a statusLine command that fails to print at all blanks the user's status
   // bar. statusline() itself never throws for the same reason.
   if (argv[0] === "statusline") return statusline(argv.slice(1));
-  if (argv[0] === "dashboard" || argv[0] === "top") return (await import("./dashboard.js")).dashboardCommand(argv.slice(1));
+  if (argv[0] === "dashboard" || argv[0] === "top") {
+    if (argv.includes("--html")) return (await import("./browser-report.js")).htmlReportCommand(argv.slice(1));
+    return (await import("./dashboard.js")).dashboardCommand(argv.slice(1));
+  }
   // Same reasoning as statusline just above: a shell completion pop-up runs
   // on every Tab press, and the legacy-home notice line printed a few lines
   // down would land inside the completion script's own stdout (fatal for

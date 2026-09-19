@@ -45,7 +45,7 @@ function formatDay(value: string | null | undefined): string {
 /** Same short window word `label()` below uses, from a bare minutes number
  * rather than an observation -- for a `last_known.window_minutes`, which
  * names a different window than the one the reading is attached to. */
-function labelForMinutes(minutes: number | null | undefined): string {
+export function labelForMinutes(minutes: number | null | undefined): string {
   if (minutes === 300) return "5h";
   if (minutes === 10_080) return "wk";
   if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
@@ -276,10 +276,14 @@ function stateColor(state: string): string | undefined {
 /** Colour is applied only after a line has been measured and clamped, so an
  * escape sequence never counts toward the terminal width and never gets cut
  * in half by a truncation. */
-function colorizeState(line: string, state: string, color: boolean): string {
+function colorizeState(line: string, state: string, color: boolean, bar?: string): string {
   const code = stateColor(state);
-  if (!color || !state || !code || !line.endsWith(state)) return line;
-  return `${line.slice(0, line.length - state.length)}${code}${state}${ANSI.reset}`;
+  if (!color || !state || !code) return line;
+  let result = line.endsWith(state) ? `${line.slice(0, line.length - state.length)}${code}${state}${ANSI.reset}` : line;
+  if (bar && result.includes(bar)) {
+    result = result.replace(bar, `${code}${bar}${ANSI.reset}`);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +299,10 @@ export interface StatusViewOptions {
   width: number;
   /** Whether the readings came from a one-shot direct read (no daemon). */
   direct: boolean;
+  ascii?: boolean;
 }
 
-export const STATUS_VIEW_FLAGS = ["--human", "--plain", "--agent", "--verbose", "-v", "--color", "--no-color"] as const;
+export const STATUS_VIEW_FLAGS = ["--human", "--plain", "--agent", "--verbose", "-v", "--color", "--no-color", "--ascii"] as const;
 
 /** The widest line the grouped form is allowed to produce when the terminal
  * width is unknown (a pipe, a CI log). Wide enough for a real principal and
@@ -322,7 +327,8 @@ export function statusViewOptions(argv: string[], isTty: boolean, environment: N
   // --no-color is the one flag nothing overrides; --color beats NO_COLOR,
   // matching how `headroom statusline --render` already reads the two.
   const color = argv.includes("--no-color") ? false : argv.includes("--color") || (isTty && !noColor);
-  return { form, verbose, color: form === "grouped" && color, width };
+  const ascii = argv.includes("--ascii") || environment.TERM === "dumb";
+  return { form, verbose, color: form === "grouped" && color, width, ascii };
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +378,7 @@ interface Row {
   meter: string;
   text?: string;
   window: string;
+  bar?: string;
   used: string;
   reset: string;
   resetCoarse: string;
@@ -381,11 +388,20 @@ interface Row {
   lease?: string;
 }
 
+export function barFor(observation: Observation, state: PaceState, ascii = false): string {
+  if (state === "NOT_ENFORCED") return ascii ? "[----------]" : "[──────────]";
+  if (state === "UNKNOWN" || !observation.quantity) return "[??????????]";
+  if (observation.metadata?.exhausted) return ascii ? "[##########]" : "[██████████]";
+  const used = Math.max(0, Math.min(100, observation.quantity.used));
+  const filled = Math.round(used / 10);
+  return ascii
+    ? `[${"#".repeat(filled)}${".".repeat(10 - filled)}]`
+    : `[${"█".repeat(filled)}${"░".repeat(10 - filled)}]`;
+}
+
 function usedCell(observation: Observation, state: PaceState): string {
-  const vendorWindow = vendorWindowNote(observation);
-  const note = vendorWindow ? ` (${vendorWindow})` : "";
-  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return `-${note}`;
-  return `${Math.round(observation.quantity.used)}% used${note}`;
+  if (state === "NOT_ENFORCED" || state === "UNKNOWN" || !observation.quantity) return "-";
+  return `${Math.round(observation.quantity.used)}% used`;
 }
 
 /** A credit balance is a count with an expiry, not a window with a pace, so
@@ -469,7 +485,7 @@ interface PrincipalBlock {
   notices: string[];
 }
 
-function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
+function buildBlocks(input: StatusViewInput, now: Date, ascii = false): PrincipalBlock[] {
   const { observations, policy } = input;
   const resetSeen = input.resetSeen ?? new Map<string, string>();
   const freeResetUsed = input.freeResetUsed ?? new Map<string, string>();
@@ -514,6 +530,7 @@ function buildBlocks(input: StatusViewInput, now: Date): PrincipalBlock[] {
           meter: index === 0 ? shortMeter(observation) : "",
           ...(isCredits(observation) ? { text: creditsCell(observation) } : {}),
           window: label(observation),
+          bar: isCredits(observation) ? undefined : barFor(observation, decision.state, ascii),
           used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),
           reset: countdown ? known : `resets in ${formatResetsIn(seconds as number)}`,
           resetCoarse: countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`,
@@ -549,7 +566,7 @@ function footer(blocks: PrincipalBlock[], direct: boolean, observations: Observa
 
 function groupedLines(input: StatusViewInput, options: StatusViewOptions): string[] {
   const now = input.now ?? new Date();
-  const blocks = buildBlocks(input, now);
+  const blocks = buildBlocks(input, now, options.ascii);
   const rows = blocks.flatMap((block) => block.rows);
   const indent = 2;
   const gap = 2;
@@ -557,17 +574,19 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
   // widens them: one long credit expiry used to push every percentage right.
   const columned = rows.filter((row) => row.text === undefined);
   const windowWidth = Math.max(0, ...columned.map((row) => row.window.length));
+  const barWidth = Math.max(0, ...columned.map((row) => (row.bar ?? "").length));
   const usedWidth = Math.max(0, ...columned.map((row) => row.used.length));
   const stateWidth = Math.max(0, ...columned.map((row) => row.state.length));
   const resetWidth = (useCoarse: boolean): number => Math.max(0, ...columned.map((row) => (useCoarse ? row.resetCoarse : row.reset).length));
-  const total = (meters: number, resets: number): number => indent + meters + gap + windowWidth + gap + usedWidth + gap + resets + gap + stateWidth;
+  const total = (meters: number, resets: number): number => indent + meters + gap + windowWidth + gap + (barWidth ? barWidth + gap : 0) + usedWidth + gap + resets + gap + stateWidth;
   // Widths adapt to the terminal: the countdown drops to its single largest
   // unit first (it is the least load-bearing column), then the meter-name
   // column gives up characters, before anything is truncated outright.
   let meterWidth = Math.max(0, ...rows.map((row) => row.meter.length));
   const coarse = total(meterWidth, resetWidth(false)) > options.width;
   const resets = resetWidth(coarse);
-  if (total(meterWidth, resets) > options.width) meterWidth = Math.max(4, meterWidth - (total(meterWidth, resets) - options.width));
+  const shouldStack = total(meterWidth, resets) > options.width;
+  if (!shouldStack && total(meterWidth, resets) > options.width) meterWidth = Math.max(4, meterWidth - (total(meterWidth, resets) - options.width));
   const clamp = (line: string): string => line.length <= options.width ? line : line.slice(0, options.width);
 
   const blockLines = blocks.map((block) => {
@@ -583,19 +602,31 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
     // fit -- a narrow terminal costs it a line break, never a cut-off name.
     lines.push(...(block.header.length <= options.width ? [block.header] : wrap(block.header, options.width, 0)));
     for (const row of block.rows) {
-      const meter = row.meter.length > meterWidth ? row.meter.slice(0, meterWidth) : row.meter.padEnd(meterWidth);
-      const cells = row.text === undefined
-        ? [`${" ".repeat(indent)}${meter}`, row.window.padEnd(windowWidth), row.used.padStart(usedWidth), (coarse ? row.resetCoarse : row.reset).padEnd(resets), row.state]
-        : [`${" ".repeat(indent)}${meter}`, row.text];
-      lines.push(colorizeState(clamp(cells.join(" ".repeat(gap)).replace(/\s+$/, "")), row.state, options.color));
+      if (row.text !== undefined) {
+        const meter = row.meter.length > meterWidth ? row.meter.slice(0, meterWidth) : row.meter.padEnd(meterWidth);
+        lines.push(clamp(`${" ".repeat(indent)}${meter}  ${row.text}`));
+      } else if (shouldStack) {
+        const meter = row.meter.length > meterWidth ? row.meter.slice(0, meterWidth) : row.meter.padEnd(meterWidth);
+        const line1 = `${" ".repeat(indent)}${meter}  ${row.window.padEnd(windowWidth)}  ${(row.bar ?? "").padEnd(barWidth)}  ${row.used.padStart(usedWidth)}`.replace(/\s+$/, "");
+        const resetText = coarse ? row.resetCoarse : row.reset;
+        const line2 = `${" ".repeat(indent + 4)}${resetText}  ${row.state}`.replace(/\s+$/, "");
+        lines.push(colorizeState(clamp(line1), row.state, options.color, row.bar));
+        lines.push(colorizeState(clamp(line2), row.state, options.color));
+      } else {
+        const meter = row.meter.length > meterWidth ? row.meter.slice(0, meterWidth) : row.meter.padEnd(meterWidth);
+        const cells = [`${" ".repeat(indent)}${meter}`, row.window.padEnd(windowWidth), ...(barWidth ? [(row.bar ?? "").padEnd(barWidth)] : []), row.used.padStart(usedWidth), (coarse ? row.resetCoarse : row.reset).padEnd(resets), row.state];
+        lines.push(colorizeState(clamp(cells.join(" ".repeat(gap)).replace(/\s+$/, "")), row.state, options.color, row.bar));
+      }
       if (options.verbose) for (const detail of row.detail) lines.push(...wrap(detail, options.width, indent + 4));
-      if (!block.shared && row.unknown) lines.push(...wrap(`UNKNOWN: ${row.unknown.text}`, options.width, indent + 4));
+      // Keep diagnostics quiet unless verbose; fresh sibling meters must remain readable when another meter is stale
+      const hasFreshSiblings = block.rows.some((r) => r.state !== "UNKNOWN" && r.state !== "");
+      if (!block.shared && row.unknown && (options.verbose || !hasFreshSiblings)) lines.push(...wrap(`UNKNOWN: ${row.unknown.text}`, options.width, indent + 4));
       if (row.lease) lines.push(...wrap(row.lease, options.width, indent + 4));
     }
     // Printed once per principal rather than once per window: the dense form
     // repeats an identical reason on every meter, which is the noise this
     // view exists to remove.
-    if (block.shared) lines.push(...wrap(`UNKNOWN: ${block.shared.text}`, options.width, indent));
+    if (block.shared && (options.verbose || block.unknownCount === block.rows.length)) lines.push(...wrap(`UNKNOWN: ${block.shared.text}`, options.width, indent));
     // An unscheduled reset (issue #20) changes what a human reading this
     // view should plan around, so it gets its own line under the principal
     // even outside --verbose, unlike the reset-seen detail wrap() folds into

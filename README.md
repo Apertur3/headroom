@@ -61,7 +61,7 @@ reader build on [CodexBar](https://github.com/steipete/codexbar) (MIT).
 | Vendors and meters | Claude `all`, `fable`, `routines` and reported scoped meters; Codex `main`, `spark`, `credits`; Antigravity `gemini`, `claude-gpt`; Grok, Kimi; and local vLLM or llama.cpp `capacity` pools |
 | Pace | HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset |
 | Decisions | `can`, `gate`, `route`, `plan`, `fill`, `wait`, leases, per-meter reserves, and a spend ledger coordinate shared capacity and pacing |
-| Views and automation | Terminal status, `dashboard`/`top`, `statusline --render`, `usage --paste` or `--clipboard`, JSON contract output, local daemon, and MCP tools |
+| Views and automation | Terminal status, `dashboard`/`top` (and `--html <path>` browser report), `statusline --render`, `usage --paste` or `--clipboard`, JSON contract output, local daemon, and MCP tools |
 | Operations | Interactive `setup`; the `notify configure` picker with calm, quiet and everything presets; `inbox`; `export` as JSON or CSV; `doctor --bundle`; `update`; `uninstall`; and shell `completion` |
 
 Headroom is not a router. Which model is good at what is your opinion and changes monthly. Keep it
@@ -112,6 +112,26 @@ Full walkthrough, including what each step grants and why: [docs/quickstart.md](
 
 `status`/`doctor` print a one-line notice when a newer `headroomd` is out; run `headroom update`
 (never automatic) to install it -- see [Staying up to date](docs/quickstart.md#staying-up-to-date).
+
+### Human dashboard and browser report
+
+Open the terminal overview, or export a local browser snapshot:
+
+```sh
+headroom dashboard
+headroom dashboard --once --ascii
+```
+
+Use Tab to select a meter, `v` for details, and `e` for events. Both chart views show
+recorded remaining capacity, with gaps where readings are missing or untrusted.
+
+To open the same recorded history in a browser:
+
+```sh
+headroom dashboard --html report.html
+```
+
+Open the generated file in your browser. The report shows subscription usage and reset times in an overview, with selectable window charts and sample details. It supports light and dark themes and makes no external requests. It is a snapshot: generate it again for newer readings. Existing files are preserved unless you pass `--force`; new files use mode 0600 on systems that support Unix permissions.
 
 ## Documentation
 

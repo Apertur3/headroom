@@ -133,9 +133,49 @@ async function legacyDatabasePath(directory: string): Promise<string | undefined
 function json(value: unknown): string | null { return value === undefined ? null : JSON.stringify(value); }
 function parseJson<T>(value: unknown, fallback: T): T { try { return typeof value === "string" ? JSON.parse(value) as T : fallback; } catch { return fallback; } }
 
+export function canonicalWindow(window: Observation["window"] | undefined | null): Observation["window"] | null {
+  if (!window) return null;
+  return {
+    kind: window.kind,
+    minutes: window.minutes ?? null,
+    enforcement: window.enforcement,
+  };
+}
+
+export function canonicalWindowJson(window: Observation["window"] | undefined | null): string | null {
+  const canonical = canonicalWindow(window);
+  return canonical ? JSON.stringify(canonical) : null;
+}
+
+export function sameSemanticWindow(
+  a: Observation["window"] | undefined | null,
+  b: Observation["window"] | undefined | null
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.kind === b.kind && (a.minutes ?? null) === (b.minutes ?? null) && a.enforcement === b.enforcement;
+}
+
+export function windowSqlMatch(
+  window: Observation["window"] | undefined | null,
+  column = "window_json"
+): { sql: string; params: unknown[] } {
+  if (!window) {
+    return {
+      sql: `(${column} IS NULL OR ${column} = 'null')`,
+      params: [],
+    };
+  }
+  return {
+    sql: `(${column} IS NOT NULL AND ${column} <> 'null' AND json_extract(${column}, '$.kind') = ? AND CAST(json_extract(${column}, '$.minutes') AS INTEGER) IS ? AND json_extract(${column}, '$.enforcement') = ?)`,
+    params: [window.kind, window.minutes ?? null, window.enforcement],
+  };
+}
+
 function observationFromRow(row: Row): StoredObservation {
   const quantity = row.quantity_json ? parseJson<Observation["quantity"]>(row.quantity_json, null) : null;
-  const window = row.window_json ? parseJson<Observation["window"]>(row.window_json, null) : null;
+  const rawWindow = row.window_json ? parseJson<Observation["window"]>(row.window_json, null) : null;
+  const window = canonicalWindow(rawWindow);
   return {
     id: Number(row.id), principal_id: String(row.principal_id), meter_id: String(row.meter_id), window, quantity,
     resets_at: string(row.resets_at), observed_at: String(row.observed_at), fetched_at: String(row.fetched_at),
@@ -408,9 +448,10 @@ export class HeadroomStore {
     // whose old fetched_at a plain "most recent" reader could still trip on
     // if a later poll's own fresh reading were ever missing.
     if (observation.window?.minutes && observation.source.endsWith(":session-log")) {
+      const match = windowSqlMatch(observation.window);
       const existingRow = this.db.prepare(
-        "SELECT * FROM observations WHERE meter_id = ? AND json_extract(window_json, '$.minutes') = ? ORDER BY fetched_at DESC, id DESC LIMIT 1",
-      ).get(observation.meter_id, observation.window.minutes);
+        `SELECT * FROM observations WHERE meter_id = ? AND ${match.sql} ORDER BY fetched_at DESC, id DESC LIMIT 1`,
+      ).get(observation.meter_id, ...match.params);
       if (existingRow) {
         const existing = observationFromRow(existingRow);
         if (Date.parse(existing.fetched_at) >= Date.parse(observation.fetched_at)) return existing;
@@ -447,10 +488,10 @@ export class HeadroomStore {
     const result = this.db.prepare(`INSERT INTO observations
       (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      resolved.principal_id, resolved.meter_id, json(resolved.window), json(resolved.quantity), resolved.resets_at ?? null,
+      resolved.principal_id, resolved.meter_id, canonicalWindowJson(resolved.window), json(resolved.quantity), resolved.resets_at ?? null,
       resolved.observed_at ?? null, resolved.fetched_at ?? null, resolved.source, resolved.truth, resolved.freshness, resolved.confidence,
       resolved.adapter_version, resolved.upstream_schema_version, reason, json(metadata));
-    const stored: StoredObservation = { ...resolved, reason, metadata, id: Number(result.lastInsertRowid) };
+    const stored: StoredObservation = { ...resolved, window: canonicalWindow(resolved.window), reason, metadata, id: Number(result.lastInsertRowid) };
     if (pastedHighUsage) {
       // Drop a prior unresolved identity hold so the paste becomes the new
       // baseline. A subsequent old-identity poll will be held against this
@@ -647,9 +688,9 @@ export class HeadroomStore {
   }
 
   private previous(observation: Observation): StoredObservation | undefined {
-    const window = observation.window ? JSON.stringify(observation.window) : null;
-    const row = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?) ORDER BY id DESC LIMIT 1")
-      .get(observation.meter_id, window, window);
+    const match = windowSqlMatch(observation.window);
+    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql} ORDER BY id DESC LIMIT 1`)
+      .get(observation.meter_id, ...match.params);
     return row ? observationFromRow(row) : undefined;
   }
 
@@ -763,11 +804,11 @@ export class HeadroomStore {
    * the contradiction evidence resolveIdleContradiction() checks a
    * detectPlaceholder-flagged idle reading against. */
   private recentFreshReading(observation: Observation): StoredObservation | undefined {
-    const window = observation.window ? JSON.stringify(observation.window) : null;
+    const match = windowSqlMatch(observation.window);
     const since = new Date(Date.parse(observation.fetched_at) - 2 * 3_600_000).toISOString();
-    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
+    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
       AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
-      .get(observation.meter_id, window, window, since);
+      .get(observation.meter_id, ...match.params, since);
     return row ? observationFromRow(row) : undefined;
   }
 
@@ -813,20 +854,13 @@ export class HeadroomStore {
    * a failed 5h window and a failed weekly window never collapse into, or
    * silently close, each other's event. */
   private openFailureForWindow(meterId: string, window: Observation["window"]): Row | undefined {
-    const minutes = window?.minutes ?? null;
-    // IS (not =) with an INTEGER cast on the JSON side only, matching
-    // eventEvidenceFor's pattern below: node:sqlite binds a JS number
-    // parameter as SQLite REAL, so CAST(?, AS TEXT) on that parameter would
-    // produce '10080.0' against json_extract's '10080' and never match. IS
-    // also makes a windowless (null-minutes) comparison exact rather than
-    // SQL NULL's usual never-equal-anything behavior.
+    const match = windowSqlMatch(window, "o.window_json");
     const row = this.db.prepare(`SELECT e.* FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.meter_id = ? AND e.kind IN ('source_failed', 'source_recovered')
-        AND o.window_json IS NOT NULL AND o.window_json <> 'null'
-        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) IS ?
-      ORDER BY e.created_at DESC, e.id DESC LIMIT 1`).get(meterId, minutes);
+        AND ${match.sql}
+      ORDER BY e.created_at DESC, e.id DESC LIMIT 1`).get(meterId, ...match.params);
     return row && row.kind === "source_failed" ? row : undefined;
   }
 
@@ -901,12 +935,12 @@ export class HeadroomStore {
    * Also accepts the legacy `<principal>:<principal>:<meter>` meter id an
    * earlier engine emitted, so older history still counts as a baseline. */
   private freshBaseline(current: StoredObservation): StoredObservation | undefined {
-    const window = current.window ? JSON.stringify(current.window) : null;
+    const match = windowSqlMatch(current.window);
     const since = new Date(Date.parse(current.fetched_at) - 7 * 86_400_000).toISOString();
     const lookup = (meterId: string): Row | undefined => this.db.prepare(`SELECT * FROM observations
-      WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
+      WHERE meter_id = ? AND ${match.sql}
         AND freshness = 'fresh' AND id < ? AND fetched_at >= ?
-      ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(meterId, window, window, current.id, since);
+      ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(meterId, ...match.params, current.id, since);
     const row = lookup(current.meter_id) ?? lookup(`${current.principal_id}:${current.meter_id}`);
     return row ? observationFromRow(row) : undefined;
   }
@@ -941,9 +975,9 @@ export class HeadroomStore {
    * expected the moment a gap is long enough to span a scheduled reset,
    * whether or not the reset happened inside THIS gap specifically. */
   private failedGapBetween(meterId: string, window: Observation["window"], afterId: number, beforeId: number): boolean {
-    const windowJson = window ? JSON.stringify(window) : null;
-    const row = this.db.prepare(`SELECT 1 FROM observations WHERE meter_id = ? AND (window_json IS ? OR window_json = ?)
-      AND freshness = 'failed' AND id > ? AND id < ? LIMIT 1`).get(meterId, windowJson, windowJson, afterId, beforeId);
+    const match = windowSqlMatch(window);
+    const row = this.db.prepare(`SELECT 1 FROM observations WHERE meter_id = ? AND ${match.sql}
+      AND freshness = 'failed' AND id > ? AND id < ? LIMIT 1`).get(meterId, ...match.params, afterId, beforeId);
     return row !== undefined;
   }
 
@@ -953,13 +987,13 @@ export class HeadroomStore {
    * the gap) does not provide, since two different closing observations can
    * in principle name the same scheduled reset. */
   private resetSeenAtScheduledTime(meterId: string, window: Observation["window"], scheduledAt: string): boolean {
-    const minutes = window?.minutes ?? null;
+    const match = windowSqlMatch(window, "o.window_json");
     const row = this.db.prepare(`SELECT 1 FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind = 'reset_seen' AND e.meter_id = ?
-        AND CAST(json_extract(o.window_json, '$.minutes') AS INTEGER) IS ?
-        AND e.created_at = ? LIMIT 1`).get(meterId, minutes, scheduledAt);
+        AND ${match.sql}
+        AND e.created_at = ? LIMIT 1`).get(meterId, ...match.params, scheduledAt);
     return row !== undefined;
   }
 
@@ -1997,10 +2031,10 @@ export class HeadroomStore {
       const key = `${observation.meter_id}:${minutes}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const windowJson = JSON.stringify(window);
-      const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND window_json = ?
+      const match = windowSqlMatch(window);
+      const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
         AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
-        .get(observation.meter_id, windowJson, since);
+        .get(observation.meter_id, ...match.params, since);
       const found = readingFrom(row);
       if (!found) continue;
       output.set(key, found.reading);
