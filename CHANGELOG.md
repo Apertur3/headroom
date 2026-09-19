@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-19
+
 ### Added
 - Export a standalone browser report with `headroom dashboard --html <path>`, including meter and window selection, recorded capacity charts, sample details, and light/dark themes.
 
@@ -14,6 +16,8 @@ All notable changes to this project are documented here. The format follows
 - Plot remaining capacity from recorded readings in terminal and browser views; break charts across resets, missing readings, and untrusted vendor responses.
 
 ### Fixed
+- Keep confirmed idle Codex windows usable when their zero-usage reset timestamps move with each poll; preserve holds for contradictory active windows and reset notification evidence.
+- Stop displaying a past timestamp as the next poll time for a stale reading.
 - Match quota windows by their fields, so reordered vendor JSON cannot select an older baseline and overcount attributed spend. Existing observations are supported; previously recorded ledger totals are not rewritten.
 - Cancel unfinished daemon requests at the shell-completion deadline, and avoid creating database state when completing an empty installation.
 
