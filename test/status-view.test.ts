@@ -88,16 +88,16 @@ describe("status view: the three forms", () => {
   it("groups by principal, aligns the columns and puts the pace state last", () => {
     expect(render()).toMatchInlineSnapshot(`
       "claude-main  claude  Max 20x  fresh <1m
-        all      5h  22% used  resets in 3h 14m  HARVEST
-                 wk  32% used  resets in 5d 14h  CONSERVE
-        fable    wk  40% used  resets in 5d 14h  CONSERVE
+        all      5h  [██░░░░░░░░]  22% used  resets in 3h 14m  HARVEST
+                 wk  [███░░░░░░░]  32% used  resets in 5d 14h  CONSERVE
+        fable    wk  [████░░░░░░]  40% used  resets in 5d 14h  CONSERVE
 
       codex-main  codex  fresh <1m
         credits  2 available, expire Oct 4
 
       gemini  gemini  failed <1m
-        all      5h         -                    UNKNOWN
-                 wk         -                    UNKNOWN
+        all      5h  [??????????]         -                    UNKNOWN
+                 wk  [??????????]         -                    UNKNOWN
         UNKNOWN: macOS has not let Headroom read this account's credentials yet. Run: headroom keychain
         grant --principal gemini
 
@@ -114,7 +114,7 @@ describe("status view: the three forms", () => {
     }
     // The default line is unchanged by --verbose; the detail is an extra,
     // indented line underneath it, never a rewrite of the row above.
-    expect(verbose).toContain("  all      5h  22% used  resets in 3h 14m  HARVEST\n      resets at 04:00,");
+    expect(verbose).toContain("  all      5h  [██░░░░░░░░]  22% used  resets in 3h 14m  HARVEST\n      resets at 04:00,");
   });
 
   it("shows the reserve and the reset evidence under --verbose", () => {
@@ -369,6 +369,29 @@ describe("status view: widths", () => {
     const lines = renderStatus(input(), options({ width: 100 }));
     expect(lines.filter((line) => line.includes("used"))).toHaveLength(3);
   });
+
+  it("stacks meter rows at width 40 without truncating pacing state", () => {
+    const narrow = renderStatus(input(), options({ width: 40 })).join("\n");
+    expect(narrow).toContain("HARVEST");
+    expect(narrow).toContain("CONSERVE");
+    for (const line of narrow.split("\n")) {
+      expect(line.length).toBeLessThanOrEqual(40);
+    }
+  });
+
+  it("keeps diagnostics quiet unless verbose when fresh sibling meters exist", () => {
+    const obs = [
+      ...STORE,
+      observation({
+        principal_id: "claude-main", meter_id: "claude-main:stale",
+        quantity: null, freshness: "failed", reason: "upstream timeout",
+      }),
+    ];
+    const quiet = render({}, { observations: obs });
+    expect(quiet).not.toContain("UNKNOWN: upstream timeout.");
+    const verbose = render({ verbose: true }, { observations: obs });
+    expect(verbose).toContain("UNKNOWN: upstream timeout.");
+  });
 });
 
 describe("status view: form and colour selection", () => {
@@ -400,7 +423,7 @@ describe("status view: form and colour selection", () => {
 
   it("paints only the pace state, and only when colour is on", () => {
     const painted = renderStatus(input(), options({ color: true }));
-    expect(painted.find((line) => line.includes("22% used"))).toBe("  all      5h  22% used  resets in 3h 14m  \u001b[32mHARVEST\u001b[0m");
+    expect(painted.find((line) => line.includes("22% used"))).toBe("  all      5h  \u001b[32m[██░░░░░░░░]\u001b[0m  22% used  resets in 3h 14m  \u001b[32mHARVEST\u001b[0m");
     expect(painted.find((line) => line.includes("32% used"))).toContain("\u001b[33mCONSERVE\u001b[0m");
     expect(painted.find((line) => line.startsWith("gemini  "))).not.toContain("\u001b[");
     expect(renderStatus(input(), options()).join("\n")).not.toContain("\u001b[");
