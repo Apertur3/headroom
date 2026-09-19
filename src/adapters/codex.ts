@@ -65,7 +65,7 @@ function rate(account: ProviderAccount, meter: string, raw: unknown, fallback: n
   // future window identity. Session-log fallbacks are historical events and
   // must never acquire this tag.
   const idleReset = markIdleWindow && used === 0 && reset !== null
-    && Math.abs(Date.parse(reset) - (Date.parse(now) + minutes * 60_000)) <= 1_000;
+    && Math.abs(Date.parse(reset) - (Date.parse(now) + minutes * 60_000)) <= 90_000;
   return { ...base(account, meter, now, source), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: reset, freshness, ...(idleReset ? { metadata: { codex_idle_window: true } } : {}) };
 }
 /** Parse the `wham/usage` body and optional reset-credit body from CodexBar's v0.56.4 contract. */

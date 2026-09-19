@@ -10,7 +10,7 @@ import type { Observation, ProviderAccount } from "../src/types.js";
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-const account: ProviderAccount = { name: "codex-main", vendor: "codex", location: "/synthetic/codex" };
+const account: ProviderAccount = { name: "codex-main", vendor: "codex", adapter: "native-ts", location: "/synthetic/codex" };
 
 function weekly(used: number, fetchedAt: string, resetsAt: string): Observation {
   return {
@@ -141,6 +141,35 @@ describe("Codex moving idle windows (issue #50)", () => {
         expect(store.latestPerWindow("codex-main:main")[0]?.quantity?.used).toBe(80);
       } finally { store.close(); }
     }
+  });
+
+  it("accepts a delayed native idle response within 90 seconds, but not beyond it", () => {
+    const at = "2026-09-19T08:00:00.000Z";
+    const usage = (offsetSeconds: number) => ({ rate_limit: {
+      primary: { used_percent: 0, window_minutes: 300, resets_at: Math.floor((Date.parse(at) + 300 * 60_000 + offsetSeconds * 1_000) / 1000) },
+      secondary: { used_percent: 0, window_minutes: 10_080, resets_at: Math.floor((Date.parse(at) + 10_080 * 60_000 + offsetSeconds * 1_000) / 1000) },
+    } });
+    const marked = observationsFromCodexUsage(usage(60), {}, account, new Date(at));
+    const beyond = observationsFromCodexUsage(usage(91), {}, account, new Date(at));
+    expect(marked.every((row) => row.metadata?.codex_idle_window)).toBe(true);
+    expect(beyond.some((row) => row.metadata?.codex_idle_window)).toBe(false);
+  });
+
+  it("recovers old untagged native idle history when a tagged idle poll arrives", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-codex-idle-upgrade-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      store.insert(weekly(100, "2026-09-19T08:00:00Z", "2026-09-19T08:01:00Z"));
+      store.insert(weekly(0, "2026-09-19T08:05:00Z", "2026-09-26T08:05:00Z"));
+      store.insert(weekly(0, "2026-09-19T08:10:00Z", "2026-09-26T08:10:00Z"));
+      const before = store.events("2026-09-19T00:00:00Z").filter((event) => event.kind === "reset_seen");
+      store.insert(idleWeekly("2026-09-19T08:15:00Z"));
+      const current = store.latestPerWindow("codex-main:main")[0]!;
+      expect(current).toMatchObject({ quantity: { used: 0 }, metadata: { codex_idle_window: true } });
+      expect(current.metadata?.vendor_window_held).toBeUndefined();
+      expect(store.events("2026-09-19T00:00:00Z").filter((event) => event.kind === "reset_seen")).toHaveLength(before.length);
+      expect(store.history("codex-main:main", "2026-09-19T00:00:00Z").slice(0, 3).every((row) => !row.metadata?.codex_idle_window)).toBe(true);
+    } finally { store.close(); }
   });
 
   it("does not make an omitted stale Spark window available from fresh main idle data", async () => {

@@ -753,7 +753,7 @@ export class HeadroomStore {
       && observation.freshness === "fresh" && observation.quantity?.unit === "percent" && observation.quantity.used === 0
       && typeof minutes === "number" && Number.isFinite(minutes)
       && Number.isFinite(fetchedAt) && Number.isFinite(resetsAt)
-      && Math.abs(resetsAt - (fetchedAt + minutes * 60_000)) <= 1_000;
+      && Math.abs(resetsAt - (fetchedAt + minutes * 60_000)) <= 90_000;
   }
 
   private isCodexIdleActivation(observation: Observation, baseline: StoredObservation | undefined): boolean {

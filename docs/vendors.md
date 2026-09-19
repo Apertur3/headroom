@@ -132,6 +132,13 @@ only when the response's `additional_rate_limits` includes a Spark entry), and
 `<principal>:credits`, a `count` window with no reset duration; it is informational and never
 gates `can`.
 
+An idle Codex window can report 0% with a reset time that moves forward on each poll.
+Headroom recognizes this native endpoint pattern with a bounded clock/response tolerance.
+After a scheduled reset, those readings remain usable; an unexpected drop to idle still
+needs a later confirming poll. The displayed reset remains vendor-reported and can move
+until usage starts. Missing or stale scoped meters remain unavailable independently of
+fresh readings on the main meter.
+
 Use Codex reset credits only while the account is on a paid plan. A free-plan credit spend is
 reported as an urgent warning because it can discard a saved paid-plan reset.
 
