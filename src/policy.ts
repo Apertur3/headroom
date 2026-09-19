@@ -111,9 +111,12 @@ export function parsePolicy(text: string): Policy {
  * row wants to know roughly when to look again, not just that it's stale.
  * Empty string when fetched is unparseable, so a genuinely invalid
  * timestamp never prints a bogus clock time. */
-function nextPollHint(fetchedAtMs: number, policy: Policy): string {
+function nextPollHint(observation: Observation, fetchedAtMs: number, policy: Policy, now: Date): string {
   if (!Number.isFinite(fetchedAtMs)) return "";
-  return `; next poll ~${formatClockTime(new Date(fetchedAtMs + policy.poll_interval_minutes * 60_000))}`;
+  const interval = policy.principal_intervals[observation.principal_id] ?? policy.poll_interval_minutes;
+  const expectedAt = fetchedAtMs + interval * 60_000;
+  if (expectedAt <= now.getTime()) return "; next poll time unknown";
+  return `; next poll ~${formatClockTime(new Date(expectedAt))}`;
 }
 
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
@@ -127,13 +130,13 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   if (observation.window?.kind === "count") return { state: "NORMAL", reason: "availability count" };
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   const parsedFetchedAt = new Date(observation.fetched_at).getTime();
-  if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(parsedFetchedAt, policy)}` };
+  if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(observation, parsedFetchedAt, policy, now)}` };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };
   if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
   const fetched = parsedFetchedAt;
   if (!Number.isFinite(fetched)) return { state: "UNKNOWN", reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
-  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `stale ${ageMinutes}m${nextPollHint(fetched, policy)}` };
+  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `stale ${ageMinutes}m${nextPollHint(observation, fetched, policy, now)}` };
   const used = observation.quantity.used;
   if (used >= 100 - policy.freeze_reserve_pct) return { state: "FREEZE", reason: "reserve reached" };
   const reset = observation.resets_at ? new Date(observation.resets_at).getTime() : Number.NaN;

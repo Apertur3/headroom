@@ -53,13 +53,20 @@ function date(value: unknown): string | null {
   if (seconds !== undefined && seconds > 0) return new Date(seconds * 1000).toISOString();
   return typeof value === "string" && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 }
-function rate(account: ProviderAccount, meter: string, raw: unknown, fallback: number, now: string, source = SOURCE, freshness: Observation["freshness"] = "fresh"): Observation | undefined {
+function rate(account: ProviderAccount, meter: string, raw: unknown, fallback: number, now: string, source = SOURCE, freshness: Observation["freshness"] = "fresh", markIdleWindow = false): Observation | undefined {
   if (!object(raw)) return undefined;
   const used = number(raw.used_percent); if (used === undefined) return undefined;
   const minutes = Math.floor((number(raw.limit_window_seconds) ?? (number(raw.window_minutes) ?? fallback) * 60) / 60) || fallback;
   const reset = date(raw.reset_at ?? raw.resets_at) ?? (() => { const seconds = number(raw.resets_in_seconds); return seconds === undefined ? null : new Date(Date.parse(now) + seconds * 1000).toISOString(); })();
   const value = Math.min(100, Math.max(0, used));
-  return { ...base(account, meter, now, source), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: reset, freshness };
+  // The live Codex endpoint reports an idle allowance as 0% with reset exactly
+  // one window after this fetch (rounded to seconds). This is useful provider
+  // evidence for the store: its reset is a moving idle marker, not a durable
+  // future window identity. Session-log fallbacks are historical events and
+  // must never acquire this tag.
+  const idleReset = markIdleWindow && used === 0 && reset !== null
+    && Math.abs(Date.parse(reset) - (Date.parse(now) + minutes * 60_000)) <= 1_000;
+  return { ...base(account, meter, now, source), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: reset, freshness, ...(idleReset ? { metadata: { codex_idle_window: true } } : {}) };
 }
 /** Parse the `wham/usage` body and optional reset-credit body from CodexBar's v0.56.4 contract. */
 export function observationsFromCodexUsage(usage: unknown, credits: unknown, account: ProviderAccount, at = new Date()): Observation[] {
@@ -67,15 +74,15 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   const now = at.toISOString(); const rateLimit = usage.rate_limit;
   const plan = string(usage.plan_type);
   const metadata = { ...(plan ? { plan } : {}), ...(object(credits) && number(credits.available_count) !== undefined ? { free_resets_available: number(credits.available_count)! } : {}) };
-  const tagged = (observation: Observation): Observation => ({ ...observation, metadata });
+  const tagged = (observation: Observation): Observation => ({ ...observation, metadata: { ...observation.metadata, ...metadata } });
   const output: Observation[] = [];
-  const primary = rate(account, "main", rateLimit.primary_window ?? rateLimit.primary, 300, now);
+  const primary = rate(account, "main", rateLimit.primary_window ?? rateLimit.primary, 300, now, SOURCE, "fresh", true);
   output.push(primary ? tagged(primary) : tagged({ ...base(account, "main", now), window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no 5-hour window from endpoint or session logs" }));
-  const weekly = rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now);
+  const weekly = rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now, SOURCE, "fresh", true);
   output.push(tagged(weekly ?? { ...base(account, "main", now), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no weekly window" }));
   if (Array.isArray(usage.additional_rate_limits)) for (const entry of usage.additional_rate_limits) {
     if (!object(entry) || !String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") || !object(entry.rate_limit)) continue;
-    const five = rate(account, "spark", entry.rate_limit.primary_window ?? entry.rate_limit.primary, 300, now); const week = rate(account, "spark", entry.rate_limit.secondary_window ?? entry.rate_limit.secondary, 10_080, now);
+    const five = rate(account, "spark", entry.rate_limit.primary_window ?? entry.rate_limit.primary, 300, now, SOURCE, "fresh", true); const week = rate(account, "spark", entry.rate_limit.secondary_window ?? entry.rate_limit.secondary, 10_080, now, SOURCE, "fresh", true);
     if (five) output.push(tagged(five)); if (week) output.push(tagged(week));
   }
   if (object(credits) && number(credits.available_count) !== undefined) {
