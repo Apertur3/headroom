@@ -189,9 +189,11 @@ describe("openUsageDatabase", () => {
     const home = join(tempDir, "CANARY_SECRET_PATH_MARKER", "home");
     await mkdir(home, { recursive: true, mode: 0o700 });
 
+    // Create a directory at the db path to trigger a deterministic
+    // "not a regular file" error on all platforms, avoiding platform-specific
+    // permission checks or file handle leaks.
     const dbPath = join(home, "usage.db");
-    await writeFile(dbPath, "");
-    if (process.platform !== "win32") await chmod(dbPath, 0o644); // Unsafe permissions
+    await mkdir(dbPath);
 
     let error: Error | undefined;
     try {
@@ -200,8 +202,8 @@ describe("openUsageDatabase", () => {
       error = e as Error;
     }
 
-    if (process.platform === "win32") return; // no mode-bit refusal to trigger
     expect(error).toBeDefined();
+    expect(error!.message).toBe("Unsafe usage database");
     expect(error!.message).not.toContain("usage.db");
     expect(error!.message).not.toContain(home);
     expect(error!.message).not.toContain("CANARY_SECRET_PATH_MARKER");
