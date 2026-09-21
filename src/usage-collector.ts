@@ -38,6 +38,7 @@ import { basename, join, posix, resolve, win32 } from "node:path";
 import { createHash } from "node:crypto";
 import { assertSafeAncestry } from "./paths.js";
 import { MAX_LINE_BYTES, parseUsageLine } from "./usage-events.js";
+import { parseCodexUsageLine } from "./codex-usage-events.js";
 import { isKnownClaudeModel, type CursorRow, type IdentityOutcome, type InterruptReason, type UsageStore } from "./usage-store.js";
 
 export { isKnownClaudeModel } from "./usage-store.js";
@@ -126,6 +127,12 @@ export interface CollectRequest {
   path: string;
   jobAlias?: string;
   maxBytes: number;
+  /** Which normalizer to run the file's lines through. `"codex"` switches to
+   * `parseCodexUsageLine` and `store.applyAndPersistCodex`, and skips the
+   * Claude-only `isKnownClaudeModel` gate entirely (Codex counter records
+   * carry no model field at all). Omitted or `"claude"` keeps today's
+   * behavior. */
+  vendor?: "claude" | "codex";
   /** Test seam only: awaited after all filesystem reads and immediately
    * before the write transaction, so a test can deterministically interleave
    * a second collector at the one point where a race is possible. */
@@ -616,12 +623,48 @@ export async function collectUsageFile(store: UsageStore, request: CollectReques
       if (!current) store.bindPath({ pathKey, sourceKey, principalKey, createdAt: new Date().toISOString() });
 
       let jobConflictIdentities = 0;
+      // The job claim is recorded per identity, not per file: the same
+      // message arriving again from a copied transcript under a different
+      // --job must not end up claimed by both. Shared between both vendor
+      // branches below since it depends only on the identity key.
+      const claimJob = (identityKey: string, identityOutcome: IdentityOutcome): void => {
+        if (!jobKey || jobConflict || identityOutcome === "quarantined_new" || identityOutcome === "quarantined_repeat") return;
+        if (store.bindIdentityJob(identityKey, jobKey) === "conflict") {
+          jobConflictIdentities += 1;
+          bump("job_conflict");
+          store.incrementCounter(cursorKey, "job_conflict");
+        }
+      };
+
       for (const event of batch.events) {
         if (event.kind === "oversized") {
           bump("rejected:line_too_large");
           store.incrementCounter(cursorKey, "rejected:line_too_large");
           continue;
         }
+
+        if (request.vendor === "codex") {
+          const outcome = parseCodexUsageLine({ line: event.text, source: { principalKey, sourceKey }, sequence: 0 });
+          if (outcome.kind === "skipped") {
+            // Rate-limit observations riding along on a skipped line (e.g.
+            // "rate_limit_only") are counted here but not yet persisted
+            // anywhere -- see the module doc for the current scope.
+            bump(`skipped:${outcome.reason}`);
+            store.incrementCounter(cursorKey, `skipped:${outcome.reason}`);
+            continue;
+          }
+          if (outcome.kind === "rejected") {
+            bump(`rejected:${outcome.reason}`);
+            store.incrementCounter(cursorKey, `rejected:${outcome.reason}`);
+            continue;
+          }
+          const identityOutcome: IdentityOutcome = store.applyAndPersistCodex(outcome.snapshot);
+          bump(identityOutcome);
+          store.incrementCounter(cursorKey, identityOutcome);
+          claimJob(outcome.snapshot.identityKey, identityOutcome);
+          continue;
+        }
+
         const outcome = parseUsageLine({ line: event.text, source: { principalKey, sourceKey }, sequence: 0 });
         if (outcome.kind === "skipped") {
           bump(`skipped:${outcome.reason}`);
@@ -641,16 +684,7 @@ export async function collectUsageFile(store: UsageStore, request: CollectReques
         const identityOutcome: IdentityOutcome = store.applyAndPersist(outcome.snapshot);
         bump(identityOutcome);
         store.incrementCounter(cursorKey, identityOutcome);
-        // The job claim is recorded per identity, not per file: the same
-        // message arriving again from a copied transcript under a different
-        // --job must not end up claimed by both.
-        if (jobKey && !jobConflict && identityOutcome !== "quarantined_new" && identityOutcome !== "quarantined_repeat") {
-          if (store.bindIdentityJob(outcome.snapshot.identityKey, jobKey) === "conflict") {
-            jobConflictIdentities += 1;
-            bump("job_conflict");
-            store.incrementCounter(cursorKey, "job_conflict");
-          }
-        }
+        claimJob(outcome.snapshot.identityKey, identityOutcome);
       }
 
       const row: CursorRow = {
