@@ -118,3 +118,49 @@ markers rather than leaving coverage implicit:
 
 See `src/usage-events.ts`, `src/usage-collector.ts`, `src/usage-store.ts` and
 their tests for the exported contract and coverage.
+
+## Codex (library only — not imported, not persisted)
+
+`src/codex-usage-events.ts` is a second, independent pure normalizer for
+Codex CLI local session-file telemetry (`~/.codex/sessions/*.jsonl`). It
+exists purely as a library module and tests: **there is no collector, no CLI
+flag, no `usage.db` schema change, and no wiring into `headroom usage
+import` for it.** `headroom usage import` still only understands Claude Code
+transcripts, exactly as described above — running it against a Codex session
+file is not supported and does not do anything useful.
+
+What the module does, given one raw JSONL line plus caller-supplied
+`(principalKey, sourceKey)` context, exactly like `usage-events.ts`:
+
+- Accepts only `token_usage_record.payload.usage`, the per-response, non-cumulative
+  counter block keyed by `response_id` — the structural analogue of Claude's
+  `message.id` + `message.usage`. `turn_token_usage` and `thread_token_usage`
+  (cumulative-to-date blocks) are read and ignored, never summed or
+  differenced.
+- Classifies `event_msg`/`token_count` events (`total_token_usage`,
+  `last_token_usage`) as skipped — cumulative and/or proven-duplicate with no
+  identity to dedup on — rather than guessing at a delta. A single event can
+  carry both a skip reason and separate rate-limit observations at once.
+- Parses `rate_limits` (`primary`/`secondary` windows) into standalone
+  `RateLimitObservation`s: percent, semantic window length, and reset time
+  only. `limit_id`, `plan_type`, `credits`, and every other account/plan
+  identifier are never parsed into any output field. No relationship between
+  a percent reading and any token count is asserted anywhere.
+- Reports `model: null` / `modelAttribution: "unavailable_in_record"` always
+  — Codex's counter records carry no model field, and the last-seen
+  `turn_context.model` is never carried forward onto them.
+- Reports every applicable counter-consistency flag at once (e.g.
+  `cached_exceeds_input`, `total_mismatch`, `incomplete`) rather than the
+  first one found, and asserts no bound for `cache_write_input_tokens` the
+  source evidence didn't establish.
+- Identity is hashed with an explicit `"codex"` vendor discriminator, so a
+  Codex `response_id` can never collide with a Claude identity even if the
+  raw strings match.
+- Ships its own idempotent revision/dedup accumulator (same
+  newer-replaces/older-dropped/tie-is-noop/conflicting-tie-quarantined rules
+  as Claude's), duplicated rather than shared, so this module cannot change
+  Claude's already-reviewed accumulator semantics.
+
+See `test/codex-usage-events.test.ts` for synthetic-fixture coverage.
+The module does not import or persist Codex telemetry or predict quota
+consumption. Collector integration and durable storage remain future work.
