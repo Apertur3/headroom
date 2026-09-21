@@ -107,6 +107,11 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   FREEZE, log overrides with a reason.
 - Adapter SDK: an adapter is a pure function `(principal) → observations[]` plus a conformance
   fixture directory; third parties add vendors without touching the core.
+- `headroom usage import --source <alias> --principal <alias> --path <file>` / `import-status`:
+  opt-in, explicitly-invoked ingestion of raw numeric usage counters (token counts, not a
+  percent-of-limit) from one named Claude Code transcript file into a private `usage.db`,
+  entirely separate from the observation/pace/`can` pipeline above. No directory walk, no
+  daemon, no scheduler; see `docs/usage-prediction.md`.
 
 ## Acceptance criteria
 

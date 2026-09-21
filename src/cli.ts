@@ -17,6 +17,7 @@ import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCred
 import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
+import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
@@ -1309,7 +1310,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["logs", "Print the tail of the daemon log"],
   ["notify", "Configure notifications, send a test message, or show the delivery ledger"],
   ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar (--render for the full line)"],
-  ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard)"],
+  ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard); or import numeric usage counters from a transcript file (import, import-status)"],
   ["update", "Check the npm registry for a newer headroomd and install it (--notes, --dry-run)"],
   ["version", "Print the Headroom version"],
   ["contract", "Print the JSON contract version and where it is documented"],
@@ -1358,7 +1359,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   logs: "Usage: headroom logs [--tail 50]",
   notify: NOTIFY_USAGE,
   statusline: "Usage: headroom statusline [--render] [--style compact|full] [--meters <m1,m2>] [--color] [--chain <command>]",
-  usage: USAGE_PASTE_HELP,
+  usage: [USAGE_PASTE_HELP, `  import: ${USAGE_IMPORT_HELP}`, `  import-status: ${USAGE_IMPORT_STATUS_HELP}`].join("\n"),
   update: "Usage: headroom update [--notes] [--dry-run] [--yes]",
   version: "Usage: headroom version (or: headroom --version)",
   contract: "Usage: headroom contract",
@@ -1403,6 +1404,13 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "completion") return completionCommand(argv.slice(1));
   if (argv[0] === "_complete-meters") return printCompletionMeterIds();
   if (argv[0] === "_complete-principals") return printCompletionPrincipalIds();
+  // Dispatched here, ahead of the proxy strip and the legacy-home migration
+  // just below: these two are local-only, file-scoped commands against their
+  // own usage.db and must never trigger an unrelated network fetch, config
+  // read, or legacy-home notice line (which would otherwise land inside a
+  // clean --json stdout).
+  if (argv[0] === "usage" && argv[1] === "import") return usageImportCommand(argv.slice(1));
+  if (argv[0] === "usage" && argv[1] === "import-status") return usageImportStatusCommand(argv.slice(1));
   // Before any command can fetch a vendor endpoint: an operator's shell
   // proxy must never silently carry a credentialed request unless
   // policy.toml opts in.

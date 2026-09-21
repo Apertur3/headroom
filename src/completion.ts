@@ -53,6 +53,7 @@ function subcommandsFromListName(name: string): string[] {
 const EXTRA_SUBCOMMANDS: Readonly<Record<string, readonly string[]>> = {
   inbox: ["send"],
   plan: ["import"],
+  usage: ["import", "import-status"],
 };
 
 /** Built fresh from cli.ts's own COMMAND_LIST/COMMAND_HELP on every call:

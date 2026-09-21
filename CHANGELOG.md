@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-21
+
+### Added
+- Opt-in incremental Claude usage imports with `headroom usage import` and `headroom usage import-status`. Each invocation reads one explicit file with bounded batches, identity deduplication, revision handling, and conflict quarantine. Imported counters live in a private `usage.db`, separate from the quota database.
+- Library-only Codex telemetry normalizer that accepts identity-bearing per-response counters, classifies cumulative streams as skipped, and parses rate-limit observations. Not yet wired into the CLI or storage.
+
 ## [0.1.4] - 2026-09-19
 
 ### Added
