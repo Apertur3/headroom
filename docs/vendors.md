@@ -193,6 +193,17 @@ Meters are `<principal>:gemini` and `<principal>:claude-gpt`, each with five-hou
 weekly windows. Missing readers, login failures and unavailable summaries remain UNKNOWN.
 Idle windows with real fractions can carry a doubt marker when their reset time matches
 fetch time plus window length; availability alone is never reported as unused capacity.
+
+A genuinely idle five-hour (rolling) window can go further: when `retrieveUserQuota`
+succeeds but omits the five-hour bucket entirely (nothing to report, not an error), Headroom
+reports that window `not_enforced` instead of failed -- no invented quantity, percentage or
+reset, shown as `5h n/a (vendor sent no 5h bucket in this response)`. This replaces a stale
+frozen reading immediately (the newer `not_enforced` observation outranks an old `fresh` one
+by fetch time) and is skipped, not blocking, on `gate --need 5h:N` and `can`. A real bucket
+with genuine usage is unaffected -- the vendor's own numbers always win when one is present.
+The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
+(UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
+
 `headroom doctor` distinguishes the native reader, login state and successful quota read.
 `--shape` is not available for this local source; use status JSON and doctor.
 
