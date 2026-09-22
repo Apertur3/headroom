@@ -114,4 +114,25 @@ describe("parseUsageImportOptions", () => {
     const res = parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "my path with spaces"]);
     expect(res).toEqual({ command: "import", source: "s", principal: "p", path: "my path with spaces", maxBytes: DEFAULT_IMPORT_BYTES, json: false });
   });
+
+  it("parses --format auto as its own real value, not folded into the claude default", () => {
+    const res = parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "p", "--format", "auto"]);
+    expect(res).toEqual({ command: "import", source: "s", principal: "p", path: "p", maxBytes: DEFAULT_IMPORT_BYTES, json: false, format: "auto" });
+  });
+
+  it("parses --format claude and --format codex explicitly", () => {
+    expect(parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "p", "--format", "claude"]))
+      .toEqual({ command: "import", source: "s", principal: "p", path: "p", maxBytes: DEFAULT_IMPORT_BYTES, json: false, format: "claude" });
+    expect(parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "p", "--format", "codex"]))
+      .toEqual({ command: "import", source: "s", principal: "p", path: "p", maxBytes: DEFAULT_IMPORT_BYTES, json: false, format: "codex" });
+  });
+
+  it("omits format entirely when --format is not given at all (distinct from an explicit auto)", () => {
+    const res = parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "p"]);
+    expect(res).not.toHaveProperty("format");
+  });
+
+  it("rejects an unrecognized --format value", () => {
+    expect(() => parseUsageImportOptions(["import", "--source", "s", "--principal", "p", "--path", "p", "--format", "bogus"])).toThrow("Invalid value for --format");
+  });
 });
