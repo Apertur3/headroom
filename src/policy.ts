@@ -119,6 +119,30 @@ function nextPollHint(observation: Observation, fetchedAtMs: number, policy: Pol
   return `; next poll ~${formatClockTime(new Date(expectedAt))}`;
 }
 
+/** A held reading (store.ts's vendor-window consistency guard: see issue
+ * #55) is deliberately frozen at its last confirmed baseline while a new
+ * vendor identity awaits a second matching poll -- its growing age is
+ * evidence of that wait, not of a dead poller or exhausted capacity. Once it
+ * crosses the ordinary staleness threshold, label it as held rather than
+ * generically "stale Nm": that phrasing reads as "the source stopped
+ * answering" or "this may be spent," neither of which is true here, and it
+ * gives no recovery path. This is checked ahead of the plain staleness
+ * reason in both paceDecision and freshnessGate, never instead of it -- the
+ * pace state stays UNKNOWN and the gate still fails closed by default,
+ * exactly like any other unconfirmed reading; only the explanation changes. */
+function heldWindowReason(observation: Observation, ageMinutes: number): string | undefined {
+  if (!observation.metadata?.vendor_window_held && !observation.metadata?.vendor_inconsistent) return undefined;
+  return `held window past reset, unconfirmed (${ageMinutes}m since the last accepted reading); the vendor has not confirmed the new window yet -- wait for the next poll, or re-run headroom status once it reports one`;
+}
+
+/** The reason text a stale-by-age fresh reading gets: heldWindowReason's
+ * distinguishable explanation when this row is a held vendor-window
+ * baseline, otherwise the plain "stale Nm" every other aged-out reading has
+ * always used. */
+function staleOrHeldReason(observation: Observation, ageMinutes: number): string {
+  return heldWindowReason(observation, ageMinutes) ?? `stale ${ageMinutes}m`;
+}
+
 export function paceDecision(observation: Observation | undefined, policy = defaultPolicy, now = new Date()): { state: PaceState; reason: string } {
   if (!observation) return { state: "UNKNOWN", reason: "no observation" };
   if (observation.window?.kind === "state") {
@@ -136,7 +160,7 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   const fetched = parsedFetchedAt;
   if (!Number.isFinite(fetched)) return { state: "UNKNOWN", reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
-  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `stale ${ageMinutes}m${nextPollHint(observation, fetched, policy, now)}` };
+  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `${staleOrHeldReason(observation, ageMinutes)}${nextPollHint(observation, fetched, policy, now)}` };
   const used = observation.quantity.used;
   if (used >= 100 - policy.freeze_reserve_pct) return { state: "FREEZE", reason: "reserve reached" };
   const reset = observation.resets_at ? new Date(observation.resets_at).getTime() : Number.NaN;
@@ -203,7 +227,7 @@ export function freshnessGate(observation: Observation | undefined, staleMinutes
   const fetched = new Date(observation.fetched_at).getTime();
   if (!Number.isFinite(fetched)) return { ok: false, reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
-  if (now.getTime() - fetched > staleMinutes * 60_000) return { ok: false, reason: `stale ${ageMinutes}m` };
+  if (now.getTime() - fetched > staleMinutes * 60_000) return { ok: false, reason: staleOrHeldReason(observation, ageMinutes) };
   return { ok: true, reason: "fresh" };
 }
 

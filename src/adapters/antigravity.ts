@@ -81,6 +81,37 @@ export function observationsFromAntigravityQuota(body: unknown, account: Provide
     const match = candidates.filter((candidate) => candidate.meter === meter && candidate.minutes === window.minutes && candidate.remaining !== undefined)
       .sort((left, right) => (left.remaining ?? 1) - (right.remaining ?? 1))[0];
     if (!match || match.remaining === undefined) {
+      // The rolling five-hour lane has no persistent state to report while
+      // genuinely unused, and retrieveUserQuota already proved this
+      // account's response is real (buckets() found at least one usable
+      // fraction somewhere, or observeAntigravity would already have failed
+      // the whole read above) -- but an absent bucket is still exactly
+      // that: absent. Earlier attempts here synthesized a 100%-remaining
+      // reading with a reset of fetch-time-plus-window-length, a number the
+      // vendor never actually sent; that is precisely the placeholder shape
+      // Headroom already treats with suspicion everywhere else (see
+      // detectPlaceholder), and inventing it for real was rejected (issue
+      // #55). So this reports the honest thing instead: `not_enforced`,
+      // with no quantity, no resets_at and no percentage -- "the vendor
+      // sent no bucket for this window in this response" -- the same
+      // vendor-confirmed-absence state claude-main:routines already uses
+      // for a scoped limit with nothing to show (see adapters/claude.ts's
+      // `scoped()`). Because `not_enforced` shares fresh's top rank in
+      // store.ts's latestPerWindow (and insertPoll treats it as present,
+      // not omitted), this reading replaces an old real fresh 5h reading
+      // the moment the window goes idle instead of freezing it in place
+      // until it ages into a misleading "stale Nm" -- the actual bug issue
+      // #55 reported. Status shows it as "5h n/a (...)", never 100% and
+      // never exhausted, and a `gate --need 5h:N` on it does not block
+      // (freshnessGate/paceDecision treat not_enforced as skip-worthy, not
+      // fail-closed). A fixed (weekly) window never gets this treatment --
+      // the vendor has never been observed to omit it while healthy, so its
+      // absence stays a genuine failed read.
+      if (window.kind === "rolling") {
+        output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" },
+          quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor sent no 5h bucket in this response" });
+        continue;
+      }
       output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no quota bucket for this window" });
       continue;
     }
