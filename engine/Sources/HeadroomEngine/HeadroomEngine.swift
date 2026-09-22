@@ -239,12 +239,12 @@ struct HeadroomEngine {
         var output: [Observation] = []
 
         if summaryWindows.isEmpty {
-            output += windows(principal, meter: "gemini", windows: [usage.primary], source: source)
-            output += windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: source)
+            output += windows(principal, meter: "gemini", windows: [usage.primary], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
+            output += windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
         } else {
             for named in summaryWindows where named.usageKnown {
                 guard let meter = AntigravitySnapshotWaiter.meter(for: named) else { continue }
-                output += windows(principal, meter: meter, windows: [named.window], source: source)
+                output += windows(principal, meter: meter, windows: [named.window], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
             }
         }
 
@@ -260,10 +260,15 @@ struct HeadroomEngine {
         return output
     }
 
-    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil) -> [Observation] {
+    /// `kind` classifies a seen window's `Window.kind`. Defaults to the
+    /// legacy resetsAt-presence heuristic (still correct for Codex, which
+    /// has no fixed window-identity table). Antigravity callers pass
+    /// `AntigravitySnapshotWaiter.kind(for:)` instead, which classifies by
+    /// window duration/identity -- see that function's doc comment.
+    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil, kind: (RateWindow) -> String = { $0.resetsAt == nil ? "rolling" : "fixed" }) -> [Observation] {
         windows.compactMap { value in
             guard let value, !value.isSyntheticPlaceholder else { return nil }
-            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: value.resetsAt == nil ? "rolling" : "fixed", minutes: value.windowMinutes, enforcement: "hard"), metadata: metadata)
+            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: kind(value), minutes: value.windowMinutes, enforcement: "hard"), metadata: metadata)
         }
     }
 
