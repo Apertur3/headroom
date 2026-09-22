@@ -90,8 +90,11 @@ function isFinished(result: CollectResult): boolean {
  * pairs (`accepted_new`, `skipped:rate_limit_only`, `rejected:missing_usage`,
  * ...), so no extra rendering is needed for it beyond labeling the run --
  * unlike import-status's grouped totals, which do carry Codex-only counter
- * columns (see `totalHumanLine`). */
-function importHumanLines(result: CollectResult, format: "claude" | "codex" = "claude"): string[] {
+ * columns (see `totalHumanLine`). `"auto"` labels the run as detected
+ * per-line (see usage-format-detect.ts); which vendor(s) it actually found
+ * is visible from the counters line below (a Codex-shaped line always bumps
+ * a Codex-vocabulary counter, and vice versa). */
+function importHumanLines(result: CollectResult, format: "claude" | "codex" | "auto" = "claude"): string[] {
   const lines: string[] = [];
   const cursor = shortHash(result.cursorKey);
   if (result.kind === "principal_conflict" || result.kind === "source_conflict") {
@@ -105,7 +108,7 @@ function importHumanLines(result: CollectResult, format: "claude" | "codex" = "c
     lines.push(`interrupted: cursor ${cursor} -- ${reasonText}; investigate before re-running`);
     return lines;
   }
-  const formatNote = format === "codex" ? " format=codex" : "";
+  const formatNote = format === "codex" || format === "auto" ? ` format=${format}` : "";
   lines.push(`imported: cursor ${cursor} generation=${result.generation} bytesRead=${result.bytesReadThisRun}${formatNote} ${isFinished(result) ? "(finished)" : "(not finished -- re-run to continue)"}`);
   if (!isFinished(result)) {
     const pending: string[] = [];
@@ -131,13 +134,14 @@ export async function usageImportCommand(argv: string[]): Promise<number> {
     store = await UsageStore.open({ create: true });
     if (!store) throw new Error(GENERIC_IMPORT_FAILURE);
 
+    const format: "claude" | "codex" | "auto" = options.format === "codex" ? "codex" : options.format === "auto" ? "auto" : "claude";
     const result = await collectUsageFile(store, {
       sourceAlias: options.source,
       principalAlias: options.principal,
       path: options.path,
       ...(options.job !== undefined ? { jobAlias: options.job } : {}),
       maxBytes: options.maxBytes,
-      vendor: options.format === "codex" ? "codex" : undefined,
+      vendor: format,
     });
 
     if (options.json) {
@@ -155,13 +159,13 @@ export async function usageImportCommand(argv: string[]): Promise<number> {
         jobConflictIdentities: result.jobConflictIdentities,
         interruptReason: result.interruptReason,
         finished: isFinished(result),
-        format: options.format === "codex" ? "codex" : "claude",
+        format,
         counters: result.counters,
         ...COVERAGE,
       };
       console.log(JSON.stringify(jsonEnvelope(payload, new Date())));
     } else {
-      for (const line of importHumanLines(result, options.format === "codex" ? "codex" : "claude")) console.log(line);
+      for (const line of importHumanLines(result, format)) console.log(line);
       console.log(`(${COVERAGE.coverage}, account coverage ${COVERAGE.account_coverage}, evidence: ${COVERAGE.evidence_note})`);
     }
     return result.kind === "imported" ? 0 : 1;
