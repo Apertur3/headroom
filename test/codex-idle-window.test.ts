@@ -189,4 +189,54 @@ describe("Codex moving idle windows (issue #50)", () => {
       expect(paceDecision(spark, undefined, new Date(at))).toMatchObject({ state: "UNKNOWN" });
     } finally { store.close(); }
   });
+
+  // Reported live: codex-main:spark stuck at "5h UNKNOWN (stale 7390m...)".
+  // A real, aged Spark reading must not freeze in place forever once the
+  // meter goes idle. Before this fix, a poll whose
+  // `additional_rate_limits` array carries no Spark entry inserted nothing
+  // for codex-main:spark at all, so the store never had a newer row to rank
+  // above the old real one -- it just sat there while its displayed age grew
+  // without bound ("5h UNKNOWN (stale 7390m...)"). The adapter now always
+  // reports both Spark windows (real or not_enforced), and store.ts ranks
+  // not_enforced alongside fresh so the new reading actually supersedes the
+  // frozen one the same poll the meter goes idle.
+  it("replaces a frozen real Spark reading with an honest not_enforced one once the meter goes idle, and does not block a gate on it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-codex-idle-spark-56-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const activeAt = "2026-09-01T08:00:00Z";
+      const activeUsage = { rate_limit: {
+        primary_window: { used_percent: 30, reset_at: Math.floor((Date.parse(activeAt) + 300 * 60_000) / 1000) },
+        secondary_window: { used_percent: 10, reset_at: Math.floor((Date.parse(activeAt) + 10_080 * 60_000) / 1000) },
+      }, additional_rate_limits: [{ limit_name: "GPT-5.3-Codex-Spark", rate_limit: {
+        primary_window: { used_percent: 45, reset_at: Math.floor((Date.parse(activeAt) + 300 * 60_000) / 1000) },
+        secondary_window: { used_percent: 12, reset_at: Math.floor((Date.parse(activeAt) + 10_080 * 60_000) / 1000) },
+      } }] };
+      store.insertPoll(observationsFromCodexUsage(activeUsage, {}, account, new Date(activeAt)));
+      const beforeIdle = store.latestPerWindow("codex-main:spark").find((row) => row.window?.minutes === 300)!;
+      expect(beforeIdle).toMatchObject({ freshness: "fresh", quantity: { used: 45 } });
+
+      // Many hours later, the meter has gone idle and the vendor stops
+      // reporting a Spark entry at all -- the exact repro shape from the
+      // stuck "5h UNKNOWN (stale 7390m...)" report.
+      const idleAt = "2026-09-06T14:23:00Z"; // ~5.3 days later
+      const idleUsage = { rate_limit: {
+        primary_window: { used_percent: 0, reset_at: Math.floor((Date.parse(idleAt) + 300 * 60_000) / 1000) },
+        secondary_window: { used_percent: 5, reset_at: Math.floor((Date.parse(idleAt) + 10_080 * 60_000) / 1000) },
+      }, additional_rate_limits: [] };
+      store.insertPoll(observationsFromCodexUsage(idleUsage, {}, account, new Date(idleAt)));
+
+      const sparkFive = store.latestPerWindow("codex-main:spark").find((row) => row.window?.minutes === 300)!;
+      expect(sparkFive).toMatchObject({ freshness: "not_enforced", quantity: null, resets_at: null, fetched_at: new Date(idleAt).toISOString() });
+      expect(sparkFive.reason).toContain("no Spark data");
+      // The old frozen 45%-used reading is gone from current status.
+      expect(sparkFive.id).not.toBe(beforeIdle.id);
+      // Read-side pace state for the now-honest gap is NOT_ENFORCED, not a
+      // frozen UNKNOWN stale-age reading and never a fabricated FREEZE/100%.
+      expect(paceDecision(sparkFive, undefined, new Date(idleAt))).toMatchObject({ state: "NOT_ENFORCED" });
+
+      const sparkWeekly = store.latestPerWindow("codex-main:spark").find((row) => row.window?.minutes === 10_080)!;
+      expect(sparkWeekly).toMatchObject({ freshness: "not_enforced", quantity: null });
+    } finally { store.close(); }
+  });
 });

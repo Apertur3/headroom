@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - Stop treating a missing Antigravity rolling 5h quota bucket as a failed read, which froze the last real reading in place until it aged into a misleading stale state even while the weekly window was fresh. A missing bucket in an otherwise-successful response is now reported honestly as not-enforced (no invented quantity, percentage, or reset), replaces the old reading immediately, shows as `5h n/a (...)` in status, and does not block a `gate --need 5h:N` check.
+- Stop treating a missing Codex Spark rate-limit entry as a silent no-op that froze the meter's last real reading in place until it aged into a misleading stale state, even while the vendor's response was otherwise healthy. A missing entry in an otherwise-successful response is now reported honestly as not-enforced (no invented quantity, percentage, or reset), replaces the old reading immediately, and does not block a `gate --need` check on it -- same truth rule as Antigravity's rolling 5h window fix.
 
 ## [0.1.5] - 2026-09-21
 

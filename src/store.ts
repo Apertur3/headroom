@@ -554,7 +554,8 @@ export class HeadroomStore {
    * A later vendor response for the same duration supersedes the retirement.
    * A `not_enforced` row counts as present, not omitted: it is the adapter
    * explicitly reporting on that window this poll (a confirmed absent cap,
-   * or issue #55's "vendor sent no bucket for it"), so it must not trigger
+   * issue #55's "vendor sent no bucket for it", or Codex Spark's "vendor
+   * sent no data for this meter in this response"), so it must not trigger
    * the same "vendor no longer reports this window" retirement a genuinely
    * omitted window would -- latestPerWindow's own ranking already lets that
    * not_enforced reading supersede an older fresh one for the same window. */
@@ -1390,15 +1391,17 @@ export class HeadroomStore {
    * `not_enforced` shares fresh's top rank (tie-broken by fetched_at like any
    * other pair in that tier): it is a vendor-confirmed CURRENT statement about
    * this window -- "no bucket for it in this response" (issue #55's rolling
-   * 5h case) or "no cap on it at all" (claude-main:routines) -- not a gap to
-   * be filled by an older reading. A genuinely idle rolling window that used
-   * to carry real usage must have that old percentage replaced by the new
-   * not_enforced reading, the same poll it goes idle, rather than freezing in
-   * place until it ages into a misleading "stale Nm": that freeze (and the
-   * synthesized-100% workaround it once justified) was the bug issue #55
-   * reported. A later real, fresh percent reading for the same window still
-   * displaces a not_enforced one exactly like it displaces another fresh one,
-   * since the tie-break is fetched_at DESC either way.
+   * 5h case), "no cap on it at all" (claude-main:routines), or "no
+   * bucket/entry for it in this response" (Codex Spark going idle) -- not a
+   * gap to be filled by an older reading. A genuinely idle rolling window
+   * that used to carry real usage must have that old percentage replaced by
+   * the new not_enforced reading, the same poll it goes idle, rather than
+   * freezing in place until it ages into a misleading "stale Nm": that
+   * freeze (and the synthesized-100% workaround it once justified for issue
+   * #55) was the underlying bug in both cases. A later real, fresh percent
+   * reading for the same window still displaces a not_enforced one exactly
+   * like it displaces another fresh one, since the tie-break is fetched_at
+   * DESC either way.
    */
   latestPerWindow(meterId?: string): StoredObservation[] {
     const filter = meterId === undefined
