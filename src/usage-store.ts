@@ -43,9 +43,19 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { AccumulatedUsageEntry, ClaudeUsageSnapshot, NumericField, QuarantineReason, UsageAccumulatorState } from "./usage-events.js";
 import { applyUsageSnapshot, createUsageAccumulator } from "./usage-events.js";
+import type { AccumulatedCodexUsageEntry, CodexQuarantineReason, CodexUsageAccumulatorState, CodexUsageFields, CodexUsageSnapshot } from "./codex-usage-events.js";
+import { applyCodexUsageSnapshot, createCodexUsageAccumulator } from "./codex-usage-events.js";
 import { openUsageDatabase, type UsageDatabase } from "./usage-db.js";
 
-export const CURRENT_USAGE_SCHEMA_VERSION = 1;
+export const CURRENT_USAGE_SCHEMA_VERSION = 2;
+
+/** `model` is `NOT NULL` on `usage_identities`, but a Codex counter record
+ * carries no model field at all (see codex-usage-events.ts). This fixed
+ * sentinel fills the column for every Codex row instead of a fabricated or
+ * guessed model id; `model_attribution = 'unavailable_in_record'` on the same
+ * row is what tells a reader the sentinel is standing in for "not present",
+ * never a real model. */
+export const CODEX_UNAVAILABLE_MODEL = "codex:unavailable";
 
 export class NewerUsageSchemaError extends Error {
   constructor(readonly found: number, readonly supported: number) {
@@ -67,7 +77,8 @@ export type PersistenceField =
   | "identity_key" | "source_key" | "principal_key" | "job_key" | "path_key"
   | "model" | "observed_at_ms" | "sequence" | "counter_value" | "counter_diagnosis"
   | "counter_kind" | "quarantine_reason" | "cursor_key" | "cursor_number"
-  | "cursor_status" | "cursor_hash" | "cursor_device_id";
+  | "cursor_status" | "cursor_hash" | "cursor_device_id"
+  | "vendor" | "model_attribution" | "consistency_flags";
 
 /** Refusal at the persistence boundary. The message names only the *field*
  * that failed, never the rejected value -- the whole point of the check is
@@ -135,6 +146,7 @@ export type IdentityOutcome = "accepted_new" | "accepted_updated" | "duplicate" 
 export type JobBindingOutcome = "bound" | "unchanged" | "conflict" | "already_conflicted";
 
 export interface GroupedTotal {
+  vendor: "claude" | "codex";
   principalKey: string;
   sourceKey: string;
   model: string;
@@ -143,6 +155,22 @@ export interface GroupedTotal {
   outputTokens: SafeSum;
   cacheReadInputTokens: SafeSum;
   cacheCreationInputTokens: SafeSum;
+  /** Present only on `vendor: "codex"` groups -- Codex's own counter
+   * vocabulary has no Claude analogue for these four. */
+  cachedInputTokens?: SafeSum;
+  cacheWriteTokens?: SafeSum;
+  reasoningTokens?: SafeSum;
+  totalTokens?: SafeSum;
+}
+
+/** Same shape as `GroupedTotal` with the Codex-only fields made mandatory,
+ * for callers that already know they are looking at a Codex group. */
+export interface CodexGroupedTotal extends GroupedTotal {
+  vendor: "codex";
+  cachedInputTokens: SafeSum;
+  cacheWriteTokens: SafeSum;
+  reasoningTokens: SafeSum;
+  totalTokens: SafeSum;
 }
 
 /** A sum kept safe-integer-exact when possible. `total` is `null` both when
@@ -167,6 +195,8 @@ const COUNTER_KIND_RE = /^[a-z_]+(?::[a-z_]+)?$/;
 const DEVICE_ID_RE = /^-?[0-9]{1,20}$/;
 const NUMERIC_DIAGNOSES = new Set(["not_a_number", "not_finite", "not_integer", "negative", "unsafe_integer"]);
 const QUARANTINE_REASONS = new Set<string>(["identity_model_conflict", "conflicting_same_version"]);
+const CODEX_QUARANTINE_REASONS = new Set<string>(["conflicting_same_version", "identity_conflict"]);
+const CODEX_CONSISTENCY_FLAGS = new Set<string>(["cached_exceeds_input", "reasoning_exceeds_output", "total_mismatch", "incomplete"]);
 /** Upper bound on an accepted observation timestamp (2100-01-01T00:00:00Z):
  * far enough out to never reject real data, close enough to reject a number
  * smuggled through a timestamp field. */
@@ -232,6 +262,35 @@ function assertPersistableEntry(entry: AccumulatedUsageEntry): void {
 
 function assertPersistableSnapshot(snapshot: ClaudeUsageSnapshot): void {
   assertPersistableEntry({ ...snapshot, evidence: "message_visible" });
+}
+
+/** Same role as `assertPersistableEntry`, for a Codex identity. `model` is
+ * asserted `null` (never coerced) because the persisted row always carries
+ * `CODEX_UNAVAILABLE_MODEL` in its `model` column instead -- the type's own
+ * `null` is what proves no real model id is being smuggled through here. */
+function assertPersistableCodexEntry(entry: AccumulatedCodexUsageEntry): void {
+  assertHex32(entry.identityKey, "identity_key");
+  assertHex32(entry.sourceKey, "source_key");
+  assertHex32(entry.principalKey, "principal_key");
+  if (entry.vendor !== "codex") throw new UsagePersistenceError("vendor");
+  if (entry.model !== null) throw new UsagePersistenceError("model");
+  if (entry.modelAttribution !== "unavailable_in_record") throw new UsagePersistenceError("model_attribution");
+  assertRange(entry.observedAtMs, "observed_at_ms", 0, MAX_OBSERVED_AT_MS);
+  assertRange(entry.sequence, "sequence", 0, MAX_SEQUENCE);
+  const usage = entry.usage;
+  assertCounterField(usage.input_tokens);
+  assertCounterField(usage.output_tokens);
+  assertCounterField(usage.cached_input_tokens);
+  assertCounterField(usage.cache_write_input_tokens);
+  assertCounterField(usage.reasoning_output_tokens);
+  assertCounterField(usage.total_tokens);
+  for (const flag of entry.consistency) {
+    if (!CODEX_CONSISTENCY_FLAGS.has(flag)) throw new UsagePersistenceError("consistency_flags");
+  }
+}
+
+function assertPersistableCodexSnapshot(snapshot: CodexUsageSnapshot): void {
+  assertPersistableCodexEntry({ ...snapshot, evidence: "usage_record_visible" });
 }
 
 function assertPersistableCursor(row: CursorRow): void {
@@ -470,9 +529,25 @@ export class UsageStore {
       if (!QUARANTINE_REASONS.has(reason)) throw new UsagePersistenceError("quarantine_reason");
       return { entries: new Map(), quarantined: new Map([[identityKey, { identityKey, reason: reason as QuarantineReason }]]) };
     }
-    const entryRow = this.db.prepare("SELECT * FROM usage_identities WHERE identity_key = ?").get(identityKey);
+    const entryRow = this.db.prepare("SELECT * FROM usage_identities WHERE identity_key = ? AND vendor = 'claude'").get(identityKey);
     if (!entryRow) return createUsageAccumulator();
     return { entries: new Map([[identityKey, entryFromRow(entryRow)]]), quarantined: new Map() };
+  }
+
+  /** Same role as `fetchSingleton`, for a Codex identity. The `vendor = 'codex'`
+   * guard on the row read means a Claude and a Codex identity can never be
+   * confused even in the (structurally impossible, given the normalizer's own
+   * "codex"-prefixed hash) case of a colliding `identity_key`. */
+  private fetchSingletonCodex(identityKey: string): CodexUsageAccumulatorState {
+    const quarantineRow = this.db.prepare("SELECT reason FROM usage_quarantine WHERE identity_key = ?").get(identityKey);
+    if (quarantineRow) {
+      const reason = String(quarantineRow.reason);
+      if (!CODEX_QUARANTINE_REASONS.has(reason)) throw new UsagePersistenceError("quarantine_reason");
+      return { entries: new Map(), quarantined: new Map([[identityKey, { identityKey, reason: reason as CodexQuarantineReason }]]) };
+    }
+    const entryRow = this.db.prepare("SELECT * FROM usage_identities WHERE identity_key = ? AND vendor = 'codex'").get(identityKey);
+    if (!entryRow) return createCodexUsageAccumulator();
+    return { entries: new Map([[identityKey, codexEntryFromRow(entryRow)]]), quarantined: new Map() };
   }
 
   /** Folds one snapshot into its identity's prior state with the pure
@@ -522,6 +597,40 @@ export class UsageStore {
     return "duplicate";
   }
 
+  /** Codex analogue of `applyAndPersist`, folding one Codex snapshot through
+   * the pure Codex accumulator (`applyCodexUsageSnapshot`) and persisting
+   * only the delta -- same outcome vocabulary, same fetch-one/apply-pure/
+   * write-one shape, distinguished only by which columns and which
+   * accumulator it reads/writes. */
+  applyAndPersistCodex(snapshot: CodexUsageSnapshot): IdentityOutcome {
+    assertPersistableCodexSnapshot(snapshot);
+    const prior = this.fetchSingletonCodex(snapshot.identityKey);
+    const next = applyCodexUsageSnapshot(prior, snapshot);
+    const hadEntry = prior.entries.get(snapshot.identityKey);
+    const hasEntry = next.entries.get(snapshot.identityKey);
+    const hadQuarantine = prior.quarantined.has(snapshot.identityKey);
+    const hasQuarantine = next.quarantined.get(snapshot.identityKey);
+    const now = new Date().toISOString();
+
+    if (hasQuarantine) {
+      if (hadQuarantine) return "quarantined_repeat";
+      this.db.prepare("DELETE FROM usage_identities WHERE identity_key = ?").run(snapshot.identityKey);
+      this.db.prepare(`INSERT INTO usage_quarantine (identity_key, source_key, principal_key, reason, updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(identity_key) DO UPDATE SET source_key = excluded.source_key, principal_key = excluded.principal_key,
+          reason = excluded.reason, updated_at = excluded.updated_at`)
+        .run(snapshot.identityKey, snapshot.sourceKey, snapshot.principalKey, hasQuarantine.reason, now);
+      return "quarantined_new";
+    }
+    if (hadEntry && hasEntry && hadEntry === hasEntry) {
+      return snapshot.observedAtMs === hadEntry.observedAtMs ? "duplicate" : "stale_ignored";
+    }
+    if (hasEntry) {
+      this.writeCodexEntry(hasEntry, now);
+      return hadEntry ? "accepted_updated" : "accepted_new";
+    }
+    return "duplicate";
+  }
+
   private writeEntry(entry: AccumulatedUsageEntry, now: string): void {
     assertPersistableEntry(entry);
     const u = entry.usage;
@@ -551,6 +660,39 @@ export class UsageStore {
       breakdown ? breakdown.ephemeral_5m_input_tokens.value : null, breakdown ? breakdown.ephemeral_5m_input_tokens.diagnosis : null,
       breakdown ? breakdown.ephemeral_1h_input_tokens.value : null, breakdown ? breakdown.ephemeral_1h_input_tokens.diagnosis : null,
       now);
+  }
+
+  /** Codex analogue of `writeEntry`. `model` is always written as
+   * `CODEX_UNAVAILABLE_MODEL` (the column is `NOT NULL`); `vendor` and
+   * `model_attribution` are what let a reader tell that sentinel apart from
+   * a real, unrecognized Claude model id. */
+  private writeCodexEntry(entry: AccumulatedCodexUsageEntry, now: string): void {
+    assertPersistableCodexEntry(entry);
+    const u: CodexUsageFields = entry.usage;
+    this.db.prepare(`INSERT INTO usage_identities
+      (identity_key, source_key, principal_key, model, vendor, model_attribution, observed_at_ms, sequence,
+       input_tokens_value, input_tokens_diagnosis, output_tokens_value, output_tokens_diagnosis,
+       cached_input_value, cached_input_diagnosis, cache_write_value, cache_write_diagnosis,
+       reasoning_value, reasoning_diagnosis, total_value, total_diagnosis, consistency_flags, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(identity_key) DO UPDATE SET
+        source_key = excluded.source_key, principal_key = excluded.principal_key, model = excluded.model,
+        vendor = excluded.vendor, model_attribution = excluded.model_attribution,
+        observed_at_ms = excluded.observed_at_ms, sequence = excluded.sequence,
+        input_tokens_value = excluded.input_tokens_value, input_tokens_diagnosis = excluded.input_tokens_diagnosis,
+        output_tokens_value = excluded.output_tokens_value, output_tokens_diagnosis = excluded.output_tokens_diagnosis,
+        cached_input_value = excluded.cached_input_value, cached_input_diagnosis = excluded.cached_input_diagnosis,
+        cache_write_value = excluded.cache_write_value, cache_write_diagnosis = excluded.cache_write_diagnosis,
+        reasoning_value = excluded.reasoning_value, reasoning_diagnosis = excluded.reasoning_diagnosis,
+        total_value = excluded.total_value, total_diagnosis = excluded.total_diagnosis,
+        consistency_flags = excluded.consistency_flags,
+        updated_at = excluded.updated_at`).run(
+      entry.identityKey, entry.sourceKey, entry.principalKey, CODEX_UNAVAILABLE_MODEL, entry.vendor, entry.modelAttribution,
+      entry.observedAtMs, entry.sequence,
+      u.input_tokens.value, u.input_tokens.diagnosis, u.output_tokens.value, u.output_tokens.diagnosis,
+      u.cached_input_tokens.value, u.cached_input_tokens.diagnosis, u.cache_write_input_tokens.value, u.cache_write_input_tokens.diagnosis,
+      u.reasoning_output_tokens.value, u.reasoning_output_tokens.diagnosis, u.total_tokens.value, u.total_tokens.diagnosis,
+      JSON.stringify(entry.consistency), now);
   }
 
   // -------------------------------------------------------------------
@@ -592,14 +734,16 @@ export class UsageStore {
   groupedTotals(filter: StatusFilter = {}): GroupedTotal[] {
     const rows = this.db.prepare("SELECT * FROM usage_identities").all()
       .filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter));
-    const groups = new Map<string, { principalKey: string; sourceKey: string; model: string; rows: Record<string, unknown>[] }>();
+    const groups = new Map<string, { vendor: "claude" | "codex"; principalKey: string; sourceKey: string; model: string; rows: Record<string, unknown>[] }>();
     for (const row of rows) {
-      const key = `${row.principal_key} ${row.source_key} ${row.model}`;
-      const group = groups.get(key) ?? { principalKey: String(row.principal_key), sourceKey: String(row.source_key), model: String(row.model), rows: [] };
+      const vendor: "claude" | "codex" = row.vendor === "codex" ? "codex" : "claude";
+      const key = `${vendor} ${row.principal_key} ${row.source_key} ${row.model}`;
+      const group = groups.get(key) ?? { vendor, principalKey: String(row.principal_key), sourceKey: String(row.source_key), model: String(row.model), rows: [] };
       group.rows.push(row);
       groups.set(key, group);
     }
-    return [...groups.values()].map((group) => ({
+    return [...groups.values()].map((group): GroupedTotal => ({
+      vendor: group.vendor,
       principalKey: group.principalKey,
       sourceKey: group.sourceKey,
       model: group.model,
@@ -608,7 +752,13 @@ export class UsageStore {
       outputTokens: safeSum(group.rows.map((row) => numberOrNull(row.output_tokens_value))),
       cacheReadInputTokens: safeSum(group.rows.map((row) => numberOrNull(row.cache_read_value))),
       cacheCreationInputTokens: safeSum(group.rows.map((row) => numberOrNull(row.cache_creation_value))),
-    })).sort((a, b) => a.principalKey.localeCompare(b.principalKey) || a.sourceKey.localeCompare(b.sourceKey) || a.model.localeCompare(b.model));
+      ...(group.vendor === "codex" ? {
+        cachedInputTokens: safeSum(group.rows.map((row) => numberOrNull(row.cached_input_value))),
+        cacheWriteTokens: safeSum(group.rows.map((row) => numberOrNull(row.cache_write_value))),
+        reasoningTokens: safeSum(group.rows.map((row) => numberOrNull(row.reasoning_value))),
+        totalTokens: safeSum(group.rows.map((row) => numberOrNull(row.total_value))),
+      } : {}),
+    })).sort((a, b) => a.vendor.localeCompare(b.vendor) || a.principalKey.localeCompare(b.principalKey) || a.sourceKey.localeCompare(b.sourceKey) || a.model.localeCompare(b.model));
   }
 }
 
@@ -702,6 +852,45 @@ function entryFromRow(row: Record<string, unknown>): AccumulatedUsageEntry {
   };
 }
 
+function consistencyFlagsFromRow(value: unknown): readonly string[] {
+  if (value === null || value === undefined) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(String(value));
+  } catch {
+    throw new UsagePersistenceError("consistency_flags");
+  }
+  if (!Array.isArray(parsed)) throw new UsagePersistenceError("consistency_flags");
+  for (const flag of parsed) {
+    if (typeof flag !== "string" || !CODEX_CONSISTENCY_FLAGS.has(flag)) throw new UsagePersistenceError("consistency_flags");
+  }
+  return parsed as string[];
+}
+
+function codexEntryFromRow(row: Record<string, unknown>): AccumulatedCodexUsageEntry {
+  if (row.vendor !== "codex") throw new UsagePersistenceError("vendor");
+  return {
+    identityKey: String(row.identity_key),
+    principalKey: String(row.principal_key),
+    sourceKey: String(row.source_key),
+    vendor: "codex",
+    model: null,
+    modelAttribution: "unavailable_in_record",
+    observedAtMs: Number(row.observed_at_ms),
+    sequence: Number(row.sequence),
+    evidence: "usage_record_visible",
+    usage: {
+      input_tokens: { value: numberOrNull(row.input_tokens_value), diagnosis: diagnosisFromRow(row.input_tokens_diagnosis) },
+      output_tokens: { value: numberOrNull(row.output_tokens_value), diagnosis: diagnosisFromRow(row.output_tokens_diagnosis) },
+      cached_input_tokens: { value: numberOrNull(row.cached_input_value), diagnosis: diagnosisFromRow(row.cached_input_diagnosis) },
+      reasoning_output_tokens: { value: numberOrNull(row.reasoning_value), diagnosis: diagnosisFromRow(row.reasoning_diagnosis) },
+      cache_write_input_tokens: { value: numberOrNull(row.cache_write_value), diagnosis: diagnosisFromRow(row.cache_write_diagnosis) },
+      total_tokens: { value: numberOrNull(row.total_value), diagnosis: diagnosisFromRow(row.total_diagnosis) },
+    },
+    consistency: consistencyFlagsFromRow(row.consistency_flags) as AccumulatedCodexUsageEntry["consistency"],
+  };
+}
+
 function usageSchemaVersion(db: UsageDatabase): number {
   const row = db.prepare("PRAGMA user_version").get();
   const value = row?.user_version;
@@ -736,6 +925,33 @@ function bootstrapSchema(db: UsageDatabase): void {
       db.exec("ROLLBACK");
       return;
     }
+
+    if (version === 1) {
+      // v1 -> v2: every table but usage_identities is already at its current
+      // shape. Existing rows (all Claude, from before Codex support existed)
+      // are left untouched -- ADD COLUMN only ever appends, never rewrites a
+      // row -- and each NOT NULL addition carries the DEFAULT SQLite requires
+      // for that to be possible at all.
+      db.exec(`
+        ALTER TABLE usage_identities ADD COLUMN vendor TEXT NOT NULL DEFAULT 'claude';
+        ALTER TABLE usage_identities ADD COLUMN model_attribution TEXT;
+        ALTER TABLE usage_identities ADD COLUMN cached_input_value INTEGER;
+        ALTER TABLE usage_identities ADD COLUMN cached_input_diagnosis TEXT;
+        ALTER TABLE usage_identities ADD COLUMN cache_write_value INTEGER;
+        ALTER TABLE usage_identities ADD COLUMN cache_write_diagnosis TEXT;
+        ALTER TABLE usage_identities ADD COLUMN reasoning_value INTEGER;
+        ALTER TABLE usage_identities ADD COLUMN reasoning_diagnosis TEXT;
+        ALTER TABLE usage_identities ADD COLUMN total_value INTEGER;
+        ALTER TABLE usage_identities ADD COLUMN total_diagnosis TEXT;
+        ALTER TABLE usage_identities ADD COLUMN consistency_flags TEXT;
+        DROP INDEX IF EXISTS usage_identities_group;
+        CREATE INDEX usage_identities_group ON usage_identities(vendor, principal_key, source_key, model);
+      `);
+      db.exec(`PRAGMA user_version = ${CURRENT_USAGE_SCHEMA_VERSION};`);
+      db.exec("COMMIT");
+      return;
+    }
+
     db.exec(`
       CREATE TABLE IF NOT EXISTS usage_meta (
         key TEXT PRIMARY KEY,
@@ -777,6 +993,8 @@ function bootstrapSchema(db: UsageDatabase): void {
         source_key TEXT NOT NULL,
         principal_key TEXT NOT NULL,
         model TEXT NOT NULL,
+        vendor TEXT NOT NULL DEFAULT 'claude',
+        model_attribution TEXT,
         observed_at_ms INTEGER NOT NULL,
         sequence INTEGER NOT NULL,
         input_tokens_value INTEGER,
@@ -792,9 +1010,18 @@ function bootstrapSchema(db: UsageDatabase): void {
         cache_5m_diagnosis TEXT,
         cache_1h_value INTEGER,
         cache_1h_diagnosis TEXT,
+        cached_input_value INTEGER,
+        cached_input_diagnosis TEXT,
+        cache_write_value INTEGER,
+        cache_write_diagnosis TEXT,
+        reasoning_value INTEGER,
+        reasoning_diagnosis TEXT,
+        total_value INTEGER,
+        total_diagnosis TEXT,
+        consistency_flags TEXT,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS usage_identities_group ON usage_identities(principal_key, source_key, model);
+      CREATE INDEX IF NOT EXISTS usage_identities_group ON usage_identities(vendor, principal_key, source_key, model);
       CREATE TABLE IF NOT EXISTS usage_identity_jobs (
         identity_key TEXT PRIMARY KEY,
         job_key TEXT,

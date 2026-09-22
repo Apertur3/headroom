@@ -15,7 +15,7 @@ import { CollectInputError, collectUsageFile, type CollectResult } from "./usage
 import { NewerUsageSchemaError, UsageStateError, UsagePersistenceError, UsageStore, type CursorRow, type GroupedTotal, type InterruptReason, type SafeSum } from "./usage-store.js";
 
 export const USAGE_IMPORT_HELP =
-  "Usage: headroom usage import --source <alias> --principal <alias> --path <file> [--job <alias>] [--max-bytes N] [--json]";
+  "Usage: headroom usage import --source <alias> --principal <alias> --path <file> [--job <alias>] [--max-bytes N] [--format auto|claude|codex] [--json]";
 export const USAGE_IMPORT_STATUS_HELP = "Usage: headroom usage import-status [--json]";
 
 /** Independent of json-contract.ts's `JSON_CONTRACT_VERSION`: these two
@@ -85,7 +85,13 @@ function isFinished(result: CollectResult): boolean {
   return result.kind === "imported" && result.atEof && !result.discardPending && !result.pendingPartial && !result.budgetExhausted;
 }
 
-function importHumanLines(result: CollectResult): string[] {
+/** `format` is display-only (it never changes what already ran): Codex's
+ * counter vocabulary is exactly the collector's own generic `kind=count`
+ * pairs (`accepted_new`, `skipped:rate_limit_only`, `rejected:missing_usage`,
+ * ...), so no extra rendering is needed for it beyond labeling the run --
+ * unlike import-status's grouped totals, which do carry Codex-only counter
+ * columns (see `totalHumanLine`). */
+function importHumanLines(result: CollectResult, format: "claude" | "codex" = "claude"): string[] {
   const lines: string[] = [];
   const cursor = shortHash(result.cursorKey);
   if (result.kind === "principal_conflict" || result.kind === "source_conflict") {
@@ -99,7 +105,8 @@ function importHumanLines(result: CollectResult): string[] {
     lines.push(`interrupted: cursor ${cursor} -- ${reasonText}; investigate before re-running`);
     return lines;
   }
-  lines.push(`imported: cursor ${cursor} generation=${result.generation} bytesRead=${result.bytesReadThisRun} ${isFinished(result) ? "(finished)" : "(not finished -- re-run to continue)"}`);
+  const formatNote = format === "codex" ? " format=codex" : "";
+  lines.push(`imported: cursor ${cursor} generation=${result.generation} bytesRead=${result.bytesReadThisRun}${formatNote} ${isFinished(result) ? "(finished)" : "(not finished -- re-run to continue)"}`);
   if (!isFinished(result)) {
     const pending: string[] = [];
     if (!result.atEof) pending.push("more bytes remain unread");
@@ -130,6 +137,7 @@ export async function usageImportCommand(argv: string[]): Promise<number> {
       path: options.path,
       ...(options.job !== undefined ? { jobAlias: options.job } : {}),
       maxBytes: options.maxBytes,
+      vendor: options.format === "codex" ? "codex" : undefined,
     });
 
     if (options.json) {
@@ -147,12 +155,13 @@ export async function usageImportCommand(argv: string[]): Promise<number> {
         jobConflictIdentities: result.jobConflictIdentities,
         interruptReason: result.interruptReason,
         finished: isFinished(result),
+        format: options.format === "codex" ? "codex" : "claude",
         counters: result.counters,
         ...COVERAGE,
       };
       console.log(JSON.stringify(jsonEnvelope(payload, new Date())));
     } else {
-      for (const line of importHumanLines(result)) console.log(line);
+      for (const line of importHumanLines(result, options.format === "codex" ? "codex" : "claude")) console.log(line);
       console.log(`(${COVERAGE.coverage}, account coverage ${COVERAGE.account_coverage}, evidence: ${COVERAGE.evidence_note})`);
     }
     return result.kind === "imported" ? 0 : 1;
@@ -176,16 +185,28 @@ function formatSafeSum(sum: SafeSum): string {
 }
 
 function totalHumanLine(total: GroupedTotal): string {
-  return [
+  const parts = [
+    `vendor=${total.vendor}`,
     `source=${shortHash(total.sourceKey)}`,
     `principal=${shortHash(total.principalKey)}`,
     `model=${total.model}`,
     `identities=${total.identityCount}`,
     `input=${formatSafeSum(total.inputTokens)}`,
     `output=${formatSafeSum(total.outputTokens)}`,
-    `cacheRead=${formatSafeSum(total.cacheReadInputTokens)}`,
-    `cacheCreation=${formatSafeSum(total.cacheCreationInputTokens)}`,
-  ].join(" ");
+  ];
+  if (total.vendor === "codex") {
+    // Codex's own counter vocabulary: cached/cache-write/reasoning/total
+    // token counts have no Claude analogue, so they render here instead of
+    // the Claude-only cache-read/cache-creation pair below.
+    if (total.cachedInputTokens) parts.push(`cachedInput=${formatSafeSum(total.cachedInputTokens)}`);
+    if (total.cacheWriteTokens) parts.push(`cacheWrite=${formatSafeSum(total.cacheWriteTokens)}`);
+    if (total.reasoningTokens) parts.push(`reasoning=${formatSafeSum(total.reasoningTokens)}`);
+    if (total.totalTokens) parts.push(`total=${formatSafeSum(total.totalTokens)}`);
+  } else {
+    parts.push(`cacheRead=${formatSafeSum(total.cacheReadInputTokens)}`);
+    parts.push(`cacheCreation=${formatSafeSum(total.cacheCreationInputTokens)}`);
+  }
+  return parts.join(" ");
 }
 
 function cursorHumanLine(cursor: CursorRow): string {
