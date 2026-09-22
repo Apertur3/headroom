@@ -101,8 +101,30 @@ struct AntigravitySnapshotFetch: Sendable {
 }
 
 enum AntigravitySnapshotWaiter {
+    static let fiveHourMinutes = 300
     static let weeklyMinutes = 10_080
     static let expectedMeters: Set<String> = ["gemini", "claude-gpt"]
+
+    /// Antigravity classifies a window by its duration/identity, not by
+    /// whether this particular poll happened to carry a `resetsAt`: the
+    /// vendor's rolling five-hour lane can go idle and stop reporting a
+    /// reset while still being the same 300-minute window, and a
+    /// `resetsAt == nil ? "rolling" : "fixed"` heuristic flips "kind"
+    /// poll-to-poll for that same window. That flip trips the store's
+    /// two-poll `vendor_window_held` guard (same window compared via
+    /// `kind`/`minutes`/`enforcement`) purely from a classification bug, not
+    /// a real vendor change -- issue #55's second path. This mirrors
+    /// `src/adapters/antigravity.ts`'s static `WINDOWS` table (5h ->
+    /// rolling, weekly -> fixed) rather than re-deriving kind from the
+    /// payload each time. Unrecognized durations (never seen from AGY) fall
+    /// back to the previous resetsAt-based heuristic.
+    static func kind(for window: RateWindow) -> String {
+        switch window.windowMinutes {
+        case fiveHourMinutes: return "rolling"
+        case weeklyMinutes: return "fixed"
+        default: return window.resetsAt == nil ? "rolling" : "fixed"
+        }
+    }
 
     static func wait(
         timeout: TimeInterval,

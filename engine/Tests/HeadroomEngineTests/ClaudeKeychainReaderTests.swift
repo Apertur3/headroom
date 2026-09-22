@@ -42,6 +42,42 @@ final class AntigravityReadinessTests: XCTestCase {
         XCTAssertTrue(failedWeekly.allSatisfy { $0.reason == "quota summary not ready" })
     }
 
+    /// Issue #55's second path: a `resetsAt == nil ? "rolling" : "fixed"`
+    /// heuristic misclassifies an idle five-hour window (no reset reported
+    /// this poll) as "fixed", flipping `Window.kind` poll-to-poll for the
+    /// same 300-minute window and tripping the store's `vendor_window_held`
+    /// guard on a classification bug rather than a real vendor change.
+    /// Kind must instead come from the window's duration/identity, matching
+    /// `src/adapters/antigravity.ts`'s static WINDOWS table: 5h is always
+    /// "rolling" and weekly is always "fixed", with or without a reset.
+    func testFiveHourWindowKindIsRollingRegardlessOfResetsAtPresence() {
+        let reset = Date(timeIntervalSince1970: 1_800_000_000)
+        let idleFiveHour = RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil)
+        let activeFiveHour = RateWindow(usedPercent: 10, windowMinutes: 300, resetsAt: reset, resetDescription: nil)
+        XCTAssertEqual(AntigravitySnapshotWaiter.kind(for: idleFiveHour), "rolling")
+        XCTAssertEqual(AntigravitySnapshotWaiter.kind(for: activeFiveHour), "rolling")
+
+        let weeklyNoReset = RateWindow(usedPercent: 0, windowMinutes: 10_080, resetsAt: nil, resetDescription: nil)
+        let weeklyWithReset = RateWindow(usedPercent: 30, windowMinutes: 10_080, resetsAt: reset, resetDescription: nil)
+        XCTAssertEqual(AntigravitySnapshotWaiter.kind(for: weeklyNoReset), "fixed")
+        XCTAssertEqual(AntigravitySnapshotWaiter.kind(for: weeklyWithReset), "fixed")
+    }
+
+    /// The same guarantee end-to-end through `antigravityWindows`, covering
+    /// both the named quota-summary rows and the primary/secondary fallback
+    /// path used before the quota summary has populated.
+    func testAntigravityWindowsNeverFlipFiveHourKindWhenResetIsAbsent() {
+        let idlePrimary = RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil)
+        let idleSecondary = RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil)
+        let usage = UsageSnapshot(primary: idlePrimary, secondary: idleSecondary, extraRateWindows: [], updatedAt: Date())
+        let observations = HeadroomEngine.antigravityWindows(
+            Principal(id: "antigravity-main", vendor: "antigravity", location: "agy"),
+            usage: usage)
+        let fiveHour = observations.filter { $0.window?.minutes == 300 }
+        XCTAssertEqual(fiveHour.count, 2)
+        XCTAssertTrue(fiveHour.allSatisfy { $0.window?.kind == "rolling" })
+    }
+
     func testShapeListsOnlyAntigravityWindowDescriptors() {
         let shape = HeadroomEngine.antigravityShape(completeUsage())
         XCTAssertEqual(shape[0], "$: object")
