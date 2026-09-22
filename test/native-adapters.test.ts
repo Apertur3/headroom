@@ -109,6 +109,64 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]));
   });
 
+  // Reported live: codex-main:spark stuck at "5h UNKNOWN (stale 7390m...)".
+  // Codex drops the Spark entry out of `additional_rate_limits` entirely
+  // while that meter is idle -- no bucket with used=0, just an absent entry
+  // in an otherwise-successful response. Before this fix that meant zero
+  // Spark observations were emitted for the poll at all, so the store never
+  // had anything newer to rank above the last real reading and it froze in
+  // place, aging into a misleading "stale Nm" forever. Reported as
+  // not_enforced instead, same truth rule as PR #58's Antigravity fix and
+  // claude.ts's scoped() fallback: no quantity, no invented percentage, no
+  // invented resets_at.
+  describe("a missing Spark entry must read as an honest not_enforced gap, never a silent no-op", () => {
+    it("reports both Spark windows as not_enforced when additional_rate_limits has no spark entry", async () => {
+      const usage = { plan_type: "pro", rate_limit: {
+        primary_window: { used_percent: 4, reset_at: 1788408000, limit_window_seconds: 18000 },
+        secondary_window: { used_percent: 16, reset_at: 1788968897, limit_window_seconds: 604800 },
+      }, additional_rate_limits: [] };
+      const rows = observationsFromCodexUsage(usage, {}, codex, at);
+      const sparkFive = rows.find((row) => row.meter_id === "codex-main:spark" && row.window?.minutes === 300);
+      const sparkWeekly = rows.find((row) => row.meter_id === "codex-main:spark" && row.window?.minutes === 10_080);
+      expect(sparkFive).toMatchObject({ freshness: "not_enforced", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null });
+      expect(sparkWeekly).toMatchObject({ freshness: "not_enforced", window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null });
+      expect(sparkFive?.reason).toContain("no Spark data");
+      expect(sparkWeekly?.reason).toContain("no Spark data");
+      // Never the shape a real reading would have.
+      expect(sparkFive?.quantity).toBeNull();
+      expect(sparkWeekly?.quantity).toBeNull();
+    });
+
+    it("keeps a real Spark reading exactly as the vendor reported it when the entry is present", () => {
+      const usage = { plan_type: "pro", rate_limit: {
+        primary_window: { used_percent: 4, reset_at: 1788408000, limit_window_seconds: 18000 },
+        secondary_window: { used_percent: 16, reset_at: 1788968897, limit_window_seconds: 604800 },
+      }, additional_rate_limits: [{ limit_name: "GPT-5.3-Codex-Spark", rate_limit: {
+        primary_window: { used_percent: 8, reset_at: 1788408000, limit_window_seconds: 18000 },
+        secondary_window: { used_percent: 2, reset_at: 1788968897, limit_window_seconds: 604800 },
+      } }] };
+      const rows = observationsFromCodexUsage(usage, {}, codex, at);
+      const sparkFive = rows.find((row) => row.meter_id === "codex-main:spark" && row.window?.minutes === 300);
+      expect(sparkFive).toMatchObject({ freshness: "fresh", truth: "official", quantity: { used: 8 } });
+      expect(sparkFive?.reason).toBeUndefined();
+    });
+
+    it("leaves an existing Spark reading completely untouched when the response never mentions additional_rate_limits at all", () => {
+      // No `additional_rate_limits` key at all: this vendor call never asked
+      // about Spark, unlike the shape above where the key is present as an
+      // array but has no spark entry in it. The adapter must
+      // not synthesize anything for the meter in this case (unchanged from
+      // before this fix -- see codex-idle-window.test.ts's identically
+      // named store-level test for the read-side guarantee this protects).
+      const usage = { plan_type: "pro", rate_limit: {
+        primary_window: { used_percent: 4, reset_at: 1788408000, limit_window_seconds: 18000 },
+        secondary_window: { used_percent: 16, reset_at: 1788968897, limit_window_seconds: 604800 },
+      } };
+      const rows = observationsFromCodexUsage(usage, {}, codex, at);
+      expect(rows.some((row) => row.meter_id === "codex-main:spark")).toBe(false);
+    });
+  });
+
   it("maps verified Antigravity quota buckets to the two 5-hour and weekly meters", async () => {
     const body = JSON.parse(await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8"));
     const rows = observationsFromAntigravityQuota(body, antigravity, at);

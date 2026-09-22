@@ -68,6 +68,26 @@ function rate(account: ProviderAccount, meter: string, raw: unknown, fallback: n
     && Math.abs(Date.parse(reset) - (Date.parse(now) + minutes * 60_000)) <= 90_000;
   return { ...base(account, meter, now, source), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: { used: value, limit: 100, remaining: Math.max(0, 100 - value), unit: "percent" }, resets_at: reset, freshness, ...(idleReset ? { metadata: { codex_idle_window: true } } : {}) };
 }
+/**
+ * A vendor-confirmed-absent reading for one window of a meter that CAN
+ * legitimately have nothing to report this poll (the reported
+ * `codex-main:spark` stuck-UNKNOWN symptom: Codex's `additional_rate_limits`
+ * array drops the Spark entry entirely whenever that meter is idle -- there
+ * is no bucket with used=0 to read, the entry is simply missing from an
+ * otherwise-successful response). This is the
+ * same truth rule PR #58 applies to Antigravity's rolling 5h window and
+ * that claude.ts's `scoped()` already applies to a missing scoped limit:
+ * no quantity, no invented percentage, no invented resets_at -- freshness
+ * `not_enforced`, which (once store.ts ranks it alongside `fresh`, see
+ * `latestPerWindow`) replaces a stale frozen reading the same poll it goes
+ * idle rather than leaving it to freeze in place and age into a misleading
+ * "stale Nm". A codex-local helper for now, kept easy to fold into a
+ * shared one once PR #58 lands and antigravity.ts's equivalent exists on
+ * master.
+ */
+function notEnforced(account: ProviderAccount, meter: string, minutes: number, now: string, reason: string): Observation {
+  return { ...base(account, meter, now), window: { kind: "rolling", minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason };
+}
 /** Parse the `wham/usage` body and optional reset-credit body from CodexBar's v0.56.4 contract. */
 export function observationsFromCodexUsage(usage: unknown, credits: unknown, account: ProviderAccount, at = new Date()): Observation[] {
   if (!object(usage) || !object(usage.rate_limit)) throw new Error("Codex usage response invalid");
@@ -80,10 +100,26 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   output.push(primary ? tagged(primary) : tagged({ ...base(account, "main", now), window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no 5-hour window from endpoint or session logs" }));
   const weekly = rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now, SOURCE, "fresh", true);
   output.push(tagged(weekly ?? { ...base(account, "main", now), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no weekly window" }));
-  if (Array.isArray(usage.additional_rate_limits)) for (const entry of usage.additional_rate_limits) {
-    if (!object(entry) || !String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") || !object(entry.rate_limit)) continue;
-    const five = rate(account, "spark", entry.rate_limit.primary_window ?? entry.rate_limit.primary, 300, now, SOURCE, "fresh", true); const week = rate(account, "spark", entry.rate_limit.secondary_window ?? entry.rate_limit.secondary, 10_080, now, SOURCE, "fresh", true);
-    if (five) output.push(tagged(five)); if (week) output.push(tagged(week));
+  // The Spark entry is only ever present in this array when the request
+  // explicitly reported on it (see the `Array.isArray` guard): a payload
+  // that omits `additional_rate_limits` entirely means this vendor call
+  // never asked about Spark at all, and an existing Spark reading (however
+  // old) is left completely alone -- same as before this fix. Once the
+  // array IS present but has no entry whose name matches "spark" -- the
+  // reported stuck-UNKNOWN shape, an otherwise-successful response that
+  // simply has nothing to say about an idle Spark meter this time -- both of its
+  // windows are still reported, honestly, as not_enforced rather than
+  // silently emitting zero rows for the meter (which let the store's last
+  // real reading freeze in place and age into "stale Nm" forever, since
+  // nothing ever superseded it).
+  if (Array.isArray(usage.additional_rate_limits)) {
+    const sparkEntry = usage.additional_rate_limits.find((entry): entry is ObjectValue =>
+      object(entry) && String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") && object(entry.rate_limit));
+    const sparkRateLimit = sparkEntry ? sparkEntry.rate_limit as ObjectValue : undefined;
+    const five = rate(account, "spark", sparkRateLimit?.primary_window ?? sparkRateLimit?.primary, 300, now, SOURCE, "fresh", true);
+    const week = rate(account, "spark", sparkRateLimit?.secondary_window ?? sparkRateLimit?.secondary, 10_080, now, SOURCE, "fresh", true);
+    output.push(tagged(five ?? notEnforced(account, "spark", 300, now, "vendor sent no Spark data for the 5-hour window in this response")));
+    output.push(tagged(week ?? notEnforced(account, "spark", 10_080, now, "vendor sent no Spark data for the weekly window in this response")));
   }
   if (object(credits) && number(credits.available_count) !== undefined) {
     const available = number(credits.available_count)!;

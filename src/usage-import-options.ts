@@ -3,7 +3,7 @@ export const MAX_IMPORT_BYTES = 64 * 1024 * 1024;
 export const MIN_IMPORT_BYTES = 256 * 1024 + 1;
 
 export type UsageImportOptions =
-  | { command: "import"; source: string; principal: string; path: string; job?: string; maxBytes: number; json: boolean; format?: "claude" | "codex" }
+  | { command: "import"; source: string; principal: string; path: string; job?: string; maxBytes: number; json: boolean; format?: "claude" | "codex" | "auto" }
   | { command: "import-status"; json: boolean };
 
 const ALIAS_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -97,10 +97,12 @@ export function parseUsageImportOptions(argv: readonly string[]): UsageImportOpt
 
   const result: UsageImportOptions = { command: "import", source, principal, path, maxBytes, json };
   if (job !== undefined) result.job = job;
-  // "auto" is accepted syntax but not yet implemented (auto-detection is
-  // future work); it normalizes to the same default as omitting --format
-  // entirely, which is Claude-format collection.
+  // Omitting --format entirely keeps today's default (Claude-format
+  // collection, `format` left undefined) rather than being folded into
+  // "auto": a caller who never asked for detection should never pay for it
+  // (or be surprised by a different rejection shape from it).
   if (formatStr === "codex") result.format = "codex";
   else if (formatStr === "claude") result.format = "claude";
+  else if (formatStr === "auto") result.format = "auto";
   return result;
 }

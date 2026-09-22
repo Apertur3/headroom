@@ -119,15 +119,14 @@ markers rather than leaving coverage implicit:
 See `src/usage-events.ts`, `src/usage-collector.ts`, `src/usage-store.ts` and
 their tests for the exported contract and coverage.
 
-## Codex (library only — not imported, not persisted)
+## Codex
 
 `src/codex-usage-events.ts` is a second, independent pure normalizer for
-Codex CLI local session-file telemetry (`~/.codex/sessions/*.jsonl`). It
-exists purely as a library module and tests: **there is no collector, no CLI
-flag, no `usage.db` schema change, and no wiring into `headroom usage
-import` for it.** `headroom usage import` still only understands Claude Code
-transcripts, exactly as described above — running it against a Codex session
-file is not supported and does not do anything useful.
+Codex CLI local session-file telemetry (`~/.codex/sessions/*.jsonl`).
+`headroom usage import --format codex` (or `--format auto`, which detects the
+Codex transcript shape per line/file) wires it into the same collector, CLI
+and `usage.db` schema as Claude — see `test/codex-collector.test.ts` for the
+schema-migration and end-to-end import coverage.
 
 What the module does, given one raw JSONL line plus caller-supplied
 `(principalKey, sourceKey)` context, exactly like `usage-events.ts`:
@@ -162,5 +161,9 @@ What the module does, given one raw JSONL line plus caller-supplied
   Claude's already-reviewed accumulator semantics.
 
 See `test/codex-usage-events.test.ts` for synthetic-fixture coverage.
-The module does not import or persist Codex telemetry or predict quota
-consumption. Collector integration and durable storage remain future work.
+Rate-limit observations (`RateLimitObservation`, parsed from `event_msg`'s
+`rate_limits` block) are persisted to their own `usage_rate_limit_observations`
+table (schema v3), independent of the identity/quarantine machinery above --
+each observation's own content hash is its dedup key, so a re-imported line
+is a no-op rather than a duplicate row. The module still does not predict
+quota consumption from either table; that remains future work.

@@ -39,6 +39,7 @@ import { createHash } from "node:crypto";
 import { assertSafeAncestry } from "./paths.js";
 import { MAX_LINE_BYTES, parseUsageLine } from "./usage-events.js";
 import { parseCodexUsageLine } from "./codex-usage-events.js";
+import { detectUsageLineFormat } from "./usage-format-detect.js";
 import { isKnownClaudeModel, type CursorRow, type IdentityOutcome, type InterruptReason, type UsageStore } from "./usage-store.js";
 
 export { isKnownClaudeModel } from "./usage-store.js";
@@ -130,9 +131,14 @@ export interface CollectRequest {
   /** Which normalizer to run the file's lines through. `"codex"` switches to
    * `parseCodexUsageLine` and `store.applyAndPersistCodex`, and skips the
    * Claude-only `isKnownClaudeModel` gate entirely (Codex counter records
-   * carry no model field at all). Omitted or `"claude"` keeps today's
-   * behavior. */
-  vendor?: "claude" | "codex";
+   * carry no model field at all). `"auto"` detects each line's shape with
+   * `detectUsageLineFormat` and routes it to whichever normalizer matches;
+   * a line whose shape cannot be told apart (see that module's "unknown"
+   * case) falls back to the Claude normalizer, which then rejects or skips
+   * it exactly as it would today with no `--format` given at all -- `auto`
+   * never invents a third rejection vocabulary just for itself. Omitted or
+   * `"claude"` keeps today's behavior. */
+  vendor?: "claude" | "codex" | "auto";
   /** Test seam only: awaited after all filesystem reads and immediately
    * before the write transaction, so a test can deterministically interleave
    * a second collector at the one point where a race is possible. */
@@ -608,7 +614,7 @@ export async function collectUsageFile(store: UsageStore, request: CollectReques
     const newBoundaryHash = batch.newByteOffset > 0 ? sha256Hex(await readExact(handle, windowStart, batch.newByteOffset - windowStart)) : null;
 
     const counters: Record<string, number> = {};
-    const bump = (kind: string): void => { counters[kind] = (counters[kind] ?? 0) + 1; };
+    const bump = (kind: string, delta = 1): void => { counters[kind] = (counters[kind] ?? 0) + delta; };
 
     const committedRun = store.withTransaction((): { raced: boolean; conflict?: "principal_conflict" | "source_conflict"; jobConflictIdentities: number } => {
       // Compare-and-set, under the write lock: every filesystem read above
@@ -643,14 +649,31 @@ export async function collectUsageFile(store: UsageStore, request: CollectReques
           continue;
         }
 
-        if (request.vendor === "codex") {
+        // "auto" resolves per line, never once for the whole file: a
+        // "codex" detection routes to the Codex normalizer, and both
+        // "claude" and "unknown" fall back to the Claude one (see
+        // usage-format-detect.ts's module doc for why "unknown" defaults
+        // there rather than getting its own rejection vocabulary).
+        const lineVendor = request.vendor === "auto" ? (detectUsageLineFormat(event.text) === "codex" ? "codex" : "claude") : request.vendor;
+
+        if (lineVendor === "codex") {
           const outcome = parseCodexUsageLine({ line: event.text, source: { principalKey, sourceKey }, sequence: 0 });
           if (outcome.kind === "skipped") {
             // Rate-limit observations riding along on a skipped line (e.g.
-            // "rate_limit_only") are counted here but not yet persisted
-            // anywhere -- see the module doc for the current scope.
+            // "rate_limit_only") are persisted below, independent of the
+            // skip reason -- a single token_count event can be both
+            // unidentified/cumulative (the skip reason) *and* carry a real
+            // rate_limits block, and dropping the observations just because
+            // the line itself has nothing accountable would silently lose
+            // that half of its evidence (PR #57's "counted here but not yet
+            // persisted anywhere" gap).
             bump(`skipped:${outcome.reason}`);
             store.incrementCounter(cursorKey, `skipped:${outcome.reason}`);
+            if (outcome.observations.length) {
+              store.persistRateLimitObservations(outcome.observations);
+              bump("rate_limit_observed", outcome.observations.length);
+              store.incrementCounter(cursorKey, "rate_limit_observed", outcome.observations.length);
+            }
             continue;
           }
           if (outcome.kind === "rejected") {
@@ -662,6 +685,11 @@ export async function collectUsageFile(store: UsageStore, request: CollectReques
           bump(identityOutcome);
           store.incrementCounter(cursorKey, identityOutcome);
           claimJob(outcome.snapshot.identityKey, identityOutcome);
+          if (outcome.observations.length) {
+            store.persistRateLimitObservations(outcome.observations);
+            bump("rate_limit_observed", outcome.observations.length);
+            store.incrementCounter(cursorKey, "rate_limit_observed", outcome.observations.length);
+          }
           continue;
         }
 

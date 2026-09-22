@@ -43,11 +43,11 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { AccumulatedUsageEntry, ClaudeUsageSnapshot, NumericField, QuarantineReason, UsageAccumulatorState } from "./usage-events.js";
 import { applyUsageSnapshot, createUsageAccumulator } from "./usage-events.js";
-import type { AccumulatedCodexUsageEntry, CodexQuarantineReason, CodexUsageAccumulatorState, CodexUsageFields, CodexUsageSnapshot } from "./codex-usage-events.js";
+import type { AccumulatedCodexUsageEntry, CodexQuarantineReason, CodexUsageAccumulatorState, CodexUsageFields, CodexUsageSnapshot, PercentField, RateLimitObservation } from "./codex-usage-events.js";
 import { applyCodexUsageSnapshot, createCodexUsageAccumulator } from "./codex-usage-events.js";
 import { openUsageDatabase, type UsageDatabase } from "./usage-db.js";
 
-export const CURRENT_USAGE_SCHEMA_VERSION = 2;
+export const CURRENT_USAGE_SCHEMA_VERSION = 3;
 
 /** `model` is `NOT NULL` on `usage_identities`, but a Codex counter record
  * carries no model field at all (see codex-usage-events.ts). This fixed
@@ -78,7 +78,7 @@ export type PersistenceField =
   | "model" | "observed_at_ms" | "sequence" | "counter_value" | "counter_diagnosis"
   | "counter_kind" | "quarantine_reason" | "cursor_key" | "cursor_number"
   | "cursor_status" | "cursor_hash" | "cursor_device_id"
-  | "vendor" | "model_attribution" | "consistency_flags";
+  | "vendor" | "model_attribution" | "consistency_flags" | "rate_limit_slot";
 
 /** Refusal at the persistence boundary. The message names only the *field*
  * that failed, never the rejected value -- the whole point of the check is
@@ -189,11 +189,32 @@ export interface StatusFilter {
   principalKeyHash?: string;
 }
 
+/** Durable form of codex-usage-events.ts's `RateLimitObservation`. Same
+ * carries-nothing-extra rule as the source type: no `limit_id`, `plan_type`,
+ * `limit_name` or any other account/plan identifier, ever. */
+export interface RateLimitObservationRow {
+  identityKey: string;
+  sourceKey: string;
+  principalKey: string;
+  vendor: "codex";
+  slot: "primary" | "secondary";
+  observedAtMs: number;
+  usedPercent: PercentField;
+  windowMinutes: NumericField;
+  resetsAtMs: NumericField;
+  createdAt: string;
+}
+
 const HEX32_RE = /^[0-9a-f]{32}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const COUNTER_KIND_RE = /^[a-z_]+(?::[a-z_]+)?$/;
 const DEVICE_ID_RE = /^-?[0-9]{1,20}$/;
 const NUMERIC_DIAGNOSES = new Set(["not_a_number", "not_finite", "not_integer", "negative", "unsafe_integer"]);
+/** codex-usage-events.ts's `PercentDiagnosis`: a float 0-100 field has its
+ * own diagnosis vocabulary, distinct from `NUMERIC_DIAGNOSES`'s
+ * integer-counter one (no `not_integer`/`unsafe_integer`; adds `exceeds_100`). */
+const PERCENT_DIAGNOSES = new Set(["not_a_number", "not_finite", "negative", "exceeds_100"]);
+const RATE_LIMIT_SLOTS = new Set<string>(["primary", "secondary"]);
 const QUARANTINE_REASONS = new Set<string>(["identity_model_conflict", "conflicting_same_version"]);
 const CODEX_QUARANTINE_REASONS = new Set<string>(["conflicting_same_version", "identity_conflict"]);
 const CODEX_CONSISTENCY_FLAGS = new Set<string>(["cached_exceeds_input", "reasoning_exceeds_output", "total_mismatch", "incomplete"]);
@@ -291,6 +312,36 @@ function assertPersistableCodexEntry(entry: AccumulatedCodexUsageEntry): void {
 
 function assertPersistableCodexSnapshot(snapshot: CodexUsageSnapshot): void {
   assertPersistableCodexEntry({ ...snapshot, evidence: "usage_record_visible" });
+}
+
+/** Same shape check as `assertCounterField`, for a `PercentField` (a float
+ * 0-100, not an integer counter): rejects an out-of-range or non-finite
+ * value and an unrecognized diagnosis, but never coerces or clamps one into
+ * range -- the caller's own `normalizePercent` already refused to do that,
+ * and this boundary must not quietly undo that refusal. */
+function assertPercentField(field: PercentField): PercentField {
+  if (field.value !== null && (typeof field.value !== "number" || !Number.isFinite(field.value) || field.value < 0 || field.value > 100)) {
+    throw new UsagePersistenceError("counter_value");
+  }
+  if (field.diagnosis !== null && !PERCENT_DIAGNOSES.has(field.diagnosis)) throw new UsagePersistenceError("counter_diagnosis");
+  return field;
+}
+
+/** Same role as `assertPersistableCodexEntry`, for one rate-limit
+ * observation. `vendor` is asserted `"codex"` for the same reason as the
+ * Codex entry check: the only vendor `RateLimitObservation` can carry today,
+ * checked rather than trusted so a hand-built object can never smuggle a
+ * different value through this boundary. */
+function assertPersistableRateLimitObservation(observation: RateLimitObservation): void {
+  assertHex32(observation.identityKey, "identity_key");
+  assertHex32(observation.sourceKey, "source_key");
+  assertHex32(observation.principalKey, "principal_key");
+  if (observation.vendor !== "codex") throw new UsagePersistenceError("vendor");
+  if (!RATE_LIMIT_SLOTS.has(observation.slot)) throw new UsagePersistenceError("rate_limit_slot");
+  assertRange(observation.observedAtMs, "observed_at_ms", 0, MAX_OBSERVED_AT_MS);
+  assertPercentField(observation.usedPercent);
+  assertCounterField(observation.windowMinutes);
+  assertCounterField(observation.resetsAtMs);
 }
 
 function assertPersistableCursor(row: CursorRow): void {
@@ -631,6 +682,39 @@ export class UsageStore {
     return "duplicate";
   }
 
+  /**
+   * Persists Codex account-level rate-limit observations (the "counted but
+   * not yet persisted anywhere" gap from PR #57 -- see codex-usage-events.ts's
+   * module doc and usage-collector.ts's Codex branch). Unlike
+   * `applyAndPersistCodex`, there is no revision/ordering logic here: each
+   * observation's `identityKey` is already a content hash of everything that
+   * makes it a distinct piece of evidence (principal, source, timestamp,
+   * window, reset, percent and their diagnoses -- slot excluded on purpose,
+   * see `RateLimitObservation`'s own doc), so a plain `INSERT OR IGNORE`
+   * keyed on it is exactly the right idempotency: re-importing the same
+   * bytes re-derives the same key and is silently a no-op, and two
+   * genuinely different readings never collide. Every observation is fully
+   * revalidated before anything is written, same boundary discipline as
+   * `applyAndPersistCodex`.
+   */
+  persistRateLimitObservations(observations: readonly RateLimitObservation[]): void {
+    if (observations.length === 0) return;
+    const now = new Date().toISOString();
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO usage_rate_limit_observations
+      (identity_key, source_key, principal_key, vendor, slot, observed_at_ms,
+       used_percent_value, used_percent_diagnosis, window_minutes_value, window_minutes_diagnosis,
+       resets_at_ms_value, resets_at_ms_diagnosis, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const observation of observations) {
+      assertPersistableRateLimitObservation(observation);
+      insert.run(
+        observation.identityKey, observation.sourceKey, observation.principalKey, observation.vendor, observation.slot,
+        observation.observedAtMs, observation.usedPercent.value, observation.usedPercent.diagnosis,
+        observation.windowMinutes.value, observation.windowMinutes.diagnosis,
+        observation.resetsAtMs.value, observation.resetsAtMs.diagnosis, now);
+    }
+  }
+
   private writeEntry(entry: AccumulatedUsageEntry, now: string): void {
     assertPersistableEntry(entry);
     const u = entry.usage;
@@ -731,6 +815,33 @@ export class UsageStore {
     return rows.filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter)).length;
   }
 
+  /** Count of persisted Codex rate-limit observations, scoped the same way
+   * as every other status accessor here. */
+  rateLimitObservationCount(filter: StatusFilter = {}): number {
+    const rows = this.db.prepare("SELECT source_key, principal_key FROM usage_rate_limit_observations").all();
+    return rows.filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter)).length;
+  }
+
+  /** Full rows, for a caller (tests, a future richer status view) that needs
+   * more than the count. Ordered oldest-first, same convention as
+   * `history()`-shaped reads elsewhere in this codebase. */
+  rateLimitObservations(filter: StatusFilter = {}): RateLimitObservationRow[] {
+    const rows = this.db.prepare("SELECT * FROM usage_rate_limit_observations").all()
+      .filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter));
+    return rows.map((row): RateLimitObservationRow => ({
+      identityKey: String(row.identity_key),
+      sourceKey: String(row.source_key),
+      principalKey: String(row.principal_key),
+      vendor: "codex",
+      slot: row.slot === "secondary" ? "secondary" : "primary",
+      observedAtMs: Number(row.observed_at_ms),
+      usedPercent: { value: numberOrNull(row.used_percent_value), diagnosis: percentDiagnosisFromRow(row.used_percent_diagnosis) },
+      windowMinutes: { value: numberOrNull(row.window_minutes_value), diagnosis: diagnosisFromRow(row.window_minutes_diagnosis) },
+      resetsAtMs: { value: numberOrNull(row.resets_at_ms_value), diagnosis: diagnosisFromRow(row.resets_at_ms_diagnosis) },
+      createdAt: String(row.created_at),
+    })).sort((a, b) => a.observedAtMs - b.observedAtMs || a.identityKey.localeCompare(b.identityKey));
+  }
+
   groupedTotals(filter: StatusFilter = {}): GroupedTotal[] {
     const rows = this.db.prepare("SELECT * FROM usage_identities").all()
       .filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter));
@@ -827,6 +938,13 @@ function diagnosisFromRow(value: unknown): NumericField["diagnosis"] {
   const text = String(value);
   if (!NUMERIC_DIAGNOSES.has(text)) throw new UsagePersistenceError("counter_diagnosis");
   return text as NumericField["diagnosis"];
+}
+
+function percentDiagnosisFromRow(value: unknown): PercentField["diagnosis"] {
+  if (value === null || value === undefined) return null;
+  const text = String(value);
+  if (!PERCENT_DIAGNOSES.has(text)) throw new UsagePersistenceError("counter_diagnosis");
+  return text as PercentField["diagnosis"];
 }
 
 function entryFromRow(row: Record<string, unknown>): AccumulatedUsageEntry {
@@ -931,7 +1049,9 @@ function bootstrapSchema(db: UsageDatabase): void {
       // shape. Existing rows (all Claude, from before Codex support existed)
       // are left untouched -- ADD COLUMN only ever appends, never rewrites a
       // row -- and each NOT NULL addition carries the DEFAULT SQLite requires
-      // for that to be possible at all.
+      // for that to be possible at all. Deliberately falls through to the v2
+      // -> v3 step below (no early return) so a v1 database lands on v3 in
+      // one bootstrap call, same as a fresh install.
       db.exec(`
         ALTER TABLE usage_identities ADD COLUMN vendor TEXT NOT NULL DEFAULT 'claude';
         ALTER TABLE usage_identities ADD COLUMN model_attribution TEXT;
@@ -946,6 +1066,33 @@ function bootstrapSchema(db: UsageDatabase): void {
         ALTER TABLE usage_identities ADD COLUMN consistency_flags TEXT;
         DROP INDEX IF EXISTS usage_identities_group;
         CREATE INDEX usage_identities_group ON usage_identities(vendor, principal_key, source_key, model);
+      `);
+    }
+
+    if (version === 1 || version === 2) {
+      // v2 -> v3: a purely additive new table for codex-usage-events.ts's
+      // `RateLimitObservation` (see usage-collector.ts's Codex branch and
+      // PR #57's module doc, "counted here but not yet persisted anywhere").
+      // No existing table or row is touched, so this is safe to run whether
+      // the database arrived here directly from v2 or by falling through
+      // from the v1 branch above.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS usage_rate_limit_observations (
+          identity_key TEXT PRIMARY KEY,
+          source_key TEXT NOT NULL,
+          principal_key TEXT NOT NULL,
+          vendor TEXT NOT NULL DEFAULT 'codex',
+          slot TEXT NOT NULL,
+          observed_at_ms INTEGER NOT NULL,
+          used_percent_value REAL,
+          used_percent_diagnosis TEXT,
+          window_minutes_value INTEGER,
+          window_minutes_diagnosis TEXT,
+          resets_at_ms_value INTEGER,
+          resets_at_ms_diagnosis TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS usage_rate_limit_observations_group ON usage_rate_limit_observations(vendor, principal_key, source_key, observed_at_ms);
       `);
       db.exec(`PRAGMA user_version = ${CURRENT_USAGE_SCHEMA_VERSION};`);
       db.exec("COMMIT");
@@ -1041,6 +1188,22 @@ function bootstrapSchema(db: UsageDatabase): void {
         count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (cursor_key, kind)
       );
+      CREATE TABLE IF NOT EXISTS usage_rate_limit_observations (
+        identity_key TEXT PRIMARY KEY,
+        source_key TEXT NOT NULL,
+        principal_key TEXT NOT NULL,
+        vendor TEXT NOT NULL DEFAULT 'codex',
+        slot TEXT NOT NULL,
+        observed_at_ms INTEGER NOT NULL,
+        used_percent_value REAL,
+        used_percent_diagnosis TEXT,
+        window_minutes_value INTEGER,
+        window_minutes_diagnosis TEXT,
+        resets_at_ms_value INTEGER,
+        resets_at_ms_diagnosis TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS usage_rate_limit_observations_group ON usage_rate_limit_observations(vendor, principal_key, source_key, observed_at_ms);
     `);
     db.prepare("INSERT OR IGNORE INTO usage_meta (key, value) VALUES ('alias_salt', ?)").run(randomBytes(32).toString("hex"));
     db.exec(`PRAGMA user_version = ${CURRENT_USAGE_SCHEMA_VERSION};`);
