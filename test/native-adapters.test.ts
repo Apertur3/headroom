@@ -13,6 +13,8 @@ import {
   observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential,
 } from "../src/adapters/antigravity.js";
 import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
+import { gateFor } from "../src/orchestrator-reads.js";
+import { HeadroomStore } from "../src/store.js";
 
 // OAuth-client-shaped fixture values are assembled at runtime so that no
 // secret-shaped literal ever sits in the repository or its history.
@@ -132,6 +134,77 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(rows.filter((row) => row.meter_id === "antigravity:gemini")).toEqual(expect.arrayContaining([
       expect.objectContaining({ freshness: "fresh", truth: "estimated", confidence: 0.5, reason: "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder", quantity: expect.objectContaining({ used: 0 }) }),
     ]));
+  });
+
+  // Issue #55: AGY leaves an inactive rolling 5h window out of an otherwise
+  // healthy retrieveUserQuota response entirely (no bucket at all, not a
+  // bucket with used=0) -- see observationsFromAntigravityQuota's comment.
+  // Before this fix that omission was mapped to freshness "failed" every
+  // poll, which froze the store's last real fresh reading forever (fresh
+  // always outranks failed in latestPerWindow regardless of age) and let it
+  // age into "5h stale Nm" even though the vendor's own app would show 100%.
+  describe("issue #55: a genuinely idle rolling window must read fresh, not held/stale", () => {
+    it("(a) reports a missing 5h bucket as fresh/100% remaining alongside a real fresh weekly reading, and the gate does not block on it", async () => {
+      const body = { buckets: [
+        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
+        // No gemini-5-hour bucket at all: genuinely inactive, nothing to report.
+        { modelId: "claude-gpt-weekly", remainingFraction: 0.58, resetTime: "2026-09-10T17:26:36Z" },
+      ] };
+      const rows = observationsFromAntigravityQuota(body, antigravity, at);
+      const gemini5h = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 300);
+      expect(gemini5h).toMatchObject({
+        freshness: "fresh", truth: "estimated", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" },
+        reason: "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder",
+      });
+      expect(gemini5h?.resets_at).toBe(new Date(at.getTime() + 300 * 60_000).toISOString());
+      const geminiWeekly = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 10_080);
+      expect(geminiWeekly).toMatchObject({ freshness: "fresh", truth: "official", quantity: { used: 14 } });
+
+      const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
+      const store = await HeadroomStore.open(join(root, ".headroom"));
+      try {
+        for (const row of rows) store.insert(row);
+        const gate = gateFor(store, [{ window: "wk", points: 1 }, { window: "5h", points: 3 }], "antigravity:gemini", 0, false, at);
+        expect(gate.allowed).toBe(true);
+        expect(gate.unknown).toBeUndefined();
+      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+    });
+
+    it("(b) keeps a real, enforced 5h reset exactly as the vendor reported it -- never mistaken for an idle placeholder", () => {
+      const body = { buckets: [
+        { modelId: "gemini-5-hour", remainingFraction: 0.01, resetTime: "2026-09-03T21:26:36Z" }, // 1% remaining, 99% used
+        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
+      ] };
+      const rows = observationsFromAntigravityQuota(body, antigravity, at);
+      const gemini5h = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 300);
+      expect(gemini5h).toMatchObject({ freshness: "fresh", truth: "official", confidence: 1, quantity: { used: 99, remaining: 1 }, resets_at: new Date("2026-09-03T21:26:36Z").toISOString() });
+      expect(gemini5h?.reason).toBeUndefined();
+    });
+
+    it("(c) a response with no enforced 5h window for either AGY pool leaves both fresh/idle, independently, never blocking a 5h gate on either", async () => {
+      const body = { buckets: [
+        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
+        { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
+      ] };
+      const rows = observationsFromAntigravityQuota(body, antigravity, at);
+      const fiveHourRows = rows.filter((row) => row.window?.minutes === 300);
+      expect(fiveHourRows).toHaveLength(2);
+      expect(fiveHourRows.every((row) => row.freshness === "fresh" && row.quantity?.used === 0)).toBe(true);
+      // Gemini's fresh weekly usage must never leak onto the separate claude-gpt pool.
+      const claudeGptWeekly = rows.find((row) => row.meter_id === "antigravity:claude-gpt" && row.window?.minutes === 10_080);
+      expect(claudeGptWeekly?.quantity?.used).toBe(0);
+      const geminiWeekly = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 10_080);
+      expect(geminiWeekly?.quantity?.used).toBe(14);
+
+      const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
+      const store = await HeadroomStore.open(join(root, ".headroom"));
+      try {
+        for (const row of rows) store.insert(row);
+        expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:gemini", 0, false, at).allowed).toBe(true);
+        expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:claude-gpt", 0, false, at).allowed).toBe(true);
+      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+    });
   });
 
   it("rejects an availability-only Antigravity quota answer without treating model availability as quota", async () => {

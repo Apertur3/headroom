@@ -1,4 +1,4 @@
-import { normalizeObservations } from "../engine/observation.js";
+import { IDLE_WINDOW_REASON, normalizeObservations } from "../engine/observation.js";
 import { redact } from "../security.js";
 import { vendorJson } from "../limits.js";
 import {
@@ -81,6 +81,28 @@ export function observationsFromAntigravityQuota(body: unknown, account: Provide
     const match = candidates.filter((candidate) => candidate.meter === meter && candidate.minutes === window.minutes && candidate.remaining !== undefined)
       .sort((left, right) => (left.remaining ?? 1) - (right.remaining ?? 1))[0];
     if (!match || match.remaining === undefined) {
+      // The rolling five-hour lane has no persistent state to report while
+      // genuinely unused: retrieveUserQuota already proved this account's
+      // response is real (buckets() found at least one usable fraction
+      // somewhere, or observeAntigravity would already have failed the whole
+      // read above), so an absent bucket for THIS rolling window, on THIS
+      // otherwise-successful poll, is the vendor's own confirmation that
+      // nothing has been spent here yet -- the same 100% a person sees in
+      // the Antigravity app itself. Report it fresh instead of failed so it
+      // never masquerades as a dead read the store then freezes on the
+      // moment the window goes quiet (issue #55): the reset is a moving idle
+      // marker computed from this fetch, not a durable identity, and
+      // IDLE_WINDOW_REASON/truth=estimated keeps it visibly inferred rather
+      // than a literal vendor number. A fixed (weekly) window never gets
+      // this treatment -- the vendor has never been observed to omit it
+      // while healthy, so its absence stays a genuine failed read.
+      if (window.kind === "rolling") {
+        output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" },
+          quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" },
+          resets_at: new Date(Date.parse(now) + window.minutes * 60_000).toISOString(),
+          freshness: "fresh", truth: "estimated", confidence: 0.5, reason: IDLE_WINDOW_REASON });
+        continue;
+      }
       output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no quota bucket for this window" });
       continue;
     }

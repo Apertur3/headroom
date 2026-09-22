@@ -789,6 +789,28 @@ describe("pace and consumes", () => {
     expect(agedDecision.reason).toBe("stale 60m; next poll time unknown");
   });
 
+  // Issue #55: a held vendor-window baseline (store.ts's two-poll
+  // consistency guard) is frozen on purpose while a new identity awaits
+  // confirmation. Once that freeze ages past staleness_minutes it must read
+  // as "held ... unconfirmed", never the generic "stale Nm" a dead poller
+  // would produce -- the two mean very different things to whoever is
+  // reading the gate refusal. The pace state stays UNKNOWN either way: this
+  // only changes the explanation, never whether the reading is trusted.
+  it("distinguishes a held vendor-window baseline gone stale from a plain stale reading", () => {
+    const held = paced(0, { freshness: "fresh", fetched_at: "2026-09-03T09:00:00Z", metadata: { vendor_window_held: true } }); // 3h old, staleness_minutes = 15
+    const decision = paceDecision(held, policy, now);
+    expect(decision.state).toBe("UNKNOWN");
+    expect(decision.reason).toMatch(/^held window past reset, unconfirmed \(180m since the last accepted reading\)/);
+    expect(decision.reason).not.toContain("stale 180m");
+
+    const inconsistent = paced(0, { freshness: "fresh", fetched_at: "2026-09-03T09:00:00Z", metadata: { vendor_inconsistent: true } });
+    expect(paceDecision(inconsistent, policy, now).reason).toMatch(/^held window past reset, unconfirmed/);
+
+    // An ordinary aged-out reading with neither flag keeps the plain wording.
+    const plain = paced(0, { freshness: "fresh", fetched_at: "2026-09-03T09:00:00Z" });
+    expect(paceDecision(plain, policy, now).reason).toBe("stale 180m; next poll time unknown");
+  });
+
   it("holds pace at NORMAL for the early grace period unless frozen", () => {
     const early = paced(70, { resets_at: "2026-09-03T13:35:00Z" }); // 5% into a 100-minute window
     const later = paced(70, { resets_at: "2026-09-03T13:25:00Z" }); // 15% elapsed
