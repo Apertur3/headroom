@@ -54,8 +54,10 @@ vendor cannot legitimately go from spending back to idle without a reset in betw
 reading that does not contradict recent history is not failed: it's shown as the vendor reported
 it, marked `estimated` at reduced confidence rather than hidden behind UNKNOWN, since a real idle
 window looks identical to a placeholder from a single snapshot alone. `not_enforced` is different from
-the other three: it means the vendor confirmed there is no cap on this window at all, so it prints
-as `n/a` and never counts toward `can` or a threshold. Anything `stale` or `failed` becomes the
+the other three: it means the vendor confirmed there is no cap on this window at all (claude-main's
+scoped limits), or confirmed nothing about it at all in an otherwise-successful response (Antigravity's
+rolling 5h window while genuinely idle -- see issue #55) -- either way, there is no real quantity to
+report and none is invented. It prints as `n/a` and never counts toward `can` or a threshold. Anything `stale` or `failed` becomes the
 pace state UNKNOWN everywhere Headroom shows it, and `headroom can` answers NO for it unless you
 pass `--allow-unknown`. UNKNOWN is never treated as capacity. `plan`, `gate`, and `fill` apply the
 same staleness threshold before doing any of their own math: a window that is stale, failed, or

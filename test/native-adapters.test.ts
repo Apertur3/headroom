@@ -143,8 +143,13 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
   // poll, which froze the store's last real fresh reading forever (fresh
   // always outranks failed in latestPerWindow regardless of age) and let it
   // age into "5h stale Nm" even though the vendor's own app would show 100%.
-  describe("issue #55: a genuinely idle rolling window must read fresh, not held/stale", () => {
-    it("(a) reports a missing 5h bucket as fresh/100% remaining alongside a real fresh weekly reading, and the gate does not block on it", async () => {
+  // A first fix attempt synthesized a fresh 100%-remaining reading instead --
+  // a number the vendor never sent, rejected by the owner as exactly the
+  // placeholder shape Headroom already treats with suspicion elsewhere. The
+  // shipped fix instead reports the honest thing: `not_enforced`, no
+  // quantity, no resets_at, no invented percentage.
+  describe("issue #55: a missing 5h bucket must read as an honest not_enforced gap, never an invented 100%", () => {
+    it("(a) reports a missing 5h bucket as not_enforced with no quantity, no resets_at and no invented percentage, replaces a stale real reading in the store, and does not block a 5h gate", async () => {
       const body = { buckets: [
         { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
         // No gemini-5-hour bucket at all: genuinely inactive, nothing to report.
@@ -153,25 +158,43 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       const rows = observationsFromAntigravityQuota(body, antigravity, at);
       const gemini5h = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 300);
       expect(gemini5h).toMatchObject({
-        freshness: "fresh", truth: "estimated", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-        quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" },
-        reason: "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder",
+        freshness: "not_enforced", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: null, resets_at: null, reason: "vendor sent no 5h bucket in this response",
       });
-      expect(gemini5h?.resets_at).toBe(new Date(at.getTime() + 300 * 60_000).toISOString());
+      // Never the rejected placeholder shape: no 100%, no reset manufactured
+      // from fetch time plus window length.
+      expect(gemini5h?.quantity).not.toMatchObject({ used: 0, remaining: 100 });
+      expect(gemini5h?.resets_at).toBeNull();
       const geminiWeekly = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 10_080);
       expect(geminiWeekly).toMatchObject({ freshness: "fresh", truth: "official", quantity: { used: 14 } });
 
       const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
       const store = await HeadroomStore.open(join(root, ".headroom"));
       try {
-        for (const row of rows) store.insert(row);
+        // A real, aged 5h reading from an earlier, active poll must not
+        // freeze in place once the window goes idle: insertPoll's own
+        // "windows omitted by this poll" bookkeeping treats a not_enforced
+        // row as present (not omitted), and latestPerWindow ranks
+        // not_enforced alongside fresh, so the newer not_enforced reading
+        // replaces the stale real one instead of both hiding each other.
+        store.insertPoll([
+          { ...gemini5h!, freshness: "fresh", truth: "official", quantity: { used: 45, limit: 100, remaining: 55, unit: "percent" }, resets_at: "2026-09-03T18:00:00Z", fetched_at: "2026-09-03T12:00:00Z", observed_at: "2026-09-03T12:00:00Z", reason: undefined },
+          { ...geminiWeekly!, fetched_at: "2026-09-03T12:00:00Z", observed_at: "2026-09-03T12:00:00Z" },
+        ]);
+        store.insertPoll(rows);
+        const current = store.latestPerWindow("antigravity:gemini").find((row) => row.window?.minutes === 300);
+        expect(current).toMatchObject({ freshness: "not_enforced", quantity: null, reason: "vendor sent no 5h bucket in this response" });
+
         const gate = gateFor(store, [{ window: "wk", points: 1 }, { window: "5h", points: 3 }], "antigravity:gemini", 0, false, at);
         expect(gate.allowed).toBe(true);
         expect(gate.unknown).toBeUndefined();
+        // The agent can tell the 5h check was skipped for lack of data,
+        // rather than silently passed.
+        expect(gate.reason).toContain("5h not enforced");
       } finally { store.close(); await rm(root, { recursive: true, force: true }); }
     });
 
-    it("(b) keeps a real, enforced 5h reset exactly as the vendor reported it -- never mistaken for an idle placeholder", () => {
+    it("(b) keeps a real, enforced 5h reading exactly as the vendor reported it -- a real bucket with usage is always preserved", () => {
       const body = { buckets: [
         { modelId: "gemini-5-hour", remainingFraction: 0.01, resetTime: "2026-09-03T21:26:36Z" }, // 1% remaining, 99% used
         { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
@@ -182,7 +205,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect(gemini5h?.reason).toBeUndefined();
     });
 
-    it("(c) a response with no enforced 5h window for either AGY pool leaves both fresh/idle, independently, never blocking a 5h gate on either", async () => {
+    it("(c) a response with no enforced 5h window for either AGY pool leaves both not_enforced, independently, never blocking a 5h gate on either", async () => {
       const body = { buckets: [
         { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
         { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
@@ -190,7 +213,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       const rows = observationsFromAntigravityQuota(body, antigravity, at);
       const fiveHourRows = rows.filter((row) => row.window?.minutes === 300);
       expect(fiveHourRows).toHaveLength(2);
-      expect(fiveHourRows.every((row) => row.freshness === "fresh" && row.quantity?.used === 0)).toBe(true);
+      expect(fiveHourRows.every((row) => row.freshness === "not_enforced" && row.quantity === null && row.resets_at === null)).toBe(true);
       // Gemini's fresh weekly usage must never leak onto the separate claude-gpt pool.
       const claudeGptWeekly = rows.find((row) => row.meter_id === "antigravity:claude-gpt" && row.window?.minutes === 10_080);
       expect(claudeGptWeekly?.quantity?.used).toBe(0);
@@ -200,9 +223,15 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
       const store = await HeadroomStore.open(join(root, ".headroom"));
       try {
-        for (const row of rows) store.insert(row);
+        store.insertPoll(rows);
+        // The two pools stay fully independent: neither's not_enforced 5h
+        // gap nor its weekly reading is visible on the other's meter.
         expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:gemini", 0, false, at).allowed).toBe(true);
         expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:claude-gpt", 0, false, at).allowed).toBe(true);
+        const geminiRows = store.latestPerWindow("antigravity:gemini");
+        const claudeGptRows = store.latestPerWindow("antigravity:claude-gpt");
+        expect(geminiRows.every((row) => row.meter_id === "antigravity:gemini")).toBe(true);
+        expect(claudeGptRows.every((row) => row.meter_id === "antigravity:claude-gpt")).toBe(true);
       } finally { store.close(); await rm(root, { recursive: true, force: true }); }
     });
   });

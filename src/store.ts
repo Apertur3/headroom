@@ -551,11 +551,17 @@ export class HeadroomStore {
   insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
 
   /** Record a complete vendor poll and retire windows omitted by that poll.
-   * A later vendor response for the same duration supersedes the retirement. */
+   * A later vendor response for the same duration supersedes the retirement.
+   * A `not_enforced` row counts as present, not omitted: it is the adapter
+   * explicitly reporting on that window this poll (a confirmed absent cap,
+   * or issue #55's "vendor sent no bucket for it"), so it must not trigger
+   * the same "vendor no longer reports this window" retirement a genuinely
+   * omitted window would -- latestPerWindow's own ranking already lets that
+   * not_enforced reading supersede an older fresh one for the same window. */
   insertPoll(observations: Observation[]): StoredObservation[] {
     const stored = this.insertAll(observations);
     const byMeter = new Map<string, StoredObservation[]>();
-    for (const row of stored) if (row.freshness === "fresh" && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
+    for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
     for (const [meter, rows] of byMeter) {
       // An incomplete vendor picture must not retire a sibling window while
       // this meter is already being held for inconsistent reset identities.
@@ -1371,15 +1377,28 @@ export class HeadroomStore {
   /**
    * The observations table is an append-only history. Current status must have
    * one row per meter and duration, chosen by the vendor fetch timestamp (not
-   * insertion order), preferring a fresh reading over anything else at any
-   * fetched_at. A stale/failed/not_enforced source that keeps re-reporting
-   * the exact same old event on every poll (Codex's session-log rate-limit
-   * fallback re-reading an unchanged log file, for one) must never eclipse a
-   * later fresh reading just because it happens to get re-inserted after
-   * it -- and a fresh reading is only ever missing in favor of a non-fresh
-   * one when no fresh reading exists for that window at all. A duration is
-   * the user-visible window identity: a 5h rolling and a 5h fixed window are
-   * still the same current 5h allowance.
+   * insertion order), preferring a fresh (or not_enforced -- see below) reading
+   * over anything else at any fetched_at. A stale/failed source that keeps
+   * re-reporting the exact same old event on every poll (Codex's session-log
+   * rate-limit fallback re-reading an unchanged log file, for one) must never
+   * eclipse a later fresh reading just because it happens to get re-inserted
+   * after it -- and a fresh reading is only ever missing in favor of a
+   * non-fresh one when no fresh reading exists for that window at all. A
+   * duration is the user-visible window identity: a 5h rolling and a 5h fixed
+   * window are still the same current 5h allowance.
+   *
+   * `not_enforced` shares fresh's top rank (tie-broken by fetched_at like any
+   * other pair in that tier): it is a vendor-confirmed CURRENT statement about
+   * this window -- "no bucket for it in this response" (issue #55's rolling
+   * 5h case) or "no cap on it at all" (claude-main:routines) -- not a gap to
+   * be filled by an older reading. A genuinely idle rolling window that used
+   * to carry real usage must have that old percentage replaced by the new
+   * not_enforced reading, the same poll it goes idle, rather than freezing in
+   * place until it ages into a misleading "stale Nm": that freeze (and the
+   * synthesized-100% workaround it once justified) was the bug issue #55
+   * reported. A later real, fresh percent reading for the same window still
+   * displaces a not_enforced one exactly like it displaces another fresh one,
+   * since the tie-break is fetched_at DESC either way.
    */
   latestPerWindow(meterId?: string): StoredObservation[] {
     const filter = meterId === undefined
@@ -1388,7 +1407,7 @@ export class HeadroomStore {
     return this.db.prepare(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
-        ORDER BY (CASE WHEN freshness = 'fresh' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
+        ORDER BY (CASE WHEN freshness = 'fresh' OR freshness = 'not_enforced' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current
