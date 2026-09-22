@@ -7,9 +7,12 @@
  * identity source (`response_id` instead of `message.id`), and the complete
  * absence of a model field on the counter record are different enough that
  * forcing one abstraction over both would risk changing Claude's already
- * reviewed semantics. Nothing here reads a file, wires a collector, changes
- * `usage.db`'s schema, or claims Codex usage is imported anywhere yet -- see
- * the "Codex (library only)" section of docs/usage-prediction.md.
+ * reviewed semantics. This module itself still never reads a file or touches
+ * `usage.db` directly -- it stays a pure, filesystem-free normalizer -- but
+ * `usage-collector.ts` and `usage-store.ts` do wire it into `headroom usage
+ * import --format codex` (and `--format auto`, via `usage-format-detect.ts`)
+ * and a real `usage.db` schema; see the "Codex usage" section of
+ * docs/usage-prediction.md for the current, wired-in state.
  *
  * Only one Codex payload is accepted as an accountable usage snapshot:
  * `token_usage_record.payload.usage`, the non-cumulative, per-response block. Every

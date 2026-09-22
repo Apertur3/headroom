@@ -128,9 +128,9 @@ Credential location: `<CODEX_HOME>/auth.json`, default `~/.codex/auth.json`, rea
 file on every platform. There is no Keychain path for Codex.
 
 Meters emitted: `<principal>:main` (5-hour and weekly), `<principal>:spark` (5-hour and weekly,
-only when the response's `additional_rate_limits` includes a Spark entry), and
-`<principal>:credits`, a `count` window with no reset duration; it is informational and never
-gates `can`.
+only when the response's `additional_rate_limits` array is present at all -- see below for what
+each window shows when the array has no Spark entry), and `<principal>:credits`, a `count` window
+with no reset duration; it is informational and never gates `can`.
 
 An idle Codex window can report 0% with a reset time that moves forward on each poll.
 Headroom recognizes this native endpoint pattern with a bounded clock/response tolerance.
@@ -146,6 +146,14 @@ Known limitation, verified live: on some plans the endpoint's `primary_window` (
 is absent from the response, and there's no recent session log to fall back to. Headroom
 reports that window `not_enforced` with reason "no 5-hour window from endpoint or session logs",
 printed as `n/a`, rather than guessing.
+
+A genuinely idle Spark meter gets the same honest treatment: `additional_rate_limits` drops the
+Spark entry entirely once it goes idle rather than sending a bucket with `used=0`. When the array
+is present but has no entry whose name matches "spark", both Spark windows report `not_enforced`
+("vendor sent no Spark data for the 5-hour/weekly window in this response"), printed as `n/a`, and
+this immediately replaces (rather than freezes) the last real reading. A response that omits
+`additional_rate_limits` entirely -- the call never asked about Spark at all -- leaves an existing
+Spark reading untouched either way.
 
 ## Antigravity
 

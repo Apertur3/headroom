@@ -4,14 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.6] - 2026-09-23
 
 ### Added
-- Wire the Codex usage normalizer into `headroom usage import` with `--format codex`, alongside the existing default Claude parsing (`--format claude`, or no flag). Codex per-response counters (`cached_input`, `cache_write`, `reasoning`, `total`) persist to the same private `usage.db`, vendor-discriminated so Codex and Claude identities never collide. `usage.db` auto-migrates from schema v1 to v2 on open (existing Claude-only data is untouched); `import-status` totals show the Codex-only counters and any counter-consistency flags for a Codex group. `--format auto` is accepted as syntax but not yet implemented -- it currently behaves like the default (Claude parsing); real format auto-detection is future work. Codex rate-limit observations riding along on a skipped line are counted in the run's counters but not yet persisted anywhere.
+- Wire the Codex usage normalizer into `headroom usage import` with `--format codex`, alongside the existing default Claude parsing (`--format claude`, or no flag). Codex per-response counters (`cached_input`, `cache_write`, `reasoning`, `total`) persist to the same private `usage.db`, vendor-discriminated so Codex and Claude identities never collide. `import-status` totals show the Codex-only counters and any counter-consistency flags for a Codex group.
+- Implement `headroom usage import --format auto`: a pure, per-line detector (`src/usage-format-detect.ts`) tells a Claude Code transcript line apart from a Codex CLI session-log line by structural shape, never by trusting the flag or the file's name/extension/path, and routes each line to whichever normalizer matches -- safe over a file that interleaves both vendors' lines. A line neither shape can classify falls back to the Claude normalizer and its ordinary rejection/skip handling.
+- Persist Codex rate-limit observations (percent, semantic window length, reset time, parsed from `event_msg`'s `rate_limits` block) to a new `usage_rate_limit_observations` table, keyed by each observation's own content hash so a re-imported line is a no-op rather than a duplicate row. `usage.db` schema moves to v3 (v1->v3 and v2->v3 migrations, both purely additive; existing rows are never touched). Not yet surfaced in `import-status`'s own output -- read via `UsageStore.rateLimitObservations`/`rateLimitObservationCount`.
 
 ### Fixed
 - Stop treating a missing Antigravity rolling 5h quota bucket as a failed read, which froze the last real reading in place until it aged into a misleading stale state even while the weekly window was fresh. A missing bucket in an otherwise-successful response is now reported honestly as not-enforced (no invented quantity, percentage, or reset), replaces the old reading immediately, shows as `5h n/a (...)` in status, and does not block a `gate --need 5h:N` check.
 - Stop treating a missing Codex Spark rate-limit entry as a silent no-op that froze the meter's last real reading in place until it aged into a misleading stale state, even while the vendor's response was otherwise healthy. A missing entry in an otherwise-successful response is now reported honestly as not-enforced (no invented quantity, percentage, or reset), replaces the old reading immediately, and does not block a `gate --need` check on it -- same truth rule as Antigravity's rolling 5h window fix.
+- Swift engine: classify an Antigravity window's kind (rolling vs. fixed) by its duration, matching the TypeScript adapter, instead of by whether the vendor happened to send a reset time this poll -- a genuinely idle rolling 5h window with no reset previously misclassified as fixed and could trip a held-window guard meant for real vendor changes.
 
 ## [0.1.5] - 2026-09-21
 
