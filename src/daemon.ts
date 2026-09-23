@@ -790,10 +790,13 @@ async function socketExists(path: string): Promise<boolean> {
  * treated conservatively as "a listener might be there": prepareSocket()
  * then leaves the file alone and falls through to the existing health-based
  * check rather than ever unlinking on an ambiguous signal. */
-async function hasListener(path: string): Promise<boolean> {
+async function hasListener(path: string, timeoutMs = 1000): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = createConnection(path);
-    const finish = (value: boolean): void => { socket.destroy(); resolve(value); };
+    // A probe that neither connects nor fails in time is ambiguous: treat it as
+    // a possible listener so startup never hangs and never unlinks on a guess.
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    const finish = (value: boolean): void => { clearTimeout(timer); socket.destroy(); resolve(value); };
     socket.once("connect", () => finish(true));
     socket.once("error", (error: NodeJS.ErrnoException) => finish(error.code !== "ECONNREFUSED" && error.code !== "ENOENT"));
   });
