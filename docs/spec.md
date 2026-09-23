@@ -100,9 +100,10 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
   `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
-- `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
-  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
-  `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
+  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, pasted
+  `/usage` ingestion, and learned points-per-token rates); see `docs/mcp-and-agents.md` for the
+  full list and field shapes.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into
@@ -112,9 +113,17 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - `headroom usage import --source <alias> --principal <alias> --path <file> [--format
   claude|codex]` / `import-status`: opt-in, explicitly-invoked ingestion of raw numeric usage
   counters (token counts, not a percent-of-limit) from one named Claude Code transcript or
-  Codex CLI session-log file into a private `usage.db` (schema v2, vendor-discriminated),
+  Codex CLI session-log file into a private `usage.db` (schema v4, vendor-discriminated),
   entirely separate from the observation/pace/`can` pipeline above. No directory walk, no
   daemon, no scheduler; see `docs/usage-prediction.md`.
+- `headroom rates [--meter <meter_id>] [--model <slug>] [--principal <id>] [--since 30d] [--json]
+  [--agent]` (MCP `quota_rates`): fits points per 1,000,000 tokens per meter/principal/model from
+  `usage.db`'s imported counts against the meter's own percent deltas (non-negative least
+  squares), with a minimum-sample refusal, a coverage/background bias disclosure, and a
+  `rate_changed` drift event when a new fit moves enough with enough confidence. `headroom usage
+  top [--window 5h|wk] [--by session|model] [--json]` estimates points per session/model from
+  those learned rates, top spenders first, clearly labelled as an estimate. Both local-only, no
+  vendor call; see `docs/usage-prediction.md`.
 
 ## Acceptance criteria
 

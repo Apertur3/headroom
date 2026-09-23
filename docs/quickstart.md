@@ -384,7 +384,7 @@ For every extra Claude Code profile, point at its config directory:
 CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
 ```
 
-This registers Headroom's MCP server (stdio; all sixteen `quota_*` tools) for that Claude Code
+This registers Headroom's MCP server (stdio; all seventeen `quota_*` tools) for that Claude Code
 session. See [mcp-and-agents.md](mcp-and-agents.md) for
 the full tool list and how an orchestrator should call them.
 
