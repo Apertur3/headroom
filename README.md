@@ -51,7 +51,9 @@ Google retired that access on June 18, 2026.
 
 For Antigravity, Headroom reads agy's local quota summary without reading its token.
 Missing or failed summaries stay UNKNOWN. An idle window with real fractions may carry
-a doubt marker when its reset time looks synthetic. The endpoint contracts and native
+a doubt marker when its reset time looks synthetic. A five-hour window entirely absent
+from an otherwise-successful response (a genuinely idle rolling window) prints `n/a`
+instead of UNKNOWN and does not block a budget check. The endpoint contracts and native
 reader build on [CodexBar](https://github.com/steipete/codexbar) (MIT).
 
 ## What you get
