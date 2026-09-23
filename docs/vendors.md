@@ -128,9 +128,9 @@ Credential location: `<CODEX_HOME>/auth.json`, default `~/.codex/auth.json`, rea
 file on every platform. There is no Keychain path for Codex.
 
 Meters emitted: `<principal>:main` (5-hour and weekly), `<principal>:spark` (5-hour and weekly,
-only when the response's `additional_rate_limits` includes a Spark entry), and
-`<principal>:credits`, a `count` window with no reset duration; it is informational and never
-gates `can`.
+only when the response's `additional_rate_limits` array is present at all -- see below for what
+each window shows when the array has no Spark entry), and `<principal>:credits`, a `count` window
+with no reset duration; it is informational and never gates `can`.
 
 An idle Codex window can report 0% with a reset time that moves forward on each poll.
 Headroom recognizes this native endpoint pattern with a bounded clock/response tolerance.
@@ -146,6 +146,14 @@ Known limitation, verified live: on some plans the endpoint's `primary_window` (
 is absent from the response, and there's no recent session log to fall back to. Headroom
 reports that window `not_enforced` with reason "no 5-hour window from endpoint or session logs",
 printed as `n/a`, rather than guessing.
+
+A genuinely idle Spark meter gets the same honest treatment: `additional_rate_limits` drops the
+Spark entry entirely once it goes idle rather than sending a bucket with `used=0`. When the array
+is present but has no entry whose name matches "spark", both Spark windows report `not_enforced`
+("vendor sent no Spark data for the 5-hour/weekly window in this response"), printed as `n/a`, and
+this immediately replaces (rather than freezes) the last real reading. A response that omits
+`additional_rate_limits` entirely -- the call never asked about Spark at all -- leaves an existing
+Spark reading untouched either way.
 
 ## Antigravity
 
@@ -193,6 +201,17 @@ Meters are `<principal>:gemini` and `<principal>:claude-gpt`, each with five-hou
 weekly windows. Missing readers, login failures and unavailable summaries remain UNKNOWN.
 Idle windows with real fractions can carry a doubt marker when their reset time matches
 fetch time plus window length; availability alone is never reported as unused capacity.
+
+A genuinely idle five-hour (rolling) window can go further: when `retrieveUserQuota`
+succeeds but omits the five-hour bucket entirely (nothing to report, not an error), Headroom
+reports that window `not_enforced` instead of failed -- no invented quantity, percentage or
+reset, shown as `5h n/a (vendor sent no 5h bucket in this response)`. This replaces a stale
+frozen reading immediately (the newer `not_enforced` observation outranks an old `fresh` one
+by fetch time) and is skipped, not blocking, on `gate --need 5h:N` and `can`. A real bucket
+with genuine usage is unaffected -- the vendor's own numbers always win when one is present.
+The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
+(UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
+
 `headroom doctor` distinguishes the native reader, login state and successful quota read.
 `--shape` is not available for this local source; use status JSON and doctor.
 

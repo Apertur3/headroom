@@ -100,16 +100,19 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
   `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
-- `headroom mcp` : stdio MCP: `quota_status`, `quota_can`, `quota_events`.
+- `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
+  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
+  `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into
   FREEZE, log overrides with a reason.
 - Adapter SDK: an adapter is a pure function `(principal) → observations[]` plus a conformance
   fixture directory; third parties add vendors without touching the core.
-- `headroom usage import --source <alias> --principal <alias> --path <file>` / `import-status`:
-  opt-in, explicitly-invoked ingestion of raw numeric usage counters (token counts, not a
-  percent-of-limit) from one named Claude Code transcript file into a private `usage.db`,
+- `headroom usage import --source <alias> --principal <alias> --path <file> [--format
+  claude|codex]` / `import-status`: opt-in, explicitly-invoked ingestion of raw numeric usage
+  counters (token counts, not a percent-of-limit) from one named Claude Code transcript or
+  Codex CLI session-log file into a private `usage.db` (schema v2, vendor-discriminated),
   entirely separate from the observation/pace/`can` pipeline above. No directory walk, no
   daemon, no scheduler; see `docs/usage-prediction.md`.
 
