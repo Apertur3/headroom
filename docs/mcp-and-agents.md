@@ -1,15 +1,18 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes sixteen tools, defined in `src/mcp.ts`: status, action checks, events,
-three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, and pasted
-`/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
+SDK dependency. It exposes seventeen tools, defined in `src/mcp.ts`: status, action checks, events,
+three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, pasted
+`/usage` ingestion, and the learned points-per-token rates. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, `quota_usage_paste`,
+and `quota_rates` tries the daemon
 first, over its local socket or named pipe, and falls back to
 a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`,
-`quota_route`, `quota_inbox`, and `quota_usage_paste` always read directly, since none has a daemon RPC case at
+`quota_route`, `quota_inbox`, `quota_usage_paste`, and `quota_rates` always read directly, since none has a daemon RPC case at
 all -- `quota_wait` because it never blocks (it just reports the reset time), `quota_route` because
-it's a deliberate, occasional call, not a hot path worth a daemon round trip, and
-`quota_usage_paste` because it is a rare, human-triggered write.
+it's a deliberate, occasional call, not a hot path worth a daemon round trip,
+`quota_usage_paste` because it is a rare, human-triggered write, and `quota_rates` because the
+rate learner is local-only state in `usage.db`/`headroom.db` the daemon has no notion of at all
+(see `docs/usage-prediction.md`'s "The rate learner").
 
 Every tool call is validated against its own declared schema before any dispatch, to the daemon or
 to the direct fallback: an argument of the wrong type, a number outside the bounds noted below (the
@@ -317,6 +320,21 @@ all, or when a human can see a scoped bar the account-wide window hides. Returns
 observations plus `unparsed`, the panel lines it could not place. The next successful poll
 supersedes these rows by being newer. CLI: `headroom usage --paste`.
 
+### `quota_rates`
+
+Optional `meter`, `model`, `principal`, `since` (an ISO timestamp, defaulting to 30 days ago).
+Local-only, direct-only (see above): fits (and, when the observation window has moved, persists)
+points-per-1,000,000-tokens per meter and model from `headroom usage import`'s already-imported
+token counts against the meter's own observed percent deltas -- never a vendor call. Returns
+`rates: [...]`, one entry per (meter, principal, model) examined, each with `status: "fit" |
+"insufficient_data"`, `sample_count`, and, when fit, `rate_per_million_tokens`,
+`background_points_per_interval`, `coverage`, `r_squared`, and `last_changed_at`. A
+`rate_changed` event is recorded (and reflected in `last_changed_at`) when a newly computed fit
+differs from the previous one by at least 25% in any token class and both fits are confident
+enough to trust the comparison. See `docs/usage-prediction.md`'s "The rate learner" for the fit
+method, the coverage/background bias, and why this only fits Claude models. CLI: `headroom
+rates`.
+
 ## How an orchestrator should use them
 
 This mirrors `skills/headroom/SKILL.md`, which any Claude Code session with the skill installed
@@ -368,6 +386,7 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_spend` | `headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]` |
 | `quota_inbox` | `headroom inbox --session <session-id> [--since <epoch-ms>] [--json]` (send: `headroom inbox send --to <session-id> --kind <budget\|note\|handoff> (--file <path> \| --text <text>)`) |
 | `quota_usage_paste` | `headroom usage --paste [--principal <id>] [--json]` (or `--clipboard`) |
+| `quota_rates` | `headroom rates [--meter <meter_id>] [--model <slug>] [--principal <id>] [--since 30d] [--json] [--agent]` |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match

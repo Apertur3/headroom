@@ -16,6 +16,8 @@ import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
 import { HeadroomStore } from "./store.js";
+import { UsageStore } from "./usage-store.js";
+import { computeRates, rateRowToJson, RATES_BIAS_NOTE } from "./rates-cli.js";
 import { isLocalAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
@@ -40,6 +42,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, need: { type: "string" } }, required: ["meter"] } },
   { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
+  { name: "quota_rates", description: "Learned points per 1,000,000 tokens per meter and model, fit from headroom usage import's already-imported token counts against the meter's own percent deltas (never a vendor call). Reports sample_count, coverage (share of observed movement the four token-class terms explain -- the rest is other, un-imported usage on the same account/window) and r_squared as confidence; a combination with too few samples reports status insufficient_data instead of a number. May persist a new fit (and a rate_changed event, on sufficient drift) when new observations exist since the last one, the same as `headroom rates`.", inputSchema: { type: "object", properties: { meter: { type: "string" }, model: { type: "string" }, principal: { type: "string" }, since: { type: "string" } } } },
 ];
 
 /**
@@ -459,6 +462,37 @@ async function directWait(meter: unknown): Promise<DirectResult> {
   } finally { store.close(); }
 }
 
+/**
+ * `quota_rates`: the CLI's `headroom rates --json` over MCP, reusing
+ * rates-cli.ts's `computeRates`/`rateRowToJson` so the two surfaces can
+ * never drift apart on field names or the bias note. Always a direct read
+ * (see `handleMcp`'s dispatch below): the daemon has no notion of the rate
+ * learner, and everything this needs (`headroom.db`'s meter history,
+ * `usage.db`'s imported tokens and fit history) is already local, so there
+ * is nothing a daemon round-trip would add.
+ */
+async function directRates(meter: unknown, model: unknown, principal: unknown, since: unknown): Promise<DirectResult> {
+  const sinceIsoValue = typeof since === "string" && since.trim() ? since.trim() : new Date(Date.now() - 30 * 86_400_000).toISOString();
+  if (Number.isNaN(Date.parse(sinceIsoValue))) throw new Error("since must be an ISO 8601 timestamp");
+  const headroomStore = await HeadroomStore.open();
+  try {
+    // create: false, same reasoning as rates-cli.ts's ratesCommand: a read
+    // must never bring usage.db into existence.
+    const usageStore = await UsageStore.open({ create: false });
+    if (!usageStore) return { source: "direct", rates: [], since: sinceIsoValue, bias_note: RATES_BIAS_NOTE };
+    try {
+      const items = computeRates(headroomStore, usageStore, {
+        meterId: typeof meter === "string" && meter.trim() ? meter.trim() : undefined,
+        model: typeof model === "string" && model.trim() ? model.trim() : undefined,
+        principalAlias: typeof principal === "string" && principal.trim() ? principal.trim() : undefined,
+        sinceIsoValue,
+      });
+      headroomStore.audit("mcp", "rates", typeof meter === "string" ? meter : null, "ok");
+      return { source: "direct", rates: items.map(rateRowToJson), since: sinceIsoValue, bias_note: RATES_BIAS_NOTE };
+    } finally { usageStore.close(); }
+  } finally { headroomStore.close(); }
+}
+
 async function directResult(method: string, arguments_: Record<string, unknown>): Promise<DirectResult> {
   if (method === "status") return directStatus();
   if (method === "can") return directCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true, typeof arguments_.owner === "string" ? arguments_.owner : undefined, typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true);
@@ -475,6 +509,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need);
   if (method === "route") return directRoute(arguments_.action_class, arguments_.owner, arguments_.allow_unknown);
   if (method === "usage_paste") return directUsagePaste(arguments_.principal, arguments_.text);
+  if (method === "rates") return directRates(arguments_.meter, arguments_.model, arguments_.principal, arguments_.since);
   return directEvents(arguments_.since);
 }
 
@@ -545,7 +580,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
     quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
-    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox",
+    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox", quota_rates: "rates",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
@@ -590,7 +625,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // (see routeFor's own doc comment: an infrequent, deliberate call, not a
     // hot path worth a daemon RPC case) -- both skip the daemon `call` step
     // every other tool takes.
-    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" ? undefined : await call(daemonMethod, params_);
+    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" || method === "rates" ? undefined : await call(daemonMethod, params_);
     const resolved = result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or

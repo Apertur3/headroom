@@ -1,11 +1,22 @@
-# Usage-based prediction — ingestion foundation
+# Usage-based prediction — ingestion, the rate learner, and drift
 
-This is still a **foundation**, not a prediction feature. There is no
-predictor turning token counts into a percent-of-limit or a pace state, and
-nothing here runs on its own — each `headroom usage import` invocation
-explicitly selects the file to read. There is no
-daemon integration, no MCP tool, no scheduler, and no directory walk or glob:
-each invocation reads exactly one file the caller named.
+The ingestion layer (`headroom usage import`) is still a **foundation**:
+nothing here runs on its own, each invocation explicitly selects the file to
+read, and there is still no daemon integration, no scheduler, and no
+directory walk or glob.
+
+On top of that foundation, `headroom rates` (and its MCP twin, `quota_rates`)
+now fits **points per 1,000,000 tokens**, per meter/principal/model, from
+that imported usage against the meter's own observed percent deltas — and
+tracks how that fit drifts over time. `headroom usage top` turns those
+learned rates into a per-session/per-model attribution view. See "The rate
+learner" and "Attribution: `headroom usage top`" below.
+
+Still out of scope, deliberately (see issue #53's items 4 and 5): there is no
+"expected now" meter reading interpolated from token telemetry between polls,
+and no `headroom cost`/`headroom fill` integration using the learned rates.
+Both are natural next steps once the learner above has run on real accounts
+for a while.
 
 ## What exists today
 
@@ -103,8 +114,14 @@ implemented.
   `~/.claude*/projects/**/*.jsonl`, walks a directory, or schedules itself.
   Every run is one explicit, file-scoped invocation; a background/opt-in mode
   is future work, not shipped.
-- Not a predictor: no token-to-percent conversion, no pace state, no
-  relationship to a vendor's actual quota.
+- This ingestion layer itself is still not a predictor: `headroom usage
+  import`/`import-status` do no token-to-percent conversion and carry no pace
+  state. The rate learner below (`headroom rates`) *is* a token-to-points
+  conversion, built on top of this layer, with its own, narrower set of
+  guarantees — see "The rate learner" for exactly what it does and does not
+  claim. Neither layer predicts an "expected now" percent between polls (that
+  is issue #53's item 4, not shipped) or feeds `headroom cost`/`headroom fill`
+  (item 5, not shipped).
 - Not settled billing evidence: "a message is visible in a transcript" is
   the only finalization evidence this ingests. It is not proof the vendor's
   own billing/accounting has settled the call, and it is not a forecast or
@@ -225,3 +242,173 @@ and `test/usage-format-detect.test.ts` for the `--format auto` detector
 `test/codex-idle-window.test.ts` for the Spark not_enforced fix. Neither the
 normalizer nor the collector predicts quota consumption or a percent-of-limit
 for Codex; this is still counter ingestion, not prediction.
+
+## The rate learner (`headroom rates`, issue #53 items 2-3)
+
+`headroom rates [--meter <meter_id>] [--model <slug>] [--principal <id>]
+[--since 30d] [--json] [--agent]` fits, per (meter, principal, model), how
+many meter points a million tokens of each class (`fresh_input`,
+`cache_read`, `cache_write`, `output`) costs. It is entirely local: it reads
+`headroom.db`'s already-collected meter history and `usage.db`'s already
+`headroom usage import`-ed token counts, never a vendor endpoint, and it
+never fits or reads Codex rows (see "Why Claude only" below).
+
+### Method
+
+1. **Meter intervals.** For one meter/window (e.g. `claude-main:all`'s 5h
+   window), consecutive percent-of-limit readings are turned into intervals
+   with a percent delta (`src/rate-learner.ts`'s `buildMeterIntervals`). An
+   interval is dropped when its raw delta is negative (an un-flagged reset)
+   or when a `reset_seen`/`free_reset_used` event for that meter falls
+   inside it, even when the raw delta happens to look like ordinary growth
+   (e.g. a reset immediately followed by enough same-poll usage to net
+   non-negative).
+2. **Attribution.** Imported per-request token counts observed inside one
+   interval are summed by model (`attributeIntervals`). An interval becomes
+   a usable sample only when **exactly one model** produced imported tokens
+   inside it — a mixed-model interval is dropped from every model's fit
+   rather than split by an assumed ratio, since a meter's own percent
+   reading gives no evidence for how to divide it. An interval with no
+   imported tokens at all is dropped too.
+3. **Fitting.** Each model's samples are fit with a small, dependency-free
+   non-negative least squares solver (`src/rate-nnls.ts`, the classic
+   Lawson-Hanson active-set method) over five non-negative columns: the four
+   token classes plus a constant **background** column. Rates can never be
+   negative — more tokens cannot free up meter headroom — so this is a
+   physical constraint on the fit, not a numerical nicety.
+4. **Refusal below a minimum sample.** Below `MIN_FIT_SAMPLES` (currently 8)
+   attributable samples, a (meter, principal, model) combination reports
+   `status: "insufficient_data"` with its actual sample count, never a
+   number built on too few constraints to identify five coefficients with
+   any confidence.
+
+### Coverage and the background term — read this before trusting a rate
+
+A meter's percent reading moves for **every** request on that account and
+window, not only the ones an operator has imported into `usage.db`. The
+background column exists exactly for this: it is what the fit attributes to
+whatever percent movement the four token-class terms cannot explain. `headroom
+rates`' output reports two figures so a caller can judge how much to trust a
+rate rather than take it on faith:
+
+- **`coverage`** (0..1): the share of the fit's own sample deltas that the
+  four token-class terms explain; `1 - coverage` is (proportionally) the
+  background term's share. A low coverage means most of this meter's
+  observed movement in the fitted window came from usage this build never
+  saw (other lanes, other machines, un-imported files on the same account).
+- **`r_squared`** (0..1): the fit's own goodness of fit against its samples,
+  used together with `sample_count` as this fit's confidence.
+
+**Known bias, stated plainly:** a model's fitted per-token rates can read
+too high if un-imported usage happens to correlate with imported usage
+within the same interval (e.g. both simply come from the account being busy
+at the same time) — the learner has no way to detect or separate that
+correlation from a genuine per-token cost, and never claims to. Coverage
+tells you how much of the movement is explained, not whether the explained
+part is unbiased.
+
+### Why Claude only
+
+The four token classes above are `usage-events.ts`'s Claude vocabulary
+(`input_tokens`/`cache_read_input_tokens`/`cache_creation_input_tokens`/`output_tokens`).
+Codex's counter vocabulary (`cached_input`/`cache_write`/`reasoning`/`total`,
+see `codex-usage-events.ts`) does not line up with it cleanly enough to reuse
+without an unstated assumption about which Codex counter plays which
+Claude-shaped role. Fitting Codex rates with its own, honest class
+vocabulary is future work.
+
+### Drift: `rate_changed`
+
+Every fit is appended (never overwritten) to `usage.db`'s new
+`usage_rate_fits` table — a real time series per (meter, principal, model),
+schema v4 (see "Schema v4" below). When a newly computed fit differs from the
+immediately preceding one by at least 25% (relative) in any token class,
+**and both fits clear an r-squared confidence floor (0.5)**, a `rate_changed`
+event is appended to `usage_rate_events`, cross-referencing the two fits it
+was derived from — modeled on how `headroom.db` already surfaces
+`reset_seen` (see `docs/spec.md`/`src/store.ts`), but kept local to
+`usage.db`: the rate learner's state is opt-in and file-scoped, independent
+of the meter/pace/event pipeline `headroom.db` owns, so it gets its own
+small event table rather than reaching into `headroom.db`'s `EventKind`
+union. Suppressing drift below the confidence floor matters: a low-r-squared
+fit swinging back toward an earlier rate is not evidence the underlying
+price changed back, it is sampling noise.
+
+`headroom rates`' output reports `last_changed_at` — the most recent
+`rate_changed` event for that (meter, principal, model), if any — alongside
+the current fit.
+
+A `headroom rates` run only appends a new fit when the observation window
+has moved past the last stored fit for that combination (comparing the new
+fit's own latest sample timestamp against the stored fit's), so repeated,
+close-together invocations do not spam the time series with duplicate rows.
+
+### Bridging `headroom.db` and `usage.db`
+
+`headroom.db` identifies an account by its plaintext `principal_id` (e.g.
+`claude-main`); `usage.db` never stores an operator alias as free text, only
+a per-database HMAC hash (see `usage-store.ts`'s module doc). `headroom
+rates` bridges the two by convention: **the `--principal` alias passed to
+`headroom usage import` must be the same string as the account's
+`headroom.db` `principal_id`** for the learner to find its imported usage.
+This is exactly the existing "account alias" convention `usage import`
+already documents above, applied here without any new flag. A meter/window
+pair (e.g. `claude-main:all`'s 5h window vs. its weekly window) gets its own
+hashed key internally (`usage.db`'s "meter" alias kind), so 5h and weekly
+rates for the same account never collide.
+
+### CLI and MCP output
+
+`headroom rates` prints one line per (meter, model), fixed field order, no
+colour, no prose when not a TTY — the same dense-line convention `headroom
+usage import-status` already uses (agents are the primary audience; `--agent`
+is accepted for explicitness and prints the identical dense form). `--json`
+carries `rates: [...]` (one entry per meter/model, `rate_per_million_tokens`,
+`background_points_per_interval`, `coverage`, `r_squared`, `sample_count`,
+`window_from`/`window_to`, `last_fit_at`, `last_changed_at`) plus a fixed
+`bias_note` field restating the coverage/background caveat above. See
+`docs/json-contract.md` for the full field list.
+
+The MCP tool `quota_rates` (`meter`, `model`, `principal`, `since`
+arguments, all optional) returns the identical shape — a direct, local-only
+read/fit, like `quota_route` and `quota_usage_paste`, never routed through
+the daemon.
+
+### Schema v4
+
+`usage.db` moves to schema v4 (v1/v2/v3 → v4, purely additive — see
+`src/usage-store.ts`'s `bootstrapSchema` and `test/rate-store.test.ts`):
+
+- `usage_rate_fits`: one row per computed fit, never updated in place —
+  `meter_key`, `principal_key`, `model`, `window_minutes`, `sample_count`,
+  the five rate columns (`rate_fresh_input`, `rate_cache_read`,
+  `rate_cache_write`, `rate_output`, `rate_background`), `coverage`,
+  `r_squared`, `window_from`/`window_to`, `created_at`.
+- `usage_rate_events`: one row per detected `rate_changed` drift event —
+  `meter_key`, `principal_key`, `model`, `prior_fit_id`, `new_fit_id`,
+  `changed_class`, `relative_change`, `created_at`.
+
+## Attribution: `headroom usage top` (issue #53 item 6)
+
+`headroom usage top [--window 5h|wk] [--by session|model] [--principal <id>]
+[--json]` estimates points spent per session or model over a window, top
+spenders first — "where did the week go" without a hand-written script. It
+never fits a rate itself: it reads whatever `headroom rates` has already
+persisted to `usage_rate_fits` and multiplies each group's imported token
+totals by that model's learned rate. A model `headroom rates` has never
+fit (or that refused for insufficient data) reports `estimated_points: null`
+for every row involving it — **never** a fabricated or partial number.
+
+`--by model` groups by model across every session. `--by session` groups by
+`usage.db`'s own `--job` alias (the closest existing lane/session concept it
+tracks — see `usage-store.ts`'s `usage_identity_jobs`); usage with no bound
+`--job` (or a conflicted one) rolls up under the fixed label `unattributed`,
+the same vocabulary the spend ledger already uses for unowned meter movement.
+A `--by session` row's own "session" label is `usage.db`'s opaque per-database
+job hash, never the raw `--job` text, consistent with `usage.db`'s existing
+no-free-text-alias policy.
+
+Every output is clearly labelled as an estimate: the human line's own
+trailer and the `--json` output's `estimate_note` field both say so, and
+`estimated_points` is exactly that — an estimate from a learned rate, not
+vendor-billed truth.

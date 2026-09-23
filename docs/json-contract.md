@@ -408,6 +408,53 @@ Observation[], unparsed: string[] }`. `unparsed` lists panel lines that
 looked like a window header but could not be parsed -- surfaced rather than
 silently dropped.
 
+### `rates` (`headroom rates --json`) -- MCP `quota_rates`
+
+`headroom rates --json`: `{ contract, generated_at, rates: RateFitJson[],
+since: string, bias_note: string }`. `quota_rates` (MCP, direct only, never
+routed through the daemon) returns the identical shape with `source:
+"direct"` added. `RateFitJson` is one entry per (meter, principal, model)
+this run examined:
+
+```
+{ meter_id: string, principal_id: string, window_minutes: number, model: string,
+  status: "fit" | "insufficient_data", sample_count: number, min_samples: number,
+  // present only when status is "fit":
+  rate_per_million_tokens?: { fresh_input: number, cache_read: number, cache_write: number, output: number },
+  background_points_per_interval?: number, coverage?: number, r_squared?: number,
+  window_from?: string, window_to?: string, last_fit_at?: string, last_changed_at?: string | null }
+```
+
+`coverage` and `r_squared` are both `0..1`; `bias_note` restates, once per
+response, that `coverage` measures explained share of this model's own
+attributable sample deltas, never a claim about the account's real total
+usage -- see `docs/usage-prediction.md`'s "The rate learner" section for the
+full method and known bias. `last_changed_at` is the most recent
+`rate_changed` drift event for that combination, or `null` if it has never
+drifted (including a fit's first-ever computation, with nothing yet to
+compare against).
+
+### `usage top` (`headroom usage top --json`)
+
+`{ contract, generated_at, rows: TopRowJson[], window: "5h" | "wk", by:
+"session" | "model", estimate_note: string }`. No MCP equivalent yet.
+`TopRowJson`:
+
+```
+{ principal_id: string,
+  session?: string,        // present only when by === "session": usage.db's opaque job hash, or "unattributed"
+  model?: string,           // present only when by === "model"
+  models: string[],         // every model that contributed to this row, regardless of by
+  identity_count: number,
+  tokens: { fresh_input: number, cache_read: number, cache_write: number, output: number },
+  estimated_points: number | null }  // null when any contributing model has no rate fit yet
+```
+
+Sorted by `estimated_points` descending (rows with `null` last). Every
+estimate reads whatever `headroom rates`/`quota_rates` has already
+persisted; this command never fits a rate itself. See
+`docs/usage-prediction.md`'s "Attribution" section.
+
 ### `export` (present, not yet part of this contract)
 
 `headroom export --format json` (the default) writes its own JSON document,
@@ -463,8 +510,10 @@ differently depending on the command:
   and `quota_events` daemon answers the same way. Every other MCP tool (`quota_can`, `quota_gate`,
   `quota_plan`, `quota_fill`, `quota_route`, `quota_wait`,
   `quota_lease_start`, `quota_lease_end`, `quota_inbox`,
-  `quota_usage_paste`) is always an object from either source, so it is
-  always enveloped.
+  `quota_usage_paste`, `quota_rates`) is always an object from either
+  source, so it is always enveloped. `quota_rates` is direct-only (like
+  `quota_route`/`quota_usage_paste`): there is no daemon variant to compare
+  it against.
 
 A caller that wants a guaranteed envelope on `status`/`cost`/`rate`/`spend`/
 `events`/`leases` over MCP should either not run a daemon, or check
