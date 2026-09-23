@@ -114,6 +114,33 @@ number an orchestrator needs, whatever the vendor calls the bucket. `gate --mode
 `--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
 routing class already consumes it via `routing.toml`.
 
+### No banked/free-reset field, as of 2026-09-23
+
+Codex's rate-limit-reset-credits endpoint carries a dedicated `credits` block (an available count
+plus a per-credit expiry -- see below), which Headroom maps to a `<principal>:credits` meter and
+fires `free_reset_granted` / `free_reset_used` / `credits_changed` off of. Checked against a live
+`GET /api/oauth/usage` response on 2026-09-23, Claude's endpoint has nothing equivalent: no field
+carrying a count of granted reset credits, an expiry, or a boolean/flag naming a one-time bonus
+reset (the kind Anthropic has occasionally granted account-side, tied to a model launch). Every
+top-level field in the response is either the two account-wide windows, a `seven_day_*` variant,
+the `limits[]` array, or a spend/dollar-denominated block (`extra_usage`, `spend`) -- none of which
+carries "how many free resets do I have left" semantics. This adapter does not invent one.
+
+Because the response's schema evidently keeps changing (new top-level keys have appeared across
+Claude Code releases without warning), `observationsFromClaudeUsage` checks every top-level key
+against the ones it actually reads and logs the name -- never the value -- of anything else exactly
+once per process, under `HEADROOM_DEBUG=1`. That is how a future field carrying this (a banked
+reset, an expiring bonus credit, anything else Codex-`credits`-shaped) gets noticed instead of
+silently staying unmapped forever. If one shows up, it maps the same way Codex's does: a
+`<principal>:credits` meter (`window.kind: "count"`, `quantity.unit: "credits"`), which
+`store.ts`'s existing, vendor-agnostic `detectEvents` already turns into `free_reset_granted` /
+`free_reset_used` / `credits_changed` on its own -- no new event-detection code, just the mapping.
+
+The zero-auth statusline snapshot (above) cannot carry this either: Claude Code's own `statusLine`
+hook payload only ever exposes a `rate_limits` object (`five_hour`/`seven_day`/scoped buckets), not
+the full usage response's `spend`/`extra_usage`/credit-shaped fields, so there is nothing further to
+check there.
+
 ## Codex
 
 Headroom reads the ChatGPT OAuth access token from Codex's own auth store and calls

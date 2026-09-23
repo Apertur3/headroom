@@ -1,11 +1,11 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
   claudeLoggedOutFix, claudeLoggedOutReason, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
-  isClaudeLoggedOutReason, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
+  isClaudeLoggedOutReason, logUnknownClaudeTopLevelKeys, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
 import {
@@ -96,6 +96,59 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     ]));
     // Routines by display name must not also spawn a claude-main:routines-named model bucket.
     expect(rows.filter((row) => row.meter_id === "claude-main:routines")).toHaveLength(1);
+  });
+
+  // As of 2026-09-23, the /api/oauth/usage response has no banked/free-reset
+  // credit field (see docs/vendors.md). logUnknownClaudeTopLevelKeys is how a
+  // future one -- or any other field nothing here maps yet -- gets noticed
+  // instead of silently staying unmapped: it reports an unrecognized
+  // top-level key's name (never its value) exactly once per process, and
+  // only under HEADROOM_DEBUG.
+  describe("logUnknownClaudeTopLevelKeys", () => {
+    const previousDebug = process.env.HEADROOM_DEBUG;
+    afterEach(() => { if (previousDebug === undefined) delete process.env.HEADROOM_DEBUG; else process.env.HEADROOM_DEBUG = previousDebug; });
+
+    it("logs an unrecognized top-level key's name once, and never a known one", () => {
+      process.env.HEADROOM_DEBUG = "1";
+      const messages: string[] = [];
+      const body = { five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], seven_day_fable: { utilization: 3 }, banked_reset: { available: 1, expires_at: "2026-10-01T00:00:00Z" } };
+      logUnknownClaudeTopLevelKeys(body, new Set(), (message) => messages.push(message));
+      expect(messages).toEqual(["headroom: Claude usage response has an unmapped top-level key: banked_reset"]);
+    });
+
+    it("logs the same key only once across repeated calls sharing the same seen set", () => {
+      process.env.HEADROOM_DEBUG = "1";
+      const messages: string[] = [];
+      const seen = new Set<string>();
+      const body = { five_hour: {}, seven_day: {}, limits: [], mystery_field: null };
+      logUnknownClaudeTopLevelKeys(body, seen, (message) => messages.push(message));
+      logUnknownClaudeTopLevelKeys(body, seen, (message) => messages.push(message));
+      expect(messages).toEqual(["headroom: Claude usage response has an unmapped top-level key: mystery_field"]);
+    });
+
+    it("stays silent without HEADROOM_DEBUG", () => {
+      delete process.env.HEADROOM_DEBUG;
+      const messages: string[] = [];
+      logUnknownClaudeTopLevelKeys({ five_hour: {}, seven_day: {}, limits: [], mystery_field: null }, new Set(), (message) => messages.push(message));
+      expect(messages).toEqual([]);
+    });
+
+    it("observationsFromClaudeUsage itself surfaces an unrecognized top-level key via the shared module log", () => {
+      process.env.HEADROOM_DEBUG = "1";
+      const errors: string[] = [];
+      const original = console.error;
+      console.error = (message: string) => errors.push(message);
+      // Unique per run so this never collides with the module-level "logged
+      // once per process" dedupe across a watch-mode rerun of this file.
+      const key = `unmapped_field_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      try {
+        const body = { five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], [key]: null };
+        observationsFromClaudeUsage(body, claude, at);
+      } finally {
+        console.error = original;
+      }
+      expect(errors).toEqual(expect.arrayContaining([`headroom: Claude usage response has an unmapped top-level key: ${key}`]));
+    });
   });
 
   it("ports Codex main, Spark, and reset-credit windows with the native fixture units", async () => {
