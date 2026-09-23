@@ -115,7 +115,16 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
     await waitUntilDead(childPid);
   }, 10_000);
 
-  it("a naive kill of only the root pid (the pre-fix behavior) leaves the PTY child alive -- this is issue #56 reproduced", async () => {
+  // macOS-specific: BSD `script` always creates a real PTY and its child
+  // becomes that PTY's own session leader, orphaned when `script` alone is
+  // killed -- issue #56 as reported. util-linux `script` on Linux takes its
+  // child down with it when killed this way (verified on ubuntu-latest CI:
+  // this exact premise, "child alive" after a naive kill of the root pid,
+  // is false there), so the "naive kill leaks an orphan" premise this test
+  // reproduces is real on macOS and does not hold on Linux. The general fix
+  // itself -- killTree() leaves no descendant alive on any platform -- is
+  // still covered above, unconditionally.
+  it.skipIf(process.platform !== "darwin")("a naive kill of only the root pid (the pre-fix behavior) leaves the PTY child alive -- this is issue #56 reproduced on macOS", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-killtree-naive-")); temporary.push(root);
     const infoFile = join(root, "child-pid.txt");
     const fakeAgy = join(root, "agy");
@@ -173,10 +182,15 @@ describe.skipIf(process.platform === "win32")("processSignature", () => {
       // antigravity-keepalive.ts) relies on to prove a pid it finds later is
       // still the same process it recorded, not one the OS has recycled.
       expect(first).toEqual(second);
-      // A `#!/bin/sh` script's `comm` is the interpreter that is actually
-      // running (/bin/sh), not the script's own filename -- real OS
-      // behavior, not a parsing gap in processSignature().
-      expect(first?.command).toContain("sh");
+      expect(first?.command).toBeTruthy();
+      // A `#!/bin/sh` script's `comm` differs by platform, both for real,
+      // documented reasons, not a parsing gap in processSignature(): macOS
+      // reports the interpreter that is actually running (/bin/sh), while
+      // Linux's `comm` (from /proc/[pid]/comm) reports the script's own
+      // name. Either way, what matters for sweepPreviousKeepalive() is that
+      // two independent reads of the same live pid agree exactly (asserted
+      // above) -- it never hardcodes which convention `comm` follows.
+      expect(first?.command).toContain(process.platform === "darwin" ? "sh" : "sleeper");
     } finally { await killTree(pid, { graceMs: 100 }); await waitUntilDead(pid); }
   }, 10_000);
 

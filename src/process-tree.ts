@@ -15,28 +15,48 @@ export interface ProcessEntry {
 }
 
 /**
- * List every process this user can see, with pid/parent/memory/command.
- * `-Ao pid=,ppid=,rss=,comm=` is accepted by both BSD `ps` (macOS) and
- * procps `ps` (Linux), so one command line works on every POSIX platform
- * Headroom runs on. `comm` is last precisely because it is the only field
- * that can itself contain spaces (a binary path with a space in it, as one
- * of this file's own tests uses) -- the three fixed numeric columns ahead of
- * it are what make splitting the rest of the line as "everything after the
- * third number" unambiguous.
+ * Parses `ps -Ao pid=,ppid=,rss=,comm=` output, accepted by both BSD `ps`
+ * (macOS) and procps `ps` (Linux), so one command line works on every POSIX
+ * platform Headroom runs on. `comm` is last precisely because it is the
+ * only field that can itself contain spaces (a binary path with a space in
+ * it, as one of this file's own tests uses) -- the three fixed numeric
+ * columns ahead of it are what make splitting the rest of the line as
+ * "everything after the third number" unambiguous.
  *
- * Never called on win32: there is no `script`/agy PTY tree to walk there,
- * and Windows `tasklist`'s output shape is different enough not to bother
- * unifying with this parser for a feature that never runs on that platform.
+ * Pure text parsing, deliberately platform-independent: it is exercised
+ * directly (with fabricated `ps`-shaped input) even on a win32 test runner,
+ * where nothing here ever actually shells out. Only listProcesses() itself
+ * decides whether to invoke a real `ps`.
  */
-export async function listProcesses(execImpl: ExecFile = execFileAsync): Promise<ProcessEntry[]> {
-  if (process.platform === "win32") return [];
+export function parsePsOutput(stdout: string): ProcessEntry[] {
+  return stdout.split("\n").flatMap((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*\S)\s*$/.exec(line);
+    if (!match) return [];
+    return [{ pid: Number(match[1]), ppid: Number(match[2]), rssKb: Number(match[3]), command: match[4] }];
+  });
+}
+
+/**
+ * List every process this user can see, with pid/parent/memory/command, by
+ * shelling out to `ps` and handing its output to parsePsOutput() above.
+ *
+ * The real `ps` invocation is skipped on win32 (there is no `script`/agy
+ * PTY tree to walk there, and Windows `tasklist`'s output shape is
+ * different enough not to bother unifying with this parser for a feature
+ * that never runs on that platform) -- but only when the caller is relying
+ * on the default, real `execFileAsync`. A caller that passes its own
+ * `execImpl` (this file's own tests, on any platform including a win32 CI
+ * runner) always gets a real call through to it and a real parse of
+ * whatever it returns, so the platform-independent parsing logic above is
+ * actually verified everywhere, not skipped on Windows along with the
+ * `ps` call it has nothing to do with.
+ */
+export async function listProcesses(execImpl?: ExecFile): Promise<ProcessEntry[]> {
+  if (process.platform === "win32" && !execImpl) return [];
+  const runner = execImpl ?? execFileAsync;
   try {
-    const { stdout } = await execImpl("ps", ["-Ao", "pid=,ppid=,rss=,comm="], { maxBuffer: 8 * 1024 * 1024 });
-    return stdout.split("\n").flatMap((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*\S)\s*$/.exec(line);
-      if (!match) return [];
-      return [{ pid: Number(match[1]), ppid: Number(match[2]), rssKb: Number(match[3]), command: match[4] }];
-    });
+    const { stdout } = await runner("ps", ["-Ao", "pid=,ppid=,rss=,comm="], { maxBuffer: 8 * 1024 * 1024 });
+    return parsePsOutput(stdout);
   } catch {
     // ps missing, or refused (e.g. a locked-down sandbox): callers treat an
     // empty list the same as "no descendants found", never as a signal to
