@@ -229,6 +229,26 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     try {
       const local = await runNativeEngine(native, antigravityAccounts);
       localAntigravity = new Map(antigravityAccounts.map((account) => [account.name, local.filter((row) => row.principal_id === account.name)]));
+      const incomplete = antigravityAccounts.filter((account) => {
+        const rows = localAntigravity.get(account.name) ?? [];
+        return !(selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0);
+      });
+      // agy's local quota-summary endpoint routinely needs a moment past the
+      // engine's own readiness wait to populate every lane, especially while
+      // the machine is busy; a real outage stays incomplete on the retry too,
+      // but this clears the common transient miss before it ever becomes a
+      // source_failed/source_recovered flap. One retry, still inside this
+      // same poll, so a genuinely down agy costs one extra native-engine call
+      // per poll rather than a silent extra failure/recovery cycle.
+      if (incomplete.length) {
+        try {
+          const retried = await runNativeEngine(native, incomplete);
+          for (const account of incomplete) {
+            const rows = retried.filter((row) => row.principal_id === account.name);
+            if (rows.length) localAntigravity.set(account.name, rows);
+          }
+        } catch { /* keep the first attempt's rows; handled below as usual */ }
+      }
       for (const account of antigravityAccounts) {
         const rows = localAntigravity.get(account.name) ?? [];
         const complete = selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0;

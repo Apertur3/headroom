@@ -218,8 +218,14 @@ struct HeadroomEngine {
         do {
             // This is a user-owned local server (app, IDE, or `agy`). It is
             // already reachable, but its quota summary can still be warming.
+            // 15s (10 attempts at this cadence) was too tight while agy was
+            // busy: the weekly lane routinely missed that window and this
+            // observed as a spurious source_failed a poll or two before agy
+            // caught up on its own. 30s roughly doubles the retry budget
+            // without materially lengthening a poll that is already bounded
+            // by the TS caller's own 90s exec timeout.
             return try await AntigravitySnapshotWaiter.wait(
-                timeout: 15,
+                timeout: 30,
                 pollNanoseconds: 1_500_000_000,
                 fetch: { remaining in
                     let status = try await AntigravityStatusProbe(timeout: min(8, remaining)).fetch()

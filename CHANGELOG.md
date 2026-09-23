@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Source-health hysteresis for `source_failed`/`source_recovered` notifications: a source must stay continuously failed for `source_health_min_polls` consecutive daemon polls (default 2) and `source_health_min_minutes` minutes (default 15) -- both configurable in `[notify]` -- before `source_failed` is actually sent, and `source_recovered` only fires if the matching `source_failed` was. A flap that clears before both bars are met produces zero messages. The events table stays the complete, undamped truth record; only notification delivery is held back.
+
+### Fixed
+- Antigravity local quota reads that came back incomplete (agy's warm quota summary still populating, most often while the machine was busy) are now retried once within the same daemon poll instead of being reported as a failure immediately -- this was the main driver of the `source_failed`/`source_recovered` flapping roughly every 15-30 minutes. The Swift engine's own per-poll readiness wait for agy's local summary also grew from 15s to 30s.
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed
