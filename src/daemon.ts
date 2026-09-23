@@ -7,7 +7,7 @@ import { readPolicy, readRouting } from "./config.js";
 import { readDashboardStore } from "./dashboard-data.js";
 import { claudeGrantGate, syncClaudeProbeState } from "./adapters/claude.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
-import { AgyKeepaliveSupervisor, resolveAgyBinary } from "./antigravity-keepalive.js";
+import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
@@ -204,12 +204,28 @@ export class HeadroomDaemon {
     await this.bindWithRaceGuard();
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
+    // Reap any agy left behind by a previous daemon (crash, forced kill, or
+    // a service restart mid-update) before deciding whether to launch a
+    // fresh one. Kept as its own tiny call -- see
+    // antigravity-keepalive.ts's sweepPreviousKeepalive() for the actual
+    // logic -- deliberately not folded into the socket setup above or the
+    // keepalive-start below, so it never has to move when either of those
+    // does.
+    await this.sweepStaleKeepalive();
     // Warm the local source before the first scheduled poll. It supplies
     // consumer quota without the retired Gemini CLI OAuth path.
     try { await this.maybeStartKeepalive(await readAccounts(), startupPolicy); }
     catch (error) { void appendDaemonLog(`antigravity startup: ${safeError(error)}`, this.home); }
     await this.schedulePrincipals();
     this.schedulingStarted = true;
+  }
+
+  /** Best-effort; a failed sweep never blocks the daemon from starting its
+   * own keepalive -- worst case a prior leftover survives one more run and
+   * shows up in `headroom doctor`. */
+  private async sweepStaleKeepalive(): Promise<void> {
+    try { await sweepPreviousKeepalive(this.home); }
+    catch (error) { void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
   }
 
   /** Start the owned agy PTY once an Antigravity poll needs it. */
@@ -223,7 +239,7 @@ export class HeadroomDaemon {
     // other executable Headroom runs must clear.
     try {
       const binary = await executablePath(resolveAgyBinary(antigravity.agy_path));
-      this.keepalive ??= new AgyKeepaliveSupervisor({ binary });
+      this.keepalive ??= new AgyKeepaliveSupervisor({ binary, home: this.home });
       this.keepalive.start();
     } catch (error) {
       void appendDaemonLog(`antigravity keepalive not started: ${safeError(error)}`, this.home);
@@ -234,7 +250,7 @@ export class HeadroomDaemon {
     this.stopping = true;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
-    this.keepalive?.stop();
+    await this.keepalive?.stop();
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
     if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }

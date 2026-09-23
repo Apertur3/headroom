@@ -12,6 +12,7 @@ import { engineStatus } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
 import { credentialPath, headroomHome } from "./paths.js";
+import { listProcesses, type ProcessEntry } from "./process-tree.js";
 import { CURRENT_SCHEMA_VERSION } from "./migrations.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
@@ -202,6 +203,28 @@ export function adapterCheck(account: Account): DoctorCheck {
   return check(level, `principal ${account.name} adapter`, detail, fix);
 }
 
+/**
+ * Reports leaked keepalive `agy` processes (issue #56): reparented to init
+ * (ppid 1) means the `script` PTY that owned them is gone, so nothing is
+ * still using them -- a live, in-use agy always still has `script` (or an
+ * interactive shell) as its parent. Purely informational; never kills
+ * anything itself, unlike sweepPreviousKeepalive() (antigravity-keepalive.ts),
+ * which only reaps the specific pids a Headroom daemon itself recorded. This
+ * check catches everything else: leftovers from before this fix shipped, or
+ * from any daemon that never got to record state at all.
+ */
+export async function antigravityOrphanCheck(list: () => Promise<ProcessEntry[]> = listProcesses): Promise<DoctorCheck> {
+  if (process.platform === "win32") return check("OK", "antigravity orphaned agy", "not applicable on Windows (no script/agy PTY)", "no action needed");
+  const processes = await list();
+  const orphans = processes.filter((entry) => entry.ppid === 1 && /(^|[\\/])agy(\.exe)?$/.test(entry.command));
+  if (!orphans.length) return check("OK", "antigravity orphaned agy", "no orphaned agy processes found", "no action needed");
+  const totalMb = Math.round(orphans.reduce((sum, entry) => sum + entry.rssKb, 0) / 1024);
+  const pids = orphans.map((entry) => entry.pid).join(" ");
+  return check("WARN", "antigravity orphaned agy",
+    `${orphans.length} orphaned agy process(es) reparented to init, ~${totalMb} MB total resident`,
+    `kill -TERM ${pids} (they trap SIGHUP; SIGKILL after a few seconds if still alive) -- an updated headroom daemon now sweeps its own leftovers on start, but these predate that, or belong to a daemon run this one never tracked`);
+}
+
 async function configCheck(name: "policy" | "routing", path: string): Promise<DoctorCheck> {
   try {
     const status = await doctorFileStatus(path);
@@ -283,6 +306,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       ? check("OK", "Antigravity local reader", "native reader available; Gemini CLI is not required", "no action needed")
       : check("FAIL", "Antigravity local reader", nativeFailure ?? (process.platform === "darwin" ? "packaged native reader missing" : "packaged Antigravity reader is macOS-only"), process.platform === "darwin" ? "reinstall headroomd" : "use Antigravity with Headroom on macOS"));
   }
+  output.push(await antigravityOrphanCheck());
 
   const daemon = await daemonRequest(socketPath(), "health");
   if (daemon.status === "available") {
