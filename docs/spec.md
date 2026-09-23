@@ -144,9 +144,10 @@ edit only that line in place. Status renders a parked principal as
   <meter> [--json]`; `headroom policy set freeze_reserve_pct <n> [--reason "<text>"] [--until
   <ISO|+7d>] [--json]`. Dated/reasoned reserves (see docs/concepts.md); edits policy.toml atomically
   (0600, timestamped `.bak-` first, comments and other keys preserved).
-- `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
-  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
-  pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom mcp` : stdio MCP, eighteen tools (`quota_status`, `quota_can`, `quota_events`, and
+  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats,
+  pasted `/usage` ingestion, and learned points-per-token rates); see `docs/mcp-and-agents.md`
+  for the full list and field shapes.
 - Both heartbeats and timers are checked by a daemon-owned maintenance pass on its own schedule,
   independent of any vendor poll: it reschedules itself around the next real deadline, roughly
   every one to sixty seconds, so neither depends on an account ever being polled. `timer set`/
@@ -177,9 +178,17 @@ edit only that line in place. Status renders a parked principal as
 - `headroom usage import --source <alias> --principal <alias> --path <file> [--format
   claude|codex]` / `import-status`: opt-in, explicitly-invoked ingestion of raw numeric usage
   counters (token counts, not a percent-of-limit) from one named Claude Code transcript or
-  Codex CLI session-log file into a private `usage.db` (schema v2, vendor-discriminated),
+  Codex CLI session-log file into a private `usage.db` (schema v4, vendor-discriminated),
   entirely separate from the observation/pace/`can` pipeline above. No directory walk, no
   daemon, no scheduler; see `docs/usage-prediction.md`.
+- `headroom rates [--meter <meter_id>] [--model <slug>] [--principal <id>] [--since 30d] [--json]
+  [--agent]` (MCP `quota_rates`): fits points per 1,000,000 tokens per meter/principal/model from
+  `usage.db`'s imported counts against the meter's own percent deltas (non-negative least
+  squares), with a minimum-sample refusal, a coverage/background bias disclosure, and a
+  `rate_changed` drift event when a new fit moves enough with enough confidence. `headroom usage
+  top [--window 5h|wk] [--by session|model] [--json]` estimates points per session/model from
+  those learned rates, top spenders first, clearly labelled as an estimate. Both local-only, no
+  vendor call; see `docs/usage-prediction.md`.
 
 ## Acceptance criteria
 
