@@ -598,9 +598,41 @@ export function modelSlug(name: string): string {
   return name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+/** Top-level `/api/oauth/usage` keys this adapter actually reads: `five_hour`
+ * and `seven_day` directly, `limits` for the scoped array, and any
+ * `seven_day_*` field (inspected below for a Fable/Routines match even when
+ * it isn't one). Anything else is a field nothing here maps yet. */
+const CLAUDE_USAGE_KNOWN_TOP_LEVEL_KEYS = new Set(["five_hour", "seven_day", "limits"]);
+
+/** Keys already reported this process, so a field that never goes away
+ * (e.g. a vendor flag that is simply always present) logs once rather than
+ * once per poll for the life of the daemon. */
+const claudeUsageUnknownKeysLogged = new Set<string>();
+
+/**
+ * Notices a future top-level field on the Claude usage response -- a banked
+ * or free-reset credit block, say, the way Codex's `credits` object already
+ * is (see docs/vendors.md's Claude section) -- instead of silently dropping
+ * it forever. Logs the key's name only, never its value (an unknown vendor
+ * field could carry anything, including something sensitive), and only
+ * under `HEADROOM_DEBUG` so a normal run stays quiet. `seen` and `log` are
+ * test seams; production always uses the shared module state so a key is
+ * still reported only once across the whole process even though every poll
+ * calls this function again.
+ */
+export function logUnknownClaudeTopLevelKeys(body: ObjectValue, seen: Set<string> = claudeUsageUnknownKeysLogged, log: (message: string) => void = (message) => console.error(message)): void {
+  if (!process.env.HEADROOM_DEBUG) return;
+  for (const key of Object.keys(body)) {
+    if (CLAUDE_USAGE_KNOWN_TOP_LEVEL_KEYS.has(key) || key.startsWith("seven_day_") || seen.has(key)) continue;
+    seen.add(key);
+    log(`headroom: Claude usage response has an unmapped top-level key: ${key}`);
+  }
+}
+
 /** Parse Claude's OAuth usage body without retaining the credential or response body. */
 export function observationsFromClaudeUsage(body: unknown, account: ProviderAccount, at = new Date()): Observation[] {
   if (!isObject(body)) throw new Error("Claude usage response invalid");
+  logUnknownClaudeTopLevelKeys(body);
   const now = at.toISOString();
   const output = [window(account, "all", body.five_hour, 300, now), window(account, "all", body.seven_day, 10_080, now)].filter((item): item is Observation => Boolean(item));
   let fable: unknown;
