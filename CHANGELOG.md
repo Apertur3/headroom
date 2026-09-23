@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Stop the daemon crash-looping forever on a stale POSIX socket file left behind by a hard reboot or a `kill -9` (#62). Startup now probes an existing socket with a real `connect()` before falling back to the health-check RPC: `ECONNREFUSED`/`ENOENT` means nobody is listening, so the file is unlinked and a fresh socket is bound; a socket that does accept the connection is left alone, whether it turns out to be a live daemon ("already running") or one that is up but not answering health in time (a clear, unchanged error, never unlinked). A bind race between two daemons starting at once (both see the same stale file, both try to reclaim it) is re-probed on `EADDRINUSE` instead of looping. Windows named pipes are unaffected -- they have no on-disk file to go stale.
+- Only unlink a path that `lstat` confirms is actually a socket; a regular file, a symlink, or anything else at the daemon's socket path is refused and left untouched.
+
 ## [0.1.6] - 2026-09-23
 
 ### Added

@@ -198,11 +198,10 @@ export class HeadroomDaemon {
     // directory the token file could sensibly live under.
     if (process.platform === "win32") this.sessionToken = await sessionToken(this.home, true);
     await this.prepareSocket();
-    this.server = createServer((socket) => this.handleSocket(socket));
     // A restrictive umask means the OS never briefly creates the socket file
     // group- or world-connectable between listen() and the chmod below.
     if (process.platform !== "win32") process.umask(0o077);
-    await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
+    await this.bindWithRaceGuard();
     if (process.platform !== "win32") await chmod(this.path, 0o600);
     this.installReloadHandlers();
     // Warm the local source before the first scheduled poll. It supplies
@@ -258,6 +257,10 @@ export class HeadroomDaemon {
   private async prepareSocket(): Promise<void> {
     if (process.platform === "win32") {
       // Node creates the pipe with the current process token's current-user DACL.
+      // Named pipes have no on-disk file: the pipe is created and destroyed
+      // atomically with its owning process, so there is nothing here that can
+      // go stale the way a POSIX socket file can survive a hard reboot -- the
+      // health check below is the whole story on this platform.
       const daemon = await daemonRequest(this.path, "health");
       if (daemon.status === "available") throw new Error("Headroom daemon is already running");
       if (daemon.status === "unresponsive") throw new Error("Headroom daemon pipe is present but health did not respond within 2s");
@@ -268,12 +271,45 @@ export class HeadroomDaemon {
       if (stat.isSymbolicLink() || !stat.isSocket()) throw new Error("Refusing unsafe headroom socket");
       if (typeof process.getuid === "function" && stat.uid !== process.getuid()) throw new Error("Refusing headroom socket owned by another user");
       if ((stat.mode & 0o077) !== 0) throw new Error("Refusing headroom socket with group or world permissions");
+      // A raw connect() probe first, ahead of (and independent of) the
+      // health-check RPC below: a POSIX socket *file* outlives the process
+      // that created it (a hard reboot or `kill -9` never gets to unlink it),
+      // so its mere presence on disk says nothing about whether anyone is
+      // listening. ECONNREFUSED/ENOENT here mean the kernel has no listener
+      // for this path at all -- definitively stale, safe to unlink and bind
+      // fresh. Only when *something* accepts the connection does startup
+      // fall through to the slower health RPC, which tells a live-but-busy
+      // daemon (never unlinked -- it just gets a clear error) from one that
+      // is fully up and answers "already running".
+      if (!(await hasListener(this.path))) { await unlink(this.path); return; }
       const daemon = await daemonRequest(this.path, "health");
       if (daemon.status === "available") throw new Error("Headroom daemon is already running");
       if (daemon.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
-      await unlink(this.path); // a safe, inaccessible stale socket only
+      await unlink(this.path); // daemonRequest's own probe found nothing there either
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  /** Binds the socket, and on a bind race -- another process also decided the
+   * old socket was stale, unlinked it, and won the path first -- re-probes
+   * rather than looping forever. prepareSocket() decides fresh each time: if
+   * the winner is a live daemon that has since finished starting up, this
+   * throws the same "already running" error a slower loser would always have
+   * reported; if the winner is itself just another daemon mid-startup that
+   * has not bound yet, or has already crashed, one more unlink-and-bind
+   * attempt goes through. Bounded so a socket that somehow keeps losing the
+   * race can never spin the process forever. */
+  private async bindWithRaceGuard(maxAttempts = 5): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      this.server = createServer((socket) => this.handleSocket(socket));
+      try {
+        await new Promise<void>((resolve, reject) => this.server!.once("error", reject).listen(this.path, resolve));
+        return;
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE" || attempt === maxAttempts) throw error;
+        await this.prepareSocket();
+      }
     }
   }
 
@@ -742,6 +778,25 @@ async function socketExists(path: string): Promise<boolean> {
   if (process.platform === "win32") return false;
   try { return (await lstat(path)).isSocket(); }
   catch { return false; }
+}
+
+/** A bare connect() probe, deliberately separate from the RPC/health
+ * protocol in rpc()/daemonRequest(): it asks the kernel only whether
+ * *anyone* is listening at `path`, never sends a request line, and never
+ * waits out a health timeout. ECONNREFUSED (nothing bound to the path) and
+ * ENOENT (the file vanished between the caller's lstat and this connect) are
+ * the only outcomes that mean "no listener" -- resolved as `false`. Anything
+ * else, including an error this process cannot interpret (e.g. EACCES), is
+ * treated conservatively as "a listener might be there": prepareSocket()
+ * then leaves the file alone and falls through to the existing health-based
+ * check rather than ever unlinking on an ambiguous signal. */
+async function hasListener(path: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection(path);
+    const finish = (value: boolean): void => { socket.destroy(); resolve(value); };
+    socket.once("connect", () => finish(true));
+    socket.once("error", (error: NodeJS.ErrnoException) => finish(error.code !== "ECONNREFUSED" && error.code !== "ENOENT"));
+  });
 }
 
 /**
