@@ -369,7 +369,9 @@ describe("notification delivery", () => {
   it("records a six-hour duplicate safety-net suppression", async () => {
     const store = await openStore("headroom-notify-safety-net-");
     const { calls, fetcher } = recorder();
-    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed"] };
+    // Source-health hysteresis is not what this test exercises; disable its
+    // hold so a single-poll failure notifies immediately, same as before.
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed"], source_health_min_polls: 1, source_health_min_minutes: 0 };
     try {
       await deliverNotifications(store, options({ config: only, fetcher, now: START }));
       store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
@@ -482,7 +484,8 @@ describe("notification delivery", () => {
   it("chunks a long batch into several telegram messages under the size cap", async () => {
     const store = await openStore("headroom-notify-chunk-");
     const { calls, fetcher } = recorder();
-    const only = { ...config(), channels: ["telegram"] as NotifyConfig["channels"], events: ["source_failed"] };
+    // Chunking, not hysteresis, is under test: delivery must not wait on it.
+    const only = { ...config(), channels: ["telegram"] as NotifyConfig["channels"], events: ["source_failed"], source_health_min_polls: 1, source_health_min_minutes: 0 };
     try {
       await deliverNotifications(store, options({ config: only, fetcher, now: START }));
       // Long meter names, not a long reason: a failure reason only reaches the
@@ -581,6 +584,86 @@ describe("notification delivery", () => {
   });
 });
 
+describe("source-health hysteresis", () => {
+  function credit(remaining: number, fetchedAt: string): Observation {
+    return {
+      principal_id: "codex-main", meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" },
+      quantity: { used: 0, limit: null, remaining, unit: "credits" }, resets_at: null,
+      observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
+      confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+    };
+  }
+
+  it("absorbs a flap (fail, recover, fail, recover) within the window: no messages, but the full event history is retained", async () => {
+    const store = await openStore("headroom-notify-health-flap-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed", "source_recovered"] };
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      // Fail, then recover a couple of minutes later -- inside both the
+      // default 2-poll and 15-minute bars.
+      store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
+      store.insert(failed("2026-09-03T12:05:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:06:00Z") }));
+      store.insert(weekly(10, "2026-09-03T12:08:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:09:00Z") }));
+      // Fail and recover again -- same short-lived shape.
+      store.insert(failed("2026-09-03T12:11:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:12:00Z") }));
+      store.insert(weekly(10, "2026-09-03T12:13:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:14:00Z") }));
+
+      expect(calls).toHaveLength(0);
+      // The store's own event history stays the complete, undamped truth
+      // record regardless of what the notifier held back.
+      const events = store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "source_failed" || event.kind === "source_recovered");
+      expect(events).toHaveLength(4);
+    } finally { store.close(); }
+  });
+
+  it("notifies exactly one source_failed and one source_recovered for a sustained outage", async () => {
+    const store = await openStore("headroom-notify-health-sustained-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed", "source_recovered"] };
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
+      store.insert(failed("2026-09-03T12:05:00Z"));
+      // First poll after the failure: held, both the default poll-count and
+      // duration bars are unmet.
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:06:00Z") }));
+      expect(calls).toHaveLength(0);
+      // A second poll, 16 minutes after the outage began: both bars clear.
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:21:00Z") }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toContain("⚠️ Source failed");
+
+      store.insert(weekly(10, "2026-09-03T12:25:00Z", "2026-09-13T12:00:00Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:26:00Z") }));
+      expect(calls).toHaveLength(2);
+      expect(calls[1].body).toContain("✅ Source recovered");
+    } finally { store.close(); }
+  });
+
+  it("leaves the free_reset_granted path untouched while a source_failed is being held", async () => {
+    const store = await openStore("headroom-notify-health-free-reset-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["source_failed", "source_recovered", "free_reset_granted"] };
+    try {
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      // A held outage on one meter...
+      store.insert(weekly(10, "2026-09-03T12:00:00Z", "2026-09-13T12:00:00Z"));
+      store.insert(failed("2026-09-03T12:05:00Z"));
+      // ...must not delay or drop a free_reset_granted on an unrelated meter.
+      store.insert(credit(0, "2026-09-03T12:05:30Z"));
+      store.insert(credit(2, "2026-09-03T12:05:45Z"));
+      await deliverNotifications(store, options({ config: only, fetcher, now: new Date("2026-09-03T12:06:00Z") }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].body).toContain("🎁 Free reset credit granted");
+    } finally { store.close(); }
+  });
+});
+
 describe("model_new", () => {
   it("records a bucket name the vendor has not reported before for a principal it already knows", async () => {
     const store = await openStore("headroom-notify-model-new-");
@@ -640,8 +723,12 @@ describe("grant_lapsed", () => {
     const { calls, fetcher } = recorder();
     try {
       await deliverNotifications(store, options({ fetcher, now: START })); // default config, no grant_lapsed
-      store.insert(failedClaude(LAPSE_REASON, "2026-09-03T20:05:00Z"));
-      await deliverNotifications(store, options({ fetcher, now: AFTER }));
+      const failedAt = new Date("2026-09-03T20:05:00Z");
+      store.insert(failedClaude(LAPSE_REASON, failedAt.toISOString()));
+      // Default source-health hysteresis (2 polls, 15 minutes) still applies:
+      // the outage has to persist before the default source_failed fires.
+      await deliverNotifications(store, options({ fetcher, now: new Date(failedAt.getTime() + 60_000) }));
+      await deliverNotifications(store, options({ fetcher, now: new Date(failedAt.getTime() + 16 * 60_000) }));
       const telegramCalls = calls.filter((call) => call.url.startsWith("https://api.telegram.org"));
       expect(telegramCalls.map((call) => JSON.parse(call.body).text as string)).toEqual(expect.arrayContaining([expect.stringContaining("⚠️ Source failed\nClaude main")]));
       expect(telegramCalls.some((call) => (JSON.parse(call.body).text as string).startsWith("🔑 Keychain grant lapsed"))).toBe(false);

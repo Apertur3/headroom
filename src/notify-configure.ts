@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { headroomHome, assertSafeAncestry } from "./paths.js";
 import { readBoundedRegularFile, safeOutputDirectory, writeFileAtomic } from "./security.js";
 import {
+  DEFAULT_SOURCE_HEALTH_MIN_MINUTES, DEFAULT_SOURCE_HEALTH_MIN_POLLS,
   NOTIFY_EVENT_NAMES, PRESET_EVENTS, TELEGRAM_SECRET, notifyTest, parseNotifyConfig,
   parseQuietHours, prepareChannels, resolveNotifyEvents, secretStoreHint, wantsEvent,
   type ChannelName, type NotifyConfig, type NotifyOptions, type NotifyPreset,
@@ -38,6 +39,8 @@ export function notifyTable(config: NotifyConfig): string {
   if (config.thresholds) lines.push(`thresholds = ${JSON.stringify(config.thresholds)}`);
   else if (config.threshold_percent !== null) lines.push(`threshold_percent = ${config.threshold_percent}`);
   if (config.quiet_hours) lines.push(`quiet_hours = ${JSON.stringify(quietText(config))}`);
+  if (config.source_health_min_polls !== DEFAULT_SOURCE_HEALTH_MIN_POLLS) lines.push(`source_health_min_polls = ${config.source_health_min_polls}`);
+  if (config.source_health_min_minutes !== DEFAULT_SOURCE_HEALTH_MIN_MINUTES) lines.push(`source_health_min_minutes = ${config.source_health_min_minutes}`);
   if (config.telegram.chat_id) lines.push("", "[notify.telegram]", `chat_id = ${JSON.stringify(config.telegram.chat_id)}`);
   if (config.ntfy.topic) lines.push("", "[notify.ntfy]", `topic = ${JSON.stringify(config.ntfy.topic)}`, `server = ${JSON.stringify(config.ntfy.server)}`);
   if (config.webhook.url) lines.push("", "[notify.webhook]", `url = ${JSON.stringify(config.webhook.url)}`);
