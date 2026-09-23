@@ -26,6 +26,7 @@ const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
 const EVENT_KINDS: readonly EventKind[] = [
   "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed", "exhausted_reported", "exhausted_cleared", "window_retired",
   "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed", "vendor_inconsistent",
+  "model_available", "model_retired",
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
  * latest reading of every hard window, once per window instance. */
@@ -34,8 +35,14 @@ export const NOTIFY_EVENT_NAMES: readonly string[] = [...EVENT_KINDS, "threshold
 export type NotifyPreset = "calm" | "quiet" | "everything";
 export const RESET_EVENT_NAMES = ["reset_unscheduled", "reset_scheduled_weekly", "reset_scheduled_short"] as const;
 export const PRESET_EVENTS: Record<NotifyPreset, readonly string[]> = {
-  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold"],
-  quiet: ["reset_unscheduled", "source_failed", "threshold"],
+  // model_available is rare (a vendor rolling out a new model to an
+  // existing account) and high-value (routing/pricing decisions often
+  // depend on knowing it exists at all), so it is on even in "quiet",
+  // unlike the rest of the rarer/lower-signal events below it in
+  // EVENT_KINDS (model_retired, grant_lapsed, lease_started/ended, ...),
+  // which stay "everything"-only.
+  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold", "model_available"],
+  quiet: ["reset_unscheduled", "source_failed", "threshold", "model_available"],
   everything: [...EVENT_KINDS.filter((kind) => kind !== "reset_seen"), ...RESET_EVENT_NAMES, "threshold"],
 };
 export const DEFAULT_NOTIFY_EVENTS = PRESET_EVENTS.calm;

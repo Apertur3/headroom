@@ -1,0 +1,11 @@
+[
+  {
+    "first_seen_at": "string",
+    "last_seen_at": "string",
+    "model_id": "string",
+    "model_name": "string",
+    "principal_id": "string",
+    "retired_at": "null",
+    "vendor": "string"
+  }
+]

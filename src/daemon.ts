@@ -16,6 +16,7 @@ import { withLastKnown, withPaceInfo } from "./pace.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
+import { checkModelAvailability } from "./model-catalog.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -500,6 +501,10 @@ export class HeadroomDaemon {
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
           result = this.store.events(since); break;
         }
+        case "models": {
+          const principal = typeof params.principal === "string" ? params.principal : undefined;
+          result = this.store.knownModels(principal); break;
+        }
         case "can": {
           const action = typeof params.action_class === "string" ? params.action_class : "";
           if (typeof params.owner !== "string" || !params.owner.trim()) return reject(-32602, "owner is required");
@@ -708,6 +713,13 @@ export class HeadroomDaemon {
       // never delay a poll, and the ledger inside carries its own retries.
       void deliverNotifications(this.store, { home: this.home })
         .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
+      // Model-catalog reads are throttled to at most once per hour per
+      // principal on their own (see MODEL_CHECK_INTERVAL_MS), independent of
+      // this poll's own interval, so piggybacking here adds no load to the
+      // ordinary quota poll cadence. Deliberately not awaited, same reason
+      // as the notification pass above.
+      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account)))
+        .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);

@@ -16,9 +16,9 @@ export interface ConfigureOptions extends NotifyOptions {
 }
 
 export const PRESET_DESCRIPTIONS: Record<NotifyPreset, string> = {
-  calm: "Useful changes: unexpected and weekly resets, reset credits, outages, recoveries and thresholds.",
-  quiet: "Only unexpected resets, source failures and thresholds.",
-  everything: "Every event, including scheduled 5h resets, stalls, new buckets and grant lapses.",
+  calm: "Useful changes: unexpected and weekly resets, reset credits, outages, recoveries, new models available and thresholds.",
+  quiet: "Only unexpected resets, source failures, new models available and thresholds.",
+  everything: "Every event, including scheduled 5h resets, stalls, new buckets, retired models and grant lapses.",
 };
 const EVENT_LABELS: Record<string, string> = {
   reset_unscheduled: "Unscheduled resets (any window)", reset_scheduled_weekly: "Weekly resets",
@@ -26,6 +26,7 @@ const EVENT_LABELS: Record<string, string> = {
   free_reset_used: "Free resets used", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
   source_failed: "Source failures", source_recovered: "Source recoveries", threshold: "Threshold crossings",
   pace_projection_conserve: "Projected stalls (once per window, plus one escalation)", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
+  model_available: "New models available (vendor model catalog)", model_retired: "Models no longer listed",
   lease_started: "Leases started", lease_ended: "Leases ended", vendor_inconsistent: "Vendor readings inconsistent", reset_seen: "Other scheduled resets",
 };
 

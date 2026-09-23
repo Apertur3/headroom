@@ -23,10 +23,10 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { main, printEventsOutput } from "../src/cli.js";
+import { main, printEventsOutput, printModelsOutput } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
-import type { HeadroomEvent, Observation } from "../src/types.js";
+import type { HeadroomEvent, KnownModel, Observation } from "../src/types.js";
 
 const FIXTURE_DIR = new URL("./fixtures/json-contract/", import.meta.url);
 
@@ -306,6 +306,16 @@ describe("CLI --json field shapes", () => {
     const { logs, restore } = captureLog();
     try { printEventsOutput([event], false); } finally { restore(); }
     return compareToFixture("cli-events", JSON.parse(logs[0]));
+  });
+
+  it("models (bare array, no envelope -- see docs/json-contract.md)", () => {
+    const model: KnownModel = {
+      principal_id: "codex-main", vendor: "codex", model_id: "gpt-6-astra", model_name: "GPT-6-Astra",
+      first_seen_at: "2026-09-23T12:00:00.000Z", last_seen_at: "2026-09-23T12:00:00.000Z", retired_at: null,
+    };
+    const { logs, restore } = captureLog();
+    try { printModelsOutput([model], true, false); } finally { restore(); }
+    return compareToFixture("cli-models", JSON.parse(logs[0]));
   });
 
   it("contract (plain text, not JSON -- see docs/json-contract.md)", async () => {

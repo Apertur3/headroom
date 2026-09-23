@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- New `model_available` event (and a quieter `model_retired`): notifies when a vendor makes a *new model* available to an account, even when it shares an existing quota pool rather than getting its own meter -- separate from `model_new`, which only fires on a whole new quota bucket. Per principal, Headroom keeps a set of known model ids with `first_seen_at`; the very first check for a principal seeds that set silently (no notification burst for models already in use), and every id after that is one event, never repeated. Sources, no new credential for any of them: Codex's own local `models_cache.json` cache, Claude Code's own local model-catalog cache, and Antigravity's `fetchAvailableModels` endpoint. Checked at most once an hour per principal, independent of the ordinary quota poll. `model_available` is on by default in the `calm` and `quiet` notify presets; `model_retired` is `everything`-only. New `headroom models [--principal <id>] [--json|--agent]` lists every known model id with `first_seen_at`/`retired_at`.
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed
