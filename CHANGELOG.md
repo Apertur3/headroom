@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `headroom rates [--meter <meter_id>] [--model <slug>] [--principal <id>] [--since 30d] [--json] [--agent]` (MCP `quota_rates`): learns points per 1,000,000 tokens per meter/principal/model from `headroom usage import`'s already-imported token counts against the meter's own observed percent deltas, via a small dependency-free non-negative least squares fit (`src/rate-nnls.ts`). Refuses below a minimum sample count (`insufficient_data`), reports `coverage` and `r_squared` as confidence, and discloses that other, un-imported usage on the same account also moves the meter (folded into a non-negative background term, never silently attributed to a model). `usage.db` moves to schema v4 (v1/v2/v3 -> v4, purely additive): a new `usage_rate_fits` time series and a `usage_rate_events` table recording `rate_changed` drift, modeled on `headroom.db`'s existing `reset_seen` events.
+- `headroom usage top [--window 5h|wk] [--by session|model] [--principal <id>] [--json]`: an attribution view estimating points spent per session (`usage.db`'s `--job` alias) or per model over a window, top spenders first, using whatever `headroom rates` has already learned -- `estimated_points: null` (never a fabricated number) for a model with no fit yet.
+- Learner and drift logic fit only Claude models in this release; Codex's counter vocabulary does not map onto the same four token classes cleanly enough to fit without a guess (see `docs/usage-prediction.md`).
+
 ## [0.1.6] - 2026-09-23
 
 ### Added
