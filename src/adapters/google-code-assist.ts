@@ -18,6 +18,13 @@ export const CODE_ASSIST_TIMEOUT_MS = 10_000;
 const BASE_URL = "https://cloudcode-pa.googleapis.com";
 export const RETRIEVE_USER_QUOTA = `${BASE_URL}/v1internal:retrieveUserQuota`;
 export const LOAD_CODE_ASSIST = `${BASE_URL}/v1internal:loadCodeAssist`;
+/** Antigravity's own model-catalog RPC on the same control-plane host as
+ * `retrieveUserQuota`/`loadCodeAssist`: same base URL, same Bearer token,
+ * same `{ project }` body shape. Used only for the `model_available`
+ * feature -- Headroom already calls `loadCodeAssist`/`retrieveUserQuota` on
+ * this exact host with this exact credential, so this adds no new
+ * credential or consent surface. */
+export const FETCH_AVAILABLE_MODELS = `${BASE_URL}/v1internal:fetchAvailableModels`;
 export const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 
 /** Headroom reads usage; it must never provision a remote Code Assist project
@@ -307,6 +314,19 @@ export async function loadCodeAssist(fetcher: typeof fetch, token: string, metad
 
 export async function postUserQuota(fetcher: typeof fetch, token: string, projectId: string | undefined, userAgent?: string): Promise<Response> {
   return outboundFetch(fetcher, new Request(RETRIEVE_USER_QUOTA, { method: "POST", headers: requestHeaders(token, userAgent), body: quotaRequestBody(projectId), signal: AbortSignal.timeout(CODE_ASSIST_TIMEOUT_MS) }));
+}
+
+export async function postAvailableModels(fetcher: typeof fetch, token: string, projectId: string | undefined, userAgent?: string): Promise<Response> {
+  return outboundFetch(fetcher, new Request(FETCH_AVAILABLE_MODELS, { method: "POST", headers: requestHeaders(token, userAgent), body: quotaRequestBody(projectId), signal: AbortSignal.timeout(CODE_ASSIST_TIMEOUT_MS) }));
+}
+
+/** `fetchAvailableModels`'s body is `{ models: { <id>: { displayName, quotaInfo } } }`
+ * -- an object keyed by model id, not an array. Only the id and display name
+ * are ever read; `quotaInfo` is availability-only (see `retrieveUserQuota`
+ * for the actual remaining-fraction numbers Headroom trusts). */
+export function modelsFromAvailableModels(body: unknown): Array<{ id: string; name: string | null }> {
+  if (!asObject(body) || !asObject(body.models)) return [];
+  return Object.entries(body.models).flatMap(([id, entry]) => id.trim() ? [{ id: id.trim(), name: asObject(entry) ? asString(entry.displayName) ?? null : null }] : []);
 }
 
 /**

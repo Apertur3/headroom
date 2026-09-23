@@ -41,7 +41,9 @@ field shape is still snapshotted by `test/json-contract.test.ts` -- a rename
 or removal there fails CI exactly like it would for an enveloped output. A
 future major version may convert them to `{ contract, generated_at, ... }`
 objects; until then, treat "this output is an array" itself as the signal
-that it predates the envelope.
+that it predates the envelope. `models` (added after this list was written)
+is deliberately bare for the same reason `events` is: a sibling list output,
+read the same way.
 
 `history` (a command with no equivalent MCP tool) is also a bare array and is
 out of scope for this version of the contract; it is not enveloped either.
@@ -355,12 +357,14 @@ principal_id: string | null, reason: string | null, last_seen_at: string |
 null, metadata?: { unscheduled?: boolean; window_minutes?: number | null;
 used_percent?: number; previous_used_percent?: number; from_plan?: string;
 to_plan?: string; downgrade?: boolean; restored?: boolean;
-credit_spent_on_free_plan?: boolean; resets_at?: string } | null }`.
+credit_spent_on_free_plan?: boolean; resets_at?: string; model_id?: string;
+model_name?: string | null; shares_pool?: boolean } | null }`.
 `EventKind` is `"reset_seen" | "free_reset_granted" |
 "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" |
 "window_retired" | "source_failed" |
 "source_recovered" | "lease_started" | "lease_ended" |
-"pace_projection_conserve" | "model_new" | "grant_lapsed"` -- an enumeration that only grows
+"pace_projection_conserve" | "model_new" | "grant_lapsed" | "model_available" |
+"model_retired"` -- an enumeration that only grows
 under the compatibility promise below. `last_seen_at` is set only on an open
 `source_failed` event (the most recent poll that still found the same
 failure); `null` on every other kind. On a `reset_seen`, `window_minutes`
@@ -369,11 +373,25 @@ instant; `used_percent`/`previous_used_percent` are then the percentages
 after and before it. On a `plan_changed`, `from_plan`, `to_plan`, `downgrade`,
 or `restored` explain the vendor-reported change. `credit_spent_on_free_plan`
 marks a free-plan reset-credit use. `resets_at` may accompany an exhausted
-report. Metadata is absent when an event has no such fact. Exit codes: always
-`0`.
+report. On a `model_available`/`model_retired`, `model_id` and `model_name`
+name the vendor model; `model_available` also carries `shares_pool`
+(`true` when Headroom cannot yet see a dedicated meter for this model, i.e.
+the common case of a model sharing the account's existing pool; `false` once
+it can). Metadata is absent when an event has no such fact. Exit codes:
+always `0`.
 
 MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct",
 events: HeadroomEvent[] }`; over a daemon, the bare `HeadroomEvent[]` instead.
+
+### `models` (bare array -- see "Array-shaped outputs")
+
+`headroom models [--principal <id>] [--json|--agent]` -- distinct from the
+`--models` flag documented above, which is Claude session-log token share.
+`--json`: `KnownModel[]`, `{ principal_id: string, vendor: string, model_id:
+string, model_name: string | null, first_seen_at: string, last_seen_at:
+string, retired_at: string | null }[]`. `retired_at` is `null` until a later
+catalog read no longer lists the id. No MCP equivalent yet. Exit codes:
+always `0`.
 
 ### `wait` -- MCP only (`quota_wait`)
 

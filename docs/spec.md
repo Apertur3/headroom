@@ -99,7 +99,8 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - `headroom` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
-  `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
+  `headroom events --since 24h`, `headroom models [--principal X] [--json|--agent]`,
+  `headroom can <principal> <action-class> [--allow-unknown]`.
 - `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
   `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.

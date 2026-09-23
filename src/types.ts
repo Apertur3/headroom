@@ -148,7 +148,22 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired";
+
+/** One vendor model id known to Headroom for a principal, as read from that
+ * vendor's own local model catalog (never fabricated, never inferred from
+ * usage). `first_seen_at` never moves once set; `retired_at` is set (not
+ * deleted) the first catalog read that no longer lists the id, and cleared
+ * again if the vendor brings it back. */
+export interface KnownModel {
+  principal_id: string;
+  vendor: string;
+  model_id: string;
+  model_name: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  retired_at: string | null;
+}
 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by
@@ -232,5 +247,10 @@ export interface HeadroomEvent {
    * `pace_projection_conserve`, it carries the measured burn and empty time
    * that let delivery deduplicate noisy repeats without changing the event
    * stream. */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number } | null;
+  /** On `model_available`/`model_retired`: the vendor model id and display
+   * name from its own catalog, and (`model_available` only) whether
+   * Headroom can already see a meter of its own for this id (`shares_pool:
+   * false`) or has only ever seen it inside an existing shared meter
+   * (`shares_pool: true`, or undefined when Headroom cannot tell yet). */
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean } | null;
 }
