@@ -1513,6 +1513,18 @@ export class HeadroomStore {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
   }
 
+  /** Every persisted `source_health:<meter>` marker (notify.ts's source-health
+   * hysteresis, keyed by meter id), for the notifier's per-poll sweep. Mirrors
+   * planDowngrades()'s own daemon_state prefix scan. This is notify-layer-only
+   * state: the events table remains the complete, undamped truth record of
+   * every source_failed/source_recovered transition regardless of what the
+   * notifier has decided to hold back so far. */
+  sourceHealthPending(): Array<{ meter_id: string; value: string }> {
+    return this.db.prepare("SELECT key, value FROM daemon_state WHERE key LIKE 'source_health:%'").all()
+      .map((row) => ({ meter_id: String(row.key).slice("source_health:".length), value: String(row.value) }))
+      .filter((row) => row.value !== "");
+  }
+
   /**
    * A vendor reset instant is presentation data, not a reliable identity:
    * some endpoints calculate it relative to each read. Keep one canonical,

@@ -49,6 +49,8 @@ events_off = ["source_recovered"]
 threshold_percent = 90
 # thresholds = [90, 95, 100] # optional threshold ladder
 quiet_hours = "23:00-07:00"
+# source_health_min_polls = 2      # default; consecutive polls before source_failed fires
+# source_health_min_minutes = 15   # default; minutes a source must stay failed before source_failed fires
 
 [notify.telegram]
 chat_id = "123456"
@@ -106,6 +108,18 @@ most once per six hours; suppressed attempts remain visible in `headroom notify
 --last`. Before delivery, Headroom also removes volatile countdowns and
 fractional timestamps and suppresses an otherwise identical message as `no new
 information`.
+
+A source has to stay down for a while before `source_failed` reaches your
+phone: `source_health_min_polls` (default 2) consecutive daemon polls *and*
+`source_health_min_minutes` (default 15) minutes, both since the outage began.
+A blip that recovers before both bars are cleared -- a vendor endpoint that
+answers on the next poll, for instance -- produces no message at all, in
+either direction: `source_recovered` only ever fires for an outage whose
+`source_failed` was actually sent. This is notification-layer damping only;
+`headroom notify --last` and the underlying event history
+(`get_ingest_log`/`headroom status --json`, the events table) still record
+every transition, however short-lived. Set either value to `0`/`1` to notify
+on the very first failing poll, matching pre-hysteresis behavior.
 
 ## When Headroom speaks
 

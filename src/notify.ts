@@ -49,6 +49,13 @@ export function resolveNotifyEvents(preset: NotifyPreset, on: string[] = [], off
 
 export interface QuietHours { start: number; end: number; }
 
+/** A source must stay continuously failed for at least this many consecutive
+ * daemon polls AND this many minutes before `source_failed` is notified; a
+ * flap that clears before both are satisfied produces zero messages. See
+ * sourceHealthGate() below. */
+export const DEFAULT_SOURCE_HEALTH_MIN_POLLS = 2;
+export const DEFAULT_SOURCE_HEALTH_MIN_MINUTES = 15;
+
 export interface NotifyConfig {
   channels: ChannelName[];
   preset: NotifyPreset;
@@ -65,6 +72,10 @@ export interface NotifyConfig {
   webhook: { url: string | null };
   /** Accepted for older policies; use events_on = ["reset_scheduled_short"] instead. */
   notify_scheduled_short: boolean;
+  /** Consecutive polls a source must stay failed before `source_failed` notifies. */
+  source_health_min_polls: number;
+  /** Minutes a source must stay continuously failed before `source_failed` notifies. */
+  source_health_min_minutes: number;
 }
 
 /** One queued notification: what the ledger stores, and what a channel renders. */
@@ -151,6 +162,8 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   let server = DEFAULT_NTFY_SERVER;
   let webhookUrl: string | null = null;
   let notifyScheduledShort = false;
+  let sourceHealthMinPolls = DEFAULT_SOURCE_HEALTH_MIN_POLLS;
+  let sourceHealthMinMinutes = DEFAULT_SOURCE_HEALTH_MIN_MINUTES;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/("(?:[^"\\]|\\.)*")|#.*/g, (match, quoted: string | undefined) => quoted ?? "").trim();
     if (!line) continue;
@@ -187,6 +200,8 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
         notifyScheduledShort = trimmed === "true";
         continue;
       }
+      if (key === "source_health_min_polls") { sourceHealthMinPolls = Number(value); continue; }
+      if (key === "source_health_min_minutes") { sourceHealthMinMinutes = Number(value); continue; }
       throw invalid(`unknown [notify] key "${key}"`);
     }
     const scalar = stringValue(value);
@@ -202,6 +217,8 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   for (const event of [...(events ?? []), ...eventsOn, ...eventsOff]) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid(`unknown event "${event}"`);
   if (thresholdPercent !== null && (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100)) throw invalid("threshold_percent must be above 0 and at most 100");
   if (thresholds?.some((threshold) => threshold <= 0 || threshold > 100)) throw invalid("thresholds must contain percentages above 0 and at most 100");
+  if (!Number.isInteger(sourceHealthMinPolls) || sourceHealthMinPolls < 1) throw invalid("source_health_min_polls must be a whole number of at least 1");
+  if (!Number.isFinite(sourceHealthMinMinutes) || sourceHealthMinMinutes < 0) throw invalid("source_health_min_minutes must be 0 or more");
   if (topic !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(topic)) throw invalid("ntfy topic must be 1 to 64 characters of letters, digits, hyphen or underscore");
   if (chatId !== null && !/^-?[0-9]{1,32}$|^@[A-Za-z0-9_]{1,64}$/.test(chatId)) throw invalid("telegram chat_id must be a numeric id or an @name");
   for (const [label, candidate] of [["ntfy server", server], ["webhook url", webhookUrl]] as const) {
@@ -221,6 +238,8 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
     ntfy: { topic, server },
     webhook: { url: webhookUrl },
     notify_scheduled_short: notifyScheduledShort,
+    source_health_min_polls: sourceHealthMinPolls,
+    source_health_min_minutes: sourceHealthMinMinutes,
   };
 }
 
@@ -599,6 +618,120 @@ function collectItems(store: HeadroomStore, config: NotifyConfig, discovered: He
   return items;
 }
 
+/* -------------------------------------------------------------------------
+ * Source-health hysteresis. AGY-style flapping (fail, recover a poll or two
+ * later, fail again) produced one source_failed and one source_recovered
+ * message per blip -- true to the store's event history, but not to what a
+ * phone should interrupt for. The events table stays the complete, undamped
+ * truth record (see store.ts's recordFailure/recoverWindowlessFailure); only
+ * this layer holds a `source_failed` item back until the outage has actually
+ * lasted, mirroring thresholdItems()'s own daemon-state-backed pattern.
+ * ---------------------------------------------------------------------- */
+
+interface PendingSourceHealth {
+  /** The originating source_failed item's id, so a later, different outage on
+   * the same meter is never mistaken for this one. */
+  event_id: string;
+  meter_id: string;
+  /** The outage's own start (the source_failed event's `created_at`), not
+   * when this poll happened to observe it -- duration is measured from here. */
+  created_at: string;
+  /** Notify passes this marker has survived while still open, including the
+   * one that created it. */
+  polls: number;
+  /** The fully rendered source_failed item, held until promoted. */
+  item: NotifyItem;
+  /** Whether that item has actually been queued for delivery yet. */
+  notified: boolean;
+}
+
+function sourceHealthPolicy(config: NotifyConfig): { minPolls: number; minMinutes: number } {
+  return { minPolls: config.source_health_min_polls, minMinutes: config.source_health_min_minutes };
+}
+
+function readSourceHealthPending(value: string): PendingSourceHealth | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<PendingSourceHealth>;
+    const item = parsed.item as Partial<NotifyItem> | undefined;
+    if (typeof parsed.event_id === "string" && typeof parsed.meter_id === "string" && typeof parsed.created_at === "string"
+      && typeof parsed.polls === "number" && typeof parsed.notified === "boolean"
+      && item && typeof item.id === "string" && typeof item.kind === "string" && typeof item.text === "string") {
+      return parsed as PendingSourceHealth;
+    }
+  } catch { /* A malformed or pre-upgrade marker is dropped, not trusted. */ }
+  return undefined;
+}
+
+function writeSourceHealthPending(store: HeadroomStore, pending: PendingSourceHealth): void {
+  store.setDaemonState(`source_health:${pending.meter_id}`, JSON.stringify(pending));
+}
+
+function clearSourceHealthPending(store: HeadroomStore, meterId: string): void {
+  store.setDaemonState(`source_health:${meterId}`, "");
+}
+
+/** True once a pending outage's own poll count and elapsed duration both
+ * clear the configured bars. `pending.polls` already reflects this poll (the
+ * caller increments before calling here for an outage carried over from an
+ * earlier pass; a brand new one starts at 1, its own first poll). */
+function sourceHealthQualifies(policy: { minPolls: number; minMinutes: number }, pending: PendingSourceHealth, now: Date): boolean {
+  const parsed = Date.parse(pending.created_at);
+  const elapsedMinutes = Number.isFinite(parsed) ? (now.getTime() - parsed) / 60_000 : Infinity;
+  return pending.polls >= policy.minPolls && elapsedMinutes >= policy.minMinutes;
+}
+
+/**
+ * Every notify pass, before this poll's newly discovered events are gated:
+ * advance every outage still pending from an earlier poll by one, and
+ * promote (return for delivery) any that have now cleared both the
+ * poll-count and duration bars. `store.latest()` -- the plain
+ * most-recent-observation lookup every other caller already uses -- is the
+ * safety net against a stuck marker: if the meter's latest reading is no
+ * longer `failed`, the recovery already arrived (or is arriving this very
+ * poll) and clearSourceHealthPending() below will retire the marker instead
+ * of this function ever promoting it.
+ */
+function promoteSourceHealth(store: HeadroomStore, config: NotifyConfig, now: Date): NotifyItem[] {
+  const policy = sourceHealthPolicy(config);
+  const promoted: NotifyItem[] = [];
+  for (const { meter_id: meterId, value } of store.sourceHealthPending()) {
+    const pending = readSourceHealthPending(value);
+    if (!pending || pending.notified) continue;
+    if (store.latest(meterId)?.freshness !== "failed") continue; // already recovered; the matching event clears this marker
+    const advanced = { ...pending, polls: pending.polls + 1 };
+    if (sourceHealthQualifies(policy, advanced, now)) { promoted.push(advanced.item); writeSourceHealthPending(store, { ...advanced, notified: true }); }
+    else writeSourceHealthPending(store, advanced);
+  }
+  return promoted;
+}
+
+/**
+ * Holds every newly discovered `source_failed` item back until it (or a
+ * carried-over predecessor via promoteSourceHealth() above) has lasted the
+ * configured poll count and duration -- a `min_polls: 1, min_minutes: 0`
+ * policy still delivers on this same poll, its own first. Drops a
+ * `source_recovered` item unless the matching failure was actually notified
+ * -- a flap that never qualified produces neither message. Every other item
+ * passes through unchanged.
+ */
+function sourceHealthGate(store: HeadroomStore, config: NotifyConfig, items: NotifyItem[], now: Date): NotifyItem[] {
+  const policy = sourceHealthPolicy(config);
+  const kept = promoteSourceHealth(store, config, now);
+  for (const item of items) {
+    if ((item.kind !== "source_failed" && item.kind !== "source_recovered") || !item.meter) { kept.push(item); continue; }
+    if (item.kind === "source_failed") {
+      const pending: PendingSourceHealth = { event_id: item.id, meter_id: item.meter, created_at: item.at, polls: 1, item, notified: false };
+      if (sourceHealthQualifies(policy, pending, now)) { kept.push(item); writeSourceHealthPending(store, { ...pending, notified: true }); }
+      else writeSourceHealthPending(store, pending);
+      continue;
+    }
+    const pending = readSourceHealthPending(store.daemonState(`source_health:${item.meter}`) ?? "");
+    clearSourceHealthPending(store, item.meter);
+    if (pending?.notified) kept.push(item);
+  }
+  return kept;
+}
+
 function eventItem(store: HeadroomStore, event: HeadroomEvent, evidence: Observation[] | undefined, siblings: Observation[]): NotifyItem {
   const current = evidence?.at(-1);
   const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
@@ -792,8 +925,12 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
   if (!ready.length) return { configured: true, queued: 0, sent: 0, quiet: false, channels: status };
   const queued = store.enqueueNotificationEvents((events) => {
     const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now)];
-    for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, items)) enqueueWithSafetyNet(store, channel.channel, item, now);
-    return items.length;
+    // Source-health hysteresis runs every pass, not just when this poll
+    // discovered something new: a held source_failed is promoted (or a stuck
+    // marker retired) purely by elapsed polls/time, independent of discovery.
+    const gated = sourceHealthGate(store, config, items, now);
+    for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, gated)) enqueueWithSafetyNet(store, channel.channel, item, now);
+    return gated.length;
   });
   if (inQuietHours(config, now)) {
     let sent = 0;
