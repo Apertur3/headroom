@@ -124,9 +124,34 @@ const ADD_EVENT_METADATA: Migration = {
   },
 };
 
+/**
+ * `known_models` tracks, per principal, every model id a vendor's own local
+ * catalog (or model-listing endpoint) has ever reported -- the "model
+ * available" feature's seed set. `retired_at` is set (never a row delete)
+ * when a later catalog read no longer lists an id, so a vendor that
+ * temporarily omits a model from one read and restores it the next does not
+ * lose its original `first_seen_at`. `model_id` is the vendor's own slug,
+ * already an opaque non-secret string -- never a credential or prompt
+ * fragment.
+ */
+const ADD_KNOWN_MODELS: Migration = {
+  version: 3,
+  description: "known_models table for the model_available/model_retired events",
+  up(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS known_models (
+        principal_id TEXT NOT NULL, vendor TEXT NOT NULL, model_id TEXT NOT NULL, model_name TEXT,
+        first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, retired_at TEXT,
+        PRIMARY KEY (principal_id, model_id)
+      );
+      CREATE INDEX IF NOT EXISTS known_models_principal ON known_models(principal_id);
+    `);
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

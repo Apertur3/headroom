@@ -122,6 +122,15 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
       return message("🐢 Projected stall", projection ? `${meter} burns ${projection[1]}%/h and would hit 100% in ${projection[2]}, reset in ${projection[3]}.` : `${meter} may run out before its reset.`, "Slow down to make this window last.");
     }
     case "model_new": return message("🆕 New model bucket seen", `${principal} now reports "${humanName(event.reason ?? event.meter_id?.split(":").at(-1) ?? "New model")}" as its own meter.`, "Check its allowance before routing work to it.");
+    case "model_available": {
+      const modelName = event.metadata?.model_name ?? humanName(event.metadata?.model_id ?? event.reason ?? "model");
+      const sharesPool = event.metadata?.shares_pool !== false;
+      return `🆕 ${planVendor(event.principal_id ?? "")}: ${clean(modelName)} now available on ${principal}${sharesPool ? " (shares the main pool)" : " (its own quota bucket)"}`;
+    }
+    case "model_retired": {
+      const modelName = event.metadata?.model_name ?? humanName(event.metadata?.model_id ?? event.reason ?? "model");
+      return message("🗑️ Model retired", `${planVendor(event.principal_id ?? "")} no longer lists "${clean(modelName)}" on ${principal}.`, "It is no longer available to route work to.");
+    }
     case "grant_lapsed": return message("🔑 Keychain grant lapsed", `${principal}.`, `Run: headroom keychain grant --principal ${clean(event.principal_id ?? "unknown")}`);
     case "lease_started": return message("▶️ Lease started", `${name} has a new work reservation.`, "Its reserved capacity is accounted for while the lease runs.");
     case "lease_ended": return message("🏁 Lease ended", `${name}'s work reservation ended.`, "Unused reserved capacity is available again.");

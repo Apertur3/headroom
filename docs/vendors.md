@@ -114,6 +114,17 @@ number an orchestrator needs, whatever the vendor calls the bucket. `gate --mode
 `--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
 routing class already consumes it via `routing.toml`.
 
+### Model catalog (`model_available`)
+
+Claude Code caches its own model catalog locally, one file per OAuth token it has used, under
+`<CLAUDE_CONFIG_DIR>/cache/model-catalog/*.json` (`CLAUDE_CONFIG_DIR` defaults to `~/.claude`).
+Headroom reads every file in that directory, keeps the newest by its own `fetchedAt` timestamp
+(a profile accumulates one file per token as the CLI's access token rotates, but every file under
+one config dir belongs to the same principal), and reads `catalog.config.models[].id`/`.name` out
+of it -- no network call, no new credential. A config dir with no cache yet (Claude Code never run,
+or run only with an older version) reports no model catalog for that principal; the feature does
+not fail the ordinary quota read.
+
 ## Codex
 
 Headroom reads the ChatGPT OAuth access token from Codex's own auth store and calls
@@ -154,6 +165,14 @@ is present but has no entry whose name matches "spark", both Spark windows repor
 this immediately replaces (rather than freezes) the last real reading. A response that omits
 `additional_rate_limits` entirely -- the call never asked about Spark at all -- leaves an existing
 Spark reading untouched either way.
+
+### Model catalog (`model_available`)
+
+The installed Codex CLI keeps its own local model-list cache at `$CODEX_HOME/models_cache.json`
+(default `~/.codex/models_cache.json`), refreshed by ordinary CLI use. Headroom reads it directly
+-- no network call, no new credential -- for the `slug`/`display_name` of every entry whose
+`visibility` is not `"hide"` (the CLI's own internal/test models). A `CODEX_HOME` with no cache
+file yet reports no model catalog for that principal.
 
 ## Antigravity
 
@@ -209,6 +228,17 @@ reset, shown as `5h n/a (vendor sent no 5h bucket in this response)`. This repla
 frozen reading immediately (the newer `not_enforced` observation outranks an old `fresh` one
 by fetch time) and is skipped, not blocking, on `gate --need 5h:N` and `can`. A real bucket
 with genuine usage is unaffected -- the vendor's own numbers always win when one is present.
+
+### Model catalog (`model_available`)
+
+Unlike quota (agy's own warm local summary, above), Headroom has no local model-list read for
+Antigravity: it calls `fetchAvailableModels` on the same `cloudcode-pa.googleapis.com` host,
+with the same Google OAuth credential class (`GoogleCredential`, `src/adapters/google-code-assist.ts`)
+and the same resolved Code Assist project id the deprecated remote quota fallback already uses --
+no new credential type, no new host. That credential is the Gemini CLI's own OAuth file
+(`~/.gemini/oauth_creds.json`); an install that discovered its `antigravity` account purely from
+`agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
+no model catalog for that principal (never a failure of the ordinary quota read).
 The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
 (UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
 

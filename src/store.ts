@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
-import type { EventKind, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -193,6 +193,10 @@ function eventFromRow(row: Row): HeadroomEvent {
   const metadata = row.metadata_json ? parseJson<(HeadroomEvent["metadata"] & { _notify_seen?: number }) | undefined>(row.metadata_json, undefined) : undefined;
   if (metadata) delete metadata._notify_seen;
   return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: metadata && Object.keys(metadata).length ? metadata : undefined };
+}
+
+function knownModelFromRow(row: Row): KnownModel {
+  return { principal_id: String(row.principal_id), vendor: String(row.vendor), model_id: String(row.model_id), model_name: string(row.model_name), first_seen_at: String(row.first_seen_at), last_seen_at: String(row.last_seen_at), retired_at: string(row.retired_at) };
 }
 
 function notifyFromRow(row: Row): NotifyDelivery {
@@ -1468,6 +1472,99 @@ export class HeadroomStore {
   }
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+
+  /** Every meter bucket name this principal has ever reported, excluding the
+   * generic bucket names every vendor uses regardless of model (a match
+   * against "main" or "credits" would tell a reader nothing about a specific
+   * model), used only as a best-effort signal for `model_available`'s
+   * `shares_pool` hint below. */
+  private ownMeterBuckets(principalId: string): string[] {
+    const generic = new Set(["main", "spark", "credits", "capacity", "all", "gemini", "claude-gpt", "state"]);
+    return (this.db.prepare("SELECT DISTINCT meter_id FROM observations WHERE principal_id = ?").all(principalId) as { meter_id: string }[])
+      .map((row) => String(row.meter_id).split(":").slice(1).join(":").toLowerCase())
+      .filter((bucket) => bucket.length > 2 && !generic.has(bucket));
+  }
+
+  /** True when this principal already has its own reported meter bucket
+   * whose name overlaps this model id -- e.g. a Claude "opus" meter for
+   * model id "claude-opus-5-5". A vendor that has no such overlap is not
+   * proven to share the main pool, only that Headroom cannot yet tell
+   * either way; `recordModelCatalog` reports the negative as `shares_pool:
+   * true` (its plainer, more common case) rather than adding a third
+   * "unknown" value to every notification and JSON reader. */
+  private hasOwnMeter(principalId: string, modelId: string): boolean {
+    const slug = modelId.toLowerCase();
+    return this.ownMeterBuckets(principalId).some((bucket) => slug.includes(bucket) || bucket.includes(slug));
+  }
+
+  /** Writes one `model_available`/`model_retired` event directly (not
+   * through `addEvent`, which requires a `StoredObservation` for its
+   * `meter_id`/`fetched_at` -- a model-catalog fact has neither). The
+   * deterministic id (`kind:principal:modelId`) makes this idempotent under
+   * `INSERT OR IGNORE`, the same guarantee `addEvent` gives its own
+   * observation-keyed ids. */
+  private addModelEvent(kind: "model_available" | "model_retired", principalId: string, modelId: string, modelName: string | null, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName };
+    if (kind === "model_available") metadata.shares_pool = !this.hasOwnMeter(principalId, modelId);
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${principalId}:${modelId}`, kind, "vendor_reported", 1, "[]", at, null, null, principalId, modelId, null, JSON.stringify(metadata));
+  }
+
+  /**
+   * Folds one vendor model-catalog read into `known_models` and emits
+   * `model_available`/`model_retired` events for what changed. The first
+   * ever call for a principal (no existing `known_models` rows at all) seeds
+   * every id silently -- no events -- so turning this feature on never
+   * produces a burst of "new model" notifications for models the operator
+   * has already been using for months. Every later call diffs against that
+   * seed: an id with no row yet is genuinely new (`first_seen_at` = now, one
+   * `model_available` event); an id previously marked `retired_at` reappears
+   * without a fresh event (the vendor listing it again is not, by itself, as
+   * newsworthy as the very first sighting, and it keeps its original
+   * `first_seen_at`); an id no longer present is marked `retired_at` = now
+   * with one `model_retired` event (excluded from every default notify
+   * preset -- see notify.ts's `PRESET_EVENTS`).
+   */
+  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date()): { seeded: boolean; added: string[]; retired: string[] } {
+    const at = now.toISOString();
+    const existingRows = this.db.prepare("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
+    const seeded = existingRows.length === 0;
+    const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
+    const seenIds = new Set(models.map((model) => model.id));
+    const added: string[] = [];
+    for (const model of models) {
+      const existing = existingById.get(model.id);
+      if (!existing) {
+        this.db.prepare("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
+          .run(principalId, vendor, model.id, model.name ?? null, at, at);
+        if (!seeded) {
+          added.push(model.id);
+          this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
+        }
+        continue;
+      }
+      this.db.prepare("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+        .run(at, model.name ?? null, vendor, principalId, model.id);
+    }
+    const retired: string[] = [];
+    if (!seeded) for (const row of existingRows) {
+      if (seenIds.has(row.model_id) || row.retired_at) continue;
+      this.db.prepare("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
+      retired.push(row.model_id);
+      this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
+    }
+    return { seeded, added, retired };
+  }
+
+  /** Every model id Headroom has ever seen in a vendor's own catalog, newest
+   * first_seen last. A retired id is kept (never deleted), so `headroom
+   * models` can still show when a model disappeared. */
+  knownModels(principalId?: string): KnownModel[] {
+    const rows = principalId
+      ? this.db.prepare("SELECT * FROM known_models WHERE principal_id = ? ORDER BY first_seen_at ASC, model_id ASC").all(principalId)
+      : this.db.prepare("SELECT * FROM known_models ORDER BY principal_id ASC, first_seen_at ASC, model_id ASC").all();
+    return rows.map(knownModelFromRow);
+  }
 
   /** Bootstrap before the daemon's first poll, without credentials or network.
    * Existing events are history; new events from that first poll are eligible.
