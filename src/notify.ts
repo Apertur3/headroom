@@ -81,6 +81,9 @@ export interface NotifyConfig {
 /** One queued notification: what the ledger stores, and what a channel renders. */
 export interface NotifyItem {
   id: string;
+  /** Store event ID for source-health lookup when a windowed notification has
+   * a separate deterministic delivery ID. */
+  source_health_event_id?: string;
   kind: string;
   meter: string | null;
   principal: string | null;
@@ -90,6 +93,9 @@ export interface NotifyItem {
   window_key?: string;
   /** Stable kind + meter + canonical-window identity for the delivery guard. */
   delivery_identity?: string;
+  /** Source-failure ledger IDs whose sent rows make this recovery eligible on
+   * a particular channel. This is intentionally not global state. */
+  source_health_failure_ids?: string[];
   /** Stored in the ledger payload so a later noisy projection can compare
    * itself with the first alert for this window instance. */
   projection?: ProjectionDetails;
@@ -513,7 +519,7 @@ function decodeItem(row: NotifyDelivery): NotifyItem {
   try {
     const parsed = JSON.parse(row.text) as Partial<NotifyItem>;
     if (parsed && typeof parsed.text === "string") {
-      return { id: row.event_id, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text, window_key: typeof parsed.window_key === "string" ? parsed.window_key : undefined, delivery_identity: typeof parsed.delivery_identity === "string" ? parsed.delivery_identity : undefined, projection: projectionDetails(parsed.projection) };
+      return { id: row.event_id, source_health_event_id: typeof parsed.source_health_event_id === "string" ? parsed.source_health_event_id : undefined, kind: String(parsed.kind ?? "event"), meter: parsed.meter ?? null, principal: parsed.principal ?? null, at: String(parsed.at ?? row.created_at), text: parsed.text, window_key: typeof parsed.window_key === "string" ? parsed.window_key : undefined, delivery_identity: typeof parsed.delivery_identity === "string" ? parsed.delivery_identity : undefined, projection: projectionDetails(parsed.projection) };
     }
   } catch { /* A row written by an older build is still deliverable as text. */ }
   return { id: row.event_id, kind: "event", meter: null, principal: null, at: row.created_at, text: row.text };
@@ -633,47 +639,75 @@ interface PendingSourceHealth {
    * the same meter is never mistaken for this one. */
   event_id: string;
   meter_id: string;
+  /** The failure's semantic window. A null window is a whole-meter outage. */
+  window: Observation["window"];
   /** The outage's own start (the source_failed event's `created_at`), not
    * when this poll happened to observe it -- duration is measured from here. */
   created_at: string;
-  /** Notify passes this marker has survived while still open, including the
-   * one that created it. */
+  /** Distinct failed observations this outage has retained, including the
+   * opening one. Unrelated notification passes never advance this. */
   polls: number;
+  /** The source_failed event's last seen time at the last counted failure. */
+  last_seen_at: string;
   /** The fully rendered source_failed item, held until promoted. */
   item: NotifyItem;
-  /** Whether that item has actually been queued for delivery yet. */
-  notified: boolean;
+  /** The failure has been released once to the normal per-channel ledger.
+   * Recovery eligibility reads each channel's sent ledger row instead. */
+  promoted: boolean;
 }
 
 function sourceHealthPolicy(config: NotifyConfig): { minPolls: number; minMinutes: number } {
   return { minPolls: config.source_health_min_polls, minMinutes: config.source_health_min_minutes };
 }
 
+function sourceHealthWindow(value: unknown): Observation["window"] | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") return undefined;
+  const window = value as Partial<NonNullable<Observation["window"]>>;
+  return (window.kind === "rolling" || window.kind === "fixed" || window.kind === "count" || window.kind === "state")
+    && (typeof window.minutes === "number" || window.minutes === null)
+    && (window.enforcement === "hard" || window.enforcement === "soft")
+    ? window as NonNullable<Observation["window"]> : undefined;
+}
+
+function sourceHealthStateKey(eventId: string, window: Observation["window"]): string {
+  const scope = window ? `${window.kind}:${window.minutes ?? "none"}:${window.enforcement}` : "none";
+  return `source_health:${encodeURIComponent(eventId)}:${encodeURIComponent(scope)}`;
+}
+
 function readSourceHealthPending(value: string): PendingSourceHealth | undefined {
   try {
     const parsed = JSON.parse(value) as Partial<PendingSourceHealth>;
     const item = parsed.item as Partial<NotifyItem> | undefined;
+    // Pre-upgrade markers did not persist scope or last_seen_at. They remain
+    // readable so an already-sent failure can still produce its recovery.
+    const window = parsed.window === undefined ? null : sourceHealthWindow(parsed.window);
     if (typeof parsed.event_id === "string" && typeof parsed.meter_id === "string" && typeof parsed.created_at === "string"
-      && typeof parsed.polls === "number" && typeof parsed.notified === "boolean"
+      && typeof parsed.polls === "number" && window !== undefined
       && item && typeof item.id === "string" && typeof item.kind === "string" && typeof item.text === "string") {
-      return parsed as PendingSourceHealth;
+      return {
+        event_id: parsed.event_id, meter_id: parsed.meter_id, window, created_at: parsed.created_at,
+        polls: parsed.polls, last_seen_at: typeof parsed.last_seen_at === "string" ? parsed.last_seen_at : parsed.created_at,
+        item: item as NotifyItem, promoted: typeof parsed.promoted === "boolean" ? parsed.promoted : (parsed as { notified?: unknown }).notified === true,
+      };
     }
   } catch { /* A malformed or pre-upgrade marker is dropped, not trusted. */ }
   return undefined;
 }
 
-function writeSourceHealthPending(store: HeadroomStore, pending: PendingSourceHealth): void {
-  store.setDaemonState(`source_health:${pending.meter_id}`, JSON.stringify(pending));
+function writeSourceHealthPending(store: HeadroomStore, pending: PendingSourceHealth, replaces?: string): void {
+  const key = sourceHealthStateKey(pending.event_id, pending.window);
+  store.setDaemonState(key, JSON.stringify(pending));
+  if (replaces && replaces !== key) store.setDaemonState(replaces, "");
 }
 
-function clearSourceHealthPending(store: HeadroomStore, meterId: string): void {
-  store.setDaemonState(`source_health:${meterId}`, "");
+function clearSourceHealthPending(store: HeadroomStore, key: string): void {
+  store.setDaemonState(key, "");
 }
 
 /** True once a pending outage's own poll count and elapsed duration both
- * clear the configured bars. `pending.polls` already reflects this poll (the
- * caller increments before calling here for an outage carried over from an
- * earlier pass; a brand new one starts at 1, its own first poll). */
+ * clear the configured bars. `pending.polls` already reflects a distinct
+ * failed observation (a brand new outage starts at 1). */
 function sourceHealthQualifies(policy: { minPolls: number; minMinutes: number }, pending: PendingSourceHealth, now: Date): boolean {
   const parsed = Date.parse(pending.created_at);
   const elapsedMinutes = Number.isFinite(parsed) ? (now.getTime() - parsed) / 60_000 : Infinity;
@@ -681,28 +715,44 @@ function sourceHealthQualifies(policy: { minPolls: number; minMinutes: number },
 }
 
 /**
- * Every notify pass, before this poll's newly discovered events are gated:
- * advance every outage still pending from an earlier poll by one, and
- * promote (return for delivery) any that have now cleared both the
- * poll-count and duration bars. `store.latest()` -- the plain
- * most-recent-observation lookup every other caller already uses -- is the
- * safety net against a stuck marker: if the meter's latest reading is no
- * longer `failed`, the recovery already arrived (or is arriving this very
- * poll) and clearSourceHealthPending() below will retire the marker instead
- * of this function ever promoting it.
+ * Before this poll's newly discovered events are gated, advance an outage
+ * only when its source_failed event's `last_seen_at` advanced too. The store
+ * asks whether this exact failure/window is still open; a fresher sibling
+ * window therefore cannot promote or retire it by accident.
  */
 function promoteSourceHealth(store: HeadroomStore, config: NotifyConfig, now: Date): NotifyItem[] {
   const policy = sourceHealthPolicy(config);
   const promoted: NotifyItem[] = [];
-  for (const { meter_id: meterId, value } of store.sourceHealthPending()) {
+  for (const { key, value } of store.sourceHealthPending()) {
     const pending = readSourceHealthPending(value);
-    if (!pending || pending.notified) continue;
-    if (store.latest(meterId)?.freshness !== "failed") continue; // already recovered; the matching event clears this marker
-    const advanced = { ...pending, polls: pending.polls + 1 };
-    if (sourceHealthQualifies(policy, advanced, now)) { promoted.push(advanced.item); writeSourceHealthPending(store, { ...advanced, notified: true }); }
-    else writeSourceHealthPending(store, advanced);
+    if (!pending) { clearSourceHealthPending(store, key); continue; }
+    const outage = store.sourceHealthOpenOutage(pending.event_id);
+    if (!outage) { clearSourceHealthPending(store, key); continue; }
+    const current = { ...pending, meter_id: outage.meter_id, window: outage.window, created_at: outage.created_at };
+    if (current.promoted || current.last_seen_at === outage.last_seen_at) {
+      if (key !== sourceHealthStateKey(current.event_id, current.window)) writeSourceHealthPending(store, current, key);
+      continue;
+    }
+    const advanced = { ...current, polls: current.polls + 1, last_seen_at: outage.last_seen_at };
+    if (sourceHealthQualifies(policy, advanced, now)) {
+      promoted.push(advanced.item);
+      writeSourceHealthPending(store, { ...advanced, promoted: true }, key);
+    } else writeSourceHealthPending(store, advanced, key);
   }
   return promoted;
+}
+
+/** Older builds did not persist source-health state. Recreate the failure's
+ * original deterministic ledger ID from its event evidence so their sent
+ * rows still authorize a later recovery after upgrade. */
+function sourceHealthFailureDeliveryId(store: HeadroomStore, eventId: string): string {
+  const event = store.eventById(eventId);
+  if (!event) return eventId;
+  const evidence = store.eventObservations([event]).get(event.id);
+  const current = evidence?.at(-1);
+  const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
+  const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
+  return event.meter_id && minutes && resetsAt ? `source_failed:${store.windowKey(event.meter_id, minutes, resetsAt)}` : event.id;
 }
 
 /**
@@ -720,14 +770,27 @@ function sourceHealthGate(store: HeadroomStore, config: NotifyConfig, items: Not
   for (const item of items) {
     if ((item.kind !== "source_failed" && item.kind !== "source_recovered") || !item.meter) { kept.push(item); continue; }
     if (item.kind === "source_failed") {
-      const pending: PendingSourceHealth = { event_id: item.id, meter_id: item.meter, created_at: item.at, polls: 1, item, notified: false };
-      if (sourceHealthQualifies(policy, pending, now)) { kept.push(item); writeSourceHealthPending(store, { ...pending, notified: true }); }
+      const eventId = item.source_health_event_id ?? item.id;
+      const outage = store.sourceHealthOpenOutage(eventId);
+      if (!outage) continue; // it recovered before this batch could be delivered
+      const existing = store.sourceHealthPending().find((entry) => readSourceHealthPending(entry.value)?.event_id === eventId);
+      if (existing) continue;
+      const pending: PendingSourceHealth = {
+        event_id: eventId, meter_id: outage.meter_id, window: outage.window, created_at: outage.created_at,
+        polls: 1, last_seen_at: outage.last_seen_at, item, promoted: false,
+      };
+      if (sourceHealthQualifies(policy, pending, now)) { kept.push(item); writeSourceHealthPending(store, { ...pending, promoted: true }); }
       else writeSourceHealthPending(store, pending);
       continue;
     }
-    const pending = readSourceHealthPending(store.daemonState(`source_health:${item.meter}`) ?? "");
-    clearSourceHealthPending(store, item.meter);
-    if (pending?.notified) kept.push(item);
+    const deliveryIds: string[] = [];
+    for (const outage of store.sourceHealthOutagesRecoveredBy(item.source_health_event_id ?? item.id)) {
+      const entry = store.sourceHealthPending().find((candidate) => readSourceHealthPending(candidate.value)?.event_id === outage.event_id);
+      const pending = entry && readSourceHealthPending(entry.value);
+      deliveryIds.push(pending?.item.id ?? sourceHealthFailureDeliveryId(store, outage.event_id));
+      if (entry) clearSourceHealthPending(store, entry.key);
+    }
+    if (deliveryIds.length) kept.push({ ...item, source_health_failure_ids: [...new Set(deliveryIds)] });
   }
   return kept;
 }
@@ -738,11 +801,16 @@ function eventItem(store: HeadroomStore, event: HeadroomEvent, evidence: Observa
   const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
   const window = event.meter_id && minutes ? store.windowKey(event.meter_id, minutes, resetsAt) : undefined;
   const planStage = event.kind === "plan_changed" ? event.metadata?.downgrade ? "downgrade" : event.metadata?.restored ? "restored" : "changed" : undefined;
-  const identity = `${event.kind}:${event.meter_id ?? event.principal_id ?? "none"}:${window ?? "none"}${planStage ? `:${planStage}` : ""}`;
+  // A source outage is meter-scoped even when its first failed observation is
+  // windowless and a later one has a vendor window. Its six-hour guard must
+  // therefore not treat those two renderings as distinct failures.
+  const identity = event.kind === "source_failed"
+    ? `source_failed:${event.meter_id ?? event.principal_id ?? "none"}:outage`
+    : `${event.kind}:${event.meter_id ?? event.principal_id ?? "none"}:${window ?? "none"}${planStage ? `:${planStage}` : ""}`;
   // A plan transition without a vendor reset is not a windowed alert: its
   // event identity must preserve a later restoration as a distinct message.
   const id = event.meter_id && minutes && resetsAt ? `${event.kind}:${window}${planStage ? `:${planStage}` : ""}` : event.id;
-  return { id, kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, window_key: window, delivery_identity: identity, text: eventText(event, evidence, siblings) };
+  return { id, ...(event.kind === "source_failed" || event.kind === "source_recovered" ? { source_health_event_id: event.id } : {}), kind: event.kind, meter: event.meter_id, principal: event.principal_id, at: event.created_at, window_key: window, delivery_identity: identity, text: eventText(event, evidence, siblings) };
 }
 
 function projectionLedgerId(projection: ProjectionDetails, stage: "plain" | "escalation"): string {
@@ -846,6 +914,16 @@ function enqueueWithSafetyNet(store: HeadroomStore, channel: ChannelName, item: 
   store.notifyEnqueue(item.id, channel, encodeItem(prepared), now.toISOString());
 }
 
+/** A recovery is meaningful only to channels that actually delivered one of
+ * the failures it closes. Pending, suppressed, exhausted, disabled, and
+ * later-added channels have no such sent ledger row and stay quiet. */
+function sourceHealthItemForChannel(store: HeadroomStore, channel: ChannelName, item: NotifyItem): NotifyItem | undefined {
+  if (item.kind !== "source_recovered") return item;
+  const failures = item.source_health_failure_ids;
+  if (!failures?.length) return undefined;
+  return failures.some((id) => store.notifyDelivery(id, channel)?.status === "sent") ? item : undefined;
+}
+
 function bypassesQuietHours(item: NotifyItem): boolean {
   return item.kind === "plan_changed" && item.text.startsWith("🚨 PLAN DOWNGRADED:")
     || item.kind === "plan_changed" && item.text.startsWith("📈 plan restored")
@@ -929,7 +1007,11 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
     // discovered something new: a held source_failed is promoted (or a stuck
     // marker retired) purely by elapsed polls/time, independent of discovery.
     const gated = sourceHealthGate(store, config, items, now);
-    for (const channel of ready) for (const item of projectionDeliveryItems(store, channel.channel, gated)) enqueueWithSafetyNet(store, channel.channel, item, now);
+    for (const channel of ready) for (const candidate of gated) {
+      const item = sourceHealthItemForChannel(store, channel.channel, candidate);
+      if (!item) continue;
+      for (const delivery of projectionDeliveryItems(store, channel.channel, [item])) enqueueWithSafetyNet(store, channel.channel, delivery, now);
+    }
     return gated.length;
   });
   if (inQuietHours(config, now)) {

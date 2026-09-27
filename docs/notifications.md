@@ -116,10 +116,12 @@ A blip that recovers before both bars are cleared -- a vendor endpoint that
 answers on the next poll, for instance -- produces no message at all, in
 either direction: `source_recovered` only ever fires for an outage whose
 `source_failed` was actually sent. This is notification-layer damping only;
-`headroom notify --last` and the underlying event history
-(`get_ingest_log`/`headroom status --json`, the events table) still record
-every transition, however short-lived. Set either value to `0`/`1` to notify
-on the very first failing poll, matching pre-hysteresis behavior.
+held flaps never enter the notification ledger, so `headroom notify --last`
+shows delivery activity rather than every transition. The internal events
+table still retains each transition, but `headroom status --json` is current
+status, not event history. Set `source_health_min_polls = 1` *and*
+`source_health_min_minutes = 0` to notify on the first failing poll, matching
+pre-hysteresis behavior.
 
 ## When Headroom speaks
 

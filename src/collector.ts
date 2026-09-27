@@ -2,7 +2,7 @@ import { adaptCodexPayload } from "./engine/codexbar/adapt.js";
 import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
-import { nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
+import { NATIVE_ENGINE_TIMEOUT_MS, nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
 import { claudeGrantNeededObservations, isClaudeProbeDenialReason, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
@@ -105,6 +105,24 @@ export function withBackoffReasons<T extends Observation>(observations: T[], bac
 
 const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
 const ANTIGRAVITY_WINDOWS = [300, 10_080];
+
+function completeAntigravityRows(rows: Observation[], principal: string): boolean {
+  return selectAntigravitySource(rows, [], principal) === rows && rows.length > 0;
+}
+
+/** An incomplete warm read must not leave an omitted lane backed by cached
+ * capacity. Keep any explicit whole-meter failure (which already covers all
+ * lanes); otherwise add failed rows only for lanes the engine omitted. */
+function completeOrFailedAntigravityRows(account: ProviderAccount, rows: Observation[], now: string): Observation[] {
+  if (completeAntigravityRows(rows, account.name)
+    || rows.some((row) => row.freshness === "failed" && !row.window)) return rows;
+  const present = new Set(rows.filter((row) => row.window?.minutes !== undefined)
+    .map((row) => `${row.meter_id}:${row.window!.minutes}`));
+  const missing = failedAntigravityObservations(account, "agy quota summary not ready", now)
+    .filter((row) => !present.has(`${row.meter_id}:${row.window?.minutes}`))
+    .map((row) => ({ ...row, source: "local:antigravity:warm" }));
+  return [...rows, ...missing];
+}
 
 /** Called only once remote has already failed to answer: picks the
  * daemon-owned agy summary in preference to remote's own failed/estimated
@@ -230,11 +248,20 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   });
   if (options.daemonOwnsAntigravity && native && antigravityAccounts.length) {
     try {
-      const local = await runNativeEngine(native, antigravityAccounts);
+      // The retry shares the native reader's normal single-attempt budget.
+      // A slow first read therefore leaves only its unused time to the retry,
+      // never turning one daemon poll into two 90-second process waits.
+      const antigravityDeadline = Date.now() + NATIVE_ENGINE_TIMEOUT_MS;
+      const readAntigravity = (accounts: ProviderAccount[]): Promise<Observation[]> => {
+        const timeoutMs = antigravityDeadline - Date.now();
+        if (timeoutMs <= 0) return Promise.reject(new Error("native Antigravity read exceeded its poll budget"));
+        return runNativeEngine(native, accounts, { timeoutMs });
+      };
+      const local = await readAntigravity(antigravityAccounts);
       localAntigravity = new Map(antigravityAccounts.map((account) => [account.name, local.filter((row) => row.principal_id === account.name)]));
       const incomplete = antigravityAccounts.filter((account) => {
         const rows = localAntigravity.get(account.name) ?? [];
-        return !(selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0);
+        return !completeAntigravityRows(rows, account.name);
       });
       // agy's local quota-summary endpoint routinely needs a moment past the
       // engine's own readiness wait to populate every lane, especially while
@@ -245,16 +272,24 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       // per poll rather than a silent extra failure/recovery cycle.
       if (incomplete.length) {
         try {
-          const retried = await runNativeEngine(native, incomplete);
+          const retried = await readAntigravity(incomplete);
           for (const account of incomplete) {
             const rows = retried.filter((row) => row.principal_id === account.name);
-            if (rows.length) localAntigravity.set(account.name, rows);
+            // A partial retry is not an authoritative replacement: it could
+            // erase this attempt's whole-meter failure and expose cached
+            // fresh capacity for a lane the retry did not answer. Only a
+            // complete quota summary wins; otherwise retain the first read.
+            if (completeAntigravityRows(rows, account.name)) localAntigravity.set(account.name, rows);
           }
         } catch { /* keep the first attempt's rows; handled below as usual */ }
       }
       for (const account of antigravityAccounts) {
-        const rows = localAntigravity.get(account.name) ?? [];
-        const complete = selectAntigravitySource(rows, [], account.name) === rows && rows.length > 0;
+        let rows = localAntigravity.get(account.name) ?? [];
+        const complete = completeAntigravityRows(rows, account.name);
+        if (!complete) {
+          rows = completeOrFailedAntigravityRows(account, rows, new Date().toISOString());
+          localAntigravity.set(account.name, rows);
+        }
         if (!complete && options.antigravityLoginState && options.antigravityLoginState !== "unknown") {
           const reason = options.antigravityLoginState === "not_logged_in" ? "agy not logged in (run: agy)" : "agy logged in; quota summary not ready";
           localAntigravity.set(account.name, rows.map((row) => row.freshness === "failed" ? { ...row, reason } : row));
