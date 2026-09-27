@@ -1,17 +1,15 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { descendantsOf, killTree, listProcesses, processSignature, type ProcessEntry } from "../src/process-tree.js";
 import { agyPtyCommand } from "../src/antigravity-keepalive.js";
+import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
 const temporary: string[] = [];
+useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
 
 async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
   const start = Date.now();
@@ -88,14 +86,7 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
   it("kills a real descendant that traps SIGTERM/SIGHUP and becomes its own session/process-group leader -- the exact shape issue #56 leaked -- not just the root pid it was told to kill", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-killtree-")); temporary.push(root);
     const infoFile = join(root, "child-pid.txt");
-    const fakeAgy = join(root, "agy");
-    await writeFile(fakeAgy, [
-      "#!/bin/sh",
-      "trap '' TERM HUP",
-      `echo $$ > ${infoFile}`,
-      "while true; do sleep 1; done",
-    ].join("\n"), { mode: 0o700 });
-    await chmod(fakeAgy, 0o700);
+    const fakeAgy = await writeFakeAgy(root, infoFile);
     // The real vehicle for "a descendant escapes the root's process group",
     // not a stand-in for it: `script` allocates a PTY and its child (the
     // fake agy above) becomes that PTY's session leader with its OWN new
@@ -104,8 +95,8 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
     // exercised for real here rather than assumed.
     const [command, args] = agyPtyCommand(fakeAgy, process.platform);
     const rootChild = spawn(command, args, { stdio: "ignore", detached: true });
-    const rootPid = rootChild.pid as number;
-    const childPid = Number(await waitForFile(infoFile));
+    const rootPid = track(rootChild.pid, root) as number;
+    const childPid = track(Number(await waitForFile(infoFile)), root) as number;
     expect(alive(childPid)).toBe(true);
     expect(childPid).not.toBe(rootPid); // the PTY child, not `script` itself
 
@@ -127,15 +118,11 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
   it.skipIf(process.platform !== "darwin")("a naive kill of only the root pid (the pre-fix behavior) leaves the PTY child alive -- this is issue #56 reproduced on macOS", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-killtree-naive-")); temporary.push(root);
     const infoFile = join(root, "child-pid.txt");
-    const fakeAgy = join(root, "agy");
-    await writeFile(fakeAgy, [
-      "#!/bin/sh", "trap '' TERM HUP", `echo $$ > ${infoFile}`, "while true; do sleep 1; done",
-    ].join("\n"), { mode: 0o700 });
-    await chmod(fakeAgy, 0o700);
+    const fakeAgy = await writeFakeAgy(root, infoFile);
     const [command, args] = agyPtyCommand(fakeAgy, process.platform);
     const rootChild = spawn(command, args, { stdio: "ignore", detached: true });
-    const rootPid = rootChild.pid as number;
-    const childPid = Number(await waitForFile(infoFile));
+    const rootPid = track(rootChild.pid, root) as number;
+    const childPid = track(Number(await waitForFile(infoFile)), root) as number;
 
     process.kill(rootPid, "SIGTERM"); // exactly what the old `child.kill("SIGTERM")` did
     await waitUntilDead(rootPid); // script itself is gone
@@ -150,11 +137,9 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
 
   it("escalates to SIGKILL only after the grace period, for a target that ignores SIGTERM", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-killtree-grace-")); temporary.push(root);
-    const script = join(root, "stubborn");
-    await writeFile(script, "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 1; done\n", { mode: 0o700 });
-    await chmod(script, 0o700);
+    const script = await writeMortalShim(join(root, "stubborn"), { ignoreTerm: true });
     const child = spawn(script, [], { stdio: "ignore", detached: true });
-    const pid = child.pid as number;
+    const pid = track(child.pid, root) as number;
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(alive(pid)).toBe(true);
 
@@ -167,11 +152,9 @@ describe.skipIf(process.platform === "win32")("processSignature", () => {
   it("reads a real process's command and start time, and the same pid queried twice agrees", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-signature-"));
     temporary.push(root);
-    const script = join(root, "sleeper");
-    await writeFile(script, "#!/bin/sh\nwhile true; do sleep 1; done\n", { mode: 0o700 });
-    await chmod(script, 0o700);
+    const script = await writeMortalShim(join(root, "sleeper"));
     const child = spawn(script, [], { stdio: "ignore", detached: true });
-    const pid = child.pid as number;
+    const pid = track(child.pid, root) as number;
     try {
       await new Promise((resolve) => setTimeout(resolve, 50));
       const first = await processSignature(pid);

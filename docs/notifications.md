@@ -14,9 +14,9 @@ Queueing and recording discovery commit together; the ledger prevents repeated d
 
 | Preset | What reaches your phone |
 | --- | --- |
-| `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, vendor-inconsistent readings, source failures and recoveries, threshold crossings. |
-| `quiet` | Unscheduled resets, source failures and threshold crossings. |
-| `everything` | All event kinds, including vendor-inconsistent readings, scheduled 5h resets, projected stalls, new model buckets, historical Keychain grant-lapse events, credit and plan changes, and leases. |
+| `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, vendor-inconsistent readings, source failures and recoveries, threshold crossings, new models available. |
+| `quiet` | Unscheduled resets, source failures, threshold crossings, new models available. |
+| `everything` | All event kinds, including vendor-inconsistent readings, scheduled 5h resets, projected stalls, new model buckets, models retired from a vendor's catalog, historical Keychain grant-lapse events, credit and plan changes, and leases. |
 
 The picker asks one question at a time: channels and destinations, preset,
 individual event choices if wanted, quiet hours, then an optional test message.
@@ -49,6 +49,8 @@ events_off = ["source_recovered"]
 threshold_percent = 90
 # thresholds = [90, 95, 100] # optional threshold ladder
 quiet_hours = "23:00-07:00"
+# source_health_min_polls = 2      # default; consecutive polls before source_failed fires
+# source_health_min_minutes = 15   # default; minutes a source must stay failed before source_failed fires
 
 [notify.telegram]
 chat_id = "123456"
@@ -76,9 +78,40 @@ name appears in both. Supported names:
 | `source_failed`, `source_recovered` | A source stopped answering or is reading again. |
 | `threshold` | A fresh hard window reached the used-percent threshold. |
 | `pace_projection_conserve` | Recent burn projects exhaustion before reset. Phone alerts fire once per window instance, with at most one materially worse escalation. |
-| `model_new` | A new model bucket on a known principal. A principal's first poll stays quiet. |
+| `model_new` | A new model *bucket* (quota meter) on a known principal. A principal's first poll stays quiet. |
+| `model_available` | A new model *id* in a vendor's own model catalog for a known principal, even when it shares an existing quota bucket. On in `calm` and `quiet`. A principal's first check stays quiet (see below). |
+| `model_retired` | A model id no longer listed in a vendor's catalog for a known principal. Only in `everything`. |
 | `grant_lapsed` | A historical Keychain grant lapse retained for existing event history. |
 | `lease_started`, `lease_ended` | Work reservations started or ended. |
+
+### `model_available`: new models, separate from new quota buckets
+
+`model_new` only fires when a vendor reports a whole new quota *meter* --
+`model_available` is separate and fires whenever a vendor's own model catalog
+lists an id Headroom has not seen for that principal before, whether or not it
+gets its own meter. A vendor often rolls a new model out inside an account's
+*existing* shared pool (e.g. Codex adding a model to the same 5h/weekly quota
+Sol/Terra/Luna already share) -- `model_new` says nothing in that case,
+`model_available` does. The notification calls a model's meter dedicated only
+when there is a current fresh official model-scoped observation, and calls it
+shared only when there is a current fresh official generic pool observation.
+When neither establishes that relationship, it says `no dedicated meter
+observed`; that is UNKNOWN information, never capacity.
+
+```
+🆕 Codex: GPT-6-Sol now available on codex-main (shares the main pool)
+```
+
+Sources, per vendor (no new credential type for any of them -- see
+`docs/vendors.md` for the exact host/credential each one reuses): Codex's own
+local `models_cache.json` cache, Claude Code's own local model-catalog
+cache, and Antigravity's `fetchAvailableModels` endpoint. Checked at most
+once an hour per principal, independent of the ordinary quota poll interval.
+The very first successful check for a principal (even an authoritative empty
+catalog) seeds its known-model list silently -- no notification burst for
+models you were already using. `headroom models
+[--principal <id>] [--json|--agent]` lists every known model id with its
+`first_seen_at` (and `retired_at` once a vendor drops one).
 
 Scheduled 5h resets are delivered only with `preset = "everything"` or
 `events_on = ["reset_scheduled_short"]`. They happen several times a day, so
@@ -106,6 +139,20 @@ most once per six hours; suppressed attempts remain visible in `headroom notify
 --last`. Before delivery, Headroom also removes volatile countdowns and
 fractional timestamps and suppresses an otherwise identical message as `no new
 information`.
+
+A source has to stay down for a while before `source_failed` reaches your
+phone: `source_health_min_polls` (default 2) consecutive daemon polls *and*
+`source_health_min_minutes` (default 15) minutes, both since the outage began.
+A blip that recovers before both bars are cleared -- a vendor endpoint that
+answers on the next poll, for instance -- produces no message at all, in
+either direction: `source_recovered` only ever fires for an outage whose
+`source_failed` was actually sent. This is notification-layer damping only;
+held flaps never enter the notification ledger, so `headroom notify --last`
+shows delivery activity rather than every transition. The internal events
+table still retains each transition, but `headroom status --json` is current
+status, not event history. Set `source_health_min_polls = 1` *and*
+`source_health_min_minutes = 0` to notify on the first failing poll, matching
+pre-hysteresis behavior.
 
 ## When Headroom speaks
 

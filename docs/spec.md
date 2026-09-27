@@ -101,7 +101,9 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - `headroom` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
-  `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
+  `headroom events --since 24h`, `headroom models [--principal <id>] [--json|--agent]`
+  (one non-flag principal value at most once),
+  `headroom can <principal> <action-class> [--allow-unknown]`.
 - `headroom credits [--json]`; `headroom credits set --principal <name> --available <n> --expires
   <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
   date-only expiry is midnight UTC on that date.

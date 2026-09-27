@@ -6,6 +6,8 @@ import { configDefaults, defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     setupFiles: ["./test/setup-isolation.ts"],
+    // Fails the run if any process this run started outlives it (see the file).
+    globalSetup: ["./test/global-leak-gate.ts"],
     testTimeout: 30_000,
     hookTimeout: 30_000,
     // Agent worktrees (e.g. .claude/worktrees/<id>/) are full checkouts of

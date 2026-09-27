@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
-import type { EventKind, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -161,6 +161,17 @@ export function sameSemanticWindow(
   return a.kind === b.kind && (a.minutes ?? null) === (b.minutes ?? null) && a.enforcement === b.enforcement;
 }
 
+/** The durable facts notification hysteresis needs for one source outage.
+ * `last_seen_at` advances only when the collector persisted another failed
+ * observation for this exact store event. */
+export interface SourceHealthOutage {
+  event_id: string;
+  meter_id: string;
+  window: Observation["window"];
+  created_at: string;
+  last_seen_at: string;
+}
+
 export function windowSqlMatch(
   window: Observation["window"] | undefined | null,
   column = "window_json"
@@ -194,6 +205,10 @@ function eventFromRow(row: Row): HeadroomEvent {
   const metadata = row.metadata_json ? parseJson<(HeadroomEvent["metadata"] & { _notify_seen?: number }) | undefined>(row.metadata_json, undefined) : undefined;
   if (metadata) delete metadata._notify_seen;
   return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: metadata && Object.keys(metadata).length ? metadata : undefined };
+}
+
+function knownModelFromRow(row: Row): KnownModel {
+  return { principal_id: String(row.principal_id), vendor: String(row.vendor), model_id: String(row.model_id), model_name: string(row.model_name), first_seen_at: String(row.first_seen_at), last_seen_at: String(row.last_seen_at), retired_at: string(row.retired_at) };
 }
 
 function notifyFromRow(row: Row): NotifyDelivery {
@@ -1552,6 +1567,112 @@ export class HeadroomStore {
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
 
+  /** One stored event by its durable ID. Notification compatibility uses this
+   * to reconstruct the deterministic delivery ID older builds used. */
+  eventById(eventId: string): HeadroomEvent | undefined {
+    const row = this.db.prepare("SELECT * FROM events WHERE id = ?").get(eventId);
+    return row ? eventFromRow(row) : undefined;
+  }
+
+  /** The catalog never reports a model-to-meter mapping, so this remains a
+   * deliberately conservative hint: only a current, fresh, official meter
+   * can establish a dedicated bucket. A current generic meter supports the
+   * usual shared-pool explanation; no current evidence remains unknown. */
+  private modelMeterScope(principalId: string, modelId: string): "dedicated" | "shared" | "unknown" {
+    const generic = new Set(["main", "spark", "credits", "capacity", "all", "gemini", "claude-gpt", "state"]);
+    const buckets = this.latestPerWindow()
+      .filter((observation) => observation.principal_id === principalId && observation.freshness === "fresh" && observation.truth === "official" && !observation.metadata?.vendor_window_held && !observation.metadata?.vendor_inconsistent)
+      .map((observation) => observation.meter_id.split(":").slice(1).join(":").toLowerCase());
+    const slug = modelId.toLowerCase();
+    if (buckets.some((bucket) => bucket.length > 2 && !generic.has(bucket) && (slug.includes(bucket) || bucket.includes(slug)))) return "dedicated";
+    if (buckets.some((bucket) => generic.has(bucket))) return "shared";
+    return "unknown";
+  }
+
+  /** Writes one `model_available`/`model_retired` event directly (not
+   * through `addEvent`, which requires a `StoredObservation` for its
+   * `meter_id`/`fetched_at` -- a model-catalog fact has neither). The
+   * deterministic id (`kind:principal:modelId`) makes this idempotent under
+   * `INSERT OR IGNORE`, the same guarantee `addEvent` gives its own
+   * observation-keyed ids. */
+  private addModelEvent(kind: "model_available" | "model_retired", principalId: string, modelId: string, modelName: string | null, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName };
+    if (kind === "model_available") {
+      const scope = this.modelMeterScope(principalId, modelId);
+      if (scope === "dedicated") metadata.shares_pool = false;
+      else if (scope === "shared") metadata.shares_pool = true;
+    }
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${principalId}:${modelId}`, kind, "vendor_reported", 1, "[]", at, null, null, principalId, modelId, null, JSON.stringify(metadata));
+  }
+
+  /**
+   * Folds one vendor model-catalog read into `known_models` and emits
+   * `model_available`/`model_retired` events for what changed. The first
+   * ever call for a principal (tracked by a durable marker, not row count)
+   * seeds every id silently -- no events -- so turning this feature on never
+   * produces a burst of "new model" notifications for models the operator
+   * has already been using for months. Every later call diffs against that
+   * seed: an id with no row yet is genuinely new (`first_seen_at` = now, one
+   * `model_available` event); an id previously marked `retired_at` reappears
+   * without a fresh event (the vendor listing it again is not, by itself, as
+   * newsworthy as the very first sighting, and it keeps its original
+   * `first_seen_at`); an id no longer present is marked `retired_at` = now
+   * with one `model_retired` event (excluded from every default notify
+   * preset -- see notify.ts's `PRESET_EVENTS`).
+   */
+  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date()): { seeded: boolean; added: string[]; retired: string[] } {
+    const at = now.toISOString();
+    const initializedKey = `model_catalog_initialized:${principalId}`;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existingRows = this.db.prepare("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
+      const seeded = this.daemonState(initializedKey) === undefined;
+      const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
+      const seenIds = new Set(models.map((model) => model.id));
+      const added: string[] = [];
+      for (const model of models) {
+        const existing = existingById.get(model.id);
+        if (!existing) {
+          this.db.prepare("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
+            .run(principalId, vendor, model.id, model.name ?? null, at, at);
+          if (!seeded) {
+            added.push(model.id);
+            this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
+          }
+          continue;
+        }
+        this.db.prepare("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+          .run(at, model.name ?? null, vendor, principalId, model.id);
+      }
+      const retired: string[] = [];
+      if (!seeded) for (const row of existingRows) {
+        if (seenIds.has(row.model_id) || row.retired_at) continue;
+        this.db.prepare("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
+        retired.push(row.model_id);
+        this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
+      }
+      // This must share the transaction with rows and events. In particular,
+      // an authoritative initial empty catalog is still an initialized check.
+      this.setDaemonState(initializedKey, at);
+      this.db.exec("COMMIT");
+      return { seeded, added, retired };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
+  }
+
+  /** Every model id Headroom has ever seen in a vendor's own catalog, newest
+   * first_seen last. A retired id is kept (never deleted), so `headroom
+   * models` can still show when a model disappeared. */
+  knownModels(principalId?: string): KnownModel[] {
+    const rows = principalId
+      ? this.db.prepare("SELECT * FROM known_models WHERE principal_id = ? ORDER BY first_seen_at ASC, model_id ASC").all(principalId)
+      : this.db.prepare("SELECT * FROM known_models ORDER BY principal_id ASC, first_seen_at ASC, model_id ASC").all();
+    return rows.map(knownModelFromRow);
+  }
+
   /** Bootstrap before the daemon's first poll, without credentials or network.
    * Existing events are history; new events from that first poll are eligible.
    * Repeated initialization must not consume undiscovered events. */
@@ -1594,6 +1715,110 @@ export class HeadroomStore {
 
   setDaemonState(key: string, value: string): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  /** Every persisted `source_health:` marker (notify.ts's source-health
+   * hysteresis, keyed by outage event and its semantic window), for the notifier's per-poll sweep. Mirrors
+   * planDowngrades()'s own daemon_state prefix scan. This is notify-layer-only
+   * state: the events table remains the complete, undamped truth record of
+   * every source_failed/source_recovered transition regardless of what the
+   * notifier has decided to hold back so far. */
+  sourceHealthPending(): Array<{ key: string; value: string }> {
+    return this.db.prepare("SELECT key, value FROM daemon_state WHERE key LIKE 'source_health:%'").all()
+      .map((row) => ({ key: String(row.key), value: String(row.value) }))
+      .filter((row) => row.value !== "");
+  }
+
+  /** The failed observation that opened one source outage. A source_failed
+   * event has one opening observation; later failed polls extend only its
+   * `last_seen_at`, keeping this a stable outage identity. */
+  sourceHealthOutage(eventId: string): SourceHealthOutage | undefined {
+    const row = this.db.prepare(`SELECT e.id AS event_id, e.meter_id, e.created_at, e.last_seen_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_failed'
+      ORDER BY o.id ASC LIMIT 1`).get(eventId);
+    if (!row || typeof row.event_id !== "string" || typeof row.meter_id !== "string" || typeof row.created_at !== "string") return undefined;
+    return {
+      event_id: row.event_id,
+      meter_id: row.meter_id,
+      window: row.window_json ? parseJson<Observation["window"]>(row.window_json, null) : null,
+      created_at: row.created_at,
+      last_seen_at: typeof row.last_seen_at === "string" ? row.last_seen_at : row.created_at,
+    };
+  }
+
+  private sourceHealthOutageClosedBefore(outage: SourceHealthOutage, before?: string): boolean {
+    const ending = before ? "AND e.created_at < ?" : "";
+    if (!outage.window) {
+      // This mirrors recoverWindowlessFailure(): a whole-meter outage closes
+      // on the next genuine source-recovered transition, regardless of the
+      // window that finally answered.
+      const row = this.db.prepare(`SELECT 1 FROM events e WHERE e.meter_id = ? AND e.kind = 'source_recovered'
+        AND e.created_at > ? ${ending} LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []));
+      return Boolean(row);
+    }
+    const match = windowSqlMatch(outage.window, "o.window_json");
+    const row = this.db.prepare(`SELECT 1 FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.meter_id = ? AND e.kind = 'source_recovered' AND e.created_at > ? ${ending}
+        AND o.freshness = 'fresh' AND ${match.sql}
+      LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []), ...match.params);
+    return Boolean(row);
+  }
+
+  /** The matching source outage only while it remains open. This is scoped by
+   * the failure's own semantic window: a newer fresh weekly row cannot hide
+   * an open failed 5h row, and vice versa. */
+  sourceHealthOpenOutage(eventId: string): SourceHealthOutage | undefined {
+    const outage = this.sourceHealthOutage(eventId);
+    return outage && !this.sourceHealthOutageClosedBefore(outage) ? outage : undefined;
+  }
+
+  /** Every source failure that the supplied recovery closes. This also finds
+   * failures delivered before source-health state existed, so an upgraded
+   * daemon can still deliver their legitimate recovery per channel. */
+  sourceHealthOutagesRecoveredBy(recoveryEventId: string): SourceHealthOutage[] {
+    const recovery = this.db.prepare(`SELECT e.meter_id, e.created_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_recovered' AND o.freshness = 'fresh'
+      ORDER BY o.id DESC LIMIT 1`).get(recoveryEventId);
+    if (!recovery || typeof recovery.meter_id !== "string" || typeof recovery.created_at !== "string") return [];
+    const recoveryMeter = recovery.meter_id;
+    const recoveryCreated = recovery.created_at;
+    const window = recovery.window_json ? parseJson<Observation["window"]>(recovery.window_json, null) : null;
+    const candidates = this.db.prepare("SELECT id FROM events WHERE meter_id = ? AND kind = 'source_failed' AND created_at < ? ORDER BY created_at ASC, id ASC")
+      .all(recoveryMeter, recoveryCreated)
+      .flatMap((row) => typeof row.id === "string" ? [row.id] : [])
+      .map((id) => this.sourceHealthOutage(id))
+      .filter((outage): outage is SourceHealthOutage => Boolean(outage))
+      .filter((outage) => !outage.window || sameSemanticWindow(outage.window, window));
+    return candidates.filter((outage) => !this.sourceHealthOutageClosedBefore(outage, recoveryCreated));
+  }
+
+  /** Atomically reserves an interval before a caller starts asynchronous
+   * work. Keeping the reservation after a failed read prevents overlapping
+   * polls (or separate CLI processes) from repeatedly retrying a bad source. */
+  claimDaemonInterval(key: string, now: Date, intervalMs: number): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.daemonState(key);
+      const previousAt = previous ? Date.parse(previous) : Number.NaN;
+      if (Number.isFinite(previousAt) && now.getTime() - previousAt < intervalMs) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      this.setDaemonState(key, now.toISOString());
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
   }
 
   /**

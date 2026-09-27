@@ -20,6 +20,7 @@ import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveC
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
+import { checkModelAvailability } from "./model-catalog.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
@@ -34,7 +35,7 @@ import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAG
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { migrateLegacyHome } from "./paths.js";
+import { headroomHome, migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
@@ -42,7 +43,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { isLocalAccount, type Account, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -130,6 +131,58 @@ function printEvents(items: HeadroomEvent[]): void {
       : item.kind === "free_reset_used" ? `free reset used ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
       : item.kind;
     console.log(`${subject}  ${event} (${item.origin}, ${Math.round(item.confidence * 100)}%)`);
+  }
+}
+
+async function models(argv: string[]): Promise<number> {
+  let principal: string | undefined;
+  let json = false;
+  let agent = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    switch (argv[index]) {
+      case "--principal": {
+        const value = argv[index + 1];
+        if (principal !== undefined || !value || value.startsWith("-")) throw new Error(COMMAND_HELP.models);
+        principal = value;
+        index += 1;
+        break;
+      }
+      case "--json":
+        if (json) throw new Error(COMMAND_HELP.models);
+        json = true;
+        break;
+      case "--agent":
+        if (agent) throw new Error(COMMAND_HELP.models);
+        agent = true;
+        break;
+      default: throw new Error(COMMAND_HELP.models);
+    }
+  }
+  if (json && agent) throw new Error(COMMAND_HELP.models);
+  const request = await requestDaemon("models", principal ? { principal } : {});
+  if (request !== undefined) { printModelsOutput(unwrapRpc(request) as KnownModel[], json, agent); return 0; }
+  directReadNotice();
+  const store = await HeadroomStore.open();
+  try {
+    const items = store.knownModels(principal);
+    store.audit("cli", "models", principal ?? null, "ok");
+    printModelsOutput(items, json, agent);
+    return 0;
+  } finally { store.close(); }
+}
+
+/** The default output is always a JSON array, empty allowed -- same
+ * contract as `printEventsOutput`. `--agent` is a dense, one-line-per-model
+ * plain-text form (no header, no padding) for a token-frugal orchestrator
+ * read; with neither flag this prints a human table instead. */
+export function printModelsOutput(items: KnownModel[], json: boolean, agent: boolean): void {
+  if (json) { console.log(JSON.stringify(items)); return; }
+  if (!items.length) { console.log(agent ? "no known models" : "No known models yet. A list appears after the first poll of a codex, claude or antigravity principal."); return; }
+  for (const item of items) {
+    const status = item.retired_at ? `retired ${formatReset(item.retired_at)}` : `first seen ${formatReset(item.first_seen_at)}`;
+    if (agent) { console.log(`${item.principal_id} ${item.model_id} ${status}`); continue; }
+    const name = item.model_name ? ` "${item.model_name}"` : "";
+    console.log(`${item.principal_id}  ${item.model_id}${name}  (${item.vendor}, ${status})`);
   }
 }
 
@@ -951,6 +1004,8 @@ export async function observe(argv: string[]): Promise<number> {
   let freeResetUsed = new Map<string, string>();
   let leases: Lease[] = [];
   let planDowngraded: PlanDowngrade[] = [];
+  let directCatalogAccounts: ProviderAccount[] | undefined;
+  let directCatalogHome: string | undefined;
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
     observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
@@ -965,6 +1020,11 @@ export async function observe(argv: string[]): Promise<number> {
       failures = polled.failures;
       store.insertPoll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
+      // Run this only after rendering below. Antigravity's catalog read can
+      // make several bounded network calls; it must never delay this direct
+      // quota result. Its own store is opened after this status store closes.
+      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
+      directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
       const paced = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
@@ -1002,6 +1062,13 @@ export async function observe(argv: string[]): Promise<number> {
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
+  }
+  if (directCatalogAccounts && directCatalogHome) {
+    await (async () => {
+      const catalogStore = await HeadroomStore.open(directCatalogHome!);
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
+      finally { catalogStore.close(); }
+    })().catch(() => undefined);
   }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
@@ -1355,6 +1422,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["dashboard (top)", "Live terminal dashboard from cached readings, with pause, events, and leases (--html <path> writes standalone HTML report)"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
+  ["models", "List every model id seen in a vendor's own model catalog, with first_seen (and retired_at once a vendor drops one)"],
   ["history <meter>", "List stored observations for one meter"],
   ["lease start|list|end", "Reserve, list, or release a meter lease"],
   ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
@@ -1398,6 +1466,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   dashboard: "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose] [--ascii] [--html <path>] [--force]",
   can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
+  models: "Usage: headroom models [--principal <id>] [--json|--agent]",
   history: "Usage: headroom history <meter> [--since 24h]",
   lease: [
     "Usage: headroom lease <start|end|list>",
@@ -1557,6 +1626,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "update") return runUpdate(argv.slice(1));
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
+  if (argv[0] === "models") return models(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
   if (argv[0] === "cost") return cost(argv.slice(1));

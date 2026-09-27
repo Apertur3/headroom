@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { childEnvironment, forwardSignal, policyProxyConfigured } from "../bin/headroom.js";
+import { track, useProcessReaper } from "./helpers/mortal-process.js";
 
 const temporary: string[] = [];
+useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 const PROXY_KEYS = ["NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
@@ -110,13 +112,16 @@ describe("launcher signal forwarding", () => {
       "process.on(\"SIGTERM\", () => { writeFileSync(receivedFile, \"SIGTERM\"); process.exit(7); });",
       "process.stdout.write(\"ready\\n\");",
       "setInterval(() => {}, 1000);",
+      "setTimeout(() => process.exit(0), 30_000);", // mortal: never outlives a failed test
     ].join("\n"));
 
     const launcher = spawn(process.execPath, [join(binDir, "headroom.js"), receivedFile, pidFile], { stdio: ["ignore", "pipe", "pipe"] });
+    track(launcher.pid, root);
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("fake cli.js never reported ready")), 5000);
       launcher.stdout.on("data", (chunk: Buffer) => { if (chunk.toString().includes("ready")) { clearTimeout(timeout); resolve(); } });
     });
+    track(Number((await readFile(pidFile, "utf8")).trim()), root);
 
     if (process.platform === "win32") {
       const childPid = Number((await readFile(pidFile, "utf8")).trim());

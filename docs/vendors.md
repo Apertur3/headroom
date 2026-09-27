@@ -114,11 +114,54 @@ number an orchestrator needs, whatever the vendor calls the bucket. `gate --mode
 `--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
 routing class already consumes it via `routing.toml`.
 
+### No banked/free-reset field, as of 2026-09-23
+
+Codex's rate-limit-reset-credits endpoint carries a dedicated `credits` block (an available count
+plus a per-credit expiry -- see below), which Headroom maps to a `<principal>:credits` meter and
+fires `free_reset_granted` / `free_reset_used` / `credits_changed` off of. Checked against a live
+`GET /api/oauth/usage` response on 2026-09-23, Claude's endpoint has nothing equivalent: no field
+carrying a count of granted reset credits, an expiry, or a boolean/flag naming a one-time bonus
+reset (the kind Anthropic has occasionally granted account-side, tied to a model launch). Every
+top-level field in the response is either the two account-wide windows, a `seven_day_*` variant,
+the `limits[]` array, or a spend/dollar-denominated block (`extra_usage`, `spend`) -- none of which
+carries "how many free resets do I have left" semantics. This adapter does not invent one.
+
 Claude's usage endpoint does not expose banked reset credits. If a human sees one in Claude's UI,
 record that fact explicitly: `headroom credits set --principal claude-main --available 1 --expires
 2026-10-05`. `headroom credits clear --principal claude-main` records its later removal without
 erasing the original entry. These manual observations are marked estimated/manual and are advisory
 to `plan --target`; Headroom never uses a reset itself.
+
+Because the response's schema evidently keeps changing (new top-level keys have appeared across
+Claude Code releases without warning), `observationsFromClaudeUsage` checks every top-level key
+against the ones it actually reads and logs a safe, capped form of the name -- never the value --
+of anything else exactly once per process, under `HEADROOM_DEBUG=1`. This shell variable takes
+effect for a foreground `headroom daemon`, or for a direct `headroom status` read when no daemon
+is running; installed launchd, systemd, and Windows services do not inherit it, and there is no
+persistent setting. That is how a future field carrying this (a banked reset, an expiring bonus
+credit, anything else Codex-`credits`-shaped) gets noticed instead of silently staying unmapped
+forever. If one shows up, it maps the same way Codex's does: a
+`<principal>:credits` meter (`window.kind: "count"`, `quantity.unit: "credits"`), which
+`store.ts`'s existing, vendor-agnostic `detectEvents` already turns into `free_reset_granted` /
+`free_reset_used` / `credits_changed` on its own -- no new event-detection code, just the mapping.
+
+The zero-auth statusline snapshot (above) cannot carry this either: Claude Code's own `statusLine`
+hook payload only ever exposes a `rate_limits` object (`five_hour`/`seven_day`/scoped buckets), not
+the full usage response's `spend`/`extra_usage`/credit-shaped fields, so there is nothing further to
+check there.
+
+### Model catalog (`model_available`)
+
+Claude Code caches its own model catalog locally, one file per OAuth token it has used, under
+`<CLAUDE_CONFIG_DIR>/cache/model-catalog/*.json` (`CLAUDE_CONFIG_DIR` defaults to `~/.claude`).
+Headroom reads every file in that directory, keeps the newest by its own `fetchedAt` timestamp
+(a profile accumulates one file per token as the CLI's access token rotates, but every file under
+one config dir belongs to the same principal), and reads `catalog.config.models[].id`/`.name` out
+of it -- no network call, no new credential. Headroom accepts only a valid timestamp no more than
+24 hours old (with five minutes of clock skew); a stale, future, malformed, or missing timestamp
+reports no model catalog and leaves known-model state untouched. A config dir with no cache yet
+(Claude Code never run, or run only with an older version) behaves the same; the feature does not
+fail the ordinary quota read.
 
 ## Codex
 
@@ -160,6 +203,16 @@ is present but has no entry whose name matches "spark", both Spark windows repor
 this immediately replaces (rather than freezes) the last real reading. A response that omits
 `additional_rate_limits` entirely -- the call never asked about Spark at all -- leaves an existing
 Spark reading untouched either way.
+
+### Model catalog (`model_available`)
+
+The installed Codex CLI keeps its own local model-list cache at `$CODEX_HOME/models_cache.json`
+(default `~/.codex/models_cache.json`), refreshed by ordinary CLI use. Headroom reads it directly
+-- no network call, no new credential -- for the `slug`/`display_name` of every entry whose
+`visibility` is not `"hide"` (the CLI's own internal/test models). A `CODEX_HOME` with no cache
+file yet reports no model catalog for that principal. Its `fetched_at` must be a valid timestamp
+no more than 24 hours old (with five minutes of clock skew); an old or malformed cache is
+unavailable rather than evidence that its models remain available.
 
 ## Antigravity
 
@@ -215,6 +268,19 @@ reset, shown as `5h n/a (vendor sent no 5h bucket in this response)`. This repla
 frozen reading immediately (the newer `not_enforced` observation outranks an old `fresh` one
 by fetch time) and is skipped, not blocking, on `gate --need 5h:N` and `can`. A real bucket
 with genuine usage is unaffected -- the vendor's own numbers always win when one is present.
+
+### Model catalog (`model_available`)
+
+Unlike quota (agy's own warm local summary, above), Headroom has no local model-list read for
+Antigravity: it calls `fetchAvailableModels` on the same `cloudcode-pa.googleapis.com` host,
+with the same Google OAuth credential class (`GoogleCredential`, `src/adapters/google-code-assist.ts`)
+and the same resolved Code Assist project id the deprecated remote quota fallback already uses --
+no new credential type, no new host. That credential is the Gemini CLI's own OAuth file
+(`~/.gemini/oauth_creds.json`); an install that discovered its `antigravity` account purely from
+`agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
+no model catalog for that principal (never a failure of the ordinary quota read).
+An HTTP success without the expected `models` object is likewise unavailable, not an authoritative
+empty catalog, so it cannot retire known models.
 The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
 (UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
 
