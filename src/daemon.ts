@@ -11,8 +11,7 @@ import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from
 import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
-import { withResetsIn } from "./resets.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
@@ -470,11 +469,14 @@ export class HeadroomDaemon {
       let result: unknown;
       switch (request.method) {
         case "dashboard": {
+          const policy = await readPolicy();
+          const now = new Date();
           const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
-          result = readDashboardStore(this.store, new Date(), rows); break;
+          result = readDashboardStore(this.store, now, rows, policy); break;
         }
         case "status": {
           await this.poll(undefined, false);
+          const policy = await readPolicy();
           const now = new Date();
           const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
           // A principal currently sitting out a live vendor 429 backoff (see
@@ -483,8 +485,7 @@ export class HeadroomDaemon {
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
-          const paced = withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now);
-          result = withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now)));
+          result = withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now);
           break;
         }
         case "plan_downgrades": {

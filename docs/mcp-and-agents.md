@@ -55,6 +55,11 @@ about.
 `structuredContent` is always an object with `observations` and `plan_downgraded`. A direct read
 also has `source: "direct"` and `failures`.
 
+An MCP server newer than its daemon recognizes an older status array by its missing
+`status_enriched_at` fields and re-enriches it with the current policy and local store before it
+returns the result. A row that has aged past `staleness_minutes` is therefore `stale` with a local
+`last_known` value even during that version mismatch; it is never presented as capacity.
+
 ### `quota_can`
 
 Arguments: `action_class` (string, required), `owner` (string, required), `allow_unknown`

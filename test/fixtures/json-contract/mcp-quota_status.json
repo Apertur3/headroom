@@ -28,6 +28,7 @@
       "resets_in": "string",
       "resets_in_seconds": "number",
       "source": "string",
+      "status_enriched_at": "string",
       "sustainable_percent_per_hour": "number",
       "truth": "string",
       "upstream_schema_version": "string",

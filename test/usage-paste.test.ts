@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { main } from "../src/cli.js";
+import { main, usagePasteLine } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { clipboardCommand, observationsFromUsagePaste, parseResetAt, parseUsagePanel, resolveClaudePrincipal, scopeMeter } from "../src/adapters/claude-usage-paste.js";
 import { HeadroomStore } from "../src/store.js";
-import type { Account } from "../src/types.js";
+import type { Account, Observation } from "../src/types.js";
 
 /** Every panel under test/fixtures/usage-paste is synthetic: hand written for
  * these tests against the shapes the parser is documented to tolerate, never
@@ -91,6 +91,19 @@ describe("parseUsagePanel", () => {
 
   it("returns nothing at all for text that is not a usage panel", () => {
     expect(parseUsagePanel("hello\nthere", new Date()).windows).toEqual([]);
+  });
+});
+
+describe("usagePasteLine", () => {
+  it("prints an overdue reset age instead of the compatibility 0m", () => {
+    const now = new Date("2026-09-06T12:00:00Z");
+    const observation: Observation = {
+      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+      quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" }, resets_at: new Date(now.getTime() - 120_000).toISOString(),
+      observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "paste", truth: "estimated", freshness: "fresh",
+      confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+    };
+    expect(usagePasteLine(observation, now)).toContain("↻ overdue 2m");
   });
 });
 
@@ -314,4 +327,3 @@ describe("a real /usage panel (recorded 2026-09-07)", () => {
     expect(parsed.unparsed).toEqual([]);
   });
 });
-
