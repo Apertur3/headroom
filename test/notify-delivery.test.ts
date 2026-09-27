@@ -598,6 +598,30 @@ describe("model_new", () => {
   });
 });
 
+describe("model catalog notification delivery", () => {
+  it("delivers distinct models discovered on consecutive hourly checks", async () => {
+    const store = await openStore("headroom-notify-model-catalog-");
+    const { calls, fetcher } = recorder();
+    const only = { ...config(), channels: ["ntfy"] as NotifyConfig["channels"], events: ["model_available"] };
+    try {
+      // Establish notification discovery before the silent catalog seed.
+      await deliverNotifications(store, options({ config: only, fetcher, now: START }));
+      store.recordModelCatalog("claude-main", "claude", [{ id: "claude-sonnet-5", name: "Sonnet 5" }], START);
+
+      const firstAt = new Date(START.getTime() + 60 * 60_000);
+      store.recordModelCatalog("claude-main", "claude", [{ id: "claude-sonnet-5" }, { id: "claude-opus-5-5", name: "Opus 5.5" }], firstAt);
+      expect((await deliverNotifications(store, options({ config: only, fetcher, now: firstAt }))).sent).toBe(1);
+
+      const secondAt = new Date(START.getTime() + 2 * 60 * 60_000);
+      store.recordModelCatalog("claude-main", "claude", [{ id: "claude-sonnet-5" }, { id: "claude-opus-5-5" }, { id: "claude-fable-5", name: "Fable 5" }], secondAt);
+      expect((await deliverNotifications(store, options({ config: only, fetcher, now: secondAt }))).sent).toBe(1);
+
+      expect(calls).toHaveLength(2);
+      expect(calls.map((call) => call.body)).toEqual(expect.arrayContaining([expect.stringContaining("Opus 5.5"), expect.stringContaining("Fable 5")]));
+    } finally { store.close(); }
+  });
+});
+
 describe("grant_lapsed", () => {
   const LAPSE_REASON = "Keychain grant lapsed; Claude Code rewrote its credentials at 2026-09-03 20:05:00; run: headroom keychain grant --principal claude-main";
 
