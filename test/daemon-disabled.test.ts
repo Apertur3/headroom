@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -24,7 +25,6 @@ describe("daemon disabled scheduling", () => {
     const internal = daemon as unknown as {
       schedulingStarted: boolean; schedulers: Map<string, ReturnType<typeof setTimeout>>;
       currentAccounts(): Promise<unknown>; schedulePrincipals(): Promise<void>; poll(principal: string | undefined, forced: boolean): Promise<unknown>;
-      handleLine(line: string, nonce: string): Promise<{ replyLine: string }>;
     };
     let historicalFailureEvents = 0;
     try {
@@ -39,7 +39,7 @@ describe("daemon disabled scheduling", () => {
         historicalFailureEvents = store.events("1970-01-01T00:00:00.000Z").filter((event) => event.kind === "source_failed" && event.principal_id === "claude-2").length;
       }
       finally { store.close(); }
-      const reply = JSON.parse((await internal.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status", params: {} }), "")).replyLine).result as { observations: Observation[]; disabled_principals: string[] };
+      const reply = (await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status", params: {} }))).result as { observations: Observation[]; disabled_principals: string[] };
       expect(reply.observations).toEqual([]);
       expect(reply.disabled_principals).toEqual(["claude-2"]);
       const afterStatus = await HeadroomStore.open(home);
