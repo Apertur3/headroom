@@ -813,6 +813,38 @@ describe("dashboard graph gathering", () => {
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
   });
 
+  it("takes the direct snapshot clock after a delayed policy read crosses freshness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-response-clock-"));
+    const requestedAt = new Date("2026-09-08T12:00:00Z");
+    const responseAt = new Date("2026-09-08T12:02:00Z");
+    const store = await HeadroomStore.open(root);
+    store.insert(row({ fetched_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(), observed_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString() }));
+    store.close();
+    const daemon = await import("../src/daemon.js"), config = await import("../src/config.js");
+    const request = vi.spyOn(daemon, "daemonRequest").mockResolvedValue({ status: "absent" });
+    let releasePolicy: () => void;
+    const policyRead = new Promise<void>((resolve) => { releasePolicy = resolve; });
+    let policyStarted: () => void;
+    const delayedPolicyStarted = new Promise<void>((resolve) => { policyStarted = resolve; });
+    const policy = vi.spyOn(config, "readPolicy").mockImplementation(async () => {
+      policyStarted();
+      await policyRead;
+      return defaultPolicy;
+    });
+    try {
+      vi.useFakeTimers(); vi.setSystemTime(requestedAt);
+      const result = gatherCachedDashboard(root);
+      await delayedPolicyStarted;
+      vi.setSystemTime(responseAt);
+      releasePolicy!();
+      expect((await result).observations).toEqual([expect.objectContaining({ freshness: "stale", status_enriched_at: responseAt.toISOString() })]);
+    } finally {
+      policy.mockRestore(); request.mockRestore();
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("selects meter with active current-period history over earlier meter with only stale old-period history", async () => {
     const baseModel = fixedModel();
     const meterOld = "antigravity:claude-gpt";

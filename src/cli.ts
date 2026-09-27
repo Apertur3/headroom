@@ -28,6 +28,7 @@ import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
@@ -880,7 +881,8 @@ export async function observe(argv: string[]): Promise<number> {
   let planDowngraded: PlanDowngrade[] = [];
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
-    observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    const daemonRows = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    observations = await normalizeUnmarkedDaemonStatus(daemonRows, policy.staleness_minutes);
     failures = [];
     const leaseRequest = await requestDaemon("leases");
     leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];

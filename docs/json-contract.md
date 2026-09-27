@@ -160,7 +160,9 @@ this carries); `id?: number` (present once read back from the store, as
 every `--json` reading is); `status_enriched_at?: string` (the response-time
 instant that set freshness, pace, last-known and reset fields; a renderer
 preserves an already-enriched payload rather than aging it again without the
-store-backed `last_known` lookup).
+store-backed `last_known` lookup. A newer CLI or MCP server locally adds this
+marker and the matching fields when an older daemon returns an unmarked status
+array, using the current policy, before it serializes or evaluates the row).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at

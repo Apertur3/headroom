@@ -468,11 +468,14 @@ export class HeadroomDaemon {
       let result: unknown;
       switch (request.method) {
         case "dashboard": {
+          const policy = await readPolicy();
+          const now = new Date();
           const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
-          result = readDashboardStore(this.store, new Date(), rows, await readPolicy()); break;
+          result = readDashboardStore(this.store, now, rows, policy); break;
         }
         case "status": {
           await this.poll(undefined, false);
+          const policy = await readPolicy();
           const now = new Date();
           const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
           // A principal currently sitting out a live vendor 429 backoff (see
@@ -481,7 +484,6 @@ export class HeadroomDaemon {
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
-          const policy = await readPolicy();
           result = withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now);
           break;
         }

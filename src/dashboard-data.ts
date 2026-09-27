@@ -103,7 +103,12 @@ export async function gatherDashboard(home?: string, timeouts: DashboardRequestT
       request: () => daemonRequest(socketPath(directory), "dashboard", {}, timeouts.healthTimeoutMs ?? DASHBOARD_HEALTH_TIMEOUT_MS, timeouts.requestTimeoutMs ?? DASHBOARD_REQUEST_TIMEOUT_MS),
       fallback: async () => {
         const store = await HeadroomStore.open(directory);
-        try { return readDashboardStore(store, new Date(), undefined, await policyPromise); } finally { store.close(); }
+        try {
+          const policy = await policyPromise;
+          const now = new Date();
+          const rows = store.latestPerWindow();
+          return readDashboardStore(store, now, rows, policy);
+        } finally { store.close(); }
       },
     }),
     policyPromise, readAccounts().catch(() => []), headroomVersion(),

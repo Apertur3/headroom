@@ -93,6 +93,12 @@ reset, and `last_known` fields. A renderer preserves that response-time
 decision rather than aging the same payload again without the store lookup
 needed to attach `last_known`.
 
+When a newer CLI or MCP server reaches an older daemon whose status rows do
+not yet carry that marker, it re-enriches those rows from the current policy
+and local store before rendering, serializing, or checking a threshold. An
+aged stored-fresh row therefore still becomes UNKNOWN with a local
+`last_known` reading; daemon version skew never makes it capacity.
+
 ## Pace states
 
 Each enforced window gets a pace state from a straight-line burn against the time since its last

@@ -6,6 +6,7 @@ import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
@@ -606,8 +607,10 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // a daemon-sourced decision still gets this annotation added here.
     let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
     if (method === "status" && Array.isArray(finalResult)) {
+      const policy = await readPolicy();
+      const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);
       const downgrade = await call("plan_downgrades", {});
-      finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself

@@ -13,6 +13,7 @@ All notable changes to this project are documented here. The format follows
 - Serve an old stored-fresh percent observation as stale, including its age and any held-window explanation; invalid fetch timestamps now fail closed too, while local state and count rows keep their policy semantics. Served status carries its enrichment instant so later renderers preserve the matching `last_known` reading.
 - Keep contract-1.0 reset countdown values (`resets_in_seconds: 0`, `resets_in: "0m"`) for overdue schedules and add `reset_overdue: true` plus `reset_overdue_seconds`; status, dashboard, HTML report, statusline, and usage-paste output show `overdue <age>` from those additive fields.
 - Direct MCP status now takes its response-time freshness, burn, last-known age, and reset values after a poll completes, rather than from the pre-poll clock.
+- Take daemon and dashboard response clocks only after policy reloads complete, so a reading that crosses a freshness boundary during that I/O is served stale. Newer CLI and MCP clients also re-enrich unmarked status arrays from older daemons with current-policy freshness and local `last_known` data before JSON, threshold, or MCP output can consume them.
 
 ## [0.1.8] - 2026-09-27
 
