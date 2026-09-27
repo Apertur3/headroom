@@ -5,6 +5,7 @@
  * sustainable-pace figure that the CLI, the daemon and the MCP server all
  * attach to the same observation objects the same way.
  */
+import { isHeldReading } from "./policy.js";
 import { formatResetsIn, withResetsIn, type ResetsIn } from "./resets.js";
 import type { LastKnownReading, Observation } from "./types.js";
 
@@ -86,27 +87,38 @@ export interface EffectiveFreshness {
   reason?: string | null;
 }
 
-/** The clock that already-enriched status renderers use for their accompanying
- * pace decision. A renderer has no store-backed last_known lookup to make a
- * second response-time age transition complete, so it stays on the response
- * clock that produced the payload. Raw observations continue using `now`. */
-export function statusDecisionTime(observation: Observation, now = new Date()): Date {
-  const enriched = Date.parse(observation.status_enriched_at ?? "");
-  return Number.isFinite(enriched) ? new Date(enriched) : now;
-}
-
 /**
- * The freshness a reader is served, evaluated at response time rather than
- * copied from the moment a row entered SQLite. History deliberately retains
- * its original vendor result; this only keeps a long-unpolled `fresh` row
- * from being presented as current. The comparison and strict boundary match
+ * The freshness a reader is served, evaluated against the current serving
+ * clock every time this is called -- including on an already-enriched daemon
+ * row (one that already carries `status_enriched_at`). A stale render loop
+ * (the dashboard, the browser report, a cached CLI payload) must re-run this
+ * gate rather than trust a marker from whenever the row was first served:
+ * otherwise a row marked fresh minutes or hours ago stays "fresh" forever,
+ * no matter how far it has since aged past `stalenessMinutes`. A renderer
+ * that re-stales a row this way has no store-backed last_known lookup to
+ * refresh alongside it -- see withLastKnown below, which always serves
+ * `last_known: null` for a row whose stored freshness was never anything but
+ * fresh, exactly the case here. That is the correct fail-closed answer: an
+ * UNKNOWN reading with no last-known figure beats a `fresh` one serving
+ * capacity nobody re-confirmed. History deliberately retains its original
+ * vendor result; this only keeps a long-unpolled `fresh` row from being
+ * presented as current. The comparison and strict boundary match
  * policy.ts's freshnessGate/paceDecision exactly.
  */
+/** "last accepted reading Nm/Nh/Nd ago[; <observation.reason>]", the wording
+ * an aged-out fresh row has always been served with -- shared so the
+ * immediate held-reading branch below can reuse the exact same age phrase
+ * and reason-combining rule instead of a different, synthetic explanation. */
+function agedFreshReason(observation: Observation, now: Date): string {
+  const fetched = Date.parse(observation.fetched_at);
+  if (!Number.isFinite(fetched)) return "invalid fetch time";
+  const ageSeconds = Math.max(0, (now.getTime() - fetched) / 1000);
+  const age = ageSeconds < 60 ? "<1m" : formatResetsIn(ageSeconds);
+  const staleReason = `last accepted reading ${age} ago`;
+  return observation.reason ? `${staleReason}; ${observation.reason}` : staleReason;
+}
+
 export function effectiveFreshness(observation: Observation, stalenessMinutes: number, now = new Date()): EffectiveFreshness {
-  // A daemon/store response has already made this decision alongside its
-  // last_known lookup. A renderer must not subsequently turn its fresh row
-  // stale, because it cannot also supply the promised last-known reading.
-  if (observation.status_enriched_at) return { freshness: observation.freshness, reason: observation.reason };
   // Match paceDecision's order: state and count observations have their own
   // policy states and never enter its timestamp age gate.
   if (observation.window?.kind === "state" || observation.window?.kind === "count") {
@@ -123,12 +135,22 @@ export function effectiveFreshness(observation: Observation, stalenessMinutes: n
   // renderer can present a timestamp it could not validate as fresh.
   if (!Number.isFinite(fetched)) return { freshness: "stale", reason: "invalid fetch time" };
   if (now.getTime() - fetched <= stalenessMinutes * 60_000) {
+    // A held vendor-window baseline (policy.ts's isHeldReading) is served
+    // stale immediately, at any age, matching paceDecision/freshnessGate: it
+    // must never be presented as fresh capacity while its identity is
+    // unconfirmed, not only once it also crosses stalenessMinutes. Its
+    // reason is left untouched here -- there is no age story to tell yet,
+    // and several renderers (browser-report, dashboard, status-view)
+    // already build their own held-specific note straight from the metadata
+    // flags. Once a held reading also ages past stalenessMinutes it falls
+    // through to the exact same age-phrase-plus-reason wording below that
+    // any other aged-out row gets -- heldWindowReason's fuller explanation
+    // is reserved for paceDecision/freshnessGate's own reason, which is what
+    // status text actually renders.
+    if (isHeldReading(observation)) return { freshness: "stale", reason: observation.reason };
     return { freshness: observation.freshness, reason: observation.reason };
   }
-  const ageSeconds = Math.max(0, (now.getTime() - fetched) / 1000);
-  const age = ageSeconds < 60 ? "<1m" : formatResetsIn(ageSeconds);
-  const staleReason = `last accepted reading ${age} ago`;
-  return { freshness: "stale", reason: observation.reason ? `${staleReason}; ${observation.reason}` : staleReason };
+  return { freshness: "stale", reason: agedFreshReason(observation, now) };
 }
 
 /** Applies effectiveFreshness without mutating stored-shaped inputs. Kept

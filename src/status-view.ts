@@ -18,7 +18,7 @@
  * and `--agent` as explicit overrides.
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
-import { statusDecisionTime, withEffectiveFreshness } from "./pace.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
@@ -224,7 +224,7 @@ export function formatMeters(observations: Observation[], policy: Policy, resetS
     const active = leases.get(meter) ?? [];
     const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
-      const decision = paceDecision(item, policy, statusDecisionTime(item, now));
+      const decision = paceDecision(item, policy, now);
       return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id), now);
     }).join(" | ")}  (${freshnessWord(ordered)} ${age(ordered[0], now)})${leaseLabel}`;
   });
@@ -514,7 +514,7 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
       const ordered = orderWindows(windows);
       const active = leases.get(meterId) ?? [];
       ordered.forEach((observation, index) => {
-        const decision = paceDecision(observation, policy, statusDecisionTime(observation, now));
+        const decision = paceDecision(observation, policy, now);
         const resetInfo = servedResetsIn(observation, now);
         const seconds = resetInfo.resets_in_seconds;
         const overdueText = formatOverdueReset(resetInfo);

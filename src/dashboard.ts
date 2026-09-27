@@ -6,7 +6,7 @@ import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
-import { statusDecisionTime, withEffectiveFreshness } from "./pace.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
@@ -19,7 +19,7 @@ export interface DashboardModel extends CachedDashboardModel {
 }
 
 function dashboardDecision(row: Observation, model: DashboardModel) {
-  return paceDecision(row, model.policy, statusDecisionTime(row, model.now));
+  return paceDecision(row, model.policy, model.now);
 }
 
 /** An older daemon can be alive without implementing the dashboard method. */

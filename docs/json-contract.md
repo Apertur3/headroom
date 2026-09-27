@@ -137,8 +137,13 @@ free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 credentials or prompt content). `metadata.vendor_inconsistent?: boolean` is
 `true` when adjacent vendor reads disagreed about the window identity; status
 then keeps showing the earlier window while Headroom waits for a second
-matching poll. Flagged raw rows remain available in history but do not affect
-burn or pace. `burn_percent_per_hour?: number | null`,
+matching poll. `metadata.vendor_window_held?: boolean` marks that same
+frozen earlier reading while a new window identity awaits confirmation.
+Either flag puts the pace state at UNKNOWN immediately -- at any age, not
+only once the reading has also aged past `staleness_minutes` -- everywhere a
+pace decision is made (`status`, `gate`, `fill`, `plan`, `route`, `can`, and
+`--threshold`). Flagged raw rows remain available in history but do not
+affect burn or pace. `burn_percent_per_hour?: number | null`,
 `empty_in_seconds?: number | null`, `sustainable_percent_per_hour?: number |
 null` (present once pace-enriched, which every `status`/`can`/`gate`/`rate`
 read is); `last_known?: { used_percent: number, resets_at: string | null,
@@ -158,11 +163,19 @@ names which window that is -- present only in this borrowed case, absent when
 `can`/`gate`/`route` keep treating UNKNOWN as no capacity regardless of what
 this carries); `id?: number` (present once read back from the store, as
 every `--json` reading is); `status_enriched_at?: string` (the response-time
-instant that set freshness, pace, last-known and reset fields; a renderer
-preserves an already-enriched payload rather than aging it again without the
-store-backed `last_known` lookup. A newer CLI or MCP server locally adds this
-marker and the matching fields when an older daemon returns an unmarked status
-array, using the current policy, before it serializes or evaluates the row).
+instant that most recently set freshness, pace, last-known and reset fields.
+This marker records when enrichment last ran, never a license to skip
+re-running it: every renderer re-evaluates freshness and pace against its
+own current serving clock on every render, whether or not a row already
+carries this marker, so a row served fresh at that instant but read again
+later -- a cached CLI payload, a long-lived dashboard -- is re-served
+UNKNOWN once it has since aged past `staleness_minutes`, with `last_known:
+null` rather than a store-backed lookup it cannot re-run. A newer CLI or MCP
+server locally adds this marker and the matching fields, from a read-only,
+non-migrating store lookup, when an older daemon returns an unmarked status
+array, using the current policy, before it serializes or evaluates the row;
+if that lookup is unavailable, enrichment still happens locally without
+history).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at

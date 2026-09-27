@@ -18,7 +18,7 @@
  */
 import { readPolicy } from "./config.js";
 import { rpc, socketPath } from "./daemon.js";
-import { statusDecisionTime, withEffectiveFreshness, withStatusInfo } from "./pace.js";
+import { withEffectiveFreshness, withStatusInfo } from "./pace.js";
 import { defaultPolicy, paceDecision, reserveFor, type Policy } from "./policy.js";
 import { readAccounts } from "./registry.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, type ResetsIn } from "./resets.js";
@@ -224,14 +224,14 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
   if (snapshot?.five_hour) {
     const reset = countdownFromEpoch(snapshot.five_hour.resets_at, now);
     const body = `5h ${percent(snapshot.five_hour.used_percent)}${resetTail(reset)}${burnTail(fiveRow, style)}`;
-    segments.push(segment(body, fiveRow ? paceDecision(fiveRow, policy, statusDecisionTime(fiveRow, now)).state : undefined, color, false));
+    segments.push(segment(body, fiveRow ? paceDecision(fiveRow, policy, now).state : undefined, color, false));
   }
   if (snapshot?.seven_day) {
     // The weekly countdown is a days-away figure that earns its width only in
     // full style; compact keeps the weekly segment to its percentage.
     const reset = style === "full" ? countdownFromEpoch(snapshot.seven_day.resets_at, now) : undefined;
     const body = `wk ${percent(snapshot.seven_day.used_percent)}${resetTail(reset)}${burnTail(weekRow, style)}`;
-    segments.push(segment(body, weekRow ? paceDecision(weekRow, policy, statusDecisionTime(weekRow, now)).state : undefined, color, false));
+    segments.push(segment(body, weekRow ? paceDecision(weekRow, policy, now).state : undefined, color, false));
   }
 
   // 2. The session principal's model-scoped meters (Fable, Routines, any
@@ -255,7 +255,7 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
     // when accounts.toml names no principal for this profile: the number is
     // exact either way, and only the pace state beside it needs a principal.
     if (!selected(options.meters, principal ? `${principal}:${name}` : name, principal ?? name, name)) continue;
-    segments.push(segment(`${name} ${percent(entry.used)}${burnTail(entry.row, style)}`, entry.row ? paceDecision(entry.row, policy, statusDecisionTime(entry.row, now)).state : undefined, color, true));
+    segments.push(segment(`${name} ${percent(entry.used)}${burnTail(entry.row, style)}`, entry.row ? paceDecision(entry.row, policy, now).state : undefined, color, true));
   }
 
   // 3. Every other principal Headroom knows about, most constrained first so
@@ -270,7 +270,7 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
     const row = decidingRow(list) ?? list[0];
     if (!row) continue;
     if (!selected(options.meters, row.meter_id, id, windowLabel(row.window?.minutes))) continue;
-    const state = paceDecision(row, policy, statusDecisionTime(row, now)).state;
+    const state = paceDecision(row, policy, now).state;
     if (!enforcedPercent(row)) {
       // A local pool (or a window with no percentage at all) has a state and
       // nothing to put a percentage on; its state is the whole reading, so it

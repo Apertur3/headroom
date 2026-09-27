@@ -49,24 +49,41 @@ function snapshotFrame(lines: string[]): string {
 }
 
 describe("dashboard frames (synthetic data)", () => {
-  it("distinguishes an unconfirmed new window from a confirmed vendor flip-flop", () => {
+  it("distinguishes an unconfirmed new window from a confirmed vendor flip-flop (verbose per-row note)", () => {
+    // Both flags now serve the held row UNKNOWN immediately (never capacity),
+    // so the compact overview collapses them into the same generic held
+    // reason; the distinguishing wording survives in the verbose per-row note.
     const model = fixedModel();
     model.observations = [row({ metadata: { vendor_window_held: true } })];
-    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: true, eventsWide: false, scroll: 0 }).join("\n"))
       .toContain("new window unconfirmed, holding");
 
     model.observations = [row({ metadata: { vendor_inconsistent: true } })];
-    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: true, eventsWide: false, scroll: 0 }).join("\n"))
       .toContain("vendor readings inconsistent, holding");
   });
 
-  it("keeps an already-enriched daemon row on its original response clock", () => {
+  it("serves a held row as UNKNOWN immediately, at any age, in the compact overview", () => {
+    const model = fixedModel();
+    model.observations = [row({ metadata: { vendor_window_held: true } })];
+    const frame = renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n");
+    expect(frame).toContain("UNKNOWN");
+    expect(frame).toContain("held window past reset, unconfirmed");
+    expect(frame).not.toMatch(/\bNORMAL\b|\bHARVEST\b/);
+  });
+
+  it("re-ages an already-enriched daemon row instead of trusting its stale marker forever", () => {
     const model = fixedModel();
     model.now = new Date(now.getTime() + 60 * 60_000);
     model.observations = [row({ status_enriched_at: now.toISOString(), last_known: null })];
     const frame = renderDashboard(model, { width: 100, height: 20, verbose: false, eventsWide: false }).join("\n");
-    expect(frame).not.toContain("UNKNOWN");
-    expect(frame).toContain("20%");
+    // Re-evaluated against the current serving clock, this row is now stale
+    // (its fetch is 1h old against a 15m default staleness), so it must be
+    // served UNKNOWN -- its own 20% reading may still appear as an explicitly
+    // labelled "last" reference, never as the live capacity figure.
+    expect(frame).toContain("UNKNOWN");
+    expect(frame).toContain("last 20% at");
+    expect(frame).not.toMatch(/\bNORMAL\b|\bHARVEST\b/);
   });
 
   it("renders an overdue response field as an overdue age, never the compatibility 0m", () => {

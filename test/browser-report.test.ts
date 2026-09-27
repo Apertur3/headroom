@@ -223,14 +223,14 @@ describe("browser report pure renderer", () => {
     expect(html).not.toContain("NaN");
   });
 
-  it("preserves an already-enriched daemon row instead of re-aging it without last_known", () => {
+  it("re-ages an already-enriched daemon row instead of trusting its stale marker forever", () => {
     const model = sampleModel({
       now: new Date(fixedNow.getTime() + 60 * 60_000),
       observations: [sampleObservation({ status_enriched_at: fixedNow.toISOString(), last_known: null })],
     });
     const html = renderBrowserReport(model);
-    expect(html).toContain("<strong>20%</strong> used");
-    expect(html).not.toContain("Reading is stale");
+    expect(html).not.toContain("<strong>20%</strong> used");
+    expect(html).toContain("Reading is stale");
   });
 
   it("renders an overdue response field as an overdue age, never 0m", () => {

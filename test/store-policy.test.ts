@@ -3,7 +3,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
+import { canConsume, canRouteWithLeases, defaultPolicy, freshnessGate, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
+import { withEffectiveFreshness } from "../src/pace.js";
 import { HeadroomStore } from "../src/store.js";
 import { endedLeaseMessage, formatMeters, printEventsOutput, thresholdReport } from "../src/cli.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason } from "../src/engine/observation.js";
@@ -809,6 +810,50 @@ describe("pace and consumes", () => {
     // An ordinary aged-out reading with neither flag keeps the plain wording.
     const plain = paced(0, { freshness: "fresh", fetched_at: "2026-09-03T09:00:00Z" });
     expect(paceDecision(plain, policy, now).reason).toBe("stale 180m; next poll time unknown");
+  });
+
+  // A held reading must never be capacity, at ANY age -- not only once it
+  // also crosses staleness_minutes. Before this was fixed, a fresh poll
+  // carrying vendor_window_held/vendor_inconsistent sailed straight through
+  // paceDecision/freshnessGate as ordinary capacity until it happened to age
+  // out, letting the CLI threshold gate and canConsume/`can` both admit an
+  // explicitly unconfirmed reading.
+  it("treats a recent held reading as UNKNOWN immediately, at any age -- never capacity", () => {
+    const recentHeld = paced(50, { metadata: { vendor_window_held: true } }); // age 0m
+    const decision = paceDecision(recentHeld, policy, now);
+    expect(decision.state).toBe("UNKNOWN");
+    expect(decision.reason).toMatch(/^held window past reset, unconfirmed \(0m since the last accepted reading\)/);
+
+    const recentInconsistent = paced(50, { metadata: { vendor_inconsistent: true } });
+    expect(paceDecision(recentInconsistent, policy, now).state).toBe("UNKNOWN");
+
+    // A recent, non-held reading at the same age is unaffected -- it is the
+    // metadata flag that matters here, not merely having just been polled.
+    expect(paceState(paced(50), policy, now)).not.toBe("UNKNOWN");
+  });
+
+  it("fails freshnessGate closed on a held reading immediately, at any age", () => {
+    const recentHeld = paced(50, { metadata: { vendor_window_held: true } });
+    const outcome = freshnessGate(recentHeld, policy.staleness_minutes, now);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toMatch(/^held window past reset, unconfirmed \(0m since the last accepted reading\)/);
+
+    // An ordinary fresh, recent reading with no hold still passes.
+    expect(freshnessGate(paced(50), policy.staleness_minutes, now).ok).toBe(true);
+  });
+
+  it("serves a recent held reading as blocking in the CLI --threshold report, not just once it ages out", () => {
+    const recentHeld = paced(50, { meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, metadata: { vendor_window_held: true } });
+    const served = withEffectiveFreshness([recentHeld], policy.staleness_minutes, now);
+    const [report] = thresholdReport(served, 90);
+    expect(report).toMatchObject({ meter_id: "claude-main:all", crossed: false, blocking: true, freshness: "stale" });
+  });
+
+  it("fails a recent held reading closed in canConsume (the raw path `can` uses), never allowing capacity", () => {
+    const recentHeld = paced(10, { meter_id: "claude-main:all", metadata: { vendor_window_held: true } });
+    const decision = canConsume([recentHeld.meter_id], new Map([[recentHeld.meter_id, recentHeld]]), policy, false, now);
+    expect(decision.allowed).toBe(false);
+    expect(decision.state).toBe("UNKNOWN");
   });
 
   it("holds pace at NORMAL for the early grace period unless frozen", () => {

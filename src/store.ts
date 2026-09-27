@@ -51,7 +51,7 @@ interface Database {
   prepare(sql: string): { run(...params: unknown[]): { lastInsertRowid: number | bigint }; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] };
   close(): void;
 }
-type DatabaseConstructor = new (path: string) => Database;
+type DatabaseConstructor = new (path: string, options?: { readOnly?: boolean }) => Database;
 // Node 26 ships SQLite. createRequire keeps Vitest/Vite from trying to resolve
 // this built-in as a browser module while preserving a dependency-free runtime.
 const DatabaseSync = (createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: DatabaseConstructor }).DatabaseSync;
@@ -265,6 +265,26 @@ export class HeadroomStore {
       try { await chmod(candidate, 0o600); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     return store;
+  }
+
+  /**
+   * Read-only, non-migrating open for compatibility lookups only (currently
+   * status-normalization.ts's older-daemon path). `open()` always runs schema
+   * migrations and data repairs (migrate(), mergePriorDatabase(),
+   * normalizeExhaustedReportExpiry(), even the WAL journal-mode PRAGMA) --
+   * fine for the daemon or a CLI that owns the database, but a newer CLI
+   * reading alongside an OLDER daemon that is still running against this
+   * file must never upgrade its schema out from under it. This connection
+   * skips every one of those steps and SQLite itself refuses any write
+   * against it. It never creates a missing file either: same as any other
+   * read-only failure, a caller here must fail closed rather than fall back
+   * to a writable open.
+   */
+  static async openReadOnly(home?: string): Promise<HeadroomStore> {
+    const path = await safeDatabasePath(home);
+    const db = new DatabaseSync(path, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 5000;");
+    return new HeadroomStore(db, path);
   }
 
   close(): void { this.db.close(); }

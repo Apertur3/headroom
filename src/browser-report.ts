@@ -1,7 +1,7 @@
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { gatherDashboard, type DashboardModel } from "./dashboard.js";
-import { statusDecisionTime, withEffectiveFreshness } from "./pace.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { redact, writeFileAtomic } from "./security.js";
@@ -229,7 +229,7 @@ export function splitSegments(points: ProcessedPoint[], maxGapMs = 15 * 60_000):
 export function processWindow(row: Observation, model: DashboardModel, now: Date): ProcessedWindow {
   const is_local = row.window?.kind === "state" || row.metadata?.state !== undefined;
   const is_credits = row.quantity?.unit === "credits" || row.window?.kind === "count";
-  const decision = paceDecision(row, model.policy, statusDecisionTime(row, now));
+  const decision = paceDecision(row, model.policy, now);
 
   const is_held_or_untrustworthy = Boolean(
     row.metadata?.vendor_window_held ||

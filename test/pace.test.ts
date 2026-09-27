@@ -173,6 +173,24 @@ describe("effectiveFreshness", () => {
     });
   });
 
+  it("serves a held row (recent, well inside the staleness window) as stale immediately -- never capacity", () => {
+    // Inside stalenessMinutes there is no age story to tell yet, so the
+    // reason passes through unchanged; a renderer that wants held-specific
+    // wording (browser-report, dashboard, status-view) builds it straight
+    // from the metadata flags instead of this field.
+    const row = observation({
+      fetched_at: "2026-09-03T11:59:00Z", metadata: { vendor_window_held: true }, reason: "new window unconfirmed, holding",
+    });
+    expect(effectiveFreshness(row, 15, now)).toEqual({
+      freshness: "stale", reason: "new window unconfirmed, holding",
+    });
+  });
+
+  it("serves a vendor_inconsistent row as stale immediately too", () => {
+    const row = observation({ fetched_at: "2026-09-03T11:59:00Z", metadata: { vendor_inconsistent: true } });
+    expect(effectiveFreshness(row, 15, now).freshness).toBe("stale");
+  });
+
   it("passes through stored stale, failed and not_enforced rows", () => {
     for (const freshness of ["stale", "failed", "not_enforced"] as const) {
       const row = observation({ freshness, reason: `${freshness} reason`, fetched_at: "2026-08-01T12:00:00Z" });
