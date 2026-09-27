@@ -95,8 +95,8 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
     // exercised for real here rather than assumed.
     const [command, args] = agyPtyCommand(fakeAgy, process.platform);
     const rootChild = spawn(command, args, { stdio: "ignore", detached: true });
-    const rootPid = track(rootChild.pid) as number;
-    const childPid = track(Number(await waitForFile(infoFile))) as number;
+    const rootPid = track(rootChild.pid, root) as number;
+    const childPid = track(Number(await waitForFile(infoFile)), root) as number;
     expect(alive(childPid)).toBe(true);
     expect(childPid).not.toBe(rootPid); // the PTY child, not `script` itself
 
@@ -121,8 +121,8 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
     const fakeAgy = await writeFakeAgy(root, infoFile);
     const [command, args] = agyPtyCommand(fakeAgy, process.platform);
     const rootChild = spawn(command, args, { stdio: "ignore", detached: true });
-    const rootPid = track(rootChild.pid) as number;
-    const childPid = track(Number(await waitForFile(infoFile))) as number;
+    const rootPid = track(rootChild.pid, root) as number;
+    const childPid = track(Number(await waitForFile(infoFile)), root) as number;
 
     process.kill(rootPid, "SIGTERM"); // exactly what the old `child.kill("SIGTERM")` did
     await waitUntilDead(rootPid); // script itself is gone
@@ -139,7 +139,7 @@ describe.skipIf(process.platform === "win32")("killTree (real processes)", () =>
     const root = await mkdtemp(join(tmpdir(), "headroom-killtree-grace-")); temporary.push(root);
     const script = await writeMortalShim(join(root, "stubborn"), { ignoreTerm: true });
     const child = spawn(script, [], { stdio: "ignore", detached: true });
-    const pid = track(child.pid) as number;
+    const pid = track(child.pid, root) as number;
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(alive(pid)).toBe(true);
 
@@ -154,7 +154,7 @@ describe.skipIf(process.platform === "win32")("processSignature", () => {
     temporary.push(root);
     const script = await writeMortalShim(join(root, "sleeper"));
     const child = spawn(script, [], { stdio: "ignore", detached: true });
-    const pid = track(child.pid) as number;
+    const pid = track(child.pid, root) as number;
     try {
       await new Promise((resolve) => setTimeout(resolve, 50));
       const first = await processSignature(pid);

@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgyKeepaliveSupervisor, keepaliveStateFilePath, sweepPreviousKeepalive } from "../src/antigravity-keepalive.js";
 import { killTree, processSignature } from "../src/process-tree.js";
-import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
 const temporary: string[] = [];
 useProcessReaper();
@@ -41,8 +42,8 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
     });
     try {
       supervisor.start();
-      const agyPid = track(Number(await waitForFile(infoFile))) as number;
-      const scriptPid = track(supervisor.pid);
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      const scriptPid = track(supervisor.pid, root);
       expect(scriptPid).toBeDefined();
       expect(agyPid).not.toBe(scriptPid); // agy is a distinct process, not script itself
       expect(alive(agyPid)).toBe(true);
@@ -62,7 +63,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
     const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
     try {
       supervisor.start();
-      track(Number(await waitForFile(infoFile))); track(supervisor.pid);
+      track(Number(await waitForFile(infoFile)), root); track(supervisor.pid, root);
       await vi.waitFor(async () => {
         await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
       }, { timeout: 3_000, interval: 20 });
@@ -74,34 +75,52 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
   }, 15_000);
 });
 
+/** Runs `body` with a `ps` on PATH that always fails, the way a sandbox that
+ * denies the process table behaves, then restores PATH. */
+async function withoutPs<T>(root: string, body: () => Promise<T>): Promise<T> {
+  const bin = join(root, "no-ps-bin");
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, "ps"), "#!/bin/sh\necho 'ps: denied' >&2\nexit 1\n", { mode: 0o700 });
+  const previous = process.env.PATH;
+  process.env.PATH = `${bin}:${previous ?? ""}`;
+  try { return await body(); } finally { process.env.PATH = previous; }
+}
+
 describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leaves agy behind (product paths)", () => {
-  it("stop() still reaps agy when the tree walk finds nothing (a host that denies ps)", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-agy-nops-")); temporary.push(root);
+  it("learns agy's pid from the launch wrapper, without ps", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-pidfile-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
-    const walkedNothing: number[] = [];
-    const supervisor = new AgyKeepaliveSupervisor({
-      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100,
-      // Signals only the root, like killTree with an empty ps listing: script
-      // dies, agy (its own session leader, ignoring TERM/HUP) would survive.
-      killTree: async (pid) => { walkedNothing.push(pid); try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } },
-    });
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
     try {
       supervisor.start();
-      const agyPid = track(Number(await waitForFile(infoFile))) as number;
-      track(supervisor.pid);
-      await vi.waitFor(async () => {
-        expect(JSON.parse(await readFile(keepaliveStateFilePath(root), "utf8")).agyPid).toBe(agyPid);
-      }, { timeout: 3_000, interval: 20 });
-
-      await supervisor.stop();
-
-      expect(walkedNothing).toHaveLength(1);
-      await waitUntilDead(agyPid);
+      track(supervisor.pid, root);
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      // exec keeps the wrapper's pid, so the file the supervisor reads holds agy's own pid
+      expect(Number(await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`))).toBe(agyPid);
     } finally { await supervisor.stop(); }
   }, 15_000);
 
-  it("reaps agy when script dies on its own, before any restart", async () => {
+  it("stop() reaps agy when ps is denied from launch through stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-nops-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, killGraceMs: 100, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
+    try {
+      await withoutPs(root, async () => {
+        supervisor.start();
+        track(supervisor.pid, root);
+        const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+        await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+
+        await supervisor.stop();
+
+        await waitUntilDead(agyPid);
+      });
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("reaps agy when script dies on its own, before any restart, with ps denied", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-scriptdied-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -109,17 +128,41 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leav
       binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 60_000,
     });
     try {
+      await withoutPs(root, async () => {
+        supervisor.start();
+        const scriptPid = track(supervisor.pid, root) as number;
+        const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+        await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+
+        process.kill(scriptPid, "SIGKILL"); // external kill of script only: agy is orphaned
+
+        await waitUntilDead(scriptPid);
+        await waitUntilDead(agyPid);
+      });
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("never signals a pid it cannot prove is agy (stale pid file after script is gone)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stranger-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+    const strangerPid = track(stranger.pid, root) as number;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 60_000,
+    });
+    try {
       supervisor.start();
-      const agyPid = track(Number(await waitForFile(infoFile))) as number;
-      const scriptPid = track(supervisor.pid) as number;
-      await vi.waitFor(async () => {
-        expect(JSON.parse(await readFile(keepaliveStateFilePath(root), "utf8")).agyPid).toBe(agyPid);
-      }, { timeout: 3_000, interval: 20 });
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      process.kill(scriptPid, "SIGKILL");
+      await waitUntilDead(agyPid); // the exit handler reaped the real agy
+      // Pretend the pid file now names a recycled pid owned by someone else.
+      await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, String(strangerPid));
 
-      process.kill(scriptPid, "SIGKILL"); // external kill of script only: agy is orphaned
+      await supervisor.stop(); // script is already gone: nothing proves the pid, so nothing is signalled
 
-      await waitUntilDead(scriptPid);
-      await waitUntilDead(agyPid);
+      expect(alive(strangerPid)).toBe(true);
     } finally { await supervisor.stop(); }
   }, 15_000);
 });
@@ -132,8 +175,8 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: records s
     const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
     try {
       supervisor.start();
-      const agyPid = track(Number(await waitForFile(infoFile))) as number;
-      const scriptPid = track(supervisor.pid);
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      const scriptPid = track(supervisor.pid, root);
 
       let state: { scriptPid?: number; agyPid?: number; scriptCommand?: string; agyCommand?: string } = {};
       await vi.waitFor(async () => {
@@ -158,8 +201,8 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
     let agyPid: number | undefined;
     try {
       supervisor.start();
-      agyPid = track(Number(await waitForFile(infoFile))) as number;
-      scriptPid = track(supervisor.pid);
+      agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      scriptPid = track(supervisor.pid, root);
       // Simulate a crash: the daemon process is gone without ever calling
       // stop(), so both processes are still alive and never signalled --
       // only the state file launch() already wrote survives.
@@ -191,7 +234,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
     const fakeAgy = await writeFakeAgy(root, infoFile);
     const { spawn } = await import("node:child_process");
     const child = spawn(fakeAgy, [], { stdio: "ignore", detached: true });
-    const pid = track(child.pid) as number;
+    const pid = track(child.pid, root) as number;
     try {
       await waitForFile(infoFile);
       const signature = await vi.waitFor(async () => {

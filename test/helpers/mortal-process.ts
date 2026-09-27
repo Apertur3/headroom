@@ -1,7 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach } from "vitest";
-import { descendantsOf, listProcesses } from "../../src/process-tree.js";
 
 /**
  * Real-process test fixtures, built so a test can never leave one running.
@@ -17,8 +17,9 @@ import { descendantsOf, listProcesses } from "../../src/process-tree.js";
  *    `lifetimeSeconds`, whatever happens to the runner (crash, SIGKILL, a
  *    sandbox where `ps` and `kill` are denied).
  * 2. Reaped by the test: `useProcessReaper()` registers an afterEach that
- *    SIGKILLs every tracked pid, its process group and every descendant `ps`
- *    can still see, then waits until each tracked pid is gone.
+ *    SIGKILLs every tracked pid, its process group and its descendants, after
+ *    checking each one's live command line still names the fixture (so a
+ *    recycled pid is never touched), then waits until they are gone.
  *
  * test/global-leak-gate.ts is the third, suite-level defence: it fails the
  * whole run if anything started under the run's temp directory survives it.
@@ -48,11 +49,15 @@ export function writeFakeAgy(root: string, pidFile: string): Promise<string> {
   return writeMortalShim(join(root, "agy"), { pidFile, ignoreTerm: true });
 }
 
-const tracked = new Set<number>();
+interface Tracked { pid: number; needle: string; at: number }
+const tracked = new Map<number, Tracked>();
 
-/** Register a pid this test started (or discovered) for the afterEach reaper. */
-export function track(pid: number | undefined): number | undefined {
-  if (typeof pid === "number" && pid > 1 && pid !== process.pid) tracked.add(pid);
+/** Register a process this test started (or discovered) for the afterEach
+ * reaper. `needle` is a string its live command line must contain before the
+ * reaper will signal it, normally the fixture's temp directory: a pid whose
+ * command no longer matches has been recycled and is left alone. */
+export function track(pid: number | undefined, needle: string): number | undefined {
+  if (typeof pid === "number" && pid > 1 && pid !== process.pid) tracked.set(pid, { pid, needle, at: Date.now() });
   return pid;
 }
 
@@ -65,21 +70,59 @@ function sigkill(pid: number): void {
   if (process.platform !== "win32") { try { process.kill(-pid, "SIGKILL"); } catch { /* not a group leader */ } }
 }
 
-/** SIGKILL every tracked pid, its group and its live descendants, then wait
- * (bounded) until each tracked pid is gone. Descendants are collected before
- * any signal is sent, so a child reparented to init by its parent's death is
- * still reached. Returns the pids that were still alive when reaping began. */
-export async function reapTracked(timeoutMs = 3_000): Promise<number[]> {
-  const pids = [...tracked]; tracked.clear();
-  if (!pids.length) return [];
-  const snapshot = process.platform === "win32" ? [] : await listProcesses();
-  const targets = new Set(pids);
-  for (const pid of pids) for (const entry of descendantsOf(pid, snapshot)) targets.add(entry.pid);
-  const survivors = [...targets].filter(alive);
-  for (const pid of survivors) sigkill(pid);
+/** pid -> {ppid, full command line}, or undefined when `ps` is unavailable. */
+function processTable(): Map<number, { ppid: number; command: string }> | undefined {
+  if (process.platform === "win32") return undefined;
+  try {
+    const stdout = execFileSync("ps", ["-Ao", "pid=,ppid=,command="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    const table = new Map<number, { ppid: number; command: string }>();
+    for (const line of stdout.split("\n")) {
+      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      if (match) table.set(Number(match[1]), { ppid: Number(match[2]), command: match[3] });
+    }
+    return table;
+  } catch { return undefined; }
+}
+
+/** Shims live SHIM_LIFETIME_SECONDS; a pid tracked more recently than this
+ * cannot have exited naturally and been handed to a stranger yet. Only used
+ * when `ps` is unavailable and identity cannot be checked directly. */
+const UNVERIFIED_KILL_WINDOW_MS = (SHIM_LIFETIME_SECONDS - 5) * 1_000;
+
+/**
+ * SIGKILL every tracked process (and its group) plus every live descendant
+ * whose command carries the same needle, then wait until they are gone.
+ * With `ps`, a pid is signalled only while its command still contains its
+ * needle. Without `ps` (a sandbox), a tracked pid is signalled only inside
+ * UNVERIFIED_KILL_WINDOW_MS; anything older is left to its own lifetime.
+ * Throws if a verified fixture is still alive afterwards.
+ */
+export async function reapTracked(timeoutMs = 3_000): Promise<void> {
+  const entries = [...tracked.values()]; tracked.clear();
+  if (!entries.length) return;
+  const table = processTable();
+  const targets = new Map<number, string>();
+  if (table) {
+    const children = new Map<number, number[]>();
+    for (const [pid, row] of table) children.set(row.ppid, [...(children.get(row.ppid) ?? []), pid]);
+    for (const entry of entries) {
+      const queue = [entry.pid];
+      while (queue.length) {
+        const pid = queue.shift() as number;
+        const row = table.get(pid);
+        if (row && row.command.includes(entry.needle) && !targets.has(pid)) targets.set(pid, entry.needle);
+        queue.push(...(children.get(pid) ?? []));
+      }
+    }
+  } else {
+    for (const entry of entries) if (Date.now() - entry.at < UNVERIFIED_KILL_WINDOW_MS) targets.set(entry.pid, entry.needle);
+  }
+  const live = [...targets.keys()].filter(alive);
+  for (const pid of live) sigkill(pid);
   const deadline = Date.now() + timeoutMs;
-  while (survivors.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
-  return survivors;
+  while (live.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  const survivors = live.filter(alive);
+  if (survivors.length && table) throw new Error(`test fixtures still alive after SIGKILL: ${survivors.join(", ")}`);
 }
 
 /** Call once at the top of a test file that starts real processes. */
