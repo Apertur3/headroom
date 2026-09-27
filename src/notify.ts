@@ -612,7 +612,11 @@ function eventItem(store: HeadroomStore, event: HeadroomEvent, evidence: Observa
   const resetsAt = event.metadata?.resets_at ?? current?.resets_at;
   const window = event.meter_id && minutes ? store.windowKey(event.meter_id, minutes, resetsAt) : undefined;
   const planStage = event.kind === "plan_changed" ? event.metadata?.downgrade ? "downgrade" : event.metadata?.restored ? "restored" : "changed" : undefined;
-  const identity = `${event.kind}:${event.meter_id ?? event.principal_id ?? "none"}:${window ?? "none"}${planStage ? `:${planStage}` : ""}`;
+  // Catalog facts have no meter/window. Include the model id so two models
+  // introduced to one principal in consecutive hourly checks do not trip the
+  // six-hour same-message safety guard.
+  const modelId = event.kind === "model_available" || event.kind === "model_retired" ? event.metadata?.model_id ?? event.reason ?? "unknown" : undefined;
+  const identity = `${event.kind}:${event.meter_id ?? event.principal_id ?? "none"}:${window ?? "none"}${planStage ? `:${planStage}` : ""}${modelId ? `:${modelId}` : ""}`;
   // A plan transition without a vendor reset is not a windowed alert: its
   // event identity must preserve a later restoration as a distinct message.
   const id = event.meter_id && minutes && resetsAt ? `${event.kind}:${window}${planStage ? `:${planStage}` : ""}` : event.id;

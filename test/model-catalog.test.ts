@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  checkModelAvailability, fetchAntigravityModelCatalog, MODEL_CHECK_INTERVAL_MS,
+  checkModelAvailability, fetchAntigravityModelCatalog, MODEL_CATALOG_MAX_AGE_MS, MODEL_CHECK_INTERVAL_MS,
   readClaudeModelCatalog, readCodexModelCatalog,
 } from "../src/model-catalog.js";
 import { HeadroomStore } from "../src/store.js";
@@ -21,6 +21,7 @@ async function tempDir(prefix: string): Promise<string> {
 describe("Codex model catalog reader (local cache file, no network)", () => {
   it("reads slug and display_name out of $CODEX_HOME/models_cache.json, dropping hidden entries", async () => {
     const home = await tempDir("headroom-codex-models-");
+    const at = new Date("2026-09-23T18:00:00Z");
     await writeFile(join(home, "models_cache.json"), JSON.stringify({
       fetched_at: "2026-09-23T17:20:36Z",
       models: [
@@ -29,7 +30,7 @@ describe("Codex model catalog reader (local cache file, no network)", () => {
         { slug: "codex-auto-review", display_name: "Codex Auto Review", visibility: "hide" },
       ],
     }));
-    const models = await readCodexModelCatalog(home);
+    const models = await readCodexModelCatalog(home, undefined, at);
     expect(models).toEqual([{ id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" }]);
   });
 
@@ -43,35 +44,55 @@ describe("Codex model catalog reader (local cache file, no network)", () => {
     await writeFile(join(home, "models_cache.json"), "{not json");
     expect(await readCodexModelCatalog(home)).toBeUndefined();
   });
+
+  it("does not treat a stale or timestamp-less cache as a current catalog", async () => {
+    const home = await tempDir("headroom-codex-models-stale-");
+    const at = new Date("2026-09-23T18:00:00Z");
+    await writeFile(join(home, "models_cache.json"), JSON.stringify({ fetched_at: new Date(at.getTime() - MODEL_CATALOG_MAX_AGE_MS - 1).toISOString(), models: [{ slug: "gpt-6-astra" }] }));
+    expect(await readCodexModelCatalog(home, undefined, at)).toBeUndefined();
+    await writeFile(join(home, "models_cache.json"), JSON.stringify({ models: [{ slug: "gpt-6-astra" }] }));
+    expect(await readCodexModelCatalog(home, undefined, at)).toBeUndefined();
+  });
 });
 
 describe("Claude model catalog reader (local cache directory, no network)", () => {
   it("reads the newest-by-fetchedAt file under cache/model-catalog and maps its models", async () => {
     const configDir = await tempDir("headroom-claude-models-");
     const catalogDir = join(configDir, "cache", "model-catalog");
+    const at = new Date("2026-09-23T18:00:00Z");
     await mkdir(catalogDir, { recursive: true });
     await writeFile(join(catalogDir, "tok-old.json"), JSON.stringify({
-      fetchedAt: 1000, catalog: { config: { models: [{ id: "claude-sonnet-4-6", name: "Sonnet 4.6" }] } },
+      fetchedAt: at.getTime() - 2000, catalog: { config: { models: [{ id: "claude-sonnet-4-6", name: "Sonnet 4.6" }] } },
     }));
     await writeFile(join(catalogDir, "tok-new.json"), JSON.stringify({
-      fetchedAt: 2000, catalog: { config: { models: [{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }] } },
+      fetchedAt: at.getTime() - 1000, catalog: { config: { models: [{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }] } },
     }));
-    const models = await readClaudeModelCatalog(configDir);
+    const models = await readClaudeModelCatalog(configDir, undefined, undefined, at);
     expect(models).toEqual([{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }]);
   });
 
   it("skips one malformed cache file rather than failing the whole read", async () => {
     const configDir = await tempDir("headroom-claude-models-partial-");
     const catalogDir = join(configDir, "cache", "model-catalog");
+    const at = new Date("2026-09-23T18:00:00Z");
     await mkdir(catalogDir, { recursive: true });
     await writeFile(join(catalogDir, "broken.json"), "{not json");
-    await writeFile(join(catalogDir, "good.json"), JSON.stringify({ fetchedAt: 1, catalog: { config: { models: [{ id: "claude-haiku-4-5", name: "Haiku 4.5" }] } } }));
-    expect(await readClaudeModelCatalog(configDir)).toEqual([{ id: "claude-haiku-4-5", name: "Haiku 4.5" }]);
+    await writeFile(join(catalogDir, "good.json"), JSON.stringify({ fetchedAt: at.getTime(), catalog: { config: { models: [{ id: "claude-haiku-4-5", name: "Haiku 4.5" }] } } }));
+    expect(await readClaudeModelCatalog(configDir, undefined, undefined, at)).toEqual([{ id: "claude-haiku-4-5", name: "Haiku 4.5" }]);
   });
 
   it("returns undefined when the config dir has no model-catalog cache yet", async () => {
     const configDir = await tempDir("headroom-claude-models-none-");
     expect(await readClaudeModelCatalog(configDir)).toBeUndefined();
+  });
+
+  it("rejects an arbitrarily old newest file instead of stamping it as seen now", async () => {
+    const configDir = await tempDir("headroom-claude-models-stale-");
+    const catalogDir = join(configDir, "cache", "model-catalog");
+    const at = new Date("2026-09-23T18:00:00Z");
+    await mkdir(catalogDir, { recursive: true });
+    await writeFile(join(catalogDir, "old.json"), JSON.stringify({ fetchedAt: at.getTime() - MODEL_CATALOG_MAX_AGE_MS - 1, catalog: { config: { models: [{ id: "claude-opus-5-5" }] } } }));
+    expect(await readClaudeModelCatalog(configDir, undefined, undefined, at)).toBeUndefined();
   });
 });
 
@@ -110,6 +131,18 @@ describe("Antigravity model catalog reader (fetchAvailableModels, same credentia
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({})))
       .mockResolvedValueOnce(new Response("{}", { status: 500 }));
+    const models = await fetchAntigravityModelCatalog({
+      now: () => at, credentialPaths: () => ["gemini-oauth"],
+      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z", project: "stored-project" }),
+      fetch,
+    });
+    expect(models).toBeUndefined();
+  });
+
+  it("does not retire models from a 200 response with an invalid catalog body", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ unexpected: "shape" })));
     const models = await fetchAntigravityModelCatalog({
       now: () => at, credentialPaths: () => ["gemini-oauth"],
       readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z", project: "stored-project" }),
@@ -183,6 +216,23 @@ describe("checkModelAvailability orchestration", () => {
       const soon = new Date(at.getTime() + 60_000);
       await checkModelAvailability(store, accounts, { now: () => soon, readCodexModelCatalog: readCodex });
       expect(readCodex).toHaveBeenCalledTimes(1); // throttled even though the first attempt failed
+    } finally { store.close(); }
+  });
+
+  it("claims the interval before awaiting a reader, so overlapping checks make one catalog read", async () => {
+    const home = await tempDir("headroom-model-check-overlap-");
+    const store = await HeadroomStore.open(join(home, ".headroom"));
+    try {
+      const at = new Date("2026-09-23T18:00:00Z");
+      let release: ((models: { id: string; name: string }[]) => void) | undefined;
+      const readCodex = vi.fn(() => new Promise<{ id: string; name: string }[]>((resolve) => { release = resolve; }));
+      const accounts = [account("codex-main", "codex")];
+      const first = checkModelAvailability(store, accounts, { now: () => at, readCodexModelCatalog: readCodex });
+      await Promise.resolve();
+      await checkModelAvailability(store, accounts, { now: () => at, readCodexModelCatalog: readCodex });
+      expect(readCodex).toHaveBeenCalledTimes(1);
+      release?.([{ id: "gpt-6-astra", name: "GPT-6-Astra" }]);
+      await first;
     } finally { store.close(); }
   });
 });

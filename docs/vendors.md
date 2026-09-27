@@ -151,9 +151,11 @@ Claude Code caches its own model catalog locally, one file per OAuth token it ha
 Headroom reads every file in that directory, keeps the newest by its own `fetchedAt` timestamp
 (a profile accumulates one file per token as the CLI's access token rotates, but every file under
 one config dir belongs to the same principal), and reads `catalog.config.models[].id`/`.name` out
-of it -- no network call, no new credential. A config dir with no cache yet (Claude Code never run,
-or run only with an older version) reports no model catalog for that principal; the feature does
-not fail the ordinary quota read.
+of it -- no network call, no new credential. Headroom accepts only a valid timestamp no more than
+24 hours old (with five minutes of clock skew); a stale, future, malformed, or missing timestamp
+reports no model catalog and leaves known-model state untouched. A config dir with no cache yet
+(Claude Code never run, or run only with an older version) behaves the same; the feature does not
+fail the ordinary quota read.
 
 ## Codex
 
@@ -202,7 +204,9 @@ The installed Codex CLI keeps its own local model-list cache at `$CODEX_HOME/mod
 (default `~/.codex/models_cache.json`), refreshed by ordinary CLI use. Headroom reads it directly
 -- no network call, no new credential -- for the `slug`/`display_name` of every entry whose
 `visibility` is not `"hide"` (the CLI's own internal/test models). A `CODEX_HOME` with no cache
-file yet reports no model catalog for that principal.
+file yet reports no model catalog for that principal. Its `fetched_at` must be a valid timestamp
+no more than 24 hours old (with five minutes of clock skew); an old or malformed cache is
+unavailable rather than evidence that its models remain available.
 
 ## Antigravity
 
@@ -269,6 +273,8 @@ no new credential type, no new host. That credential is the Gemini CLI's own OAu
 (`~/.gemini/oauth_creds.json`); an install that discovered its `antigravity` account purely from
 `agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
 no model catalog for that principal (never a failure of the ordinary quota read).
+An HTTP success without the expected `models` object is likewise unavailable, not an authoritative
+empty catalog, so it cannot retire known models.
 The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
 (UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
 

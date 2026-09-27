@@ -92,6 +92,12 @@ describe("phone notification text", () => {
     expect(thresholdText({ ...observation, principal_id: "codex", meter_id: "codex:main", fetched_at: new Date(2026, 8, 8, 10, 8).toISOString(), resets_at: new Date(2026, 8, 10, 15, 8).toISOString(), quantity: { used: 90.3, remaining: 9.7, limit: 100, unit: "percent" } }, 90)).toBe("🔥 Threshold\nCodex weekly crossed 90% (now 90%); resets Sep 10 15:08, in 2d 5h.\nCONSERVE until then.");
   });
 
+  it("labels an unknown model-meter relationship without implying capacity", () => {
+    expect(eventText(event("model_available", {
+      reason: "claude-fable-5", metadata: { model_id: "claude-fable-5", model_name: "Fable 5" },
+    }))).toContain("no dedicated meter observed");
+  });
+
   it("does not invent a percentage for old events without evidence or leak multiline markup", () => {
     expect(eventText(event("reset_seen"))).not.toContain("0%");
     expect(eventText(event("source_failed", { reason: "403\nAuthorization: Bearer synthetic-secret" }))).toBe("⚠️ Source failed\nClaude main has not answered (403).\nRows read UNKNOWN until it recovers.");

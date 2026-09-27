@@ -3,9 +3,9 @@
     "first_seen_at": "string",
     "last_seen_at": "string",
     "model_id": "string",
-    "model_name": "string",
+    "model_name": "null | string",
     "principal_id": "string",
-    "retired_at": "null",
+    "retired_at": "null | string",
     "vendor": "string"
   }
 ]

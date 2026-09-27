@@ -1473,28 +1473,19 @@ export class HeadroomStore {
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
 
-  /** Every meter bucket name this principal has ever reported, excluding the
-   * generic bucket names every vendor uses regardless of model (a match
-   * against "main" or "credits" would tell a reader nothing about a specific
-   * model), used only as a best-effort signal for `model_available`'s
-   * `shares_pool` hint below. */
-  private ownMeterBuckets(principalId: string): string[] {
+  /** The catalog never reports a model-to-meter mapping, so this remains a
+   * deliberately conservative hint: only a current, fresh, official meter
+   * can establish a dedicated bucket. A current generic meter supports the
+   * usual shared-pool explanation; no current evidence remains unknown. */
+  private modelMeterScope(principalId: string, modelId: string): "dedicated" | "shared" | "unknown" {
     const generic = new Set(["main", "spark", "credits", "capacity", "all", "gemini", "claude-gpt", "state"]);
-    return (this.db.prepare("SELECT DISTINCT meter_id FROM observations WHERE principal_id = ?").all(principalId) as { meter_id: string }[])
-      .map((row) => String(row.meter_id).split(":").slice(1).join(":").toLowerCase())
-      .filter((bucket) => bucket.length > 2 && !generic.has(bucket));
-  }
-
-  /** True when this principal already has its own reported meter bucket
-   * whose name overlaps this model id -- e.g. a Claude "opus" meter for
-   * model id "claude-opus-5-5". A vendor that has no such overlap is not
-   * proven to share the main pool, only that Headroom cannot yet tell
-   * either way; `recordModelCatalog` reports the negative as `shares_pool:
-   * true` (its plainer, more common case) rather than adding a third
-   * "unknown" value to every notification and JSON reader. */
-  private hasOwnMeter(principalId: string, modelId: string): boolean {
+    const buckets = this.latestPerWindow()
+      .filter((observation) => observation.principal_id === principalId && observation.freshness === "fresh" && observation.truth === "official" && !observation.metadata?.vendor_window_held && !observation.metadata?.vendor_inconsistent)
+      .map((observation) => observation.meter_id.split(":").slice(1).join(":").toLowerCase());
     const slug = modelId.toLowerCase();
-    return this.ownMeterBuckets(principalId).some((bucket) => slug.includes(bucket) || bucket.includes(slug));
+    if (buckets.some((bucket) => bucket.length > 2 && !generic.has(bucket) && (slug.includes(bucket) || bucket.includes(slug)))) return "dedicated";
+    if (buckets.some((bucket) => generic.has(bucket))) return "shared";
+    return "unknown";
   }
 
   /** Writes one `model_available`/`model_retired` event directly (not
@@ -1505,7 +1496,11 @@ export class HeadroomStore {
    * observation-keyed ids. */
   private addModelEvent(kind: "model_available" | "model_retired", principalId: string, modelId: string, modelName: string | null, at: string): void {
     const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName };
-    if (kind === "model_available") metadata.shares_pool = !this.hasOwnMeter(principalId, modelId);
+    if (kind === "model_available") {
+      const scope = this.modelMeterScope(principalId, modelId);
+      if (scope === "dedicated") metadata.shares_pool = false;
+      else if (scope === "shared") metadata.shares_pool = true;
+    }
     this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
       .run(`${kind}:${principalId}:${modelId}`, kind, "vendor_reported", 1, "[]", at, null, null, principalId, modelId, null, JSON.stringify(metadata));
   }
@@ -1513,8 +1508,8 @@ export class HeadroomStore {
   /**
    * Folds one vendor model-catalog read into `known_models` and emits
    * `model_available`/`model_retired` events for what changed. The first
-   * ever call for a principal (no existing `known_models` rows at all) seeds
-   * every id silently -- no events -- so turning this feature on never
+   * ever call for a principal (tracked by a durable marker, not row count)
+   * seeds every id silently -- no events -- so turning this feature on never
    * produces a burst of "new model" notifications for models the operator
    * has already been using for months. Every later call diffs against that
    * seed: an id with no row yet is genuinely new (`first_seen_at` = now, one
@@ -1527,33 +1522,44 @@ export class HeadroomStore {
    */
   recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date()): { seeded: boolean; added: string[]; retired: string[] } {
     const at = now.toISOString();
-    const existingRows = this.db.prepare("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
-    const seeded = existingRows.length === 0;
-    const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
-    const seenIds = new Set(models.map((model) => model.id));
-    const added: string[] = [];
-    for (const model of models) {
-      const existing = existingById.get(model.id);
-      if (!existing) {
-        this.db.prepare("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
-          .run(principalId, vendor, model.id, model.name ?? null, at, at);
-        if (!seeded) {
-          added.push(model.id);
-          this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
+    const initializedKey = `model_catalog_initialized:${principalId}`;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existingRows = this.db.prepare("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
+      const seeded = this.daemonState(initializedKey) === undefined;
+      const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
+      const seenIds = new Set(models.map((model) => model.id));
+      const added: string[] = [];
+      for (const model of models) {
+        const existing = existingById.get(model.id);
+        if (!existing) {
+          this.db.prepare("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
+            .run(principalId, vendor, model.id, model.name ?? null, at, at);
+          if (!seeded) {
+            added.push(model.id);
+            this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
+          }
+          continue;
         }
-        continue;
+        this.db.prepare("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+          .run(at, model.name ?? null, vendor, principalId, model.id);
       }
-      this.db.prepare("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
-        .run(at, model.name ?? null, vendor, principalId, model.id);
+      const retired: string[] = [];
+      if (!seeded) for (const row of existingRows) {
+        if (seenIds.has(row.model_id) || row.retired_at) continue;
+        this.db.prepare("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
+        retired.push(row.model_id);
+        this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
+      }
+      // This must share the transaction with rows and events. In particular,
+      // an authoritative initial empty catalog is still an initialized check.
+      this.setDaemonState(initializedKey, at);
+      this.db.exec("COMMIT");
+      return { seeded, added, retired };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
     }
-    const retired: string[] = [];
-    if (!seeded) for (const row of existingRows) {
-      if (seenIds.has(row.model_id) || row.retired_at) continue;
-      this.db.prepare("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
-      retired.push(row.model_id);
-      this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
-    }
-    return { seeded, added, retired };
   }
 
   /** Every model id Headroom has ever seen in a vendor's own catalog, newest
@@ -1608,6 +1614,27 @@ export class HeadroomStore {
 
   setDaemonState(key: string, value: string): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  /** Atomically reserves an interval before a caller starts asynchronous
+   * work. Keeping the reservation after a failed read prevents overlapping
+   * polls (or separate CLI processes) from repeatedly retrying a bad source. */
+  claimDaemonInterval(key: string, now: Date, intervalMs: number): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.daemonState(key);
+      const previousAt = previous ? Date.parse(previous) : Number.NaN;
+      if (Number.isFinite(previousAt) && now.getTime() - previousAt < intervalMs) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      this.setDaemonState(key, now.toISOString());
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
   }
 
   /**

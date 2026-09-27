@@ -374,10 +374,11 @@ after and before it. On a `plan_changed`, `from_plan`, `to_plan`, `downgrade`,
 or `restored` explain the vendor-reported change. `credit_spent_on_free_plan`
 marks a free-plan reset-credit use. `resets_at` may accompany an exhausted
 report. On a `model_available`/`model_retired`, `model_id` and `model_name`
-name the vendor model; `model_available` also carries `shares_pool`
-(`true` when Headroom cannot yet see a dedicated meter for this model, i.e.
-the common case of a model sharing the account's existing pool; `false` once
-it can). Metadata is absent when an event has no such fact. Exit codes:
+name the vendor model. `model_available.shares_pool` is `false` only when a
+current fresh official model-scoped meter matches the id, `true` when a
+current fresh official generic meter establishes a shared pool, and absent
+when neither relationship is observed; absence is UNKNOWN, never capacity.
+Metadata is absent when an event has no such fact. Exit codes:
 always `0`.
 
 MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct",
@@ -387,6 +388,7 @@ events: HeadroomEvent[] }`; over a daemon, the bare `HeadroomEvent[]` instead.
 
 `headroom models [--principal <id>] [--json|--agent]` -- distinct from the
 `--models` flag documented above, which is Claude session-log token share.
+`--principal` accepts exactly one non-flag id (and may appear only once).
 `--json`: `KnownModel[]`, `{ principal_id: string, vendor: string, model_id:
 string, model_name: string | null, first_seen_at: string, last_seen_at:
 string, retired_at: string | null }[]`. `retired_at` is `null` until a later

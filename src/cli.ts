@@ -35,7 +35,7 @@ import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAG
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { migrateLegacyHome } from "./paths.js";
+import { headroomHome, migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
@@ -134,16 +134,30 @@ function printEvents(items: HeadroomEvent[]): void {
 }
 
 async function models(argv: string[]): Promise<number> {
-  const allowed = new Set(["--principal", "--json", "--agent"]);
+  let principal: string | undefined;
+  let json = false;
+  let agent = false;
   for (let index = 0; index < argv.length; index += 1) {
-    if (!allowed.has(argv[index])) throw new Error(COMMAND_HELP.models);
-    if (argv[index] === "--principal") index += 1;
+    switch (argv[index]) {
+      case "--principal": {
+        const value = argv[index + 1];
+        if (principal !== undefined || !value || value.startsWith("-")) throw new Error(COMMAND_HELP.models);
+        principal = value;
+        index += 1;
+        break;
+      }
+      case "--json":
+        if (json) throw new Error(COMMAND_HELP.models);
+        json = true;
+        break;
+      case "--agent":
+        if (agent) throw new Error(COMMAND_HELP.models);
+        agent = true;
+        break;
+      default: throw new Error(COMMAND_HELP.models);
+    }
   }
-  if (argv.includes("--json") && argv.includes("--agent")) throw new Error(COMMAND_HELP.models);
-  const principalAt = argv.indexOf("--principal");
-  const principal = principalAt >= 0 ? argv[principalAt + 1] : undefined;
-  const json = argv.includes("--json");
-  const agent = argv.includes("--agent");
+  if (json && agent) throw new Error(COMMAND_HELP.models);
   const request = await requestDaemon("models", principal ? { principal } : {});
   if (request !== undefined) { printModelsOutput(unwrapRpc(request) as KnownModel[], json, agent); return 0; }
   directReadNotice();
@@ -916,6 +930,8 @@ export async function observe(argv: string[]): Promise<number> {
   let freeResetUsed = new Map<string, string>();
   let leases: Lease[] = [];
   let planDowngraded: PlanDowngrade[] = [];
+  let directCatalogAccounts: ProviderAccount[] | undefined;
+  let directCatalogHome: string | undefined;
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
     observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
@@ -930,12 +946,11 @@ export async function observe(argv: string[]): Promise<number> {
       failures = polled.failures;
       store.insertPoll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
-      // No daemon is running to piggyback this on its own poll loop, so a
-      // no-daemon direct read is the only chance this principal gets one --
-      // still throttled to once an hour per principal (see
-      // MODEL_CHECK_INTERVAL_MS), and never allowed to fail this status read.
-      const accountsForModelCheck = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
-      await checkModelAvailability(store, accountsForModelCheck).catch(() => undefined);
+      // Run this only after rendering below. Antigravity's catalog read can
+      // make several bounded network calls; it must never delay this direct
+      // quota result. Its own store is opened after this status store closes.
+      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
+      directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
       const paced = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
@@ -973,6 +988,13 @@ export async function observe(argv: string[]): Promise<number> {
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
+  }
+  if (directCatalogAccounts && directCatalogHome) {
+    await (async () => {
+      const catalogStore = await HeadroomStore.open(directCatalogHome!);
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
+      finally { catalogStore.close(); }
+    })().catch(() => undefined);
   }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;

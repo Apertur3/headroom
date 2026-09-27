@@ -124,8 +124,10 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
     case "model_new": return message("🆕 New model bucket seen", `${principal} now reports "${humanName(event.reason ?? event.meter_id?.split(":").at(-1) ?? "New model")}" as its own meter.`, "Check its allowance before routing work to it.");
     case "model_available": {
       const modelName = event.metadata?.model_name ?? humanName(event.metadata?.model_id ?? event.reason ?? "model");
-      const sharesPool = event.metadata?.shares_pool !== false;
-      return `🆕 ${planVendor(event.principal_id ?? "")}: ${clean(modelName)} now available on ${principal}${sharesPool ? " (shares the main pool)" : " (its own quota bucket)"}`;
+      const meter = event.metadata?.shares_pool === false ? "its own quota bucket"
+        : event.metadata?.shares_pool === true ? "shares the main pool"
+          : "no dedicated meter observed";
+      return `🆕 ${planVendor(event.principal_id ?? "")}: ${clean(modelName)} now available on ${principal} (${meter})`;
     }
     case "model_retired": {
       const modelName = event.metadata?.model_name ?? humanName(event.metadata?.model_id ?? event.reason ?? "model");

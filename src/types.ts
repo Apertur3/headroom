@@ -250,7 +250,7 @@ export interface HeadroomEvent {
   /** On `model_available`/`model_retired`: the vendor model id and display
    * name from its own catalog, and (`model_available` only) whether
    * Headroom can already see a meter of its own for this id (`shares_pool:
-   * false`) or has only ever seen it inside an existing shared meter
-   * (`shares_pool: true`, or undefined when Headroom cannot tell yet). */
+   * false`) or a current generic meter (`shares_pool: true`). Undefined
+   * means no current fresh official meter establishes either relationship. */
   metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean } | null;
 }

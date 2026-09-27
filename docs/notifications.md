@@ -90,8 +90,11 @@ lists an id Headroom has not seen for that principal before, whether or not it
 gets its own meter. A vendor often rolls a new model out inside an account's
 *existing* shared pool (e.g. Codex adding a model to the same 5h/weekly quota
 Sol/Terra/Luna already share) -- `model_new` says nothing in that case,
-`model_available` does. The notification names whether Headroom can tell the
-model has its own quota bucket or still shares the main pool:
+`model_available` does. The notification calls a model's meter dedicated only
+when there is a current fresh official model-scoped observation, and calls it
+shared only when there is a current fresh official generic pool observation.
+When neither establishes that relationship, it says `no dedicated meter
+observed`; that is UNKNOWN information, never capacity.
 
 ```
 🆕 Codex: GPT-6-Sol now available on codex-main (shares the main pool)
@@ -102,8 +105,9 @@ Sources, per vendor (no new credential type for any of them -- see
 local `models_cache.json` cache, Claude Code's own local model-catalog
 cache, and Antigravity's `fetchAvailableModels` endpoint. Checked at most
 once an hour per principal, independent of the ordinary quota poll interval.
-The very first check for a principal seeds its known-model list silently --
-no notification burst for models you were already using. `headroom models
+The very first successful check for a principal (even an authoritative empty
+catalog) seeds its known-model list silently -- no notification burst for
+models you were already using. `headroom models
 [--principal <id>] [--json|--agent]` lists every known model id with its
 `first_seen_at` (and `retired_at` once a vendor drops one).
 

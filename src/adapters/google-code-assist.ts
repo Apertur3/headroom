@@ -324,8 +324,11 @@ export async function postAvailableModels(fetcher: typeof fetch, token: string, 
  * -- an object keyed by model id, not an array. Only the id and display name
  * are ever read; `quotaInfo` is availability-only (see `retrieveUserQuota`
  * for the actual remaining-fraction numbers Headroom trusts). */
-export function modelsFromAvailableModels(body: unknown): Array<{ id: string; name: string | null }> {
-  if (!asObject(body) || !asObject(body.models)) return [];
+export function modelsFromAvailableModels(body: unknown): Array<{ id: string; name: string | null }> | undefined {
+  // An empty object is an authoritative empty catalog. A missing or malformed
+  // `models` object is not: treating it as [] would retire every known model
+  // after an otherwise-successful but incompatible response.
+  if (!asObject(body) || !asObject(body.models)) return undefined;
   return Object.entries(body.models).flatMap(([id, entry]) => id.trim() ? [{ id: id.trim(), name: asObject(entry) ? asString(entry.displayName) ?? null : null }] : []);
 }
 

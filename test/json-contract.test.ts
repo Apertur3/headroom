@@ -303,8 +303,13 @@ describe("CLI --json field shapes", () => {
       id: "reset_seen:1", kind: "reset_seen", origin: "inferred", confidence: 0.9, evidence_observation_ids: [1, 2],
       created_at: "2026-09-03T12:00:00.000Z", corrected_by: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: null, last_seen_at: null,
     };
+    const modelAvailable: HeadroomEvent = {
+      id: "model_available:codex-main:gpt-6-astra", kind: "model_available", origin: "vendor_reported", confidence: 1, evidence_observation_ids: [3],
+      created_at: "2026-09-23T12:00:00.000Z", corrected_by: null, meter_id: null, principal_id: "codex-main", reason: "gpt-6-astra", last_seen_at: null,
+      metadata: { model_id: "gpt-6-astra", model_name: "GPT-6-Astra", shares_pool: false },
+    };
     const { logs, restore } = captureLog();
-    try { printEventsOutput([event], false); } finally { restore(); }
+    try { printEventsOutput([event, modelAvailable], false); } finally { restore(); }
     return compareToFixture("cli-events", JSON.parse(logs[0]));
   });
 
@@ -313,8 +318,12 @@ describe("CLI --json field shapes", () => {
       principal_id: "codex-main", vendor: "codex", model_id: "gpt-6-astra", model_name: "GPT-6-Astra",
       first_seen_at: "2026-09-23T12:00:00.000Z", last_seen_at: "2026-09-23T12:00:00.000Z", retired_at: null,
     };
+    const retiredUnnamed: KnownModel = {
+      principal_id: "codex-main", vendor: "codex", model_id: "gpt-6-fable", model_name: null,
+      first_seen_at: "2026-09-23T12:00:00.000Z", last_seen_at: "2026-09-24T12:00:00.000Z", retired_at: "2026-09-24T12:00:00.000Z",
+    };
     const { logs, restore } = captureLog();
-    try { printModelsOutput([model], true, false); } finally { restore(); }
+    try { printModelsOutput([model, retiredUnnamed], true, false); } finally { restore(); }
     return compareToFixture("cli-models", JSON.parse(logs[0]));
   });
 

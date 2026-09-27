@@ -41,6 +41,18 @@ export interface CatalogModel { id: string; name: string | null; }
 
 const OBJECT = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
+/** A local catalog that has not been refreshed in a day is not evidence that
+ * a model remains available now. The vendor clients refresh these caches in
+ * normal use, so treating an older (or invalid/future) timestamp as
+ * unavailable is safer than announcing stale entries as new availability. */
+export const MODEL_CATALOG_MAX_AGE_MS = 24 * 60 * 60_000;
+const MODEL_CATALOG_CLOCK_SKEW_MS = 5 * 60_000;
+
+function freshCatalogTimestamp(value: unknown, now: Date): boolean {
+  const at = typeof value === "string" ? Date.parse(value) : typeof value === "number" ? value : Number.NaN;
+  return Number.isFinite(at) && at <= now.getTime() + MODEL_CATALOG_CLOCK_SKEW_MS && now.getTime() - at <= MODEL_CATALOG_MAX_AGE_MS;
+}
+
 async function readRegularFile(path: string): Promise<string> {
   const stat = await lstat(path);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("not a regular file");
@@ -55,13 +67,13 @@ async function readRegularFile(path: string): Promise<string> {
  * visibility, ... }] }`. `visibility: "hide"` entries (internal test/review
  * models CodexBar itself never lists) are excluded.
  */
-export async function readCodexModelCatalog(codexHome: string, readFileFn: (path: string) => Promise<string> = readRegularFile): Promise<CatalogModel[] | undefined> {
+export async function readCodexModelCatalog(codexHome: string, readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogModel[] | undefined> {
   let text: string;
   try { text = await readFileFn(join(codexHome, "models_cache.json")); }
   catch { return undefined; }
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { return undefined; }
-  if (!OBJECT(parsed) || !Array.isArray(parsed.models)) return undefined;
+  if (!OBJECT(parsed) || !freshCatalogTimestamp(parsed.fetched_at, now) || !Array.isArray(parsed.models)) return undefined;
   return parsed.models.flatMap((entry): CatalogModel[] => {
     if (!OBJECT(entry) || typeof entry.slug !== "string" || !entry.slug.trim()) return [];
     if (entry.visibility === "hide") return [];
@@ -81,7 +93,7 @@ interface ModelCatalogFile { fetchedAt?: number; catalog?: { config?: { models?:
  * hash the CLI derives from the current token. Shape: `{ fetchedAt,
  * catalog: { config: { models: [{ id, name }] } } }`.
  */
-export async function readClaudeModelCatalog(configDir: string, readDir: (path: string) => Promise<string[]> = async (path) => readdir(path), readFileFn: (path: string) => Promise<string> = readRegularFile): Promise<CatalogModel[] | undefined> {
+export async function readClaudeModelCatalog(configDir: string, readDir: (path: string) => Promise<string[]> = async (path) => readdir(path), readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogModel[] | undefined> {
   const directory = join(configDir, "cache", "model-catalog");
   let names: string[];
   try { names = await readDir(directory); } catch { return undefined; }
@@ -90,7 +102,7 @@ export async function readClaudeModelCatalog(configDir: string, readDir: (path: 
     if (!name.endsWith(".json")) continue;
     try {
       const parsed: unknown = JSON.parse(await readFileFn(join(directory, name)));
-      if (OBJECT(parsed)) files.push(parsed as ModelCatalogFile);
+      if (OBJECT(parsed) && freshCatalogTimestamp(parsed.fetchedAt, now)) files.push(parsed as ModelCatalogFile);
     } catch { /* one unreadable or malformed cache file must not fail the whole read */ }
   }
   if (!files.length) return undefined;
@@ -146,9 +158,9 @@ export const MODEL_CHECK_INTERVAL_MS = 60 * 60_000;
 
 function daemonStateKey(principalId: string): string { return `model_check:${principalId}`; }
 
-async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabilityDependencies): Promise<CatalogModel[] | undefined> {
-  if (account.vendor === "codex") return (dependencies.readCodexModelCatalog ?? readCodexModelCatalog)(resolve(account.location || vendorHome("codex")));
-  if (account.vendor === "claude") return (dependencies.readClaudeModelCatalog ?? readClaudeModelCatalog)(resolve(account.location || vendorHome("claude")));
+async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabilityDependencies, now: Date): Promise<CatalogModel[] | undefined> {
+  if (account.vendor === "codex") return (dependencies.readCodexModelCatalog ?? readCodexModelCatalog)(resolve(account.location || vendorHome("codex")), undefined, now);
+  if (account.vendor === "claude") return (dependencies.readClaudeModelCatalog ?? readClaudeModelCatalog)(resolve(account.location || vendorHome("claude")), undefined, undefined, now);
   if (account.vendor === "antigravity") return (dependencies.fetchAntigravityModelCatalog ?? fetchAntigravityModelCatalog)({ now: dependencies.now, fetch: dependencies.fetch });
   return undefined;
 }
@@ -165,13 +177,14 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
   for (const account of accounts) {
     if (account.vendor !== "codex" && account.vendor !== "claude" && account.vendor !== "antigravity") continue;
     const key = daemonStateKey(account.name);
-    const last = store.daemonState(key);
-    if (last && Number.isFinite(Date.parse(last)) && now.getTime() - Date.parse(last) < MODEL_CHECK_INTERVAL_MS) continue;
+    // Claim before the reader's first await. This is a BEGIN IMMEDIATE
+    // transaction in the store, so overlapping daemon polls and direct CLI
+    // processes cannot all decide that the same hourly check is due.
+    if (!store.claimDaemonInterval(key, now, MODEL_CHECK_INTERVAL_MS)) continue;
     try {
-      const models = await catalogFor(account, dependencies);
-      store.setDaemonState(key, now.toISOString());
+      const models = await catalogFor(account, dependencies, now);
       if (models === undefined) continue;
       store.recordModelCatalog(account.name, account.vendor, models, now);
-    } catch { store.setDaemonState(key, now.toISOString()); /* the throttle still advances: a broken source should not be retried every poll */ }
+    } catch { /* The pre-I/O claim remains: a broken source is not retried every poll. */ }
   }
 }
