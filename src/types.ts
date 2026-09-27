@@ -123,9 +123,24 @@ export interface Observation {
   burn_percent_per_hour?: number | null;
   empty_in_seconds?: number | null;
   sustainable_percent_per_hour?: number | null;
+  /** Computed, never persisted: response-time reset fields. The first two
+   * retain their contract-1.0 meanings even once a reset is overdue; agents
+   * check `reset_overdue` and its age instead. */
+  resets_in_seconds?: number | null;
+  resets_in?: string | null;
+  /** True only when `resets_at` is more than the one-minute reset-identity
+   * tolerance in the past. `reset_overdue_seconds` is present with it.
+   * Absent for a reset that is unknown, upcoming, or just crossed. */
+  reset_overdue?: true;
+  reset_overdue_seconds?: number;
+  /** Computed, never persisted: ISO time when status enrichment set served
+   * freshness, last_known, pace and reset fields. Renderers preserve an
+   * already-enriched row rather than aging it again without its store-backed
+   * last-known context. */
+  status_enriched_at?: string;
   /** Computed, never persisted: the newest FRESH reading of this exact meter
    * and window from the last 7 days, attached only when this observation's
-   * own freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
+   * served freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
    * trend for a person or a fail-closed orchestrator to glance at while the
    * live number is UNKNOWN -- never a decision input: `can`/`gate`/`route`
    * keep treating UNKNOWN as no capacity regardless of what this carries.

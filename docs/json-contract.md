@@ -55,8 +55,13 @@ These fields recur across almost every output. They are documented in full in
 needs the JSON meaning.
 
 - **`freshness`** -- `"fresh" | "stale" | "failed" | "not_enforced"`, on every
-  `Observation`. `fresh` is a good recent read. `stale` is older than the
-  staleness threshold (15 minutes by default). `failed` is an errored,
+  served `Observation`. `fresh` is a good recent read. A row stored as
+  `fresh` is served as `stale` once its `fetched_at` is older than the
+  staleness threshold (15 minutes by default); its `reason` begins `last
+  accepted reading <age> ago` and retains any stored explanation after it.
+  An unparsable `fetched_at` is also served stale rather than fresh. State and
+  count observations do not use this percent-window age gate. This
+  response-time label does not rewrite history. `failed` is an errored,
   timed-out, or contradicted read. `not_enforced` means the vendor confirmed
   there is no cap at all on this window -- it never counts as UNKNOWN and
   never blocks `can`/`gate`/`fill`.
@@ -120,22 +125,33 @@ An `Observation` (the unit everything else builds on) is: `principal_id`,
 null`; `quantity: { used: number, limit: number | null, remaining: number |
 null, unit: "percent" | "tokens" | "requests" | "credits" } | null`;
 `resets_at: string | null`; `resets_in_seconds: number | null` and `resets_in:
-string | null` (added by `withResetsIn`, computed fresh at response time, not
-stored); `observed_at`, `fetched_at` (both ISO strings); `source` (string,
+string | null` (computed fresh at response time, not stored). These retain
+their contract-1.0 meanings: a due or overdue reset has `resets_in_seconds:
+0` and `resets_in: "0m"`. Agents check additive `reset_overdue: true` to
+identify an overdue schedule, and read its additive `reset_overdue_seconds:
+number` for the number of seconds since it was due; both fields are absent
+otherwise. Human output renders that state as `overdue <age>`. A reset within
+the 60-second tolerance has no overdue fields and remains `0m`. `observed_at`,
+`fetched_at` (both ISO strings); `source` (string,
 free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 `adapter_version`, `upstream_schema_version` (both strings); `reason?: string
 | null`; `metadata?: {...}` (optional, vendor facts -- see `types.ts`, never
 credentials or prompt content). `metadata.vendor_inconsistent?: boolean` is
 `true` when adjacent vendor reads disagreed about the window identity; status
 then keeps showing the earlier window while Headroom waits for a second
-matching poll. Flagged raw rows remain available in history but do not affect
-burn or pace. `burn_percent_per_hour?: number | null`,
+matching poll. `metadata.vendor_window_held?: boolean` marks that same
+frozen earlier reading while a new window identity awaits confirmation.
+Either flag puts the pace state at UNKNOWN immediately -- at any age, not
+only once the reading has also aged past `staleness_minutes` -- everywhere a
+pace decision is made (`status`, `gate`, `fill`, `plan`, `route`, `can`, and
+`--threshold`). Flagged raw rows remain available in history but do not
+affect burn or pace. `burn_percent_per_hour?: number | null`,
 `empty_in_seconds?: number | null`, `sustainable_percent_per_hour?: number |
 null` (present once pace-enriched, which every `status`/`can`/`gate`/`rate`
 read is); `last_known?: { used_percent: number, resets_at: string | null,
 observed_at: string, age_seconds: number, window_minutes?: number | null } |
 null` (present once last-known-enriched, which every `status` read is;
-non-null only when this observation's own `freshness` is `failed` or `stale`
+non-null only when this observation's served `freshness` is `failed` or `stale`
 -- the two values that always render as UNKNOWN -- and a fresh reading exists
 within the last 7 days; the newest such reading, so a fail-closed caller can
 still see the trend behind an UNKNOWN. For a windowed observation this is the
@@ -150,7 +166,20 @@ names which window that is -- present only in this borrowed case, absent when
 this carries); `credits_lapsed?: boolean` is present and `true` only on an
 enriched credits observation whose `resets_at` expiry is in the past (it is
 computed at response time; the stored fact is never rewritten); `id?: number` (present once read back from the store, as
-every `--json` reading is).
+every `--json` reading is); `status_enriched_at?: string` (the response-time
+instant that most recently set freshness, pace, last-known and reset fields.
+This marker records when enrichment last ran, never a license to skip
+re-running it: every renderer re-evaluates freshness and pace against its
+own current serving clock on every render, whether or not a row already
+carries this marker, so a row served fresh at that instant but read again
+later -- a cached CLI payload, a long-lived dashboard -- is re-served
+UNKNOWN once it has since aged past `staleness_minutes`, with `last_known:
+null` rather than a store-backed lookup it cannot re-run. A newer CLI or MCP
+server locally adds this marker and the matching fields, from a read-only,
+non-migrating store lookup, when an older daemon returns an unmarked status
+array, using the current policy, before it serializes or evaluates the row;
+if that lookup is unavailable, enrichment still happens locally without
+history).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at

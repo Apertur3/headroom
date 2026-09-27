@@ -5,13 +5,14 @@ import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./co
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
-import { resetsIn, withResetsIn } from "./resets.js";
+import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
@@ -162,23 +163,27 @@ export function serveMcp(): void {
 
 type DirectResult = Record<string, unknown>;
 
-/** Attaches burn/empty-in/sustainable-pace fields, and (for a failed or
- * stale observation) last_known, to every observation of a fresh store
- * read -- from one shared burn computation and one shared last-known
- * lookup. */
-function withPace(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, now: Date): ReturnType<HeadroomStore["latestPerWindow"]> {
-  const paced = withPaceInfo(observations, store.burnRateFor(observations, now), now);
-  return withLastKnown(paced, store.lastKnownFor(observations, now)) as ReturnType<HeadroomStore["latestPerWindow"]>;
+/** The direct-MCP equivalent of daemon status: one shared served shape keeps
+ * freshness, pace, last-known and reset countdowns on the same clock. */
+function withStatus(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, stalenessMinutes: number, now: Date) {
+  return withStatusInfo(observations, store.burnRateFor(observations, now), store.lastKnownFor(observations, now), stalenessMinutes, now);
 }
 
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
-export async function directStatus(): Promise<DirectResult> {
+export interface DirectStatusDependencies {
+  /** Test seam: production uses the wall clock and real collector. */
+  now?: () => Date;
+  poll?: typeof pollAccounts;
+}
+
+export async function directStatus(dependencies: DirectStatusDependencies = {}): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try {
     const policy = await readPolicy();
-    const now = Date.now();
+    const requestedAt = dependencies.now?.() ?? new Date();
+    const now = requestedAt.getTime();
     // Without a daemon scheduler, a direct MCP status call has no in-process
     // rate limit of its own; share one persisted in the database instead, so
     // repeated tool calls (or several MCP client processes reading the same
@@ -188,24 +193,28 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, cached, new Date(now)), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, cached, policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, store.latestPerWindow(), new Date(now)), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
     // spawn the Claude probe on every call regardless of a keychain_grants
     // marker, popping a fresh dialog instead of respecting it.
     await syncClaudeProbeState(store);
-    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    const polled = await (dependencies.poll ?? pollAccounts)(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    // Polling is asynchronous. Everything sent to the caller must use the
+    // response clock, not the clock captured before a slow vendor call.
+    const responseAt = dependencies.now?.() ?? new Date();
+    const responseNow = responseAt.getTime();
     store.insertPoll(polled.observations);
     for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);
     store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
-    store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, store.latestPerWindow(), new Date(now)), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    store.setDirectPollBackoff({ lastPollAt: responseNow, until: protectedFailure ? responseNow + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
+    return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 
@@ -454,7 +463,7 @@ async function directWait(meter: unknown): Promise<DirectResult> {
     const rows = store.latestPerWindow(meter).filter((item) => item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
     const shortest = [...rows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER))[0];
     const resetsAt = shortest?.resets_at ?? null;
-    const { resets_in_seconds } = resetsIn(resetsAt);
+    const resets_in_seconds = resetSecondsRemaining(resetsAt);
     store.audit("mcp", "wait", meter, "ok");
     return { source: "direct", meter, resets_at: resetsAt, resets_in_seconds, suggested_sleep_seconds: resets_in_seconds === null ? null : Math.max(0, Math.min(resets_in_seconds, 3600)) };
   } finally { store.close(); }
@@ -599,8 +608,10 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // a daemon-sourced decision still gets this annotation added here.
     let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
     if (method === "status" && Array.isArray(finalResult)) {
+      const policy = await readPolicy();
+      const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);
       const downgrade = await call("plan_downgrades", {});
-      finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself

@@ -184,6 +184,38 @@ describe("CLI --json field shapes", () => {
     await compareToFixture("cli-status-threshold", JSON.parse(logs[0]));
   });
 
+  it("status serves an overdue stale observation without adding overdue fields to a normal row", async () => {
+    const home = await newHome("status-served-freshness");
+    await writeFile(join(home, "accounts.toml"), "");
+    const now = new Date();
+    const oldAt = new Date(now.getTime() - 10 * 86_400_000).toISOString();
+    const stale: Observation = {
+      ...weekly(40, new Date(oldAt)), principal_id: "codex-main", meter_id: "codex-main:spark",
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(), observed_at: oldAt, fetched_at: oldAt,
+    };
+    const store = await HeadroomStore.open(home);
+    try {
+      const storedBaseline = store.insert(stale);
+      const newerAt = new Date(now.getTime() - 60_000).toISOString();
+      const suspect = { ...stale, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" }, resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt };
+      const storedSuspect = store.insert(suspect);
+      store.setDaemonState("vendor_window_suspect:codex-main:spark:10080", JSON.stringify({
+        baseline_id: storedBaseline.id, suspect_id: storedSuspect.id,
+        baseline_resets_at: stale.resets_at, suspect_resets_at: suspect.resets_at,
+      }));
+      store.insert({ ...fiveHour(20, 0, 3_600_000, now), principal_id: "codex-main", meter_id: "codex-main:main" });
+    } finally { store.close(); }
+    const { logs, restore } = captureLog();
+    try { await withHeadroomHome(home, () => main(["--json"])); } finally { restore(); }
+    const rows = JSON.parse(logs[0]).observations as Observation[];
+    const served = rows.find((row) => row.meter_id === "codex-main:spark");
+    const normal = rows.find((row) => row.meter_id === "codex-main:main");
+    expect(served).toMatchObject({ freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number), last_known: { used_percent: 41 } });
+    expect(served?.reason).toMatch(/^last accepted reading 10d ago/);
+    expect(normal).toMatchObject({ freshness: "fresh" });
+    expect(normal).not.toHaveProperty("reset_overdue");
+  });
+
   it("status --models", async () => {
     const home = await newHome("status-models");
     const claudeConfigDir = join(home, "..", ".claude");

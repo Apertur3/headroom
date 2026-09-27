@@ -46,7 +46,11 @@ Example: an observation for `claude-main:fable` at 82% used, `resets_at` next Sa
 ## Freshness and UNKNOWN
 
 Every observation is `fresh`, `stale`, `failed`, or `not_enforced`. `fresh` is a good, recent
-vendor read. `stale` means the last good read is older than the staleness threshold (15 minutes by
+vendor read. Freshness is evaluated again whenever a percent-quota row is served: a row stored as
+`fresh` whose `fetched_at` has crossed `staleness_minutes`, or cannot be parsed, is served as
+`stale`, with `last accepted reading <age> ago` at the front of its reason (followed by any stored
+explanation). Local-pool state and count observations have their own policy states and are not
+aged by this rule. This presentation rule does not rewrite the historical row. `stale` means the last good read is older than the staleness threshold (15 minutes by
 default). `failed` means the last attempt errored, timed out, exceeded Headroom's own bounds on
 the response, or -- for a vendor-reported idle window that looks like a placeholder -- contradicted
 a real-usage reading Headroom already trusted for that same window within the last two hours (a
@@ -68,7 +72,7 @@ that might no longer be true.
 Example: a Codex account with no 5-hour window in the vendor's response and no recent session log
 shows `5h n/a`, not `5h 0%`.
 
-A window that is `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
+A window that is served `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
 exact meter and window from the last 7 days, with the age of that reading, so a person or a
 fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the word itself --
 `headroom` prints it as `UNKNOWN (reason; last 41% at 00:05, 65m ago)`, and it rides along on
@@ -76,6 +80,47 @@ fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the
 age_seconds }` (`null` when nothing fresh exists in that window within 7 days). It is informational
 only: `can`, `gate`, and `route` keep treating UNKNOWN as no capacity no matter what `last_known`
 says.
+
+Reset countdowns are also evaluated when served. A reset within 60 seconds of now still reads
+`0m`, matching the store's same-window tolerance. Once it is older, human output says `overdue
+<age>` instead of an imminent `0m`. JSON retains its contract-1.0 values
+`resets_in_seconds: 0` and `resets_in: "0m"`, then adds `reset_overdue: true`
+and `reset_overdue_seconds` (the age in seconds). Agents check `reset_overdue`,
+not the compatibility countdown, to distinguish an overdue schedule from an unknown one.
+
+Status enrichment carries `status_enriched_at` with the freshness, pace,
+reset, and `last_known` fields it was served with at that instant. That
+marker records when enrichment last ran; it is never a license to skip
+re-running it. Every renderer (the dashboard, the browser report, the
+statusline, a cached CLI payload) re-evaluates freshness and pace against
+its own current serving clock on every render, whether or not a row already
+carries `status_enriched_at`. A row served fresh minutes or hours ago that
+has since aged past `staleness_minutes` is re-served UNKNOWN, not left
+fresh forever on the strength of an old marker. A renderer re-staling a row
+this way has no store-backed lookup to attach a fresh `last_known` reading
+to it, so it serves `last_known: null` instead -- an UNKNOWN reading with no
+last-known figure, never a `fresh` one claiming capacity nobody
+re-confirmed.
+
+When a newer CLI or MCP server reaches an older daemon whose status rows do
+not yet carry that marker, it re-enriches those rows from the current policy
+and a read-only, non-migrating store lookup before rendering, serializing,
+or checking a threshold: this path must never run schema migrations against
+a database an older daemon may still be running against. If that lookup is
+unavailable (the file does not exist yet, or predates something the lookup
+needs), enrichment still happens locally, without history: no burn rate, no
+real `last_known`. Either way an aged stored-fresh row still becomes UNKNOWN;
+daemon version skew never makes it capacity.
+
+A vendor-window hold (`metadata.vendor_window_held` or
+`vendor_inconsistent` -- see "Vendor-window consistency" below) is served
+UNKNOWN immediately, at any age, the same way: a reading frozen at its last
+confirmed baseline while a new identity awaits confirmation is not capacity
+just because it hasn't yet aged past `staleness_minutes`. This applies
+uniformly everywhere a pace decision or freshness gate is made -- `status`,
+`gate`, `fill`, `plan`, `route`, `can`, and the CLI's `--threshold` report --
+since they all resolve through the same shared `paceDecision`/`freshnessGate`
+functions.
 
 ## Pace states
 
@@ -381,6 +426,14 @@ both conflicting raw rows are marked `metadata.vendor_inconsistent: true`, no
 reset event is recorded, and status keeps the earlier reading with a holding
 note. A `vendor_inconsistent` notification is emitted at most once per meter
 per six hours. Flagged rows never contribute to burn-rate or pace calculations.
+
+Either flag (`vendor_window_held` or `vendor_inconsistent`) puts the reading's
+pace state at UNKNOWN immediately, the moment the poll that holds it lands --
+not only once it has also aged past `staleness_minutes`. This is enforced
+centrally in `paceDecision` and `freshnessGate`, so every caller that
+consumes them (`status`, `gate`, `fill`, `plan`, `route`, `can`, and the
+CLI's `--threshold` report) fails closed on a held reading from the start of
+the hold, never treating it as capacity while it waits to age out.
 
 ## Export
 

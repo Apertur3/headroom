@@ -28,7 +28,8 @@ import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
@@ -36,7 +37,7 @@ import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from ".
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { headroomHome, migrateLegacyHome } from "./paths.js";
-import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
+import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
@@ -998,6 +999,7 @@ export async function observe(argv: string[]): Promise<number> {
   }
   const request = await requestDaemon("status");
   const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
+  const policy = await readPolicy();
   let observations: Observation[];
   let failures: string[];
   let resetSeen = new Map<string, string>();
@@ -1008,7 +1010,8 @@ export async function observe(argv: string[]): Promise<number> {
   let directCatalogHome: string | undefined;
   const direct = daemonObservations === undefined;
   if (daemonObservations) {
-    observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    const daemonRows = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    observations = await normalizeUnmarkedDaemonStatus(daemonRows, policy.staleness_minutes);
     failures = [];
     const leaseRequest = await requestDaemon("leases");
     leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];
@@ -1027,8 +1030,7 @@ export async function observe(argv: string[]): Promise<number> {
       directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
-      const paced = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
-      observations = withLastKnown(paced, store.lastKnownFor(rawObservations, now));
+      observations = withStatusInfo(rawObservations, store.burnRateFor(rawObservations, now), store.lastKnownFor(rawObservations, now), policy.staleness_minutes, now);
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);
@@ -1048,10 +1050,9 @@ export async function observe(argv: string[]): Promise<number> {
   // The grouped view's own footer already says where the numbers came from, so
   // the stderr notice would only repeat it on the one form that carries both.
   if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
-  const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const withResets = withResetsIn(withCreditsLapsed(observations)); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  if (argv.includes("--json")) { const lapsed = withCreditsLapsed(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
@@ -1252,8 +1253,11 @@ function readClipboardText(): Promise<string> {
  * own percentage, and the reset both as a clock time and as a countdown. */
 export function usagePasteLine(observation: Observation, now = new Date()): string {
   const used = observation.quantity?.used ?? 0;
-  const remaining = resetsIn(observation.resets_at, now).resets_in;
-  const reset = observation.resets_at ? `resets ${formatReset(observation.resets_at)}${remaining ? ` (in ${remaining})` : ""}` : "no reset in the panel";
+  const remaining = resetsIn(observation.resets_at, now);
+  const overdue = formatOverdueReset(remaining);
+  const reset = observation.resets_at
+    ? overdue ? `↻ ${overdue}` : `resets ${formatReset(observation.resets_at)}${remaining.resets_in ? ` (in ${remaining.resets_in})` : ""}`
+    : "no reset in the panel";
   return `ingested ${observation.meter_id} ${label(observation)} ${Math.round(used)}% used, ${reset}`;
 }
 
