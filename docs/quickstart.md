@@ -277,6 +277,9 @@ This is separate from `freeze_reserve_pct`, which changes a window to FREEZE nea
 Every window's countdown (`resets_in_seconds`/`resets_in` in `--json`, the daemon status, and the
 MCP `quota_status` result) is computed fresh at response time, not stored. `headroom can` reasons
 carry the same information, more tersely: `wk 61% CONSERVE, resets in 26h`.
+For an overdue schedule, those two compatibility fields remain `0` and `"0m"`;
+agents check the additive `reset_overdue: true` and `reset_overdue_seconds`
+instead, while human output says `overdue <age>`.
 
 If a meter shows UNKNOWN, that's Headroom refusing to guess, not a bug. The grouped view says why
 in plain words and what to do about it, once per principal when every meter shares the reason.

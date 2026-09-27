@@ -37,6 +37,9 @@ threshold per meter, default 15 minutes. Inferred events carry confidence and ar
 inferred; a drop from 82% to 7% during backoff is `reset_seen` with low confidence, not a fact.
 Vendor-confirmed `not_enforced` windows are ignored by `can` and `--threshold`; they are not
 reported as `UNKNOWN` because there is no vendor-enforced capacity to fail closed over.
+CLI and MCP clients re-enrich an unmarked status array from an older daemon using the current
+policy and local store before they show it or make a threshold decision, so compatibility with a
+running daemon cannot serve an expired stored-fresh row as capacity.
 
 ## Architecture
 
@@ -98,7 +101,8 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 
 - `headroom` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
-- `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
+- `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any enforced window is stale,
+  failed, or ≥ N),
   `headroom events --since 24h`, `headroom models [--principal <id>] [--json|--agent]`
   (one non-flag principal value at most once),
   `headroom can <principal> <action-class> [--allow-unknown]`.

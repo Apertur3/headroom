@@ -6,12 +6,14 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
+import * as config from "../src/config.js";
 import { daemonRequest, rpc, socketPath, HeadroomDaemon } from "../src/daemon.js";
 import { tailDaemonLog } from "../src/logs.js";
 import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -51,36 +53,79 @@ function pipeServerProof(token: string, serverNonce: string, clientNonce: string
   return createHmac("sha256", token).update(`headroom-pipe-server-v2:${serverNonce}:${clientNonce}:${requestHash}:${replyHash}`).digest("hex");
 }
 
-/**
- * handleLine() requires the Windows pipe-auth handshake (a proof of a
- * per-connection nonce) for every method but "health" -- production code
- * always supplies a real nonce from handleSocket(). Tests that call
- * handleLine() directly are exercising request dispatch, not the pipe
- * transport itself (test/pipe-auth.test.ts covers that), so on win32 they
- * authenticate the same way a real client would: force a known session
- * token onto the daemon, then sign a fresh nonce the same way rpc() does.
- * handleLine() itself now returns the reply and its transcript-proof frame
- * as two separate wire lines (src/daemon.ts's HandledLine) rather than one
- * object; this helper parses the reply line back into the plain
- * `{id, result, error}` shape every call site in this file already expects,
- * so none of them need to know the wire format changed.
- */
-async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> {
-  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ replyLine: string; proofLine?: string; authenticated: boolean }> };
-  if (process.platform !== "win32") { const { replyLine } = await internal.handleLine(line); return JSON.parse(replyLine); }
-  internal.sessionToken ??= randomBytes(32).toString("hex");
-  const nonce = randomBytes(16).toString("hex");
-  // A malformed line (null, a number, an array, invalid JSON) is passed through
-  // unchanged so the test exercises the daemon's own rejection of it.
-  let request: { params?: Record<string, unknown> } | null = null;
-  try { const parsed: unknown = JSON.parse(line); request = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as { params?: Record<string, unknown> } : null; } catch { request = null; }
-  if (!request) { const { replyLine } = await internal.handleLine(line, nonce); return JSON.parse(replyLine); }
-  const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
-  const { replyLine } = await internal.handleLine(JSON.stringify({ ...request, params }), nonce);
-  return JSON.parse(replyLine);
-}
-
 describe("daemon JSON-RPC", () => {
+  it("takes the status response clock after a delayed policy reload crosses the freshness boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-response-clock-")); temporary.push(root);
+    const requestedAt = new Date("2026-09-03T12:00:00Z");
+    const responseAt = new Date("2026-09-03T12:02:00Z");
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]",
+      'name = "codex-main"',
+      'vendor = "codex"',
+      'location = "/nonexistent/.codex"',
+      'adapter = "native-ts"',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      vi.useFakeTimers(); vi.setSystemTime(requestedAt);
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
+      const internal = daemon as unknown as { store: HeadroomStore };
+      internal.store.insert({ ...fixture(), fetched_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(), observed_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString() });
+      let releasePolicy: () => void;
+      const policyRead = new Promise<void>((resolve) => { releasePolicy = resolve; });
+      let policyStarted: () => void;
+      const delayedPolicyStarted = new Promise<void>((resolve) => { policyStarted = resolve; });
+      const policy = vi.spyOn(config, "readPolicy")
+        .mockResolvedValueOnce(defaultPolicy)
+        .mockImplementationOnce(async () => {
+          policyStarted();
+          await policyRead;
+          return defaultPolicy;
+        });
+      try {
+        const reply = authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"status"}');
+        await delayedPolicyStarted;
+        vi.setSystemTime(responseAt);
+        releasePolicy!();
+        const rows = (await reply).result as Observation[];
+        expect(rows).toEqual([expect.objectContaining({ freshness: "stale", status_enriched_at: responseAt.toISOString() })]);
+      } finally {
+        policy.mockRestore();
+        await daemon.stop();
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("fails a CLI threshold closed for an aged status array from an older daemon", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-cli-legacy-daemon-")); temporary.push(root);
+    const responseAt = new Date("2026-09-03T12:00:00Z");
+    const oldDaemonRow = { ...fixture(), fetched_at: new Date(responseAt.getTime() - 16 * 60_000).toISOString(), observed_at: new Date(responseAt.getTime() - 16 * 60_000).toISOString() };
+    const store = await HeadroomStore.open(root); store.insert(oldDaemonRow); store.close();
+    await withHeadroomHome(root, async () => {
+      vi.useFakeTimers(); vi.setSystemTime(responseAt);
+      const daemon = await import("../src/daemon.js");
+      const request = vi.spyOn(daemon, "daemonRequest").mockImplementation(async (_path, method) => ({
+        status: "available" as const,
+        result: method === "status" ? [oldDaemonRow]
+          : method === "leases" || method === "plan_downgrades" ? []
+            : {},
+      }));
+      const output: string[] = [];
+      const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
+      try {
+        await expect(main(["--json", "--threshold", "90"])).resolves.toBe(2);
+        const result = JSON.parse(output[0]) as { observations: Observation[]; threshold: { any_blocking: boolean; windows: Array<{ freshness: string; blocking: boolean }> } };
+        expect(result.observations).toEqual([expect.objectContaining({ freshness: "stale", status_enriched_at: responseAt.toISOString(), last_known: expect.objectContaining({ used_percent: 20 }) })]);
+        expect(result.threshold).toMatchObject({ any_blocking: true, windows: [expect.objectContaining({ freshness: "stale", blocking: true })] });
+      } finally {
+        log.mockRestore();
+        request.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("keeps a warm local Antigravity read running while its remote source is backed off", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-warm-")); temporary.push(root);
     const options: Array<Record<string, unknown> | undefined> = [];
@@ -286,6 +331,67 @@ describe("MCP JSON-RPC", () => {
       return { source: "direct", observations: [fixture()], failures: [] };
     });
     expect(response).toMatchObject({ result: { structuredContent: { source: "direct", observations: [expect.objectContaining({ meter_id: "codex-main:main" })] } } });
+  });
+
+  it("serves an aged pre-marker daemon status as stale through quota_status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-legacy-daemon-")); temporary.push(root);
+    const responseAt = new Date("2026-09-03T12:00:00Z");
+    const oldDaemonRow = { ...fixture(), fetched_at: new Date(responseAt.getTime() - 16 * 60_000).toISOString(), observed_at: new Date(responseAt.getTime() - 16 * 60_000).toISOString() };
+    const store = await HeadroomStore.open(root); store.insert(oldDaemonRow); store.close();
+    await withHeadroomHome(root, async () => {
+      vi.useFakeTimers(); vi.setSystemTime(responseAt);
+      try {
+        const response = await handleMcp('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async (method) => method === "status" ? [oldDaemonRow] : []);
+        const content = (response as { result: { structuredContent: { observations: Observation[] } } }).result.structuredContent;
+        expect(content.observations).toEqual([expect.objectContaining({ freshness: "stale", status_enriched_at: responseAt.toISOString(), last_known: expect.objectContaining({ used_percent: 20 }) })]);
+      } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("serves an aged held window as stale and overdue through direct quota_status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-served-freshness-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const now = new Date();
+    const baselineAt = new Date(now.getTime() - 10 * 86_400_000).toISOString();
+    const baseline: Observation = {
+      ...fixture(), meter_id: "codex-main:spark", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(), observed_at: baselineAt, fetched_at: baselineAt,
+    };
+    const newerAt = new Date(now.getTime() - 60_000).toISOString();
+    const suspect: Observation = {
+      ...baseline, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" },
+      resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt,
+    };
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      try {
+        const storedBaseline = store.insert(baseline);
+        const storedSuspect = store.insert(suspect);
+        // This recreates a hold that began before the baseline's reset and
+        // is now old enough to serve: the raw newer read remains available
+        // as last_known while latestPerWindow deliberately keeps the baseline.
+        store.setDaemonState("vendor_window_suspect:codex-main:spark:10080", JSON.stringify({
+          baseline_id: storedBaseline.id, suspect_id: storedSuspect.id,
+          baseline_resets_at: baseline.resets_at, suspect_resets_at: suspect.resets_at,
+        }));
+        store.insert({ ...fixture(), meter_id: "codex-main:main", observed_at: newerAt, fetched_at: newerAt, resets_at: new Date(now.getTime() + 3_600_000).toISOString() });
+        store.setDirectPollBackoff({ lastPollAt: Date.now(), until: 0, failures: 0 });
+      } finally { store.close(); }
+      const direct = await directStatus();
+      const rows = direct.observations as Observation[];
+      const held = rows.find((row) => row.meter_id === "codex-main:spark");
+      const normal = rows.find((row) => row.meter_id === "codex-main:main");
+      expect(held).toMatchObject({
+        freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number),
+        last_known: { used_percent: 41 },
+      });
+      expect(held?.reason).toMatch(/^last accepted reading 10d ago/);
+      expect(normal).toMatchObject({ freshness: "fresh" });
+      expect(normal).not.toHaveProperty("reset_overdue");
+
+      const response = await handleMcp('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async () => undefined, async () => direct);
+      expect(response).toMatchObject({ result: { structuredContent: { observations: expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:spark", freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number), last_known: expect.any(Object) })]) } } });
+    });
   });
 
   it("uses the daemon's atomic can_lease admission when quota_can asks for a lease", async () => {
@@ -518,6 +624,37 @@ describe("MCP stdio loop bounds its own input", () => {
 });
 
 describe("MCP direct status shares a persisted backoff across calls", () => {
+  it("uses the response clock after a delayed direct poll crosses freshness and reset boundaries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-response-clock-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const requestedAt = new Date("2026-09-03T12:00:00Z");
+    const responseAt = new Date("2026-09-03T12:02:00Z");
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      store.insert({
+        ...fixture(),
+        fetched_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(),
+        observed_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(),
+        resets_at: requestedAt.toISOString(),
+      });
+      store.close();
+      const clocks = [requestedAt, responseAt];
+      const result = await directStatus({
+        now: () => clocks.shift()!,
+        poll: async () => ({ observations: [], failures: [] }),
+      });
+      const row = (result.observations as Observation[]).find((item) => item.meter_id === "codex-main:main");
+      expect(row).toMatchObject({
+        freshness: "stale",
+        last_known: { used_percent: 20, age_seconds: 16 * 60 },
+        resets_in_seconds: 0,
+        resets_in: "0m",
+        reset_overdue: true,
+        reset_overdue_seconds: 120,
+      });
+    });
+  });
+
   it("skips a fresh poll and returns cached observations within the same poll interval", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-backoff-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });

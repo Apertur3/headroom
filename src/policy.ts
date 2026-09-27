@@ -1,5 +1,5 @@
 import { expandHome } from "./paths.js";
-import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetSecondsRemaining } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 export interface Policy {
@@ -119,19 +119,42 @@ function nextPollHint(observation: Observation, fetchedAtMs: number, policy: Pol
   return `; next poll ~${formatClockTime(new Date(expectedAt))}`;
 }
 
+/** True for a held reading: store.ts's vendor-window consistency guard (see
+ * issue #55) freezes it at its last confirmed baseline while a new vendor
+ * identity awaits a second matching poll, or while two vendor readings have
+ * flip-flopped between windows. Exported so pace.ts's effectiveFreshness can
+ * apply the same "never capacity" rule to the served freshness label,
+ * central to paceDecision and freshnessGate below. */
+export function isHeldReading(observation: Observation): boolean {
+  return Boolean(observation.metadata?.vendor_window_held || observation.metadata?.vendor_inconsistent);
+}
+
+/** Whole minutes since `fetchedAt`, clamped at 0; 0 when it cannot be
+ * parsed at all, which only ever feeds held-window reason text below. */
+export function ageMinutesSince(fetchedAt: string, now: Date): number {
+  const fetched = new Date(fetchedAt).getTime();
+  return Number.isFinite(fetched) ? Math.max(0, Math.floor((now.getTime() - fetched) / 60_000)) : 0;
+}
+
 /** A held reading (store.ts's vendor-window consistency guard: see issue
  * #55) is deliberately frozen at its last confirmed baseline while a new
  * vendor identity awaits a second matching poll -- its growing age is
- * evidence of that wait, not of a dead poller or exhausted capacity. Once it
- * crosses the ordinary staleness threshold, label it as held rather than
- * generically "stale Nm": that phrasing reads as "the source stopped
- * answering" or "this may be spent," neither of which is true here, and it
- * gives no recovery path. This is checked ahead of the plain staleness
- * reason in both paceDecision and freshnessGate, never instead of it -- the
- * pace state stays UNKNOWN and the gate still fails closed by default,
- * exactly like any other unconfirmed reading; only the explanation changes. */
-function heldWindowReason(observation: Observation, ageMinutes: number): string | undefined {
-  if (!observation.metadata?.vendor_window_held && !observation.metadata?.vendor_inconsistent) return undefined;
+ * evidence of that wait, not of a dead poller or exhausted capacity. Label it
+ * as held rather than generically "stale Nm": that phrasing reads as "the
+ * source stopped answering" or "this may be spent," neither of which is true
+ * here, and it gives no recovery path. A held reading is UNKNOWN immediately,
+ * at any age -- see isHeldReading's callers in paceDecision and
+ * freshnessGate below, which use this text as their own reason; pace.ts's
+ * effectiveFreshness also fails a held reading closed immediately (served
+ * `freshness: "stale"`) but leaves its own `reason` field untouched while
+ * still within stalenessMinutes, since several renderers (browser-report,
+ * dashboard, status-view) already build their own held-specific note
+ * straight from the metadata flags rather than reading this text off the
+ * observation. Either way the pace state and the served freshness both fail
+ * closed from the first poll that holds it, exactly like any other
+ * unconfirmed reading. */
+export function heldWindowReason(observation: Observation, ageMinutes: number): string | undefined {
+  if (!isHeldReading(observation)) return undefined;
   return `held window past reset, unconfirmed (${ageMinutes}m since the last accepted reading); the vendor has not confirmed the new window yet -- wait for the next poll, or re-run headroom status once it reports one`;
 }
 
@@ -152,6 +175,11 @@ export function paceDecision(observation: Observation | undefined, policy = defa
     return { state: "DOWN", reason: observation.reason ?? "local pool down" };
   }
   if (observation.window?.kind === "count") return { state: "NORMAL", reason: "availability count" };
+  // A held reading is UNKNOWN immediately, at any age -- see isHeldReading.
+  // This is checked ahead of every other classification (including
+  // not_enforced) so a frozen, unconfirmed baseline can never be treated as
+  // capacity while it waits out its hold.
+  if (isHeldReading(observation)) return { state: "UNKNOWN", reason: heldWindowReason(observation, ageMinutesSince(observation.fetched_at, now))! };
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   const parsedFetchedAt = new Date(observation.fetched_at).getTime();
   if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(observation, parsedFetchedAt, policy, now)}` };
@@ -220,6 +248,9 @@ export interface FreshnessOutcome {
  */
 export function freshnessGate(observation: Observation | undefined, staleMinutes: number, now: Date): FreshnessOutcome {
   if (!observation) return { ok: false, reason: "no observation" };
+  // A held reading fails closed immediately, at any age -- see isHeldReading
+  // and paceDecision's identical ordering above.
+  if (isHeldReading(observation)) return { ok: false, reason: heldWindowReason(observation, ageMinutesSince(observation.fetched_at, now))! };
   if (observation.freshness === "not_enforced") return { ok: true, reason: "not enforced", notEnforced: true };
   if (observation.freshness === "stale") return { ok: false, reason: observation.reason ?? "stale" };
   if (observation.freshness !== "fresh") return { ok: false, reason: observation.reason ?? observation.freshness };
@@ -352,7 +383,7 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   // `label value STATE` form, since there the trailing state word is the pace
   // classification of a real percentage, not a duplicate of it.
   if (deciding.state === "UNKNOWN") return { state: deciding.state, reason: `${windowLabel(deciding.observation)} UNKNOWN (${deciding.reason})` };
-  const seconds = resetsIn(deciding.observation.resets_at, now).resets_in_seconds;
+  const seconds = resetSecondsRemaining(deciding.observation.resets_at, now);
   const resetSuffix = seconds === null ? "" : `, resets in ${formatResetsInCoarse(seconds)}`;
   return {
     state: deciding.state,
