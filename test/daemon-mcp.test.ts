@@ -12,6 +12,7 @@ import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -51,36 +52,29 @@ function pipeServerProof(token: string, serverNonce: string, clientNonce: string
   return createHmac("sha256", token).update(`headroom-pipe-server-v2:${serverNonce}:${clientNonce}:${requestHash}:${replyHash}`).digest("hex");
 }
 
-/**
- * handleLine() requires the Windows pipe-auth handshake (a proof of a
- * per-connection nonce) for every method but "health" -- production code
- * always supplies a real nonce from handleSocket(). Tests that call
- * handleLine() directly are exercising request dispatch, not the pipe
- * transport itself (test/pipe-auth.test.ts covers that), so on win32 they
- * authenticate the same way a real client would: force a known session
- * token onto the daemon, then sign a fresh nonce the same way rpc() does.
- * handleLine() itself now returns the reply and its transcript-proof frame
- * as two separate wire lines (src/daemon.ts's HandledLine) rather than one
- * object; this helper parses the reply line back into the plain
- * `{id, result, error}` shape every call site in this file already expects,
- * so none of them need to know the wire format changed.
- */
-async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> {
-  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ replyLine: string; proofLine?: string; authenticated: boolean }> };
-  if (process.platform !== "win32") { const { replyLine } = await internal.handleLine(line); return JSON.parse(replyLine); }
-  internal.sessionToken ??= randomBytes(32).toString("hex");
-  const nonce = randomBytes(16).toString("hex");
-  // A malformed line (null, a number, an array, invalid JSON) is passed through
-  // unchanged so the test exercises the daemon's own rejection of it.
-  let request: { params?: Record<string, unknown> } | null = null;
-  try { const parsed: unknown = JSON.parse(line); request = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as { params?: Record<string, unknown> } : null; } catch { request = null; }
-  if (!request) { const { replyLine } = await internal.handleLine(line, nonce); return JSON.parse(replyLine); }
-  const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
-  const { replyLine } = await internal.handleLine(JSON.stringify({ ...request, params }), nonce);
-  return JSON.parse(replyLine);
-}
-
 describe("daemon JSON-RPC", () => {
+  it("admits only one concurrent gate lease through daemon RPC", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-gate-lease-race-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      await writeFile(join(root, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+      const store = await HeadroomStore.open(root);
+      try {
+        const now = new Date().toISOString();
+        store.insert({ ...fixture(), resets_at: new Date(Date.now() + 4 * 60 * 60_000).toISOString(), observed_at: now, fetched_at: now });
+      } finally { store.close(); }
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
+      try {
+        const call = (owner: string) => authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: owner, method: "gate", params: { meter: "codex-main:main", owner, needs: [{ window: "5h", points: 60 }], lease: true, expect: 60, ttl_ms: 3_600_000 } }));
+        const [first, second] = await Promise.all([call("lane-a"), call("lane-b")]);
+        const results = [first, second].map((reply) => reply.result as { allowed: boolean; lease_id: string | null });
+        expect(results.filter((result) => result.allowed)).toHaveLength(1);
+        expect(results.filter((result) => !result.allowed && result.lease_id === null)).toHaveLength(1);
+        const checked = await HeadroomStore.open(root);
+        try { expect(checked.leases(undefined, true)).toHaveLength(1); } finally { checked.close(); }
+      } finally { await daemon.stop(); }
+    });
+  });
+
   it("keeps a warm local Antigravity read running while its remote source is backed off", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-warm-")); temporary.push(root);
     const options: Array<Record<string, unknown> | undefined> = [];
@@ -317,6 +311,67 @@ describe("MCP JSON-RPC", () => {
       expect(first).toMatchObject({ result: { structuredContent: { source: "direct", decision: { allowed: true }, leased_id: expect.any(String) } } });
       expect(second).toMatchObject({ result: { structuredContent: { source: "direct", decision: { allowed: false }, leased_id: null } } });
     });
+  });
+
+  it("never opens a direct quota_gate lease when the requested window is refused", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-gate-lease-refused-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      await writeFile(join(root, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+      const store = await HeadroomStore.open(root);
+      try {
+        const now = new Date().toISOString();
+        store.insert({ ...fixture(), quantity: { used: 40, limit: 100, remaining: 60, unit: "percent" }, resets_at: new Date(Date.now() + 4 * 60 * 60_000).toISOString(), observed_at: now, fetched_at: now });
+      } finally { store.close(); }
+      const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:60"],"meter":"codex-main:main","owner":"lane-a","lease":true,"expect":60,"ttl_ms":3600000}}}', async () => undefined);
+      expect(response).toMatchObject({ result: { structuredContent: { source: "direct", allowed: false, lease_id: null } } });
+      const checked = await HeadroomStore.open(root);
+      try { expect(checked.leases(undefined, true)).toEqual([]); } finally { checked.close(); }
+    });
+  });
+
+  it("opens a direct quota_gate lease only with the granted decision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-gate-lease-granted-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      await writeFile(join(root, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+      const store = await HeadroomStore.open(root);
+      try {
+        const now = new Date().toISOString();
+        store.insert({ ...fixture(), resets_at: new Date(Date.now() + 4 * 60 * 60_000).toISOString(), observed_at: now, fetched_at: now });
+      } finally { store.close(); }
+      const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:60"],"meter":"codex-main:main","owner":"lane-a","lease":true,"expect":60,"ttl_ms":3600000}}}', async () => undefined);
+      const id = (response as { result: { structuredContent: { lease_id: string } } }).result.structuredContent.lease_id;
+      expect(response).toMatchObject({ result: { structuredContent: { source: "direct", allowed: true, lease_id: expect.any(String) } } });
+      const checked = await HeadroomStore.open(root);
+      try { expect(checked.leases(undefined, true)).toEqual([expect.objectContaining({ id, owner: "lane-a", meter_id: "codex-main:main", expected_percent: 60 })]); } finally { checked.close(); }
+    });
+  });
+
+  it("admits only one concurrent direct quota_gate lease when both requests together exceed the budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-gate-lease-race-")); temporary.push(root);
+    await withHeadroomHome(root, async () => {
+      await writeFile(join(root, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+      const store = await HeadroomStore.open(root);
+      try {
+        const now = new Date().toISOString();
+        store.insert({ ...fixture(), resets_at: new Date(Date.now() + 4 * 60 * 60_000).toISOString(), observed_at: now, fetched_at: now });
+      } finally { store.close(); }
+      const call = (owner: string) => handleMcp(JSON.stringify({ jsonrpc: "2.0", id: owner, method: "tools/call", params: { name: "quota_gate", arguments: { needs: ["5h:60"], meter: "codex-main:main", owner, lease: true, expect: 60, ttl_ms: 3_600_000 } } }), async () => undefined);
+      const [first, second] = await Promise.all([call("lane-a"), call("lane-b")]);
+      const results = [first, second].map((response) => (response as { result: { structuredContent: { allowed: boolean; lease_id: string | null } } }).result.structuredContent);
+      expect(results.filter((result) => result.allowed)).toHaveLength(1);
+      expect(results.filter((result) => !result.allowed && result.lease_id === null)).toHaveLength(1);
+      const checked = await HeadroomStore.open(root);
+      try { expect(checked.leases(undefined, true)).toHaveLength(1); } finally { checked.close(); }
+    });
+  });
+
+  it("forwards quota_gate's atomic lease fields to the daemon unchanged", async () => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:7"],"meter":"codex-main:main","owner":"lane-a","lease":true,"expect":7,"ttl_ms":3600000}}}', async (method, params) => {
+      expect(method).toBe("gate");
+      expect(params).toMatchObject({ meter: "codex-main:main", owner: "lane-a", lease: true, expect: 7, ttl_ms: 3_600_000, needs: [{ window: "5h", points: 7 }] });
+      return { allowed: true, reason: "fits", meters_checked: ["codex-main:main"], lease_id: "atomic-gate-lease" };
+    });
+    expect(response).toMatchObject({ result: { structuredContent: { allowed: true, lease_id: "atomic-gate-lease" } } });
   });
 
   it("never spawns the Claude probe from a direct (no-daemon) MCP status read once a keychain grant marker exists", async () => {

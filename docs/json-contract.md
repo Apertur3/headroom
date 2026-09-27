@@ -182,7 +182,8 @@ daemon) fallback.
 
 `{ contract, generated_at, allowed: boolean, reason: string, meters_checked:
 string[], not_enforced?: Array<"5h" | "wk">, unknown?: true,
-lanes_remaining_for_class?: number | null, notices: string[] }`. `not_enforced`
+lanes_remaining_for_class?: number | null, notices: string[], lease_id?: string |
+null }`. `not_enforced`
 lists needs skipped because their window is not enforced on the deciding meter
 -- informational, never a refusal on its own. `unknown: true` (present only on
 some refusals) means the refusal is because a needed window's usage could not
@@ -194,6 +195,13 @@ unscheduled reset (issue #20) in the last 24 hours -- `["unscheduled reset on
 codex-main:main at 2026-09-08T01:24:26Z; capacity appeared, re-plan"]` --
 empty when none; treat it like a free reset just landed, not like the
 scheduled boundary the rest of this result already accounts for.
+
+With `--lease` / `lease: true`, `lease_id` is the first id in the atomically
+created lease group when allowed, and `null` when refused. It is absent for an
+advisory gate. The lease reserves the largest requested need unless `--expect`
+/ `expect` supplies a larger value; a smaller expectation is invalid because it
+would make the reservation understate the gate's request. That expectation is
+also checked against every requested window before the lease is written.
 
 Exit codes: `2` when refused (`allowed: false`, `unknown` or not); `0` when
 allowed.

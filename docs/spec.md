@@ -100,9 +100,13 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
   `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
+- `headroom gate --need ... --lease [--expect N] [--ttl 30m]` : atomically re-check a
+  needs-based dispatch and reserve it on YES; a refusal creates no lease.
 - `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
-  `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+  `/usage` ingestion); `quota_gate` has the same atomic `lease`, `expect`, and `ttl` (or
+  `ttl_ms`) path;
+  see `docs/mcp-and-agents.md` for the full list and field shapes.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into

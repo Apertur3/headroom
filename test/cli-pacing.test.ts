@@ -221,6 +221,23 @@ describe("headroom plan", () => {
 });
 
 describe("headroom gate", () => {
+  it("atomically creates a lease with --lease and returns its id in JSON", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(20, 0, 4 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["gate", "--need", "5h:60", "--meter", "claude-main:all", "--owner", "lane-a", "--lease", "--expect", "60", "--ttl", "1h", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(JSON.parse(logs[0])).toMatchObject({ allowed: true, lease_id: expect.any(String) });
+    const checked = await HeadroomStore.open(home);
+    try { expect(checked.leases(undefined, true)).toEqual([expect.objectContaining({ owner: "lane-a", expected_percent: 60 })]); } finally { checked.close(); }
+  });
+
   it("exits 0 when the request fits and 2 with a named reason when it would cross the reserve", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);

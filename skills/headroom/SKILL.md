@@ -52,9 +52,12 @@ into a real reading instead of dispatching blind.
    table. Headroom has no opinion on model quality and never will.
 2. **Ask Headroom if that pool can afford it.** `headroom can <action-class>` returns YES or NO with the
    limiting meter and its pace state. Exit code 0 means yes, 2 means no.
-   Dispatch through `headroom run` so the gate and lease bracket the launched lane, or call
-   `quota_gate` and `quota_lease_start` yourself over MCP. Never launch a lane on a meter you have
-   not gated.
+   Dispatch through `headroom run` so the gate and lease bracket the launched lane. For an MCP
+   lane with explicit needs, call `quota_gate` once with `lease: true`, `meter`, `owner`, `needs`,
+   and (when known) `expect`/`ttl` in milliseconds; its YES returns `lease_id` and its NO creates no lease.
+   For an action-class-only MCP decision, `quota_can` with `lease: true` is atomic too.
+   `quota_lease_start` does not gate; never call it after a separate gate. Never launch a lane on
+   a meter you have not atomically admitted.
 3. **On NO, walk your fallback list** for that action class, in your order. Headroom only filters
    the list by budget; it never reorders it by capability.
 4. **Harvest only fungible work.** HARVEST means a meter is under its straight-line burn and the
@@ -93,14 +96,21 @@ into a real reading instead of dispatching blind.
 - `headroom inbox --session <id>` / `headroom inbox send --to <id> --kind <budget|note|handoff> --text ...` : hand-offs between orchestrators.
 - `headroom plan --meter M --until reset --reserve N` : points per remaining 5h window and the plan line.
 - `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
-- `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
+- `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X [--lease] [--expect N] [--ttl 30m]` : atomically admit and reserve a lane when `--lease` is set.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
 - MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, and `quota_route` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
 
 ## Leases
 
-Take a lease before fanning out work: `headroom lease start --owner <name> --meter <meter_id> --expect <percent> [--class <action-class>]`. Pass `--owner <name>` to `headroom can` (and to `headroom route --class <action-class> --owner <name>`, which reserves the same way) so your own reservation is not counted twice, and end the lease when the work is done. Other orchestrators on this machine see active leases.
+Take an atomic gate lease before fanning out work: `headroom gate --need 5h:N --owner <name> --meter <meter_id> --lease --expect <percent>`. Pass `--owner <name>` to `headroom can` (and to `headroom route --class <action-class> --owner <name>`, which reserves the same way) so your own reservation is not counted twice, and end the lease when the work is done. `headroom lease start` (and `quota_lease_start`) records a manual reservation only; it does not gate. Other orchestrators on this machine see active leases.
+
+## Waiting without turn churn
+
+A lane waiting on a build or reset blocks in one call, never a series of short turns. For a reset,
+run `headroom wait --meter M --until-reset --max <duration>` once. For a build, use one blocking
+shell until-loop that waits for the build condition. `quota_wait` never blocks: an MCP-only lane
+passes its suggested sleep to one blocking wait call rather than ending turns to poll status.
 
 ## Sharing one account with other orchestrators
 

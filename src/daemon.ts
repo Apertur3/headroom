@@ -520,7 +520,7 @@ export class HeadroomDaemon {
           const action = typeof params.action_class === "string" ? params.action_class : "";
           const owner = typeof params.owner === "string" ? params.owner.trim() : "";
           const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
-          const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
+          const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : typeof params.ttl === "number" ? params.ttl : 30 * 60_000;
           if (!owner) return reject(-32602, "owner is required");
           if (expected === null || !Number.isFinite(expected) || expected < 0 || expected > 100) return reject(-32602, "expected_percent must be 0 through 100");
           const routing = await readRouting();
@@ -609,13 +609,36 @@ export class HeadroomDaemon {
             return typeof candidate.window === "string" && windowNeedMinutes(candidate.window) !== undefined && typeof candidate.points === "number" ? [{ window: candidate.window, points: candidate.points }] : [];
           });
           if (!needs.length) return reject(-32602, "needs is required");
+          const lease = params.lease === true;
+          const expected = typeof params.expect === "number" ? params.expect : Math.max(...needs.map((need) => need.points));
+          const required = Math.max(...needs.map((need) => need.points));
+          const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
+          if (lease && (!Number.isFinite(expected) || expected < 0 || expected > 100 || expected < required)) return reject(-32602, "expect must be 0 through 100 and at least every requested need");
+          if (lease && (!Number.isFinite(ttl) || ttl <= 0)) return reject(-32602, "ttl must be positive");
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
+          const now = new Date();
+          if (lease) {
+            if (!owner?.trim()) return reject(-32602, "owner is required when lease is true");
+            if (!meter || !Array.isArray(meter) && !meter.trim()) return reject(-32602, "meter is required when lease is true");
+            const admitted = this.store.admitAndStartLeases(
+              () => gateFor(this.store, needs.map((need) => ({ ...need, points: expected })), meter, reserve, params.plan === true, now, { owner, includeOwnerReservations: true, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }),
+              owner,
+              Array.isArray(meter) ? meter : meter ? [meter] : [],
+              expected,
+              ttl,
+              `gate:${actionClass ?? "manual"}`,
+              now,
+              actionClass ?? null,
+            );
+            if (admitted.leases.length) this.store.audit(caller, "lease_start", `${owner}:${admitted.leases.map((item) => item.meter_id).join(",")}`, "ok");
+            result = { ...admitted.decision, lease_id: admitted.leases[0]?.id ?? null };
+          } else result = gateFor(this.store, needs, meter, reserve, params.plan === true, now, { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve });
+          break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";

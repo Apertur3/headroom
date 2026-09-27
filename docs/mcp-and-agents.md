@@ -143,6 +143,10 @@ optional, 0-100), `ttl_ms` (number, optional, > 0; the CLI's own default is 30 m
 (string, optional), `action_class` (string, optional; attributes the lease's spend to a class for
 `quota_cost`, same as `lease start --class`).
 
+This tool does **not** gate: it records the requested lease even when the meter cannot afford it.
+Use `quota_gate` with `lease: true` for a new needs-based lane, or `quota_can` with `lease: true`
+for an action class.
+
 ```json
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_lease_start","arguments":{"owner":"triage-bot","meter_id":"codex-main:main","expected_percent":15,"ttl_ms":1800000}}}
 ```
@@ -254,7 +258,13 @@ plan`.
 `needs` (array of `"5h:15"` / `"wk:3"` strings; rejected as a whole if any entry does not match
 that shape), optional `meter`, `plan`, `reserve_percent` (0-100), `owner`, `plan_share_percent`
 (>= 0), `action_class` (adds a `lanes_remaining_for_class` figure from the learned cost for that
-class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
+class, when one exists), plus `lease` (boolean), `expect` (0-100), and `ttl` / `ttl_ms` (> 0,
+milliseconds). With
+`lease: true`, `meter` and `owner` are required: the gate is re-evaluated and its reservation is
+written in one transaction. A YES returns `lease_id`; a NO returns `lease_id: null` and creates no
+lease. `expect` defaults to the largest requested need and cannot be lower than it; `ttl` (or
+`ttl_ms`) defaults to 30 minutes. The atomically checked reservation is that expectation on every
+requested window. The pre-dispatch check: `fits: true` when the requested points fit
 the current window (and, with `plan`, the plan line); under even pacing a 5h need is also checked
 against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
 Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
@@ -264,7 +274,17 @@ produced a windowed reading at all. CLI: `headroom gate` (exit 2 when it does no
 ### `quota_wait`
 
 `meter`. Never blocks: returns the window's reset time and a suggested sleep in seconds so the
-caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
+caller can wait itself. An MCP-only lane gives that one suggested sleep to one blocking wait call;
+it must not end a sequence of short turns to poll again. CLI: `headroom wait --until-reset` blocks
+for you.
+
+### Blocking waits
+
+A lane waiting on a reset or build stays blocked in one call, never a series of short turns. For a
+reset, run `headroom wait --meter M --until-reset --max <duration>` once. For a build, use one
+blocking shell until-loop that waits for the build condition. Since `quota_wait` returns immediately,
+an MCP-only lane hands its suggested sleep to that one blocking call instead of repeatedly ending
+turns to ask again.
 
 ### `quota_fill`
 
@@ -324,10 +344,12 @@ already follows:
 
 1. Pick the pool by capability first, from your own routing table. Headroom has no opinion on
    which model is good at what, and never will.
-2. Ask `quota_can` (or `headroom can`) whether that pool can afford the action, passing your own
-   `owner` name. `allowed: true` means go; `allowed: false` means walk your own fallback list for
-   that action class, in your own order. Headroom only filters that list by budget; it never
-   reorders it by capability.
+2. For a lane with explicit window needs, call `quota_gate` once with `lease: true`, `meter`,
+   `owner`, `needs`, and (when known) `expect` and `ttl` (milliseconds). Its YES includes `lease_id`; its NO
+   creates no lease. For an action-class-only decision, `quota_can` with `lease: true` is the
+   equivalent atomic path. `quota_lease_start` does not gate and is not a follow-up to a refused
+   check. An `allowed: false` answer means walk your own fallback list for that action class, in
+   your own order. Headroom only filters that list by budget; it never reorders it by capability.
 3. Before fanning out more than a couple of agents, and after any 429 or vendor limit error, call
    `quota_status` (or `headroom`) once to refresh your picture. Don't poll in a loop; the daemon
    already owns the sampling.
@@ -337,9 +359,9 @@ already follows:
    or a declined local pool, is advice you can override, but log why in the lease note or dispatch
    record when you do.
 6. Treat UNKNOWN as no capacity. Only pass `allow_unknown: true` on purpose, never as a default.
-7. Take a lease (`quota_lease_start`) before fanning out a batch of work against a meter, and end
-   it (`quota_lease_end`) when the batch finishes, so other orchestrators on the same machine see
-   the reservation instead of racing it.
+7. End the atomic lease (`quota_lease_end`) when its lane finishes, so other orchestrators on the
+   same machine recover that reservation. Use `quota_lease_start` only for a pre-agreed manual
+   reservation, never as a check-then-lease dispatch sequence.
 8. On a shared account, take one lease per lane so the ledger can attribute what the meter
    actually moves to you, and read `quota_spend` with your own `owner` at each window boundary to
    see what your share really cost. Leave anything another session has to act on in its inbox
@@ -361,7 +383,7 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
 | `quota_rate` | `headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--json]` |
 | `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]` |
-| `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--json]` (exit 2 when it does not fit) |
+| `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--lease] [--expect <n>] [--ttl 30m] [--json]` (exit 2 when it does not fit) |
 | `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
 | `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |
 | `quota_cost` | `headroom cost [<action-class>] [--json]` |

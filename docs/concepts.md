@@ -198,6 +198,10 @@ different orchestrator has already spoken for.
 Example: `headroom lease start --owner triage-bot --meter codex-main:main --expect 15 --ttl 30m`
 reserves 15 points of `codex-main:main` for 30 minutes.
 
+`lease start` records a reservation only; it does not check whether that reservation fits. For a
+new lane, use an atomic admission (`headroom gate --lease` with explicit `--need`, or
+`headroom can --lease` for an action class) rather than a separate check followed by `lease start`.
+
 ## Plan line, gate and fill
 
 `headroom plan --meter M --reserve N` splits the weekly window's remaining percent (after the
@@ -210,6 +214,14 @@ resolving to several meters, every one of them must have a usable reading -- a m
 genuinely consumes but that has never produced a windowed reading fails the whole gate UNKNOWN by
 name, rather than being silently skipped while a different, populated meter in the same class
 answers on its own.
+
+Add `--lease` to make that gate the reservation itself: Headroom re-evaluates the gate and creates
+the lease in one SQLite transaction, returning `lease_id` only on YES. A NO creates nothing, so it
+cannot be followed by a reservation from the same documented flow. `--expect` sets the reservation
+amount and must be at least the largest `--need`; when omitted, that largest need is reserved.
+The gate checks that reservation amount against every requested window. `--ttl` defaults to 30
+minutes. A multi-meter class creates one linked lease per meter; ending the returned id ends that
+group.
 
 `policy.toml`'s `pacing` (`"even"`, the default, or `"none"`) controls two extra checks scoped to a
 5h `--need` and one owner. The pro-rata line is that owner's planned share of the window (from

@@ -631,7 +631,7 @@ async function plan(argv: string[]): Promise<number> {
 async function gate(argv: string[]): Promise<number> {
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share N] [--json]";
+  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share N] [--lease] [--expect N] [--ttl 30m] [--json]";
   if (!owner) throw new Error(usage);
   const needs: GateNeed[] = [];
   for (let index = 0; index < argv.length; index += 1) if (argv[index] === "--need") needs.push(parseGateNeed(argv[index + 1] ?? ""));
@@ -661,19 +661,44 @@ async function gate(argv: string[]): Promise<number> {
     target = claudeAccounts.map((account) => `${account.name}:${model}`);
   }
   const usePlan = argv.includes("--plan");
+  const leaseFlag = argv.includes("--lease");
+  const expectValue = option(argv, "--expect");
+  const expectOverride = expectValue === undefined ? undefined : Number(expectValue);
+  if (expectOverride !== undefined && (!Number.isFinite(expectOverride) || expectOverride < 0 || expectOverride > 100)) throw new Error("--expect must be 0 through 100");
+  const expected = leaseFlag ? Math.max(...needs.map((need) => need.points), expectOverride ?? 0) : undefined;
+  if (leaseFlag && expectOverride !== undefined && expectOverride < Math.max(...needs.map((need) => need.points))) throw new Error("--expect must be at least every requested --need");
+  const admissionNeeds = leaseFlag ? needs.map((need) => ({ ...need, points: expected! })) : needs;
+  const leaseTtl = leaseFlag ? ttl(option(argv, "--ttl")) : undefined;
   const planShareValue = option(argv, "--plan-share");
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
   const options = { owner, planSharePercent, actionClass };
-  const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
-  let result: Awaited<ReturnType<typeof gateFor>>;
+  const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass, lease: leaseFlag, expect: expected, ttl_ms: leaseTtl });
+  let result: Awaited<ReturnType<typeof gateFor>> & { lease_id?: string | null };
   if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
   else {
     directReadNotice();
     const policy = await readPolicy();
     const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    try {
+      const now = new Date();
+      if (leaseFlag) {
+        const admitted = store.admitAndStartLeases(
+          () => gateFor(store, admissionNeeds, target, policy.freeze_reserve_pct, usePlan, now, { ...options, includeOwnerReservations: true, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }),
+          owner,
+          Array.isArray(target) ? target : target ? [target] : [],
+          expected!,
+          leaseTtl!,
+          `gate:${actionClass ?? "manual"}`,
+          now,
+          actionClass ?? null,
+        );
+        result = { ...admitted.decision, lease_id: admitted.leases[0]?.id ?? null };
+        if (admitted.leases.length) store.audit("cli", "lease_start", `${owner}:${admitted.leases.map((lease) => lease.meter_id).join(",")}`, "ok");
+      } else result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, now, { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve });
+      store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no");
+    } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
@@ -683,7 +708,8 @@ async function gate(argv: string[]): Promise<number> {
   // status/rate/plan/fill do, rather than as a plain "NO".
   if (result.unknown) { console.log(`${targetLabel}  UNKNOWN (${result.reason})`); return result.allowed ? 0 : 2; }
   const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
-  console.log(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}`);
+  const lease = result.lease_id ? ` lease ${result.lease_id}` : "";
+  console.log(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}${lease}`);
   return result.allowed ? 0 : 2;
 }
 
@@ -1339,7 +1365,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
     `  import: ${PLAN_IMPORT_HELP}`,
   ].join("\n"),
-  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
+  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--lease] [--expect <N>] [--ttl 30m] [--json]",
   run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
   report: "Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]",
   ack: "Usage: headroom ack plan <principal>",

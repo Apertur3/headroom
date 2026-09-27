@@ -27,7 +27,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_status", description: "Return the latest quota windows for every Headroom meter.", inputSchema: { type: "object", properties: {} } },
   { name: "quota_can", description: "Check whether an action class can consume all of its meters. With no expect_percent, reports the learned cost and confidence for this action class; lease atomically reserves every consumed meter for the learned (or given) expectation so the next call learns too.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" }, expect_percent: { type: "number", minimum: 0, maximum: 100 }, lease: { type: "boolean" } }, required: ["action_class", "owner"] } },
   { name: "quota_events", description: "Return Headroom events since an ISO timestamp or duration resolved by the caller.", inputSchema: { type: "object", properties: { since: { type: "string" } } } },
-  { name: "quota_lease_start", description: "Reserve a meter for an orchestrator. owner defaults to this MCP session's client name and session id when omitted.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number", minimum: 0, maximum: 100 }, ttl_ms: { type: "number", exclusiveMinimum: 0 }, note: { type: "string" }, action_class: { type: "string" } }, required: ["meter_id"] } },
+  { name: "quota_lease_start", description: "Reserve a meter without checking capacity; this does not gate. owner defaults to this MCP session's client name and session id when omitted.", inputSchema: { type: "object", properties: { owner: { type: "string" }, meter_id: { type: "string" }, expected_percent: { type: "number", minimum: 0, maximum: 100 }, ttl_ms: { type: "number", exclusiveMinimum: 0 }, note: { type: "string" }, action_class: { type: "string" } }, required: ["meter_id"] } },
   { name: "quota_lease_end", description: "End a meter lease. A different owner must set force plus confirm_force and a reason, both of which are audited.", inputSchema: { type: "object", properties: { id: { type: "string" }, owner: { type: "string" }, force: { type: "boolean" }, confirm_force: { type: "boolean" }, reason: { type: "string" } }, required: ["id", "owner"] } },
   { name: "quota_leases", description: "List meter leases and estimated spend.", inputSchema: { type: "object", properties: {} } },
   { name: "quota_cost", description: "Learned median, interquartile range and sample count of spent percent, per action class.", inputSchema: { type: "object", properties: { action_class: { type: "string" } } } },
@@ -35,7 +35,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_spend", description: "Per-owner attributed spend on shared meters: how much of each window's actual movement the spend ledger books to each lease owner, with a confidence. The owner `unattributed` is movement that happened while no lease was open. since is an ISO timestamp, defaulting to 24 hours ago.", inputSchema: { type: "object", properties: { meter: { type: "string" }, owner: { type: "string" }, since: { type: "string" } } } },
   { name: "quota_inbox", description: "Read this session's hand-off messages from <HEADROOM_HOME>/inbox/<session>/, oldest first, marking each read. Read-only: sending a message is `headroom inbox send`, never this tool.", inputSchema: { type: "object", properties: { session: { type: "string" }, since: { type: "number", minimum: 0 } }, required: ["session"] } },
   { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" } }, required: ["meter"] } },
-  { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
+  { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. With lease, atomically admits and reserves the checked meters; a refusal creates no lease. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" }, lease: { type: "boolean" }, expect: { type: "number", minimum: 0, maximum: 100 }, ttl: { type: "number", exclusiveMinimum: 0 }, ttl_ms: { type: "number", exclusiveMinimum: 0 } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
   { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, need: { type: "string" } }, required: ["meter"] } },
   { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
@@ -409,21 +409,42 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
   } finally { store.close(); }
 }
 
-async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown): Promise<DirectResult> {
+async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown, lease: unknown, expectPercent: unknown, ttl: unknown, ttlMs: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
+  const leaseRequested = lease === true;
+  const required = Math.max(...needs.map((need) => need.points));
+  const expected = typeof expectPercent === "number" ? expectPercent : required;
+  const ttlValue = typeof ttlMs === "number" ? ttlMs : typeof ttl === "number" ? ttl : 30 * 60_000;
+  if (leaseRequested && (!Number.isFinite(expected) || expected < 0 || expected > 100 || expected < required)) throw new Error("expect must be 0 through 100 and at least every requested need");
+  if (leaseRequested && (!Number.isFinite(ttlValue) || ttlValue <= 0)) throw new Error("ttl must be positive");
+  if (leaseRequested && (typeof owner !== "string" || !owner.trim())) throw new Error("owner is required when lease is true");
+  if (leaseRequested && (typeof meter !== "string" || !meter.trim())) throw new Error("meter is required when lease is true");
+  const leaseOwner = typeof owner === "string" ? owner.trim() : "";
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
   try {
-    const result = gateFor(store, needs, typeof meter === "string" ? meter : undefined, reserve, usePlan === true, new Date(), {
+    const now = new Date();
+    const target = typeof meter === "string" ? meter : undefined;
+    const options = {
       owner: typeof owner === "string" ? owner : undefined,
       planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined,
       actionClass: typeof actionClass === "string" ? actionClass : undefined,
       pacing: policy.pacing,
       staleness_minutes: policy.staleness_minutes,
       reserves: policy.reserve,
-    });
+    };
+    const result = leaseRequested
+      ? (() => {
+        const admitted = store.admitAndStartLeases(
+          () => gateFor(store, needs.map((need) => ({ ...need, points: expected })), target, reserve, usePlan === true, now, { ...options, includeOwnerReservations: true }),
+          leaseOwner, target ? [target] : [], expected, ttlValue, `gate:${options.actionClass ?? "manual"}`, now, options.actionClass ?? null,
+        );
+        if (admitted.leases.length) store.audit("mcp", "lease_start", `${leaseOwner}:${admitted.leases.map((item) => item.meter_id).join(",")}`, "ok");
+        return { ...admitted.decision, lease_id: admitted.leases[0]?.id ?? null };
+      })()
+      : gateFor(store, needs, target, reserve, usePlan === true, now, options);
     store.audit("mcp", "gate", typeof meter === "string" ? meter : null, result.allowed ? "yes" : "no");
     return { source: "direct", ...result };
   } finally { store.close(); }
@@ -470,7 +491,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "spend") return directSpend(arguments_.meter, arguments_.owner, arguments_.since);
   if (method === "inbox") return directInbox(arguments_.session, arguments_.since);
   if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need);
-  if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class);
+  if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class, arguments_.lease, arguments_.expect, arguments_.ttl, arguments_.ttl_ms);
   if (method === "wait") return directWait(arguments_.meter);
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need);
   if (method === "route") return directRoute(arguments_.action_class, arguments_.owner, arguments_.allow_unknown);
@@ -577,7 +598,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "rate" ? { meter: arguments_.meter, minutes: arguments_.minutes, owner: arguments_.owner, need: arguments_.need }
       : method === "spend" ? { meter: arguments_.meter, owner: arguments_.owner, since: arguments_.since }
       : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need }
-      : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
+      : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, lease: arguments_.lease === true, expect: arguments_.expect, ttl: arguments_.ttl, ttl_ms: arguments_.ttl_ms, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, need: arguments_.need }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }

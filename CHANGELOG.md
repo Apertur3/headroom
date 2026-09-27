@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `headroom gate --lease` and MCP `quota_gate`'s `lease: true` atomically re-check a needs-based
+  dispatch and create its reservations under one SQLite write lock. A refused gate returns no
+  lease; an allowed one returns `lease_id`. `--expect` / `expect` records an explicit reservation
+  amount (defaulting to the largest requested need) and `--ttl` / `ttl` / `ttl_ms` controls its
+  lifetime.
+
+### Changed
+- Agent guidance now uses atomic gate-and-lease dispatch instead of a separate `quota_gate` then
+  `quota_lease_start` sequence; the latter is documented as a manual reservation that does not
+  gate. Waiting guidance now keeps a build or reset in one blocking call, rather than short
+  polling turns.
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed
