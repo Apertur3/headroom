@@ -92,12 +92,16 @@ into a real reading instead of dispatching blind.
 - `headroom spend [--meter M] [--owner X] [--since 24h]` : per-owner attributed spend on a shared meter.
 - `headroom inbox --session <id>` / `headroom inbox send --to <id> --kind <budget|note|handoff> --text ...` : hand-offs between orchestrators.
 - `headroom plan --meter M --until reset --reserve N [--target <points>]` : points per remaining 5h window, banked-reset advice and the plan line. Ask `quota_plan` with `target_points` before recommending a banked reset.
-- `headroom credits set --principal <name> --available <n> --expires <date>` : record a banked reset only when the human says one exists; never infer it. Never fire a reset yourself -- that is a human action in the vendor UI.
+- `headroom credits set --principal <name> --available <n> --expires <date>` : record a banked reset only when the human says one exists; never infer it. A date-only expiry is midnight UTC on that date. Never fire a reset yourself -- that is a human action in the vendor UI.
 - `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
 - MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, and `quota_route` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
+
+Credit/count meters are informational, not dispatch capacity: never name one in routing or pass
+one to `can`, `route`, or `gate`. `quota_plan` treats only a manual entry or a fresh, unheld vendor
+count explicitly marked as reset availability as banked; a prepaid balance is not a reset credit.
 
 ## Leases
 

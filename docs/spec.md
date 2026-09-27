@@ -22,7 +22,7 @@ apps or single-account CLIs. Headroom owns the second and third and keeps the fi
 |---|---|
 | Principal | One credential location: `{vendor, location}`. Claude = a config dir, Codex = a `CODEX_HOME`, Antigravity = the Google login behind `agy`, local = a base URL. Stable id, e.g. `claude-main`. |
 | Meter | One vendor-enforced limit on a principal, stable id `principal:meter`. Claude Max: `all`, `fable`, `routines`. Antigravity: `gemini`, `claude-gpt`. Codex: `main`, `spark`, `credits`. Local: `capacity`. |
-| Window | A bucket inside a meter: `kind = rolling | fixed | count`, `minutes`, `enforcement = hard | soft`. Credit counts have no duration, are informational, and do not constrain `can`. |
+| Window | A bucket inside a meter: `kind = rolling | fixed | count`, `minutes`, `enforcement = hard | soft`. Credit counts have no duration and are informational. A count meter cannot be used in a consumes entry: `can`, `route`, and `gate` refuse it even with `--allow-unknown`. |
 | Observation | One sample of one window: typed quantity (`used`, `limit`, `remaining`, `unit = percent | tokens | requests | credits`), nullable `resets_at`, `observed_at` (vendor time if given) and `fetched_at`, `source`, `truth = official | estimated`, `freshness = fresh | stale | failed | not_enforced`, `confidence 0..1`, `adapter_version`, `upstream_schema_version`. `not_enforced` is a vendor-confirmed absent cap (printed `n/a`), not an unknown read. Never a whole "reading" with mixed provenance; each datum carries its own. |
 | Consumes | An action class maps to the set of meters it draws from. A Fable call on `claude-main` consumes `claude-main:all` and `claude-main:fable`. `headroom can` checks every consumed meter; one frozen meter freezes the action. |
 | Event | Separate record with id, kind (`reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`, `source_recovered`), `origin = vendor_reported | inferred`, `confidence`, evidence (observation ids), and later corrections. Never embedded in observations. |
@@ -37,6 +37,8 @@ threshold per meter, default 15 minutes. Inferred events carry confidence and ar
 inferred; a drop from 82% to 7% during backoff is `reset_seen` with low confidence, not a fact.
 Vendor-confirmed `not_enforced` windows are ignored by `can` and `--threshold`; they are not
 reported as `UNKNOWN` because there is no vendor-enforced capacity to fail closed over.
+Informational count meters are also never capacity, but unlike a confirmed absent limit they are an
+invalid dispatch target: `can`, `route`, and `gate` refuse them rather than silently ignoring them.
 
 ## Architecture
 
@@ -101,7 +103,8 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
 - `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
   `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
 - `headroom credits [--json]`; `headroom credits set --principal <name> --available <n> --expires
-  <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`.
+  <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
+  date-only expiry is midnight UTC on that date.
 - `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]`.
 - `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted

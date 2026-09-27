@@ -572,7 +572,10 @@ export class HeadroomStore {
       principal_id: principal, meter_id: `${principal}:credits`,
       window: { kind: "count", minutes: null, enforcement: "hard" },
       quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiresAt,
-      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9,
+      // A clear is a zero-valued audit record, not a fresh capacity claim.
+      // Ranking lets it replace an earlier manual entry, while a later failed
+      // vendor read can still surface instead of disappearing behind it.
+      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: cleared ? "stale" : "fresh", confidence: 0.9,
       adapter_version: "manual", upstream_schema_version: "manual",
       metadata: { free_resets_available: available, manual: true, ...(cleared ? { manual_cleared: true } : {}) },
     };
@@ -1464,7 +1467,29 @@ export class HeadroomStore {
     return this.db.prepare(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
-        ORDER BY (CASE WHEN freshness = 'fresh' OR freshness = 'not_enforced' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
+        -- A later manual entry supersedes an earlier one, including a clear.
+        -- A cleared/expired manual fact does not hide a newer failed poll:
+        -- rank it beside that failure so the newer row can explain the live
+        -- state rather than leaving this meter blank after filtering.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced')
+                         AND NOT (source = 'manual' AND (
+                           EXISTS (
+                             SELECT 1 FROM observations AS newer_manual
+                             WHERE newer_manual.meter_id = observations.meter_id
+                               AND COALESCE(CAST(json_extract(newer_manual.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                               AND newer_manual.source = 'manual'
+                               AND (newer_manual.fetched_at > observations.fetched_at OR (newer_manual.fetched_at = observations.fetched_at AND newer_manual.id > observations.id))
+                           )
+                           OR ((COALESCE(json_extract(metadata_json, '$.manual_cleared'), 0) = 1 OR (resets_at IS NOT NULL AND julianday(resets_at) <= julianday('now')))
+                             AND EXISTS (
+                               SELECT 1 FROM observations AS newer_failed
+                               WHERE newer_failed.meter_id = observations.meter_id
+                                 AND COALESCE(CAST(json_extract(newer_failed.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                                 AND newer_failed.freshness = 'failed'
+                                 AND (newer_failed.fetched_at > observations.fetched_at OR (newer_failed.fetched_at = observations.fetched_at AND newer_failed.id > observations.id))
+                             ))
+                         ))
+                      THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current
@@ -1495,13 +1520,16 @@ export class HeadroomStore {
               OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
-            -- A reading the operator pasted from the vendor's own panel, or a
-            -- manual banked-reset entry for a field the adapter cannot expose,
-            -- stays authoritative for an hour: a failed poll in that hour (a
-            -- denied probe, a transport error) must not hide it, or the entry
-            -- would be pointless on exactly the machine where it is needed.
-            AND NOT (current.source IN ('paste', 'manual') AND peer.freshness = 'failed'
-                     AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+            -- A pasted reading stays authoritative for an hour. A live manual
+            -- banked-reset entry stays authoritative until it is cleared,
+            -- superseded, or expires: a later failed vendor poll must never
+            -- erase the one operator fact it cannot read itself.
+            AND NOT (peer.freshness = 'failed' AND (
+              (current.source = 'paste' AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+              OR (current.source = 'manual'
+                AND COALESCE(json_extract(current.metadata_json, '$.manual_cleared'), 0) = 0
+                AND (current.resets_at IS NULL OR julianday(current.resets_at) > julianday('now')))
+            ))
         )
       ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)
       .all(...(meterId === undefined ? [] : [meterId]))

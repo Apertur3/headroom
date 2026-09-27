@@ -697,7 +697,7 @@ async function plan(argv: string[]): Promise<number> {
   const bankedText = banked.lapsed
     ? `banked ${banked.available} expired${banked.expires_at ? ` ${banked.expires_at}` : ""} (${banked.source ?? "vendor"})`
     : `banked ${banked.available} available${banked.expires_at ? ` (expires ${banked.expires_at})` : ""}${banked.source ? ` (${banked.source})` : ""}`;
-  const targetText = result.target ? `  target ${result.target.points}: ${result.target.fits_now ? "fits now" : result.target.fits_with_banked ? `needs ${result.target.resets_needed} banked reset${result.target.resets_needed === 1 ? "" : "s"}` : `needs ${result.target.resets_needed} resets`}` : "";
+  const targetText = result.target ? `  target ${result.target.points}: ${result.target.fits_now ? "fits now" : result.target.resets_needed === null ? "cannot fit: each banked reset is fully reserved" : result.target.fits_with_banked ? `needs ${result.target.resets_needed} banked reset${result.target.resets_needed === 1 ? "" : "s"}` : `needs ${result.target.resets_needed} resets`}` : "";
   console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h  ${bankedText}${targetText}  ${result.advice.reason}`);
   return 0;
 }

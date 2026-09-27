@@ -12,7 +12,7 @@ import { computeFill, computePlan, evaluateBurst, evaluateProRataLine, fillClass
 import { maxMoreBeforeReset } from "./cost.js";
 import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type CanDecision, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
-import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
+import { creditSource, creditsLapsed, isCurrentBankedResetObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 import type { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
 
@@ -154,7 +154,8 @@ export interface PlanTarget {
   points: number;
   fits_now: boolean;
   fits_with_banked: boolean;
-  resets_needed: number;
+  /** null means every banked reset is fully reserved, so no finite count fits. */
+  resets_needed: number | null;
 }
 
 export interface PlanAdvice {
@@ -194,7 +195,8 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
   const plan = computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now);
-  const credits = store.latestPerWindow(`${target.principal_id}:credits`).find(isCreditsObservation);
+  const credits = store.latestPerWindow(`${target.principal_id}:credits`)
+    .find((row) => isCurrentBankedResetObservation(row, staleMinutes, now));
   const lapsed = credits ? creditsLapsed(credits, now) : false;
   const banked: BankedPlan = {
     available: usableCredits(credits, now), expires_at: credits?.resets_at ?? null,
@@ -210,10 +212,9 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
     const fitsWithBanked = targetPoints <= plan.usable_now_percent + banked.available * banked.worth_percent;
     const resetsNeeded = fitsNow ? 0
       : banked.worth_percent > 0 ? Math.ceil((targetPoints - plan.usable_now_percent) / banked.worth_percent)
-        // A 100% reserve leaves no usable capacity per reset. There is no
-        // finite solution; `available + 1` communicates "more than exist"
-        // without introducing Infinity into the JSON contract.
-        : banked.available + 1;
+        // A 100% reserve leaves no usable capacity per reset, so no finite
+        // number can fit. Null is valid JSON and says that directly.
+        : null;
     return { points: targetPoints, fits_now: fitsNow, fits_with_banked: fitsWithBanked, resets_needed: resetsNeeded };
   })();
   const expiryBeforeReset = banked.expires_at && Number.isFinite(Date.parse(banked.expires_at))
@@ -221,6 +222,8 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
   const resetHours = Math.ceil(hoursUntilReset);
   const advice: PlanAdvice = banked.available <= 0
     ? { use_now: false, reason: banked.lapsed ? "the banked reset has lapsed" : "no banked reset available", use_before: null }
+    : banked.worth_percent <= 0
+      ? { use_now: false, reason: "the reserve leaves no usable capacity per banked reset", use_before: null }
     : expiryBeforeReset
       ? { use_now: true, reason: `expires ${banked.expires_at} before the scheduled reset ${scheduledReset}; it is lost otherwise`, use_before: banked.expires_at }
       : targetResult && !targetResult.fits_now && hoursUntilReset > 24
@@ -297,6 +300,8 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   for (const id of candidates) {
     const blocked = store.dispatchBlockForMeter(id, now) ?? store.dispatchBlockForPrincipal(id.split(":")[0]);
     if (blocked) return { allowed: false, reason: blocked, meters_checked: checked };
+    const rawRows = store.latestPerWindow(id);
+    if (id.endsWith(":credits") || rawRows.some((row) => row.window?.kind === "count")) return { allowed: false, reason: `count meter ${id} cannot be used for dispatch`, meters_checked: checked };
     const { short, long } = meterWindows(store, id);
     if (!short && !long) {
       // A meter with zero readings of ANY kind is treated the same as a
@@ -310,9 +315,8 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       // target already does below, instead of silently being skipped while
       // a different, populated meter in the same --class carries the
       // answer.
-      const rawRows = store.latestPerWindow(id);
-      const localOrCountOnly = rawRows.length > 0 && rawRows.every((row) => row.window?.kind === "state" || row.window?.kind === "count");
-      if (localOrCountOnly) continue;
+      const localOnly = rawRows.length > 0 && rawRows.every((row) => row.window?.kind === "state");
+      if (localOnly) continue;
       return { allowed: false, reason: meterUnknownReason(store, id, `no windowed reading for ${id}`), meters_checked: checked, unknown: true };
     }
     checked.push(id);

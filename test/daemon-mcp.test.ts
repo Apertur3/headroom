@@ -11,6 +11,7 @@ import { tailDaemonLog } from "../src/logs.js";
 import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 import type { Observation } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -49,35 +50,6 @@ function pipeAuthProof(token: string, nonce: string): string {
  * pipe-auth.test.ts and in case a future test here needs to verify one. */
 function pipeServerProof(token: string, serverNonce: string, clientNonce: string, requestHash: string, replyHash: string): string {
   return createHmac("sha256", token).update(`headroom-pipe-server-v2:${serverNonce}:${clientNonce}:${requestHash}:${replyHash}`).digest("hex");
-}
-
-/**
- * handleLine() requires the Windows pipe-auth handshake (a proof of a
- * per-connection nonce) for every method but "health" -- production code
- * always supplies a real nonce from handleSocket(). Tests that call
- * handleLine() directly are exercising request dispatch, not the pipe
- * transport itself (test/pipe-auth.test.ts covers that), so on win32 they
- * authenticate the same way a real client would: force a known session
- * token onto the daemon, then sign a fresh nonce the same way rpc() does.
- * handleLine() itself now returns the reply and its transcript-proof frame
- * as two separate wire lines (src/daemon.ts's HandledLine) rather than one
- * object; this helper parses the reply line back into the plain
- * `{id, result, error}` shape every call site in this file already expects,
- * so none of them need to know the wire format changed.
- */
-async function authedHandleLine(daemon: HeadroomDaemon, line: string): Promise<{ id?: unknown; result?: unknown; error?: { code: number; message: string } }> {
-  const internal = daemon as unknown as { sessionToken?: string; handleLine(line: string, nonce?: string): Promise<{ replyLine: string; proofLine?: string; authenticated: boolean }> };
-  if (process.platform !== "win32") { const { replyLine } = await internal.handleLine(line); return JSON.parse(replyLine); }
-  internal.sessionToken ??= randomBytes(32).toString("hex");
-  const nonce = randomBytes(16).toString("hex");
-  // A malformed line (null, a number, an array, invalid JSON) is passed through
-  // unchanged so the test exercises the daemon's own rejection of it.
-  let request: { params?: Record<string, unknown> } | null = null;
-  try { const parsed: unknown = JSON.parse(line); request = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as { params?: Record<string, unknown> } : null; } catch { request = null; }
-  if (!request) { const { replyLine } = await internal.handleLine(line, nonce); return JSON.parse(replyLine); }
-  const params = { ...(request.params ?? {}), _proof: pipeAuthProof(internal.sessionToken, nonce) };
-  const { replyLine } = await internal.handleLine(JSON.stringify({ ...request, params }), nonce);
-  return JSON.parse(replyLine);
 }
 
 describe("daemon JSON-RPC", () => {

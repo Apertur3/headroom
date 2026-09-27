@@ -217,7 +217,7 @@ describe("CLI --json field shapes", () => {
     const home = await newHome("plan");
     await seedBasic(home);
     const { logs, restore } = captureLog();
-    try { await withHeadroomHome(home, () => main(["plan", "--meter", "claude-main:all", "--until", "reset", "--json"])); } finally { restore(); }
+    try { await withHeadroomHome(home, () => main(["plan", "--meter", "claude-main:all", "--until", "reset", "--target", "20", "--json"])); } finally { restore(); }
     await compareToFixture("cli-plan", JSON.parse(logs[0]));
   });
 
@@ -429,7 +429,7 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
   it("quota_plan", async () => {
     const home = await newHome("mcp-plan");
     await seedBasic(home);
-    const result = await withHeadroomHome(home, () => call("quota_plan", { meter: "claude-main:all" }));
+    const result = await withHeadroomHome(home, () => call("quota_plan", { meter: "claude-main:all", target_points: 20 }));
     await compareToFixture("mcp-quota_plan", result);
   });
 

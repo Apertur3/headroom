@@ -23,6 +23,12 @@
   "remaining_5h_windows": "number",
   "reserve_percent": "number",
   "source": "string",
+  "target": {
+    "fits_now": "boolean",
+    "fits_with_banked": "boolean",
+    "points": "number",
+    "resets_needed": "number"
+  },
   "usable_now_percent": "number",
   "weekly_remaining_percent": "number"
 }

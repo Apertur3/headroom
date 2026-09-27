@@ -10,6 +10,11 @@ All notable changes to this project are documented here. The format follows
 
 - Add auditable manual banked-reset entries (`headroom credits`), reset-aware `plan --target` advice, and matching daemon/MCP/status support (#71).
 
+### Fixed
+
+- Keep informational count meters out of dispatch decisions: `can`, `route`, and `gate` now refuse them even with `--allow-unknown`; only explicitly marked, current reset counts contribute to banked-reset planning. Manual reset entries survive failed vendor polls until cleared, superseded, or expired.
+- Treat credit expiry as lapsed at its exact instant, retain UTC calendar semantics for date-only expiry input and status, and report a fully reserved banked-reset target as impossible instead of inventing a finite reset count.
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed

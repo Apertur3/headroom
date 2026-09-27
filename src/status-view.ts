@@ -43,6 +43,15 @@ function formatDay(value: string | null | undefined): string {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
 }
 
+/** Date-only manual-credit expiry inputs are defined as UTC calendar dates;
+ * render credits in that same calendar rather than shifting them by locale. */
+function formatCreditExpiryDay(value: string | null | undefined): string {
+  if (!value) return "?";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "?";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" }).format(date);
+}
+
 /** Same short window word `label()` below uses, from a bare minutes number
  * rather than an observation -- for a `last_known.window_minutes`, which
  * names a different window than the one the reading is attached to. */
@@ -166,9 +175,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   if (isCredits(observation)) {
     const available = observation.quantity?.remaining ?? 0;
     const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
-    const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${formatDay(observation.resets_at)})` : "";
+    const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${formatCreditExpiryDay(observation.resets_at)})` : "";
     const manual = observation.source === "manual" ? " (manual)" : "";
-    if (creditsLapsed(observation, now)) return `credits ${available} expired ${formatDay(observation.resets_at)}${manual}`;
+    if (creditsLapsed(observation, now)) return `credits ${available} expired ${formatCreditExpiryDay(observation.resets_at)}${manual}`;
     return `credits ${available} available${expiry}${manual}`;
   }
   // resetSeen may carry resets.ts's unscheduled marker (issue #20): a reset
@@ -413,8 +422,8 @@ function creditsCell(observation: Observation, now: Date): string {
   const available = observation.quantity?.remaining ?? 0;
   const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
   const manual = observation.source === "manual" ? " (manual)" : "";
-  if (creditsLapsed(observation, now)) return `${available} expired${date && !Number.isNaN(date.getTime()) ? ` ${formatDay(observation.resets_at)}` : ""}${manual}`;
-  return `${available} available${date && !Number.isNaN(date.getTime()) ? `, expire ${formatDay(observation.resets_at)}` : ""}${manual}`;
+  if (creditsLapsed(observation, now)) return `${available} expired${date && !Number.isNaN(date.getTime()) ? ` ${formatCreditExpiryDay(observation.resets_at)}` : ""}${manual}`;
+  return `${available} available${date && !Number.isNaN(date.getTime()) ? `, expire ${formatCreditExpiryDay(observation.resets_at)}` : ""}${manual}`;
 }
 
 /** Everything the default line deliberately leaves out: the reserve, the

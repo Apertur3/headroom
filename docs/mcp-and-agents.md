@@ -247,7 +247,10 @@ CLI: `headroom rate --meter M`.
 >= 0). `need` selects a vendor-reported window. Returns the weekly points available per remaining
 5h window before the weekly reset, the plan line, banked-reset availability and advisory use-now
 guidance; with `target_points`, it also says whether the target fits now or after banked resets.
-Fails UNKNOWN if the weekly window's own reading is stale, failed, or older than
+Only a manual credit or a fresh, unheld vendor count marked `free_resets_available` is banked-reset
+capacity; a prepaid balance is not. At a 100% reserve, `resets_needed` is `null` when the target
+does not already fit, and advice never recommends using a zero-worth reset. Fails UNKNOWN if the
+weekly window's own reading is stale, failed, or older than
 `staleness_minutes`. CLI: `headroom plan`.
 
 ### `quota_gate`

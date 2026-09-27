@@ -223,7 +223,10 @@ export function freshnessGate(observation: Observation | undefined, staleMinutes
   if (observation.freshness === "not_enforced") return { ok: true, reason: "not enforced", notEnforced: true };
   if (observation.freshness === "stale") return { ok: false, reason: observation.reason ?? "stale" };
   if (observation.freshness !== "fresh") return { ok: false, reason: observation.reason ?? observation.freshness };
-  if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { ok: false, reason: observation.reason ?? "missing window or quantity" };
+  // Count observations have no percentage limit or duration, but callers
+  // that use a vendor count as an advisory fact still need the same age gate.
+  const isCount = observation.window?.kind === "count";
+  if (!observation.quantity || (!isCount && (observation.quantity.limit === null || !observation.window?.minutes))) return { ok: false, reason: observation.reason ?? "missing window or quantity" };
   const fetched = new Date(observation.fetched_at).getTime();
   if (!Number.isFinite(fetched)) return { ok: false, reason: "invalid fetch time" };
   const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
@@ -313,6 +316,13 @@ export interface CanDecision {
   local_meter_considered?: boolean;
 }
 
+interface MeterDecision extends Omit<MeterPaceDecision, "meter"> { dispatchable: boolean; }
+
+function isCountMeter(meter: string, observations: Observation | Observation[] | undefined): boolean {
+  const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
+  return meter.endsWith(":credits") || windows.some((observation) => observation.window?.kind === "count");
+}
+
 function windowLabel(observation: Observation): string {
   const minutes = observation.window?.minutes;
   if (minutes === 300) return "5h";
@@ -327,23 +337,29 @@ function windowValue(observation: Observation, state: PaceState): string {
   return state === "NOT_ENFORCED" ? "n/a" : observation.quantity ? `${Math.round(observation.quantity.used)}%` : "UNKNOWN";
 }
 
-function meterDecision(meter: string, observations: Observation | Observation[] | undefined, policy: Policy, now: Date): Omit<MeterPaceDecision, "meter"> {
+function meterDecision(meter: string, observations: Observation | Observation[] | undefined, policy: Policy, now: Date): MeterDecision {
   const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
+  // Counts are informational facts, never an allowance an action can spend.
+  // Check the meter id too so --allow-unknown cannot make an unread credits
+  // meter dispatchable before its first observation arrives.
+  if (isCountMeter(meter, windows)) {
+    return { state: "UNKNOWN", reason: `count meter ${meter} cannot be used for dispatch`, dispatchable: false };
+  }
   // No reading at all (a fresh install, a misspelled routing meter, or an
   // absent adapter) is UNKNOWN, never NOT_ENFORCED: NOT_ENFORCED is a
   // vendor-confirmed absent limit, which requires an actual observation to
   // confirm it. An empty set must fail closed like any other unknown state.
-  if (!windows.length) return { state: "UNKNOWN", reason: `no readings for ${meter}` };
+  if (!windows.length) return { state: "UNKNOWN", reason: `no readings for ${meter}`, dispatchable: true };
   const enforced = windows
     .filter((observation) => observation.window?.kind !== "count")
     .map((observation) => ({ observation, ...paceDecision(observation, policy, now) }))
     .filter((window) => window.state !== "NOT_ENFORCED");
-  if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced" };
+  if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced", dispatchable: true };
   const deciding = enforced.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
   if (deciding.state === "UP" || deciding.state === "BUSY" || deciding.state === "DOWN") {
     const metadata = deciding.observation.metadata;
     const model = metadata?.model_ids?.[0] ?? "unknown";
-    return { state: deciding.state, reason: `${deciding.state}, model ${model}, ${metadata?.running ?? deciding.observation.quantity?.used ?? 0} running` };
+    return { state: deciding.state, reason: `${deciding.state}, model ${model}, ${metadata?.running ?? deciding.observation.quantity?.used ?? 0} running`, dispatchable: true };
   }
   // A window with no percentage (a failed/stale/missing read) already carries
   // its own explanation from paceDecision; repeating the bare state word after
@@ -351,12 +367,13 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   // hid the actual reason. Every other state still gets the original
   // `label value STATE` form, since there the trailing state word is the pace
   // classification of a real percentage, not a duplicate of it.
-  if (deciding.state === "UNKNOWN") return { state: deciding.state, reason: `${windowLabel(deciding.observation)} UNKNOWN (${deciding.reason})` };
+  if (deciding.state === "UNKNOWN") return { state: deciding.state, reason: `${windowLabel(deciding.observation)} UNKNOWN (${deciding.reason})`, dispatchable: true };
   const seconds = resetsIn(deciding.observation.resets_at, now).resets_in_seconds;
   const resetSuffix = seconds === null ? "" : `, resets in ${formatResetsInCoarse(seconds)}`;
   return {
     state: deciding.state,
     reason: `${windowLabel(deciding.observation)} ${windowValue(deciding.observation, deciding.state)} ${deciding.state}${resetSuffix}`,
+    dispatchable: true,
   };
 }
 
@@ -374,7 +391,11 @@ export function canConsume(meters: string[], observations: Map<string, Observati
   if (!meters.length) throw new Error("An action must consume at least one meter");
   const states = meters.map((meter) => ({ meter, ...meterDecision(meter, observations.get(meter), policy, now) }));
   const limiting = states.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
-  return { allowed: !states.some((item) => item.state === "FREEZE" || item.state === "DOWN" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)), ...limiting, meters: states };
+  return {
+    allowed: !states.some((item) => !item.dispatchable || item.state === "FREEZE" || item.state === "DOWN" || item.state === "CONSERVE" || (item.state === "UNKNOWN" && !allowUnknown)),
+    meter: limiting.meter, state: limiting.state, reason: limiting.reason,
+    meters: states.map(({ meter, state, reason }) => ({ meter, state, reason })),
+  };
 }
 
 /** Select local capacity as an alternative route without weakening subscription
@@ -385,6 +406,10 @@ export function canRoute(
   localPreference: "fallback" | "prefer" | "never", policy = defaultPolicy, allowUnknown = false, now = new Date(),
 ): CanDecision {
   const subscriptions = canConsume(subscriptionMeters, observations, policy, allowUnknown, now);
+  // A count meter is an invalid consumes target, not a subscription that a
+  // local preference may replace. Otherwise `prefer` could silently turn a
+  // misconfigured credits action into a dispatch to local capacity.
+  if (subscriptionMeters.some((meter) => isCountMeter(meter, observations.get(meter)))) return { ...subscriptions, local_preference: localPreference, local_meter_considered: false };
   const localAvailable = localMeters.length > 0;
   const fallbackEligible = subscriptions.meters.length > 0 && subscriptions.meters.every((item) => item.state === "CONSERVE" || item.state === "FREEZE");
   const consider = localAvailable && localPreference !== "never" && (localPreference === "prefer" || fallbackEligible);

@@ -4,9 +4,10 @@ import { encodeResetSeen, formatClockTime } from "../src/resets.js";
 import { explainUnknown, renderStatus, statusViewOptions, type StatusViewInput, type StatusViewOptions } from "../src/status-view.js";
 import type { Lease, Observation } from "../src/types.js";
 
-// Absolute reset times and credit expiries are formatted in the local zone,
-// so the snapshots below are pinned to UTC and the ambient zone is restored
-// afterwards -- test files share a worker process.
+// Absolute reset times are formatted in the local zone, while credit expiry
+// days use UTC so date-only manual entries never shift across a timezone.
+// Pin the snapshots to UTC and restore the ambient zone afterwards -- test
+// files share a worker process.
 let originalTimezone: string | undefined;
 beforeAll(() => { originalTimezone = process.env.TZ; process.env.TZ = "UTC"; });
 afterAll(() => { if (originalTimezone === undefined) delete process.env.TZ; else process.env.TZ = originalTimezone; });

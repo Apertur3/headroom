@@ -218,6 +218,8 @@ freshness: "fresh", confidence: 0.9, adapter_version: "manual",
 upstream_schema_version: "manual", metadata: { free_resets_available: number,
 manual: true } }`. `clear` keeps the same shape with `remaining: 0` and adds
 `metadata.manual_cleared: true`; neither operation deletes prior history.
+A date-only `expires` input is stored as midnight UTC and credit status renders its UTC calendar
+day, so the displayed day and lapse boundary do not change with the machine timezone.
 
 ### `plan` (`headroom plan --meter M --until reset [--target P] --json`, MCP `quota_plan`)
 
@@ -227,7 +229,7 @@ remaining_5h_windows: number, points_per_5h_window: number,
 plan_line_percent_per_hour: number, usable_now_percent: number, banked: {
 available: number, expires_at: string | null, source: "vendor" | "manual" |
 null, lapsed: boolean, worth_percent: number }, target?: { points: number,
-fits_now: boolean, fits_with_banked: boolean, resets_needed: number }, advice:
+fits_now: boolean, fits_with_banked: boolean, resets_needed: number | null }, advice:
 { use_now: boolean, reason: string, use_before: string | null }, notices:
 string[] }`. Failure (the meter
 has no weekly window, or it is stale/failed/unpolled too long): `{ contract,
@@ -235,6 +237,10 @@ generated_at, meter: string, error: string, notices: string[] }` -- a data
 state, not a CLI failure; the CLI renders it as an UNKNOWN line and always
 exits `0`. `notices` is the same unscheduled-reset line `gate` carries above
 (issue #20), scoped to this one meter; empty when none.
+`resets_needed` is `null` when the reserve gives each banked reset zero usable points and the
+target does not already fit; `advice.use_now` is then always `false`. A banked count is only a
+manual entry or a fresh, unheld vendor observation marked `free_resets_available`; other credits
+counts remain informational and contribute zero.
 
 Exit codes: always `0`.
 
