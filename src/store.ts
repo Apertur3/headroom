@@ -160,6 +160,17 @@ export function sameSemanticWindow(
   return a.kind === b.kind && (a.minutes ?? null) === (b.minutes ?? null) && a.enforcement === b.enforcement;
 }
 
+/** The durable facts notification hysteresis needs for one source outage.
+ * `last_seen_at` advances only when the collector persisted another failed
+ * observation for this exact store event. */
+export interface SourceHealthOutage {
+  event_id: string;
+  meter_id: string;
+  window: Observation["window"];
+  created_at: string;
+  last_seen_at: string;
+}
+
 export function windowSqlMatch(
   window: Observation["window"] | undefined | null,
   column = "window_json"
@@ -1473,6 +1484,13 @@ export class HeadroomStore {
 
   events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
 
+  /** One stored event by its durable ID. Notification compatibility uses this
+   * to reconstruct the deterministic delivery ID older builds used. */
+  eventById(eventId: string): HeadroomEvent | undefined {
+    const row = this.db.prepare("SELECT * FROM events WHERE id = ?").get(eventId);
+    return row ? eventFromRow(row) : undefined;
+  }
+
   /** The catalog never reports a model-to-meter mapping, so this remains a
    * deliberately conservative hint: only a current, fresh, official meter
    * can establish a dedicated bucket. A current generic meter supports the
@@ -1614,6 +1632,89 @@ export class HeadroomStore {
 
   setDaemonState(key: string, value: string): void {
     this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  /** Every persisted `source_health:` marker (notify.ts's source-health
+   * hysteresis, keyed by outage event and its semantic window), for the notifier's per-poll sweep. Mirrors
+   * planDowngrades()'s own daemon_state prefix scan. This is notify-layer-only
+   * state: the events table remains the complete, undamped truth record of
+   * every source_failed/source_recovered transition regardless of what the
+   * notifier has decided to hold back so far. */
+  sourceHealthPending(): Array<{ key: string; value: string }> {
+    return this.db.prepare("SELECT key, value FROM daemon_state WHERE key LIKE 'source_health:%'").all()
+      .map((row) => ({ key: String(row.key), value: String(row.value) }))
+      .filter((row) => row.value !== "");
+  }
+
+  /** The failed observation that opened one source outage. A source_failed
+   * event has one opening observation; later failed polls extend only its
+   * `last_seen_at`, keeping this a stable outage identity. */
+  sourceHealthOutage(eventId: string): SourceHealthOutage | undefined {
+    const row = this.db.prepare(`SELECT e.id AS event_id, e.meter_id, e.created_at, e.last_seen_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_failed'
+      ORDER BY o.id ASC LIMIT 1`).get(eventId);
+    if (!row || typeof row.event_id !== "string" || typeof row.meter_id !== "string" || typeof row.created_at !== "string") return undefined;
+    return {
+      event_id: row.event_id,
+      meter_id: row.meter_id,
+      window: row.window_json ? parseJson<Observation["window"]>(row.window_json, null) : null,
+      created_at: row.created_at,
+      last_seen_at: typeof row.last_seen_at === "string" ? row.last_seen_at : row.created_at,
+    };
+  }
+
+  private sourceHealthOutageClosedBefore(outage: SourceHealthOutage, before?: string): boolean {
+    const ending = before ? "AND e.created_at < ?" : "";
+    if (!outage.window) {
+      // This mirrors recoverWindowlessFailure(): a whole-meter outage closes
+      // on the next genuine source-recovered transition, regardless of the
+      // window that finally answered.
+      const row = this.db.prepare(`SELECT 1 FROM events e WHERE e.meter_id = ? AND e.kind = 'source_recovered'
+        AND e.created_at > ? ${ending} LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []));
+      return Boolean(row);
+    }
+    const match = windowSqlMatch(outage.window, "o.window_json");
+    const row = this.db.prepare(`SELECT 1 FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.meter_id = ? AND e.kind = 'source_recovered' AND e.created_at > ? ${ending}
+        AND o.freshness = 'fresh' AND ${match.sql}
+      LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []), ...match.params);
+    return Boolean(row);
+  }
+
+  /** The matching source outage only while it remains open. This is scoped by
+   * the failure's own semantic window: a newer fresh weekly row cannot hide
+   * an open failed 5h row, and vice versa. */
+  sourceHealthOpenOutage(eventId: string): SourceHealthOutage | undefined {
+    const outage = this.sourceHealthOutage(eventId);
+    return outage && !this.sourceHealthOutageClosedBefore(outage) ? outage : undefined;
+  }
+
+  /** Every source failure that the supplied recovery closes. This also finds
+   * failures delivered before source-health state existed, so an upgraded
+   * daemon can still deliver their legitimate recovery per channel. */
+  sourceHealthOutagesRecoveredBy(recoveryEventId: string): SourceHealthOutage[] {
+    const recovery = this.db.prepare(`SELECT e.meter_id, e.created_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_recovered' AND o.freshness = 'fresh'
+      ORDER BY o.id DESC LIMIT 1`).get(recoveryEventId);
+    if (!recovery || typeof recovery.meter_id !== "string" || typeof recovery.created_at !== "string") return [];
+    const recoveryMeter = recovery.meter_id;
+    const recoveryCreated = recovery.created_at;
+    const window = recovery.window_json ? parseJson<Observation["window"]>(recovery.window_json, null) : null;
+    const candidates = this.db.prepare("SELECT id FROM events WHERE meter_id = ? AND kind = 'source_failed' AND created_at < ? ORDER BY created_at ASC, id ASC")
+      .all(recoveryMeter, recoveryCreated)
+      .flatMap((row) => typeof row.id === "string" ? [row.id] : [])
+      .map((id) => this.sourceHealthOutage(id))
+      .filter((outage): outage is SourceHealthOutage => Boolean(outage))
+      .filter((outage) => !outage.window || sameSemanticWindow(outage.window, window));
+    return candidates.filter((outage) => !this.sourceHealthOutageClosedBefore(outage, recoveryCreated));
   }
 
   /** Atomically reserves an interval before a caller starts asynchronous
