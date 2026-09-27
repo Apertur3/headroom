@@ -261,7 +261,7 @@ export class AgyKeepaliveSupervisor {
       // long as its PTY session, so a pid written by this launch's wrapper is
       // proven to be agy right now, with no `ps` involved and no chance of a
       // recycled pid.
-      const agyPid = this.readAgyPid();
+      const agyPid = this.agyPidFile ? await this.awaitAgyPid(child) : undefined;
       const pid = child.pid;
       if (typeof pid === "number") await killTree(pid, { graceMs: this.killGraceMs });
       else child.kill("SIGTERM");
@@ -333,8 +333,23 @@ export class AgyKeepaliveSupervisor {
         recordedAt: new Date().toISOString(),
       };
       if (agyPid !== undefined && agySignature) { state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt; }
+      // The awaits above can outlive this launch: never write a stopped or
+      // replaced launch's pids over the state a newer one (or stop) left.
+      if (this.child !== child || !isAlive(child)) return;
       await writeKeepaliveState(this.stateFilePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
+  }
+
+  /** stop() right after start() can beat the wrapper to its pid file; wait
+   * (bounded) while script is alive, since agy cannot outlive an unseen pid
+   * any other way on a host where killTree's ps walk finds nothing. */
+  private async awaitAgyPid(child: ChildProcess, timeoutMs = 1_000): Promise<number | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const pid = this.readAgyPid();
+      if (pid !== undefined || !this.agyPidFile || !isAlive(child) || Date.now() >= deadline) return pid;
+      await sleep(10);
+    }
   }
 
   private readAgyPid(): number | undefined {
@@ -345,13 +360,15 @@ export class AgyKeepaliveSupervisor {
     } catch { return undefined; }
   }
 
+  /** Throws unless the file is gone afterwards: launch() must never run while
+   * a stale pid from an earlier launch could still be read as this one's. */
   private removeAgyPidFile(): void {
     if (!this.agyPidFile) return;
-    try { unlinkSync(this.agyPidFile); } catch { /* not there */ }
+    try { unlinkSync(this.agyPidFile); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
 
   private async clearState(): Promise<void> {
-    this.removeAgyPidFile();
+    try { this.removeAgyPidFile(); } catch { /* the next launch refuses to start until it can remove it */ }
     if (!this.stateFilePath) return;
     try { await unlink(this.stateFilePath); } catch { /* already gone */ }
   }

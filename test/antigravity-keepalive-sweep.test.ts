@@ -142,6 +142,66 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leav
     } finally { await supervisor.stop(); }
   }, 15_000);
 
+  it("stop() immediately after start() still reaps agy, with ps denied", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-quickstop-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, killGraceMs: 100 });
+    try {
+      await withoutPs(root, async () => {
+        supervisor.start();
+        track(supervisor.pid, root);
+        await supervisor.stop(); // races the wrapper's pid file on purpose
+        const agyPid = track(Number(await waitForFile(infoFile).catch(() => "0")), root) as number;
+        if (agyPid) await waitUntilDead(agyPid);
+      });
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("restarts only after the orphaned agy of a dead script is gone, with ps denied", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-restart-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const launches: { oldAgyAlive: boolean | undefined }[] = [];
+    let firstAgy: number | undefined;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof spawn>[2]) => {
+      launches.push({ oldAgyAlive: firstAgy === undefined ? undefined : alive(firstAgy) });
+      return spawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, spawn: spyingSpawn, restartDelay: () => 0 });
+    try {
+      await withoutPs(root, async () => {
+        supervisor.start();
+        const scriptPid = track(supervisor.pid, root) as number;
+        firstAgy = track(Number(await waitForFile(infoFile)), root) as number;
+        await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+        await rm(infoFile);
+
+        process.kill(scriptPid, "SIGKILL");
+
+        await vi.waitFor(() => expect(launches.length).toBe(2), { timeout: 5_000, interval: 20 });
+        track(supervisor.pid, root);
+        track(Number(await waitForFile(infoFile)), root);
+        expect(launches[1].oldAgyAlive).toBe(false); // reaped before the second launch began
+      });
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("refuses to launch while a stale pid file cannot be removed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stuckpid-")); temporary.push(root);
+    await mkdir(`${keepaliveStateFilePath(root)}.agy-pid`); // a directory: unlink fails with something other than ENOENT
+    const spawnCalls: string[] = [];
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: "/bin/false", home: root, restartDelay: () => 60_000,
+      spawn: ((command: string) => { spawnCalls.push(command); throw new Error("must not spawn"); }) as never,
+    });
+    try {
+      supervisor.start();
+      expect(spawnCalls).toEqual([]);
+      expect(supervisor.running).toBe(false);
+    } finally { await supervisor.stop(); }
+  });
+
   it("never signals a pid it cannot prove is agy (stale pid file after script is gone)", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-stranger-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
