@@ -86,6 +86,15 @@ export interface EffectiveFreshness {
   reason?: string | null;
 }
 
+/** The clock that already-enriched status renderers use for their accompanying
+ * pace decision. A renderer has no store-backed last_known lookup to make a
+ * second response-time age transition complete, so it stays on the response
+ * clock that produced the payload. Raw observations continue using `now`. */
+export function statusDecisionTime(observation: Observation, now = new Date()): Date {
+  const enriched = Date.parse(observation.status_enriched_at ?? "");
+  return Number.isFinite(enriched) ? new Date(enriched) : now;
+}
+
 /**
  * The freshness a reader is served, evaluated at response time rather than
  * copied from the moment a row entered SQLite. History deliberately retains
@@ -94,9 +103,26 @@ export interface EffectiveFreshness {
  * policy.ts's freshnessGate/paceDecision exactly.
  */
 export function effectiveFreshness(observation: Observation, stalenessMinutes: number, now = new Date()): EffectiveFreshness {
+  // A daemon/store response has already made this decision alongside its
+  // last_known lookup. A renderer must not subsequently turn its fresh row
+  // stale, because it cannot also supply the promised last-known reading.
+  if (observation.status_enriched_at) return { freshness: observation.freshness, reason: observation.reason };
+  // Match paceDecision's order: state and count observations have their own
+  // policy states and never enter its timestamp age gate.
+  if (observation.window?.kind === "state" || observation.window?.kind === "count") {
+    return { freshness: observation.freshness, reason: observation.reason };
+  }
   if (observation.freshness !== "fresh") return { freshness: observation.freshness, reason: observation.reason };
+  // Like paceDecision, a malformed percent-window shape is UNKNOWN for its
+  // missing data rather than a synthetic age state.
+  if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) {
+    return { freshness: observation.freshness, reason: observation.reason };
+  }
   const fetched = Date.parse(observation.fetched_at);
-  if (!Number.isFinite(fetched) || now.getTime() - fetched <= stalenessMinutes * 60_000) {
+  // paceDecision rejects this as UNKNOWN. Serve it as stale too so no
+  // renderer can present a timestamp it could not validate as fresh.
+  if (!Number.isFinite(fetched)) return { freshness: "stale", reason: "invalid fetch time" };
+  if (now.getTime() - fetched <= stalenessMinutes * 60_000) {
     return { freshness: observation.freshness, reason: observation.reason };
   }
   const ageSeconds = Math.max(0, (now.getTime() - fetched) / 1000);
@@ -150,5 +176,6 @@ export function withStatusInfo(
   now = new Date(),
 ): Array<Observation & BurnInfo & { sustainable_percent_per_hour: number | null; last_known: LastKnownReading | null } & ResetsIn> {
   const served = withEffectiveFreshness(observations, stalenessMinutes, now);
-  return withResetsIn(withLastKnown(withPaceInfo(served, burn, now), lastKnown), now);
+  return withResetsIn(withLastKnown(withPaceInfo(served, burn, now), lastKnown), now)
+    .map((item) => ({ ...item, status_enriched_at: now.toISOString() }));
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatResetsIn, formatResetsInCoarse, resetSecondsRemaining, resetsIn, withResetsIn } from "../src/resets.js";
+import { formatOverdueReset, formatResetsIn, formatResetsInCoarse, resetSecondsRemaining, resetsIn, withResetsIn } from "../src/resets.js";
 
 describe("formatResetsIn", () => {
   it("renders minutes below an hour", () => {
@@ -59,7 +59,9 @@ describe("resetsIn", () => {
   });
 
   it("reports a reset more than one minute past due as overdue", () => {
-    expect(resetsIn("2026-09-03T11:58:59Z", now)).toEqual({ resets_in_seconds: null, resets_in: "overdue 1m", reset_overdue: true });
+    const result = resetsIn("2026-09-03T11:58:59Z", now);
+    expect(result).toEqual({ resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: 61 });
+    expect(formatOverdueReset(result)).toBe("overdue 1m");
   });
 
   it("keeps overdue reset arithmetic at zero for decision paths", () => {
@@ -79,8 +81,9 @@ describe("withResetsIn", () => {
     expect(items[0]).not.toHaveProperty("resets_in_seconds"); // original left untouched
   });
 
-  it("keeps reset_overdue absent when a previously enriched item is no longer overdue", () => {
-    const [result] = withResetsIn([{ resets_at: "2026-09-03T12:12:00Z", reset_overdue: true as const }], new Date("2026-09-03T12:00:00Z"));
+  it("keeps overdue fields absent when a previously enriched item is no longer overdue", () => {
+    const [result] = withResetsIn([{ resets_at: "2026-09-03T12:12:00Z", reset_overdue: true as const, reset_overdue_seconds: 300 }], new Date("2026-09-03T12:00:00Z"));
     expect(result).not.toHaveProperty("reset_overdue");
+    expect(result).not.toHaveProperty("reset_overdue_seconds");
   });
 });

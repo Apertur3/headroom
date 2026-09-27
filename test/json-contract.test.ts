@@ -210,7 +210,7 @@ describe("CLI --json field shapes", () => {
     const rows = JSON.parse(logs[0]).observations as Observation[];
     const served = rows.find((row) => row.meter_id === "codex-main:spark");
     const normal = rows.find((row) => row.meter_id === "codex-main:main");
-    expect(served).toMatchObject({ freshness: "stale", resets_in_seconds: null, resets_in: "overdue 3d", reset_overdue: true, last_known: { used_percent: 41 } });
+    expect(served).toMatchObject({ freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number), last_known: { used_percent: 41 } });
     expect(served?.reason).toMatch(/^last accepted reading 10d ago/);
     expect(normal).toMatchObject({ freshness: "fresh" });
     expect(normal).not.toHaveProperty("reset_overdue");

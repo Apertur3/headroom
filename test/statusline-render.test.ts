@@ -251,6 +251,16 @@ describe("renderStatusline", () => {
     const line = renderStatusline(undefined, context([]), { style: "compact", meters: [], color: false }, new Date());
     expect(line).toContain("no rate limit data");
   });
+
+  it("formats an overdue payload reset from its overdue age, never 0m", () => {
+    const now = new Date("2026-09-16T12:00:00Z");
+    const line = renderStatusline(
+      { profile: "default", observed_at: Math.floor(now.getTime() / 1000), five_hour: { used_percent: 55, resets_at: Math.floor((now.getTime() - 120_000) / 1000) }, seven_day: { used_percent: 12, resets_at: null }, extra: {} },
+      context([]), { style: "compact", meters: [], color: false }, now,
+    );
+    expect(line).toContain("↻ overdue 2m");
+    expect(line).not.toContain("↻0m");
+  });
 });
 
 describe("parseRenderOptions", () => {

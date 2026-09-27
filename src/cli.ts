@@ -35,7 +35,7 @@ import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type Pla
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
-import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
+import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
@@ -1111,8 +1111,9 @@ function readClipboardText(): Promise<string> {
 export function usagePasteLine(observation: Observation, now = new Date()): string {
   const used = observation.quantity?.used ?? 0;
   const remaining = resetsIn(observation.resets_at, now);
+  const overdue = formatOverdueReset(remaining);
   const reset = observation.resets_at
-    ? remaining.reset_overdue ? `↻ ${remaining.resets_in}` : `resets ${formatReset(observation.resets_at)}${remaining.resets_in ? ` (in ${remaining.resets_in})` : ""}`
+    ? overdue ? `↻ ${overdue}` : `resets ${formatReset(observation.resets_at)}${remaining.resets_in ? ` (in ${remaining.resets_in})` : ""}`
     : "no reset in the panel";
   return `ingested ${observation.meter_id} ${label(observation)} ${Math.round(used)}% used, ${reset}`;
 }

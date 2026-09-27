@@ -60,6 +60,29 @@ describe("dashboard frames (synthetic data)", () => {
       .toContain("vendor readings inconsistent, holding");
   });
 
+  it("keeps an already-enriched daemon row on its original response clock", () => {
+    const model = fixedModel();
+    model.now = new Date(now.getTime() + 60 * 60_000);
+    model.observations = [row({ status_enriched_at: now.toISOString(), last_known: null })];
+    const frame = renderDashboard(model, { width: 100, height: 20, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).not.toContain("UNKNOWN");
+    expect(frame).toContain("20%");
+  });
+
+  it("renders an overdue response field as an overdue age, never the compatibility 0m", () => {
+    const model = fixedModel();
+    model.observations = [row({
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(),
+      resets_in_seconds: 0,
+      resets_in: "0m",
+      reset_overdue: true,
+      reset_overdue_seconds: 3 * 86_400,
+    })];
+    const frame = renderDashboard(model, { width: 100, height: 20, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).toContain("overdue 3d");
+    expect(frame).not.toContain("resets in 0m");
+  });
+
   it("keeps the overview first, scrolls a full screen, and Enter reaches the focused panel", () => {
     const model = fixedModel();
     for (let index = 0; index < 18; index++) model.observations.push(row({ principal_id: `mock-${index}`, meter_id: `mock-${index}:all`, resets_at: "2026-09-08T16:00:00Z" }));

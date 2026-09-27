@@ -170,11 +170,18 @@ function withStatus(store: HeadroomStore, observations: ReturnType<HeadroomStore
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
-export async function directStatus(): Promise<DirectResult> {
+export interface DirectStatusDependencies {
+  /** Test seam: production uses the wall clock and real collector. */
+  now?: () => Date;
+  poll?: typeof pollAccounts;
+}
+
+export async function directStatus(dependencies: DirectStatusDependencies = {}): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try {
     const policy = await readPolicy();
-    const now = Date.now();
+    const requestedAt = dependencies.now?.() ?? new Date();
+    const now = requestedAt.getTime();
     // Without a daemon scheduler, a direct MCP status call has no in-process
     // rate limit of its own; share one persisted in the database instead, so
     // repeated tool calls (or several MCP client processes reading the same
@@ -184,24 +191,28 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withStatus(store, cached, policy.staleness_minutes, new Date(now)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withStatus(store, cached, policy.staleness_minutes, requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, new Date(now)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
     // spawn the Claude probe on every call regardless of a keychain_grants
     // marker, popping a fresh dialog instead of respecting it.
     await syncClaudeProbeState(store);
-    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    const polled = await (dependencies.poll ?? pollAccounts)(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    // Polling is asynchronous. Everything sent to the caller must use the
+    // response clock, not the clock captured before a slow vendor call.
+    const responseAt = dependencies.now?.() ?? new Date();
+    const responseNow = responseAt.getTime();
     store.insertPoll(polled.observations);
     for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);
     store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
-    store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, new Date(now)), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    store.setDirectPollBackoff({ lastPollAt: responseNow, until: protectedFailure ? responseNow + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
+    return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 

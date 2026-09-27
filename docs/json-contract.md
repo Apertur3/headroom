@@ -57,7 +57,9 @@ needs the JSON meaning.
   `fresh` is served as `stale` once its `fetched_at` is older than the
   staleness threshold (15 minutes by default); its `reason` begins `last
   accepted reading <age> ago` and retains any stored explanation after it.
-  This response-time label does not rewrite history. `failed` is an errored,
+  An unparsable `fetched_at` is also served stale rather than fresh. State and
+  count observations do not use this percent-window age gate. This
+  response-time label does not rewrite history. `failed` is an errored,
   timed-out, or contradicted read. `not_enforced` means the vendor confirmed
   there is no cap at all on this window -- it never counts as UNKNOWN and
   never blocks `can`/`gate`/`fill`.
@@ -121,10 +123,13 @@ An `Observation` (the unit everything else builds on) is: `principal_id`,
 null`; `quantity: { used: number, limit: number | null, remaining: number |
 null, unit: "percent" | "tokens" | "requests" | "credits" } | null`;
 `resets_at: string | null`; `resets_in_seconds: number | null` and `resets_in:
-string | null` (computed fresh at response time, not stored). When `resets_at`
-is more than 60 seconds past, `resets_in_seconds` is `null`, `resets_in` is
-`"overdue <age>"`, and additive `reset_overdue: true` is present; it is absent
-otherwise. A reset within that tolerance remains `0m`. `observed_at`,
+string | null` (computed fresh at response time, not stored). These retain
+their contract-1.0 meanings: a due or overdue reset has `resets_in_seconds:
+0` and `resets_in: "0m"`. Agents check additive `reset_overdue: true` to
+identify an overdue schedule, and read its additive `reset_overdue_seconds:
+number` for the number of seconds since it was due; both fields are absent
+otherwise. Human output renders that state as `overdue <age>`. A reset within
+the 60-second tolerance has no overdue fields and remains `0m`. `observed_at`,
 `fetched_at` (both ISO strings); `source` (string,
 free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 `adapter_version`, `upstream_schema_version` (both strings); `reason?: string
@@ -152,7 +157,10 @@ names which window that is -- present only in this borrowed case, absent when
 `last_known` already shares the observation's own window. Informational only:
 `can`/`gate`/`route` keep treating UNKNOWN as no capacity regardless of what
 this carries); `id?: number` (present once read back from the store, as
-every `--json` reading is).
+every `--json` reading is); `status_enriched_at?: string` (the response-time
+instant that set freshness, pace, last-known and reset fields; a renderer
+preserves an already-enriched payload rather than aging it again without the
+store-backed `last_known` lookup).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at

@@ -10,7 +10,9 @@ All notable changes to this project are documented here. The format follows
 - Claude adapter: log a safe, capped form of the name (never the value) of any `/api/oauth/usage` top-level key it does not yet map, once per process, under `HEADROOM_DEBUG=1` -- so a future field (e.g. a banked/free-reset credit block) is noticed instead of silently staying unmapped. This shell variable applies to a foreground `headroom daemon`, or a direct `headroom status` read when no daemon is running; installed services do not inherit it. As of 2026-09-23 the response carries no such field; see `docs/vendors.md`'s Claude section.
 
 ### Fixed
-- Serve an old stored-fresh observation as stale, including its age and any held-window explanation, and label reset schedules older than the one-minute identity tolerance as overdue instead of `0m` across status, dashboard, HTML report, and statusline output (#72).
+- Serve an old stored-fresh percent observation as stale, including its age and any held-window explanation; invalid fetch timestamps now fail closed too, while local state and count rows keep their policy semantics. Served status carries its enrichment instant so later renderers preserve the matching `last_known` reading.
+- Keep contract-1.0 reset countdown values (`resets_in_seconds: 0`, `resets_in: "0m"`) for overdue schedules and add `reset_overdue: true` plus `reset_overdue_seconds`; status, dashboard, HTML report, statusline, and usage-paste output show `overdue <age>` from those additive fields.
+- Direct MCP status now takes its response-time freshness, burn, last-known age, and reset values after a poll completes, rather than from the pre-poll clock.
 
 ## [0.1.8] - 2026-09-27
 

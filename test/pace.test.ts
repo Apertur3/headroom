@@ -180,11 +180,28 @@ describe("effectiveFreshness", () => {
     }
   });
 
+  it("matches policy's non-age-gated state and count rows", () => {
+    const old = "2026-08-01T12:00:00Z";
+    const state = observation({ window: { kind: "state", minutes: null, enforcement: "hard" }, fetched_at: old, metadata: { state: "UP" } });
+    const count = observation({ window: { kind: "count", minutes: null, enforcement: "soft" }, fetched_at: old });
+    expect(effectiveFreshness(state, 1, now)).toEqual({ freshness: "fresh", reason: undefined });
+    expect(effectiveFreshness(count, 1, now)).toEqual({ freshness: "fresh", reason: undefined });
+  });
+
+  it("serves an invalid fetched_at as stale rather than fresh", () => {
+    expect(effectiveFreshness(observation({ fetched_at: "not a timestamp" }), 15, now)).toEqual({ freshness: "stale", reason: "invalid fetch time" });
+  });
+
   it("uses the supplied staleness_minutes and attaches last_known after a fresh row ages out", () => {
     const row = observation({ fetched_at: "2026-09-03T11:50:00Z" });
     expect(effectiveFreshness(row, 15, now).freshness).toBe("fresh");
     const known: LastKnownReading = { used_percent: 39, resets_at: row.resets_at, observed_at: "2026-09-03T11:49:00Z", age_seconds: 660 };
     const [served] = withStatusInfo([row], new Map(), new Map([["codex-main:spark:10080", known]]), 5, now);
     expect(served).toMatchObject({ freshness: "stale", last_known: known });
+  });
+
+  it("marks the complete response enrichment instant", () => {
+    const [served] = withStatusInfo([observation()], new Map(), new Map(), 15, now);
+    expect(served.status_enriched_at).toBe(now.toISOString());
   });
 });

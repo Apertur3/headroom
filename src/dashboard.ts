@@ -6,9 +6,9 @@ import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
-import { withEffectiveFreshness } from "./pace.js";
+import { statusDecisionTime, withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
-import { decodeResetSeen, formatResetsIn, resetsIn } from "./resets.js";
+import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
 import { isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
@@ -16,6 +16,10 @@ import { isLocalAccount, type HeadroomEvent, type Observation } from "./types.js
 export interface DashboardModel extends CachedDashboardModel {
   history?: Record<string, Observation[]>;
   graphEvents?: HeadroomEvent[];
+}
+
+function dashboardDecision(row: Observation, model: DashboardModel) {
+  return paceDecision(row, model.policy, statusDecisionTime(row, model.now));
 }
 
 /** An older daemon can be alive without implementing the dashboard method. */
@@ -307,7 +311,7 @@ export function renderBurndown(row: Observation, model: DashboardModel, width: n
   });
   const dayTime = (at: number): string => new Intl.DateTimeFormat(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(at));
   const axis = ends(dayTime(start), `${dayTime(reset)} reset`, width);
-  const decision = paceDecision(row, model.policy, model.now);
+  const decision = dashboardDecision(row, model);
   const used = row.quantity?.unit === "percent" && decision.state !== "UNKNOWN" && row.freshness === "fresh" ? row.quantity.used : null;
   const planned = clamp((model.now.getTime() - start) / (reset - start), 1) * 100;
   const difference = used === null ? 0 : Math.round(used - planned);
@@ -360,7 +364,7 @@ export function renderWeekly(row: Observation, model: DashboardModel, width: num
 }
 
 function windowLines(row: Observation, model: DashboardModel, view: DashboardView, sharedReason = false, showBurndown = false): string[] {
-  const decision = paceDecision(row, model.policy, model.now);
+  const decision = dashboardDecision(row, model);
   const meter = row.meter_id.startsWith(`${row.principal_id}:`) ? row.meter_id.slice(row.principal_id.length + 1) : row.meter_id;
   const key = `${row.meter_id}:${row.window?.minutes ?? "none"}`;
   if (row.window?.kind === "state") {
@@ -373,8 +377,9 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
   const used = !unknown && row.quantity?.unit === "percent" ? row.quantity.used : null;
   const narrowStack = view.width < 70;
   const bar = barFor(row, decision.state, view.ascii);
-  const resetInfo = resetsIn(row.resets_at, model.now);
+  const resetInfo = servedResetsIn(row, model.now);
   const seconds = resetInfo.resets_in_seconds;
+  const overdueText = formatOverdueReset(resetInfo);
   const glyph = { NORMAL: "●", HARVEST: "↗", CONSERVE: "⚠", FREEZE: "🛑", UNKNOWN: "?", NOT_ENFORCED: "", UP: "●", BUSY: "⚠", DOWN: "🛑" }[decision.state];
   let note = "";
   if (row.metadata?.vendor_inconsistent) note = " (vendor readings inconsistent, holding)";
@@ -384,10 +389,10 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
     lines.push(`  ${meter} ${label(row)} n/a (not enforced)`);
   } else if (narrowStack) {
     lines.push(`  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)}`);
-    const reset = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
+    const reset = overdueText ? `↻ ${overdueText}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
     lines.push(`      ${glyph} ${reset} ${decision.state}${note}`);
   } else {
-    const reset = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
+    const reset = overdueText ? `↻ ${overdueText}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
     let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} ${reset} ${decision.state}${note}`;
     if (view.graphs !== false && view.width >= 100 && !unknown && model.burns[key]?.length) text += ` ${spark(model.burns[key])}`;
     lines.push(text);
@@ -413,7 +418,7 @@ interface DashboardContent { lines: string[]; panels: number[]; principals: stri
 
 function tightest(rows: Observation[], model: DashboardModel): Observation {
   return [...rows].sort((a, b) => {
-    const state = (value: Observation): number => (({ FREEZE: 4, CONSERVE: 3, UNKNOWN: 2, HARVEST: 1, NORMAL: 0, NOT_ENFORCED: -1 } as Record<string, number>)[paceDecision(value, model.policy, model.now).state] ?? 0);
+    const state = (value: Observation): number => (({ FREEZE: 4, CONSERVE: 3, UNKNOWN: 2, HARVEST: 1, NORMAL: 0, NOT_ENFORCED: -1 } as Record<string, number>)[dashboardDecision(value, model).state] ?? 0);
     return state(b) - state(a) || (b.quantity?.used ?? -1) - (a.quantity?.used ?? -1) || (a.window?.minutes ?? Infinity) - (b.window?.minutes ?? Infinity);
   })[0]!;
 }
@@ -453,7 +458,7 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
   const panels: number[] = [];
   const longestMeter = Math.max(0, ...meters.map((m) => m.length));
   const meterColWidth = Math.max(10, Math.min(24, longestMeter));
-  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && paceDecision(row, model.policy, model.now).state !== "UNKNOWN");
+  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && dashboardDecision(row, model).state !== "UNKNOWN");
 
   for (let i = 0; i < meters.length; i++) {
     const meterId = meters[i];
@@ -480,21 +485,21 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
     });
 
     const tightestRow = tightest(rows, model);
-    const overallDecision = paceDecision(tightestRow, model.policy, model.now);
+    const overallDecision = dashboardDecision(tightestRow, model);
     const rawState = overallDecision.state;
     const displayState = rawState === "NOT_ENFORCED" ? "n/a" : rawState;
-    const isUnknownOnly = rows.every((r) => paceDecision(r, model.policy, model.now).state === "UNKNOWN");
+    const isUnknownOnly = rows.every((r) => dashboardDecision(r, model).state === "UNKNOWN");
 
-    const resettingWindows = rows.filter((r) => isTrustworthy(r) && r.resets_at && resetsIn(r.resets_at, model.now).resets_in !== null);
+    const resettingWindows = rows.filter((r) => isTrustworthy(r) && r.resets_at && servedResetsIn(r, model.now).resets_in !== null);
     const resetOrder = (row: Observation): number => {
-      const info = resetsIn(row.resets_at, model.now);
+      const info = servedResetsIn(row, model.now);
       return info.reset_overdue ? -1 : info.resets_in_seconds ?? Infinity;
     };
     const earliestResetRow = resettingWindows.sort((a, b) => resetOrder(a) - resetOrder(b))[0];
 
     const windowParts: string[] = [];
     for (const w of ordered) {
-      const wDecision = paceDecision(w, model.policy, model.now);
+      const wDecision = dashboardDecision(w, model);
       const isHeld = Boolean(w.metadata?.vendor_window_held || w.metadata?.vendor_inconsistent);
       const isUnknown = wDecision.state === "UNKNOWN" || isHeld;
       const wLabel = label(w);
@@ -504,11 +509,12 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
         : wDecision.state === "NOT_ENFORCED" ? "n/a" : "-";
       let countdownStr = "";
       if (w === earliestResetRow) {
-        const resetInfo = resetsIn(w.resets_at, model.now);
+        const resetInfo = servedResetsIn(w, model.now);
         const sec = resetInfo.resets_in_seconds;
-        if (resetInfo.reset_overdue) {
+        const overdueText = formatOverdueReset(resetInfo);
+        if (overdueText) {
           const glyph = view.ascii ? "~" : "↻";
-          countdownStr = ` ${glyph} ${resetInfo.resets_in}`;
+          countdownStr = ` ${glyph} ${overdueText}`;
         } else if (sec !== null && !isUnknown) {
           const glyph = view.ascii ? "~" : "↻";
           countdownStr = ` ${glyph}${formatResetsIn(sec).replace(/\s+/g, "")}`;
@@ -533,7 +539,7 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
     }
 
     if (!view.verbose && !hasFreshInModel) {
-      const unknownRows = rows.filter((r) => paceDecision(r, model.policy, model.now).state === "UNKNOWN" || r.metadata?.vendor_window_held || r.metadata?.vendor_inconsistent);
+      const unknownRows = rows.filter((r) => dashboardDecision(r, model).state === "UNKNOWN" || r.metadata?.vendor_window_held || r.metadata?.vendor_inconsistent);
       for (const u of unknownRows) {
         const known = u.last_known ?? (u.quantity?.unit === "percent" ? { used_percent: u.quantity.used, observed_at: u.observed_at, window_minutes: undefined } : null);
         const knownWindow = known?.window_minutes !== undefined ? `${labelForMinutes(known.window_minutes)} ` : "";
@@ -559,9 +565,9 @@ function dashboardContent(model: DashboardModel, view: DashboardView): Dashboard
     .filter((row) => isTrustworthy(row) && row.resets_at && Date.parse(row.resets_at) > model.now.getTime())
     .sort((a, b) => Date.parse(a.resets_at!) - Date.parse(b.resets_at!))[0];
 
-  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && paceDecision(row, model.policy, model.now).state !== "UNKNOWN");
+  const hasFreshInModel = model.observations.some((row) => row.window?.kind !== "state" && dashboardDecision(row, model).state !== "UNKNOWN");
   const unknownDecisions = model.observations
-    .map((row) => paceDecision(row, model.policy, model.now))
+    .map((row) => dashboardDecision(row, model))
     .filter((decision) => decision.state === "UNKNOWN");
   const uniqueReasons = [...new Set(unknownDecisions.map((d) => explainUnknown(d.reason).text))];
   const allSameReason = uniqueReasons.length === 1;
@@ -603,7 +609,7 @@ function dashboardContent(model: DashboardModel, view: DashboardView): Dashboard
       const rows = model.observations.filter((row) => row.principal_id === principal).sort((a, b) => a.meter_id.localeCompare(b.meter_id) || (a.window?.minutes ?? 0) - (b.window?.minutes ?? 0));
       const metered = rows.filter((row) => row.window?.kind !== "state");
       const header = metered.length ? renderStatus({ observations: metered, policy: model.policy, vendors: model.vendors, now: model.now }, { form: "grouped", width: 10_000, verbose: false, color: false, direct: model.direct })[0] : `${principal}  local`;
-      const principalUnknowns = metered.map((row) => paceDecision(row, model.policy, model.now)).filter((decision) => decision.state === "UNKNOWN");
+      const principalUnknowns = metered.map((row) => dashboardDecision(row, model)).filter((decision) => decision.state === "UNKNOWN");
       lines.push(header);
       if (!allSameReason && principalUnknowns.length > 0) {
         lines.push(...wrap(`  UNKNOWN: ${explainUnknown(principalUnknowns[0].reason).text}`, width));

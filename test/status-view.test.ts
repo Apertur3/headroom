@@ -95,7 +95,7 @@ describe("status view: the three forms", () => {
       const view = renderStatus({ observations: [oldHeld], policy: defaultPolicy, now: NOW }, options({ form })).join("\n");
       expect(view).toContain("stale");
       expect(view).toContain("↻ overdue 3d");
-      expect(view).not.toContain("fresh");
+      expect(view).not.toMatch(/\bfresh \d+m/);
       expect(view).not.toContain("(in 0m)");
     }
   });
@@ -267,6 +267,8 @@ describe("status view: UNKNOWN in plain words", () => {
     });
     expect(explainUnknown("stale 60m; next poll ~14:20")).toMatchObject({ cause: "stale" });
     expect(explainUnknown("stale 60m; next poll ~14:20").text).toContain("Run: headroom --refresh");
+    expect(explainUnknown("last accepted reading 60m ago")).toMatchObject({ cause: "stale" });
+    expect(explainUnknown("last accepted reading 60m ago").text).toContain("Run: headroom --refresh");
     expect(explainUnknown("no readings for codex-main:main")).toMatchObject({ cause: "never read" });
     expect(explainUnknown("Gemini CLI OAuth client unavailable")).toEqual({ cause: "read failed", text: "Gemini CLI OAuth client unavailable." });
   });

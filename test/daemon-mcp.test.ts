@@ -322,7 +322,7 @@ describe("MCP JSON-RPC", () => {
       const held = rows.find((row) => row.meter_id === "codex-main:spark");
       const normal = rows.find((row) => row.meter_id === "codex-main:main");
       expect(held).toMatchObject({
-        freshness: "stale", resets_in_seconds: null, resets_in: "overdue 3d", reset_overdue: true,
+        freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number),
         last_known: { used_percent: 41 },
       });
       expect(held?.reason).toMatch(/^last accepted reading 10d ago/);
@@ -330,7 +330,7 @@ describe("MCP JSON-RPC", () => {
       expect(normal).not.toHaveProperty("reset_overdue");
 
       const response = await handleMcp('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async () => undefined, async () => direct);
-      expect(response).toMatchObject({ result: { structuredContent: { observations: expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:spark", freshness: "stale", resets_in_seconds: null, resets_in: "overdue 3d", reset_overdue: true, last_known: expect.any(Object) })]) } } });
+      expect(response).toMatchObject({ result: { structuredContent: { observations: expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:spark", freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number), last_known: expect.any(Object) })]) } } });
     });
   });
 
@@ -564,6 +564,37 @@ describe("MCP stdio loop bounds its own input", () => {
 });
 
 describe("MCP direct status shares a persisted backoff across calls", () => {
+  it("uses the response clock after a delayed direct poll crosses freshness and reset boundaries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-response-clock-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const requestedAt = new Date("2026-09-03T12:00:00Z");
+    const responseAt = new Date("2026-09-03T12:02:00Z");
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      store.insert({
+        ...fixture(),
+        fetched_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(),
+        observed_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(),
+        resets_at: requestedAt.toISOString(),
+      });
+      store.close();
+      const clocks = [requestedAt, responseAt];
+      const result = await directStatus({
+        now: () => clocks.shift()!,
+        poll: async () => ({ observations: [], failures: [] }),
+      });
+      const row = (result.observations as Observation[]).find((item) => item.meter_id === "codex-main:main");
+      expect(row).toMatchObject({
+        freshness: "stale",
+        last_known: { used_percent: 20, age_seconds: 16 * 60 },
+        resets_in_seconds: 0,
+        resets_in: "0m",
+        reset_overdue: true,
+        reset_overdue_seconds: 120,
+      });
+    });
+  });
+
   it("skips a fresh poll and returns cached observations within the same poll interval", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-backoff-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });

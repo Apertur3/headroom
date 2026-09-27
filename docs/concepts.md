@@ -46,10 +46,11 @@ Example: an observation for `claude-main:fable` at 82% used, `resets_at` next Sa
 ## Freshness and UNKNOWN
 
 Every observation is `fresh`, `stale`, `failed`, or `not_enforced`. `fresh` is a good, recent
-vendor read. Freshness is evaluated again whenever a row is served: a row stored as `fresh` whose
-`fetched_at` has crossed `staleness_minutes` is served as `stale`, with `last accepted reading
-<age> ago` at the front of its reason (followed by any stored explanation). This presentation rule
-does not rewrite the historical row. `stale` means the last good read is older than the staleness threshold (15 minutes by
+vendor read. Freshness is evaluated again whenever a percent-quota row is served: a row stored as
+`fresh` whose `fetched_at` has crossed `staleness_minutes`, or cannot be parsed, is served as
+`stale`, with `last accepted reading <age> ago` at the front of its reason (followed by any stored
+explanation). Local-pool state and count observations have their own policy states and are not
+aged by this rule. This presentation rule does not rewrite the historical row. `stale` means the last good read is older than the staleness threshold (15 minutes by
 default). `failed` means the last attempt errored, timed out, exceeded Headroom's own bounds on
 the response, or -- for a vendor-reported idle window that looks like a placeholder -- contradicted
 a real-usage reading Headroom already trusted for that same window within the last two hours (a
@@ -81,9 +82,16 @@ only: `can`, `gate`, and `route` keep treating UNKNOWN as no capacity no matter 
 says.
 
 Reset countdowns are also evaluated when served. A reset within 60 seconds of now still reads
-`0m`, matching the store's same-window tolerance. Once it is older, status says `overdue <age>`
-instead of an imminent `0m`; JSON adds `reset_overdue: true` and sets `resets_in_seconds` to
-`null` so callers can distinguish an overdue schedule from an unknown one.
+`0m`, matching the store's same-window tolerance. Once it is older, human output says `overdue
+<age>` instead of an imminent `0m`. JSON retains its contract-1.0 values
+`resets_in_seconds: 0` and `resets_in: "0m"`, then adds `reset_overdue: true`
+and `reset_overdue_seconds` (the age in seconds). Agents check `reset_overdue`,
+not the compatibility countdown, to distinguish an overdue schedule from an unknown one.
+
+Status enrichment carries `status_enriched_at` with its served freshness, pace,
+reset, and `last_known` fields. A renderer preserves that response-time
+decision rather than aging the same payload again without the store lookup
+needed to attach `last_known`.
 
 ## Pace states
 

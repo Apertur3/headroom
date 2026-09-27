@@ -18,9 +18,9 @@
  * and `--agent` as explicit overrides.
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
-import { withEffectiveFreshness } from "./pace.js";
+import { statusDecisionTime, withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
-import { decodeResetSeen, formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
+import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
@@ -177,8 +177,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   const evidence = `${decodedResetSeen ? ` reset seen ${formatReset(decodedResetSeen.at, now)}${decodedResetSeen.unscheduled ? " (unscheduled)" : ""}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
   const vendorWindow = vendorWindowNote(observation);
   const inconsistent = vendorWindow ? ` (${vendorWindow})` : "";
-  const resetInfo = resetsIn(observation.resets_at, now);
-  const overdue = resetInfo.reset_overdue ? ` ↻ ${resetInfo.resets_in}` : "";
+  const resetInfo = servedResetsIn(observation, now);
+  const overdueText = formatOverdueReset(resetInfo);
+  const overdue = overdueText ? ` ↻ ${overdueText}` : "";
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -199,7 +200,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // The protected reserve (policy.toml [reserve]) follows the numbers so a
   // reader can see why a healthy-looking percentage still produced a NO from
   // gate/fill/route/can. It never changes the pace state beside it.
-  const reset = resetInfo.reset_overdue ? overdue : ` ↻${formatReset(observation.resets_at, now)}${countdown}`;
+  const reset = overdueText ? overdue : ` ↻${formatReset(observation.resets_at, now)}${countdown}`;
   return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)}${reset} ${state}${doubt}${inconsistent}${evidence}${paceSegment(observation)}`;
 }
 
@@ -223,7 +224,7 @@ export function formatMeters(observations: Observation[], policy: Policy, resetS
     const active = leases.get(meter) ?? [];
     const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
-      const decision = paceDecision(item, policy, now);
+      const decision = paceDecision(item, policy, statusDecisionTime(item, now));
       return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id), now);
     }).join(" | ")}  (${freshnessWord(ordered)} ${age(ordered[0], now)})${leaseLabel}`;
   });
@@ -259,7 +260,7 @@ export function explainUnknown(reason: string | null | undefined): UnknownExplan
   if (/^keychain grant needed/i.test(text)) return { cause: "grant needed", text: withRemedy("macOS has not let Headroom read this account's credentials yet") };
   if (/^keychain grant lapsed/i.test(text)) return { cause: "grant lapsed", text: withRemedy(`the Keychain grant lapsed: ${body.replace(/^keychain grant lapsed;?\s*/i, "")}`) };
   if (/^no daemon/i.test(text)) return { cause: "no daemon", text: withRemedy(body.replace(/^no daemon;?\s*/i, "the daemon is not running, and ")) };
-  if (/^stale/i.test(text)) return { cause: "stale", text: `the last reading is older than the staleness limit, so Headroom will not report it as fact (${body}). Run: headroom --refresh` };
+  if (/^(?:stale|last accepted reading)/i.test(text)) return { cause: "stale", text: `the last reading is older than the staleness limit, so Headroom will not report it as fact (${body}). Run: headroom --refresh` };
   if (/^no readings for/i.test(text)) return { cause: "never read", text: `${sentence(body)} Run: headroom --refresh` };
   return { cause: "read failed", text: withRemedy(body) };
 }
@@ -513,10 +514,11 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
       const ordered = orderWindows(windows);
       const active = leases.get(meterId) ?? [];
       ordered.forEach((observation, index) => {
-        const decision = paceDecision(observation, policy, now);
-        const resetInfo = resetsIn(observation.resets_at, now);
+        const decision = paceDecision(observation, policy, statusDecisionTime(observation, now));
+        const resetInfo = servedResetsIn(observation, now);
         const seconds = resetInfo.resets_in_seconds;
-        const overdue = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : undefined;
+        const overdueText = formatOverdueReset(resetInfo);
+        const overdue = overdueText ? `↻ ${overdueText}` : undefined;
         const countdown = !overdue && (seconds === null || decision.state === "UNKNOWN");
         const unknown = decision.state === "UNKNOWN" ? explainUnknown(observation.reason ?? decision.reason) : undefined;
         if (unknown) explanations.push(unknown);
