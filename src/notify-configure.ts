@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { headroomHome, assertSafeAncestry } from "./paths.js";
 import { readBoundedRegularFile, safeOutputDirectory, writeFileAtomic } from "./security.js";
 import {
+  DEFAULT_SOURCE_HEALTH_MIN_MINUTES, DEFAULT_SOURCE_HEALTH_MIN_POLLS,
   NOTIFY_EVENT_NAMES, PRESET_EVENTS, TELEGRAM_SECRET, notifyTest, parseNotifyConfig,
   parseQuietHours, prepareChannels, resolveNotifyEvents, secretStoreHint, wantsEvent,
   type ChannelName, type NotifyConfig, type NotifyOptions, type NotifyPreset,
@@ -16,9 +17,9 @@ export interface ConfigureOptions extends NotifyOptions {
 }
 
 export const PRESET_DESCRIPTIONS: Record<NotifyPreset, string> = {
-  calm: "Useful changes: unexpected and weekly resets, reset credits, outages, recoveries and thresholds.",
-  quiet: "Only unexpected resets, source failures and thresholds.",
-  everything: "Every event, including scheduled 5h resets, stalls, new buckets and grant lapses.",
+  calm: "Useful changes: unexpected and weekly resets, reset credits, outages, recoveries, new models available and thresholds.",
+  quiet: "Only unexpected resets, source failures, new models available and thresholds.",
+  everything: "Every event, including scheduled 5h resets, stalls, new buckets, retired models and grant lapses.",
 };
 const EVENT_LABELS: Record<string, string> = {
   reset_unscheduled: "Unscheduled resets (any window)", reset_scheduled_weekly: "Weekly resets",
@@ -26,6 +27,7 @@ const EVENT_LABELS: Record<string, string> = {
   free_reset_used: "Free resets used", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
   source_failed: "Source failures", source_recovered: "Source recoveries", threshold: "Threshold crossings",
   pace_projection_conserve: "Projected stalls (once per window, plus one escalation)", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
+  model_available: "New models available (vendor model catalog)", model_retired: "Models no longer listed",
   lease_started: "Leases started", lease_ended: "Leases ended", vendor_inconsistent: "Vendor readings inconsistent", reset_seen: "Other scheduled resets",
 };
 
@@ -38,6 +40,8 @@ export function notifyTable(config: NotifyConfig): string {
   if (config.thresholds) lines.push(`thresholds = ${JSON.stringify(config.thresholds)}`);
   else if (config.threshold_percent !== null) lines.push(`threshold_percent = ${config.threshold_percent}`);
   if (config.quiet_hours) lines.push(`quiet_hours = ${JSON.stringify(quietText(config))}`);
+  if (config.source_health_min_polls !== DEFAULT_SOURCE_HEALTH_MIN_POLLS) lines.push(`source_health_min_polls = ${config.source_health_min_polls}`);
+  if (config.source_health_min_minutes !== DEFAULT_SOURCE_HEALTH_MIN_MINUTES) lines.push(`source_health_min_minutes = ${config.source_health_min_minutes}`);
   if (config.telegram.chat_id) lines.push("", "[notify.telegram]", `chat_id = ${JSON.stringify(config.telegram.chat_id)}`);
   if (config.ntfy.topic) lines.push("", "[notify.ntfy]", `topic = ${JSON.stringify(config.ntfy.topic)}`, `server = ${JSON.stringify(config.ntfy.server)}`);
   if (config.webhook.url) lines.push("", "[notify.webhook]", `url = ${JSON.stringify(config.webhook.url)}`);

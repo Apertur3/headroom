@@ -120,3 +120,14 @@ describe("headroom --principal X --models", () => {
     });
   });
 });
+
+describe("headroom models", () => {
+  it("requires one non-flag principal value and rejects duplicate options", async () => {
+    for (const argv of [
+      ["models", "--principal"],
+      ["models", "--principal", "--json"],
+      ["models", "--principal", "codex-main", "--principal", "codex-work"],
+      ["models", "--json", "--json"],
+    ]) await expect(main(argv)).rejects.toThrow("Usage: headroom models [--principal <id>] [--json|--agent]");
+  });
+});

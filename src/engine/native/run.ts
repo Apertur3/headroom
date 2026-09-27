@@ -16,6 +16,11 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine");
 
+/** The native reader's maximum budget for one daemon poll. Callers that make
+ * a retry pass the remaining portion of this same budget, rather than
+ * granting a second full timeout. */
+export const NATIVE_ENGINE_TIMEOUT_MS = 90_000;
+
 export class NativeEngineVerificationError extends Error {}
 
 /** The immutable npm artifact supplies both the reader and its digest. A
@@ -67,7 +72,8 @@ export async function nativeEnginePath(): Promise<string | undefined> {
   return undefined;
 }
 
-export async function runNativeEngine(enginePath: string, accounts: ProviderAccount[]): Promise<Observation[]> {
+export async function runNativeEngine(enginePath: string, accounts: ProviderAccount[], options: { timeoutMs?: number } = {}): Promise<Observation[]> {
+  const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? NATIVE_ENGINE_TIMEOUT_MS, NATIVE_ENGINE_TIMEOUT_MS));
   const directory = await mkdtemp(join(tmpdir(), "headroom-principals-"));
   const principals = join(directory, "principals.json");
   try {
@@ -75,7 +81,7 @@ export async function runNativeEngine(enginePath: string, accounts: ProviderAcco
     await chmod(principals, 0o600);
     try {
       const { proxy } = await readPolicy();
-      const { stdout } = await execFileAsync(enginePath, ["observe", "--principals", principals], { timeout: 90_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" }) });
+      const { stdout } = await execFileAsync(enginePath, ["observe", "--principals", principals], { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" }) });
       return parseObservations(stdout);
     } catch (error: unknown) {
       const result = error as { stdout?: string; stderr?: string; message?: string };

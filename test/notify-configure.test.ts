@@ -21,11 +21,11 @@ function script(answers: string[]) {
 
 describe("notification presets", () => {
   it("resolves all three presets with off winning a conflicting override", () => {
-    expect(config().events).toEqual(["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold"]);
-    expect(config('preset = "quiet"').events).toEqual(["reset_unscheduled", "source_failed", "threshold"]);
+    expect(config().events).toEqual(["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold", "model_available"]);
+    expect(config('preset = "quiet"').events).toEqual(["reset_unscheduled", "source_failed", "threshold", "model_available"]);
     expect(config('preset = "everything"').events).toContain("grant_lapsed");
     expect(config().threshold_percent).toBe(90);
-    expect(resolveNotifyEvents("quiet", ["source_recovered", "model_new"], ["model_new", "source_failed"])).toEqual(["reset_unscheduled", "threshold", "source_recovered"]);
+    expect(resolveNotifyEvents("quiet", ["source_recovered", "model_new"], ["model_new", "source_failed"])).toEqual(["reset_unscheduled", "threshold", "model_available", "source_recovered"]);
     expect(config('preset = "quiet"\nevents_on = ["model_new"]\nevents_off = ["source_failed"]').events).toContain("model_new");
     expect(wantsEvent(failed, config('events_off = ["source_failed"]'))).toBe(false);
     expect(() => config('preset = "loud"')).toThrow(/preset/);
