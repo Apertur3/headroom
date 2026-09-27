@@ -12,6 +12,11 @@ antigravity_keepalive = true
 # points in its last 45 minutes, the pro-rata allowance before that.
 # "none" skips both, leaving only the plain reserve/plan-line checks.
 pacing = "even"
+# "pro_rata" (default) protects an even planned share throughout a 5h
+# window. "fill" is for an orchestrator that intentionally spends a
+# use-it-or-lose-it window before reset; it projects current usage, open
+# leases, and recent burn to the lane end while retaining the cap.
+# allowance = "pro_rata"
 # Check the npm registry at most once every 24 hours for a newer headroomd
 # and print a one-line notice from `status`/`doctor`. Never installs
 # anything on its own; set false to disable the check entirely.

@@ -252,11 +252,14 @@ plan`.
 ### `quota_gate`
 
 `needs` (array of `"5h:15"` / `"wk:3"` strings; rejected as a whole if any entry does not match
-that shape), optional `meter`, `plan`, `reserve_percent` (0-100), `owner`, `plan_share_percent`
+that shape), optional `meter`, `plan`, `reserve_percent` (0-100), `cap_percent` (0-100),
+`duration_minutes` (> 0), `allowance` (`"pro_rata" | "fill"`), `owner`, `plan_share_percent`
 (>= 0), `action_class` (adds a `lanes_remaining_for_class` figure from the learned cost for that
 class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
 the current window (and, with `plan`, the plan line); under even pacing a 5h need is also checked
 against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
+`allowance: "fill"` replaces those two pacing checks with an end-of-lane projection of use, other
+owners' leases, and recent burn under the reserve-derived (and optionally tightened) cap.
 Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
 older than `staleness_minutes`, or if `meter` resolves to several meters and one of them has never
 produced a windowed reading at all. CLI: `headroom gate` (exit 2 when it does not fit).
@@ -268,8 +271,9 @@ caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
 
 ### `quota_fill`
 
-`meter` (required), optional `lane_cost_percent` (> 0), `weekly_reserve_percent` (0-100), `owner`,
-`plan_share_percent` (>= 0), and `need`. `need` selects a vendor-reported window. How many more lanes fit before the 5h window's unspent points are
+`meter` (required), optional `lane_cost_percent` (> 0), `weekly_reserve_percent` (0-100),
+`duration_minutes` (> 0), `allowance` (`"pro_rata" | "fill"`), `owner`, `plan_share_percent`
+(>= 0), `action_class`, and `need`. `need` selects a vendor-reported window. How many more lanes fit before the 5h window's unspent points are
 lost at reset, and which `routing.toml` action classes still fit the remaining points and minutes.
 Fails UNKNOWN if the tightest enforced window (or the weekly one, when both are enforced) is stale,
 failed, or older than `staleness_minutes`. CLI: `headroom fill`.
@@ -361,9 +365,9 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
 | `quota_rate` | `headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--json]` |
 | `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]` |
-| `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--json]` (exit 2 when it does not fit) |
+| `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--reserve <n>] [--cap <n>] [--duration <minutes>] [--allowance pro_rata\|fill] [--json]` (exit 2 when it does not fit) |
 | `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
-| `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |
+| `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] [--class <action-class>] [--duration <minutes>] [--allowance pro_rata\|fill] --owner <name> [--json]` |
 | `quota_cost` | `headroom cost [<action-class>] [--json]` |
 | `quota_spend` | `headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]` |
 | `quota_inbox` | `headroom inbox --session <session-id> [--since <epoch-ms>] [--json]` (send: `headroom inbox send --to <session-id> --kind <budget\|note\|handoff> (--file <path> \| --text <text>)`) |

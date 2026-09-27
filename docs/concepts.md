@@ -225,6 +225,15 @@ also lists, per `routing.toml` `[cost.<class>]` entry, how many runs of that cla
 remaining points and remaining minutes (a learned median cost overrides the static config number
 once samples exist).
 
+The allowance basis is `"pro_rata"` by default. An orchestrator may set policy `allowance = "fill"`
+or pass `--allowance fill` when it deliberately wants to spend a use-it-or-lose-it 5h window before
+its reset and no other work needs that capacity. The fill basis keeps the gate cap (including the
+reserve floor), projects other owners' open leases and the meter's recent 60-minute burn to the lane
+end, and refuses if the requested work would cross that cap. `--duration <minutes>` (or a routing
+class's configured duration) defines that horizon, never beyond the reset. `fill` keeps its existing
+5-point safety margin and meter reserve while making its lane offer. Leave the default pro-rata basis
+in place for ordinary paced work.
+
 `policy.toml`'s `[reserve]` table is a different thing from `freeze_reserve_pct`, and the two names
 are easy to confuse. `freeze_reserve_pct` is a **pace** threshold: once a window's used percent
 reaches `100 - freeze_reserve_pct`, that window's pace state becomes FREEZE, for every caller

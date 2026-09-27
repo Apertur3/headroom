@@ -8,7 +8,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { readRouting } from "./config.js";
-import { computeFill, computePlan, evaluateBurst, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
+import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
 import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type CanDecision, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
@@ -195,6 +195,14 @@ export interface GateOptions {
   /** policy.toml's pacing: "even" (default) enforces the pro-rata line and
    * the burst check for a 5h need; "none" skips both. */
   pacing?: "even" | "none";
+  /** The even-pacing allowance basis. `fill` is opt-in: it projects the
+   * current window to the lane's end instead of rationing a plan share. */
+  allowance?: "pro_rata" | "fill";
+  /** A caller may tighten, never raise, the reserve-derived gate ceiling. */
+  capPercent?: number;
+  /** Projection horizon supplied explicitly, or resolved from an action
+   * class's routing cost by the CLI/daemon/MCP boundary. */
+  durationMinutes?: number;
   /** policy.toml's staleness_minutes: a window older than this (or one
    * whose freshness itself is stale/failed) is treated as an unusable
    * reading, the same rule paceDecision applies before scoring a pace
@@ -230,6 +238,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
+  const allowance = options.allowance ?? "pro_rata";
   const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
   let lastShort: StoredObservation | undefined;
   let lastReservedPercent = 0;
@@ -292,9 +301,15 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       if (used === undefined) return { allowed: false, reason: `${label} usage unknown`, meters_checked: checked, unknown: true };
       const meterReserve = reserveFor(options.reserves ?? {}, id);
       const reserve = Math.max(reservePercent, meterReserve);
-      if (used + need.points > 100 - reserve) {
-        const left = Math.max(0, 100 - reserve - used);
-        const reserveReason = meterReserve >= reservePercent && meterReserve > 0 ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id}` : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve`;
+      const reserveCeiling = 100 - reserve;
+      const ceiling = Math.min(reserveCeiling, options.capPercent ?? 100);
+      if (used + need.points > ceiling) {
+        const left = Math.max(0, ceiling - used);
+        const reserveReason = ceiling < reserveCeiling
+          ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${ceiling}% cap`
+          : meterReserve >= reservePercent && meterReserve > 0
+            ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id}`
+            : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve`;
         return { allowed: false, reason: reserveReason, meters_checked: checked };
       }
       if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
@@ -313,16 +328,35 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
 
     const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
     if (pacing === "even" && fiveHourNeed && short?.resets_at && short.window?.minutes && options.owner) {
-      const windowStart = new Date(Date.parse(short.resets_at) - short.window.minutes * 60_000);
-      const windowHours = short.window.minutes / 60;
-      const ownerLeases = store.leases(id, true, now).filter((lease) => lease.owner === options.owner);
-      const plannedShare = options.planSharePercent ?? (ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0) + fiveHourNeed.points);
-      const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
-      const proRata = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: fiveHourNeed.points, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now });
-      if (!proRata.allowed) return { allowed: false, reason: proRata.reason, meters_checked: checked };
-      const burst10m = store.burnRateFor([short], now, 10).get(`${id}:${short.window.minutes}`);
-      const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: Math.min(100, short.quantity!.used + reservedPercent), windowStart });
-      if (!burst.allowed) return { allowed: false, reason: burst.reason, meters_checked: checked };
+      if (allowance === "fill") {
+        const meterReserve = reserveFor(options.reserves ?? {}, id);
+        const cap = Math.min(100 - Math.max(reservePercent, meterReserve), options.capPercent ?? 100);
+        const minutesToReset = Math.max(0, (Date.parse(short.resets_at) - now.getTime()) / 60_000);
+        const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
+        const burn = store.burnRateFor([short], now, 60).get(`${id}:${short.window.minutes}`);
+        const fill = evaluateFillAllowance({
+          usedPercent: short.quantity!.used,
+          reservedByOthersPercent: reservedPercent,
+          burnPercentPerHour: burn?.burn_percent_per_hour ?? null,
+          laneHours: durationMinutes / 60,
+          capPercent: cap,
+          requestPercent: fiveHourNeed.points,
+        });
+        const fillFields = { allowance_basis: "fill" as const, projected_percent: fill.projected_percent, cap_percent: fill.cap_percent };
+        if (!fill.allowed) return { allowed: false, reason: fill.reason, meters_checked: checked, ...fillFields };
+        lastResult = { allowed: true, reason: fill.reason, ...(notEnforced.length ? { not_enforced: notEnforced } : {}), ...fillFields };
+      } else {
+        const windowStart = new Date(Date.parse(short.resets_at) - short.window.minutes * 60_000);
+        const windowHours = short.window.minutes / 60;
+        const ownerLeases = store.leases(id, true, now).filter((lease) => lease.owner === options.owner);
+        const plannedShare = options.planSharePercent ?? (ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0) + fiveHourNeed.points);
+        const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
+        const proRata = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: fiveHourNeed.points, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now });
+        if (!proRata.allowed) return { allowed: false, reason: proRata.reason, meters_checked: checked };
+        const burst10m = store.burnRateFor([short], now, 10).get(`${id}:${short.window.minutes}`);
+        const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: Math.min(100, short.quantity!.used + reservedPercent), windowStart });
+        if (!burst.allowed) return { allowed: false, reason: burst.reason, meters_checked: checked };
+      }
     }
   }
   if (!checked.length) {
@@ -341,7 +375,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     return learned ? maxMoreBeforeReset(remaining, learned.median_percent) : null;
   })() : undefined;
   const notEnforcedNote = lastResult?.not_enforced?.length ? ` (${lastResult.not_enforced.join(", ")} not enforced on ${checked[checked.length - 1]})` : "";
-  return { allowed: true, reason: `fits${notEnforcedNote}`, meters_checked: checked, ...(lanesRemaining !== undefined ? { lanes_remaining_for_class: lanesRemaining } : {}) };
+  return { allowed: true, reason: lastResult?.reason === "fits" ? `fits${notEnforcedNote}` : lastResult?.reason ?? `fits${notEnforcedNote}`, meters_checked: checked, ...(lastResult?.allowance_basis ? { allowance_basis: lastResult.allowance_basis, projected_percent: lastResult.projected_percent, cap_percent: lastResult.cap_percent } : {}), ...(lanesRemaining !== undefined ? { lanes_remaining_for_class: lanesRemaining } : {}) };
 }
 
 export function gateFor(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now = new Date(), options: GateOptions = {}): GateOutcome {
@@ -392,9 +426,9 @@ export interface FillOutcome {
   lane_cost_source: "given" | "learned" | "unknown";
   /** "full": the window's whole remaining points, offered outside even
    * pacing or inside the last 45 minutes before reset (nothing left to
-   * smooth by then). "pro_rata": even pacing restricted the offer to the
-   * owner's pro-rata line, this far from reset. */
-  allowance_basis: "full" | "pro_rata";
+   * smooth by then). "pro_rata" preserves the planned-share default;
+   * "fill" projects actual use and burn to a lane's end. */
+  allowance_basis: "full" | "pro_rata" | "fill";
   /** The tightest enforced window the lane math actually used -- "5h" on a
    * normal meter; "wk" (or another label) when the 5h window is not
    * enforced and the tightest enforced window found was the weekly one
@@ -409,6 +443,11 @@ export interface FillOptions {
   includeOwnerReservations?: boolean;
   planSharePercent?: number;
   pacing?: "even" | "none";
+  allowance?: "pro_rata" | "fill";
+  /** An explicit lane horizon, or an action class's routing duration as
+   * resolved by the boundary caller. It cannot extend past the reset. */
+  durationMinutes?: number;
+  actionClass?: string;
   /** Same as GateOptions.staleness_minutes: defaults to defaultPolicy's own
    * value; a caller with the real policy loaded should pass its
    * staleness_minutes here explicitly. */
@@ -445,9 +484,9 @@ function windowShortLabel(minutes: number | null | undefined): string {
  *
  * Under even pacing (the default), the lane count only spends the window's
  * full remaining points in the last 45 minutes before reset -- the point
- * past which nothing is left to smooth. Earlier than that, it offers only
- * the owner's pro-rata allowance (planned share times elapsed fraction,
- * minus what that owner has already spent), the same line `gate` enforces.
+ * past which nothing is left to smooth. Earlier than that, it defaults to
+ * the owner's pro-rata allowance; an explicit fill basis instead projects
+ * current use, other leases and recent burn to the lane's end.
  */
 type FillCore = FillOutcome | { meter: string; error: string; no_enforced_window?: true };
 
@@ -493,6 +532,7 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   const source: FillOutcome["lane_cost_source"] = laneCostOverride !== undefined ? "given" : learned ? "learned" : "unknown";
 
   const pacing = options.pacing ?? "even";
+  const allowance = options.allowance ?? "pro_rata";
   const inFinalStretch = secondsLeft !== null && secondsLeft <= EVEN_PACING_FULL_BURST_MINUTES * 60;
   // Pro-rata smoothing only makes sense for a genuine 5h window: it rations a
   // short window's own budget across the hours until IT resets. Once the
@@ -505,15 +545,30 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   let used5hForLanes = used5h;
   let allowanceBasis: FillOutcome["allowance_basis"] = "full";
   if (restrictedByPacing) {
-    const windowStart = new Date(Date.parse(tight.resets_at!) - (tight.window!.minutes as number) * 60_000);
-    const windowHours = (tight.window!.minutes as number) / 60;
-    const ownerLeases = store.leases(meter, true, now).filter((lease) => lease.owner === options.owner);
-    const plannedShare = options.planSharePercent ?? ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
-    const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
-    const line = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: 0, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now }).line_percent;
-    const proRataRemaining = Math.max(0, line - usedSoFar);
-    used5hForLanes = Math.max(used5h, 100 - proRataRemaining);
-    allowanceBasis = "pro_rata";
+    if (allowance === "fill") {
+      const minutesToReset = Math.max(0, secondsLeft ?? 0) / 60;
+      const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
+      const burn = store.burnRateFor([tight], now, 60).get(`${meter}:${tight.window!.minutes}`);
+      used5hForLanes = evaluateFillAllowance({
+        usedPercent: tight.quantity!.used,
+        reservedByOthersPercent: reservedPercent,
+        burnPercentPerHour: burn?.burn_percent_per_hour ?? null,
+        laneHours: durationMinutes / 60,
+        capPercent: 100,
+        requestPercent: 0,
+      }).projected_percent;
+      allowanceBasis = "fill";
+    } else {
+      const windowStart = new Date(Date.parse(tight.resets_at!) - (tight.window!.minutes as number) * 60_000);
+      const windowHours = (tight.window!.minutes as number) / 60;
+      const ownerLeases = store.leases(meter, true, now).filter((lease) => lease.owner === options.owner);
+      const plannedShare = options.planSharePercent ?? ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
+      const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
+      const line = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: 0, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now }).line_percent;
+      const proRataRemaining = Math.max(0, line - usedSoFar);
+      used5hForLanes = Math.max(used5h, 100 - proRataRemaining);
+      allowanceBasis = "pro_rata";
+    }
   }
   // computeFill's default weekly-cost-per-lane is the 5h-to-weekly
   // calibration ratio, which only makes sense between two distinct windows.

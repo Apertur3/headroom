@@ -77,6 +77,12 @@ export interface GateUsage {
 export interface GateResult {
   allowed: boolean;
   reason: string;
+  /** Present when even pacing used the explicit fill allowance rather than
+   * the default pro-rata/burst checks. The two numbers make that decision
+   * scriptable without parsing its explanatory reason. */
+  allowance_basis?: "fill";
+  projected_percent?: number;
+  cap_percent?: number;
   /** Present only when at least one need was skipped because its window is
    * not enforced on this meter -- informational, never a refusal on its own. */
   not_enforced?: string[];
@@ -187,6 +193,46 @@ export function evaluateProRataLine(input: ProRataInput): ProRataResult {
     return { allowed: false, line_percent: line, reason: `pro-rata: ${prospective.toFixed(1)} pts used+requested exceeds the ${line.toFixed(1)} pt line (+${tolerance} tolerance) by ${over.toFixed(1)}` };
   }
   return { allowed: true, line_percent: line, reason: "fits the pro-rata line" };
+}
+
+/** A use-it-or-lose-it allowance for a lane the caller intends to finish
+ * before this window resets. Unlike the pro-rata line, this projects the
+ * meter's observed use, other owners' open work, and recent burn to the end
+ * of that lane, then leaves every point above the caller's cap untouched. */
+export interface FillAllowanceInput {
+  usedPercent: number;
+  reservedByOthersPercent: number;
+  /** The 60-minute least-squares burn; an absent history is deliberately
+   * treated as no projected burn, and named as such in the explanation. */
+  burnPercentPerHour: number | null;
+  laneHours: number;
+  capPercent: number;
+  requestPercent: number;
+}
+export interface FillAllowanceResult {
+  allowed: boolean;
+  reason: string;
+  projected_percent: number;
+  allowance_percent: number;
+  cap_percent: number;
+}
+
+export function evaluateFillAllowance(input: FillAllowanceInput): FillAllowanceResult {
+  const burn = Math.max(0, input.burnPercentPerHour ?? 0);
+  const laneHours = Math.max(0, input.laneHours);
+  const projected = Math.min(100, input.usedPercent + input.reservedByOthersPercent + burn * laneHours);
+  const cap = Math.max(0, Math.min(100, input.capPercent));
+  const capLabel = Number.isInteger(cap) ? cap.toFixed(0) : cap.toFixed(1);
+  const allowance = Math.max(0, cap - projected);
+  const allowed = input.requestPercent <= allowance;
+  const burnTerm = input.burnPercentPerHour === null
+    ? "no burn history"
+    : `burn ${burn.toFixed(1)} pts/h x ${laneHours.toFixed(1)} h`;
+  const terms = `used ${input.usedPercent.toFixed(1)} + reserved ${input.reservedByOthersPercent.toFixed(1)} + ${burnTerm}`;
+  const reason = allowed
+    ? `fill: projected ${projected.toFixed(1)} pts at lane end (${terms}) leaves ${allowance.toFixed(1)} under the ${capLabel} cap`
+    : `fill: projected ${projected.toFixed(1)} pts at lane end (${terms}); request ${input.requestPercent.toFixed(1)} exceeds the ${capLabel} cap by ${(input.requestPercent - allowance).toFixed(1)}`;
+  return { allowed, reason, projected_percent: projected, allowance_percent: allowance, cap_percent: cap };
 }
 
 export interface BurstInput {

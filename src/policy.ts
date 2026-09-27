@@ -23,6 +23,10 @@ export interface Policy {
    * "none": neither restriction applies -- gate falls back to the plain
    * reserve/plan-line checks, and fill always offers the full remainder. */
   pacing: "even" | "none";
+  /** The even-pacing allowance basis. "pro_rata" preserves a planned share
+   * through the window; "fill" projects use to a lane's end so an explicit
+   * caller can spend a use-it-or-lose-it window without crossing its cap. */
+  allowance: "pro_rata" | "fill";
   proxy?: string;
   /** Directories the statusline snapshot adapter scans for `<profile>.json`
    * files (headroom's own `headroom statusline` output) and third-party
@@ -47,7 +51,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", statusline_snapshot_dirs: [], update_check: true,
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", allowance: "pro_rata", statusline_snapshot_dirs: [], update_check: true,
 };
 
 /** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
@@ -61,6 +65,7 @@ export function parsePolicy(text: string): Policy {
   let antigravityKeepalive: boolean | undefined;
   let updateCheck: boolean | undefined;
   let pacing: Policy["pacing"] | undefined;
+  let allowance: Policy["allowance"] | undefined;
   let statuslineSnapshotDirs: string[] | undefined;
   for (const raw of text.split("\n")) {
     const line = raw.replace(/#.*/, "").trim();
@@ -88,6 +93,10 @@ export function parsePolicy(text: string): Policy {
     if (updateCheckMatch) { updateCheck = updateCheckMatch[1] === "true"; continue; }
     const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
     if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
+    if (/^pacing\s*=/.test(line)) throw new Error("Invalid Headroom policy");
+    const allowanceMatch = /^allowance\s*=\s*"(pro_rata|fill)"\s*$/.exec(line);
+    if (allowanceMatch) { allowance = allowanceMatch[1] as Policy["allowance"]; continue; }
+    if (/^allowance\s*=/.test(line)) throw new Error("Invalid Headroom policy");
     const dirsMatch = /^statusline_snapshot_dirs\s*=\s*\[(.*)\]\s*$/.exec(line);
     if (dirsMatch) {
       statuslineSnapshotDirs = [...dirsMatch[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((item) => expandHome(JSON.parse(`"${item[1]}"`) as string));
@@ -101,7 +110,7 @@ export function parsePolicy(text: string): Policy {
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0) || Object.values(reserves).some((value) => !Number.isFinite(value) || value < 0 || value > 90)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, allowance: allowance ?? defaultPolicy.allowance, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, ...(proxy ? { proxy } : {}) };
 }
 
 /** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from

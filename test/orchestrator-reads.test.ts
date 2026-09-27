@@ -454,6 +454,66 @@ describe("fillFor: even pacing restricts the offer before the final stretch", ()
   });
 });
 
+describe("gateFor/fillFor: explicit fill allowance basis", () => {
+  const meter = "claude-main:all";
+  const now = new Date("2026-09-03T12:00:00Z");
+  const resetsAt = "2026-09-03T16:30:00Z"; // 4.5h left, outside the final stretch
+
+  it("keeps the pro-rata default but lets an explicit caller spend the unclaimed window", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      const proRataGate = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even" });
+      const fillGate = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      const proRataFill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even" });
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(proRataGate.allowed).toBe(false);
+      expect(fillGate).toMatchObject({ allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
+      expect("error" in proRataFill ? null : proRataFill.lanes?.lanes).toBe(0);
+      expect(fill).toMatchObject({ allowance_basis: "fill" });
+      expect("error" in fill ? null : fill.lanes?.lanes).toBe(Math.floor((100 - 1 - 5) / 2));
+    } finally { store.close(); }
+  });
+
+  it("projects competing leases and 60-minute burn to the lane horizon", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(0, "2026-09-03T11:57:00Z", "2026-09-03T14:00:00Z", meter));
+      store.insert(fiveHour(1, now.toISOString(), "2026-09-03T14:00:00Z", meter)); // 20 pts/h over the last 3 minutes
+      const lease = store.startLease("other-owner", meter, 40, 3_600_000, null, now);
+      const withLease = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      store.endLease(lease.id, "other-owner");
+      const withBurn = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill", durationMinutes: 120 });
+      expect("error" in withLease ? null : withLease.lanes?.lanes).toBe(Math.floor((100 - 1 - 40 - 40 - 5) / 2));
+      expect(withBurn).toMatchObject({ allowed: false, allowance_basis: "fill", projected_percent: 41, cap_percent: 90 });
+    } finally { store.close(); }
+  });
+
+  it("never crosses the reserve-derived cap, honours a tighter cap, and stays full in the final stretch", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      expect(gateFor(store, [{ window: "5h", points: 95 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" }).allowed).toBe(false);
+      expect(gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill", capPercent: 50 }).allowed).toBe(false);
+      store.insert(fiveHour(1, "2026-09-03T15:50:00Z", resetsAt, meter));
+      const finalStretch = await fillFor(store, meter, 2, 10, new Date("2026-09-03T15:50:00Z"), { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(finalStretch).toMatchObject({ allowance_basis: "full" });
+    } finally { store.close(); }
+  });
+
+  it("uses a class-resolved shorter duration rather than projecting past the lane end", async () => {
+    const store = await open();
+    try {
+      store.insert(fiveHour(0, "2026-09-03T11:57:00Z", "2026-09-03T14:00:00Z", meter));
+      store.insert(fiveHour(1, now.toISOString(), "2026-09-03T14:00:00Z", meter));
+      const fullHorizon = gateFor(store, [{ window: "5h", points: 60 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      const classDuration = gateFor(store, [{ window: "5h", points: 60 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill", actionClass: "review", durationMinutes: 60 });
+      expect(fullHorizon.allowed).toBe(false);
+      expect(classDuration).toMatchObject({ allowed: true, projected_percent: 21, cap_percent: 90 });
+    } finally { store.close(); }
+  });
+});
+
 describe("gateFor/planFor/fillFor: unscheduled-reset notices (issue #20)", () => {
   it("carries one notice on gate, plan and fill for 24 hours after an unscheduled reset on a checked meter, then none", async () => {
     const store = await open();

@@ -20,7 +20,7 @@ import { isLocalAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
-interface JsonSchemaProperty { type?: string; items?: { type?: string; pattern?: string }; minimum?: number; maximum?: number; exclusiveMinimum?: number; }
+interface JsonSchemaProperty { type?: string; items?: { type?: string; pattern?: string }; minimum?: number; maximum?: number; exclusiveMinimum?: number; enum?: string[]; }
 interface ToolDefinition { name: string; description: string; inputSchema: { type: "object"; properties: Record<string, JsonSchemaProperty>; required?: string[] }; }
 
 const tools: ToolDefinition[] = [
@@ -35,9 +35,9 @@ const tools: ToolDefinition[] = [
   { name: "quota_spend", description: "Per-owner attributed spend on shared meters: how much of each window's actual movement the spend ledger books to each lease owner, with a confidence. The owner `unattributed` is movement that happened while no lease was open. since is an ISO timestamp, defaulting to 24 hours ago.", inputSchema: { type: "object", properties: { meter: { type: "string" }, owner: { type: "string" }, since: { type: "string" } } } },
   { name: "quota_inbox", description: "Read this session's hand-off messages from <HEADROOM_HOME>/inbox/<session>/, oldest first, marking each read. Read-only: sending a message is `headroom inbox send`, never this tool.", inputSchema: { type: "object", properties: { session: { type: "string" }, since: { type: "number", minimum: 0 } }, required: ["session"] } },
   { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" } }, required: ["meter"] } },
-  { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
+  { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, cap_percent: { type: "number", minimum: 0, maximum: 100 }, duration_minutes: { type: "number", exclusiveMinimum: 0 }, allowance: { type: "string", enum: ["pro_rata", "fill"] }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
-  { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, need: { type: "string" } }, required: ["meter"] } },
+  { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, duration_minutes: { type: "number", exclusiveMinimum: 0 }, allowance: { type: "string", enum: ["pro_rata", "fill"] }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" }, need: { type: "string" } }, required: ["meter"] } },
   { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
 ];
@@ -72,6 +72,7 @@ function validateToolArguments(toolName: string, rawArguments: unknown): Record<
     if (value === undefined) continue;
     if (spec.type === "string") {
       if (typeof value !== "string") throw new Error(`${key} must be a string`);
+      if (spec.enum && !spec.enum.includes(value)) throw new Error(`${key} must be one of ${spec.enum.join(", ")}`);
     } else if (spec.type === "boolean") {
       if (typeof value !== "boolean") throw new Error(`${key} must be a boolean`);
     } else if (spec.type === "number") {
@@ -409,11 +410,12 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
   } finally { store.close(); }
 }
 
-async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown): Promise<DirectResult> {
+async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown, allowance: unknown, capPercent: unknown, durationMinutes: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
   const policy = await readPolicy();
-  const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
+  const reserve = Math.max(policy.freeze_reserve_pct, typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct);
+  const routing = typeof actionClass === "string" ? await readRouting() : undefined;
   const store = await HeadroomStore.open();
   try {
     const result = gateFor(store, needs, typeof meter === "string" ? meter : undefined, reserve, usePlan === true, new Date(), {
@@ -421,6 +423,9 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
       planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined,
       actionClass: typeof actionClass === "string" ? actionClass : undefined,
       pacing: policy.pacing,
+      allowance: allowance === "pro_rata" || allowance === "fill" ? allowance : policy.allowance,
+      capPercent: typeof capPercent === "number" ? capPercent : undefined,
+      durationMinutes: typeof durationMinutes === "number" ? durationMinutes : routing?.costs[typeof actionClass === "string" ? actionClass : ""]?.duration_minutes,
       staleness_minutes: policy.staleness_minutes,
       reserves: policy.reserve,
     });
@@ -429,14 +434,15 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
   } finally { store.close(); }
 }
 
-async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReservePercent: unknown, owner: unknown, planSharePercent: unknown, need: unknown): Promise<DirectResult> {
+async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReservePercent: unknown, owner: unknown, planSharePercent: unknown, need: unknown, actionClass: unknown, allowance: unknown, durationMinutes: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
   const policy = await readPolicy();
   const weeklyReserve = typeof weeklyReservePercent === "number" ? weeklyReservePercent : policy.freeze_reserve_pct;
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
+  const routing = typeof actionClass === "string" ? await readRouting() : undefined;
   const store = await HeadroomStore.open();
   try {
-    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof need === "string" ? need : undefined });
+    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, actionClass: typeof actionClass === "string" ? actionClass : undefined, durationMinutes: typeof durationMinutes === "number" ? durationMinutes : routing?.costs[typeof actionClass === "string" ? actionClass : ""]?.duration_minutes, pacing: policy.pacing, allowance: allowance === "pro_rata" || allowance === "fill" ? allowance : policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof need === "string" ? need : undefined });
     store.audit("mcp", "fill", meter, "ok");
     return { source: "direct", ...result };
   } finally { store.close(); }
@@ -470,9 +476,9 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "spend") return directSpend(arguments_.meter, arguments_.owner, arguments_.since);
   if (method === "inbox") return directInbox(arguments_.session, arguments_.since);
   if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need);
-  if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class);
+  if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class, arguments_.allowance, arguments_.cap_percent, arguments_.duration_minutes);
   if (method === "wait") return directWait(arguments_.meter);
-  if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need);
+  if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need, arguments_.action_class, arguments_.allowance, arguments_.duration_minutes);
   if (method === "route") return directRoute(arguments_.action_class, arguments_.owner, arguments_.allow_unknown);
   if (method === "usage_paste") return directUsagePaste(arguments_.principal, arguments_.text);
   return directEvents(arguments_.since);
@@ -577,8 +583,8 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "rate" ? { meter: arguments_.meter, minutes: arguments_.minutes, owner: arguments_.owner, need: arguments_.need }
       : method === "spend" ? { meter: arguments_.meter, owner: arguments_.owner, since: arguments_.since }
       : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need }
-      : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
-      : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, need: arguments_.need }
+      : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, cap_percent: arguments_.cap_percent, duration_minutes: arguments_.duration_minutes, allowance: arguments_.allowance, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
+      : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, duration_minutes: arguments_.duration_minutes, allowance: arguments_.allowance, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, need: arguments_.need }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }
       : {};

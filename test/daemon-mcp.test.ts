@@ -381,12 +381,34 @@ describe("MCP tool arguments are validated against their own schema before dispa
   });
 
   it("accepts every duration form advertised by quota_gate and forwards the shared parser result", async () => {
-    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["30d:1","90m:2","48h:3"],"meter":"claude-main:all"}}}', async (method, params) => {
+    const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["30d:1","90m:2","48h:3"],"meter":"claude-main:all","allowance":"fill","cap_percent":50,"duration_minutes":30}}}', async (method, params) => {
       expect(method).toBe("gate");
       expect(params.needs).toEqual([{ window: "30d", points: 1 }, { window: "90m", points: 2 }, { window: "48h", points: 3 }]);
+      expect(params).toMatchObject({ allowance: "fill", cap_percent: 50, duration_minutes: 30 });
       return { allowed: true, reason: "fits", meters_checked: ["claude-main:all"] };
     });
     expect(response).toMatchObject({ result: { structuredContent: { allowed: true } } });
+  });
+
+  it("advertises allowance's enum and takes fill through the direct MCP decision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-fill-allowance-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    const now = new Date();
+    const store = await HeadroomStore.open(home);
+    store.insert({
+      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+      quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+      observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+    });
+    store.close();
+    await withHeadroomHome(home, async () => {
+      const listed = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
+      const gate = ((listed as { result: { tools: Array<{ name: string; inputSchema: { properties: Record<string, { enum?: string[] }> } }> } }).result.tools).find((tool) => tool.name === "quota_gate");
+      expect(gate?.inputSchema.properties.allowance.enum).toEqual(["pro_rata", "fill"]);
+      const response = await handleMcp('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:50"],"meter":"claude-main:all","owner":"x","allowance":"fill"}}}', async () => undefined);
+      expect(response).toMatchObject({ result: { structuredContent: { allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 } } });
+    });
   });
 
   it("rejects a negative reserve_percent the same way the CLI's --reserve does", async () => {
@@ -416,6 +438,62 @@ describe("MCP tool arguments are validated against their own schema before dispa
   it("still lets a fully valid call through unchanged", async () => {
     const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_gate","arguments":{"needs":["5h:1"],"meter":"claude-main:all","owner":"cadence","reserve_percent":10}}}', async (method) => { expect(method).toBe("gate"); return { allowed: true, reason: "fits", meters_checked: ["claude-main:all"] }; });
     expect(response).toMatchObject({ result: { structuredContent: { allowed: true } } });
+  });
+});
+
+describe("fill allowance through daemon RPC", () => {
+  it("uses the fill basis and returns its projection fields", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-fill-allowance-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "accounts.toml"), "", { mode: 0o600 });
+    await withHeadroomHome(home, async () => {
+      const daemon = await HeadroomDaemon.create({ home, path: testSocketPath(root, "fill-allowance") });
+      const now = new Date();
+      const store = await HeadroomStore.open(home);
+      store.insert({
+        principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+        observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+      store.close();
+      try {
+        const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"gate","params":{"needs":[{"window":"5h","points":50}],"meter":"claude-main:all","owner":"x","allowance":"fill"}}');
+        expect(reply.error).toBeUndefined();
+        expect(reply.result).toMatchObject({ allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
+      } finally { await daemon.stop(); }
+    });
+  });
+
+  it("reaches the same fill decision through the CLI when a daemon is available", async () => {
+    const root = await mkdtemp(join(tmpdir(), "h-c-f-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "accounts.toml"), "", { mode: 0o600 });
+    const path = socketPath(home);
+    const daemon = await HeadroomDaemon.create({ home, path });
+    try {
+      await daemon.start();
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+      throw error;
+    }
+    const now = new Date();
+    const store = await HeadroomStore.open(home);
+    store.insert({
+      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+      quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+      observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+    });
+    store.close();
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["gate", "--need", "5h:50", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill", "--json"])).toBe(0);
+      });
+    } finally { spy.mockRestore(); await daemon.stop(); }
+    expect(JSON.parse(logs[0])).toMatchObject({ allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
   });
 });
 

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Opt-in `fill` allowance basis for `gate`, `fill`, and `run`: it projects current use, open leases, and recent burn to a lane's end while retaining reserve-derived caps; pro-rata pacing remains the default. (#70)
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed
