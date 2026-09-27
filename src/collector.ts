@@ -34,6 +34,8 @@ export interface PollResult {
   claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh">;
 }
 export interface PollOptions {
+  /** Overrides the platform's native-engine availability for controlled callers. */
+  nativeEngineAvailable?: boolean;
   /** Set only by the daemon while it owns a warmed `agy` PTY. */
   daemonOwnsAntigravity?: boolean;
   /** Remote quota failures are backed off independently from the warm local probe. */
@@ -221,7 +223,8 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   const antigravityLocal: Record<string, AntigravityLocalRead> = {};
   const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && account.vendor !== "claude" && (account.adapter === "engine" || account.adapter === "native"));
   let nativeFailure: string | undefined;
-  const native = process.platform === "win32" ? undefined : await nativeEnginePath().catch((error: unknown) => {
+  const nativeEngineAvailable = options.nativeEngineAvailable ?? process.platform !== "win32";
+  const native = !nativeEngineAvailable ? undefined : await nativeEnginePath().catch((error: unknown) => {
     nativeFailure = safeError(error);
     return undefined;
   });

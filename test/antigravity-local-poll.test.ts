@@ -65,7 +65,7 @@ it("retries the native Antigravity read once within the same poll and uses a com
   process.env.HEADROOM_HOME = root;
   vi.mocked(nativeEnginePath).mockResolvedValue("/fake/engine");
   vi.mocked(runNativeEngine).mockReset().mockResolvedValueOnce(transientFailurePair()).mockResolvedValueOnce(COMPLETE_ANTIGRAVITY_ROWS);
-  const result = await pollAccounts(undefined, { daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
+  const result = await pollAccounts(undefined, { nativeEngineAvailable: true, daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
   expect(runNativeEngine).toHaveBeenCalledTimes(2);
   const rows = result.observations.filter((item) => item.principal_id === "antigravity");
   expect(rows).toHaveLength(4);
@@ -79,7 +79,7 @@ it("gives up after one retry and reports the transient failure honestly when it 
   process.env.HEADROOM_HOME = root;
   vi.mocked(nativeEnginePath).mockResolvedValue("/fake/engine");
   vi.mocked(runNativeEngine).mockReset().mockResolvedValue(transientFailurePair()); // still incomplete every call
-  const result = await pollAccounts(undefined, { daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
+  const result = await pollAccounts(undefined, { nativeEngineAvailable: true, daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
   expect(runNativeEngine).toHaveBeenCalledTimes(2); // one retry, not an unbounded loop
   const rows = result.observations.filter((item) => item.principal_id === "antigravity");
   expect(rows).toHaveLength(2);
