@@ -16,7 +16,7 @@ import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
@@ -170,6 +170,19 @@ function withPace(store: HeadroomStore, observations: ReturnType<HeadroomStore["
   return withLastKnown(paced, store.lastKnownFor(observations, now)) as ReturnType<HeadroomStore["latestPerWindow"]>;
 }
 
+async function disabledMeterReason(meter: string): Promise<string | undefined> {
+  const principal = disabledPrincipalForMeter(await readAccounts().catch(() => []), meter);
+  return principal ? disabledPrincipalReason(principal) : undefined;
+}
+
+async function statusObservations(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, now: Date): Promise<{ observations: ReturnType<HeadroomStore["latestPerWindow"]>; disabled_principals: string[] }> {
+  // A direct MCP read must hide old rows exactly like daemon-backed status;
+  // this configuration lookup touches neither credentials nor adapters.
+  const accounts = await readAccounts().catch(() => []);
+  const disabled_principals = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+  return { observations: withResetsIn(withPace(store, observations.filter((item) => !disabled_principals.includes(item.principal_id)), now)), disabled_principals };
+}
+
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
@@ -187,10 +200,10 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", ...(await statusObservations(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", ...(await statusObservations(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -204,7 +217,7 @@ export async function directStatus(): Promise<DirectResult> {
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    return { source: "direct", ...(await statusObservations(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 
@@ -218,7 +231,13 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
   try {
     const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
     if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
-    const localAccounts = accounts.filter(isLocalAccount);
+    const disabled = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
+    if (disabled) {
+      const reason = disabledPrincipalReason(disabled);
+      const decision: CanDecision = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] };
+      return { source: "direct", decision, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
+    }
+    const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
     store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
     const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
     const now = new Date();
@@ -284,10 +303,12 @@ async function directEvents(since: unknown): Promise<DirectResult> {
 }
 
 async function directLeaseStart(arguments_: Record<string, unknown>): Promise<DirectResult> {
+  const meterId = String(arguments_.meter_id ?? "");
+  const disabled = meterId ? await disabledMeterReason(meterId) : undefined;
+  if (disabled) return { source: "direct", meter_id: meterId, allowed: false, unknown: true, reason: disabled };
   const store = await HeadroomStore.open();
   try {
     const owner = String(arguments_.owner ?? "");
-    const meterId = String(arguments_.meter_id ?? "");
     const actionClass = typeof arguments_.action_class === "string" && arguments_.action_class.trim() ? arguments_.action_class.trim() : null;
     const lease = store.startLease(owner, meterId, typeof arguments_.expected_percent === "number" ? arguments_.expected_percent : null, typeof arguments_.ttl_ms === "number" ? arguments_.ttl_ms : 30 * 60_000, typeof arguments_.note === "string" ? arguments_.note : null, new Date(), actionClass);
     store.audit("mcp", "lease_start", `${owner}:${meterId}`, "ok");
@@ -328,6 +349,8 @@ async function directCost(actionClass: unknown): Promise<DirectResult> {
 }
 
 async function directRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  if (disabled) return { source: "direct", lines: [{ meter, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }] };
   const store = await HeadroomStore.open();
   try {
     const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
@@ -366,6 +389,8 @@ async function directInbox(session: unknown, since: unknown): Promise<DirectResu
 
 async function directPlan(meter: unknown, reservePercent: unknown, need: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return { source: "direct", meter, error: disabled, unknown: true };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
@@ -381,6 +406,8 @@ async function directPlan(meter: unknown, reservePercent: unknown, need: unknown
 async function directUsagePaste(principal: unknown, text: unknown): Promise<DirectResult> {
   if (typeof text !== "string" || !text.trim()) throw new Error("text is required: paste the /usage panel");
   const resolved = resolveClaudePrincipal(await readAccounts(), typeof principal === "string" && principal.trim() ? principal.trim() : undefined);
+  const disabled = await disabledMeterReason(`${resolved}:all`);
+  if (disabled) return { source: "direct", principal: resolved, allowed: false, unknown: true, reason: disabled };
   const now = new Date();
   const panel = parseUsagePanel(text, now);
   if (!panel.windows.length) throw new Error('no usage window in the pasted text; expected a line like "Current session" or "Current week (all models)" with a percent');
@@ -412,6 +439,8 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
 async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
+  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  if (disabled) return { source: "direct", allowed: false, unknown: true, reason: disabled, meters_checked: [], notices: [] };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
@@ -431,6 +460,8 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
 
 async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReservePercent: unknown, owner: unknown, planSharePercent: unknown, need: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return { source: "direct", meter, error: disabled, notices: [] };
   const policy = await readPolicy();
   const weeklyReserve = typeof weeklyReservePercent === "number" ? weeklyReservePercent : policy.freeze_reserve_pct;
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
@@ -448,6 +479,8 @@ async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReserv
  * in one uninterruptible call. */
 async function directWait(meter: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return { source: "direct", meter, resets_at: null, resets_in_seconds: null, suggested_sleep_seconds: null, reason: disabled, unknown: true };
   const store = await HeadroomStore.open();
   try {
     const rows = store.latestPerWindow(meter).filter((item) => item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
@@ -597,9 +630,14 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
     let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
-    if (method === "status" && Array.isArray(finalResult)) {
+    if (method === "status" && (Array.isArray(finalResult) || (finalResult && typeof finalResult === "object" && Array.isArray((finalResult as { observations?: unknown }).observations)))) {
       const downgrade = await call("plan_downgrades", {});
-      finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+      const accounts = await readAccounts().catch(() => []);
+      const disabled_principals = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+      const observations = (Array.isArray(finalResult) ? finalResult : (finalResult as { observations: unknown[] }).observations).filter((item) => item && typeof item === "object" && !disabled_principals.includes(String((item as { principal_id?: unknown }).principal_id)));
+      finalResult = Array.isArray(finalResult)
+        ? { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null, disabled_principals }
+        : { ...finalResult, observations, plan_downgraded: (finalResult as { plan_downgraded?: unknown }).plan_downgraded ?? (Array.isArray(downgrade) ? downgrade[0] ?? null : null), disabled_principals };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself

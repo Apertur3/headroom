@@ -778,13 +778,18 @@ describe("dashboard graph gathering", () => {
     const model = graphModel(); store.insertAll(model.history!["account-a:all"]);
     const request = vi.spyOn(daemon, "daemonRequest").mockResolvedValue({ status: "available", result: { result: model } });
     vi.spyOn(config, "readPolicy").mockResolvedValue(model.policy);
-    vi.spyOn(registry, "readAccounts").mockResolvedValue([]);
+    vi.spyOn(registry, "readAccounts").mockResolvedValue([
+      { name: "account-a", vendor: "claude", location: "/fixture/.claude", adapter: "native-ts" },
+      { name: "account-b", enabled: false, vendor: "claude", location: "/fixture/.claude2", adapter: "native-ts" },
+    ]);
     vi.spyOn(HeadroomStore, "open").mockResolvedValue(store);
     const close = vi.spyOn(store, "close"), latest = vi.spyOn(store, "latestPerWindow");
     try {
       vi.useFakeTimers(); vi.setSystemTime(now);
       const gathered = await gatherDashboard();
       expect(gathered.direct).toBe(false); expect(gathered.history!["account-a:all"]).toHaveLength(3);
+      expect(gathered.observations.some((row) => row.principal_id === "account-b")).toBe(false);
+      expect(gathered.notices).toContain("disabled principals: account-b (enabled = false in accounts.toml)");
       expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$|^\\\\\.\\pipe\\headroom-/), "dashboard", {}, 50, 500);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }

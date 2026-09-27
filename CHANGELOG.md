@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Principals can be parked with `enabled = false` in `accounts.toml`, or with `headroom accounts disable <name>`, without removing their configuration. Disabled principals are not polled, scheduled, or considered capacity; status and JSON name them explicitly, and `headroom accounts enable <name>` restores them. (#73)
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed

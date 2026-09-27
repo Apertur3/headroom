@@ -105,7 +105,13 @@ below.
 ### `status` (`headroom --json` / `--threshold N --json`, MCP `quota_status`)
 
 CLI: `{ contract, generated_at, observations: Observation[], leases: Lease[],
-plan_downgraded: { principal, from, to, since, acknowledged } | null, threshold?: {...} }`.
+plan_downgraded: { principal, from, to, since, acknowledged } | null,
+disabled_principals: string[], threshold?: {...} }`. `disabled_principals` is
+always present (empty when none): its principals are configured with
+`enabled = false`, so their stored observations are omitted rather than
+reported as current capacity. MCP `quota_status` carries the same additive
+field. The daemon JSON-RPC `status` result is `{ observations,
+disabled_principals }` with the same meaning.
 `threshold` is present only with `--threshold N`:
 `{ percent: number, windows: ThresholdWindow[], any_crossed: boolean,
 any_blocking: boolean }`, where each `ThresholdWindow` is `{ meter_id: string,

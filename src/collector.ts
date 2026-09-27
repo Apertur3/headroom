@@ -14,7 +14,7 @@ import { observeKimi } from "./adapters/kimi.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
-import { isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
 import type { AgyLoginState } from "./antigravity-keepalive.js";
 
 export interface PollResult {
@@ -127,7 +127,10 @@ export function antigravityFallbackNote(daemonOwnsAntigravity: boolean, local: O
 
 /** One credential-backed collection pass. The daemon supplies serialization/rate limits. */
 export async function pollAccounts(principal?: string, options: PollOptions = {}): Promise<PollResult> {
-  const accounts = (await readAccounts()).filter((account) => !principal || account.name === principal);
+  // Disabled is an opt-out before *any* adapter-specific preparation. In
+  // particular this must happen before Claude policy/statusline setup and
+  // before an Antigravity warm read or local-pool probe can touch a source.
+  const accounts = (await readAccounts()).filter((account) => isAccountEnabled(account) && (!principal || account.name === principal));
   const providerAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account));
   const localAccounts = accounts.filter(isLocalAccount);
   const observations: Observation[] = [];

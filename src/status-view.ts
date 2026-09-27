@@ -337,6 +337,10 @@ export function statusViewOptions(argv: string[], isTty: boolean, environment: N
 
 export interface StatusViewInput {
   observations: Observation[];
+  /** Configured principals deliberately parked with `enabled = false`.
+   * Their old rows remain in SQLite for history, but status never renders
+   * them as a current meter. */
+  disabled_principals?: string[];
   policy: Policy;
   resetSeen?: Map<string, string>;
   freeResetUsed?: Map<string, string>;
@@ -554,8 +558,10 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
 
 /** The one-line summary under everything: how much was read, how much of it
  * is unusable and why, and where the numbers came from. */
-function footer(blocks: PrincipalBlock[], direct: boolean, observations: Observation[], now: Date): string {
-  const parts = [`${blocks.length} principal${blocks.length === 1 ? "" : "s"}`];
+function footer(blocks: PrincipalBlock[], disabledCount: number, direct: boolean, observations: Observation[], now: Date): string {
+  const configured = blocks.length + disabledCount;
+  const parts = [`${configured} principal${configured === 1 ? "" : "s"}`];
+  if (disabledCount) parts.push(`${disabledCount} disabled`);
   const unknownCount = blocks.reduce((sum, block) => sum + block.unknownCount, 0);
   if (unknownCount) parts.push(`${unknownCount} UNKNOWN (${[...new Set(blocks.flatMap((block) => block.causes))].join(", ")})`);
   if (direct) parts.push("direct read, no daemon");
@@ -635,15 +641,22 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
     return lines;
   }).filter((lines) => lines.length);
 
-  const body = blockLines.flatMap((lines, index) => index === 0 ? lines : ["", ...lines]);
-  return [...body, ...(body.length ? [""] : []), ...wrap(footer(blocks, options.direct, input.observations, now), options.width, 0)];
+  const disabled = [...new Set(input.disabled_principals ?? [])].sort().map((principal) => `${principal}  disabled (enabled = false in accounts.toml)`);
+  const allBlocks = [...blockLines, ...disabled.map((line) => [line])];
+  const body = allBlocks.flatMap((lines, index) => index === 0 ? lines : ["", ...lines]);
+  return [...body, ...(body.length ? [""] : []), ...wrap(footer(blocks, disabled.length, options.direct, input.observations, now), options.width, 0)];
 }
 
 /** The entry point cli.ts calls: one array of ready-to-print lines, in
  * whichever form the options selected. */
 export function renderStatus(input: StatusViewInput, options: StatusViewOptions): string[] {
+  const disabled = [...new Set(input.disabled_principals ?? [])].sort();
+  // A disabled principal can have an arbitrarily alarming failed row in the
+  // store from before it was parked. Keep that history on disk, but never let
+  // it leak back into a current status view.
+  const active = { ...input, observations: input.observations.filter((item) => !disabled.includes(item.principal_id)), disabled_principals: disabled };
   const warnings = (input.planDowngraded ?? []).map(planDowngradeLine);
-  if (options.form === "plain") return [...warnings, ...formatMeters(input.observations, input.policy, input.resetSeen, input.leases, input.freeResetUsed, input.now ?? new Date())];
-  const body = groupedLines(input, options);
+  if (options.form === "plain") return [...warnings, ...formatMeters(active.observations, active.policy, active.resetSeen, active.leases, active.freeResetUsed, active.now ?? new Date()), ...disabled.map((principal) => `${principal}  disabled (enabled = false in accounts.toml)`)];
+  const body = groupedLines(active, options);
   return options.color ? [...warnings.map((line) => `${ANSI.red}${line}${ANSI.reset}`), ...body] : [...warnings, ...body];
 }

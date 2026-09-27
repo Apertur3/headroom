@@ -200,6 +200,22 @@ describe("status view: the three forms", () => {
   });
 });
 
+describe("status view: disabled principals", () => {
+  it("replaces every stored meter for a parked principal with one disabled line in both forms", () => {
+    const observations = [...STORE, observation({
+      principal_id: "claude-2", meter_id: "claude-2:all", quantity: null, freshness: "failed",
+      reason: "Claude Code is logged out for this profile",
+    })];
+    const grouped = render({}, { observations, disabled_principals: ["claude-2"] });
+    const plain = render({ form: "plain" }, { observations, disabled_principals: ["claude-2"] });
+    for (const text of [grouped, plain]) {
+      expect(text).toContain("claude-2  disabled (enabled = false in accounts.toml)");
+      expect(text).not.toContain("claude-2:all");
+      expect(text).not.toContain("Claude Code is logged out");
+    }
+  });
+});
+
 describe("status view: local pools and credits", () => {
   const pool = (state: "UP" | "DOWN", extra: Partial<Observation> = {}): Observation => observation({
     principal_id: "gpu-box", meter_id: "gpu-box:capacity", source: "native:local",

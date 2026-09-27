@@ -61,8 +61,9 @@ Seeded /Users/you/.headroom/routing.toml from examples/routing.toml (action clas
 The `policy.toml`/`routing.toml` seed step only runs when those files don't already exist, so it
 never overwrites a config you've customized. The three seeded action classes (`claude-fable`,
 `codex-build`, `gemini-bulk`) let `headroom can <class>` work right away; edit `routing.toml` to
-match the accounts you actually have, and rename or drop `accounts.toml` entries you don't want
-polled. `examples/accounts.toml` shows the full shape, including the commented-out `local` block
+match the accounts you actually have. To keep an optional or deliberately logged-out second
+profile without polling it, set `enabled = false` in its `[[accounts]]` block (or run
+`headroom accounts disable <name>`); `headroom accounts enable <name>` restores it. `examples/accounts.toml` shows the full shape, including the commented-out `local` block
 for a vLLM or llama.cpp box.
 
 If `accounts.toml` doesn't exist yet and you run a bare `headroom` first, it says so plainly:

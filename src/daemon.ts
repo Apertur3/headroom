@@ -17,7 +17,7 @@ import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrat
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { accountsPath, readAccounts } from "./registry.js";
-import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 
@@ -168,7 +168,7 @@ export class HeadroomDaemon {
   private readonly backoff = new Map<string, { failures: number; until: number }>();
   private readonly schedulers = new Map<string, NodeJS.Timeout>();
   private accounts: Account[] = [];
-  private accountsMtime: number | undefined;
+  private accountsMtime: string | undefined;
   private schedulingStarted = false;
   private stopping = false;
   private sessionToken: string | undefined;
@@ -262,7 +262,7 @@ export class HeadroomDaemon {
   private canDecision(meters: string[], accounts: Account[], localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, owner: string, now: Date, includeOwnerReservations = false): CanDecision {
     const blocked = meters.map((meter) => this.store.dispatchBlockForMeter(meter, now) ?? this.store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
     if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
-    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
     const allMeters = [...new Set([...meters, ...localMeters])];
     const rows = new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)]));
     const burn = this.store.burnRateFor([...rows.values()].flat(), now);
@@ -469,13 +469,13 @@ export class HeadroomDaemon {
       let result: unknown;
       switch (request.method) {
         case "dashboard": {
-          const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
           result = readDashboardStore(this.store, new Date(), rows); break;
         }
         case "status": {
           await this.poll(undefined, false);
           const now = new Date();
-          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
           // A principal currently sitting out a live vendor 429 backoff (see
           // poll()'s own backoff bookkeeping) still serves whatever it last
           // read, unchanged, except its reason: naming the real deadline this
@@ -483,7 +483,10 @@ export class HeadroomDaemon {
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
           const paced = withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now);
-          result = withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now)));
+          result = {
+            observations: withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now))),
+            disabled_principals: this.accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name),
+          };
           break;
         }
         case "plan_downgrades": {
@@ -494,6 +497,8 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
           if (!meter) return reject(-32602, "meter is required");
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           result = this.store.history(meter, since); break;
         }
         case "events": {
@@ -510,6 +515,8 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
+          const disabled = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
+          if (disabled) { const reason = disabledPrincipalReason(disabled); result = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] } satisfies CanDecision; break; }
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const now = new Date();
@@ -530,6 +537,8 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
+          const disabled = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
+          if (disabled) { const reason = disabledPrincipalReason(disabled); result = { decision: { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] }, leases: [] }; break; }
           // Refreshes may happen before the transaction; the transaction is
           // deliberately only the local decision plus lease write, never a
           // credential-backed network request.
@@ -538,10 +547,10 @@ export class HeadroomDaemon {
           const now = new Date();
           const admitted = this.store.admitAndStartLeases(() => {
             const raw = this.canDecision(meters, accounts, routing.local_preference, policy, params.allow_unknown === true, owner, now, true);
-            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
             return admitCanCost(this.store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, policy, expected, now);
           }, owner, (admittedDecision) => {
-            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
             return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
           }, expected, ttl, `can:${action}`, now, action);
           result = { decision: admitted.decision, leases: admitted.leases };
@@ -553,6 +562,8 @@ export class HeadroomDaemon {
           const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
           const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
           const actionClass = typeof params.action_class === "string" && params.action_class.trim() ? params.action_class.trim() : null;
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null, new Date(), actionClass); break;
         }
         case "lease_end": {
@@ -584,6 +595,8 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : undefined;
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
           const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          const disabled = meter ? disabledPrincipalForMeter(await this.currentAccounts(), meter) : undefined;
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined); break;
         }
         case "spend": {
@@ -595,6 +608,8 @@ export class HeadroomDaemon {
         case "plan": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
           result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined); break;
@@ -609,6 +624,10 @@ export class HeadroomDaemon {
             return typeof candidate.window === "string" && windowNeedMinutes(candidate.window) !== undefined && typeof candidate.points === "number" ? [{ window: candidate.window, points: candidate.points }] : [];
           });
           if (!needs.length) return reject(-32602, "needs is required");
+          const targetMeters = meter === undefined ? [] : Array.isArray(meter) ? meter : [meter];
+          const accounts = await this.currentAccounts();
+          const disabled = targetMeters.map((item) => disabledPrincipalForMeter(accounts, item)).find((item): item is string => item !== undefined);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled));
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
@@ -620,6 +639,8 @@ export class HeadroomDaemon {
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           const laneCost = typeof params.lane_cost_percent === "number" ? params.lane_cost_percent : undefined;
           const policy = await readPolicy();
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
@@ -680,12 +701,16 @@ export class HeadroomDaemon {
     if (!forced && principal === undefined && !warmOnly) {
       try {
         const accounts = await this.currentAccounts();
-        if (accounts.length && accounts.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
+        const enabled = accounts.filter(isAccountEnabled);
+        if (enabled.length && enabled.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
       } catch { /* A collection pass returns the useful configuration error. */ }
     }
     if (forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { rate_limited: true };
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
     const accounts = await this.currentAccounts();
+    const enabledAccounts = accounts.filter(isAccountEnabled);
+    if (principal && accounts.some((account) => account.name === principal && !isAccountEnabled(account))) return { observations: [], failures: [] };
+    if (!principal && accounts.length && !enabledAccounts.length) return { observations: [], failures: [] };
     // Records which probe binary this poll is about to run, before it runs.
     // Idempotent, so two concurrent poll() calls racing here (before the
     // inFlight check/set pair right below, which must stay await-free to keep
@@ -698,7 +723,15 @@ export class HeadroomDaemon {
       skipRemoteAntigravity: warmOnly,
       antigravityLoginState: this.keepalive?.loginState ?? "unknown",
       claudeGrant: claudeGrantGate(this.store),
-    }).then((result) => {
+    }).then((rawResult) => {
+      // Keep the daemon's bookkeeping closed even for an injected poller:
+      // disabled rows must not create observations, source events, or alerts.
+      const disabled = new Set(accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name));
+      const result = {
+        ...rawResult,
+        observations: rawResult.observations.filter((item) => !disabled.has(item.principal_id)),
+        failures: rawResult.failures.filter((failure) => ![...disabled].some((name) => failure.startsWith(`${name} source failed`))),
+      };
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertPoll(result.observations);
@@ -709,17 +742,20 @@ export class HeadroomDaemon {
       void deliverNotifications(this.store, { home: this.home })
         .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
+        if (disabled.has(principalId)) continue;
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
-      if (this.schedulingStarted && !this.keepalive?.running && accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-        void this.maybeStartKeepalive(accounts, policy);
+      if (this.schedulingStarted && !this.keepalive?.running && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+        void this.maybeStartKeepalive(enabledAccounts, policy);
       }
       // A gate-blocked skip renders the exact same failed observation reason
       // as a real denial on purpose (see PollResult.claudeProbeOutcomes), so
       // the audit outcome comes from the collector's own record of what it
       // did, never from inspecting the observations after the fact.
-      for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) this.store.audit("daemon", "claude_probe", principalId, outcome);
+      for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) {
+        if (!disabled.has(principalId)) this.store.audit("daemon", "claude_probe", principalId, outcome);
+      }
       // Every scheduled vendor poll is audited, not only Claude's (which
       // already gets its own claude_probe row above): a non-Claude principal
       // that failed to fetch must leave the same evidence trail.
@@ -748,11 +784,15 @@ export class HeadroomDaemon {
     if (this.stopping) return;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
-    try { for (const account of await this.currentAccounts()) this.schedulePrincipal(account.name); }
+    try { for (const account of (await this.currentAccounts()).filter(isAccountEnabled)) this.schedulePrincipal(account.name); }
     catch { this.schedulePrincipal("all"); }
   }
 
   private async schedulePrincipal(principal: string): Promise<void> {
+    if (principal !== "all") {
+      const account = (await this.currentAccounts()).find((item) => item.name === principal);
+      if (!account || !isAccountEnabled(account)) { this.schedulers.delete(principal); return; }
+    }
     const policy = await readPolicy();
     const minutes = policy.principal_intervals[principal] ?? policy.poll_interval_minutes;
     const delay = Math.max(1_000, minutes * 60_000 * (0.8 + Math.random() * 0.4));
@@ -769,23 +809,24 @@ export class HeadroomDaemon {
 
   /** Reloads principal scheduling when accounts.toml changes without a restart. */
   private async currentAccounts(): Promise<Account[]> {
-    let mtime: number;
-    try { mtime = (await stat(accountsPath())).mtimeMs; }
+    let mtime: string;
+    try { const info = await stat(accountsPath()); mtime = `${info.mtimeMs}:${info.size}`; }
     catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { this.accounts = []; this.accountsMtime = undefined; return this.accounts; } throw error; }
     if (this.accountsMtime === mtime) return this.accounts;
     const accounts = await readAccounts();
-    const prior = new Set(this.accounts.map((account) => account.name));
+    const priorAccounts = new Map(this.accounts.map((account) => [account.name, account]));
+    const prior = new Set(priorAccounts.keys());
     const next = new Set(accounts.map((account) => account.name));
     this.accounts = accounts;
     this.accountsMtime = mtime;
-    for (const name of prior) if (!next.has(name)) {
+    for (const name of prior) if (!next.has(name) || !isAccountEnabled(accounts.find((account) => account.name === name)!)) {
       const timer = this.schedulers.get(name);
       if (timer) clearTimeout(timer);
       this.schedulers.delete(name);
       this.lastPoll.delete(name);
       this.backoff.delete(name);
     }
-    if (this.schedulingStarted) for (const account of accounts) if (!prior.has(account.name)) void this.schedulePrincipal(account.name);
+    if (this.schedulingStarted) for (const account of accounts) if (isAccountEnabled(account) && (!prior.has(account.name) || !isAccountEnabled(priorAccounts.get(account.name)!))) void this.schedulePrincipal(account.name);
     return this.accounts;
   }
 }

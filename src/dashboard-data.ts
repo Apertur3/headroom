@@ -3,7 +3,7 @@ import { withLastKnown, withPaceInfo } from "./pace.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import type { PlanDowngrade } from "./store.js";
-import { isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
 import type { Policy } from "./policy.js";
 import { headroomVersion } from "./version.js";
 
@@ -107,5 +107,14 @@ export async function gatherDashboard(home?: string, timeouts: DashboardRequestT
     }),
     readPolicy(), readAccounts().catch(() => []), headroomVersion(),
   ]);
-  return { ...snapshot, direct, policy, version, now: new Date(), vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
+  const disabled = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+  const enabled = new Set(accounts.filter(isAccountEnabled).map((account) => account.name));
+  const filtered = accounts.length ? {
+    ...snapshot,
+    observations: snapshot.observations.filter((row) => enabled.has(row.principal_id)),
+    events: snapshot.events.filter((event) => !event.principal_id || enabled.has(event.principal_id)),
+    leases: snapshot.leases.filter((lease) => enabled.has(lease.meter_id.split(":", 1)[0])),
+  } : snapshot;
+  const notices = disabled.length ? [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] : filtered.notices;
+  return { ...filtered, notices, direct, policy, version, now: new Date(), vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
 }

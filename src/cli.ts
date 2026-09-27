@@ -33,7 +33,7 @@ import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
-import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { accountsPath, accountsToml, discoverAccounts, readAccounts, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
 import { migrateLegacyHome } from "./paths.js";
 import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
@@ -41,7 +41,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type PlanDowngrade } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -86,6 +86,8 @@ export { formatMeters };
 async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: headroom history <meter> [--since 24h]");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return disabledUnknownLine(meter, disabled);
   const at = argv.indexOf("--since");
   const request = await requestDaemon("history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
   if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
@@ -149,6 +151,13 @@ async function can(argv: string[]): Promise<number> {
   const accounts = await readAccounts();
   const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
   if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
+  const disabledPrincipal = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
+  if (disabledPrincipal) {
+    const reason = disabledPrincipalReason(disabledPrincipal);
+    const decision: CanDecision = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] };
+    printCan(decision, buildCostEstimate(action, expectOverride, undefined, null), undefined, argv.includes("--json"));
+    return 2;
+  }
 
   const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
   let decision: CanDecision;
@@ -158,7 +167,7 @@ async function can(argv: string[]): Promise<number> {
     directReadNotice();
     const [policy, directStore] = await Promise.all([readPolicy(), HeadroomStore.open()]);
     try {
-      const localAccounts = accounts.filter(isLocalAccount);
+      const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
       // With no daemon, `can` is also a direct read: refresh local state rather
       // than deciding a routing preference from an old queue-depth sample.
       directStore.insertAll(await Promise.all(localAccounts.map(observeLocal)));
@@ -197,7 +206,7 @@ async function can(argv: string[]): Promise<number> {
       // now; only this recomputation decides whether a lease is created.
       const admissionNow = new Date();
       const admitted = store.admitAndStartLeases(() => {
-        const localAccounts = accounts.filter(isLocalAccount);
+        const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
         const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
         const allMeters = [...new Set([...meters, ...localMeters])];
         const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
@@ -209,7 +218,7 @@ async function can(argv: string[]): Promise<number> {
           : canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, canPolicy, argv.includes("--allow-unknown"), store.leases(undefined, true, admissionNow), owner, admissionNow, true);
         return admitCanCost(store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, canPolicy, cost.expected_percent, admissionNow);
       }, owner, (admittedDecision) => {
-        const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+        const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
         return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
       }, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, admissionNow, action);
       decision = admitted.decision;
@@ -246,6 +255,23 @@ function ttl(value: string | undefined, flag = "--ttl"): number {
 
 function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
 
+async function disabledMeterReason(meter: string): Promise<string | undefined> {
+  const principal = disabledPrincipalForMeter(await readAccounts().catch(() => []), meter);
+  return principal ? disabledPrincipalReason(principal) : undefined;
+}
+
+async function disabledMetersReason(meters: string[]): Promise<string | undefined> {
+  const accounts = await readAccounts().catch(() => []);
+  const principal = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
+  return principal ? disabledPrincipalReason(principal) : undefined;
+}
+
+function disabledUnknownLine(meter: string, reason: string, asJson = false): number {
+  if (asJson) console.log(JSON.stringify(withContract({ meter, allowed: false, unknown: true, reason })));
+  else console.log(`${meter}  UNKNOWN (${reason})`);
+  return 2;
+}
+
 function printLeases(items: Lease[]): void {
   for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
 }
@@ -256,6 +282,8 @@ async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
     const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note"); const actionClass = option(argv, "--class");
     if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]");
+    const disabled = await disabledMeterReason(meter);
+    if (disabled) return disabledUnknownLine(meter, disabled);
     const expected = expect === undefined ? null : Number(expect);
     if (expected !== null && (!Number.isFinite(expected) || expected < 0 || expected > 100)) throw new Error("--expect must be 0 through 100");
     const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null, action_class: actionClass ?? null };
@@ -327,6 +355,10 @@ async function rate(argv: string[]): Promise<number> {
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
+  if (meter) {
+    const disabled = await disabledMeterReason(meter);
+    if (disabled) return disabledUnknownLine(meter, disabled, asJson);
+  }
   const request = await requestDaemon("rate", { meter, minutes, owner, need });
   let lines: RateLine[];
   if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
@@ -430,6 +462,12 @@ async function run(argv: string[]): Promise<number> {
       if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
     }
     if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
+    const disabled = Array.isArray(target) ? await disabledMetersReason(target) : await disabledMeterReason(target);
+    if (disabled) {
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: { allowed: false, unknown: true, reason: disabled }, lease_id: null })));
+      else console.log(`${Array.isArray(target) ? target.join(", ") : target}  UNKNOWN (${disabled})`);
+      return 2;
+    }
     const now = new Date();
     // Gate and reservation are one admission. A previous implementation
     // checked first and inserted the lease later, so two CLI processes could
@@ -607,6 +645,8 @@ async function plan(argv: string[]): Promise<number> {
   const reserveValue = option(argv, "--reserve");
   if (reserveValue !== undefined && (!Number.isFinite(Number(reserveValue)) || Number(reserveValue) < 0 || Number(reserveValue) > 100)) throw new Error("--reserve must be 0 through 100");
   const asJson = argv.includes("--json");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return disabledUnknownLine(meter, disabled, asJson);
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
   const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need });
@@ -665,6 +705,11 @@ async function gate(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
+  const disabled = Array.isArray(target) ? await disabledMetersReason(target) : target ? await disabledMeterReason(target) : undefined;
+  if (disabled) {
+    const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass ?? model ?? "meter");
+    return disabledUnknownLine(targetLabel, disabled, asJson);
+  }
   const options = { owner, planSharePercent, actionClass };
   const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
   let result: Awaited<ReturnType<typeof gateFor>>;
@@ -691,6 +736,8 @@ async function wait(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
   if (!meter || !argv.includes("--until-reset")) throw new Error("Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]");
   const maxValue = option(argv, "--max");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return disabledUnknownLine(meter, disabled);
   const maxMs = maxValue === undefined ? null : ttl(maxValue, "--max");
   // Set whenever a poll finds no windowed reading for this meter at all: the
   // meter's own latest reason (e.g. a pending Keychain grant), so the final
@@ -701,7 +748,7 @@ async function wait(argv: string[]): Promise<number> {
   const getResetsAt = async (): Promise<string | null> => {
     const request = await requestDaemon("status");
     let observations: Observation[];
-    if (request !== undefined) { observations = unwrapRpc(request) as Observation[]; }
+    if (request !== undefined) { observations = statusObservations(unwrapRpc(request)); }
     else {
       const store = await HeadroomStore.open();
       try { observations = store.latestPerWindow(meter); } finally { store.close(); }
@@ -735,6 +782,8 @@ async function fill(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return disabledUnknownLine(meter, disabled, asJson);
   const need = option(argv, "--need"); if (need) parseGateNeed(`${need}:0`);
   const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
   let result: Awaited<ReturnType<typeof fillFor>>;
@@ -809,6 +858,7 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
   const accounts = await readAccounts();
   const account = accounts.find((item) => item.name === principal);
   if (!account || isLocalAccount(account) || account.vendor !== "claude") throw new Error(`--models requires a configured Claude principal (got ${principal})`);
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   const now = new Date();
   // Best effort: prefer the stored <principal>:all 5h window's own resets_at
   // (whatever the vendor last reported) as the window boundary; fall back to
@@ -857,6 +907,8 @@ export async function observe(argv: string[]): Promise<number> {
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
   if (argv.includes("--models")) return printModelShare(principal, argv.includes("--json"));
+  const configuredAccounts = await readAccounts().catch(() => [] as Account[]);
+  const disabledPrincipals = configuredAccounts.filter((account) => !isAccountEnabled(account) && (!principal || account.name === principal)).map((account) => account.name);
   // --ttl 0 is a synonym for --refresh: both force a fresh probe through the
   // daemon's own `refresh` method (still gated by the grant marker and the
   // daemon's own vendor backoff, same as any other poll) instead of serving
@@ -870,7 +922,7 @@ export async function observe(argv: string[]): Promise<number> {
     }
   }
   const request = await requestDaemon("status");
-  const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
+  const daemonObservations = request === undefined ? undefined : statusObservations(unwrapRpc(request));
   let observations: Observation[];
   let failures: string[];
   let resetSeen = new Map<string, string>();
@@ -910,6 +962,9 @@ export async function observe(argv: string[]): Promise<number> {
     freeResetUsed = new Map(Object.entries(freeResetEvents));
     planDowngraded = unwrapRpc(await requestDaemon("plan_downgrades")) as PlanDowngrade[];
   }
+  // Store rows intentionally outlive a configuration change for audit and
+  // history, but current status must not revive a parked principal.
+  observations = observations.filter((item) => !disabledPrincipals.includes(item.principal_id));
   const view = { ...statusViewOptions(argv, process.stdout.isTTY === true, process.env, process.stdout.columns), direct };
   // The grouped view's own footer already says where the numbers came from, so
   // the stderr notice would only repeat it on the one form that carries both.
@@ -917,12 +972,12 @@ export async function observe(argv: string[]): Promise<number> {
   const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals } : { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
-    const vendors = new Map((await readAccounts().catch(() => [])).map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
-    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded }, view)) console.log(line);
+    const vendors = new Map(configuredAccounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
+    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded, disabled_principals: disabledPrincipals }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.
@@ -937,6 +992,7 @@ async function responseShape(argv: string[]): Promise<number> {
   if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
   if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   if (account.vendor === "gemini") throw new Error(GEMINI_RETIRED_REASON);
   if (account.vendor === "antigravity") throw new Error("Antigravity uses agy local quota summaries; inspect headroom doctor and headroom --principal <id> --json instead");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
@@ -960,6 +1016,12 @@ function unwrapRpc(value: unknown): unknown {
     throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
   }
   return value;
+}
+
+function statusObservations(value: unknown): Observation[] {
+  if (Array.isArray(value)) return value as Observation[]; // pre-#73 daemon
+  if (value && typeof value === "object" && Array.isArray((value as { observations?: unknown }).observations)) return (value as { observations: Observation[] }).observations;
+  throw new Error("Daemon status response is invalid");
 }
 
 /**
@@ -1135,7 +1197,10 @@ async function usagePaste(argv: string[]): Promise<number> {
   }
   const fromClipboard = argv.includes("--clipboard");
   if (fromClipboard === argv.includes("--paste")) throw new Error(USAGE_PASTE_HELP);
-  const principal = resolveClaudePrincipal(await readAccounts(), option(argv, "--principal"));
+  const accounts = await readAccounts();
+  const principal = resolveClaudePrincipal(accounts, option(argv, "--principal"));
+  const disabled = disabledPrincipalForMeter(accounts, `${principal}:all`);
+  if (disabled) return disabledUnknownLine(`${principal}:all`, disabledPrincipalReason(disabled), argv.includes("--json"));
   const text = fromClipboard ? await readClipboardText() : await readStdinText();
   const now = new Date();
   const panel = parseUsagePanel(text, now);
@@ -1175,6 +1240,14 @@ async function logs(argv: string[]): Promise<number> {
   return 0;
 }
 
+async function accounts(argv: string[]): Promise<number> {
+  const action = argv[0];
+  if ((action !== "enable" && action !== "disable") || !argv[1] || argv.length !== 2) throw new Error("Usage: headroom accounts <discover|enable|disable> [<name>]");
+  await setAccountEnabled(argv[1], action === "enable");
+  console.log(`${argv[1]} ${action}d`);
+  return 0;
+}
+
 /** The message for a config dir Claude Code was never logged into: distinct
  * from a Keychain access denial, since there is nothing to grant yet. */
 export function noKeychainItemMessage(directory: string): string {
@@ -1209,7 +1282,7 @@ export async function keychain(argv: string[]): Promise<number> {
   // README, or from a stored marker, learns that there is nothing to answer.
   if (process.platform === "darwin") console.log("Checking that the Claude credential is readable. No Keychain dialog is involved: the probe reads it through /usr/bin/security, which the item already admits.");
   const requested = option(parsed, "--principal");
-  const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
+  const accounts = (await readAccounts()).filter((item): item is ProviderAccount => isAccountEnabled(item) && !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
   if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
   const store = await HeadroomStore.open();
@@ -1296,7 +1369,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
-  ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
+  ["accounts discover|enable|disable", "Scan for accounts, or park/re-enable one configured principal"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config (--bundle [path] writes a redacted report for a GitHub issue)"],
   ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
   ["keychain grant", "macOS: check that the Claude credential is readable (no dialog)"],
@@ -1346,7 +1419,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
-  accounts: "Usage: headroom accounts discover",
+  accounts: "Usage: headroom accounts <discover|enable|disable> [<name>]",
   doctor: "Usage: headroom doctor [--bundle [path]]",
   setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]",
@@ -1437,13 +1510,15 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") {
-    const accounts = await discoverAccounts();
+    const discovered = await discoverAccounts();
+    await writeDiscoveredAccounts(discovered);
+    const accounts = await readAccounts();
     console.log(accountsToml(accounts));
-    await writeDiscoveredAccounts(accounts);
     console.log(`Wrote ${accountsPath()} (${accounts.length} account${accounts.length === 1 ? "" : "s"}). Next: headroom doctor`);
     for (const line of await seedExampleConfig()) console.log(line);
     return 0;
   }
+  if (argv[0] === "accounts") return accounts(argv.slice(1));
   if (argv[0] === "doctor") return doctor(argv.slice(1));
   // `headroom` has always rendered status, and the help text documents the
   // explicit spelling too. Dispatch it before observe() so `status` is never

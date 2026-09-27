@@ -11,6 +11,14 @@ principals.
 Example: `claude-2` is the principal for `~/.claude2`, named that way by
 `headroom accounts discover` because it isn't the default `~/.claude`.
 
+A principal can stay configured but be parked with `enabled = false` in its
+`[[accounts]]` block. A disabled principal is not polled (no credential,
+Keychain, statusline, keepalive, or local-pool read), is shown once as
+`disabled` in status, and its old observations stay only as stored history.
+Use this for an optional profile that is deliberately logged out; restore it
+with `headroom accounts enable <name>`. Decisions fail closed while it is
+parked and routing reports it as skipped.
+
 ## Meter
 
 A meter is one vendor-enforced limit on a principal, addressed as `principal:meter`. Claude always
