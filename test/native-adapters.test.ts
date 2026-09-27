@@ -108,12 +108,42 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const previousDebug = process.env.HEADROOM_DEBUG;
     afterEach(() => { if (previousDebug === undefined) delete process.env.HEADROOM_DEBUG; else process.env.HEADROOM_DEBUG = previousDebug; });
 
-    it("logs an unrecognized top-level key's name once, and never a known one", () => {
+    it("logs an unrecognized top-level key's name once, and never a mapped one", () => {
       process.env.HEADROOM_DEBUG = "1";
       const messages: string[] = [];
       const body = { five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], seven_day_fable: { utilization: 3 }, banked_reset: { available: 1, expires_at: "2026-10-01T00:00:00Z" } };
-      logUnknownClaudeTopLevelKeys(body, new Set(), (message) => messages.push(message));
+      logUnknownClaudeTopLevelKeys(body, new Set(), (message) => messages.push(message), new Set(["seven_day_fable"]));
       expect(messages).toEqual(["headroom: Claude usage response has an unmapped top-level key: banked_reset"]);
+    });
+
+    it("logs an unmapped seven-day key, but not mapped Fable, Routines, or Cowork variants", () => {
+      process.env.HEADROOM_DEBUG = "1";
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        observationsFromClaudeUsage({ five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], seven_day_banked_reset: {} }, claude, at);
+        expect(errors).toHaveBeenCalledWith("headroom: Claude usage response has an unmapped top-level key: seven_day_banked_reset");
+        errors.mockClear();
+        observationsFromClaudeUsage({ five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], seven_day_fable: { utilization: 1 }, seven_day_routines: { utilization: 2 } }, claude, at);
+        observationsFromClaudeUsage({ five_hour: { utilization: 1 }, seven_day: { utilization: 2 }, limits: [], seven_day_fable: { utilization: 1 }, seven_day_cowork: { utilization: 2 } }, claude, at);
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it("sanitizes and caps hostile key names while deduplicating on the raw key", () => {
+      process.env.HEADROOM_DEBUG = "1";
+      const messages: string[] = [];
+      const seen = new Set<string>();
+      const hostile = "line\n\u001b[31muser@example.com";
+      const long = "x".repeat(500);
+      const body = { [hostile]: null, [long]: null };
+      logUnknownClaudeTopLevelKeys(body, seen, (message) => messages.push(message));
+      logUnknownClaudeTopLevelKeys(body, seen, (message) => messages.push(message));
+      expect(messages).toEqual([
+        "headroom: Claude usage response has an unmapped top-level key: line???31muser?example.com",
+        `headroom: Claude usage response has an unmapped top-level key: ${"x".repeat(61)}...`,
+      ]);
     });
 
     it("logs the same key only once across repeated calls sharing the same seen set", () => {

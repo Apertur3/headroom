@@ -128,10 +128,13 @@ carries "how many free resets do I have left" semantics. This adapter does not i
 
 Because the response's schema evidently keeps changing (new top-level keys have appeared across
 Claude Code releases without warning), `observationsFromClaudeUsage` checks every top-level key
-against the ones it actually reads and logs the name -- never the value -- of anything else exactly
-once per process, under `HEADROOM_DEBUG=1`. That is how a future field carrying this (a banked
-reset, an expiring bonus credit, anything else Codex-`credits`-shaped) gets noticed instead of
-silently staying unmapped forever. If one shows up, it maps the same way Codex's does: a
+against the ones it actually reads and logs a safe, capped form of the name -- never the value --
+of anything else exactly once per process, under `HEADROOM_DEBUG=1`. This shell variable takes
+effect for a foreground `headroom daemon`, or for a direct `headroom status` read when no daemon
+is running; installed launchd, systemd, and Windows services do not inherit it, and there is no
+persistent setting. That is how a future field carrying this (a banked reset, an expiring bonus
+credit, anything else Codex-`credits`-shaped) gets noticed instead of silently staying unmapped
+forever. If one shows up, it maps the same way Codex's does: a
 `<principal>:credits` meter (`window.kind: "count"`, `quantity.unit: "credits"`), which
 `store.ts`'s existing, vendor-agnostic `detectEvents` already turns into `free_reset_granted` /
 `free_reset_used` / `credits_changed` on its own -- no new event-detection code, just the mapping.

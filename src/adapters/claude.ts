@@ -599,9 +599,9 @@ export function modelSlug(name: string): string {
 }
 
 /** Top-level `/api/oauth/usage` keys this adapter actually reads: `five_hour`
- * and `seven_day` directly, `limits` for the scoped array, and any
- * `seven_day_*` field (inspected below for a Fable/Routines match even when
- * it isn't one). Anything else is a field nothing here maps yet. */
+ * and `seven_day` directly, plus `limits` for the scoped array. Legacy
+ * `seven_day_*` fields are added per response only when the Fable/Routines/
+ * Cowork matching below actually selects one. */
 const CLAUDE_USAGE_KNOWN_TOP_LEVEL_KEYS = new Set(["five_hour", "seven_day", "limits"]);
 
 /** Keys already reported this process, so a field that never goes away
@@ -618,25 +618,27 @@ const claudeUsageUnknownKeysLogged = new Set<string>();
  * under `HEADROOM_DEBUG` so a normal run stays quiet. `seen` and `log` are
  * test seams; production always uses the shared module state so a key is
  * still reported only once across the whole process even though every poll
- * calls this function again.
+ * calls this function again. `mappedSevenDayKeys` contains the legacy scoped
+ * fields the caller selected from this response.
  */
-export function logUnknownClaudeTopLevelKeys(body: ObjectValue, seen: Set<string> = claudeUsageUnknownKeysLogged, log: (message: string) => void = (message) => console.error(message)): void {
+export function logUnknownClaudeTopLevelKeys(body: ObjectValue, seen: Set<string> = claudeUsageUnknownKeysLogged, log: (message: string) => void = (message) => console.error(message), mappedSevenDayKeys: ReadonlySet<string> = new Set()): void {
   if (!process.env.HEADROOM_DEBUG) return;
   for (const key of Object.keys(body)) {
-    if (CLAUDE_USAGE_KNOWN_TOP_LEVEL_KEYS.has(key) || key.startsWith("seven_day_") || seen.has(key)) continue;
+    if (CLAUDE_USAGE_KNOWN_TOP_LEVEL_KEYS.has(key) || mappedSevenDayKeys.has(key) || seen.has(key)) continue;
     seen.add(key);
-    log(`headroom: Claude usage response has an unmapped top-level key: ${key}`);
+    const safeKey = key.replace(/[^A-Za-z0-9_.-]/g, "?");
+    log(`headroom: Claude usage response has an unmapped top-level key: ${safeKey.length > 64 ? `${safeKey.slice(0, 61)}...` : safeKey}`);
   }
 }
 
 /** Parse Claude's OAuth usage body without retaining the credential or response body. */
 export function observationsFromClaudeUsage(body: unknown, account: ProviderAccount, at = new Date()): Observation[] {
   if (!isObject(body)) throw new Error("Claude usage response invalid");
-  logUnknownClaudeTopLevelKeys(body);
   const now = at.toISOString();
   const output = [window(account, "all", body.five_hour, 300, now), window(account, "all", body.seven_day, 10_080, now)].filter((item): item is Observation => Boolean(item));
   let fable: unknown;
   let routines: unknown;
+  const mappedSevenDayKeys = new Set<string>();
   // Any other model-scoped bucket the response offers, keyed by its own
   // display name's slug -- Sonnet, Opus, or any future named allowance
   // beyond the two Headroom already gives a dedicated meter.
@@ -645,9 +647,10 @@ export function observationsFromClaudeUsage(body: unknown, account: ProviderAcco
     const lower = key.toLowerCase();
     if (!lower.startsWith("seven_day_")) continue;
     const valid = isObject(value) && (finiteNumber(value.utilization) !== undefined || finiteNumber(value.percent) !== undefined);
-    if (lower.includes("fable") && fable === undefined && valid) fable = value;
-    if ((lower.includes("routine") || lower.includes("cowork")) && routines === undefined && valid) routines = value;
+    if (lower.includes("fable") && fable === undefined && valid) { fable = value; mappedSevenDayKeys.add(key); }
+    if ((lower.includes("routine") || lower.includes("cowork")) && routines === undefined && valid) { routines = value; mappedSevenDayKeys.add(key); }
   }
+  logUnknownClaudeTopLevelKeys(body, claudeUsageUnknownKeysLogged, undefined, mappedSevenDayKeys);
   if (Array.isArray(body.limits)) for (const limit of body.limits) {
     if (!isObject(limit) || !String(limit.kind ?? "").toLowerCase().includes("scoped")) continue;
     // Match the Swift reader: an active but malformed scoped entry is ignored;

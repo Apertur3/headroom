@@ -7,7 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Claude adapter: log the name (never the value) of any `/api/oauth/usage` top-level key it does not yet map, once per process, under `HEADROOM_DEBUG=1` -- so a future field (e.g. a banked/free-reset credit block) is noticed instead of silently staying unmapped. As of 2026-09-23 the response carries no such field; see `docs/vendors.md`'s Claude section.
+- Claude adapter: log a safe, capped form of the name (never the value) of any `/api/oauth/usage` top-level key it does not yet map, once per process, under `HEADROOM_DEBUG=1` -- so a future field (e.g. a banked/free-reset credit block) is noticed instead of silently staying unmapped. This shell variable applies to a foreground `headroom daemon`, or a direct `headroom status` read when no daemon is running; installed services do not inherit it. As of 2026-09-23 the response carries no such field; see `docs/vendors.md`'s Claude section.
 
 ## [0.1.8] - 2026-09-27
 
