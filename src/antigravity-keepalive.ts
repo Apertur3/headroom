@@ -49,6 +49,9 @@ export interface AgyKeepaliveOptions {
    * giving up and recording script's pid alone. */
   pidDiscoveryAttempts?: number;
   pidDiscoveryIntervalMs?: number;
+  /** Replaces the tree kill stop() uses; tests pass one that finds nothing,
+   * the way a host that denies `ps` would, to prove agy is still reaped. */
+  killTree?: typeof killTree;
 }
 
 export interface KeepaliveState {
@@ -199,6 +202,11 @@ export class AgyKeepaliveSupervisor {
   private readonly killGraceMs: number;
   private readonly pidDiscoveryAttempts: number;
   private readonly pidDiscoveryIntervalMs: number;
+  private readonly killTreeImpl: typeof killTree;
+  /** agy's own pid and ps signature, once discovered for the current child.
+   * Kept in memory so stop() and an unexpected script exit can reap agy
+   * directly, without depending on a fresh `ps` walk finding it. */
+  private ownedAgy: { child: ChildProcess; pid: number; command: string; startedAt: string } | undefined;
 
   constructor(options: AgyKeepaliveOptions = {}) {
     this.binary = options.binary ?? resolveAgyBinary(process.env.ANTIGRAVITY_CLI_PATH);
@@ -212,6 +220,7 @@ export class AgyKeepaliveSupervisor {
     this.killGraceMs = options.killGraceMs ?? 300;
     this.pidDiscoveryAttempts = options.pidDiscoveryAttempts ?? 20;
     this.pidDiscoveryIntervalMs = options.pidDiscoveryIntervalMs ?? 100;
+    this.killTreeImpl = options.killTree ?? killTree;
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
@@ -253,9 +262,13 @@ export class AgyKeepaliveSupervisor {
     this.child = undefined;
     if (child && child.exitCode === null) {
       const pid = child.pid;
-      if (typeof pid === "number") await killTree(pid, { graceMs: this.killGraceMs });
+      if (typeof pid === "number") await this.killTreeImpl(pid, { graceMs: this.killGraceMs });
       else child.kill("SIGTERM");
     }
+    // killTree reaches agy through a live `ps` walk; if that walk found
+    // nothing (ps denied, or agy already reparented), agy would survive as an
+    // orphan holding a PTY. Reap the pid recorded at launch directly too.
+    if (child) await this.reapOwnedAgy(child);
     await this.clearState();
   }
 
@@ -272,6 +285,9 @@ export class AgyKeepaliveSupervisor {
       const exited = () => {
         if (handled) return;
         handled = true;
+        // script died on its own (crash, external kill): its agy is now an
+        // orphan session leader. Reap it before a restart starts another one.
+        if (!this.stopping) void this.reapOwnedAgy(child);
         if (this.child === child) { this.child = undefined; this.startedAt = undefined; this.stopLoginWatch(); }
         if (!this.stopping) this.scheduleRestart();
       };
@@ -309,9 +325,27 @@ export class AgyKeepaliveSupervisor {
         scriptPid, scriptCommand: scriptSignature.command, scriptStartedAt: scriptSignature.startedAt,
         recordedAt: new Date().toISOString(),
       };
-      if (agyPid !== undefined && agySignature) { state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt; }
+      if (agyPid !== undefined && agySignature) {
+        state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt;
+        this.ownedAgy = { child, pid: agyPid, command: agySignature.command, startedAt: agySignature.startedAt };
+      }
       await writeKeepaliveState(this.stateFilePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
+  }
+
+  /** SIGKILL the agy recorded for `child`, its process group included, but
+   * only while its ps signature still matches what was recorded (never a
+   * recycled pid). A no-op once it has exited. */
+  private async reapOwnedAgy(child: ChildProcess): Promise<void> {
+    const owned = this.ownedAgy;
+    if (!owned || owned.child !== child || this.platform === "win32") return;
+    this.ownedAgy = undefined;
+    const current = await processSignature(owned.pid);
+    // ps unavailable: the pid was ours moments ago and signalling a gone pid
+    // is harmless, so a missing signature still gets the kill; a different
+    // live signature means the pid was recycled and is left alone.
+    if (current && (current.command !== owned.command || current.startedAt !== owned.startedAt)) return;
+    for (const target of [owned.pid, -owned.pid]) { try { process.kill(target, "SIGKILL"); } catch { /* already gone */ } }
   }
 
   private async clearState(): Promise<void> {

@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Stop the test suite leaking real processes. The issue #56 regression tests start a fake `agy` that ignores SIGTERM/SIGHUP under `script`, so it becomes its own PTY session leader. Where `ps` is unavailable (a sandboxed agent or CI runner) cleanup could not find that child, and each `npm test` left six of them running forever, each holding a pseudo-terminal, until a machine ran out of PTYs and its kernel sat at 96% system CPU. Three defences now apply: every fake process exits on its own after 30 s; every test tracks the pids it starts and an `afterEach` SIGKILLs them, their process groups and their descendants even when an assertion failed; and a vitest `globalSetup` gate runs each suite under its own temp directory and fails the run (exit 1) if any process started under it outlives the run, killing it first.
+- The Antigravity keepalive no longer depends on `ps` to stop `agy`. It remembers the `agy` pid and signature it discovered at launch and SIGKILLs that process group directly on `stop()`, even when the tree walk finds nothing. When `script` dies on its own (a crash or an external kill), its orphaned `agy` is now reaped before the supervisor starts a new one, instead of being left behind.
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed
