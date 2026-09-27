@@ -145,7 +145,9 @@ minutes, i.e. nearest reset) that still has one in range, and `window_minutes`
 names which window that is -- present only in this borrowed case, absent when
 `last_known` already shares the observation's own window. Informational only:
 `can`/`gate`/`route` keep treating UNKNOWN as no capacity regardless of what
-this carries); `id?: number` (present once read back from the store, as
+this carries); `credits_lapsed?: boolean` is present and `true` only on an
+enriched credits observation whose `resets_at` expiry is in the past (it is
+computed at response time; the stored fact is never rewritten); `id?: number` (present once read back from the store, as
 every `--json` reading is).
 
 Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
@@ -200,12 +202,34 @@ allowed.
 
 MCP `quota_gate` adds `source?: "direct"` over the same fields.
 
-### `plan` (`headroom plan --meter M --until reset --json`, MCP `quota_plan`)
+### `credits` (`headroom credits [set|clear] --json`)
+
+List: `{ contract, generated_at, credits: [{ principal: string, meter: string,
+available: number, expires_at: string | null, source: "vendor" | "manual",
+lapsed: boolean }] }`. `available` is zero once the expiry has passed, while
+`lapsed` preserves why. `set` and `clear` return the same per-meter object as
+`{ contract, generated_at, credit: {...} }`.
+
+A manual set is stored as an ordinary observation on `<principal>:credits`:
+`{ principal_id, meter_id, window: { kind: "count", minutes: null,
+enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: number,
+unit: "credits" }, resets_at: string, source: "manual", truth: "estimated",
+freshness: "fresh", confidence: 0.9, adapter_version: "manual",
+upstream_schema_version: "manual", metadata: { free_resets_available: number,
+manual: true } }`. `clear` keeps the same shape with `remaining: 0` and adds
+`metadata.manual_cleared: true`; neither operation deletes prior history.
+
+### `plan` (`headroom plan --meter M --until reset [--target P] --json`, MCP `quota_plan`)
 
 Success: `{ contract, generated_at, meter: string, weekly_remaining_percent:
 number, reserve_percent: number, hours_per_window: number,
 remaining_5h_windows: number, points_per_5h_window: number,
-plan_line_percent_per_hour: number, notices: string[] }`. Failure (the meter
+plan_line_percent_per_hour: number, usable_now_percent: number, banked: {
+available: number, expires_at: string | null, source: "vendor" | "manual" |
+null, lapsed: boolean, worth_percent: number }, target?: { points: number,
+fits_now: boolean, fits_with_banked: boolean, resets_needed: number }, advice:
+{ use_now: boolean, reason: string, use_before: string | null }, notices:
+string[] }`. Failure (the meter
 has no weekly window, or it is stale/failed/unpolled too long): `{ contract,
 generated_at, meter: string, error: string, notices: string[] }` -- a data
 state, not a CLI failure; the CLI renders it as an UNKNOWN line and always

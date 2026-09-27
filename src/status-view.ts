@@ -18,6 +18,7 @@
  * and `--agent` as explicit overrides.
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
+import { creditsLapsed } from "./credits.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
@@ -166,7 +167,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     const available = observation.quantity?.remaining ?? 0;
     const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
     const expiry = date && !Number.isNaN(date.getTime()) ? ` (expires ${formatDay(observation.resets_at)})` : "";
-    return `credits ${available} available${expiry}`;
+    const manual = observation.source === "manual" ? " (manual)" : "";
+    if (creditsLapsed(observation, now)) return `credits ${available} expired ${formatDay(observation.resets_at)}${manual}`;
+    return `credits ${available} available${expiry}${manual}`;
   }
   // resetSeen may carry resets.ts's unscheduled marker (issue #20): a reset
   // that fired before its own scheduled instant, worth flagging inline since
@@ -406,10 +409,12 @@ function usedCell(observation: Observation, state: PaceState): string {
 
 /** A credit balance is a count with an expiry, not a window with a pace, so
  * it gets the whole row after the meter name instead of the four columns. */
-function creditsCell(observation: Observation): string {
+function creditsCell(observation: Observation, now: Date): string {
   const available = observation.quantity?.remaining ?? 0;
   const date = observation.resets_at ? new Date(observation.resets_at) : undefined;
-  return `${available} available${date && !Number.isNaN(date.getTime()) ? `, expire ${formatDay(observation.resets_at)}` : ""}`;
+  const manual = observation.source === "manual" ? " (manual)" : "";
+  if (creditsLapsed(observation, now)) return `${available} expired${date && !Number.isNaN(date.getTime()) ? ` ${formatDay(observation.resets_at)}` : ""}${manual}`;
+  return `${available} available${date && !Number.isNaN(date.getTime()) ? `, expire ${formatDay(observation.resets_at)}` : ""}${manual}`;
 }
 
 /** Everything the default line deliberately leaves out: the reserve, the
@@ -528,7 +533,7 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
         const known = decision.state === "UNKNOWN" && observation.last_known ? lastKnownCompact(observation.last_known) : "";
         rows.push({
           meter: index === 0 ? shortMeter(observation) : "",
-          ...(isCredits(observation) ? { text: creditsCell(observation) } : {}),
+          ...(isCredits(observation) ? { text: creditsCell(observation, now) } : {}),
           window: label(observation),
           bar: isCredits(observation) ? undefined : barFor(observation, decision.state, ascii),
           used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),

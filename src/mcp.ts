@@ -12,6 +12,7 @@ import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateL
 import { readAccounts } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { resetsIn, withResetsIn } from "./resets.js";
+import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
@@ -34,7 +35,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_rate", description: "Burn in percent per hour over the last N minutes. need selects a vendor-reported window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, minutes: { type: "number", exclusiveMinimum: 0 }, owner: { type: "string" }, need: { type: "string" } } } },
   { name: "quota_spend", description: "Per-owner attributed spend on shared meters: how much of each window's actual movement the spend ledger books to each lease owner, with a confidence. The owner `unattributed` is movement that happened while no lease was open. since is an ISO timestamp, defaulting to 24 hours ago.", inputSchema: { type: "object", properties: { meter: { type: "string" }, owner: { type: "string" }, since: { type: "string" } } } },
   { name: "quota_inbox", description: "Read this session's hand-off messages from <HEADROOM_HOME>/inbox/<session>/, oldest first, marking each read. Read-only: sending a message is `headroom inbox send`, never this tool.", inputSchema: { type: "object", properties: { session: { type: "string" }, since: { type: "number", minimum: 0 } }, required: ["session"] } },
-  { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" } }, required: ["meter"] } },
+  { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset, including advisory banked-reset guidance. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" }, target_points: { type: "number", minimum: 0 } }, required: ["meter"] } },
   { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
   { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, need: { type: "string" } }, required: ["meter"] } },
@@ -187,10 +188,10 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, cached, new Date(now)), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, store.latestPerWindow(), new Date(now)), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -204,7 +205,7 @@ export async function directStatus(): Promise<DirectResult> {
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    return { source: "direct", observations: withResetsIn(withCreditsLapsed(withPace(store, store.latestPerWindow(), new Date(now)), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 
@@ -364,12 +365,12 @@ async function directInbox(session: unknown, since: unknown): Promise<DirectResu
   return { source: "direct", ...result };
 }
 
-async function directPlan(meter: unknown, reservePercent: unknown, need: unknown): Promise<DirectResult> {
+async function directPlan(meter: unknown, reservePercent: unknown, need: unknown, targetPoints: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
-  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined, typeof targetPoints === "number" ? targetPoints : undefined); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
 }
 
 /**
@@ -469,7 +470,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "rate") return directRate(arguments_.meter, arguments_.minutes, arguments_.owner, arguments_.need);
   if (method === "spend") return directSpend(arguments_.meter, arguments_.owner, arguments_.since);
   if (method === "inbox") return directInbox(arguments_.session, arguments_.since);
-  if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need);
+  if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need, arguments_.target_points);
   if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class);
   if (method === "wait") return directWait(arguments_.meter);
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need);
@@ -576,7 +577,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "cost" ? { action_class: arguments_.action_class }
       : method === "rate" ? { meter: arguments_.meter, minutes: arguments_.minutes, owner: arguments_.owner, need: arguments_.need }
       : method === "spend" ? { meter: arguments_.meter, owner: arguments_.owner, since: arguments_.since }
-      : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need }
+      : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need, target_points: arguments_.target_points }
       : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, need: arguments_.need }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }

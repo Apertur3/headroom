@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Add auditable manual banked-reset entries (`headroom credits`), reset-aware `plan --target` advice, and matching daemon/MCP/status support (#71).
+
 ## [0.1.7] - 2026-09-23
 
 ### Fixed

@@ -221,6 +221,20 @@ describe("CLI --json field shapes", () => {
     await compareToFixture("cli-plan", JSON.parse(logs[0]));
   });
 
+  it("credits", async () => {
+    const home = await newHome("credits");
+    await seedBasic(home);
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["credits", "set", "--principal", "claude-main", "--available", "1", "--expires", "2026-10-05", "--json"]);
+        await main(["credits", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-credits-set", JSON.parse(logs[0]));
+    await compareToFixture("cli-credits", JSON.parse(logs[1]));
+  });
+
   it("fill", async () => {
     const home = await newHome("fill");
     await seedBasic(home);

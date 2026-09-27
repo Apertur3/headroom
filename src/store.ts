@@ -14,6 +14,7 @@ import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion } from "./migrations.js";
 import { redact } from "./security.js";
+import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
  * carrying a leaked secret in one of its string fields is scrubbed the same
@@ -205,6 +206,17 @@ export interface PlanDowngrade {
   to: string;
   since: string;
   acknowledged: boolean;
+}
+
+/** The compact, deliberately vendor-neutral shape used by `headroom credits`.
+ * The raw observation is still available from history/status for audit detail. */
+export interface CreditBalance {
+  principal: string;
+  meter: string;
+  available: number;
+  expires_at: string | null;
+  source: BankedCreditSource;
+  lapsed: boolean;
 }
 
 function leaseFromRow(row: Row): Lease {
@@ -549,6 +561,44 @@ export class HeadroomStore {
   }
 
   insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
+
+  /** Record a banked reset a human can see in a vendor UI but the adapter
+   * cannot read (Claude currently exposes no corresponding usage field).
+   * This is an ordinary synthetic observation rather than mutable state: a
+   * later vendor fact wins naturally and every correction remains auditable. */
+  recordManualCredits(principal: string, available: number, expiresAt: string | null, cleared = false, now = new Date()): StoredObservation {
+    const at = now.toISOString();
+    const observation: Observation = {
+      principal_id: principal, meter_id: `${principal}:credits`,
+      window: { kind: "count", minutes: null, enforcement: "hard" },
+      quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiresAt,
+      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9,
+      adapter_version: "manual", upstream_schema_version: "manual",
+      metadata: { free_resets_available: available, manual: true, ...(cleared ? { manual_cleared: true } : {}) },
+    };
+    // insert() normally compares against this exact count window and emits
+    // the change event. The first manual fact has no predecessor, but it is
+    // still a useful operator action to audit, so seed that one event here.
+    const previous = this.previous(observation);
+    const stored = this.insert(observation);
+    if (!previous) this.addEvent("credits_changed", "inferred", 0.9, [stored.id], stored, cleared ? "manual credits cleared" : "manual credits entry");
+    return stored;
+  }
+
+  /** Clearing is a zero-valued observation, not deletion. Preserve the
+   * prior expiry where one exists so history still says which banked reset
+   * the operator closed, even though its current usable count is zero. */
+  clearManualCredits(principal: string, now = new Date()): StoredObservation {
+    const existing = this.latestPerWindow(`${principal}:credits`).find(isCreditsObservation);
+    return this.recordManualCredits(principal, 0, existing?.resets_at ?? null, true, now);
+  }
+
+  credits(now = new Date()): CreditBalance[] {
+    return this.latestPerWindow().filter(isCreditsObservation).map((row) => ({
+      principal: row.principal_id, meter: row.meter_id, available: usableCredits(row, now), expires_at: row.resets_at,
+      source: creditSource(row), lapsed: creditsLapsed(row, now),
+    })).sort((a, b) => a.meter.localeCompare(b.meter));
+  }
 
   /** Record a complete vendor poll and retire windows omitted by that poll.
    * A later vendor response for the same duration supersedes the retirement.
@@ -1330,9 +1380,13 @@ export class HeadroomStore {
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
-      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
-      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current, null, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
-      if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
+      const manual = current.source === "manual";
+      const origin = manual ? "inferred" : "vendor_reported";
+      const confidence = manual ? 0.9 : 1;
+      const reason = manual ? current.metadata?.manual_cleared ? "manual credits cleared" : "manual credits entry" : null;
+      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", origin, confidence, evidence, current, reason);
+      if (currentCredits < previousCredits) this.addEvent("free_reset_used", origin, confidence, evidence, current, reason, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
+      if (currentCredits !== previousCredits) this.addEvent("credits_changed", origin, confidence, evidence, current, reason);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.recordPlanChange(previous, current, evidence);
   }
@@ -1441,11 +1495,12 @@ export class HeadroomStore {
               OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
-            -- A reading the operator pasted from the vendor's own panel stays
-            -- authoritative for an hour: a failed poll in that hour (a denied
-            -- probe, a transport error) must not hide it, or the paste would be
-            -- pointless on exactly the machine where the probe cannot read.
-            AND NOT (current.source = 'paste' AND peer.freshness = 'failed'
+            -- A reading the operator pasted from the vendor's own panel, or a
+            -- manual banked-reset entry for a field the adapter cannot expose,
+            -- stays authoritative for an hour: a failed poll in that hour (a
+            -- denied probe, a transport error) must not hide it, or the entry
+            -- would be pointless on exactly the machine where it is needed.
+            AND NOT (current.source IN ('paste', 'manual') AND peer.freshness = 'failed'
                      AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
         )
       ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)

@@ -211,6 +211,21 @@ genuinely consumes but that has never produced a windowed reading fails the whol
 name, rather than being silently skipped while a different, populated meter in the same class
 answers on its own.
 
+### Banked resets
+
+Codex reports banked reset credits and their earliest expiry as a `<principal>:credits` count;
+Claude's usage endpoint does not expose them. When a human says a Claude banked reset exists,
+record it with `headroom credits set --principal claude-main --available 1 --expires 2026-10-05`
+(and `headroom credits clear --principal claude-main` after it is gone). The entry is an auditable,
+estimated manual observation, and a later vendor-reported Codex reading naturally supersedes a
+manual one. `headroom plan --meter claude-main:all --until reset --target <points>` reports the
+weekly budget left above reserve, the value of each banked reset (`100 - reserve`), and whether the
+target fits now or after a number of resets. It advises using one now only when none would otherwise
+survive to the scheduled reset, or when a blocked target is more than 24 hours from that reset;
+otherwise it says to wait, or that no target is blocked. A lapsed credit remains in history and
+status as expired but contributes zero to planning. Headroom never fires a reset: that remains a
+human action in the vendor UI.
+
 `policy.toml`'s `pacing` (`"even"`, the default, or `"none"`) controls two extra checks scoped to a
 5h `--need` and one owner. The pro-rata line is that owner's planned share of the window (from
 `--plan-share`, or their active leases plus the request) scaled by how much of the window has

@@ -114,6 +114,12 @@ number an orchestrator needs, whatever the vendor calls the bucket. `gate --mode
 `--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
 routing class already consumes it via `routing.toml`.
 
+Claude's usage endpoint does not expose banked reset credits. If a human sees one in Claude's UI,
+record that fact explicitly: `headroom credits set --principal claude-main --available 1 --expires
+2026-10-05`. `headroom credits clear --principal claude-main` records its later removal without
+erasing the original entry. These manual observations are marked estimated/manual and are advisory
+to `plan --target`; Headroom never uses a reset itself.
+
 ## Codex
 
 Headroom reads the ChatGPT OAuth access token from Codex's own auth store and calls

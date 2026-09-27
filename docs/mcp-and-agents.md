@@ -243,11 +243,12 @@ CLI: `headroom rate --meter M`.
 
 ### `quota_plan`
 
-`meter` (required), optional `reserve_percent` (0-100) and `need`. `need` selects a
-vendor-reported window. Returns the weekly points available per remaining 5h
-window before the weekly reset, and the plan line (linear budget) to hold. Fails UNKNOWN if the
-weekly window's own reading is stale, failed, or older than `staleness_minutes`. CLI: `headroom
-plan`.
+`meter` (required), optional `reserve_percent` (0-100), `need`, and `target_points` (number,
+>= 0). `need` selects a vendor-reported window. Returns the weekly points available per remaining
+5h window before the weekly reset, the plan line, banked-reset availability and advisory use-now
+guidance; with `target_points`, it also says whether the target fits now or after banked resets.
+Fails UNKNOWN if the weekly window's own reading is stale, failed, or older than
+`staleness_minutes`. CLI: `headroom plan`.
 
 ### `quota_gate`
 
@@ -360,7 +361,7 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_leases` | `headroom lease list` |
 | `quota_route` | `headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]` |
 | `quota_rate` | `headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--json]` |
-| `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]` |
+| `quota_plan` | `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]` |
 | `quota_gate` | `headroom gate --need 5h:<n> [--need wk:<n>] (--meter <meter_id> \| --class <action-class> \| --model <slug>) --owner <name> [--plan] [--plan-share <n>] [--json]` (exit 2 when it does not fit) |
 | `quota_wait` | `headroom wait --meter <meter_id> --until-reset [--max 6h]` (exit 3 on `--max`) |
 | `quota_fill` | `headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <n>] --owner <name> [--json]` |

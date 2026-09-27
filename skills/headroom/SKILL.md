@@ -91,7 +91,8 @@ into a real reading instead of dispatching blind.
 - `headroom rate [--meter M] [--owner X] [--minutes 30]` : burn over a recent window and ETA to the limit, plus X's attributed share of it.
 - `headroom spend [--meter M] [--owner X] [--since 24h]` : per-owner attributed spend on a shared meter.
 - `headroom inbox --session <id>` / `headroom inbox send --to <id> --kind <budget|note|handoff> --text ...` : hand-offs between orchestrators.
-- `headroom plan --meter M --until reset --reserve N` : points per remaining 5h window and the plan line.
+- `headroom plan --meter M --until reset --reserve N [--target <points>]` : points per remaining 5h window, banked-reset advice and the plan line. Ask `quota_plan` with `target_points` before recommending a banked reset.
+- `headroom credits set --principal <name> --available <n> --expires <date>` : record a banked reset only when the human says one exists; never infer it. Never fire a reset yourself -- that is a human action in the vendor UI.
 - `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
