@@ -1,10 +1,10 @@
 import { readPolicy } from "./config.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withStatusInfo } from "./pace.js";
 import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import type { PlanDowngrade } from "./store.js";
 import { isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
-import type { Policy } from "./policy.js";
+import { defaultPolicy, type Policy } from "./policy.js";
 import { headroomVersion } from "./version.js";
 
 export interface DashboardSnapshot {
@@ -48,8 +48,8 @@ export function burnBuckets(rows: Observation[], now: Date): Array<number | null
 }
 
 /** Cached reads only. This helper is also used by the daemon's dashboard RPC. */
-export function readDashboardStore(store: HeadroomStore, now = new Date(), rows = store.latestPerWindow()): DashboardSnapshot {
-  const observations = withLastKnown(withPaceInfo(rows, store.burnRateFor(rows, now), now), store.lastKnownFor(rows, now));
+export function readDashboardStore(store: HeadroomStore, now = new Date(), rows = store.latestPerWindow(), policy: Policy = defaultPolicy): DashboardSnapshot {
+  const observations = withStatusInfo(rows, store.burnRateFor(rows, now), store.lastKnownFor(rows, now), policy.staleness_minutes, now);
   const meters = [...new Set(rows.map((row) => row.meter_id))];
   const burns: DashboardSnapshot["burns"] = {};
   for (const meter of meters) {
@@ -97,15 +97,16 @@ export interface DashboardRequestTimeouts {
 export async function gatherDashboard(home?: string, timeouts: DashboardRequestTimeouts = {}): Promise<DashboardModel> {
   const { daemonRequest, socketPath } = await import("./daemon.js");
   const directory = await safeHeadroomDirectory(home);
+  const policyPromise = readPolicy();
   const [{ snapshot, direct }, policy, accounts, version] = await Promise.all([
     dashboardSnapshot({
       request: () => daemonRequest(socketPath(directory), "dashboard", {}, timeouts.healthTimeoutMs ?? DASHBOARD_HEALTH_TIMEOUT_MS, timeouts.requestTimeoutMs ?? DASHBOARD_REQUEST_TIMEOUT_MS),
       fallback: async () => {
         const store = await HeadroomStore.open(directory);
-        try { return readDashboardStore(store); } finally { store.close(); }
+        try { return readDashboardStore(store, new Date(), undefined, await policyPromise); } finally { store.close(); }
       },
     }),
-    readPolicy(), readAccounts().catch(() => []), headroomVersion(),
+    policyPromise, readAccounts().catch(() => []), headroomVersion(),
   ]);
   return { ...snapshot, direct, policy, version, now: new Date(), vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
 }

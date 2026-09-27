@@ -116,9 +116,14 @@ export interface Observation {
   burn_percent_per_hour?: number | null;
   empty_in_seconds?: number | null;
   sustainable_percent_per_hour?: number | null;
+  /** Computed, never persisted: true only when `resets_at` is more than the
+   * one-minute reset-identity tolerance in the past. In that case served
+   * status has `resets_in_seconds: null` and `resets_in: "overdue <age>"`.
+   * Absent for a reset that is unknown, upcoming, or just crossed. */
+  reset_overdue?: true;
   /** Computed, never persisted: the newest FRESH reading of this exact meter
    * and window from the last 7 days, attached only when this observation's
-   * own freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
+   * served freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
    * trend for a person or a fail-closed orchestrator to glance at while the
    * live number is UNKNOWN -- never a decision input: `can`/`gate`/`route`
    * keep treating UNKNOWN as no capacity regardless of what this carries.

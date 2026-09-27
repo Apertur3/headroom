@@ -288,6 +288,52 @@ describe("MCP JSON-RPC", () => {
     expect(response).toMatchObject({ result: { structuredContent: { source: "direct", observations: [expect.objectContaining({ meter_id: "codex-main:main" })] } } });
   });
 
+  it("serves an aged held window as stale and overdue through direct quota_status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-served-freshness-")); temporary.push(root);
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const now = new Date();
+    const baselineAt = new Date(now.getTime() - 10 * 86_400_000).toISOString();
+    const baseline: Observation = {
+      ...fixture(), meter_id: "codex-main:spark", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(), observed_at: baselineAt, fetched_at: baselineAt,
+    };
+    const newerAt = new Date(now.getTime() - 60_000).toISOString();
+    const suspect: Observation = {
+      ...baseline, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" },
+      resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt,
+    };
+    await withHeadroomHome(root, async () => {
+      const store = await HeadroomStore.open(root);
+      try {
+        const storedBaseline = store.insert(baseline);
+        const storedSuspect = store.insert(suspect);
+        // This recreates a hold that began before the baseline's reset and
+        // is now old enough to serve: the raw newer read remains available
+        // as last_known while latestPerWindow deliberately keeps the baseline.
+        store.setDaemonState("vendor_window_suspect:codex-main:spark:10080", JSON.stringify({
+          baseline_id: storedBaseline.id, suspect_id: storedSuspect.id,
+          baseline_resets_at: baseline.resets_at, suspect_resets_at: suspect.resets_at,
+        }));
+        store.insert({ ...fixture(), meter_id: "codex-main:main", observed_at: newerAt, fetched_at: newerAt, resets_at: new Date(now.getTime() + 3_600_000).toISOString() });
+        store.setDirectPollBackoff({ lastPollAt: Date.now(), until: 0, failures: 0 });
+      } finally { store.close(); }
+      const direct = await directStatus();
+      const rows = direct.observations as Observation[];
+      const held = rows.find((row) => row.meter_id === "codex-main:spark");
+      const normal = rows.find((row) => row.meter_id === "codex-main:main");
+      expect(held).toMatchObject({
+        freshness: "stale", resets_in_seconds: null, resets_in: "overdue 3d", reset_overdue: true,
+        last_known: { used_percent: 41 },
+      });
+      expect(held?.reason).toMatch(/^last accepted reading 10d ago/);
+      expect(normal).toMatchObject({ freshness: "fresh" });
+      expect(normal).not.toHaveProperty("reset_overdue");
+
+      const response = await handleMcp('{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', async () => undefined, async () => direct);
+      expect(response).toMatchObject({ result: { structuredContent: { observations: expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:spark", freshness: "stale", resets_in_seconds: null, resets_in: "overdue 3d", reset_overdue: true, last_known: expect.any(Object) })]) } } });
+    });
+  });
+
   it("uses the daemon's atomic can_lease admission when quota_can asks for a lease", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-mcp-can-lease-")); temporary.push(root);
     await withHeadroomHome(root, async () => {

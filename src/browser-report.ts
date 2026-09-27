@@ -1,6 +1,7 @@
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { gatherDashboard, type DashboardModel } from "./dashboard.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { formatResetsIn, resetsIn } from "./resets.js";
 import { redact, writeFileAtomic } from "./security.js";
@@ -697,20 +698,23 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
     const isHeld = Boolean(pw.metadata?.vendor_window_held || pw.metadata?.vendor_inconsistent);
     const tag = isHeld ? "HELD" : "UNKNOWN";
     const reason = sanitizeFailureReason(pw.raw_reason ?? pw.decision_reason);
+    const reset = pw.resets_at ? resetsIn(pw.resets_at, now) : undefined;
     return `
       <div class="cell-block">
         <div class="cell-status-row">
           <span class="badge unknown">${escapeHtml(tag)}</span>
           <span class="cell-reason muted" title="${escapeHtml(reason)}">${escapeHtml(reason)}</span>
         </div>
+        ${reset?.reset_overdue ? `<div class="reset-time muted mono">↻ ${escapeHtml(reset.resets_in)}</div>` : ""}
       </div>
     `;
   }
 
   const usedVal = pw.used_percent !== null ? pw.used_percent : 0;
   const remVal = pw.remaining_percent !== null ? pw.remaining_percent : 100;
-  const secondsToReset = pw.resets_at ? resetsIn(pw.resets_at, now).resets_in_seconds : null;
-  const displayReset = secondsToReset !== null ? formatResetsIn(secondsToReset) : "?";
+  const reset = pw.resets_at ? resetsIn(pw.resets_at, now) : undefined;
+  const displayReset = reset?.resets_in ?? "?";
+  const resetText = reset?.reset_overdue ? `↻ ${displayReset}` : `resets in ${displayReset}`;
 
   // Color bar by usage level
   const barClass = usedVal > 90 ? "danger" : usedVal > 70 ? "warning" : "healthy";
@@ -723,7 +727,7 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
       <div class="cell-numbers">
         <span class="pct mono"><strong>${formatHumanPercent(usedVal)}%</strong> used</span>
         <span class="rem-pct muted mono">(${formatHumanPercent(remVal)}% rem)</span>
-        <span class="reset-time muted mono">resets in ${escapeHtml(displayReset)}</span>
+        <span class="reset-time muted mono">${escapeHtml(resetText)}</span>
       </div>
     </div>
   `;
@@ -732,7 +736,8 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
 /** Pure renderer that converts a DashboardModel to a standalone HTML snapshot. */
 export function renderBrowserReport(model: DashboardModel, options: BrowserReportOptions = {}): string {
   const now = options.generatedAt ?? model.now ?? new Date();
-  const observations = model.observations ?? [];
+  const observations = withEffectiveFreshness(model.observations ?? [], model.policy.staleness_minutes, now);
+  model = { ...model, observations };
   const processedWindows = observations.map((row) => processWindow(row, model, now));
 
   // Determine latest observation / fetch timestamps safely
@@ -1704,8 +1709,8 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
           const isSelected = pw.meter_id === defaultSelection.meter_id && (pw.window_minutes === defaultSelection.window_minutes || (defaultSelection.window_minutes === null && pw.window_minutes === null));
           const safeMeterKey = pw.meter_id.replace(/[^a-zA-Z0-9_-]/g, "_");
           const panelId = `panel-${safeMeterKey}-${pw.window_minutes ?? "custom"}`;
-          const secondsToReset = pw.resets_at ? resetsIn(pw.resets_at, now).resets_in_seconds : null;
-          const displayReset = secondsToReset !== null ? formatResetsIn(secondsToReset) : "?";
+          const reset = pw.resets_at ? resetsIn(pw.resets_at, now) : undefined;
+          const displayReset = reset?.resets_in ?? "?";
 
           return `
           <div class="chart-panel" id="${panelId}" style="display: ${isSelected ? "block" : "none"};">

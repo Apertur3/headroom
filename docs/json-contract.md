@@ -53,8 +53,11 @@ These fields recur across almost every output. They are documented in full in
 needs the JSON meaning.
 
 - **`freshness`** -- `"fresh" | "stale" | "failed" | "not_enforced"`, on every
-  `Observation`. `fresh` is a good recent read. `stale` is older than the
-  staleness threshold (15 minutes by default). `failed` is an errored,
+  served `Observation`. `fresh` is a good recent read. A row stored as
+  `fresh` is served as `stale` once its `fetched_at` is older than the
+  staleness threshold (15 minutes by default); its `reason` begins `last
+  accepted reading <age> ago` and retains any stored explanation after it.
+  This response-time label does not rewrite history. `failed` is an errored,
   timed-out, or contradicted read. `not_enforced` means the vendor confirmed
   there is no cap at all on this window -- it never counts as UNKNOWN and
   never blocks `can`/`gate`/`fill`.
@@ -118,8 +121,11 @@ An `Observation` (the unit everything else builds on) is: `principal_id`,
 null`; `quantity: { used: number, limit: number | null, remaining: number |
 null, unit: "percent" | "tokens" | "requests" | "credits" } | null`;
 `resets_at: string | null`; `resets_in_seconds: number | null` and `resets_in:
-string | null` (added by `withResetsIn`, computed fresh at response time, not
-stored); `observed_at`, `fetched_at` (both ISO strings); `source` (string,
+string | null` (computed fresh at response time, not stored). When `resets_at`
+is more than 60 seconds past, `resets_in_seconds` is `null`, `resets_in` is
+`"overdue <age>"`, and additive `reset_overdue: true` is present; it is absent
+otherwise. A reset within that tolerance remains `0m`. `observed_at`,
+`fetched_at` (both ISO strings); `source` (string,
 free-form vendor/adapter tag); `truth`; `freshness`; `confidence`;
 `adapter_version`, `upstream_schema_version` (both strings); `reason?: string
 | null`; `metadata?: {...}` (optional, vendor facts -- see `types.ts`, never
@@ -133,7 +139,7 @@ null` (present once pace-enriched, which every `status`/`can`/`gate`/`rate`
 read is); `last_known?: { used_percent: number, resets_at: string | null,
 observed_at: string, age_seconds: number, window_minutes?: number | null } |
 null` (present once last-known-enriched, which every `status` read is;
-non-null only when this observation's own `freshness` is `failed` or `stale`
+non-null only when this observation's served `freshness` is `failed` or `stale`
 -- the two values that always render as UNKNOWN -- and a fresh reading exists
 within the last 7 days; the newest such reading, so a fail-closed caller can
 still see the trend behind an UNKNOWN. For a windowed observation this is the

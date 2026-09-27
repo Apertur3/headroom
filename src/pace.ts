@@ -5,6 +5,7 @@
  * sustainable-pace figure that the CLI, the daemon and the MCP server all
  * attach to the same observation objects the same way.
  */
+import { formatResetsIn, withResetsIn, type ResetsIn } from "./resets.js";
 import type { LastKnownReading, Observation } from "./types.js";
 
 export interface BurnInfo {
@@ -80,10 +81,42 @@ export function withPaceInfo<T extends Observation>(observations: T[], burn: Map
   });
 }
 
+export interface EffectiveFreshness {
+  freshness: Observation["freshness"];
+  reason?: string | null;
+}
+
+/**
+ * The freshness a reader is served, evaluated at response time rather than
+ * copied from the moment a row entered SQLite. History deliberately retains
+ * its original vendor result; this only keeps a long-unpolled `fresh` row
+ * from being presented as current. The comparison and strict boundary match
+ * policy.ts's freshnessGate/paceDecision exactly.
+ */
+export function effectiveFreshness(observation: Observation, stalenessMinutes: number, now = new Date()): EffectiveFreshness {
+  if (observation.freshness !== "fresh") return { freshness: observation.freshness, reason: observation.reason };
+  const fetched = Date.parse(observation.fetched_at);
+  if (!Number.isFinite(fetched) || now.getTime() - fetched <= stalenessMinutes * 60_000) {
+    return { freshness: observation.freshness, reason: observation.reason };
+  }
+  const ageSeconds = Math.max(0, (now.getTime() - fetched) / 1000);
+  const age = ageSeconds < 60 ? "<1m" : formatResetsIn(ageSeconds);
+  const staleReason = `last accepted reading ${age} ago`;
+  return { freshness: "stale", reason: observation.reason ? `${staleReason}; ${observation.reason}` : staleReason };
+}
+
+/** Applies effectiveFreshness without mutating stored-shaped inputs. Kept
+ * separate from withStatusInfo so renderers that receive an already-enriched
+ * daemon payload can still protect a direct caller without recomputing its
+ * store-backed burn and last-known data. */
+export function withEffectiveFreshness(observations: Observation[], stalenessMinutes: number, now = new Date()): Observation[] {
+  return observations.map((item) => ({ ...item, ...effectiveFreshness(item, stalenessMinutes, now) }));
+}
+
 /**
  * Attaches `last_known` (see types.ts) to every observation whose own
- * `freshness` is `failed` or `stale` -- the two raw freshness values that
- * always render as UNKNOWN (see policy.ts's paceDecision) -- from a map
+ * served `freshness` is `failed` or `stale` -- the two values that always
+ * render as UNKNOWN (see policy.ts's paceDecision) -- from a map
  * store.ts's lastKnownFor() already collected, keyed the same way as `burn`
  * above. A fresh observation, or an UNKNOWN one with nothing fresh in the
  * lookback, gets `last_known: null`: this is purely informational, so it is
@@ -102,4 +135,20 @@ export function withLastKnown<T extends Observation>(observations: T[], lastKnow
     const known = key ? lastKnown.get(key) : undefined;
     return { ...item, last_known: known ?? null };
   });
+}
+
+/**
+ * The one response-time status shape: served freshness, pace, last-known and
+ * reset countdowns all come from the same clock. Store rows stay verbatim;
+ * only callers returning observations to people or agents use this helper.
+ */
+export function withStatusInfo(
+  observations: Observation[],
+  burn: Map<string, BurnInfo>,
+  lastKnown: Map<string, LastKnownReading>,
+  stalenessMinutes: number,
+  now = new Date(),
+): Array<Observation & BurnInfo & { sustainable_percent_per_hour: number | null; last_known: LastKnownReading | null } & ResetsIn> {
+  const served = withEffectiveFreshness(observations, stalenessMinutes, now);
+  return withResetsIn(withLastKnown(withPaceInfo(served, burn, now), lastKnown), now);
 }

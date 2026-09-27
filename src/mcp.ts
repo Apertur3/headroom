@@ -5,13 +5,13 @@ import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./co
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
-import { resetsIn, withResetsIn } from "./resets.js";
+import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
@@ -161,13 +161,10 @@ export function serveMcp(): void {
 
 type DirectResult = Record<string, unknown>;
 
-/** Attaches burn/empty-in/sustainable-pace fields, and (for a failed or
- * stale observation) last_known, to every observation of a fresh store
- * read -- from one shared burn computation and one shared last-known
- * lookup. */
-function withPace(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, now: Date): ReturnType<HeadroomStore["latestPerWindow"]> {
-  const paced = withPaceInfo(observations, store.burnRateFor(observations, now), now);
-  return withLastKnown(paced, store.lastKnownFor(observations, now)) as ReturnType<HeadroomStore["latestPerWindow"]>;
+/** The direct-MCP equivalent of daemon status: one shared served shape keeps
+ * freshness, pace, last-known and reset countdowns on the same clock. */
+function withStatus(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, stalenessMinutes: number, now: Date) {
+  return withStatusInfo(observations, store.burnRateFor(observations, now), store.lastKnownFor(observations, now), stalenessMinutes, now);
 }
 
 /** Exported only for tests: the MCP client that skips the daemon and reads
@@ -187,10 +184,10 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withStatus(store, cached, policy.staleness_minutes, new Date(now)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, new Date(now)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -204,7 +201,7 @@ export async function directStatus(): Promise<DirectResult> {
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    return { source: "direct", observations: withStatus(store, store.latestPerWindow(), policy.staleness_minutes, new Date(now)), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
   } finally { store.close(); }
 }
 
@@ -453,7 +450,7 @@ async function directWait(meter: unknown): Promise<DirectResult> {
     const rows = store.latestPerWindow(meter).filter((item) => item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
     const shortest = [...rows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER))[0];
     const resetsAt = shortest?.resets_at ?? null;
-    const { resets_in_seconds } = resetsIn(resetsAt);
+    const resets_in_seconds = resetSecondsRemaining(resetsAt);
     store.audit("mcp", "wait", meter, "ok");
     return { source: "direct", meter, resets_at: resetsAt, resets_in_seconds, suggested_sleep_seconds: resets_in_seconds === null ? null : Math.max(0, Math.min(resets_in_seconds, 3600)) };
   } finally { store.close(); }

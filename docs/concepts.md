@@ -46,7 +46,10 @@ Example: an observation for `claude-main:fable` at 82% used, `resets_at` next Sa
 ## Freshness and UNKNOWN
 
 Every observation is `fresh`, `stale`, `failed`, or `not_enforced`. `fresh` is a good, recent
-vendor read. `stale` means the last good read is older than the staleness threshold (15 minutes by
+vendor read. Freshness is evaluated again whenever a row is served: a row stored as `fresh` whose
+`fetched_at` has crossed `staleness_minutes` is served as `stale`, with `last accepted reading
+<age> ago` at the front of its reason (followed by any stored explanation). This presentation rule
+does not rewrite the historical row. `stale` means the last good read is older than the staleness threshold (15 minutes by
 default). `failed` means the last attempt errored, timed out, exceeded Headroom's own bounds on
 the response, or -- for a vendor-reported idle window that looks like a placeholder -- contradicted
 a real-usage reading Headroom already trusted for that same window within the last two hours (a
@@ -68,7 +71,7 @@ that might no longer be true.
 Example: a Codex account with no 5-hour window in the vendor's response and no recent session log
 shows `5h n/a`, not `5h 0%`.
 
-A window that is `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
+A window that is served `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
 exact meter and window from the last 7 days, with the age of that reading, so a person or a
 fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the word itself --
 `headroom` prints it as `UNKNOWN (reason; last 41% at 00:05, 65m ago)`, and it rides along on
@@ -76,6 +79,11 @@ fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the
 age_seconds }` (`null` when nothing fresh exists in that window within 7 days). It is informational
 only: `can`, `gate`, and `route` keep treating UNKNOWN as no capacity no matter what `last_known`
 says.
+
+Reset countdowns are also evaluated when served. A reset within 60 seconds of now still reads
+`0m`, matching the store's same-window tolerance. Once it is older, status says `overdue <age>`
+instead of an imminent `0m`; JSON adds `reset_overdue: true` and sets `resets_in_seconds` to
+`null` so callers can distinguish an overdue schedule from an unknown one.
 
 ## Pace states
 

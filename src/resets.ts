@@ -37,19 +37,50 @@ export function formatClockTime(date: Date): string {
   return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
 }
 
-export interface ResetsIn { resets_in_seconds: number | null; resets_in: string | null; }
+export interface ResetsIn {
+  resets_in_seconds: number | null;
+  resets_in: string | null;
+  /** Present only after a reset has been due for longer than the store's
+   * one-minute same-window tolerance. A null countdown then means overdue,
+   * rather than an unknown reset time. */
+  reset_overdue?: true;
+}
+
+/** Decision paths use a past scheduled instant as zero time remaining. This
+ * deliberately stays separate from resetsIn's served-status vocabulary:
+ * overdue is useful information for a reader, but must not turn a due-now
+ * gate/fill/wait calculation into an unknown duration. */
+export function resetSecondsRemaining(resetsAt: string | null | undefined, now = new Date()): number | null {
+  if (!resetsAt) return null;
+  const target = new Date(resetsAt).getTime();
+  if (!Number.isFinite(target)) return null;
+  return Math.max(0, Math.round((target - now.getTime()) / 1000));
+}
 
 export function resetsIn(resetsAt: string | null | undefined, now = new Date()): ResetsIn {
   if (!resetsAt) return { resets_in_seconds: null, resets_in: null };
   const target = new Date(resetsAt).getTime();
   if (!Number.isFinite(target)) return { resets_in_seconds: null, resets_in: null };
-  const seconds = Math.max(0, Math.round((target - now.getTime()) / 1000));
+  const difference = target - now.getTime();
+  // reset identity tolerates a minute of vendor timestamp jitter (store.ts's
+  // sameReset); keep that same small grace here so a just-crossed boundary
+  // still reads "0m", but never let an old schedule masquerade as imminent.
+  if (difference < -60_000) {
+    return { resets_in_seconds: null, resets_in: `overdue ${formatResetsIn(-difference / 1000)}`, reset_overdue: true };
+  }
+  const seconds = resetSecondsRemaining(resetsAt, now)!;
   return { resets_in_seconds: seconds, resets_in: formatResetsIn(seconds) };
 }
 
 /** Attaches resets_in_seconds/resets_in to every observation, without mutating the input. */
 export function withResetsIn<T extends { resets_at: string | null }>(observations: T[], now = new Date()): Array<T & ResetsIn> {
-  return observations.map((item) => ({ ...item, ...resetsIn(item.resets_at, now) }));
+  return observations.map((item) => {
+    // An input can be an earlier served object rather than a raw store row;
+    // discard its old marker first so reset_overdue is genuinely absent once
+    // the reset becomes unknown, upcoming, or falls back inside tolerance.
+    const { reset_overdue: _previousOverdue, ...withoutPreviousOverdue } = item as T & { reset_overdue?: true };
+    return { ...withoutPreviousOverdue, ...resetsIn(item.resets_at, now) } as T & ResetsIn;
+  });
 }
 
 /**

@@ -18,6 +18,7 @@
  * and `--agent` as explicit overrides.
  */
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatResetsIn, formatResetsInCoarse, resetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
@@ -176,6 +177,8 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   const evidence = `${decodedResetSeen ? ` reset seen ${formatReset(decodedResetSeen.at, now)}${decodedResetSeen.unscheduled ? " (unscheduled)" : ""}` : ""}${freeResetUsed ? ` free reset ${formatReset(freeResetUsed, now)}` : ""}`;
   const vendorWindow = vendorWindowNote(observation);
   const inconsistent = vendorWindow ? ` (${vendorWindow})` : "";
+  const resetInfo = resetsIn(observation.resets_at, now);
+  const overdue = resetInfo.reset_overdue ? ` ↻ ${resetInfo.resets_in}` : "";
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -184,9 +187,9 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     // A windowless row's borrowed reading names its source window first
     // ("last wk 41% at ...") the same way the compact form does.
     const known = observation.last_known ? `; last ${lastKnownWindowPrefix(observation.last_known)}${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
-    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${inconsistent}${evidence}`;
+    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${overdue}${inconsistent}${evidence}`;
   }
-  const seconds = resetsIn(observation.resets_at, now).resets_in_seconds;
+  const seconds = resetInfo.resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
   // A vendor-reported idle window that looks like a manufactured placeholder
   // (see engine/observation.ts's normalizeObservations) is still shown as a
@@ -196,7 +199,8 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // The protected reserve (policy.toml [reserve]) follows the numbers so a
   // reader can see why a healthy-looking percentage still produced a NO from
   // gate/fill/route/can. It never changes the pace state beside it.
-  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)} ↻${formatReset(observation.resets_at, now)}${countdown} ${state}${doubt}${inconsistent}${evidence}${paceSegment(observation)}`;
+  const reset = resetInfo.reset_overdue ? overdue : ` ↻${formatReset(observation.resets_at, now)}${countdown}`;
+  return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)}${reset} ${state}${doubt}${inconsistent}${evidence}${paceSegment(observation)}`;
 }
 
 function formatLocal(observation: Observation): string {
@@ -210,6 +214,7 @@ function formatLocal(observation: Observation): string {
 }
 
 export function formatMeters(observations: Observation[], policy: Policy, resetSeen = new Map<string, string>(), leases = new Map<string, Lease[]>(), freeResetUsed = new Map<string, string>(), now = new Date()): string[] {
+  observations = withEffectiveFreshness(observations, policy.staleness_minutes, now);
   const meters = new Map<string, Observation[]>();
   for (const observation of observations) meters.set(observation.meter_id, [...(meters.get(observation.meter_id) ?? []), observation]);
   return [...meters.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([meter, windows]) => {
@@ -509,8 +514,10 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
       const active = leases.get(meterId) ?? [];
       ordered.forEach((observation, index) => {
         const decision = paceDecision(observation, policy, now);
-        const seconds = resetsIn(observation.resets_at, now).resets_in_seconds;
-        const countdown = seconds === null || decision.state === "UNKNOWN";
+        const resetInfo = resetsIn(observation.resets_at, now);
+        const seconds = resetInfo.resets_in_seconds;
+        const overdue = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : undefined;
+        const countdown = !overdue && (seconds === null || decision.state === "UNKNOWN");
         const unknown = decision.state === "UNKNOWN" ? explainUnknown(observation.reason ?? decision.reason) : undefined;
         if (unknown) explanations.push(unknown);
         const rawResetSeen = resetSeen.get(windowKey(observation));
@@ -532,8 +539,8 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
           window: label(observation),
           bar: isCredits(observation) ? undefined : barFor(observation, decision.state, ascii),
           used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),
-          reset: countdown ? known : `resets in ${formatResetsIn(seconds as number)}`,
-          resetCoarse: countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`,
+          reset: overdue ?? (countdown ? known : `resets in ${formatResetsIn(seconds as number)}`),
+          resetCoarse: overdue ?? (countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`),
           state: isCredits(observation) ? "" : observation.metadata?.exhausted ? "FREEZE" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
           detail: detailLine(observation, reserveFor(policy.reserve, observation.meter_id), resetSeen.get(windowKey(observation)), freeResetUsed.get(windowKey(observation)), now),
           unknown,
@@ -560,7 +567,7 @@ function footer(blocks: PrincipalBlock[], direct: boolean, observations: Observa
   if (unknownCount) parts.push(`${unknownCount} UNKNOWN (${[...new Set(blocks.flatMap((block) => block.causes))].join(", ")})`);
   if (direct) parts.push("direct read, no daemon");
   else if (!observations.length) parts.push("no readings yet");
-  else parts.push(`daemon fresh ${age(newest(observations), now)} ago`);
+  else parts.push(`daemon ${freshnessWord(observations)} ${age(newest(observations), now)} ago`);
   return parts.join(", ");
 }
 
@@ -644,6 +651,7 @@ function groupedLines(input: StatusViewInput, options: StatusViewOptions): strin
 export function renderStatus(input: StatusViewInput, options: StatusViewOptions): string[] {
   const warnings = (input.planDowngraded ?? []).map(planDowngradeLine);
   if (options.form === "plain") return [...warnings, ...formatMeters(input.observations, input.policy, input.resetSeen, input.leases, input.freeResetUsed, input.now ?? new Date())];
-  const body = groupedLines(input, options);
+  const now = input.now ?? new Date();
+  const body = groupedLines({ ...input, observations: withEffectiveFreshness(input.observations, input.policy.staleness_minutes, now), now }, options);
   return options.color ? [...warnings.map((line) => `${ANSI.red}${line}${ANSI.reset}`), ...body] : [...warnings, ...body];
 }

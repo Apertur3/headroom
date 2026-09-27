@@ -284,6 +284,22 @@ describe("headroom wait", () => {
     });
   });
 
+  it("still reports reset immediately for a past resets_at", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(10, -HOUR, -30 * 60_000));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        const started = Date.now();
+        expect(await main(["wait", "--meter", "claude-main:all", "--until-reset", "--max", "1m"])).toBe(0);
+        expect(Date.now() - started).toBeLessThan(2000);
+      });
+    } finally { restore(); }
+    expect(logs).toContain("claude-main:all reset");
+  });
+
   it("exits 0, not 1, when the meter has no windowed reading to wait on -- an unknown reading, not a CLI failure", async () => {
     const home = await seededHome();
     await withHeadroomHome(home, async () => {
@@ -660,6 +676,18 @@ describe("MCP quota_cost / quota_rate / quota_plan / quota_gate / quota_wait (di
       expect(content.resets_at).toBe(resetsAt);
       expect(content.suggested_sleep_seconds).toBeGreaterThan(0);
       expect(content.suggested_sleep_seconds).toBeLessThanOrEqual(3600);
+    });
+  });
+
+  it("keeps quota_wait at zero seconds once its reset is in the past", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    const resetsAt = at(-30 * 60_000);
+    store.insert({ ...fiveHour(10, 0, 0), resets_at: resetsAt });
+    store.close();
+    await withHeadroomHome(home, async () => {
+      const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_wait","arguments":{"meter":"claude-main:all"}}}', noDaemon);
+      expect(response).toMatchObject({ result: { structuredContent: { resets_at: resetsAt, resets_in_seconds: 0, suggested_sleep_seconds: 0 } } });
     });
   });
 });

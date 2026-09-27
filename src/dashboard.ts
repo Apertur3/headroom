@@ -6,6 +6,7 @@ import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatResetsIn, resetsIn } from "./resets.js";
 import { safeError } from "./security.js";
@@ -67,7 +68,7 @@ export async function gatherDashboard(): Promise<DashboardModel> {
   const store = await HeadroomStore.open(home);
   try {
     const now = new Date();
-    const { snapshot, direct } = await dashboardRead({ request: async () => reply, fallback: async () => readDashboardStore(store, now) });
+    const { snapshot, direct } = await dashboardRead({ request: async () => reply, fallback: async () => readDashboardStore(store, now, undefined, policy) });
     const filtered = filterDashboardPrincipals(snapshot, new Set(accounts.map((account) => account.name)));
     const observations = filtered.observations;
     return { ...filtered, ...readDashboardGraphs(store, observations, now), direct, policy, version, now,
@@ -372,7 +373,8 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
   const used = !unknown && row.quantity?.unit === "percent" ? row.quantity.used : null;
   const narrowStack = view.width < 70;
   const bar = barFor(row, decision.state, view.ascii);
-  const seconds = resetsIn(row.resets_at, model.now).resets_in_seconds;
+  const resetInfo = resetsIn(row.resets_at, model.now);
+  const seconds = resetInfo.resets_in_seconds;
   const glyph = { NORMAL: "●", HARVEST: "↗", CONSERVE: "⚠", FREEZE: "🛑", UNKNOWN: "?", NOT_ENFORCED: "", UP: "●", BUSY: "⚠", DOWN: "🛑" }[decision.state];
   let note = "";
   if (row.metadata?.vendor_inconsistent) note = " (vendor readings inconsistent, holding)";
@@ -382,9 +384,11 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
     lines.push(`  ${meter} ${label(row)} n/a (not enforced)`);
   } else if (narrowStack) {
     lines.push(`  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)}`);
-    lines.push(`      ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}${note}`);
+    const reset = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
+    lines.push(`      ${glyph} ${reset} ${decision.state}${note}`);
   } else {
-    let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)} ${decision.state}${note}`;
+    const reset = resetInfo.reset_overdue ? `↻ ${resetInfo.resets_in}` : `resets in ${unknown || seconds === null ? "?" : formatResetsIn(seconds)}`;
+    let text = `  ${clip(meter, 10).padEnd(10)} ${label(row).padEnd(3)} ${bar} ${used === null ? "  -" : `${Math.round(used)}%`.padStart(4)} ${glyph} ${reset} ${decision.state}${note}`;
     if (view.graphs !== false && view.width >= 100 && !unknown && model.burns[key]?.length) text += ` ${spark(model.burns[key])}`;
     lines.push(text);
   }
@@ -481,8 +485,12 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
     const displayState = rawState === "NOT_ENFORCED" ? "n/a" : rawState;
     const isUnknownOnly = rows.every((r) => paceDecision(r, model.policy, model.now).state === "UNKNOWN");
 
-    const resettingWindows = rows.filter((r) => isTrustworthy(r) && r.resets_at && resetsIn(r.resets_at, model.now).resets_in_seconds !== null);
-    const earliestResetRow = resettingWindows.sort((a, b) => (resetsIn(a.resets_at, model.now).resets_in_seconds ?? Infinity) - (resetsIn(b.resets_at, model.now).resets_in_seconds ?? Infinity))[0];
+    const resettingWindows = rows.filter((r) => isTrustworthy(r) && r.resets_at && resetsIn(r.resets_at, model.now).resets_in !== null);
+    const resetOrder = (row: Observation): number => {
+      const info = resetsIn(row.resets_at, model.now);
+      return info.reset_overdue ? -1 : info.resets_in_seconds ?? Infinity;
+    };
+    const earliestResetRow = resettingWindows.sort((a, b) => resetOrder(a) - resetOrder(b))[0];
 
     const windowParts: string[] = [];
     for (const w of ordered) {
@@ -496,8 +504,12 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
         : wDecision.state === "NOT_ENFORCED" ? "n/a" : "-";
       let countdownStr = "";
       if (w === earliestResetRow) {
-        const sec = resetsIn(w.resets_at, model.now).resets_in_seconds;
-        if (sec !== null && !isUnknown) {
+        const resetInfo = resetsIn(w.resets_at, model.now);
+        const sec = resetInfo.resets_in_seconds;
+        if (resetInfo.reset_overdue) {
+          const glyph = view.ascii ? "~" : "↻";
+          countdownStr = ` ${glyph} ${resetInfo.resets_in}`;
+        } else if (sec !== null && !isUnknown) {
           const glyph = view.ascii ? "~" : "↻";
           countdownStr = ` ${glyph}${formatResetsIn(sec).replace(/\s+/g, "")}`;
         }
@@ -662,6 +674,7 @@ function dashboardLayout(model: DashboardModel, options: DashboardView): Dashboa
 
 /** A deterministic dashboard frame with a fixed header and a scrollable content viewport. */
 export function renderDashboard(model: DashboardModel, options: DashboardView): string[] {
+  model = { ...model, observations: withEffectiveFreshness(model.observations, model.policy.staleness_minutes, model.now) };
   const width = Math.max(1, Math.floor(options.width) || 80), height = Math.max(1, Math.floor(options.height) || 24);
   const bodyWidth = width > 1 ? width - 1 : 1;
   const layout = dashboardLayout(model, options);
