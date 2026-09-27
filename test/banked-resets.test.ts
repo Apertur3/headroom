@@ -84,7 +84,9 @@ describe("manual banked-reset storage", () => {
       const expires = new Date(now.getTime() + 3_600_000).toISOString();
       store.recordManualCredits("claude-main", 1, expires, false, now);
       store.clearManualCredits("claude-main", new Date(now.getTime() + 1_000));
-      expect(store.latestPerWindow("claude-main:credits")[0]).toMatchObject({ source: "manual", quantity: { remaining: 0 }, metadata: { manual: true, manual_cleared: true } });
+      // A clear is a current fact ("the balance is zero now"), not a stale
+      // reading; only metadata.manual_cleared marks it for ranking/exclusion.
+      expect(store.latestPerWindow("claude-main:credits")[0]).toMatchObject({ source: "manual", freshness: "fresh", quantity: { remaining: 0 }, metadata: { manual: true, manual_cleared: true } });
       expect(store.history("claude-main:credits", new Date(now.getTime() - 1_000).toISOString())).toHaveLength(2);
 
       const lapsedExpires = new Date(now.getTime() + 2_000).toISOString();
@@ -221,6 +223,25 @@ describe("count meters never dispatch", () => {
       expect(routeFor(store, [credit.meter_id], [account], defaultPolicy, true, now)).toMatchObject({ principal: null, candidates: [expect.objectContaining({ state: "UNKNOWN", remaining_percent: null })] });
     } finally { store.close(); }
   });
+
+  it("skips a credits meter during an omitted-meter global gate instead of refusing every account, but still refuses it when explicitly targeted", async () => {
+    const value = await home("banked-count-global-gate");
+    const now = new Date("2026-10-01T12:00:00Z");
+    const store = await HeadroomStore.open(value);
+    try {
+      store.insert(percent("claude-main", "all", 300, 10, now, new Date(now.getTime() + 5 * 3_600_000).toISOString()));
+      store.insert(percent("claude-main", "all", 10_080, 20, now, new Date(now.getTime() + 48 * 3_600_000).toISOString()));
+      store.insert(vendorCredits("claude-main", 1, new Date(now.getTime() + 48 * 3_600_000).toISOString(), now));
+      // No --meter/--class at all: the credits meter is inferred as a
+      // candidate alongside the percent one but must be silently skipped,
+      // not treated as a global refusal.
+      expect(gateFor(store, [{ window: "5h", points: 1 }], undefined, 10, false, now)).toMatchObject({ allowed: true, meters_checked: ["claude-main:all"] });
+      // Named explicitly (a --meter or a --class resolved to it), the same
+      // credits meter still refuses.
+      expect(gateFor(store, [{ window: "5h", points: 1 }], "claude-main:credits", 10, false, now)).toMatchObject({ allowed: false, reason: "count meter claude-main:credits cannot be used for dispatch" });
+      expect(gateFor(store, [{ window: "5h", points: 1 }], ["claude-main:all", "claude-main:credits"], 10, false, now)).toMatchObject({ allowed: false, reason: "count meter claude-main:credits cannot be used for dispatch" });
+    } finally { store.close(); }
+  });
 });
 
 describe("credits CLI, daemon RPC, MCP and status", () => {
@@ -280,12 +301,60 @@ describe("credits CLI, daemon RPC, MCP and status", () => {
     spy.mockRestore();
   });
 
+  it("audits credits_set and credits_clear exactly once each through the daemon RPC path (not doubled by the case-local and common audit)", async () => {
+    const value = await home("banked-rpc-audit");
+    const expires = new Date(Date.now() + 48 * 3_600_000).toISOString();
+    await withHome(value, async () => {
+      const daemon = await HeadroomDaemon.create({ home: value, path: socketPath(value), poller: async () => ({ observations: [], failures: [] }) });
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        await daemon.stop();
+        if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+        throw error;
+      }
+      try {
+        const setReply = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "credits_set", params: { principal: "claude-main", available: 1, expires } }));
+        expect(setReply).toMatchObject({ result: { meter: "claude-main:credits", available: 1 } });
+        const clearReply = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 2, method: "credits_clear", params: { principal: "claude-main" } }));
+        expect(clearReply).toMatchObject({ result: { meter: "claude-main:credits", available: 0 } });
+      } finally { await daemon.stop(); }
+    });
+
+    const store = await HeadroomStore.open(value);
+    try {
+      const db = (store as unknown as { db: { prepare(sql: string): { all(...params: unknown[]): Record<string, unknown>[] } } }).db;
+      const setRows = db.prepare("SELECT * FROM audit WHERE action = 'credits_set' AND meter_or_principal = 'claude-main'").all();
+      const clearRows = db.prepare("SELECT * FROM audit WHERE action = 'credits_clear' AND meter_or_principal = 'claude-main'").all();
+      expect(setRows).toHaveLength(1);
+      expect(clearRows).toHaveLength(1);
+      expect(setRows[0]).toMatchObject({ outcome: "ok" });
+      expect(clearRows[0]).toMatchObject({ outcome: "ok" });
+    } finally { store.close(); }
+  });
+
   it("marks manual credits in status and renders them expired after their expiry", () => {
     const now = new Date("2026-10-01T12:00:00Z");
     const future = { ...vendorCredits("claude-main", 1, "2026-10-02T12:00:00Z", now), source: "manual", truth: "estimated", confidence: 0.9, adapter_version: "manual", metadata: { free_resets_available: 1, manual: true } };
     const past = { ...future, resets_at: "2026-09-30T12:00:00Z" };
     expect(formatMeters([future], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 available (expires Oct 2) (manual)");
     expect(formatMeters([past], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 expired Sep 30 (manual)");
+  });
+
+  it("rejects an ISO instant with an impossible calendar date instead of silently normalizing it forward, with both Z and an offset", () => {
+    // 2026 is not a leap year, so Feb has 28 days; Date.parse would otherwise
+    // silently roll 2026-02-30 forward into March, extending a manual
+    // banked-reset expiry past what the operator actually typed.
+    expect(() => parseCreditExpiry("2026-02-30T00:00:00Z")).toThrow("--expires must be YYYY-MM-DD or an ISO instant");
+    expect(() => parseCreditExpiry("2026-02-30T00:00:00+02:00")).toThrow("--expires must be YYYY-MM-DD or an ISO instant");
+    // April only has 30 days.
+    expect(() => parseCreditExpiry("2026-04-31T00:00:00Z")).toThrow("--expires must be YYYY-MM-DD or an ISO instant");
+    // 2026 is not a leap year: Feb 29 does not exist that year, but it does
+    // in 2028 -- the check is a real leap-year calculation, not a fixed cap.
+    expect(() => parseCreditExpiry("2026-02-29T00:00:00Z")).toThrow("--expires must be YYYY-MM-DD or an ISO instant");
+    expect(parseCreditExpiry("2028-02-29T00:00:00Z")).toBe("2028-02-29T00:00:00.000Z");
+    // A genuine last-of-month date, with both suffix forms, still parses.
+    expect(parseCreditExpiry("2026-02-28T00:00:00Z")).toBe("2026-02-28T00:00:00.000Z");
+    expect(parseCreditExpiry("2026-04-30T12:00:00+02:00")).toBe(new Date("2026-04-30T12:00:00+02:00").toISOString());
   });
 
   it("uses UTC calendar dates for date-only expiry input in every local timezone and lapses at the exact instant", () => {

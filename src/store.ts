@@ -587,10 +587,14 @@ export class HeadroomStore {
       principal_id: principal, meter_id: `${principal}:credits`,
       window: { kind: "count", minutes: null, enforcement: "hard" },
       quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiresAt,
-      // A clear is a zero-valued audit record, not a fresh capacity claim.
-      // Ranking lets it replace an earlier manual entry, while a later failed
-      // vendor read can still surface instead of disappearing behind it.
-      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: cleared ? "stale" : "fresh", confidence: 0.9,
+      // A clear is a current, genuinely fresh fact -- "the operator's balance
+      // is now zero" -- not a stale reading; `stale` means "this used to be
+      // current but has aged past the threshold", which a just-recorded clear
+      // never is. `metadata.manual_cleared` alone marks it for ranking
+      // (a later manual entry supersedes it, but a later failed vendor read
+      // does not hide it) and for excluding it from banked capacity; it keeps
+      // the same observation shape a fresh entry has (see docs/json-contract.md).
+      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9,
       adapter_version: "manual", upstream_schema_version: "manual",
       metadata: { free_resets_available: available, manual: true, ...(cleared ? { manual_cleared: true } : {}) },
     };

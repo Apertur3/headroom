@@ -230,8 +230,10 @@ manual one. `headroom plan --meter claude-main:all --until reset --target <point
 weekly budget left above reserve, the value of each banked reset (`100 - reserve`), and whether the
 target fits now or after a number of resets. It advises using one now only when none would otherwise
 survive to the scheduled reset, or when a blocked target is more than 24 hours from that reset;
-otherwise it says to wait, or that no target is blocked. A lapsed credit remains in history and
-status as expired but contributes zero to planning. Headroom never fires a reset: that remains a
+otherwise it says to wait, or that no target is blocked. A lapsed credit always remains in history,
+and shows in status as expired until superseded there by a newer reading for the same meter -- even
+a failed vendor poll, which a live (unlapsed, uncleared) manual entry would otherwise outrank; either
+way, a lapsed credit contributes zero to planning. Headroom never fires a reset: that remains a
 human action in the vendor UI. A date-only `--expires` value is midnight UTC on that calendar day,
 and credit status renders that same UTC calendar day in every timezone. At a 100% reserve each
 reset is worth zero, so a target that does not already fit has `resets_needed: null` and the advice

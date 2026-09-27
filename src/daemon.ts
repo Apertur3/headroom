@@ -612,8 +612,10 @@ export class HeadroomDaemon {
           try { expires = parseCreditExpiry(params.expires); }
           catch (error) { return reject(-32602, error instanceof Error ? error.message : "invalid expiry", principal); }
           this.store.recordManualCredits(principal, available, expires);
+          // Audited once, by the common `ok` audit after the switch (it
+          // already reads params.principal for the subject) -- a case-local
+          // audit here would double the row for this RPC only.
           result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
-          this.store.audit(caller, "credits_set", principal, "ok");
           break;
         }
         case "credits_clear": {
@@ -621,8 +623,8 @@ export class HeadroomDaemon {
           if (!principal) return reject(-32602, "principal is required");
           if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
           this.store.clearManualCredits(principal);
+          // See credits_set above: the common `ok` audit below covers this too.
           result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
-          this.store.audit(caller, "credits_clear", principal, "ok");
           break;
         }
         case "plan": {

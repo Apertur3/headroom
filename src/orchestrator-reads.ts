@@ -290,6 +290,16 @@ export interface GateOutcome extends GateOutcomeCore {
  * blocks the whole gate). `meter` also accepts an explicit list (a --class
  * resolved through routing.toml to several meters), checked the same way. */
 function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now: Date, options: GateOptions): GateOutcomeCore {
+  // No --meter/--class means the caller wants "every account's dispatch
+  // capacity", inferred by scanning every meter this store has ever seen --
+  // a count/credits meter picked up that way (an account that simply also
+  // carries a manual banked-reset balance) is never dispatch capacity, but
+  // it is not what the caller asked to check either, so it is skipped below
+  // rather than failing the whole global gate. An explicit target (a single
+  // --meter, or a --class resolved through routing.toml to a specific list)
+  // IS what the caller asked to check, so a count/credits meter named there
+  // still refuses, same as before.
+  const explicitTarget = meter !== undefined;
   const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
@@ -301,7 +311,10 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     const blocked = store.dispatchBlockForMeter(id, now) ?? store.dispatchBlockForPrincipal(id.split(":")[0]);
     if (blocked) return { allowed: false, reason: blocked, meters_checked: checked };
     const rawRows = store.latestPerWindow(id);
-    if (id.endsWith(":credits") || rawRows.some((row) => row.window?.kind === "count")) return { allowed: false, reason: `count meter ${id} cannot be used for dispatch`, meters_checked: checked };
+    if (id.endsWith(":credits") || rawRows.some((row) => row.window?.kind === "count")) {
+      if (!explicitTarget) continue;
+      return { allowed: false, reason: `count meter ${id} cannot be used for dispatch`, meters_checked: checked };
+    }
     const { short, long } = meterWindows(store, id);
     if (!short && !long) {
       // A meter with zero readings of ANY kind is treated the same as a

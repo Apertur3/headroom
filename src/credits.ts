@@ -47,6 +47,14 @@ export function usableCredits(observation: Pick<Observation, "quantity" | "reset
   return Math.max(0, observation.quantity?.unit === "credits" ? observation.quantity.remaining ?? 0 : 0);
 }
 
+/** True when year/month/day form a Gregorian calendar date that actually
+ * exists -- handles both leap years and each month's real length. */
+function isValidCalendarDate(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(month) || month < 1 || month > 12) return false;
+  if (!Number.isInteger(day) || day < 1) return false;
+  return day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
 /** Date-only values are UTC calendar dates at midnight. Keeping them in UTC
  * makes the stored instant, expiry boundary, and status day agree everywhere. */
 export function parseCreditExpiry(value: string): string {
@@ -55,7 +63,16 @@ export function parseCreditExpiry(value: string): string {
     const parsed = new Date(`${value}T00:00:00.000Z`);
     if (Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value) return parsed.toISOString();
   }
-  if (/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(value) && Number.isFinite(Date.parse(value))) return new Date(value).toISOString();
+  const instant = /^(\d{4})-(\d{2})-(\d{2})T.*(?:Z|[+-]\d{2}:\d{2})$/i.exec(value);
+  // Date.parse silently NORMALIZES an impossible calendar date (e.g.
+  // 2026-02-30T00:00:00Z becomes 2026-03-02T00:00:00.000Z) instead of
+  // rejecting it, which would silently extend a manual banked-reset expiry
+  // past what the operator actually typed. The calendar-date component is
+  // validated explicitly before trusting the parse, the same way the
+  // date-only branch above already does via its own round-trip check.
+  if (instant && isValidCalendarDate(Number(instant[1]), Number(instant[2]), Number(instant[3])) && Number.isFinite(Date.parse(value))) {
+    return new Date(value).toISOString();
+  }
   throw new Error("--expires must be YYYY-MM-DD or an ISO instant");
 }
 
