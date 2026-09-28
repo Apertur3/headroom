@@ -290,7 +290,7 @@ async function can(argv: string[]): Promise<number> {
       const readStore = await HeadroomStore.openReadOnly();
       try {
         const policy = await readPolicy();
-        const localAccounts = accounts.filter(isLocalAccount);
+        const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
         const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
         const allMeters = [...new Set([...meters, ...localMeters])];
         const now = new Date();
@@ -1590,7 +1590,7 @@ export async function observe(argv: string[]): Promise<number> {
       // Run this only after rendering below. Antigravity's catalog read can
       // make several bounded network calls; it must never delay this direct
       // quota result. Its own store is opened after this status store closes.
-      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
+      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && isAccountEnabled(account) && (!principal || account.name === principal));
       directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
@@ -1672,7 +1672,7 @@ export async function observe(argv: string[]): Promise<number> {
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
   }
-  if (directCatalogAccounts && directCatalogHome) {
+  if (directCatalogAccounts?.length && directCatalogHome) {
     await (async () => {
       const catalogStore = await HeadroomStore.open(directCatalogHome!);
       try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }

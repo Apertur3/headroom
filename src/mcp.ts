@@ -370,7 +370,9 @@ function directCanDecisionReadOnly(store: HeadroomStore, meters: string[], local
  * handleMcp), so a dispatch decision that can reserve capacity stays exactly
  * as fail-closed as it is today.
  */
-async function cacheCan(action: string, allowUnknown: boolean, owner: string | undefined, expectOverride: number | null): Promise<DirectResult> {
+/** Exported only for cache-fallback tests; production reaches this through
+ * `quota_can` after the daemon read-through reports an unresponsive socket. */
+export async function cacheCan(action: string, allowUnknown: boolean, owner: string | undefined, expectOverride: number | null): Promise<DirectResult> {
   if (!owner?.trim()) throw new Error("owner is required");
   const routing = await readRouting();
   if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
@@ -380,7 +382,13 @@ async function cacheCan(action: string, allowUnknown: boolean, owner: string | u
   try {
     const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
     if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
-    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+    if (disabledMeter) {
+      const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+      const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
+      return { source: "cache", daemon: "unresponsive", decision, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
+    }
+    const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
     const now = new Date();
     const decision = directCanDecisionReadOnly(store, meters, localMeters, routing.local_preference, policy, allowUnknown, owner, now);
     const learned = store.learnedCost(action)[0];
@@ -492,7 +500,11 @@ async function directRate(meter: unknown, minutes: unknown, owner: unknown, need
   } finally { store.close(); }
 }
 
-async function cacheRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+/** Exported only for cache-fallback tests; production reaches this through
+ * `quota_rate` after the daemon read-through reports an unresponsive socket. */
+export async function cacheRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  if (disabled) return { source: "cache", daemon: "unresponsive", lines: [{ meter, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }] };
   const store = await HeadroomStore.openReadOnly();
   try {
     const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Parked principals are now excluded at the model-catalog credential/cache boundary and by both daemon and direct-status callers, so a disabled account cannot read a vendor cache, credential, or model-list endpoint. Cached `can`/`quota_can` also exclude disabled local pools, and cached `quota_rate` returns the same disabled-meter UNKNOWN line as daemon and direct reads.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

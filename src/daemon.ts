@@ -908,7 +908,7 @@ export class HeadroomDaemon {
       // this poll's own interval, so piggybacking here adds no load to the
       // ordinary quota poll cadence. Deliberately not awaited, same reason
       // as the notification pass above.
-      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account)))
+      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && isAccountEnabled(account)))
         .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         if (disabled.has(principalId)) continue;

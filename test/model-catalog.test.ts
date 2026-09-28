@@ -161,8 +161,8 @@ describe("Antigravity model catalog reader (fetchAvailableModels, same credentia
 });
 
 describe("checkModelAvailability orchestration", () => {
-  function account(name: string, vendor: ProviderAccount["vendor"]): ProviderAccount {
-    return { name, vendor, location: `/tmp/${name}`, adapter: "native-ts" };
+  function account(name: string, vendor: ProviderAccount["vendor"], enabled = true): ProviderAccount {
+    return { name, vendor, ...(enabled ? {} : { enabled: false }), location: `/tmp/${name}`, adapter: "native-ts" };
   }
 
   it("checks every codex/claude/antigravity principal once, then skips all of them inside the hourly throttle", async () => {
@@ -202,6 +202,26 @@ describe("checkModelAvailability orchestration", () => {
       expect(readCodex).not.toHaveBeenCalled();
       expect(readClaude).not.toHaveBeenCalled();
       expect(store.knownModels()).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("never invokes cache readers or the Antigravity fetcher for a disabled principal", async () => {
+    const home = await tempDir("headroom-model-check-disabled-");
+    const store = await HeadroomStore.open(join(home, ".headroom"));
+    try {
+      const readCodex = vi.fn().mockResolvedValue([]);
+      const readClaude = vi.fn().mockResolvedValue([]);
+      const fetchAntigravity = vi.fn().mockResolvedValue([]);
+      await checkModelAvailability(store, [
+        account("codex-parked", "codex", false), account("claude-parked", "claude", false), account("antigravity-parked", "antigravity", false),
+        account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
+      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
+      expect(readCodex).toHaveBeenCalledTimes(1);
+      expect(readClaude).toHaveBeenCalledTimes(1);
+      expect(fetchAntigravity).toHaveBeenCalledTimes(1);
+      expect(store.knownModels("codex-parked")).toEqual([]);
+      expect(store.knownModels("claude-parked")).toEqual([]);
+      expect(store.knownModels("antigravity-parked")).toEqual([]);
     } finally { store.close(); }
   });
 
