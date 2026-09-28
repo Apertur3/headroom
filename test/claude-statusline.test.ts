@@ -141,6 +141,18 @@ describe("latestStatuslineSnapshot / freshStatuslineSnapshot", () => {
     expect(noneForClaude2).toBeUndefined();
   });
 
+  it("does not open a parked profile's file while finding an enabled profile snapshot", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-disabled-file-")); temporary.push(dir);
+    const now = new Date();
+    await writeFile(join(dir, "default.json"), JSON.stringify({ profile: "default", observed_at: Math.floor(now.getTime() / 1000) - 1, five_hour: { used_percent: 1, resets_at: null }, seven_day: null, extra: {} }));
+    // If discovery opened this parked filename before resolving the enabled
+    // allowlist, its forged profile identity would outrank the live file.
+    await writeFile(join(dir, ".claude2.json"), JSON.stringify({ profile: "default", observed_at: Math.floor(now.getTime() / 1000), five_hour: { used_percent: 99, resets_at: null }, seven_day: null, extra: {} }));
+    const parked: ProviderAccount = { ...claude2, enabled: false };
+    const snapshot = await latestStatuslineSnapshot([dir], claudeMain, [claudeMain, parked], now);
+    expect(snapshot?.five_hour?.used_percent).toBe(1);
+  });
+
   it("matches the external collector shape's alias 'main' to the default profile with zero configuration", async () => {
     const dir = await mkdtemp(join(tmpdir(), "headroom-statusline-fc-")); temporary.push(dir);
     await writeFile(join(dir, "main.json"), JSON.stringify({ alias: "main", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_pct: 44, resets_at: 0 }, seven_day: { used_pct: 56, resets_at: 0 } }));

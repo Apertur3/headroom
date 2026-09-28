@@ -407,7 +407,7 @@ describe("MCP JSON-RPC", () => {
         expect(params).toMatchObject({ action_class: "review", owner: "sdk", expected_percent: 7 });
         return { decision: { allowed: true, meter: "codex-main:main", state: "NORMAL", reason: "fits", meters: [] }, leases: [{ id: "atomic-lease", meter_id: "codex-main:main" }] };
       });
-      expect(response).toMatchObject({ result: { structuredContent: { allowed: true, leased_id: "atomic-lease" } } });
+      expect(response).toMatchObject({ result: { structuredContent: { decision: { allowed: true }, leased_id: "atomic-lease" } } });
     });
   });
 

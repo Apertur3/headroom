@@ -152,8 +152,12 @@ export interface RateLine {
  * carries that owner's ledger-attributed share of the same lookback, so
  * "the meter is burning 22%/h" and "9%/h of that is mine" are read together
  * rather than from two separate commands. */
-export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date(), owner?: string, needWindow?: string): RateLine[] {
-  const meterIds = meter ? [meter] : [...new Set(store.latestPerWindow().map((row) => row.meter_id))];
+export function rateLines(store: HeadroomStore, meter: string | undefined, lookbackMinutes: number, now = new Date(), owner?: string, needWindow?: string, options: { enabledPrincipalIds?: ReadonlySet<string> } = {}): RateLine[] {
+  const meterIds = meter
+    ? [meter]
+    : [...new Set(store.latestPerWindow()
+      .filter((row) => !options.enabledPrincipalIds || options.enabledPrincipalIds.has(row.principal_id))
+      .map((row) => row.meter_id))];
   const sinceIso = new Date(now.getTime() - lookbackMinutes * 60_000).toISOString();
   const lines: RateLine[] = [];
   for (const id of meterIds) {
@@ -336,6 +340,10 @@ export interface GateOptions {
   /** policy.toml's own mtime -- the fallback attribution for a reserve
    * refusal that names no reason/set_at of its own. */
   policyMtime?: string | null;
+  /** When no meter is named, current dispatch capacity is restricted to
+   * these enabled registry principals. Explicit targets keep their own
+   * disabled-principal refusal at the serving boundary. */
+  enabledPrincipalIds?: ReadonlySet<string>;
 }
 
 interface GateOutcomeCore extends GateResult {
@@ -368,7 +376,11 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   // IS what the caller asked to check, so a count/credits meter named there
   // still refuses, same as before.
   const explicitTarget = meter !== undefined;
-  const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
+  const candidates = meter === undefined
+    ? [...new Set(store.latestPerWindow()
+      .filter((row) => !options.enabledPrincipalIds || options.enabledPrincipalIds.has(row.principal_id))
+      .map((row) => row.meter_id))]
+    : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
   const allowance = options.allowance ?? "pro_rata";
