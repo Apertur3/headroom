@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,11 +16,14 @@ import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.
  * took before entering it.
  */
 const gate = vi.hoisted(() => {
-  let release: (() => void) | undefined;
+  let waiters: Array<() => void> = [];
   return {
     armed: false,
-    hold(): Promise<void> { return new Promise<void>((resolve) => { release = resolve; }); },
-    release(): void { release?.(); release = undefined; },
+    // Sticky: hold every executablePath() call while armed (the daemon's own
+    // poll path and a test-driven attempt alike), not just the first one.
+    sticky: false,
+    hold(): Promise<void> { return new Promise<void>((resolve) => { waiters.push(resolve); }); },
+    release(): void { const pending = waiters; waiters = []; this.armed = false; this.sticky = false; for (const resolve of pending) resolve(); },
   };
 });
 vi.mock("../src/paths.js", async (importOriginal) => {
@@ -28,7 +31,7 @@ vi.mock("../src/paths.js", async (importOriginal) => {
   return {
     ...actual,
     executablePath: async (path: string, options?: { repoRoot?: string; development?: boolean }) => {
-      if (gate.armed) { gate.armed = false; await gate.hold(); }
+      if (gate.armed) { if (!gate.sticky) gate.armed = false; await gate.hold(); }
       return actual.executablePath(path, options);
     },
   };
@@ -126,8 +129,12 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-deferredpath-")); temporary.push(root);
     const firstInfoFile = join(root, "agy-first-pid.txt");
     const secondInfoFile = join(root, "agy-second-pid.txt");
-    const firstAgy = await writeFakeAgy(root, firstInfoFile);
-    const secondAgy = await writeFakeAgy(root, secondInfoFile);
+    // Two distinct executables (writeFakeAgy always names its file "agy").
+    await mkdir(join(root, "first"), { recursive: true, mode: 0o700 });
+    await mkdir(join(root, "second"), { recursive: true, mode: 0o700 });
+    const firstAgy = await writeFakeAgy(join(root, "first"), firstInfoFile);
+    const secondAgy = await writeFakeAgy(join(root, "second"), secondInfoFile);
+    expect(firstAgy).not.toBe(secondAgy);
     await writeFile(join(root, "accounts.toml"), accountsToml(false, firstAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
@@ -143,10 +150,13 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
         currentAccounts(): Promise<unknown[]>;
         maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
       };
+      // Arm the gate before enabling the account: enabling it schedules the
+      // daemon's own poll, whose keepalive attempt must go through the same
+      // gated executable lookup as this test's direct attempt.
+      gate.armed = true;
+      gate.sticky = true;
       await writeFile(join(root, "accounts.toml"), accountsToml(true, firstAgy), { mode: 0o600 });
       const enabledAccounts = await internal.currentAccounts();
-
-      gate.armed = true;
       const attempt = internal.maybeStartKeepalive(enabledAccounts, {});
       await new Promise((resolve) => setTimeout(resolve, 150));
 
@@ -155,6 +165,8 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       await writeFile(join(root, "accounts.toml"), accountsToml(true, secondAgy), { mode: 0o600 });
       gate.release();
       await attempt;
+      // Let any background (poll-path) attempt that was held at the gate settle too.
+      await new Promise((resolve) => setTimeout(resolve, 300));
 
       await trackPidIfWritten(firstInfoFile, root);
       await trackPidIfWritten(secondInfoFile, root);
