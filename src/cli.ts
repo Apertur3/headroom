@@ -33,6 +33,7 @@ import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
+import { parseTimerAt } from "./heartbeat.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
@@ -44,7 +45,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
-import { isLocalAccount, type Account, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -343,6 +344,137 @@ async function lease(argv: string[]): Promise<number> {
     directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); if (asJson) { console.log(JSON.stringify(withContract({ leases: items }))); return 0; } printLeases(items); return 0; } finally { store.close(); }
   }
   throw new Error("Usage: headroom lease <start|end|list> [--json]");
+}
+
+const HEARTBEAT_HELP = "Usage: headroom heartbeat --owner <name> --every <duration> [--resume \"<sentence>\"] | headroom heartbeat --owner <name> --stop | headroom heartbeat list [--json]";
+
+function printHeartbeats(items: Heartbeat[]): void {
+  if (!items.length) { console.log("no registered heartbeats"); return; }
+  for (const item of items) console.log(`${item.owner}  every ${item.interval_ms}ms  last beat ${item.last_beat_at}${item.lapsed_since ? `  LAPSED since ${item.lapsed_since}` : ""}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
+}
+
+/**
+ * `headroom heartbeat`: an orchestrator's promise to beat at least every
+ * `--every`, recorded in the daemon's own store -- the one process that
+ * survives a crashed session (see .claude/INCIDENT-2026-09-27-pty-leak.md).
+ * The daemon's own poll loop is what notices a lapse; this command only
+ * ever records/refreshes/stops the promise or lists it.
+ */
+async function heartbeat(argv: string[]): Promise<number> {
+  if (argv[0] === "list") {
+    const asJson = argv.includes("--json");
+    const request = await requestDaemon("heartbeats");
+    if (request !== undefined) {
+      const items = unwrapRpc(request) as Heartbeat[];
+      if (asJson) { console.log(JSON.stringify(withContract({ heartbeats: items }))); return 0; }
+      printHeartbeats(items);
+      return 0;
+    }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try {
+      const items = store.heartbeats();
+      store.audit("cli", "heartbeats", null, "ok");
+      if (asJson) { console.log(JSON.stringify(withContract({ heartbeats: items }))); return 0; }
+      printHeartbeats(items);
+      return 0;
+    } finally { store.close(); }
+  }
+  const owner = option(argv, "--owner");
+  if (!owner) throw new Error(HEARTBEAT_HELP);
+  if (argv.includes("--stop")) {
+    const params = { owner };
+    const request = await requestDaemon("heartbeat_stop", params);
+    if (request !== undefined) { const result = unwrapRpc(request) as { stopped: boolean }; console.log(result.stopped ? `stopped ${owner}` : `no heartbeat registered for ${owner}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const stopped = store.heartbeatStop(owner); store.audit("cli", "heartbeat_stop", owner, "ok"); console.log(stopped ? `stopped ${owner}` : `no heartbeat registered for ${owner}`); return 0; } finally { store.close(); }
+  }
+  const every = option(argv, "--every");
+  if (!every) throw new Error(HEARTBEAT_HELP);
+  const intervalMs = ttl(every, "--every");
+  // undefined (the flag was not passed at all) keeps whatever resume
+  // sentence a prior beat registered; store.heartbeatBeat treats an
+  // explicit --resume "" the same as any other non-empty string (a plain
+  // re-beat need not repeat one every time).
+  const resumeSentence = option(argv, "--resume");
+  const params = { owner, interval_ms: intervalMs, resume_sentence: resumeSentence };
+  const request = await requestDaemon("heartbeat_beat", params);
+  if (request !== undefined) { const item = unwrapRpc(request) as Heartbeat; console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; }
+  directReadNotice();
+  const store = await HeadroomStore.open();
+  try { const item = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); store.audit("cli", "heartbeat_beat", owner, "ok"); console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; } finally { store.close(); }
+}
+
+const TIMER_HELP = [
+  "Usage: headroom timer <set|list|clear>",
+  "  set:   headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action \"<text>\" [--if-missed notify|drop]",
+  "  list:  headroom timer list [--owner <name>] [--json]",
+  "  clear: headroom timer clear --owner <name> --name <id>",
+].join("\n");
+
+function printTimers(items: Timer[]): void {
+  if (!items.length) { console.log("no pending timers"); return; }
+  for (const item of items) console.log(`${item.owner}/${item.name}  at ${item.at}  if-missed ${item.if_missed}  ${item.action}`);
+}
+
+/**
+ * `headroom timer`: a named wake-up the daemon fires (as one inbox entry to
+ * its owner, never executed -- see src/heartbeat.ts's fireDueTimers) once
+ * `--at` is due. `list` shows only pending timers (never fired, never
+ * cleared); a fired or cleared one stays in the store for history but drops
+ * out of this view, same as leases()'s activeOnly default.
+ */
+async function timer(argv: string[]): Promise<number> {
+  if (argv[0] === "set") {
+    const owner = option(argv, "--owner");
+    const name = option(argv, "--name");
+    const atRaw = option(argv, "--at");
+    const action = option(argv, "--action");
+    const ifMissedRaw = option(argv, "--if-missed");
+    if (!owner || !name || !atRaw || !action) throw new Error(TIMER_HELP);
+    if (ifMissedRaw !== undefined && ifMissedRaw !== "notify" && ifMissedRaw !== "drop") throw new Error("--if-missed must be notify or drop");
+    const ifMissed = ifMissedRaw === "drop" ? "drop" : "notify";
+    const at = parseTimerAt(atRaw);
+    const params = { owner, name, at, action, if_missed: ifMissed };
+    const request = await requestDaemon("timer_set", params);
+    if (request !== undefined) { const item = unwrapRpc(request) as Timer; console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const item = store.setTimer(owner, name, at, action, ifMissed, new Date()); store.audit("cli", "timer_set", `${owner}:${name}`, "ok"); console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "clear") {
+    const owner = option(argv, "--owner");
+    const name = option(argv, "--name");
+    if (!owner || !name) throw new Error(TIMER_HELP);
+    const params = { owner, name };
+    const request = await requestDaemon("timer_clear", params);
+    if (request !== undefined) { const result = unwrapRpc(request) as { cleared: boolean }; console.log(result.cleared ? `cleared ${owner}/${name}` : `no timer ${owner}/${name}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const cleared = store.clearTimer(owner, name); store.audit("cli", "timer_clear", `${owner}:${name}`, "ok"); console.log(cleared ? `cleared ${owner}/${name}` : `no timer ${owner}/${name}`); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "list") {
+    const owner = option(argv, "--owner");
+    const asJson = argv.includes("--json");
+    const request = await requestDaemon("timer_list", { owner });
+    if (request !== undefined) {
+      const items = unwrapRpc(request) as Timer[];
+      if (asJson) { console.log(JSON.stringify(withContract({ timers: items }))); return 0; }
+      printTimers(items);
+      return 0;
+    }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try {
+      const items = store.timers(owner);
+      store.audit("cli", "timer_list", owner ?? null, "ok");
+      if (asJson) { console.log(JSON.stringify(withContract({ timers: items }))); return 0; }
+      printTimers(items);
+      return 0;
+    } finally { store.close(); }
+  }
+  throw new Error(TIMER_HELP);
 }
 
 async function cost(argv: string[]): Promise<number> {
@@ -1052,13 +1184,50 @@ export async function observe(argv: string[]): Promise<number> {
   if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const lapsed = withCreditsLapsed(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  // Additive surfaces (see .claude/lanes/specs/heartbeat.md item 4): every
+  // registered heartbeat lease, and every pending timer already at or past
+  // its own `at` -- a daemon-side notion ("due"), recomputed here
+  // client-side from the same `timer_list` a no-daemon fallback would read.
+  let heartbeats: Heartbeat[];
+  let dueTimers: Timer[];
+  if (direct) {
+    const store = await HeadroomStore.open();
+    try { heartbeats = store.heartbeats(); dueTimers = store.timers().filter((item) => Date.parse(item.at) <= Date.now()); }
+    finally { store.close(); }
+  } else {
+    // An older daemon (or, in tests, a mocked one) may not answer these two
+    // methods with an array at all -- treated the same as "none", never a
+    // crash, matching how `leases`/`plan_downgrades` are read just above.
+    const heartbeatsRequest = await requestDaemon("heartbeats");
+    const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapRpc(heartbeatsRequest);
+    heartbeats = Array.isArray(unwrappedHeartbeats) ? unwrappedHeartbeats as Heartbeat[] : [];
+    const timersRequest = await requestDaemon("timer_list");
+    const unwrappedTimers = timersRequest === undefined ? [] : unwrapRpc(timersRequest);
+    const pendingTimers = Array.isArray(unwrappedTimers) ? unwrappedTimers as Timer[] : [];
+    dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
+  }
+  if (argv.includes("--json")) {
+    const lapsed = withCreditsLapsed(observations);
+    console.log(JSON.stringify(withContract(thresholdRows === undefined
+      ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers }
+      : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } })));
+  }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
     const vendors = new Map((await readAccounts().catch(() => [])).map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
     for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
+    // The dense/agent form is what a script or an orchestrator shell reads
+    // (see status-view.ts's own doc comment); a lapsed heartbeat or a due
+    // timer is squarely that reader's business, so it gets one line each
+    // here, same shape as printHeartbeats/printTimers above. The grouped
+    // human view stays unchanged -- adding a full section to renderStatus's
+    // own layout is a larger, separate change.
+    if (view.form !== "grouped") {
+      for (const item of heartbeats.filter((entry) => entry.lapsed_since)) console.log(`heartbeat ${item.owner} LAPSED since ${item.lapsed_since}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
+      for (const item of dueTimers) console.log(`timer ${item.owner}/${item.name} due ${item.at}  ${item.action}`);
+    }
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
@@ -1429,6 +1598,8 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["models", "List every model id seen in a vendor's own model catalog, with first_seen (and retired_at once a vendor drops one)"],
   ["history <meter>", "List stored observations for one meter"],
   ["lease start|list|end", "Reserve, list, or release a meter lease"],
+  ["heartbeat", "Record or refresh an orchestrator's heartbeat lease with the daemon (or --stop it, or list every registered one)"],
+  ["timer set|list|clear", "Register, list, or clear a named daemon-held wake-up, delivered as one inbox entry when due"],
   ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
   ["rate", "Burn in percent per hour over a recent window, and ETA to the limit"],
   ["spend", "Per-owner attributed spend on a shared meter, from the spend ledger"],
@@ -1478,6 +1649,8 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "  end:   headroom lease end <id> --owner <name> [--force]",
     "  list:  headroom lease list [--json]",
   ].join("\n"),
+  heartbeat: HEARTBEAT_HELP,
+  timer: TIMER_HELP,
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--window 10m] [--json]",
   spend: SPEND_HELP,
@@ -1632,6 +1805,8 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "events") return events(argv.slice(1));
   if (argv[0] === "models") return models(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));
+  if (argv[0] === "heartbeat") return heartbeat(argv.slice(1));
+  if (argv[0] === "timer") return timer(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
   if (argv[0] === "cost") return cost(argv.slice(1));
   if (argv[0] === "rate") return rate(argv.slice(1));

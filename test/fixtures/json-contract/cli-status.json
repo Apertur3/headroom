@@ -1,6 +1,29 @@
 {
   "contract": "string",
+  "due_timers": [
+    {
+      "action": "string",
+      "at": "string",
+      "cleared_at": "null",
+      "created_at": "string",
+      "fired_at": "null",
+      "if_missed": "string",
+      "name": "string",
+      "owner": "string"
+    }
+  ],
   "generated_at": "string",
+  "heartbeats": [
+    {
+      "interval_ms": "number",
+      "lapsed_since": "string",
+      "last_beat_at": "string",
+      "owner": "string",
+      "resume_sentence": "string",
+      "started_at": "string",
+      "updated_at": "string"
+    }
+  ],
   "leases": [
     "unknown (empty array in the fixture data)"
   ],

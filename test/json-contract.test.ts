@@ -164,6 +164,11 @@ describe("CLI --json field shapes", () => {
       const now = new Date();
       store.insert(fiveHour(30, 0, 4 * 3_600_000, now));
       store.insert(weekly(40, now));
+      // One lapsed heartbeat and one due timer, so the fixture captures their
+      // real object shape rather than an "empty array" placeholder.
+      store.heartbeatBeat("cadence", 60_000, "resume: rerun the deploy", new Date(now.getTime() - 3 * 60_000));
+      store.checkHeartbeatLapses(now);
+      store.setTimer("cadence", "check-pr", now.toISOString(), "check PR CI status", "notify", new Date(now.getTime() - 60_000));
     } finally { store.close(); }
     const { logs, restore } = captureLog();
     try { await withHeadroomHome(home, () => main(["--json"])); } finally { restore(); }
@@ -314,6 +319,30 @@ describe("CLI --json field shapes", () => {
     await compareToFixture("cli-lease-list", JSON.parse(logs[1]));
   });
 
+  it("heartbeat list", async () => {
+    const home = await newHome("heartbeat-list");
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["heartbeat", "--owner", "cadence", "--every", "5m", "--resume", "rerun the deploy"]);
+        await main(["heartbeat", "list", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-heartbeat-list", JSON.parse(logs[1]));
+  });
+
+  it("timer list", async () => {
+    const home = await newHome("timer-list");
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["timer", "set", "--owner", "cadence", "--name", "check-pr", "--at", "+30m", "--action", "check PR CI status"]);
+        await main(["timer", "list", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-timer-list", JSON.parse(logs[1]));
+  });
+
   it("cost (bare array, no envelope -- see docs/json-contract.md)", async () => {
     const home = await newHome("cost");
     await seedBasic(home);
@@ -441,6 +470,12 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
     await withHeadroomHome(home, () => call("quota_lease_start", { meter_id: "claude-main:all", owner: "cadence", expected_percent: 5 }));
     const result = await withHeadroomHome(home, () => call("quota_leases", {}));
     await compareToFixture("mcp-quota_leases", result);
+  });
+
+  it("quota_heartbeat", async () => {
+    const home = await newHome("mcp-heartbeat");
+    const result = await withHeadroomHome(home, () => call("quota_heartbeat", { owner: "cadence", interval_ms: 300_000, resume_sentence: "rerun the deploy" }));
+    await compareToFixture("mcp-quota_heartbeat", result);
   });
 
   it("quota_cost", async () => {

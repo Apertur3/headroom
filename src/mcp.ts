@@ -42,6 +42,7 @@ const tools: ToolDefinition[] = [
   { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, need: { type: "string" } }, required: ["meter"] } },
   { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
+  { name: "quota_heartbeat", description: "Record or refresh this orchestrator's heartbeat lease with the daemon -- the one process that survives a crashed session -- so a lapse past 2x interval_ms is noticed and, once configured, notified. owner defaults to this MCP session's client name and session id, same as quota_lease_start. resume_sentence is what a human or a fresh session should do to pick this session's work back up; omit it on a plain re-beat to keep whatever was registered before. Pass stop: true to deregister instead of beating (interval_ms and resume_sentence are ignored then).", inputSchema: { type: "object", properties: { owner: { type: "string" }, interval_ms: { type: "number", exclusiveMinimum: 0 }, resume_sentence: { type: "string" }, stop: { type: "boolean" } } } },
 ];
 
 /**
@@ -323,6 +324,30 @@ async function directLeaseEnd(arguments_: Record<string, unknown>): Promise<Dire
   finally { store.close(); }
 }
 
+/**
+ * `quota_heartbeat`: the MCP twin of `headroom heartbeat`. `stop: true`
+ * deregisters instead of beating; interval_ms and resume_sentence are then
+ * ignored, matching the CLI's own `--stop` (which also takes no `--every`).
+ */
+async function directHeartbeat(arguments_: Record<string, unknown>): Promise<DirectResult> {
+  const owner = String(arguments_.owner ?? "");
+  if (!owner.trim()) throw new Error("owner is required");
+  const store = await HeadroomStore.open();
+  try {
+    if (arguments_.stop === true) {
+      const stopped = store.heartbeatStop(owner);
+      store.audit("mcp", "heartbeat_stop", owner, "ok");
+      return { source: "direct", stopped };
+    }
+    const intervalMs = typeof arguments_.interval_ms === "number" ? arguments_.interval_ms : Number.NaN;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("interval_ms must be positive");
+    const resumeSentence = arguments_.resume_sentence === null ? null : typeof arguments_.resume_sentence === "string" ? arguments_.resume_sentence : undefined;
+    const heartbeat = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date());
+    store.audit("mcp", "heartbeat_beat", owner, "ok");
+    return { source: "direct", heartbeat };
+  } finally { store.close(); }
+}
+
 async function directLeases(): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try { return { source: "direct", leases: store.leases(undefined, true) }; } finally { store.close(); }
@@ -473,6 +498,7 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "status") return directStatus();
   if (method === "can") return directCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true, typeof arguments_.owner === "string" ? arguments_.owner : undefined, typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true);
   if (method === "lease_start") return directLeaseStart(arguments_);
+  if (method === "heartbeat") return directHeartbeat(arguments_);
   if (method === "lease_end") return directLeaseEnd(arguments_);
   if (method === "leases") return directLeases();
   if (method === "cost") return directCost(arguments_.action_class);
@@ -555,7 +581,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
     quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
-    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox",
+    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox", quota_heartbeat: "heartbeat",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
@@ -569,7 +595,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     const reason = typeof rawArguments.reason === "string" ? rawArguments.reason.trim() : "";
     if (rawArguments.confirm_force !== true || !reason) return failure(request.id, -32602, "force requires confirm_force: true and a non-empty reason string, both of which are audited");
   }
-  const arguments_ = method === "lease_start" ? { ...rawArguments, owner: deriveLeaseOwner(rawArguments.owner) } : rawArguments;
+  const arguments_ = method === "lease_start" || method === "heartbeat" ? { ...rawArguments, owner: deriveLeaseOwner(rawArguments.owner) } : rawArguments;
   // Every tool handler is wrapped: a thrown error (invalid owner, unknown
   // action class, a daemon socket error, ...) must become a JSON-RPC error
   // response, never an uncaught rejection out of this stdio loop.
@@ -591,8 +617,10 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, need: arguments_.need }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }
+      : method === "heartbeat" ? (arguments_.stop === true ? { owner: arguments_.owner } : { owner: arguments_.owner, interval_ms: arguments_.interval_ms, resume_sentence: arguments_.resume_sentence })
       : {};
-    const daemonMethod = atomicCanLease && requestedCost?.expected_percent !== null
+    const daemonMethod = method === "heartbeat" ? (arguments_.stop === true ? "heartbeat_stop" : "heartbeat_beat")
+      : atomicCanLease && requestedCost?.expected_percent !== null
       ? "can_lease"
       : method;
     if (daemonMethod === "can_lease") Object.assign(params_, { expected_percent: requestedCost!.expected_percent });
@@ -606,7 +634,14 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // of whether the decision came from the daemon (a raw CanDecision) or
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
-    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
+    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost)
+      // A daemon-sourced heartbeat reply is the bare Heartbeat/{stopped}
+      // object the "heartbeat_beat"/"heartbeat_stop" RPC returns; the direct
+      // fallback (directHeartbeat, above) already returns the named,
+      // source-tagged shape below, so only the daemon path needs wrapping
+      // here.
+      : method === "heartbeat" && result !== undefined ? { source: "daemon", ...(daemonMethod === "heartbeat_stop" ? { stopped: (resolved as { stopped: boolean }).stopped } : { heartbeat: resolved }) }
+      : normalizeDaemonResult(method, resolved, arguments_);
     if (method === "status" && Array.isArray(finalResult)) {
       const policy = await readPolicy();
       const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);

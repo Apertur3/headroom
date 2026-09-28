@@ -149,9 +149,56 @@ const ADD_KNOWN_MODELS: Migration = {
   },
 };
 
+/**
+ * `heartbeats` and `timers` back the orchestrator heartbeat / named wake-up
+ * feature (issue: the P0 on 2026-09-27 -- see .claude/INCIDENT-2026-09-27-pty-leak.md
+ * -- where a crashed orchestrator session took every in-session timer and
+ * watcher with it, and nothing noticed for 45 minutes). Both live in the
+ * daemon-owned store, the one process that survives a session crash.
+ *
+ * `heartbeats` is one row per owner (an orchestrator identity, the same
+ * namespace as a lease owner or an inbox session): `interval_ms` is what the
+ * owner promised to beat at, `last_beat_at` the most recent beat,
+ * `resume_sentence` an optional human-readable note of what a fresh session
+ * should do to pick the work back up, and `lapsed_since` non-null exactly
+ * while the daemon currently considers this heartbeat overdue (more than 2x
+ * its own interval) -- set once when a poll first detects the lapse, cleared
+ * the moment a later beat arrives, which is what lets the daemon tell "still
+ * the same open lapse" from "a fresh one" and know when to emit
+ * `heartbeat_restored`.
+ *
+ * `timers` is one named wake-up per (owner, name): `at` is when it is due,
+ * `action` the text Headroom only ever delivers, never executes, and
+ * `if_missed` ("notify" or "drop") controls whether a due timer whose
+ * owner's heartbeat is currently lapsed also raises a `timer_missed` event
+ * (in addition to the inbox entry every due timer always gets). `fired_at`
+ * is set once delivered so a later poll never delivers it twice;
+ * `cleared_at` is set by `headroom timer clear` and, like `fired_at`, only
+ * ever hides a row from the "pending" views -- neither is a delete, so the
+ * history stays inspectable.
+ */
+const ADD_HEARTBEATS_AND_TIMERS: Migration = {
+  version: 4,
+  description: "heartbeats and timers tables for orchestrator heartbeat leases and named wake-ups",
+  up(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS heartbeats (
+        owner TEXT PRIMARY KEY, interval_ms INTEGER NOT NULL, resume_sentence TEXT,
+        started_at TEXT NOT NULL, last_beat_at TEXT NOT NULL, lapsed_since TEXT, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS timers (
+        owner TEXT NOT NULL, name TEXT NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL,
+        if_missed TEXT NOT NULL DEFAULT 'notify', created_at TEXT NOT NULL, fired_at TEXT, cleared_at TEXT,
+        PRIMARY KEY (owner, name)
+      );
+      CREATE INDEX IF NOT EXISTS timers_due ON timers(at, fired_at, cleared_at);
+    `);
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

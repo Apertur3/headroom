@@ -26,7 +26,7 @@ const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
 const EVENT_KINDS: readonly EventKind[] = [
   "reset_seen", "free_reset_granted", "free_reset_used", "credits_changed", "plan_changed", "exhausted_reported", "exhausted_cleared", "window_retired",
   "source_failed", "source_recovered", "lease_started", "lease_ended", "pace_projection_conserve", "model_new", "grant_lapsed", "vendor_inconsistent",
-  "model_available", "model_retired",
+  "model_available", "model_retired", "heartbeat_lapsed", "heartbeat_restored", "timer_missed",
 ];
 /** `threshold` is not a stored event kind: it is synthesized here from the
  * latest reading of every hard window, once per window instance. */
@@ -41,8 +41,8 @@ export const PRESET_EVENTS: Record<NotifyPreset, readonly string[]> = {
   // unlike the rest of the rarer/lower-signal events below it in
   // EVENT_KINDS (model_retired, grant_lapsed, lease_started/ended, ...),
   // which stay "everything"-only.
-  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold", "model_available"],
-  quiet: ["reset_unscheduled", "source_failed", "threshold", "model_available"],
+  calm: ["reset_unscheduled", "reset_scheduled_weekly", "free_reset_granted", "source_failed", "source_recovered", "vendor_inconsistent", "threshold", "model_available", "heartbeat_lapsed", "heartbeat_restored", "timer_missed"],
+  quiet: ["reset_unscheduled", "source_failed", "threshold", "model_available", "heartbeat_lapsed", "timer_missed"],
   everything: [...EVENT_KINDS.filter((kind) => kind !== "reset_seen"), ...RESET_EVENT_NAMES, "threshold"],
 };
 export const DEFAULT_NOTIFY_EVENTS = PRESET_EVENTS.calm;

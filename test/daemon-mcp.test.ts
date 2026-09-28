@@ -890,3 +890,40 @@ describe("plan/gate/fill round-trip through a real daemon socket for a meter who
     }
   });
 });
+
+describe("heartbeat and timer RPCs", () => {
+  it("round-trips heartbeat_beat, heartbeats, timer_set, timer_list, timer_clear and heartbeat_stop over the real socket", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-heartbeat-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "heartbeat"), poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      const beat = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "heartbeat_beat", params: { owner: "cadence", interval_ms: 300_000, resume_sentence: "resume: rerun the deploy" } }));
+      expect(beat.result).toMatchObject({ owner: "cadence", interval_ms: 300_000, resume_sentence: "resume: rerun the deploy", lapsed_since: null });
+
+      const missingOwner = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 2, method: "heartbeat_beat", params: { interval_ms: 1000 } }));
+      expect(missingOwner.error).toMatchObject({ code: -32602 });
+
+      const list = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 3, method: "heartbeats" }));
+      expect(list.result).toEqual([expect.objectContaining({ owner: "cadence" })]);
+
+      const timerAt = new Date(Date.now() + 60_000).toISOString();
+      const timerSet = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 4, method: "timer_set", params: { owner: "cadence", name: "check-pr", at: timerAt, action: "check PR CI status" } }));
+      expect(timerSet.result).toMatchObject({ owner: "cadence", name: "check-pr", at: timerAt, action: "check PR CI status", if_missed: "notify", fired_at: null, cleared_at: null });
+
+      const invalidAt = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 5, method: "timer_set", params: { owner: "cadence", name: "bad", at: "not-a-date", action: "x" } }));
+      expect(invalidAt.error).toMatchObject({ code: -32602 });
+
+      const timerList = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 6, method: "timer_list", params: { owner: "cadence" } }));
+      expect(timerList.result).toEqual([expect.objectContaining({ name: "check-pr" })]);
+
+      const cleared = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 7, method: "timer_clear", params: { owner: "cadence", name: "check-pr" } }));
+      expect(cleared.result).toEqual({ cleared: true });
+      const listAfterClear = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 8, method: "timer_list", params: { owner: "cadence" } }));
+      expect(listAfterClear.result).toEqual([]);
+
+      const stopped = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 9, method: "heartbeat_stop", params: { owner: "cadence" } }));
+      expect(stopped.result).toEqual({ stopped: true });
+      const listAfterStop = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 10, method: "heartbeats" }));
+      expect(listAfterStop.result).toEqual([]);
+    } finally { await daemon.stop(); }
+  });
+});

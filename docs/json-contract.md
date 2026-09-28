@@ -112,7 +112,11 @@ below.
 ### `status` (`headroom --json` / `--threshold N --json`, MCP `quota_status`)
 
 CLI: `{ contract, generated_at, observations: Observation[], leases: Lease[],
-plan_downgraded: { principal, from, to, since, acknowledged } | null, threshold?: {...} }`.
+plan_downgraded: { principal, from, to, since, acknowledged } | null,
+heartbeats: Heartbeat[], due_timers: Timer[], threshold?: {...} }`.
+`heartbeats` is every registered orchestrator heartbeat (see `heartbeat list`
+below); `due_timers` is every pending `Timer` (see `timer list` below) already
+at or past its own `at`.
 `threshold` is present only with `--threshold N`:
 `{ percent: number, windows: ThresholdWindow[], any_crossed: boolean,
 any_blocking: boolean }`, where each `ThresholdWindow` is `{ meter_id: string,
@@ -363,6 +367,33 @@ generated_at, source?: "direct", leases: Lease[] }`. `source` is present on
 `quota_leases` only over the direct fallback; **over a daemon it answers with
 the same bare `Lease[]` array the daemon's `leases` RPC method returns**, not
 enveloped -- see "CLI vs MCP: daemon vs direct" below.
+
+### `heartbeat list` (`headroom heartbeat list --json`, MCP `quota_heartbeat`)
+
+`{ contract, generated_at, heartbeats: Heartbeat[] }`. `Heartbeat` is `{
+owner: string, interval_ms: number, resume_sentence: string | null,
+started_at: string, last_beat_at: string, lapsed_since: string | null,
+updated_at: string }`. `lapsed_since` is non-null exactly while the daemon
+currently considers this heartbeat overdue by more than 2x its own interval.
+
+`headroom heartbeat --owner X --every D [--resume S]` and `--stop` have no
+`--json` output of their own (a plain confirmation line); `heartbeat list
+--json` always exits `0`.
+
+MCP `quota_heartbeat` returns `{ contract, generated_at, source: "direct" |
+"daemon", heartbeat: Heartbeat }` on a beat, or `{ contract, generated_at,
+source, stopped: boolean }` with `stop: true`.
+
+### `timer list` (`headroom timer list --json`, MCP: none -- CLI only)
+
+`{ contract, generated_at, timers: Timer[] }`. `Timer` is `{ owner: string,
+name: string, at: string, action: string, if_missed: "notify" | "drop",
+created_at: string, fired_at: string | null, cleared_at: string | null }`.
+Only pending timers (never fired, never cleared) are listed. `status`'s own
+`due_timers` (above) is the subset of this already at or past `at`.
+
+`timer set`/`timer clear` have no `--json` output of their own (a plain
+confirmation line); `timer list --json` always exits `0`.
 
 ### `cost` (bare array -- see "Array-shaped outputs")
 
