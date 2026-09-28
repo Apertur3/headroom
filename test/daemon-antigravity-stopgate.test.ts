@@ -63,7 +63,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-existing-reap-")); temporary.push(root);
     await writeFile(join(root, "accounts.toml"), accountsToml(true, "/not-used"), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
-    const reapingSupervisor = { running: false, start: vi.fn(), stop: vi.fn(async () => undefined) };
+    const reapingSupervisor = { running: false, managingLifecycle: true, start: vi.fn(), stop: vi.fn(async () => undefined) };
     const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async () => ({ observations: [], failures: [] }), keepalive: reapingSupervisor as never });
     try {
       const internal = daemon as unknown as {

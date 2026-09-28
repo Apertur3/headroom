@@ -619,6 +619,11 @@ export class AgyKeepaliveSupervisor {
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
+  /** True while this supervisor still owns a lifecycle of its own: a live
+   * child, an orphan reap in progress, or a scheduled restart. An idle
+   * supervisor (never started, or cleanly stopped) owns nothing and is
+   * started again by the daemon's normal launch path. */
+  get managingLifecycle(): boolean { return this.running || this.reaping || this.restart !== undefined; }
   get pid(): number | undefined { return this.running ? this.child?.pid : undefined; }
   get uptimeMs(): number | undefined { return this.running && this.startedAt !== undefined ? Date.now() - this.startedAt : undefined; }
   get loginState(): AgyLoginState { return this._loginState; }

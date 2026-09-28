@@ -320,10 +320,12 @@ export class HeadroomDaemon {
         && gateAccounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
       this.stopKeepaliveUnless(stillJustified, "policy or account disable");
       if (!stillJustified) return;
-      // An existing supervisor owns its own delayed restart and orphan-reap
-      // lifecycle. In particular, its pid-file discovery may still be
-      // pending; a daemon sweep must not clear that evidence underneath it.
-      return;
+      // A supervisor that still owns a lifecycle (a live child, an orphan
+      // reap, a scheduled restart) manages it itself; its pid-file discovery
+      // may still be pending, so a daemon sweep must not clear that evidence
+      // underneath it. An idle supervisor owns nothing and falls through to
+      // the normal sweep-and-launch path below.
+      if ((this.keepalive as { managingLifecycle?: boolean }).managingLifecycle) return;
     }
     // Never construct a new supervisor while an old one's stop() might still
     // be reading or writing the same shared home/state-file paths -- see
