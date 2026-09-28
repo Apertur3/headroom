@@ -6,7 +6,7 @@ import { HeadroomDaemon } from "../src/daemon.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
 /**
- * Proves should-fix item 3: a policy-level `antigravity_keepalive = false`
+ * Proves that a policy-level `antigravity_keepalive = false`
  * must stop an EXISTING supervisor -- whether it is currently `running` or
  * merely has a scheduled restart pending after a crash -- exactly as
  * surely as an accounts.toml-level disable already does (see

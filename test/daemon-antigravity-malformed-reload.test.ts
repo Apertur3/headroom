@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
 /**
- * Proves should-fix item 2: currentAccounts()/readPolicy() inside
+ * Proves that currentAccounts()/readPolicy() inside
  * maybeStartKeepalive() can reject on a malformed reload, and the poll
  * path calls maybeStartKeepalive() fire-and-forget with no rejection
  * handler of its own. Both scenarios corrupt the relevant config file
