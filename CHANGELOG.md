@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Antigravity keepalive: a daemon that died (or ran with `ps` denied) before its process record was fully written could leave an orphaned `agy` unrecoverable -- the next daemon start ignored the launch wrapper's own pid file and deleted it before launching a replacement. The supervisor now writes a ps-independent provisional record synchronously at spawn, and the startup sweep reconciles both that record and the leftover pid file, using a `ps` signature match when available and process-group/mtime evidence when it is not; a pid it cannot verify is left alone, logged, and blocks a fresh launch until it is confirmed gone.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

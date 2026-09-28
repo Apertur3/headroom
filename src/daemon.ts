@@ -9,6 +9,7 @@ import { claudeGrantGate, syncClaudeProbeState } from "./adapters/claude.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from "./antigravity-keepalive.js";
 import { appendDaemonLog } from "./logs.js";
+import { isProcessGroupAlive } from "./process-tree.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
@@ -175,6 +176,12 @@ export class HeadroomDaemon {
   private stopping = false;
   private sessionToken: string | undefined;
   private keepalive: AgyKeepaliveSupervisor | undefined;
+  /** Pids sweepStaleKeepalive() found alive but could not prove were a
+   * previous run's (see sweepPreviousKeepalive's `unverified`). Re-checked
+   * (ps-free, by process-group signal) before every keepalive launch attempt
+   * so a possibly-live orphan is never doubled up on; cleared once none of
+   * them are alive any more. */
+  private keepaliveUnverifiedPids: number[] = [];
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
   /** Guards against a second timer-firing pass starting while a slow one
@@ -233,13 +240,26 @@ export class HeadroomDaemon {
    * own keepalive -- worst case a prior leftover survives one more run and
    * shows up in `headroom doctor`. */
   private async sweepStaleKeepalive(): Promise<void> {
-    try { await sweepPreviousKeepalive(this.home); }
+    try {
+      const result = await sweepPreviousKeepalive(this.home, { log: (message) => { void appendDaemonLog(message, this.home); } });
+      this.keepaliveUnverifiedPids = result.unverified;
+    }
     catch (error) { void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
   }
 
   /** Start the owned agy PTY once an Antigravity poll needs it. */
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
+    if (this.keepaliveUnverifiedPids.length) {
+      // "until the next check": re-probe (ps-free) rather than trusting a
+      // sweep result that may be stale by now -- once every unverified pid
+      // has actually exited on its own, a fresh keepalive is free to start.
+      this.keepaliveUnverifiedPids = this.keepaliveUnverifiedPids.filter(isProcessGroupAlive);
+      if (this.keepaliveUnverifiedPids.length) {
+        void appendDaemonLog(`antigravity keepalive: deferring a new launch while pid(s) ${this.keepaliveUnverifiedPids.join(", ")} from a previous run remain unverified and alive`, this.home);
+        return;
+      }
+    }
     if (!policy.antigravity_keepalive || process.platform === "win32") return;
     // Centralized here (rather than trusting every caller to pre-filter) so
     // a disabled Antigravity account never launches its keepalive, whether

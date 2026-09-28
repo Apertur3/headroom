@@ -112,6 +112,35 @@ function trySignal(pid: number, signal: NodeJS.Signals): void {
   try { process.kill(pid, signal); } catch { /* already exited, or never ours to signal */ }
 }
 
+/** ps-free liveness probe for a process GROUP (not just the bare pid): true
+ * iff a signal-0 send to `-pid` succeeds or fails with EPERM (exists, just
+ * not ours to signal -- still alive), false on ESRCH (no such group) or any
+ * other error. Uses no `ps` at all, so it is the one identity signal that
+ * still works when `ps` is denied or absent. Checking the GROUP specifically
+ * (not the bare pid) is deliberately more specific than a plain liveness
+ * check: a pid the OS recycled to an ordinary, non-leader process would
+ * essentially never also happen to be a session/group leader of that exact
+ * id, whereas an agy process (see antigravity-keepalive.ts) always is one.
+ * It is still not a full identity proof -- see sweepPreviousKeepalive()'s use
+ * of it alongside a launch-time/mtime cross-check for what that combination
+ * does and does not verify. */
+export function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** SIGKILL a pid and, on POSIX, the process group it may lead (a PTY session
+ * leader like agy always is one -- see antigravity-keepalive.ts). Uses no
+ * `ps` or process listing at all, unlike killTree()'s SIGKILL escalation
+ * (which re-lists via `ps` to decide who survived a SIGTERM and, if `ps`
+ * cannot answer, silently skips escalating at all): this is the one kill
+ * primitive that still reliably reaps a SIGTERM-ignoring process when `ps` is
+ * denied or unavailable. Errors mean the target is already gone. */
+export function killProcessGroup(pid: number, options: { groupOnly?: boolean } = {}): void {
+  for (const target of options.groupOnly ? [-pid] : [-pid, pid]) { try { process.kill(target, "SIGKILL"); } catch { /* already gone */ } }
+}
+
 /** Signal both `pid` itself and, on POSIX, the process group it may be the
  * leader of (negative pid). A pid that never became its own group leader
  * (the common case for an ordinary child) just makes the group signal a

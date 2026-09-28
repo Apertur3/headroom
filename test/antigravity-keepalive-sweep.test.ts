@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,6 +250,28 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: records s
       expect(typeof state.agyCommand).toBe("string");
     } finally { await supervisor.stop(); }
   }, 15_000);
+
+  it("records a provisional, unverified state synchronously at spawn -- before recordState()'s first ps call could possibly have answered", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-provisional-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root);
+      // Read synchronously, in the very same tick start() returned in --
+      // nothing asynchronous (a `ps` call, a timer, a microtask) has had a
+      // chance to run yet, so this can only be what launch() itself wrote,
+      // synchronously, before spawn() even returned control here.
+      const state = JSON.parse(readFileSync(keepaliveStateFilePath(root), "utf8"));
+      expect(state.verified).toBe(false);
+      expect(state.scriptCommand).toBe("");
+      expect(state.scriptStartedAt).toBe("");
+      expect(state.scriptPid).toBe(scriptPid);
+      expect(typeof state.launchedAt).toBe("string");
+      track(Number(await waitForFile(infoFile)), root);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
 });
 
 describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
@@ -285,7 +308,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
   it("does nothing when no state file exists (first ever start, or an already-clean stop)", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-empty-"));
     temporary.push(root);
-    await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [] });
+    await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [], unverified: [] });
   });
 
   it("sweeps a lone recorded pid whose live signature still matches exactly", async () => {
@@ -333,4 +356,98 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
     expect(result.swept).toEqual([]);
     expect(alive(process.pid)).toBe(true);
   });
+});
+
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2 -- unrecoverable orphans when ps is denied or state was never fully recorded", () => {
+  it("(a) reaps an agy left behind by a daemon that died before recordState() ever ran, entirely without ps", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-provisional-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const crashed = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 60_000,
+    });
+    try {
+      await withoutPs(root, async () => {
+        crashed.start();
+        track(crashed.pid, root);
+        const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+        await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+        // Without `ps`, recordState() can never get past its first ps call --
+        // only the synchronous, provisional record survives, exactly as if
+        // the daemon process had been killed moments after spawn.
+        const provisional = JSON.parse(await readFile(keepaliveStateFilePath(root), "utf8"));
+        expect(provisional.verified).toBe(false);
+        expect(provisional.agyPid).toBeUndefined(); // recordState() never got this far
+        expect(alive(agyPid)).toBe(true); // "the daemon" never called stop(): agy is abandoned, alive
+
+        // A brand new daemon's startup sweep, still without ps -- the only
+        // thing distinguishing this from the old (broken) behaviour: it must
+        // not just shrug and let launch() delete the evidence.
+        const result = await sweepPreviousKeepalive(root);
+
+        // Either outcome closes the leak: ps-free evidence (process group
+        // still alive + pid-file mtime matching the recorded launch time) was
+        // strong enough here to reap it outright ...
+        if (result.swept.includes(agyPid)) {
+          await waitUntilDead(agyPid);
+        } else {
+          // ... or, at minimum, it was never silently discarded: it must be
+          // reported so a fresh keepalive refuses to launch on top of it.
+          expect(result.unverified).toContain(agyPid);
+          expect(alive(agyPid)).toBe(true);
+        }
+      });
+    } finally { await crashed.stop(); }
+  }, 15_000);
+
+  it("(b) repeated crash/restart cycles across daemon starts never leave more than one agy alive at once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-repeated-crash-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const agyPids: number[] = [];
+    try {
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        // Stands in for the next daemon's startup sweep, before it decides
+        // whether to launch its own keepalive.
+        await sweepPreviousKeepalive(root);
+        if (cycle > 0) await waitUntilDead(agyPids[cycle - 1]); // no accumulation across cycles
+        await rm(infoFile, { force: true });
+        const supervisor = new AgyKeepaliveSupervisor({
+          binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 60_000,
+        });
+        supervisor.start();
+        track(supervisor.pid, root);
+        const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+        agyPids.push(agyPid);
+        await vi.waitFor(async () => {
+          const raw = JSON.parse(await readFile(keepaliveStateFilePath(root), "utf8"));
+          expect(raw.agyPid).toBe(agyPid);
+        }, { timeout: 3_000, interval: 20 });
+        // "Crash": nobody calls supervisor.stop() -- script and agy are
+        // abandoned alive, exactly like an unclean daemon exit, for the next
+        // cycle's sweep to find.
+      }
+      // The next daemon start after the last crash.
+      await sweepPreviousKeepalive(root);
+      await Promise.all(agyPids.map((pid) => waitUntilDead(pid)));
+      expect(agyPids.every((pid) => !alive(pid))).toBe(true);
+    } finally { for (const pid of agyPids) if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
+  }, 30_000);
+
+  it("(c) a stale .agy-pid file naming an unrelated live process is never signalled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-stranger-")); temporary.push(root);
+    const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+    const strangerPid = track(stranger.pid, root) as number;
+    // No JSON state at all -- only a leftover pid file, the one artifact a
+    // crash-before-any-record-at-all (or a corrupted/lost state file) could
+    // leave, naming a pid the OS has since handed to something else entirely
+    // (a live, unrelated process, for a deterministic test).
+    await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, String(strangerPid), { mode: 0o600 });
+
+    const result = await sweepPreviousKeepalive(root);
+
+    expect(result.swept).toEqual([]);
+    expect(result.unverified).toEqual([strangerPid]); // alive, but never provably ours: reported, not touched
+    expect(alive(strangerPid)).toBe(true);
+  }, 10_000);
 });
