@@ -83,6 +83,33 @@ name appears in both. Supported names:
 | `model_retired` | A model id no longer listed in a vendor's catalog for a known principal. Only in `everything`. |
 | `grant_lapsed` | A historical Keychain grant lapse retained for existing event history. |
 | `lease_started`, `lease_ended` | Work reservations started or ended. |
+| `heartbeat_lapsed`, `heartbeat_restored` | An orchestrator's registered heartbeat (`headroom heartbeat`) went overdue by more than 2x its own interval, or a later beat closed that lapse. On in `calm`; `heartbeat_lapsed` alone is also on in `quiet`. |
+| `timer_missed` | A named wake-up (`headroom timer set --if-missed notify`) came due while its owner's heartbeat was lapsed. On in `calm` and `quiet`. |
+
+### Heartbeats and named wake-ups
+
+`headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]`
+registers an orchestrator's promise to beat at least that often; the daemon --
+the one process that survives a crashed session -- checks every registered
+heartbeat on each poll, and once one goes overdue by more than 2x its own
+interval it records exactly one `heartbeat_lapsed` event (never repeated
+while that lapse stays open) carrying the last beat and the `--resume`
+sentence, so the notification says what a human or a fresh session should do.
+A later beat closes the lapse immediately and may send one short
+`heartbeat_restored`. `headroom heartbeat --owner <name> --stop` deregisters
+it without announcing a restore; `headroom heartbeat list [--json]` shows
+every registered one.
+
+`headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action
+"<text>"` registers a named wake-up. When it comes due, the daemon delivers it
+exactly once as one `headroom inbox` entry to its owner's session --
+**Headroom only ever delivers the action text; it never executes it.**
+`--if-missed notify` (the default) additionally raises one `timer_missed`
+notification if the owner's heartbeat is currently lapsed at that moment (a
+crashed session will never read its own inbox); `--if-missed drop` still
+delivers the inbox entry but never notifies. `headroom timer list [--owner
+<name>] [--json]` shows pending timers; `headroom timer clear --owner <name>
+--name <id>` clears one.
 
 ### `model_available`: new models, separate from new quota buckets
 

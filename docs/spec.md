@@ -124,9 +124,22 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
   date-only expiry is midnight UTC on that date.
 - `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]`.
-- `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
-  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
-  `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
+  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
+  pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"] | --stop |
+  list [--json]` (MCP `quota_heartbeat`): an orchestrator's promise to beat at least that
+  often, recorded in the daemon's own store -- the one process that survives a crashed
+  session. The daemon checks every registered heartbeat on each poll; one gone overdue by
+  more than 2x its own interval gets exactly one `heartbeat_lapsed` event (never repeated for
+  the same open lapse), delivered through the ordinary notify ledger/quiet-hours path; a later
+  beat closes the lapse and may send one short `heartbeat_restored`. See `docs/notifications.md`.
+- `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
+  [--if-missed notify|drop] | list [--owner <name>] [--json] | clear --owner <name> --name
+  <id>`: a named wake-up the daemon delivers, once, as one `headroom inbox` entry to its owner
+  when due. Headroom only ever delivers the action text; it never executes it. `--if-missed
+  notify` (default) also raises one `timer_missed` notification if the owner's heartbeat is
+  currently lapsed when it fires; `--if-missed drop` never notifies.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into

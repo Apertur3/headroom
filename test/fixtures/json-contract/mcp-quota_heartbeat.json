@@ -1,0 +1,14 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "heartbeat": {
+    "interval_ms": "number",
+    "lapsed_since": "null",
+    "last_beat_at": "string",
+    "owner": "string",
+    "resume_sentence": "string",
+    "started_at": "string",
+    "updated_at": "string"
+  },
+  "source": "string"
+}

@@ -136,6 +136,22 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
     case "grant_lapsed": return message("🔑 Keychain grant lapsed", `${principal}.`, `Run: headroom keychain grant --principal ${clean(event.principal_id ?? "unknown")}`);
     case "lease_started": return message("▶️ Lease started", `${name} has a new work reservation.`, "Its reserved capacity is accounted for while the lease runs.");
     case "lease_ended": return message("🏁 Lease ended", `${name}'s work reservation ended.`, "Unused reserved capacity is available again.");
+    case "heartbeat_lapsed": {
+      const owner = clean(event.metadata?.owner ?? event.principal_id ?? "orchestrator");
+      const lastBeat = event.metadata?.last_beat_at ? formatClockTime(new Date(event.metadata.last_beat_at)) : "unknown";
+      const resume = event.metadata?.resume_sentence ? clean(event.metadata.resume_sentence) : undefined;
+      return message(`💔 Heartbeat lapsed: ${owner}`, `Last beat ${lastBeat}. Nothing has picked this session's work back up.`, resume ? `Resume: ${resume}` : "No resume note was left; check what this session was doing.");
+    }
+    case "heartbeat_restored": {
+      const owner = clean(event.metadata?.owner ?? event.principal_id ?? "orchestrator");
+      return `💚 Heartbeat restored: ${owner} is beating again.`;
+    }
+    case "timer_missed": {
+      const owner = clean(event.metadata?.owner ?? event.principal_id ?? "orchestrator");
+      const timerName = clean(event.metadata?.timer_name ?? event.reason ?? "timer");
+      const action = event.metadata?.action ? clean(event.metadata.action) : undefined;
+      return message(`⏰ Timer fired while ${owner} is unattended`, `"${timerName}" was due and delivered to its inbox, but ${owner}'s heartbeat is lapsed.`, action ? `Action: ${action}` : undefined);
+    }
   }
 }
 
