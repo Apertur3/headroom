@@ -334,7 +334,8 @@ describe("headroom policy CLI", () => {
     expect(backups).toHaveLength(1);
     expect(await readFile(join(home, backups[0]), "utf8")).toBe(original);
     const { stat } = await import("node:fs/promises");
-    expect((await stat(join(home, "policy.toml"))).mode & 0o777).toBe(0o600);
+    // Windows has no POSIX permission bits (it reports 0666 whatever was asked).
+    if (process.platform !== "win32") expect((await stat(join(home, "policy.toml"))).mode & 0o777).toBe(0o600);
     expect((await stat(join(home, backups[0]))).mode & 0o777).toBe(0o600);
   });
 
