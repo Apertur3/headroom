@@ -261,6 +261,29 @@ describe("sendInboxMessageAt", () => {
     await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: -1, home: path })).rejects.toThrow(/delivery_id/);
     await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: 1.5, home: path })).rejects.toThrow(/delivery_id/);
   });
+
+  // should-fix: findExistingDelivery used to trust a name match alone. A
+  // corrupt file, or a genuine collision with some unrelated message that
+  // happens to carry the same kind and delivery id in its own filename,
+  // must never be mistaken for this exact delivery already landing --
+  // reporting delivered: false for a delivery that never actually happened
+  // would let fireDueTimers mark a timer fired without its action ever
+  // reaching its owner.
+  it("throws rather than silently treating a name-matching file as delivered when its own envelope disagrees", async () => {
+    const path = await home();
+    const directory = await sessionDirectory("session-h", path);
+    // Written directly, bypassing the API entirely -- exactly what a
+    // corrupt write or a colliding delivery id from an unrelated message
+    // would leave behind: right name, wrong content.
+    await writeFile(join(directory, "5000-321-handoff.json"), JSON.stringify({ version: 1, kind: "handoff", to: "someone-else", from: "a-human", at: "2026-01-01T00:00:00.000Z", delivery_id: 321, body: "unrelated" }));
+    const options = { to: "session-h", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 321, home: path, now: new Date(5_000) };
+    await expect(sendInboxMessageAt(options)).rejects.toThrow(/matches delivery 321 by name but not by envelope content/);
+    // Never treated as delivered, and never overwritten either -- the
+    // corrupt/colliding file is left exactly as found for a human to
+    // investigate, not silently replaced.
+    const messages = await readdir(directory);
+    expect(messages).toEqual(["5000-321-handoff.json"]);
+  });
 });
 
 describe("headroom inbox", () => {

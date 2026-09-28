@@ -2473,9 +2473,22 @@ export class HeadroomStore {
     if (expectedDeliveryId !== undefined && existingDeliveryId !== expectedDeliveryId) return undefined;
     const claimToken = randomUUID();
     const deliveryId = existingDeliveryId ?? generateTimerDeliveryId();
-    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ?, delivery_id = ? WHERE owner = ? AND name = ? AND at <= ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
-      .run(nowIso, claimToken, deliveryId, owner, name, nowIso, staleThreshold);
-    if (Number(claimed.changes) === 0) return undefined; // lost the race to a concurrent claim
+    // The check above only proves the row's identity as of the SELECT that
+    // already happened -- a different connection can still replace this
+    // exact row (a fresh setTimer for the same owner+name) in the gap
+    // between that SELECT and this UPDATE. `delivery_id IS ?` repeats the
+    // identity check as part of the SAME atomic statement that performs the
+    // claim, so a replacement landing in that gap makes this UPDATE match
+    // zero rows instead of claiming whatever is live now under the identity
+    // that was true a moment ago. Omitted entirely when the caller passed
+    // no `expectedDeliveryId` (a direct RPC claim with no snapshot to
+    // protect), matching the pre-check just above.
+    const deliveryIdGuard = expectedDeliveryId !== undefined ? " AND delivery_id IS ?" : "";
+    const updateParams: unknown[] = [nowIso, claimToken, deliveryId, owner, name, nowIso, staleThreshold];
+    if (expectedDeliveryId !== undefined) updateParams.push(expectedDeliveryId);
+    const claimed = this.db.prepare(`UPDATE timers SET claimed_at = ?, claim_token = ?, delivery_id = ? WHERE owner = ? AND name = ? AND at <= ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)${deliveryIdGuard}`)
+      .run(...updateParams);
+    if (Number(claimed.changes) === 0) return undefined; // lost the race to a concurrent claim or a replacement since the SELECT above
     const timer: ClaimedTimer = { ...timerFromRow(row), claim_token: claimToken, delivery_id: deliveryId };
     if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, nowIso);
     return timer;

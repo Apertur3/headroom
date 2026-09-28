@@ -88,8 +88,27 @@ export function parseTimerAt(value: string, now = new Date()): string {
  * either way because `sendInboxMessageAt`'s delivery-id verification makes a
  * retry idempotent even if the abandoned attempt's write does eventually
  * succeed.
+ *
+ * `clock` supplies the timestamp for each individual claim, send and
+ * confirm/release -- deliberately NOT the same instant as this pass's own
+ * `now` (which only decides WHICH timers are due for this pass, via
+ * `dueTimers(now)`). A pass can take real, unbounded wall-clock time to run
+ * (one timer's own delivery can take up to `deliveryTimeoutMs`, and a pass
+ * with several due timers serializes them); stamping every one of them with
+ * the single instant the pass happened to start would let a later timer in
+ * the same pass land on disk, in real time, strictly after some ordinary
+ * hand-off written meanwhile -- yet carry an OLDER epoch in its own
+ * filename than that hand-off, since the pass's frozen `now` predates it.
+ * A `--since` cursor taken right after that hand-off would then wrongly
+ * skip the timer message a moment later, even though it had not been
+ * written yet when the cursor was read. Defaults to returning this pass's
+ * own `now` unchanged -- exactly today's (pre-fix) behavior -- so every
+ * caller that does not pass an explicit clock (every test that predates
+ * this) is unaffected; only a caller that wants each timestamp to reflect
+ * real elapsed time (daemon.ts's own production call site) supplies
+ * `() => new Date()`.
  */
-export async function fireDueTimers(store: HeadroomStore, home: string, now = new Date(), log: (message: string) => Promise<void> = (message) => appendDaemonLog(message, home), send: typeof sendInboxMessageAt = sendInboxMessageAt, deliveryTimeoutMs = DELIVERY_TIMEOUT_MS): Promise<number> {
+export async function fireDueTimers(store: HeadroomStore, home: string, now = new Date(), log: (message: string) => Promise<void> = (message) => appendDaemonLog(message, home), send: typeof sendInboxMessageAt = sendInboxMessageAt, deliveryTimeoutMs = DELIVERY_TIMEOUT_MS, clock: () => Date = () => now, logTimeoutMs = LOG_TIMEOUT_MS): Promise<number> {
   let fired = 0;
   for (const timer of store.dueTimers(now)) {
     // The snapshot's own delivery_id, not just its owner/name: a later
@@ -97,13 +116,14 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
     // while an earlier delivery in this same pass is still in flight) must
     // never be claimed and delivered under this snapshot entry's place --
     // see claimTimer's own doc comment.
-    const claimed = store.claimTimer(timer.owner, timer.name, now, undefined, timer.delivery_id);
+    const claimed = store.claimTimer(timer.owner, timer.name, clock(), undefined, timer.delivery_id);
     if (!claimed) continue; // an overlapping pass already claimed it, or its claim is still fresh
+    const sendAt = clock();
     const sendPromise = send({
       to: claimed.owner, kind: TIMER_DELIVERY_KIND, from: TIMER_DELIVERY_FROM,
       text: JSON.stringify({ timer: claimed.name, at: claimed.at, action: claimed.action }),
       delivery_id: claimed.delivery_id,
-      home, now,
+      home, now: sendAt,
     });
     // A late settlement from an abandoned (timed-out) attempt is expected,
     // not a defect: by the time it happens this loop has already moved on,
@@ -114,7 +134,7 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
     try {
       const timedOut = await raceDeliveryTimeout(sendPromise, deliveryTimeoutMs);
       if (timedOut) {
-        await log(`timer ${claimed.owner}/${claimed.name} delivery timed out after ${deliveryTimeoutMs}ms; abandoning this attempt, its claim will go stale and be retried`);
+        await safeLog(log, `timer ${claimed.owner}/${claimed.name} delivery timed out after ${deliveryTimeoutMs}ms; abandoning this attempt, its claim will go stale and be retried`, logTimeoutMs);
         continue;
       }
       // Durable only once the message is confirmed on disk -- freshly
@@ -123,21 +143,47 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
       // comment). confirmTimerDelivered is a no-op (false) if a different
       // pass already closed this exact claim out first; `fired` only counts
       // the call that actually did.
-      if (store.confirmTimerDelivered(claimed.owner, claimed.name, claimed.claim_token, now)) fired += 1;
+      if (store.confirmTimerDelivered(claimed.owner, claimed.name, claimed.claim_token, clock())) fired += 1;
     } catch (error) {
       // Bounded retry (store.ts's own MAX_TIMER_DELIVERY_ATTEMPTS): past the
       // limit, releaseTimerClaim sets failed_at instead of releasing the
       // claim, so dueTimers() never offers this row again -- an
       // undeliverable timer (an invalid owner, an oversized action) stops
       // being retried on every future maintenance pass rather than forever.
-      const outcome = store.releaseTimerClaim(claimed.owner, claimed.name, claimed.claim_token, now);
+      const outcome = store.releaseTimerClaim(claimed.owner, claimed.name, claimed.claim_token, clock());
       const reason = safeError(error);
-      await log(outcome?.permanentlyFailed
+      await safeLog(log, outcome?.permanentlyFailed
         ? `timer ${claimed.owner}/${claimed.name} permanently failed after ${outcome.attempts} delivery attempts, giving up: ${reason}`
-        : `timer ${claimed.owner}/${claimed.name} failed to deliver (attempt ${outcome?.attempts ?? "?"}): ${reason}`);
+        : `timer ${claimed.owner}/${claimed.name} failed to deliver (attempt ${outcome?.attempts ?? "?"}): ${reason}`, logTimeoutMs);
     }
   }
   return fired;
+}
+
+/** How long `safeLog` waits for one `log` call before giving up on it and
+ * moving on -- generous relative to appendDaemonLog's own local file
+ * append, while still bounding this loop against a logger that never
+ * settles at all. */
+const LOG_TIMEOUT_MS = 2_000;
+
+/** Wraps a `fireDueTimers` log call so neither a rejecting nor a never-
+ * settling `log` can take this loop down with it. By the time this runs,
+ * the due timer it describes has already been claimed and either delivered
+ * or released -- that outcome is real and already durable in the store;
+ * losing the ONE log line describing it to an unrelated logging problem
+ * (a full disk, a broken custom `log` test double, or any other) is a far
+ * smaller loss than aborting the rest of this pass -- every other due timer
+ * still queued behind it -- over a log write, or hanging this pass (and so
+ * the daemon's own maintenance scheduler, which awaits it) forever on one
+ * that never settles. Bounded the same way a delivery itself already is
+ * (see DELIVERY_TIMEOUT_MS/raceDeliveryTimeout): a `log` call abandoned on
+ * timeout is left running, unobserved, its own eventual rejection or
+ * resolution already swallowed by the `.catch` below. */
+async function safeLog(log: (message: string) => Promise<void>, message: string, timeoutMs: number): Promise<void> {
+  await Promise.race([
+    log(message).catch(() => { /* a broken logger must never fail this loop */ }),
+    new Promise<void>((resolve) => { const timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
+  ]);
 }
 
 /** Races `promise` against a `timeoutMs` timer; returns `true` when the

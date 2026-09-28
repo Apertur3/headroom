@@ -28,6 +28,16 @@ export const JSON_CONTRACT_VERSION = "1.0";
  * docs/notifications.md."). */
 export const JSON_CONTRACT_DOC_PATH = "docs/json-contract.md";
 
+/** Every Timer field that predates `attempts`/`failed_at` -- the two this
+ * normalizer defaults for an older daemon (see its own doc comment below).
+ * Checked, not defaulted: a row missing one of THESE is not an older-shape
+ * compatibility case, it is a malformed reply, and normalizing it into a
+ * contract-invalid object (an `owner` of `undefined`, an `if_missed` of
+ * anything at all) would just move the defect one layer further from where
+ * it happened. */
+const REQUIRED_STRING_TIMER_FIELDS = ["owner", "name", "at", "action", "created_at"] as const;
+const NULLABLE_STRING_TIMER_FIELDS = ["fired_at", "cleared_at"] as const;
+
 /** Normalizes one timer row from a daemon JSON-RPC reply to the current
  * additive shape: `attempts`/`failed_at` default to `0`/`null` when a still-
  * running OLDER daemon's own reply predates those two fields (see
@@ -36,13 +46,26 @@ export const JSON_CONTRACT_DOC_PATH = "docs/json-contract.md";
  * an older on-disk schema. Used at every protocol boundary a timer can
  * arrive at from a daemon RPC reply rather than a local store read: the CLI's
  * `timer list` command and `observe()`'s `due_timers`, and MCP's
- * `quota_status`. A malformed (non-object) row still gets the same
- * defaulting rather than propagating `undefined` fields into a result a
- * caller expects the documented shape from -- every OTHER Timer field
- * passes through unchanged, this only ever adds or defaults the two
- * additive ones. */
+ * `quota_status`.
+ *
+ * Every OTHER (pre-additive) Timer field is required and type-checked --
+ * this only ever adds or defaults the two additive ones, it never invents
+ * or silently drops any other field. A row missing or misshaping one of
+ * those throws instead of being normalized into a contract-invalid object
+ * (e.g. an `owner` of `undefined`): a caller that already trusts this
+ * reply enough to treat its shape as a Timer must never see it silently
+ * hollowed out by a defect a fresh daemon bug, a corrupt reply, or a
+ * genuinely incompatible future protocol version would produce. */
 export function normalizeDaemonTimer(row: unknown): TimerLike {
-  const record = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : {};
+  const record = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : undefined;
+  if (!record) throw new Error("Daemon timer row was not an object");
+  for (const field of REQUIRED_STRING_TIMER_FIELDS) {
+    if (typeof record[field] !== "string") throw new Error(`Daemon timer row is missing required field "${field}"`);
+  }
+  if (record.if_missed !== "notify" && record.if_missed !== "drop") throw new Error(`Daemon timer row has an invalid if_missed: ${JSON.stringify(record.if_missed)}`);
+  for (const field of NULLABLE_STRING_TIMER_FIELDS) {
+    if (record[field] !== null && typeof record[field] !== "string") throw new Error(`Daemon timer row has an invalid "${field}"`);
+  }
   return { ...record, attempts: typeof record.attempts === "number" ? record.attempts : 0, failed_at: typeof record.failed_at === "string" ? record.failed_at : null } as TimerLike;
 }
 

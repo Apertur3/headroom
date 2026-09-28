@@ -179,15 +179,39 @@ export interface SendAtOptions extends SendOptions {
  * scan, not a single-path check, precisely because a retry's own send time
  * (and so its own filename) legitimately differs from the original
  * attempt's. At most one is expected under normal operation; the first
- * found is treated as authoritative. */
-async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number): Promise<{ path: string; file: string } | undefined> {
+ * found is treated as authoritative -- but only once its own envelope
+ * confirms it: the filename is what THIS scan searches by, never what it
+ * trusts. A corrupt file, or a genuine collision with some unrelated
+ * message that happens to carry a matching kind and delivery id in its own
+ * name, must never be mistaken for this exact delivery already landing --
+ * that would report `delivered: false` for a delivery that never actually
+ * happened, and (via fireDueTimers's confirmTimerDelivered) let a timer be
+ * marked fired without its action ever reaching its owner. The envelope's
+ * own `delivery_id` field is the one place that identity is written under
+ * the writer's control (serializeInboxEnvelope), so it -- and the `kind` and
+ * `to` fields alongside it -- has to agree with what this scan is actually
+ * looking for before the file is trusted. A file this scan cannot read back
+ * at all (gone since the directory listing, or genuinely corrupt) is
+ * skipped, not thrown on: it is not proof of anything either way, and the
+ * caller's own write attempt will simply proceed past it. A file that DOES
+ * parse but disagrees on identity is the one case worth failing loud on. */
+async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number, to: string): Promise<{ path: string; file: string } | undefined> {
   let entries: string[];
   try { entries = await readdir(directory); }
   catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
   for (const entry of entries) {
     const bare = entry.endsWith(READ_SUFFIX) ? entry.slice(0, -READ_SUFFIX.length) : entry;
     const parsed = parseMessageName(bare);
-    if (parsed && parsed.kind === kind && parsed.deliveryId === deliveryId) return { path: join(directory, entry), file: entry };
+    if (!parsed || parsed.kind !== kind || parsed.deliveryId !== deliveryId) continue;
+    const path = join(directory, entry);
+    let raw: string;
+    try { raw = await readBoundedRegularFile(path); }
+    catch { continue; } // gone or unreadable since the directory listing above; not proof of anything
+    let envelope: unknown;
+    try { envelope = JSON.parse(raw); } catch { continue; } // not a name match worth trusting either
+    const record = envelope && typeof envelope === "object" && !Array.isArray(envelope) ? envelope as Record<string, unknown> : {};
+    if (record.delivery_id === deliveryId && record.kind === kind && record.to === to) return { path, file: entry };
+    throw new Error(`inbox file ${entry} matches delivery ${deliveryId} by name but not by envelope content`);
   }
   return undefined;
 }
@@ -228,7 +252,7 @@ export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path
   const attempt = (async (): Promise<{ path: string; file: string; session: string; delivered: boolean }> => {
     const now = options.now ?? new Date();
     const directory = await sessionDirectory(session, options.home);
-    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id);
+    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id, session);
     if (existing) return { path: existing.path, file: existing.file, session, delivered: false };
     const file = `${now.getTime()}-${options.delivery_id}-${options.kind}.json`;
     const path = join(directory, file);

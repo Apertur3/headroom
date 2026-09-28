@@ -9,10 +9,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
-import { readInbox, sendInboxMessageAt } from "../src/inbox.js";
+import { readInbox, sendInboxMessage, sendInboxMessageAt } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
 import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS, TIMER_CLAIM_STALE_MS } from "../src/store.js";
@@ -731,6 +731,111 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
+  // The two tests above race a REPLACEMENT against an in-flight delivery
+  // across an async gap (fireDueTimers awaiting an earlier timer's send).
+  // This one isolates a narrower window: claimTimer's own pre-check reads
+  // the row, then a SEPARATE connection replaces that exact row, then
+  // claimTimer's own UPDATE runs -- all with no async gap of this call's
+  // own. The pre-check alone cannot see a write that lands after it read,
+  // so the atomic UPDATE's own WHERE clause has to repeat the identity
+  // check itself.
+  it("claimTimer's own SELECT-then-UPDATE has no window for a concurrent replacement to slip through", async () => {
+    const { store } = await openStore("headroom-claimtimer-select-update-race-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-race", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+      const snapshot = store.dueTimers(at)[0];
+      expect(snapshot.owner).toBe("orch-race");
+
+      const originalPrepare = store.db.prepare.bind(store.db);
+      let intercepted = false;
+      const prepareSpy = vi.spyOn(store.db, "prepare").mockImplementation((sql: string) => {
+        const real = originalPrepare(sql);
+        if (!intercepted && sql.startsWith("SELECT * FROM timers WHERE owner")) {
+          intercepted = true;
+          return {
+            run: real.run.bind(real),
+            all: real.all.bind(real),
+            get: (...args: unknown[]) => {
+              const row = real.get(...args);
+              // A genuinely different connection replaces this exact row
+              // right here -- after claimTimer's own SELECT already read
+              // it, before claimTimer's own UPDATE runs.
+              store.setTimer("orch-race", "wake", at.toISOString(), "check the NEW deploy", "notify", at);
+              return row;
+            },
+          };
+        }
+        return real;
+      });
+
+      const claimed = store.claimTimer("orch-race", "wake", at, undefined, snapshot.delivery_id);
+      prepareSpy.mockRestore();
+      expect(claimed).toBeUndefined(); // the row it read is not the row now live
+
+      const row = store.timers("orch-race")[0];
+      expect(row.action).toBe("check the NEW deploy");
+      // claimed_at/claim_token are internal-only, not on the public Timer
+      // shape timers() returns -- read the raw row to prove the replaced
+      // row itself was never touched by the stale attempt.
+      const raw = store.db.prepare("SELECT claimed_at, claim_token FROM timers WHERE owner = ? AND name = ?").get("orch-race", "wake") as { claimed_at: unknown; claim_token: unknown };
+      expect(raw.claimed_at).toBeNull();
+      expect(raw.claim_token).toBeNull();
+    } finally { store.close(); }
+  });
+
+  // Blocker fix: every claim/send/confirm in a pass used to share the same
+  // frozen `now` the pass started with. A pass with a slow earlier delivery
+  // can genuinely take real, unbounded time to reach a later timer -- long
+  // enough for an ordinary hand-off to land, in real time, before that later
+  // timer's own delivery -- yet the later timer's filename epoch would
+  // still predate the hand-off's, since it was stamped with the pass's
+  // original instant. A --since cursor read right after the hand-off would
+  // then wrongly hide the timer message. `clock` (a test seam here; a real
+  // wall clock in production) lets this test simulate real elapsed time
+  // between each individual claim/send/confirm without depending on actual
+  // wall-clock timing.
+  it("captures a fresh time for each claim, send and confirm, so a --since cursor set after an ordinary message sent mid-pass does not hide a timer message the same pass delivers later", async () => {
+    const { store, home } = await openStore("headroom-firedue-fresh-clock-");
+    try {
+      const passStart = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-cursor-a", "wake", passStart.toISOString(), "first", "notify", createdAt);
+      store.setTimer("orch-cursor-b", "wake", passStart.toISOString(), "second", "notify", createdAt);
+
+      let calls = 0;
+      const clock = () => new Date(passStart.getTime() + 1000 * (calls += 1));
+
+      let releaseFirst: () => void;
+      const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const gatedSend: typeof sendInboxMessageAt = async (options) => {
+        if (options.to === "orch-cursor-a") await gate;
+        return sendInboxMessageAt(options);
+      };
+
+      const pass = fireDueTimers(store, home, passStart, undefined, gatedSend, undefined, clock);
+      // A genuinely concurrent ordinary hand-off lands for orch-cursor-b
+      // while this pass is still stuck delivering orch-cursor-a -- its own
+      // real send time sits strictly between this pass's claim/send calls
+      // for the two timers (see `clock` above).
+      await sendInboxMessage({ to: "orch-cursor-b", kind: "note", text: "unrelated", home, now: new Date(passStart.getTime() + 2_500) });
+      releaseFirst!();
+      const fired = await pass;
+      expect(fired).toBe(2);
+
+      const inbox = await readInbox({ session: "orch-cursor-b", home, markRead: false });
+      // Real send order (note at +2500ms, the timer delivered strictly
+      // later), not pass-start order (which would put the timer first, at
+      // the pass's own frozen `now`).
+      expect(inbox.messages.map((message) => message.kind)).toEqual(["note", "handoff"]);
+      const sinceOrdinary = await readInbox({ session: "orch-cursor-b", home, since: inbox.messages[0].at_epoch + 1, markRead: false });
+      // The timer delivery, written after the ordinary note in real time,
+      // is not hidden behind a cursor set just past that note.
+      expect(sinceOrdinary.messages.map((message) => message.kind)).toEqual(["handoff"]);
+    } finally { store.close(); }
+  });
+
   it("un-claims a timer whose inbox delivery fails, so a later pass can retry and succeed", async () => {
     const { store, home } = await openStore("headroom-firedue-retry-");
     try {
@@ -825,6 +930,57 @@ describe("fireDueTimers", () => {
       // waiting out the real (2 minute) default.
       const later = new Date(at.getTime() + 50);
       expect(store.dueTimers(later, 10)).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  // should-fix: fireDueTimers's own timeout/failure logging used to be an
+  // unprotected `await log(...)`. A `log` that rejects (a broken custom
+  // logger, a full disk under appendDaemonLog) must never abort this pass --
+  // the timer it was about to log about has already been claimed and
+  // released, a real, already-durable outcome that losing one log line
+  // must never take down with it -- and every other due timer still queued
+  // behind it in the same pass must still get processed.
+  it("a rejecting logger never aborts the pass, and every other due timer is still processed", async () => {
+    const { store, home } = await openStore("headroom-firedue-log-rejects-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-log-a", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+      store.setTimer("orch-log-b", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+      const alwaysFailingSend: typeof sendInboxMessageAt = async () => { throw new Error("simulated permanent inbox failure"); };
+      const rejectingLog = async (): Promise<void> => { throw new Error("simulated broken logger"); };
+
+      const fired = await fireDueTimers(store, home, at, rejectingLog, alwaysFailingSend);
+      expect(fired).toBe(0); // both deliveries failed, but the pass itself completed
+      // Both timers' claims were released for retry -- the rejecting logger
+      // never stopped the second one from even being reached.
+      expect(store.timers("orch-log-a")[0]).toMatchObject({ fired_at: null, attempts: 1 });
+      expect(store.timers("orch-log-b")[0]).toMatchObject({ fired_at: null, attempts: 1 });
+    } finally { store.close(); }
+  });
+
+  // should-fix, continued: a `log` that never settles at all (a stuck
+  // filesystem under appendDaemonLog, not merely a slow one) must not hang
+  // this pass -- and so the daemon's own maintenance scheduler, which
+  // awaits it -- forever either. Proven with a short logTimeoutMs rather
+  // than waiting out the real (2s) default.
+  it("does not hang forever on a logger that never resolves, and still processes every other due timer", async () => {
+    const { store, home } = await openStore("headroom-firedue-log-never-resolves-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-log-hang-a", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+      store.setTimer("orch-log-hang-b", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+      const alwaysFailingSend: typeof sendInboxMessageAt = async () => { throw new Error("simulated permanent inbox failure"); };
+      const neverResolvingLog = (): Promise<void> => new Promise(() => { /* never settles */ });
+
+      const start = Date.now();
+      const fired = await fireDueTimers(store, home, at, neverResolvingLog, alwaysFailingSend, undefined, undefined, 20); // 20ms log timeout
+      const elapsed = Date.now() - start;
+      expect(fired).toBe(0);
+      expect(elapsed).toBeLessThan(5_000); // bounded, nowhere near a real hang -- and nowhere near two real 2s log timeouts
+      expect(store.timers("orch-log-hang-a")[0]).toMatchObject({ fired_at: null, attempts: 1 });
+      expect(store.timers("orch-log-hang-b")[0]).toMatchObject({ fired_at: null, attempts: 1 });
     } finally { store.close(); }
   });
 

@@ -453,9 +453,16 @@ second reservation mechanism:
 
 Orchestrators sharing an account also need to leave each other notes, which the meters cannot
 carry. Each session has a directory `<HEADROOM_HOME>/inbox/<session-id>/` holding one file per
-message, named `<epoch-ms>-<kind>.json` for a kind of `budget`, `note`, or `handoff`. The file is
-a small envelope: `version`, `kind`, `to`, `from` (null when the sender did not name itself), `at`,
-and `body` -- the sender's payload, parsed when it was JSON and kept as text otherwise.
+message, named `<epoch-ms>-<kind>.json` for an ordinary hand-off (a kind of `budget`, `note`, or
+`handoff`) sent by `headroom inbox send` or the equivalent MCP path. A due timer's own delivery (see
+Heartbeats and timers, below) is named `<epoch-ms>-<delivery_id>-<kind>.json` instead -- the same
+real send time in the same leading position, plus the timer's own persisted `delivery_id` as a
+second, separate filename component, so a crash-and-retry can recognize an already-delivered timer
+message by that id rather than by guessing its exact filename. The two shapes never collide: only a
+timer delivery's filename has that middle numeric component at all. The file itself is a small
+envelope: `version`, `kind`, `to`, `from` (null when the sender did not name itself), `at`, `body` --
+the sender's payload, parsed when it was JSON and kept as text otherwise -- and, for a timer
+delivery only, the same `delivery_id` carried in its own filename.
 
 `headroom inbox send --to <session-id> --kind <kind> (--file <path> | --text <text>)` writes one,
 atomically and 0600, capped at 64 KiB. `headroom inbox --session <id> [--since <epoch-ms>]` prints

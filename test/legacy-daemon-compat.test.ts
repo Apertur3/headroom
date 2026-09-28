@@ -282,4 +282,66 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     ) as { result: { structuredContent: { due_timers: Array<{ owner: string; attempts: number; failed_at: string | null }> } } };
     expect(reply.result.structuredContent.due_timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
   });
+
+  // should-fix: normalizeDaemonTimer used to default attempts/failed_at onto
+  // ANY object, missing pre-additive fields included -- silently producing a
+  // contract-invalid Timer (an `owner` of `undefined`) instead of surfacing
+  // the malformed reply. Only the two genuinely additive fields may be
+  // defaulted; every other required field is now checked and fails loud when
+  // missing or misshapen, at each of the three protocol boundaries a timer
+  // row reaches from a daemon reply.
+  const timerRowMalformed = { name: "wake", at: "2020-01-01T00:00:00.000Z", action: "check the deploy", if_missed: "notify", created_at: "2019-12-31T23:00:00.000Z", fired_at: null, cleared_at: null }; // missing owner
+
+  it("`headroom status --json` throws on a malformed timer_list member, instead of normalizing it into a contract-invalid due_timer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-malformed-member-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    try { server = await startLegacyDaemon(path, undefined, [timerRowMalformed]); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI malformed-member test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      await expect(main(["--json"])).rejects.toThrow(/missing required field "owner"/);
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("`headroom timer list --json` throws on a malformed row, instead of normalizing it into a contract-invalid timer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-timerlist-malformed-member-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    try { server = await startLegacyDaemon(path, undefined, [timerRowMalformed]); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list malformed-member test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      await expect(main(["timer", "list", "--json"])).rejects.toThrow(/missing required field "owner"/);
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("MCP quota_status throws on a malformed timer_list member, instead of normalizing it into a contract-invalid due_timer", async () => {
+    const reply = await handleMcp(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}',
+      async (method) => {
+        if (method === "status") return [];
+        if (method === "plan_downgrades") return { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } };
+        if (method === "heartbeats") return [];
+        if (method === "timer_list") return [timerRowMalformed];
+        return undefined;
+      },
+    ) as { error?: { code: number; message: string }; result?: unknown };
+    expect(reply.result).toBeUndefined();
+    expect(reply.error?.message).toContain('missing required field "owner"');
+  });
 });

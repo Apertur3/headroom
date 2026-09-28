@@ -966,7 +966,13 @@ export class HeadroomDaemon {
     // succeed), but skipping the second pass entirely avoids the wasted
     // work and duplicate log lines it would otherwise produce.
     if (!this.timerFiringInFlight) {
-      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now, undefined, undefined, this.deliveryTimeoutMs)
+      // A real, advancing clock for each individual claim/send/confirm --
+      // not this pass's own frozen `now`, which only decides which timers
+      // are due for this pass (see fireDueTimers's own doc comment on why
+      // reusing it for every timestamp would let a --since cursor hide a
+      // timer this same pass genuinely delivers later, in real time, than
+      // some other message written while it was still busy).
+      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now, undefined, undefined, this.deliveryTimeoutMs, () => new Date())
         .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
         .finally(() => { this.timerFiringInFlight = undefined; });
     }
