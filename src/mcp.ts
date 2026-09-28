@@ -10,7 +10,7 @@ import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
-import { readAccounts } from "./registry.js";
+import { readAccounts, readAccountsOrEmpty } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
@@ -19,7 +19,7 @@ import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
 import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Heartbeat, type Timer } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Heartbeat, type Timer } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
@@ -181,6 +181,27 @@ function heartbeatFields(store: HeadroomStore, now: Date): { heartbeats: Heartbe
   return { heartbeats: store.heartbeats(), due_timers: store.timers().filter((item) => Date.parse(item.at) <= now.getTime()) };
 }
 
+// Registry reads for the disabled-principal check use readAccountsOrEmpty():
+// a missing accounts.toml (before the first `accounts discover`) is a
+// normal, well-defined "no accounts configured" state, but a malformed or
+// otherwise unreadable file must still fail closed -- propagated here, which
+// the outer handleMcp try/catch turns into an MCP tool error -- never
+// silently reported as "no disabled accounts," which could admit a parked
+// principal's stored capacity as current.
+async function disabledMeterReason(meter: string): Promise<string | undefined> {
+  const principal = disabledPrincipalForMeter(await readAccountsOrEmpty(), meter);
+  return principal ? disabledPrincipalReason(principal) : undefined;
+}
+
+async function statusObservations(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, stalenessMinutes: number, now: Date): Promise<{ observations: ReturnType<typeof withStatus>; disabled_principals: string[] }> {
+  // A direct MCP read must hide old rows exactly like daemon-backed status;
+  // this configuration lookup touches neither credentials nor adapters.
+  const accounts = await readAccountsOrEmpty();
+  const disabled_principals = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+  const served = withCreditsLapsed(withStatus(store, observations.filter((item) => !disabled_principals.includes(item.principal_id)), stalenessMinutes, now), now);
+  return { observations: served, disabled_principals };
+}
+
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
@@ -205,10 +226,10 @@ export async function directStatus(dependencies: DirectStatusDependencies = {}):
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withCreditsLapsed(withStatus(store, cached, policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
+      return { source: "direct", ...(await statusObservations(store, cached, policy.staleness_minutes, requestedAt)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
+      return { source: "direct", ...(await statusObservations(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt)), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -226,7 +247,7 @@ export async function directStatus(dependencies: DirectStatusDependencies = {}):
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: responseNow, until: protectedFailure ? responseNow + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, responseAt) };
+    return { source: "direct", ...(await statusObservations(store, store.latestPerWindow(), policy.staleness_minutes, responseAt)), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, responseAt) };
   } finally { store.close(); }
 }
 
@@ -247,7 +268,7 @@ async function cacheStatus(dependencies: DirectStatusDependencies = {}): Promise
     const now = dependencies.now?.() ?? new Date();
     return {
       source: "cache", daemon: "unresponsive",
-      observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, now), now),
+      ...(await statusObservations(store, store.latestPerWindow(), policy.staleness_minutes, now)),
       failures: [], plan_downgraded: store.planDowngrades()[0] ?? null,
       ...heartbeatFields(store, now),
     };
@@ -264,7 +285,13 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
   try {
     const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
     if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
-    const localAccounts = accounts.filter(isLocalAccount);
+    const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+    if (disabledMeter) {
+      const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+      const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
+      return { source: "direct", decision, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
+    }
+    const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
     store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
     const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
     const now = new Date();
@@ -379,10 +406,17 @@ async function cacheEvents(since: unknown): Promise<DirectResult> {
 }
 
 async function directLeaseStart(arguments_: Record<string, unknown>): Promise<DirectResult> {
+  const meterId = String(arguments_.meter_id ?? "");
+  const disabled = meterId ? await disabledMeterReason(meterId) : undefined;
+  // A write, not a read with its own "UNKNOWN" convention: refuse it the
+  // same way the daemon's own lease_start RPC rejection already does (a
+  // thrown error, which handleMcp's own catch turns into a standard MCP
+  // tool error), never a one-off { allowed: false } object only this path
+  // would ever produce.
+  if (disabled) throw new Error(disabled);
   const store = await HeadroomStore.open();
   try {
     const owner = String(arguments_.owner ?? "");
-    const meterId = String(arguments_.meter_id ?? "");
     const actionClass = typeof arguments_.action_class === "string" && arguments_.action_class.trim() ? arguments_.action_class.trim() : null;
     const lease = store.startLease(owner, meterId, typeof arguments_.expected_percent === "number" ? arguments_.expected_percent : null, typeof arguments_.ttl_ms === "number" ? arguments_.ttl_ms : 30 * 60_000, typeof arguments_.note === "string" ? arguments_.note : null, new Date(), actionClass);
     store.audit("mcp", "lease_start", `${owner}:${meterId}`, "ok");
@@ -447,6 +481,8 @@ async function directCost(actionClass: unknown): Promise<DirectResult> {
 }
 
 async function directRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  if (disabled) return { source: "direct", lines: [{ meter, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }] };
   const store = await HeadroomStore.open();
   try {
     const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
@@ -493,6 +529,11 @@ async function directInbox(session: unknown, since: unknown): Promise<DirectResu
 
 async function directPlan(meter: unknown, reservePercent: unknown, need: unknown, targetPoints: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  // Same documented { meter, error, notices } failure shape `plan` always
+  // returns (docs/json-contract.md) -- no `unknown` field (plan's contract
+  // has none), matching the daemon's identical disabled-plan branch.
+  if (disabled) return { source: "direct", meter, error: disabled, notices: [] };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
@@ -508,6 +549,12 @@ async function directPlan(meter: unknown, reservePercent: unknown, need: unknown
 async function directUsagePaste(principal: unknown, text: unknown): Promise<DirectResult> {
   if (typeof text !== "string" || !text.trim()) throw new Error("text is required: paste the /usage panel");
   const resolved = resolveClaudePrincipal(await readAccounts(), typeof principal === "string" && principal.trim() ? principal.trim() : undefined);
+  const disabled = await disabledMeterReason(`${resolved}:all`);
+  // A write, not a read with its own "UNKNOWN" convention: refuse it as an
+  // ordinary thrown error (handleMcp's own catch turns it into a standard
+  // MCP tool error), matching the CLI's usage --paste refusal, never a
+  // one-off { allowed: false } object only this path would ever produce.
+  if (disabled) throw new Error(disabled);
   const now = new Date();
   const panel = parseUsagePanel(text, now);
   if (!panel.windows.length) throw new Error('no usage window in the pasted text; expected a line like "Current session" or "Current week (all models)" with a percent');
@@ -539,6 +586,11 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
 async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
+  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  // meters_checked names the meter actually examined, matching gateFor's own
+  // convention (and the daemon's identical disabled-gate branch) -- never a
+  // hard-coded empty array.
+  if (disabled) return { source: "direct", allowed: false, unknown: true, reason: disabled, meters_checked: typeof meter === "string" ? [meter] : [], notices: [] };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
@@ -558,6 +610,8 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
 
 async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReservePercent: unknown, owner: unknown, planSharePercent: unknown, need: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return { source: "direct", meter, error: disabled, notices: [] };
   const policy = await readPolicy();
   const weeklyReserve = typeof weeklyReservePercent === "number" ? weeklyReservePercent : policy.freeze_reserve_pct;
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
@@ -575,6 +629,8 @@ async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReserv
  * in one uninterruptible call. */
 async function directWait(meter: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
+  const disabled = await disabledMeterReason(meter);
+  if (disabled) return { source: "direct", meter, resets_at: null, resets_in_seconds: null, suggested_sleep_seconds: null, reason: disabled, unknown: true };
   const store = await HeadroomStore.open();
   try {
     const rows = store.latestPerWindow(meter).filter((item) => item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
@@ -772,6 +828,20 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     } else {
       result = await call(daemonMethod, params_);
     }
+    // A rejected daemon RPC (e.g. a disabled-principal fail-closed refusal
+    // from plan/gate/fill/rate/lease_start/can) comes back as a JSON-RPC
+    // error envelope, not `undefined` -- daemonRequest()/rpc() only treat a
+    // dropped connection as "unresponsive", never a domain-level `error`
+    // reply, as "not available". Without this check that envelope would be
+    // treated as ordinary tool data and wrapped inside a successful
+    // tools/call reply (see src/cli.ts's own unwrapRpc for the equivalent
+    // direct-CLI guard). Throwing here instead routes it through the same
+    // catch below that already turns every other failure into a proper MCP
+    // tool error.
+    if (result && typeof result === "object" && "jsonrpc" in result && "error" in result) {
+      const rpcErrorReply = (result as { error?: { message?: unknown } }).error;
+      throw new Error(typeof rpcErrorReply?.message === "string" ? rpcErrorReply.message : "Daemon request failed");
+    }
     const resolved = servedFromCache ? await cacheResult(method, arguments_) : result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or
@@ -799,7 +869,17 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       const timersReply = await call("timer_list", {});
       const pendingTimers = Array.isArray(timersReply) ? timersReply as Timer[] : [];
       const dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
-      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null, heartbeats, due_timers: dueTimers };
+      // disabled_principals is derived here, from the registry, never
+      // returned by the daemon's own "status" RPC -- that stays the bare
+      // Observation[] array the 1.x contract requires (docs/json-contract.md).
+      // A missing accounts.toml reads as "no accounts"; a malformed or
+      // otherwise unreadable one fails closed (propagates, caught below as
+      // an MCP tool error) rather than silently reporting "no disabled
+      // accounts."
+      const accounts = await readAccountsOrEmpty();
+      const disabled_principals = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+      const filteredObservations = observations.filter((item) => !disabled_principals.includes(item.principal_id));
+      finalResult = { observations: filteredObservations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null, disabled_principals, heartbeats, due_timers: dueTimers };
     }
     // `can` and `gate` additionally carry the same host-pressure reading
     // `headroom can`/`gate --json` and `doctor` report (src/host-health.ts):

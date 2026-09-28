@@ -12,8 +12,8 @@ function quoted(value: string): string { return JSON.stringify(value); }
 
 export function accountsToml(accounts: Account[]): string {
   return accounts.map((account) => isLocalAccount(account)
-    ? ["[[accounts]]", `name = ${quoted(account.name)}`, 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "native"', ""].join("\n")
-    : ["[[accounts]]", `name = ${quoted(account.name)}`, `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ...(account.alias ? [`alias = ${quoted(account.alias)}`] : []), ""].join("\n")).join("\n");
+    ? ["[[accounts]]", `name = ${quoted(account.name)}`, ...(account.enabled === false ? ["enabled = false"] : []), 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "native"', ""].join("\n")
+    : ["[[accounts]]", `name = ${quoted(account.name)}`, ...(account.enabled === false ? ["enabled = false"] : []), `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ...(account.alias ? [`alias = ${quoted(account.alias)}`] : []), ""].join("\n")).join("\n");
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -71,7 +71,24 @@ export async function discoverAccounts(home = homedir(), environment = process.e
 
 export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void> {
   await fs.mkdir(headroomHome(), { recursive: true, mode: 0o700 });
-  await fs.writeFile(accountsPath(), accountsToml(accounts), { mode: 0o600 });
+  // Discovery updates locations and adapters, but an existing account is the
+  // operator's configuration. In particular, rediscovery must not wake a
+  // deliberately parked principal.
+  const existing = await readAccountsOrEmpty();
+  // Only the operator's `enabled` flag survives a rediscovery for a name it
+  // already knew -- everything else (location, adapter, etc.) comes from the
+  // fresh scan, so a moved config dir or a changed adapter actually takes
+  // effect instead of being frozen at whatever discovery first saw. A
+  // provider account discovery no longer finds (credential removed, config
+  // dir gone) is dropped, matching docs/vendors.md's "rerunning discovery
+  // replaces the account file" -- it must stop being polled forever. Local
+  // accounts (`kind: "local"`) are never produced by discovery at all and
+  // are preserved untouched.
+  const priorEnabled = new Map(existing.map((account) => [account.name, account.enabled]));
+  const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
+  const localAccounts = existing.filter(isLocalAccount);
+  const merged = [...discovered, ...localAccounts];
+  await fs.writeFile(accountsPath(), accountsToml(merged), { mode: 0o600 });
   await fs.chmod(accountsPath(), 0o600);
 }
 
@@ -82,23 +99,74 @@ export async function readAccounts(): Promise<Account[]> {
   for (const rawLine of text.split("\n")) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
-    if (line === "[[accounts]]") { if (current) accounts.push(validate(current)); current = {}; continue; }
-    const match = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path|alias)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(line);
-    if (!match || !current) throw new Error(`Invalid accounts.toml line: ${line}`);
-    current[match[1]] = JSON.parse(`"${match[2]}"`) as string;
+    if (/^\[\[accounts\]\]\s*(?:#.*)?$/.test(line)) { if (current) accounts.push(validate(current)); current = {}; continue; }
+    const stringMatch = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path|alias)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(line);
+    const enabledMatch = /^enabled\s*=\s*(true|false)\s*(?:#.*)?$/.exec(line);
+    if (!current || (!stringMatch && !enabledMatch)) throw new Error(`Invalid accounts.toml line: ${line}`);
+    if (stringMatch) current[stringMatch[1]] = JSON.parse(`"${stringMatch[2]}"`) as string;
+    else current.enabled = enabledMatch![1];
   }
   if (current) accounts.push(validate(current));
   return accounts.map((account) => isLocalAccount(account) ? account : { ...account, location: expandHome(account.location) });
 }
 
+/**
+ * The disabled-principal check (and anything else that only needs to know
+ * *which* principals exist, not fail a whole command over it) reads the
+ * registry through this instead of a swallowing `.catch(() => [])`: a
+ * missing `accounts.toml` (before the first `accounts discover`) is a
+ * normal, well-defined "no accounts configured" state, but a malformed or
+ * otherwise unreadable file must still fail closed -- propagated here, never
+ * silently reported as "nothing disabled," which could let a parked
+ * principal's stored capacity look admissible again.
+ */
+export async function readAccountsOrEmpty(): Promise<Account[]> {
+  return readAccounts().catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as Account[];
+    throw error;
+  });
+}
+
 function validate(value: Record<string, string>): Account {
   if (value.kind === "local") {
     if (!value.name || !value.base_url || (value.adapter && value.adapter !== "native")) throw new Error("Invalid local account entry in accounts.toml");
-    return { name: value.name, kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "native" } satisfies LocalAccount;
+    return { name: value.name, ...(value.enabled === "false" ? { enabled: false } : {}), kind: "local", base_url: value.base_url, ...(value.wake ? { wake: value.wake } : {}), adapter: "native" } satisfies LocalAccount;
   }
   if (!value.name || (value.vendor !== "codex" && value.vendor !== "claude" && value.vendor !== "antigravity" && value.vendor !== "gemini" && value.vendor !== "grok" && value.vendor !== "kimi") || !value.location || (value.adapter !== "codexbar" && value.adapter !== "native" && value.adapter !== "native-ts" && value.adapter !== "engine" && value.adapter !== "pending")) throw new Error("Invalid account entry in accounts.toml");
   // `native` was the old Swift-first spelling. Preserve existing configs while
   // making the new registry default unambiguous.
   const adapter = value.adapter === "native" ? (value.vendor === "antigravity" ? "engine" : "native-ts") : value.adapter;
-  return { name: value.name, vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}), ...(value.alias ? { alias: value.alias } : {}) } as ProviderAccount;
+  return { name: value.name, ...(value.enabled === "false" ? { enabled: false } : {}), vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}), ...(value.alias ? { alias: value.alias } : {}) } as ProviderAccount;
+}
+
+/** Changes only one entry's enabled line. This avoids a serialize/parse round
+ * trip that would erase an operator's comments, layout, and unknown future
+ * TOML keys just to park one principal. */
+export async function setAccountEnabled(name: string, enabled: boolean): Promise<void> {
+  const path = accountsPath();
+  const text = await fs.readFile(path, "utf8");
+  const lines = text.split(/(?<=\n)/);
+  const bare = (line: string): string => line.replace(/\r?\n$/, "");
+  const starts = lines.map((line, index) => /^\s*\[\[accounts\]\]\s*(?:#.*)?$/.test(bare(line)) ? index : -1).filter((index) => index >= 0);
+  let start = -1, end = lines.length, nameLine = -1;
+  for (let index = 0; index < starts.length; index += 1) {
+    const candidateStart = starts[index];
+    const candidateEnd = starts[index + 1] ?? lines.length;
+    const found = lines.slice(candidateStart + 1, candidateEnd).findIndex((line) => {
+      const match = /^\s*name\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(bare(line));
+      return match !== null && JSON.parse(match[1]) === name;
+    });
+    if (found >= 0) { start = candidateStart; end = candidateEnd; nameLine = candidateStart + 1 + found; break; }
+  }
+  if (start < 0) throw new Error(`Unknown account: ${name}`);
+  const enabledLine = lines.slice(start + 1, end).findIndex((line) => /^\s*enabled\s*=\s*(?:true|false)\s*(?:#.*)?$/.test(bare(line)));
+  if (enabledLine >= 0) {
+    const index = start + 1 + enabledLine;
+    lines[index] = lines[index].replace(/^(\s*)enabled\s*=\s*(?:true|false)(\s*(?:#.*)?)(\r?\n?)$/, `$1enabled = ${enabled}$2$3`);
+  } else {
+    const newline = lines[nameLine].endsWith("\r\n") ? "\r\n" : "\n";
+    if (!lines[nameLine].endsWith("\n")) lines[nameLine] += newline;
+    lines.splice(nameLine + 1, 0, `enabled = ${enabled}${newline}`);
+  }
+  await fs.writeFile(path, lines.join(""), { mode: 0o600 });
 }
