@@ -216,6 +216,21 @@ export async function processSignature(pid: number, execImpl: ExecFile = execFil
   return command && startedAt ? { command, startedAt } : undefined;
 }
 
+/** How long one process has been running, in whole seconds, from `ps`'s
+ * `etime` (`[[dd-]hh:]mm:ss`, the same on BSD and procps). Unlike `lstart`,
+ * this is measured on one clock: procps derives `lstart` from the boot time,
+ * kept in whole seconds, so it can read up to a second early against the
+ * wall clock. Undefined when the process is gone or `ps` cannot be run. */
+export async function processElapsedSeconds(pid: number, execImpl: ExecFile = execFileAsync): Promise<number | undefined> {
+  let raw: string | undefined;
+  try { raw = (await execImpl("ps", ["-o", "etime=", "-p", String(pid)])).stdout.split("\n")[0]?.trim(); }
+  catch { return undefined; }
+  const match = raw?.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!match) return undefined;
+  const [, days, hours, minutes, seconds] = match;
+  return ((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds);
+}
+
 /** One process's full argument line from `ps`, never truncated to a
  * terminal width (`-ww`, accepted by both BSD and procps ps). Undefined when
  * the process is gone or `ps` cannot be run. */

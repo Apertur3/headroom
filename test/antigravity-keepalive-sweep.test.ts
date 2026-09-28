@@ -349,9 +349,9 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leav
     try {
       const pidPath = launchPidPath(root, supervisor);
       const writtenAtMs = (await stat(pidPath)).mtimeMs;
-      // Start the look-alike in a later whole second than the pid file's write.
-      const nextSecond = Math.floor(writtenAtMs / 1000) * 1000 + 1000;
-      await new Promise((resolve) => setTimeout(resolve, Math.max(0, nextSecond - Date.now()) + 100));
+      // Start the look-alike well after the pid file's write, clear of ps's
+      // whole-second resolution.
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, writtenAtMs + 2_000 - Date.now())));
       const recycled = spawn(fakeAgy, [], { stdio: "ignore", detached: true });
       const recycledPid = track(recycled.pid, root) as number;
       await writeFile(pidPath, String(recycledPid));

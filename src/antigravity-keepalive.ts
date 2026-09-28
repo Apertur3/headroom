@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSyn
 import { lstat, open, readdir, readFile, rmdir, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
-import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processArgs, processSignature, type ExecFile } from "./process-tree.js";
+import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processArgs, processElapsedSeconds, processSignature, type ExecFile } from "./process-tree.js";
 
 type Spawn = (command: string, args: string[], options: { stdio: "ignore"; env: NodeJS.ProcessEnv; detached?: boolean }) => ChildProcess;
 
@@ -938,22 +938,20 @@ export class AgyKeepaliveSupervisor {
   }
 
   /** The wrapper's pid is this launch's agy when it still runs this
-   * supervisor's binary and started between this launch and the pid file's
-   * write, compared in whole seconds because lstart has that resolution. The
-   * genuine wrapper writes the file after it starts, so its start second is
-   * never later than the file's; a pid recycled after agy died starts later,
-   * and anything else runs a different command.
-   * Without ps this says no, and reconcileEvidence's ps-free tier decides. */
+   * supervisor's binary and has been running at least as long as its pid
+   * file has existed (the wrapper writes the file after it starts) and no
+   * longer than this launch. A pid recycled after agy died is younger than
+   * the file, and anything else runs a different command. Both ages are
+   * durations, so ps's whole-second truncation is the only slack. Without
+   * ps this says no, and reconcileEvidence's ps-free tier decides. */
   private async isThisLaunchAgy(pid: number, pidPath: string, launchedAt: string | undefined): Promise<boolean> {
     const launchedAtMs = launchedAt ? Date.parse(launchedAt) : NaN;
     const entry = await readAgyPidFile(pidPath);
     if (!Number.isFinite(launchedAtMs) || !entry || entry.pid !== pid) return false;
-    const [signature, args] = await Promise.all([processSignature(pid), processArgs(pid)]);
-    if (!signature || !args || !argsRunBinary(args, this.binary)) return false;
-    const startedMs = Date.parse(signature.startedAt);
-    return Number.isFinite(startedMs)
-      && startedMs >= Math.floor(launchedAtMs / 1000) * 1000 - 1000
-      && startedMs <= Math.floor(entry.mtimeMs / 1000) * 1000;
+    const now = Date.now();
+    const [elapsed, args] = await Promise.all([processElapsedSeconds(pid), processArgs(pid)]);
+    if (elapsed === undefined || !args || !argsRunBinary(args, this.binary)) return false;
+    return elapsed >= Math.floor((now - entry.mtimeMs) / 1000) && elapsed <= Math.ceil((Date.now() - launchedAtMs) / 1000) + 1;
   }
 
   private forgetLaunchDirectory(): void {
