@@ -401,15 +401,41 @@ sends. A session id is one path segment of `[A-Za-z0-9._-]{1,64}` and nothing el
 tree lives inside the verified Headroom home at 0700, and a file Headroom did not write is skipped
 rather than guessed at.
 
+## Heartbeats and timers
+
+An orchestrator session can crash and take every in-session timer and watcher down with it,
+unnoticed for however long nobody happens to look. The daemon is the one process that survives
+that crash, so it can hold both an orchestrator's heartbeat and its named wake-ups instead.
+
+`headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` records or
+refreshes a promise to beat at least that often, keyed by `owner` (the same identity namespace as
+a lease owner or an inbox session), with an optional resume sentence -- what a human or a fresh
+session should do to pick the work back up. The daemon checks every registered heartbeat on each
+poll; one gone overdue by more than 2x its own interval gets `lapsed_since` set and exactly one
+`heartbeat_lapsed` event (never repeated while that lapse stays open), which the notifier delivers
+through the ordinary ledger dedupe and quiet hours -- see `docs/notifications.md`. A later beat
+closes the lapse immediately and may send one short `heartbeat_restored`. `--stop` deregisters a
+heartbeat without announcing a restore; `heartbeat list [--json]` shows every registered one.
+
+`headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
+[--if-missed notify|drop]` registers a named wake-up. When it comes due, the daemon delivers it
+exactly once as one inbox entry to its owner (see Inbox, above) -- **Headroom only ever delivers
+the action text; it never executes it.** `--if-missed notify` (the default) additionally raises
+one `timer_missed` event if the owner's heartbeat is currently lapsed at that moment, since a
+crashed session will never read its own inbox; `--if-missed drop` still delivers the inbox entry
+but never notifies. `timer list [--owner <name>] [--json]` shows pending timers (never fired,
+never cleared); `timer clear --owner <name> --name <id>` clears one. `status`'s own `due_timers`
+field is the subset of pending timers already at or past their own `at`.
+
 ## Events
 
 An event is a separate, append-only record of something that happened to a principal or meter: a
 reset was seen, a free reset was granted or used, a plan changed, a source started failing or
-recovered, a lease started or ended. Each event carries its origin, `vendor_reported` when the
-vendor said so directly or `inferred` when Headroom deduced it (for example, from a large drop in
-usage between polls), a confidence score, and the observation ids that back it up. Events are
-never folded into observations; a percentage and the fact that explains it are two different kinds
-of record.
+recovered, a lease started or ended, a heartbeat lapsed or was restored, a timer fired while its
+owner was unattended. Each event carries its origin, `vendor_reported` when the vendor said so
+directly or `inferred` when Headroom deduced it (for example, from a large drop in usage between
+polls), a confidence score, and the observation ids that back it up. Events are never folded into
+observations; a percentage and the fact that explains it are two different kinds of record.
 
 Example: `codex-main` shows `reset seen 14:00 (inferred, 62%)` when usage drops sharply without a
 vendor-confirmed reset timestamp yet.

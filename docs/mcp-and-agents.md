@@ -1,9 +1,9 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes sixteen tools, defined in `src/mcp.ts`: status, action checks, events,
-three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, and pasted
-`/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
+SDK dependency. It exposes seventeen tools, defined in `src/mcp.ts`: status, action checks, events,
+three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats, and
+pasted `/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
 first, over its local socket or named pipe, and falls back to
 a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`,
 `quota_route`, `quota_inbox`, and `quota_usage_paste` always read directly, since none has a daemon RPC case at
@@ -250,6 +250,50 @@ No arguments. Lists active and recently ended leases with their estimated spend.
 }
 ```
 
+## Heartbeat tool
+
+### `quota_heartbeat`
+
+Arguments: `owner` (string, optional; defaults to `<client name>#<session id>` from the MCP
+session, same as `quota_lease_start`), `interval_ms` (number, required unless `stop: true`, > 0),
+`resume_sentence` (string, optional -- what a human or a fresh session should do to pick this
+session's work back up; omitted on a plain re-beat to keep whatever was registered before),
+`stop` (boolean, optional -- deregisters instead of beating; `interval_ms`/`resume_sentence` are
+then ignored). Tries the daemon first like every lease tool; there is no CLI equivalent for a
+one-shot beat other than `headroom heartbeat --owner <name> --every <duration>` itself.
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"quota_heartbeat","arguments":{"owner":"triage-bot","interval_ms":300000,"resume_sentence":"rerun the deploy"}}}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "result": {
+    "content": [{ "type": "text", "text": "{...}" }],
+    "structuredContent": {
+      "source": "daemon",
+      "heartbeat": {
+        "owner": "triage-bot",
+        "interval_ms": 300000,
+        "resume_sentence": "rerun the deploy",
+        "started_at": "2026-09-28T12:00:00.000Z",
+        "last_beat_at": "2026-09-28T12:00:00.000Z",
+        "lapsed_since": null,
+        "updated_at": "2026-09-28T12:00:00.000Z"
+      }
+    }
+  }
+}
+```
+
+The daemon checks every registered heartbeat on each poll; one gone overdue by more than 2x its
+own interval gets one `heartbeat_lapsed` notification (never repeated for the same open lapse),
+delivered the same way every other event is -- see `docs/notifications.md`. A later beat closes
+the lapse and may send one short `heartbeat_restored`. Named wake-ups (`headroom timer`) have no
+MCP tool of their own; they are CLI-only.
+
 ## Pacing and routing tools
 
 Every one of these takes a `meter` id (for example `codex-main:main`) unless noted, and answers
@@ -396,6 +440,8 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_spend` | `headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]` |
 | `quota_inbox` | `headroom inbox --session <session-id> [--since <epoch-ms>] [--json]` (send: `headroom inbox send --to <session-id> --kind <budget\|note\|handoff> (--file <path> \| --text <text>)`) |
 | `quota_usage_paste` | `headroom usage --paste [--principal <id>] [--json]` (or `--clipboard`) |
+| `quota_heartbeat` | `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` (stop: `--stop`; list: `heartbeat list [--json]`) |
+| (none -- CLI only) | `headroom timer set --owner <name> --name <id> --at <ISO\|+duration> --action "<text>" [--if-missed notify\|drop]` (list: `timer list [--owner <name>] [--json]`; clear: `timer clear --owner <name> --name <id>`) |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match
