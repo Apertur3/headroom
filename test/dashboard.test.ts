@@ -3,7 +3,6 @@ import { PassThrough, Writable } from "node:stream";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHmac } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +11,7 @@ import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboar
 import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 import type { Observation } from "../src/types.js";
 
 const now = new Date("2026-09-08T12:00:00Z");
@@ -437,11 +437,10 @@ describe("dashboard cached data", () => {
     const poller = vi.fn(async () => { throw new Error("must not poll"); });
     const daemon = await HeadroomDaemon.create({ home: root, poller });
     try {
-      const internal = daemon as unknown as { accounts: Array<{ name: string }>; sessionToken: string; handleLine(line: string, nonce: string): Promise<{ replyLine: string }> };
-      internal.accounts = [{ name: "account-a" }]; internal.sessionToken = "synthetic-local-test-token";
-      const nonce = "synthetic-nonce", proof = createHmac("sha256", internal.sessionToken).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");
-      const reply = await internal.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "dashboard", params: { _proof: proof } }), nonce);
-      expect(JSON.parse(reply.replyLine).result.observations[0].quantity.used).toBe(20); expect(poller).not.toHaveBeenCalled();
+      const internal = daemon as unknown as { accounts: Array<{ name: string }> };
+      internal.accounts = [{ name: "account-a" }];
+      const reply = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "dashboard", params: {} }));
+      expect((reply.result as { observations: Observation[] }).observations[0].quantity?.used).toBe(20); expect(poller).not.toHaveBeenCalled();
     } finally { await daemon.stop(); await rm(root, { recursive: true, force: true }); }
   });
 });

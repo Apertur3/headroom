@@ -908,11 +908,12 @@ describe("pace and consumes", () => {
     expect(unknownMeterPrincipals(["codex-main:main", "typo-principal:main"], known)).toEqual(["typo-principal:main"]);
   });
 
-  it("renders credit counts as availability and excludes them from can decisions", () => {
+  it("renders credit counts as availability but never dispatches through one", () => {
     const now = new Date("2026-09-03T12:00:00Z");
     const credit = observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-21T12:00:00Z", fetched_at: now.toISOString() });
     expect(formatMeters([credit], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 available (expires Sep 21)");
-    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy)).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
+    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy, false, now)).toMatchObject({ allowed: false, state: "UNKNOWN", reason: "count meter codex-main:credits cannot be used for dispatch" });
+    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy, true, now)).toMatchObject({ allowed: false, state: "UNKNOWN" });
   });
 
   it("labels a multi-window meter fresh when any enforced window is fresh", () => {

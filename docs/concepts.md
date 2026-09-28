@@ -228,6 +228,10 @@ if the account's overall `all` meter has room.
 Example: `claude-fable = ["claude-main:all", "claude-main:fable"]` means a `claude-fable` action
 needs both meters to allow it.
 
+An informational `count` meter is never a meter an action can consume: placing one in a consumes
+entry makes `can`, `route`, and `gate` refuse, even with `--allow-unknown`. It can describe reset
+credits, prepaid money, or another vendor count; none of those is dispatch capacity.
+
 ## Leases
 
 A lease reserves a slice of a meter for one orchestrator before it fans out work, so a second
@@ -255,6 +259,30 @@ resolving to several meters, every one of them must have a usable reading -- a m
 genuinely consumes but that has never produced a windowed reading fails the whole gate UNKNOWN by
 name, rather than being silently skipped while a different, populated meter in the same class
 answers on its own.
+
+### Banked resets
+
+Codex reports banked reset credits and their earliest expiry as a `<principal>:credits` count;
+Claude's usage endpoint does not expose them. A count becomes a banked reset for planning only when
+it is an operator's manual entry or has the vendor's explicit `free_resets_available` marker.
+Prepaid or on-demand balances remain informational counts, never reset capacity. Vendor-marked
+reset counts must also be fresh and not held or inconsistent; a manual entry remains usable until it
+is cleared, superseded, or expires. When a human says a Claude banked reset exists,
+record it with `headroom credits set --principal claude-main --available 1 --expires 2026-10-05`
+(and `headroom credits clear --principal claude-main` after it is gone). The entry is an auditable,
+estimated manual observation, and a later vendor-reported Codex reading naturally supersedes a
+manual one. `headroom plan --meter claude-main:all --until reset --target <points>` reports the
+weekly budget left above reserve, the value of each banked reset (`100 - reserve`), and whether the
+target fits now or after a number of resets. It advises using one now only when none would otherwise
+survive to the scheduled reset, or when a blocked target is more than 24 hours from that reset;
+otherwise it says to wait, or that no target is blocked. A lapsed credit always remains in history,
+and shows in status as expired until superseded there by a newer reading for the same meter -- even
+a failed vendor poll, which a live (unlapsed, uncleared) manual entry would otherwise outrank; either
+way, a lapsed credit contributes zero to planning. Headroom never fires a reset: that remains a
+human action in the vendor UI. A date-only `--expires` value is midnight UTC on that calendar day,
+and credit status renders that same UTC calendar day in every timezone. At a 100% reserve each
+reset is worth zero, so a target that does not already fit has `resets_needed: null` and the advice
+never recommends using a credit.
 
 `policy.toml`'s `pacing` (`"even"`, the default, or `"none"`) controls two extra checks scoped to a
 5h `--need` and one owner. The pro-rata line is that owner's planned share of the window (from

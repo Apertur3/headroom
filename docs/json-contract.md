@@ -163,7 +163,9 @@ minutes, i.e. nearest reset) that still has one in range, and `window_minutes`
 names which window that is -- present only in this borrowed case, absent when
 `last_known` already shares the observation's own window. Informational only:
 `can`/`gate`/`route` keep treating UNKNOWN as no capacity regardless of what
-this carries); `id?: number` (present once read back from the store, as
+this carries); `credits_lapsed?: boolean` is present and `true` only on an
+enriched credits observation whose `resets_at` expiry is in the past (it is
+computed at response time; the stored fact is never rewritten); `id?: number` (present once read back from the store, as
 every `--json` reading is); `status_enriched_at?: string` (the response-time
 instant that most recently set freshness, pace, last-known and reset fields.
 This marker records when enrichment last ran, never a license to skip
@@ -231,17 +233,45 @@ allowed.
 
 MCP `quota_gate` adds `source?: "direct"` over the same fields.
 
-### `plan` (`headroom plan --meter M --until reset --json`, MCP `quota_plan`)
+### `credits` (`headroom credits [set|clear] --json`)
+
+List: `{ contract, generated_at, credits: [{ principal: string, meter: string,
+available: number, expires_at: string | null, source: "vendor" | "manual",
+lapsed: boolean }] }`. `available` is zero once the expiry has passed, while
+`lapsed` preserves why. `set` and `clear` return the same per-meter object as
+`{ contract, generated_at, credit: {...} }`.
+
+A manual set is stored as an ordinary observation on `<principal>:credits`:
+`{ principal_id, meter_id, window: { kind: "count", minutes: null,
+enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: number,
+unit: "credits" }, resets_at: string, source: "manual", truth: "estimated",
+freshness: "fresh", confidence: 0.9, adapter_version: "manual",
+upstream_schema_version: "manual", metadata: { free_resets_available: number,
+manual: true } }`. `clear` keeps the same shape with `remaining: 0` and adds
+`metadata.manual_cleared: true`; neither operation deletes prior history.
+A date-only `expires` input is stored as midnight UTC and credit status renders its UTC calendar
+day, so the displayed day and lapse boundary do not change with the machine timezone.
+
+### `plan` (`headroom plan --meter M --until reset [--target P] --json`, MCP `quota_plan`)
 
 Success: `{ contract, generated_at, meter: string, weekly_remaining_percent:
 number, reserve_percent: number, hours_per_window: number,
 remaining_5h_windows: number, points_per_5h_window: number,
-plan_line_percent_per_hour: number, notices: string[] }`. Failure (the meter
+plan_line_percent_per_hour: number, usable_now_percent: number, banked: {
+available: number, expires_at: string | null, source: "vendor" | "manual" |
+null, lapsed: boolean, worth_percent: number }, target?: { points: number,
+fits_now: boolean, fits_with_banked: boolean, resets_needed: number | null }, advice:
+{ use_now: boolean, reason: string, use_before: string | null }, notices:
+string[] }`. Failure (the meter
 has no weekly window, or it is stale/failed/unpolled too long): `{ contract,
 generated_at, meter: string, error: string, notices: string[] }` -- a data
 state, not a CLI failure; the CLI renders it as an UNKNOWN line and always
 exits `0`. `notices` is the same unscheduled-reset line `gate` carries above
 (issue #20), scoped to this one meter; empty when none.
+`resets_needed` is `null` when the reserve gives each banked reset zero usable points and the
+target does not already fit; `advice.use_now` is then always `false`. A banked count is only a
+manual entry or a fresh, unheld vendor observation marked `free_resets_available`; other credits
+counts remain informational and contribute zero.
 
 Exit codes: always `0`.
 

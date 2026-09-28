@@ -14,6 +14,7 @@ import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion } from "./migrations.js";
 import { redact } from "./security.js";
+import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
  * carrying a leaked secret in one of its string fields is scrubbed the same
@@ -220,6 +221,17 @@ export interface PlanDowngrade {
   to: string;
   since: string;
   acknowledged: boolean;
+}
+
+/** The compact, deliberately vendor-neutral shape used by `headroom credits`.
+ * The raw observation is still available from history/status for audit detail. */
+export interface CreditBalance {
+  principal: string;
+  meter: string;
+  available: number;
+  expires_at: string | null;
+  source: BankedCreditSource;
+  lapsed: boolean;
 }
 
 function leaseFromRow(row: Row): Lease {
@@ -584,6 +596,51 @@ export class HeadroomStore {
   }
 
   insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
+
+  /** Record a banked reset a human can see in a vendor UI but the adapter
+   * cannot read (Claude currently exposes no corresponding usage field).
+   * This is an ordinary synthetic observation rather than mutable state: a
+   * later vendor fact wins naturally and every correction remains auditable. */
+  recordManualCredits(principal: string, available: number, expiresAt: string | null, cleared = false, now = new Date()): StoredObservation {
+    const at = now.toISOString();
+    const observation: Observation = {
+      principal_id: principal, meter_id: `${principal}:credits`,
+      window: { kind: "count", minutes: null, enforcement: "hard" },
+      quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiresAt,
+      // A clear is a current, genuinely fresh fact -- "the operator's balance
+      // is now zero" -- not a stale reading; `stale` means "this used to be
+      // current but has aged past the threshold", which a just-recorded clear
+      // never is. `metadata.manual_cleared` alone marks it for ranking
+      // (a later manual entry supersedes it, but a later failed vendor read
+      // does not hide it) and for excluding it from banked capacity; it keeps
+      // the same observation shape a fresh entry has (see docs/json-contract.md).
+      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9,
+      adapter_version: "manual", upstream_schema_version: "manual",
+      metadata: { free_resets_available: available, manual: true, ...(cleared ? { manual_cleared: true } : {}) },
+    };
+    // insert() normally compares against this exact count window and emits
+    // the change event. The first manual fact has no predecessor, but it is
+    // still a useful operator action to audit, so seed that one event here.
+    const previous = this.previous(observation);
+    const stored = this.insert(observation);
+    if (!previous) this.addEvent("credits_changed", "inferred", 0.9, [stored.id], stored, cleared ? "manual credits cleared" : "manual credits entry");
+    return stored;
+  }
+
+  /** Clearing is a zero-valued observation, not deletion. Preserve the
+   * prior expiry where one exists so history still says which banked reset
+   * the operator closed, even though its current usable count is zero. */
+  clearManualCredits(principal: string, now = new Date()): StoredObservation {
+    const existing = this.latestPerWindow(`${principal}:credits`).find(isCreditsObservation);
+    return this.recordManualCredits(principal, 0, existing?.resets_at ?? null, true, now);
+  }
+
+  credits(now = new Date()): CreditBalance[] {
+    return this.latestPerWindow().filter(isCreditsObservation).map((row) => ({
+      principal: row.principal_id, meter: row.meter_id, available: usableCredits(row, now), expires_at: row.resets_at,
+      source: creditSource(row), lapsed: creditsLapsed(row, now),
+    })).sort((a, b) => a.meter.localeCompare(b.meter));
+  }
 
   /** Record a complete vendor poll and retire windows omitted by that poll.
    * A later vendor response for the same duration supersedes the retirement.
@@ -1365,9 +1422,13 @@ export class HeadroomStore {
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
-      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
-      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current, null, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
-      if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
+      const manual = current.source === "manual";
+      const origin = manual ? "inferred" : "vendor_reported";
+      const confidence = manual ? 0.9 : 1;
+      const reason = manual ? current.metadata?.manual_cleared ? "manual credits cleared" : "manual credits entry" : null;
+      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", origin, confidence, evidence, current, reason);
+      if (currentCredits < previousCredits) this.addEvent("free_reset_used", origin, confidence, evidence, current, reason, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
+      if (currentCredits !== previousCredits) this.addEvent("credits_changed", origin, confidence, evidence, current, reason);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.recordPlanChange(previous, current, evidence);
   }
@@ -1445,7 +1506,29 @@ export class HeadroomStore {
     return this.db.prepare(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
-        ORDER BY (CASE WHEN freshness = 'fresh' OR freshness = 'not_enforced' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
+        -- A later manual entry supersedes an earlier one, including a clear.
+        -- A cleared/expired manual fact does not hide a newer failed poll:
+        -- rank it beside that failure so the newer row can explain the live
+        -- state rather than leaving this meter blank after filtering.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced')
+                         AND NOT (source = 'manual' AND (
+                           EXISTS (
+                             SELECT 1 FROM observations AS newer_manual
+                             WHERE newer_manual.meter_id = observations.meter_id
+                               AND COALESCE(CAST(json_extract(newer_manual.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                               AND newer_manual.source = 'manual'
+                               AND (newer_manual.fetched_at > observations.fetched_at OR (newer_manual.fetched_at = observations.fetched_at AND newer_manual.id > observations.id))
+                           )
+                           OR ((COALESCE(json_extract(metadata_json, '$.manual_cleared'), 0) = 1 OR (resets_at IS NOT NULL AND julianday(resets_at) <= julianday('now')))
+                             AND EXISTS (
+                               SELECT 1 FROM observations AS newer_failed
+                               WHERE newer_failed.meter_id = observations.meter_id
+                                 AND COALESCE(CAST(json_extract(newer_failed.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                                 AND newer_failed.freshness = 'failed'
+                                 AND (newer_failed.fetched_at > observations.fetched_at OR (newer_failed.fetched_at = observations.fetched_at AND newer_failed.id > observations.id))
+                             ))
+                         ))
+                      THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current
@@ -1476,12 +1559,16 @@ export class HeadroomStore {
               OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
-            -- A reading the operator pasted from the vendor's own panel stays
-            -- authoritative for an hour: a failed poll in that hour (a denied
-            -- probe, a transport error) must not hide it, or the paste would be
-            -- pointless on exactly the machine where the probe cannot read.
-            AND NOT (current.source = 'paste' AND peer.freshness = 'failed'
-                     AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+            -- A pasted reading stays authoritative for an hour. A live manual
+            -- banked-reset entry stays authoritative until it is cleared,
+            -- superseded, or expires: a later failed vendor poll must never
+            -- erase the one operator fact it cannot read itself.
+            AND NOT (peer.freshness = 'failed' AND (
+              (current.source = 'paste' AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+              OR (current.source = 'manual'
+                AND COALESCE(json_extract(current.metadata_json, '$.manual_cleared'), 0) = 0
+                AND (current.resets_at IS NULL OR julianday(current.resets_at) > julianday('now')))
+            ))
         )
       ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)
       .all(...(meterId === undefined ? [] : [meterId]))

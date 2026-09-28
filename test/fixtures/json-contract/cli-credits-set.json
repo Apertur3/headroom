@@ -1,0 +1,12 @@
+{
+  "contract": "string",
+  "credit": {
+    "available": "number",
+    "expires_at": "string",
+    "lapsed": "boolean",
+    "meter": "string",
+    "principal": "string",
+    "source": "string"
+  },
+  "generated_at": "string"
+}

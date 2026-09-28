@@ -1,4 +1,16 @@
 {
+  "advice": {
+    "reason": "string",
+    "use_before": "null",
+    "use_now": "boolean"
+  },
+  "banked": {
+    "available": "number",
+    "expires_at": "null",
+    "lapsed": "boolean",
+    "source": "null",
+    "worth_percent": "number"
+  },
   "contract": "string",
   "generated_at": "string",
   "hours_per_window": "number",
@@ -11,5 +23,12 @@
   "remaining_5h_windows": "number",
   "reserve_percent": "number",
   "source": "string",
+  "target": {
+    "fits_now": "boolean",
+    "fits_with_banked": "boolean",
+    "points": "number",
+    "resets_needed": "number"
+  },
+  "usable_now_percent": "number",
   "weekly_remaining_percent": "number"
 }

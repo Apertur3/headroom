@@ -12,6 +12,7 @@ import { computeFill, computePlan, evaluateBurst, evaluateProRataLine, fillClass
 import { maxMoreBeforeReset } from "./cost.js";
 import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type CanDecision, type Policy } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
+import { creditSource, creditsLapsed, isCurrentBankedResetObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 import type { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
 
@@ -141,7 +142,30 @@ export function rateLines(store: HeadroomStore, meter: string | undefined, lookb
   return lines;
 }
 
-type PlanCore = ({ meter: string } & PlanResult) | { meter: string; error: string };
+export interface BankedPlan {
+  available: number;
+  expires_at: string | null;
+  source: BankedCreditSource | null;
+  lapsed: boolean;
+  worth_percent: number;
+}
+
+export interface PlanTarget {
+  points: number;
+  fits_now: boolean;
+  fits_with_banked: boolean;
+  /** null means every banked reset is fully reserved, so no finite count fits. */
+  resets_needed: number | null;
+}
+
+export interface PlanAdvice {
+  use_now: boolean;
+  reason: string;
+  use_before: string | null;
+}
+
+export type PlanSuccess = { meter: string } & PlanResult & { banked: BankedPlan; target?: PlanTarget; advice: PlanAdvice };
+type PlanCore = PlanSuccess | { meter: string; error: string };
 
 /** Adds gate/plan/fill's shared `notices` (issue #20): for
  * UNSCHEDULED_RESET_HOURS after an unscheduled reset on any of the given
@@ -159,7 +183,7 @@ export type PlanOutcome = PlanCore & { notices: string[] };
 /** `reserves` is policy.toml's `[reserve]` table: the plan line is drawn
  * above the larger of the caller's own reserve percent and this meter's
  * protected floor, so `plan` never budgets points `gate` would then refuse. */
-function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>, needWindow?: string): PlanCore {
+function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>, needWindow?: string, targetPoints?: number): PlanCore {
   const { short, long } = meterWindows(store, meter);
   const target = needWindow ? knownPercentWindows(store, meter).find((row) => row.window?.minutes === windowNeedMinutes(needWindow)) : long;
   if (!target || !target.resets_at) return { meter, error: meterUnknownReason(store, meter, `no ${needWindow ?? "weekly"} window for ${meter}`) };
@@ -170,11 +194,50 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
   const freshness = freshnessGate(target, staleMinutes, now);
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
-  return { meter, ...computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now) };
+  const plan = computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now);
+  const credits = store.latestPerWindow(`${target.principal_id}:credits`)
+    .find((row) => isCurrentBankedResetObservation(row, staleMinutes, now));
+  const lapsed = credits ? creditsLapsed(credits, now) : false;
+  const banked: BankedPlan = {
+    available: usableCredits(credits, now), expires_at: credits?.resets_at ?? null,
+    source: credits ? creditSource(credits) : null, lapsed, worth_percent: 100 - plan.reserve_percent,
+  };
+  // `need` can select a shorter vendor window for the old pacing feature,
+  // but banked-reset advice always compares expiry with the weekly reset when
+  // one is available: that is the allowance a reset actually restores.
+  const scheduledReset = long?.resets_at ?? target.resets_at;
+  const hoursUntilReset = Math.max(0, (Date.parse(scheduledReset) - now.getTime()) / 3_600_000);
+  const targetResult = targetPoints === undefined ? undefined : (() => {
+    const fitsNow = targetPoints <= plan.usable_now_percent;
+    const fitsWithBanked = targetPoints <= plan.usable_now_percent + banked.available * banked.worth_percent;
+    const resetsNeeded = fitsNow ? 0
+      : banked.worth_percent > 0 ? Math.ceil((targetPoints - plan.usable_now_percent) / banked.worth_percent)
+        // A 100% reserve leaves no usable capacity per reset, so no finite
+        // number can fit. Null is valid JSON and says that directly.
+        : null;
+    return { points: targetPoints, fits_now: fitsNow, fits_with_banked: fitsWithBanked, resets_needed: resetsNeeded };
+  })();
+  const expiryBeforeReset = banked.expires_at && Number.isFinite(Date.parse(banked.expires_at))
+    && Number.isFinite(Date.parse(scheduledReset)) && Date.parse(banked.expires_at) < Date.parse(scheduledReset);
+  const resetHours = Math.ceil(hoursUntilReset);
+  const advice: PlanAdvice = banked.available <= 0
+    ? { use_now: false, reason: banked.lapsed ? "the banked reset has lapsed" : "no banked reset available", use_before: null }
+    : banked.worth_percent <= 0
+      ? { use_now: false, reason: "the reserve leaves no usable capacity per banked reset", use_before: null }
+    : expiryBeforeReset
+      ? { use_now: true, reason: `expires ${banked.expires_at} before the scheduled reset ${scheduledReset}; it is lost otherwise`, use_before: banked.expires_at }
+      : targetResult && !targetResult.fits_now && hoursUntilReset > 24
+        ? { use_now: true, reason: `the target does not fit in what is left and the reset is ${resetHours} h away`, use_before: null }
+        : targetResult?.fits_now
+          ? { use_now: false, reason: "the queued work fits without it", use_before: null }
+          : hoursUntilReset <= 24
+            ? { use_now: false, reason: `reset in ${resetHours} h; wait for it`, use_before: null }
+            : { use_now: false, reason: "no target given; nothing is blocked", use_before: null };
+  return { meter, ...plan, banked, ...(targetResult ? { target: targetResult } : {}), advice };
 }
 
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}, needWindow?: string): PlanOutcome {
-  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves, needWindow);
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}, needWindow?: string, targetPoints?: number): PlanOutcome {
+  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves, needWindow, targetPoints);
   return { ...result, notices: unscheduledResetNotices(store, [meter], now) };
 }
 
@@ -227,6 +290,16 @@ export interface GateOutcome extends GateOutcomeCore {
  * blocks the whole gate). `meter` also accepts an explicit list (a --class
  * resolved through routing.toml to several meters), checked the same way. */
 function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | string[] | undefined, reservePercent: number, usePlan: boolean, now: Date, options: GateOptions): GateOutcomeCore {
+  // No --meter/--class means the caller wants "every account's dispatch
+  // capacity", inferred by scanning every meter this store has ever seen --
+  // a count/credits meter picked up that way (an account that simply also
+  // carries a manual banked-reset balance) is never dispatch capacity, but
+  // it is not what the caller asked to check either, so it is skipped below
+  // rather than failing the whole global gate. An explicit target (a single
+  // --meter, or a --class resolved through routing.toml to a specific list)
+  // IS what the caller asked to check, so a count/credits meter named there
+  // still refuses, same as before.
+  const explicitTarget = meter !== undefined;
   const candidates = meter === undefined ? [...new Set(store.latestPerWindow().map((row) => row.meter_id))] : Array.isArray(meter) ? meter : [meter];
   const checked: string[] = [];
   const pacing = options.pacing ?? "even";
@@ -237,6 +310,11 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   for (const id of candidates) {
     const blocked = store.dispatchBlockForMeter(id, now) ?? store.dispatchBlockForPrincipal(id.split(":")[0]);
     if (blocked) return { allowed: false, reason: blocked, meters_checked: checked };
+    const rawRows = store.latestPerWindow(id);
+    if (id.endsWith(":credits") || rawRows.some((row) => row.window?.kind === "count")) {
+      if (!explicitTarget) continue;
+      return { allowed: false, reason: `count meter ${id} cannot be used for dispatch`, meters_checked: checked };
+    }
     const { short, long } = meterWindows(store, id);
     if (!short && !long) {
       // A meter with zero readings of ANY kind is treated the same as a
@@ -250,9 +328,8 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       // target already does below, instead of silently being skipped while
       // a different, populated meter in the same --class carries the
       // answer.
-      const rawRows = store.latestPerWindow(id);
-      const localOrCountOnly = rawRows.length > 0 && rawRows.every((row) => row.window?.kind === "state" || row.window?.kind === "count");
-      if (localOrCountOnly) continue;
+      const localOnly = rawRows.length > 0 && rawRows.every((row) => row.window?.kind === "state");
+      if (localOnly) continue;
       return { allowed: false, reason: meterUnknownReason(store, id, `no windowed reading for ${id}`), meters_checked: checked, unknown: true };
     }
     checked.push(id);

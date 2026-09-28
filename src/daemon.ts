@@ -11,6 +11,7 @@ import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from
 import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
+import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
@@ -485,7 +486,7 @@ export class HeadroomDaemon {
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
-          result = withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now);
+          result = withCreditsLapsed(withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now), now);
           break;
         }
         case "plan_downgrades": {
@@ -598,12 +599,42 @@ export class HeadroomDaemon {
           const sinceValue = typeof params.since === "string" && params.since.trim() ? params.since.trim() : new Date(Date.now() - 86_400_000).toISOString();
           result = this.store.spendByOwner({ meter, owner, since: sinceValue }); break;
         }
+        case "credits": {
+          result = this.store.credits(new Date()); break;
+        }
+        case "credits_set": {
+          const principal = typeof params.principal === "string" ? params.principal.trim() : "";
+          const available = params.available;
+          if (!principal) return reject(-32602, "principal is required");
+          if (!Number.isFinite(available) || typeof available !== "number" || available < 0 || !Number.isInteger(available)) return reject(-32602, "available must be a non-negative whole number", principal);
+          if (typeof params.expires !== "string") return reject(-32602, "expires is required", principal);
+          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          let expires: string;
+          try { expires = parseCreditExpiry(params.expires); }
+          catch (error) { return reject(-32602, error instanceof Error ? error.message : "invalid expiry", principal); }
+          this.store.recordManualCredits(principal, available, expires);
+          // Audited once, by the common `ok` audit after the switch (it
+          // already reads params.principal for the subject) -- a case-local
+          // audit here would double the row for this RPC only.
+          result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
+          break;
+        }
+        case "credits_clear": {
+          const principal = typeof params.principal === "string" ? params.principal.trim() : "";
+          if (!principal) return reject(-32602, "principal is required");
+          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          this.store.clearManualCredits(principal);
+          // See credits_set above: the common `ok` audit below covers this too.
+          result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
+          break;
+        }
         case "plan": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
+          if (params.target_points !== undefined && (typeof params.target_points !== "number" || !Number.isFinite(params.target_points) || params.target_points < 0)) return reject(-32602, "target_points must be a non-negative number", meter);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
