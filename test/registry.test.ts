@@ -46,13 +46,33 @@ describe("disabled accounts", () => {
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 
-  it("does not overwrite a discovered entry's disabled flag", async () => {
+  it("does not overwrite a discovered entry's disabled flag, but does refresh its location", async () => {
     root = await mkdtemp(join(tmpdir(), "headroom-registry-discovery-disabled-"));
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     try {
       await writeFile(accountsPath(), ['[[accounts]]', 'name = "claude-main"', 'enabled = false', 'vendor = "claude"', 'location = "~/.claude"', 'adapter = "native-ts"', ''].join("\n"));
       await writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "/replacement/.claude", adapter: "native-ts" }]);
-      await expect(readAccounts()).resolves.toEqual([expect.objectContaining({ name: "claude-main", enabled: false, location: expect.stringMatching(/\.claude$/) })]);
+      // enabled: false survives rediscovery, but location is replaced with
+      // whatever the fresh scan found -- a suffix-only match (`/\.claude$/`)
+      // would pass even if the stale "~/.claude" location had leaked through,
+      // so this asserts the exact discovered path.
+      await expect(readAccounts()).resolves.toEqual([expect.objectContaining({ name: "claude-main", enabled: false, location: "/replacement/.claude" })]);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it("drops a provider account rediscovery no longer finds, and keeps local accounts untouched", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-discovery-drop-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), ['[[accounts]]', 'name = "claude-main"', 'vendor = "claude"', 'location = "~/.claude"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "codex-main"', 'vendor = "codex"', 'location = "~/.codex"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "local-vllm"', 'kind = "local"', 'base_url = "http://localhost:8000"', 'adapter = "native"', ''].join("\n"));
+      // Rediscovery only finds claude-main this time -- codex-main's config
+      // dir is gone. It must be dropped, not remain forever polled; the
+      // manually configured local account is untouched either way.
+      await writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "~/.claude", adapter: "native-ts" }]);
+      const accounts = await readAccounts();
+      expect(accounts.find((account) => account.name === "codex-main")).toBeUndefined();
+      expect(accounts.find((account) => account.name === "claude-main")).toBeDefined();
+      expect(accounts.find((account) => account.name === "local-vllm")).toMatchObject({ kind: "local", base_url: "http://localhost:8000" });
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 });

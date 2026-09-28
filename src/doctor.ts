@@ -12,7 +12,8 @@ import { engineStatus } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
 import { credentialPath, headroomHome } from "./paths.js";
-import { listProcesses, type ProcessEntry } from "./process-tree.js";
+import { isOrphanedAgentProcess, listProcesses, type ProcessEntry } from "./process-tree.js";
+import { checkHostHealth, defaultHostGuardPolicy, readHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "./host-health.js";
 import { CURRENT_SCHEMA_VERSION } from "./migrations.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
@@ -216,13 +217,36 @@ export function adapterCheck(account: Account): DoctorCheck {
 export async function antigravityOrphanCheck(list: () => Promise<ProcessEntry[]> = listProcesses): Promise<DoctorCheck> {
   if (process.platform === "win32") return check("OK", "antigravity orphaned agy", "not applicable on Windows (no script/agy PTY)", "no action needed");
   const processes = await list();
-  const orphans = processes.filter((entry) => entry.ppid === 1 && /(^|[\\/])agy(\.exe)?$/.test(entry.command));
+  const orphans = processes.filter(isOrphanedAgentProcess);
   if (!orphans.length) return check("OK", "antigravity orphaned agy", "no orphaned agy processes found", "no action needed");
   const totalMb = Math.round(orphans.reduce((sum, entry) => sum + entry.rssKb, 0) / 1024);
   const pids = orphans.map((entry) => entry.pid).join(" ");
   return check("WARN", "antigravity orphaned agy",
     `${orphans.length} orphaned agy process(es) reparented to init, ~${totalMb} MB total resident`,
     `kill -TERM ${pids} (they trap SIGHUP; SIGKILL after a few seconds if still alive) -- an updated headroom daemon now sweeps its own leftovers on start, but these predate that, or belong to a daemon run this one never tracked`);
+}
+
+/**
+ * "Host pressure" (see src/host-health.ts): the same measurement `can`,
+ * `gate` and `headroom run` read, surfaced here so an operator can see it
+ * without dispatching anything. `refuse` is FAIL (this is what `run` would
+ * currently refuse over, when `host_guard.mode = "refuse"`); `warn` is WARN;
+ * `unknown` (no probe available on this platform, or every one failed) is
+ * INFO, never a problem to fix.
+ */
+export async function hostPressureCheck(
+  checkHealth: (policy?: HostGuardPolicy) => Promise<HostHealth> = checkHostHealth,
+  policy: HostGuardPolicy = defaultHostGuardPolicy,
+): Promise<DoctorCheck> {
+  const health = await checkHealth(policy);
+  const measurements = `load_ratio ${health.load_ratio === null ? "unknown" : health.load_ratio.toFixed(2)}, pty ${health.pty_used ?? "unknown"}/${health.pty_max ?? "unknown"}, orphans ${health.orphans ?? "unknown"}`;
+  const detail = `${health.state} (mode: ${policy.mode}); ${measurements}${health.reasons.length ? `; ${health.reasons.join("; ")}` : ""}`;
+  const level: DoctorLevel = health.state === "refuse" ? "FAIL" : health.state === "warn" ? "WARN" : health.state === "unknown" ? "INFO" : "OK";
+  const fix = health.state === "refuse" ? `headroom run currently refuses local dispatch; wait for load to drop, or raise the host_guard.* thresholds (or set mode = "warn"/"off") in policy.toml`
+    : health.state === "warn" ? "headroom run still launches, but the host is under pressure; monitor"
+    : health.state === "unknown" ? "no host pressure probe is available on this platform"
+    : "no action needed";
+  return check(level, "host pressure", detail, fix);
 }
 
 async function configCheck(name: "policy" | "routing", path: string): Promise<DoctorCheck> {
@@ -312,6 +336,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       : check("FAIL", "Antigravity local reader", nativeFailure ?? (process.platform === "darwin" ? "packaged native reader missing" : "packaged Antigravity reader is macOS-only"), process.platform === "darwin" ? "reinstall headroomd" : "use Antigravity with Headroom on macOS"));
   }
   output.push(await antigravityOrphanCheck());
+  output.push(await hostPressureCheck(checkHostHealth, await readHostGuardPolicy(home)));
 
   const daemon = await daemonRequest(socketPath(), "health");
   if (daemon.status === "available") {

@@ -23,10 +23,19 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { main, printEventsOutput } from "../src/cli.js";
+import { main, printEventsOutput, printModelsOutput } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
-import type { HeadroomEvent, Observation } from "../src/types.js";
+import type { HeadroomEvent, KnownModel, Observation } from "../src/types.js";
+
+// Host pressure is a live reading of whatever machine runs the suite, and
+// its measurements are null where a probe does not exist (Windows has no
+// load average or PTY table). Pin one fully populated reading so the shape
+// snapshot compares the contract, not the runner.
+vi.mock("../src/host-health.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/host-health.js")>()),
+  checkHostHealth: async () => ({ state: "ok", reasons: [], load_ratio: 0.5, pty_used: 10, pty_max: 511, orphans: 0 }),
+}));
 
 const FIXTURE_DIR = new URL("./fixtures/json-contract/", import.meta.url);
 
@@ -164,6 +173,11 @@ describe("CLI --json field shapes", () => {
       const now = new Date();
       store.insert(fiveHour(30, 0, 4 * 3_600_000, now));
       store.insert(weekly(40, now));
+      // One lapsed heartbeat and one due timer, so the fixture captures their
+      // real object shape rather than an "empty array" placeholder.
+      store.heartbeatBeat("cadence", 60_000, "resume: rerun the deploy", new Date(now.getTime() - 3 * 60_000));
+      store.checkHeartbeatLapses(now);
+      store.setTimer("cadence", "check-pr", now.toISOString(), "check PR CI status", "notify", new Date(now.getTime() - 60_000));
     } finally { store.close(); }
     const { logs, restore } = captureLog();
     try { await withHeadroomHome(home, () => main(["--json"])); } finally { restore(); }
@@ -182,6 +196,38 @@ describe("CLI --json field shapes", () => {
     const { logs, restore } = captureLog();
     try { await withHeadroomHome(home, () => main(["--json", "--threshold", "50"])); } finally { restore(); }
     await compareToFixture("cli-status-threshold", JSON.parse(logs[0]));
+  });
+
+  it("status serves an overdue stale observation without adding overdue fields to a normal row", async () => {
+    const home = await newHome("status-served-freshness");
+    await writeFile(join(home, "accounts.toml"), "");
+    const now = new Date();
+    const oldAt = new Date(now.getTime() - 10 * 86_400_000).toISOString();
+    const stale: Observation = {
+      ...weekly(40, new Date(oldAt)), principal_id: "codex-main", meter_id: "codex-main:spark",
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(), observed_at: oldAt, fetched_at: oldAt,
+    };
+    const store = await HeadroomStore.open(home);
+    try {
+      const storedBaseline = store.insert(stale);
+      const newerAt = new Date(now.getTime() - 60_000).toISOString();
+      const suspect = { ...stale, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" }, resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt };
+      const storedSuspect = store.insert(suspect);
+      store.setDaemonState("vendor_window_suspect:codex-main:spark:10080", JSON.stringify({
+        baseline_id: storedBaseline.id, suspect_id: storedSuspect.id,
+        baseline_resets_at: stale.resets_at, suspect_resets_at: suspect.resets_at,
+      }));
+      store.insert({ ...fiveHour(20, 0, 3_600_000, now), principal_id: "codex-main", meter_id: "codex-main:main" });
+    } finally { store.close(); }
+    const { logs, restore } = captureLog();
+    try { await withHeadroomHome(home, () => main(["--json"])); } finally { restore(); }
+    const rows = JSON.parse(logs[0]).observations as Observation[];
+    const served = rows.find((row) => row.meter_id === "codex-main:spark");
+    const normal = rows.find((row) => row.meter_id === "codex-main:main");
+    expect(served).toMatchObject({ freshness: "stale", resets_in_seconds: 0, resets_in: "0m", reset_overdue: true, reset_overdue_seconds: expect.any(Number), last_known: { used_percent: 41 } });
+    expect(served?.reason).toMatch(/^last accepted reading 10d ago/);
+    expect(normal).toMatchObject({ freshness: "fresh" });
+    expect(normal).not.toHaveProperty("reset_overdue");
   });
 
   it("status --models", async () => {
@@ -217,8 +263,22 @@ describe("CLI --json field shapes", () => {
     const home = await newHome("plan");
     await seedBasic(home);
     const { logs, restore } = captureLog();
-    try { await withHeadroomHome(home, () => main(["plan", "--meter", "claude-main:all", "--until", "reset", "--json"])); } finally { restore(); }
+    try { await withHeadroomHome(home, () => main(["plan", "--meter", "claude-main:all", "--until", "reset", "--target", "20", "--json"])); } finally { restore(); }
     await compareToFixture("cli-plan", JSON.parse(logs[0]));
+  });
+
+  it("credits", async () => {
+    const home = await newHome("credits");
+    await seedBasic(home);
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["credits", "set", "--principal", "claude-main", "--available", "1", "--expires", "2026-10-05", "--json"]);
+        await main(["credits", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-credits-set", JSON.parse(logs[0]));
+    await compareToFixture("cli-credits", JSON.parse(logs[1]));
   });
 
   it("fill", async () => {
@@ -268,6 +328,30 @@ describe("CLI --json field shapes", () => {
     await compareToFixture("cli-lease-list", JSON.parse(logs[1]));
   });
 
+  it("heartbeat list", async () => {
+    const home = await newHome("heartbeat-list");
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["heartbeat", "--owner", "cadence", "--every", "5m", "--resume", "rerun the deploy"]);
+        await main(["heartbeat", "list", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-heartbeat-list", JSON.parse(logs[1]));
+  });
+
+  it("timer list", async () => {
+    const home = await newHome("timer-list");
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["timer", "set", "--owner", "cadence", "--name", "check-pr", "--at", "+30m", "--action", "check PR CI status"]);
+        await main(["timer", "list", "--json"]);
+      });
+    } finally { restore(); }
+    await compareToFixture("cli-timer-list", JSON.parse(logs[1]));
+  });
+
   it("cost (bare array, no envelope -- see docs/json-contract.md)", async () => {
     const home = await newHome("cost");
     await seedBasic(home);
@@ -303,9 +387,28 @@ describe("CLI --json field shapes", () => {
       id: "reset_seen:1", kind: "reset_seen", origin: "inferred", confidence: 0.9, evidence_observation_ids: [1, 2],
       created_at: "2026-09-03T12:00:00.000Z", corrected_by: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: null, last_seen_at: null,
     };
+    const modelAvailable: HeadroomEvent = {
+      id: "model_available:codex-main:gpt-6-astra", kind: "model_available", origin: "vendor_reported", confidence: 1, evidence_observation_ids: [3],
+      created_at: "2026-09-23T12:00:00.000Z", corrected_by: null, meter_id: null, principal_id: "codex-main", reason: "gpt-6-astra", last_seen_at: null,
+      metadata: { model_id: "gpt-6-astra", model_name: "GPT-6-Astra", shares_pool: false },
+    };
     const { logs, restore } = captureLog();
-    try { printEventsOutput([event], false); } finally { restore(); }
+    try { printEventsOutput([event, modelAvailable], false); } finally { restore(); }
     return compareToFixture("cli-events", JSON.parse(logs[0]));
+  });
+
+  it("models (bare array, no envelope -- see docs/json-contract.md)", () => {
+    const model: KnownModel = {
+      principal_id: "codex-main", vendor: "codex", model_id: "gpt-6-astra", model_name: "GPT-6-Astra",
+      first_seen_at: "2026-09-23T12:00:00.000Z", last_seen_at: "2026-09-23T12:00:00.000Z", retired_at: null,
+    };
+    const retiredUnnamed: KnownModel = {
+      principal_id: "codex-main", vendor: "codex", model_id: "gpt-6-fable", model_name: null,
+      first_seen_at: "2026-09-23T12:00:00.000Z", last_seen_at: "2026-09-24T12:00:00.000Z", retired_at: "2026-09-24T12:00:00.000Z",
+    };
+    const { logs, restore } = captureLog();
+    try { printModelsOutput([model, retiredUnnamed], true, false); } finally { restore(); }
+    return compareToFixture("cli-models", JSON.parse(logs[0]));
   });
 
   it("contract (plain text, not JSON -- see docs/json-contract.md)", async () => {
@@ -345,6 +448,12 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
       const now = new Date();
       store.insert(fiveHour(30, 0, 4 * 3_600_000, now));
       store.insert(weekly(40, now));
+      // One lapsed heartbeat and one due timer, so the fixture captures
+      // their real object shape rather than an "empty array" placeholder --
+      // same seeding as the CLI "status" test above.
+      store.heartbeatBeat("cadence", 60_000, "resume: rerun the deploy", new Date(now.getTime() - 3 * 60_000));
+      store.checkHeartbeatLapses(now);
+      store.setTimer("cadence", "check-pr", now.toISOString(), "check PR CI status", "notify", new Date(now.getTime() - 60_000));
     } finally { store.close(); }
     const result = await withHeadroomHome(home, () => call("quota_status", {}));
     await compareToFixture("mcp-quota_status", result);
@@ -376,6 +485,12 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
     await withHeadroomHome(home, () => call("quota_lease_start", { meter_id: "claude-main:all", owner: "cadence", expected_percent: 5 }));
     const result = await withHeadroomHome(home, () => call("quota_leases", {}));
     await compareToFixture("mcp-quota_leases", result);
+  });
+
+  it("quota_heartbeat", async () => {
+    const home = await newHome("mcp-heartbeat");
+    const result = await withHeadroomHome(home, () => call("quota_heartbeat", { owner: "cadence", interval_ms: 300_000, resume_sentence: "rerun the deploy" }));
+    await compareToFixture("mcp-quota_heartbeat", result);
   });
 
   it("quota_cost", async () => {
@@ -415,7 +530,7 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
   it("quota_plan", async () => {
     const home = await newHome("mcp-plan");
     await seedBasic(home);
-    const result = await withHeadroomHome(home, () => call("quota_plan", { meter: "claude-main:all" }));
+    const result = await withHeadroomHome(home, () => call("quota_plan", { meter: "claude-main:all", target_points: 20 }));
     await compareToFixture("mcp-quota_plan", result);
   });
 

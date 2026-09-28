@@ -39,9 +39,14 @@ describe("daemon disabled scheduling", () => {
         historicalFailureEvents = store.events("1970-01-01T00:00:00.000Z").filter((event) => event.kind === "source_failed" && event.principal_id === "claude-2").length;
       }
       finally { store.close(); }
-      const reply = (await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status", params: {} }))).result as { observations: Observation[]; disabled_principals: string[] };
-      expect(reply.observations).toEqual([]);
-      expect(reply.disabled_principals).toEqual(["claude-2"]);
+      // The daemon's own "status" RPC stays a plain Observation[] array under
+      // the 1.x JSON contract (docs/json-contract.md) -- it never grows a
+      // `disabled_principals` field of its own; disabled principals are
+      // still excluded from capacity, just by dropping their rows from this
+      // array rather than by an additive field the CLI/MCP layers derive
+      // separately from the registry.
+      const reply = (await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status", params: {} }))).result as Observation[];
+      expect(reply).toEqual([]);
       const afterStatus = await HeadroomStore.open(home);
       try { expect(afterStatus.events("1970-01-01T00:00:00.000Z").filter((event) => event.kind === "source_failed" && event.principal_id === "claude-2")).toHaveLength(historicalFailureEvents); }
       finally { afterStatus.close(); }

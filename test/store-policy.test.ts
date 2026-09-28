@@ -3,7 +3,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canConsume, canRouteWithLeases, defaultPolicy, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
+import { canConsume, canRouteWithLeases, defaultPolicy, freshnessGate, paceDecision, paceState, unknownMeterPrincipals } from "../src/policy.js";
+import { withEffectiveFreshness } from "../src/pace.js";
 import { HeadroomStore } from "../src/store.js";
 import { endedLeaseMessage, formatMeters, printEventsOutput, thresholdReport } from "../src/cli.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason } from "../src/engine/observation.js";
@@ -811,6 +812,50 @@ describe("pace and consumes", () => {
     expect(paceDecision(plain, policy, now).reason).toBe("stale 180m; next poll time unknown");
   });
 
+  // A held reading must never be capacity, at ANY age -- not only once it
+  // also crosses staleness_minutes. Before this was fixed, a fresh poll
+  // carrying vendor_window_held/vendor_inconsistent sailed straight through
+  // paceDecision/freshnessGate as ordinary capacity until it happened to age
+  // out, letting the CLI threshold gate and canConsume/`can` both admit an
+  // explicitly unconfirmed reading.
+  it("treats a recent held reading as UNKNOWN immediately, at any age -- never capacity", () => {
+    const recentHeld = paced(50, { metadata: { vendor_window_held: true } }); // age 0m
+    const decision = paceDecision(recentHeld, policy, now);
+    expect(decision.state).toBe("UNKNOWN");
+    expect(decision.reason).toMatch(/^held window past reset, unconfirmed \(0m since the last accepted reading\)/);
+
+    const recentInconsistent = paced(50, { metadata: { vendor_inconsistent: true } });
+    expect(paceDecision(recentInconsistent, policy, now).state).toBe("UNKNOWN");
+
+    // A recent, non-held reading at the same age is unaffected -- it is the
+    // metadata flag that matters here, not merely having just been polled.
+    expect(paceState(paced(50), policy, now)).not.toBe("UNKNOWN");
+  });
+
+  it("fails freshnessGate closed on a held reading immediately, at any age", () => {
+    const recentHeld = paced(50, { metadata: { vendor_window_held: true } });
+    const outcome = freshnessGate(recentHeld, policy.staleness_minutes, now);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toMatch(/^held window past reset, unconfirmed \(0m since the last accepted reading\)/);
+
+    // An ordinary fresh, recent reading with no hold still passes.
+    expect(freshnessGate(paced(50), policy.staleness_minutes, now).ok).toBe(true);
+  });
+
+  it("serves a recent held reading as blocking in the CLI --threshold report, not just once it ages out", () => {
+    const recentHeld = paced(50, { meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, metadata: { vendor_window_held: true } });
+    const served = withEffectiveFreshness([recentHeld], policy.staleness_minutes, now);
+    const [report] = thresholdReport(served, 90);
+    expect(report).toMatchObject({ meter_id: "claude-main:all", crossed: false, blocking: true, freshness: "stale" });
+  });
+
+  it("fails a recent held reading closed in canConsume (the raw path `can` uses), never allowing capacity", () => {
+    const recentHeld = paced(10, { meter_id: "claude-main:all", metadata: { vendor_window_held: true } });
+    const decision = canConsume([recentHeld.meter_id], new Map([[recentHeld.meter_id, recentHeld]]), policy, false, now);
+    expect(decision.allowed).toBe(false);
+    expect(decision.state).toBe("UNKNOWN");
+  });
+
   it("holds pace at NORMAL for the early grace period unless frozen", () => {
     const early = paced(70, { resets_at: "2026-09-03T13:35:00Z" }); // 5% into a 100-minute window
     const later = paced(70, { resets_at: "2026-09-03T13:25:00Z" }); // 15% elapsed
@@ -863,11 +908,12 @@ describe("pace and consumes", () => {
     expect(unknownMeterPrincipals(["codex-main:main", "typo-principal:main"], known)).toEqual(["typo-principal:main"]);
   });
 
-  it("renders credit counts as availability and excludes them from can decisions", () => {
+  it("renders credit counts as availability but never dispatches through one", () => {
     const now = new Date("2026-09-03T12:00:00Z");
     const credit = observation({ meter_id: "codex-main:credits", window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 1, unit: "credits" }, resets_at: "2026-09-21T12:00:00Z", fetched_at: now.toISOString() });
     expect(formatMeters([credit], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 available (expires Sep 21)");
-    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy)).toMatchObject({ allowed: true, state: "NOT_ENFORCED" });
+    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy, false, now)).toMatchObject({ allowed: false, state: "UNKNOWN", reason: "count meter codex-main:credits cannot be used for dispatch" });
+    expect(canConsume([credit.meter_id], new Map([[credit.meter_id, credit]]), defaultPolicy, true, now)).toMatchObject({ allowed: false, state: "UNKNOWN" });
   });
 
   it("labels a multi-window meter fresh when any enforced window is fresh", () => {

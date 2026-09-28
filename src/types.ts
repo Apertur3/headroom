@@ -125,7 +125,14 @@ export interface Observation {
     /** Codex endpoint idle zero: reset is fetch time plus the window, so the
      * timestamp moves each poll and is not a durable window identity. */
     codex_idle_window?: boolean;
+    /** A human recorded a banked reset the vendor does not expose. A clear is
+     * also a real zero-valued row so the prior count stays auditable. */
+    manual?: boolean;
+    manual_cleared?: boolean;
   };
+  /** Computed at response time for a credits count whose recorded expiry has
+   * passed. Raw stored observations never gain this field or get rewritten. */
+  credits_lapsed?: boolean;
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the
    * projected time to 100% used at that rate, and the straight-line percent
@@ -135,9 +142,24 @@ export interface Observation {
   burn_percent_per_hour?: number | null;
   empty_in_seconds?: number | null;
   sustainable_percent_per_hour?: number | null;
+  /** Computed, never persisted: response-time reset fields. The first two
+   * retain their contract-1.0 meanings even once a reset is overdue; agents
+   * check `reset_overdue` and its age instead. */
+  resets_in_seconds?: number | null;
+  resets_in?: string | null;
+  /** True only when `resets_at` is more than the one-minute reset-identity
+   * tolerance in the past. `reset_overdue_seconds` is present with it.
+   * Absent for a reset that is unknown, upcoming, or just crossed. */
+  reset_overdue?: true;
+  reset_overdue_seconds?: number;
+  /** Computed, never persisted: ISO time when status enrichment set served
+   * freshness, last_known, pace and reset fields. Renderers preserve an
+   * already-enriched row rather than aging it again without its store-backed
+   * last-known context. */
+  status_enriched_at?: string;
   /** Computed, never persisted: the newest FRESH reading of this exact meter
    * and window from the last 7 days, attached only when this observation's
-   * own freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
+   * served freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
    * trend for a person or a fail-closed orchestrator to glance at while the
    * live number is UNKNOWN -- never a decision input: `can`/`gate`/`route`
    * keep treating UNKNOWN as no capacity regardless of what this carries.
@@ -167,7 +189,22 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired" | "heartbeat_lapsed" | "heartbeat_restored" | "timer_missed";
+
+/** One vendor model id known to Headroom for a principal, as read from that
+ * vendor's own local model catalog (never fabricated, never inferred from
+ * usage). `first_seen_at` never moves once set; `retired_at` is set (not
+ * deleted) the first catalog read that no longer lists the id, and cleared
+ * again if the vendor brings it back. */
+export interface KnownModel {
+  principal_id: string;
+  vendor: string;
+  model_id: string;
+  model_name: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  retired_at: string | null;
+}
 
 /** One row of the notification delivery ledger: a single event's delivery
  * state on one channel. `pending` is queued (a new event, one held back by
@@ -251,5 +288,50 @@ export interface HeadroomEvent {
    * `pace_projection_conserve`, it carries the measured burn and empty time
    * that let delivery deduplicate noisy repeats without changing the event
    * stream. */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number } | null;
+  /** On `model_available`/`model_retired`: the vendor model id and display
+   * name from its own catalog, and (`model_available` only) whether
+   * Headroom can already see a meter of its own for this id (`shares_pool:
+   * false`) or a current generic meter (`shares_pool: true`). Undefined
+   * means no current fresh official meter establishes either relationship. */
+  /** On `heartbeat_lapsed`/`heartbeat_restored`: the owner whose heartbeat
+   * lapsed or resumed, its configured interval, its last beat before the
+   * lapse (or the beat that closed it), and, on a lapse, the resume sentence
+   * that owner registered -- what a human or a fresh session should do to
+   * pick the work back up. On `timer_missed`: the owner and timer name whose
+   * due wake-up fired while that owner's heartbeat was lapsed, and the
+   * action text Headroom delivered (never executed). */
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean; owner?: string; interval_ms?: number; last_beat_at?: string; resume_sentence?: string | null; timer_name?: string; action?: string } | null;
+}
+
+/** One orchestrator heartbeat lease: an owner's promise to beat at least
+ * every `interval_ms`, so the daemon -- the one process that survives a
+ * crashed session -- can notice when it stops and say what a fresh session
+ * should do about it. `lapsed_since` is non-null exactly while the daemon
+ * currently considers this heartbeat overdue by more than 2x its interval. */
+export interface Heartbeat {
+  owner: string;
+  interval_ms: number;
+  resume_sentence: string | null;
+  started_at: string;
+  last_beat_at: string;
+  lapsed_since: string | null;
+  updated_at: string;
+}
+
+/** One named wake-up: `at` is when it is due, `action` the text Headroom only
+ * ever delivers (as one inbox entry to `owner`), never executes. `if_missed`
+ * controls whether a due timer whose owner's heartbeat is currently lapsed
+ * also raises a `timer_missed` notification, in addition to the inbox entry
+ * every due timer always gets. `fired_at`/`cleared_at` are set once, never
+ * cleared, so a timer's history stays inspectable after it fires or is
+ * cleared. */
+export interface Timer {
+  owner: string;
+  name: string;
+  at: string;
+  action: string;
+  if_missed: "notify" | "drop";
+  created_at: string;
+  fired_at: string | null;
+  cleared_at: string | null;
 }

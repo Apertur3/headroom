@@ -223,6 +223,28 @@ describe("browser report pure renderer", () => {
     expect(html).not.toContain("NaN");
   });
 
+  it("re-ages an already-enriched daemon row instead of trusting its stale marker forever", () => {
+    const model = sampleModel({
+      now: new Date(fixedNow.getTime() + 60 * 60_000),
+      observations: [sampleObservation({ status_enriched_at: fixedNow.toISOString(), last_known: null })],
+    });
+    const html = renderBrowserReport(model);
+    expect(html).not.toContain("<strong>20%</strong> used");
+    expect(html).toContain("Reading is stale");
+  });
+
+  it("renders an overdue response field as an overdue age, never 0m", () => {
+    const html = renderBrowserReport(sampleModel({ observations: [sampleObservation({
+      resets_at: new Date(fixedNow.getTime() - 3 * 86_400_000).toISOString(),
+      resets_in_seconds: 0,
+      resets_in: "0m",
+      reset_overdue: true,
+      reset_overdue_seconds: 3 * 86_400,
+    })] }));
+    expect(html).toContain("overdue 3d");
+    expect(html).not.toContain("resets in 0m");
+  });
+
   it("safely escapes HTML characters in dynamic data to prevent XSS and hides raw secrets", () => {
     expect(escapeHtml("<script>alert('xss')</script>")).toBe("&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;");
     expect(escapeHtml("Tom & Jerry \"quotes\"")).toBe("Tom &amp; Jerry &quot;quotes&quot;");
@@ -616,6 +638,7 @@ describe("unknown data, invalid samples, and special meter handling", () => {
   it("does not silently make missing quota zero and sanitizes failure reasons", () => {
     expect(sanitizeFailureReason("Error: Keychain grant needed /Users/test/.credentials")).toBe("Credential access required");
     expect(sanitizeFailureReason("Rate limit 429 backoff")).toBe("Rate limit backoff");
+    expect(sanitizeFailureReason("last accepted reading 60m ago")).toBe("Reading is stale");
     expect(sanitizeFailureReason("arbitrary unknown provider message")).toBe("Reading unavailable; run headroom doctor");
     expect(sanitizeFailureReason(null)).toBe("Reading unavailable; run headroom doctor");
 

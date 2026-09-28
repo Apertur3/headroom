@@ -3,7 +3,6 @@ import { PassThrough, Writable } from "node:stream";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHmac } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +11,7 @@ import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboar
 import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 import type { Observation } from "../src/types.js";
 
 const now = new Date("2026-09-08T12:00:00Z");
@@ -49,15 +49,55 @@ function snapshotFrame(lines: string[]): string {
 }
 
 describe("dashboard frames (synthetic data)", () => {
-  it("distinguishes an unconfirmed new window from a confirmed vendor flip-flop", () => {
+  it("distinguishes an unconfirmed new window from a confirmed vendor flip-flop (verbose per-row note)", () => {
+    // Both flags now serve the held row UNKNOWN immediately (never capacity),
+    // so the compact overview collapses them into the same generic held
+    // reason; the distinguishing wording survives in the verbose per-row note.
     const model = fixedModel();
     model.observations = [row({ metadata: { vendor_window_held: true } })];
-    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: true, eventsWide: false, scroll: 0 }).join("\n"))
       .toContain("new window unconfirmed, holding");
 
     model.observations = [row({ metadata: { vendor_inconsistent: true } })];
-    expect(renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n"))
+    expect(renderDashboard(model, { width: 200, height: 20, verbose: true, eventsWide: false, scroll: 0 }).join("\n"))
       .toContain("vendor readings inconsistent, holding");
+  });
+
+  it("serves a held row as UNKNOWN immediately, at any age, in the compact overview", () => {
+    const model = fixedModel();
+    model.observations = [row({ metadata: { vendor_window_held: true } })];
+    const frame = renderDashboard(model, { width: 200, height: 20, verbose: false, eventsWide: false, scroll: 0 }).join("\n");
+    expect(frame).toContain("UNKNOWN");
+    expect(frame).toContain("held window past reset, unconfirmed");
+    expect(frame).not.toMatch(/\bNORMAL\b|\bHARVEST\b/);
+  });
+
+  it("re-ages an already-enriched daemon row instead of trusting its stale marker forever", () => {
+    const model = fixedModel();
+    model.now = new Date(now.getTime() + 60 * 60_000);
+    model.observations = [row({ status_enriched_at: now.toISOString(), last_known: null })];
+    const frame = renderDashboard(model, { width: 100, height: 20, verbose: false, eventsWide: false }).join("\n");
+    // Re-evaluated against the current serving clock, this row is now stale
+    // (its fetch is 1h old against a 15m default staleness), so it must be
+    // served UNKNOWN -- its own 20% reading may still appear as an explicitly
+    // labelled "last" reference, never as the live capacity figure.
+    expect(frame).toContain("UNKNOWN");
+    expect(frame).toContain("last 20% at");
+    expect(frame).not.toMatch(/\bNORMAL\b|\bHARVEST\b/);
+  });
+
+  it("renders an overdue response field as an overdue age, never the compatibility 0m", () => {
+    const model = fixedModel();
+    model.observations = [row({
+      resets_at: new Date(now.getTime() - 3 * 86_400_000).toISOString(),
+      resets_in_seconds: 0,
+      resets_in: "0m",
+      reset_overdue: true,
+      reset_overdue_seconds: 3 * 86_400,
+    })];
+    const frame = renderDashboard(model, { width: 100, height: 20, verbose: false, eventsWide: false }).join("\n");
+    expect(frame).toContain("overdue 3d");
+    expect(frame).not.toContain("resets in 0m");
   });
 
   it("keeps the overview first, scrolls a full screen, and Enter reaches the focused panel", () => {
@@ -397,11 +437,10 @@ describe("dashboard cached data", () => {
     const poller = vi.fn(async () => { throw new Error("must not poll"); });
     const daemon = await HeadroomDaemon.create({ home: root, poller });
     try {
-      const internal = daemon as unknown as { accounts: Array<{ name: string }>; sessionToken: string; handleLine(line: string, nonce: string): Promise<{ replyLine: string }> };
-      internal.accounts = [{ name: "account-a" }]; internal.sessionToken = "synthetic-local-test-token";
-      const nonce = "synthetic-nonce", proof = createHmac("sha256", internal.sessionToken).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");
-      const reply = await internal.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "dashboard", params: { _proof: proof } }), nonce);
-      expect(JSON.parse(reply.replyLine).result.observations[0].quantity.used).toBe(20); expect(poller).not.toHaveBeenCalled();
+      const internal = daemon as unknown as { accounts: Array<{ name: string }> };
+      internal.accounts = [{ name: "account-a" }];
+      const reply = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "dashboard", params: {} }));
+      expect((reply.result as { observations: Observation[] }).observations[0].quantity?.used).toBe(20); expect(poller).not.toHaveBeenCalled();
     } finally { await daemon.stop(); await rm(root, { recursive: true, force: true }); }
   });
 });
@@ -793,6 +832,38 @@ describe("dashboard graph gathering", () => {
       expect(request).toHaveBeenCalledWith(expect.stringMatching(/headroom\.sock$|^\\\\\.\\pipe\\headroom-/), "dashboard", {}, 50, 500);
       expect(latest).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     } finally { if (!close.mock.calls.length) store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("takes the direct snapshot clock after a delayed policy read crosses freshness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-response-clock-"));
+    const requestedAt = new Date("2026-09-08T12:00:00Z");
+    const responseAt = new Date("2026-09-08T12:02:00Z");
+    const store = await HeadroomStore.open(root);
+    store.insert(row({ fetched_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString(), observed_at: new Date(requestedAt.getTime() - 14 * 60_000).toISOString() }));
+    store.close();
+    const daemon = await import("../src/daemon.js"), config = await import("../src/config.js");
+    const request = vi.spyOn(daemon, "daemonRequest").mockResolvedValue({ status: "absent" });
+    let releasePolicy: () => void;
+    const policyRead = new Promise<void>((resolve) => { releasePolicy = resolve; });
+    let policyStarted: () => void;
+    const delayedPolicyStarted = new Promise<void>((resolve) => { policyStarted = resolve; });
+    const policy = vi.spyOn(config, "readPolicy").mockImplementation(async () => {
+      policyStarted();
+      await policyRead;
+      return defaultPolicy;
+    });
+    try {
+      vi.useFakeTimers(); vi.setSystemTime(requestedAt);
+      const result = gatherCachedDashboard(root);
+      await delayedPolicyStarted;
+      vi.setSystemTime(responseAt);
+      releasePolicy!();
+      expect((await result).observations).toEqual([expect.objectContaining({ freshness: "stale", status_enriched_at: responseAt.toISOString() })]);
+    } finally {
+      policy.mockRestore(); request.mockRestore();
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("selects meter with active current-period history over earlier meter with only stale old-period history", async () => {

@@ -4,9 +4,10 @@ import { encodeResetSeen, formatClockTime } from "../src/resets.js";
 import { explainUnknown, renderStatus, statusViewOptions, type StatusViewInput, type StatusViewOptions } from "../src/status-view.js";
 import type { Lease, Observation } from "../src/types.js";
 
-// Absolute reset times and credit expiries are formatted in the local zone,
-// so the snapshots below are pinned to UTC and the ambient zone is restored
-// afterwards -- test files share a worker process.
+// Absolute reset times are formatted in the local zone, while credit expiry
+// days use UTC so date-only manual entries never shift across a timezone.
+// Pin the snapshots to UTC and restore the ambient zone afterwards -- test
+// files share a worker process.
 let originalTimezone: string | undefined;
 beforeAll(() => { originalTimezone = process.env.TZ; process.env.TZ = "UTC"; });
 afterAll(() => { if (originalTimezone === undefined) delete process.env.TZ; else process.env.TZ = originalTimezone; });
@@ -85,6 +86,26 @@ function render(viewOverrides: Partial<StatusViewOptions> = {}, dataOverrides: P
 }
 
 describe("status view: the three forms", () => {
+  it("serves an aged held reading as stale and names its overdue reset in both forms", () => {
+    const oldHeld = observation({
+      principal_id: "codex-main", meter_id: "codex-main:spark", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      fetched_at: new Date(NOW.getTime() - 10 * 86_400_000).toISOString(), observed_at: new Date(NOW.getTime() - 10 * 86_400_000).toISOString(),
+      resets_at: new Date(NOW.getTime() - 3 * 86_400_000).toISOString(), metadata: { vendor_window_held: true }, reason: "new window unconfirmed, holding",
+    });
+    for (const form of ["plain", "grouped"] as const) {
+      const view = renderStatus({ observations: [oldHeld], policy: defaultPolicy, now: NOW }, options({ form })).join("\n");
+      expect(view).toContain("stale");
+      expect(view).toContain("↻ overdue 3d");
+      expect(view).not.toMatch(/\bfresh \d+m/);
+      expect(view).not.toContain("(in 0m)");
+    }
+  });
+
+  it("keeps a minute-old stored fresh reading fresh", () => {
+    const recent = observation({ principal_id: "codex-main", meter_id: "codex-main:spark", fetched_at: new Date(NOW.getTime() - 60_000).toISOString() });
+    expect(renderStatus({ observations: [recent], policy: defaultPolicy, now: NOW }, options({ form: "plain" })).join("\n")).toContain("(fresh 1m)");
+  });
+
   it("groups by principal, aligns the columns and puts the pace state last", () => {
     expect(render()).toMatchInlineSnapshot(`
       "claude-main  claude  Max 20x  fresh <1m
@@ -263,6 +284,8 @@ describe("status view: UNKNOWN in plain words", () => {
     });
     expect(explainUnknown("stale 60m; next poll ~14:20")).toMatchObject({ cause: "stale" });
     expect(explainUnknown("stale 60m; next poll ~14:20").text).toContain("Run: headroom --refresh");
+    expect(explainUnknown("last accepted reading 60m ago")).toMatchObject({ cause: "stale" });
+    expect(explainUnknown("last accepted reading 60m ago").text).toContain("Run: headroom --refresh");
     expect(explainUnknown("no readings for codex-main:main")).toMatchObject({ cause: "never read" });
     expect(explainUnknown("Gemini CLI OAuth client unavailable")).toEqual({ cause: "read failed", text: "Gemini CLI OAuth client unavailable." });
   });

@@ -91,12 +91,19 @@ into a real reading instead of dispatching blind.
 - `headroom rate [--meter M] [--owner X] [--minutes 30]` : burn over a recent window and ETA to the limit, plus X's attributed share of it.
 - `headroom spend [--meter M] [--owner X] [--since 24h]` : per-owner attributed spend on a shared meter.
 - `headroom inbox --session <id>` / `headroom inbox send --to <id> --kind <budget|note|handoff> --text ...` : hand-offs between orchestrators.
-- `headroom plan --meter M --until reset --reserve N` : points per remaining 5h window and the plan line.
+- `headroom plan --meter M --until reset --reserve N [--target <points>]` : points per remaining 5h window, banked-reset advice and the plan line. Ask `quota_plan` with `target_points` before recommending a banked reset.
+- `headroom credits set --principal <name> --available <n> --expires <date>` : record a banked reset only when the human says one exists; never infer it. A date-only expiry is midnight UTC on that date. Never fire a reset yourself -- that is a human action in the vendor UI.
 - `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
 - `headroom fill --meter M --until-reset [--lane-cost N] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
-- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, and `quota_route` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep).
+- `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` : record or refresh your own heartbeat with the daemon (`--stop` to deregister; `heartbeat list` to see every registered one).
+- `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"` : a named wake-up the daemon delivers, once, to your inbox when due (`timer list` / `timer clear --owner <name> --name <id>`).
+- MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, `quota_route`, and `quota_heartbeat` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep; named wake-ups are CLI-only, no MCP tool).
+
+Credit/count meters are informational, not dispatch capacity: never name one in routing or pass
+one to `can`, `route`, or `gate`. `quota_plan` treats only a manual entry or a fresh, unheld vendor
+count explicitly marked as reset availability as banked; a prepaid balance is not a reset credit.
 
 ## Leases
 
@@ -115,6 +122,37 @@ of a window, `headroom plan import <file>` turns it into advisory leases the oth
 already respect. Leave anything another session must act on in its inbox (`headroom inbox send
 --to <session> --kind handoff --text ...`) and read your own with `headroom inbox --session <self>`
 before planning the next window; reading marks a message read, so a hand-off is acted on once.
+
+## Host guard
+
+`can` and `gate` (CLI and MCP) carry an additive `host` object -- `{ state: "ok" | "warn" |
+"refuse" | "unknown", reasons, load_ratio, pty_used, pty_max, orphans }` -- alongside the quota
+decision: local CPU load, pseudo-terminal usage and leaked-process count on the machine you're
+about to fan out onto. Neither `can` nor `gate` ever refuses over it themselves; read `host.state`
+before dispatching more LOCAL work anyway (spawning several agent lanes onto an already-overloaded
+host is exactly how this repo's own P0 incident started -- see docs/concepts.md's "Host guard"
+section). Only `headroom run`, which actually launches a child process, refuses on its own
+(`state: "refuse"`, exit 2) when `policy.toml`'s `host_guard.mode = "refuse"` (the default);
+`"warn"` or `"off"` still launches. `host.state: "unknown"` (a probe unsupported on this platform,
+or one that failed) is never a reason to hold back -- treat it like any other unknown: no signal
+either way, not a red flag.
+
+## Heartbeats and named wake-ups
+
+A crashed orchestrator session takes every in-session timer and watcher down with it, unnoticed
+for as long as nobody happens to look. Beat once per interval so the daemon -- the one process
+that survives that crash -- can tell "quiet because idle" from "quiet because gone": `headroom
+heartbeat --owner <self> --every 5m --resume "<what a fresh session should do next>"` at the start
+of a session and again on your own cadence, keeping the resume sentence current as the plan
+changes. Miss more than 2x that interval and the daemon records `heartbeat_lapsed`, delivered to
+the human the same way any other notification is; beating again closes it. Stop it explicitly
+(`--stop`) when the session ends normally -- an unstopped heartbeat left lapsed is a false alarm
+for whoever reads it next.
+
+For a wake-up at a specific time rather than a recurring beat, `headroom timer set --owner <self>
+--name <id> --at <ISO|+duration> --action "<text>"` delivers that text to your inbox once, when
+due -- Headroom never executes it, only delivers it. Add `--if-missed notify` (the default) when a
+human should also be told if you are not there to read it.
 
 ## Pacing
 
@@ -137,5 +175,6 @@ before planning the next window; reading marks a message read, so a hand-off is 
 ## Habits
 
 - Check `headroom` before any fan-out of more than two agents and after any 429 or limit error.
+- Read `can`/`gate`'s `host.state` before fanning out more LOCAL work, not just the quota decision.
 - Do not poll in a loop; one read per decision. Headroom's daemon does the sampling.
 - When the user fires a free reset, `headroom events` shows it; refresh your plan then.

@@ -20,6 +20,7 @@ import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveC
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
 import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
+import { checkModelAvailability } from "./model-catalog.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
@@ -27,21 +28,25 @@ import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { checkHostHealth, hostGuardRefusal, hostGuardWarning, readHostGuardPolicy, type HostHealth } from "./host-health.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
-import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
+import { parseTimerAt } from "./heartbeat.js";
+import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
-import { accountsPath, accountsToml, discoverAccounts, readAccounts, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
-import { migrateLegacyHome } from "./paths.js";
-import { formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
+import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccountsOrEmpty, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
+import { headroomHome, migrateLegacyHome } from "./paths.js";
+import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
+import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
-import { HeadroomStore, safeHeadroomDirectory, type PlanDowngrade } from "./store.js";
-import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
+import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -53,13 +58,48 @@ function since(value: string | undefined): string {
 }
 
 /** Only fall back to SQLite when no daemon socket exists. A socket which cannot
- * answer health is an operational problem, not permission to race its writer. */
+ * answer health is an operational problem, not permission to race its writer.
+ * Every write/dispatch path (lease start, gate with a lease, `can --lease`,
+ * `run`, and every other command not listed in requestDaemonReadThrough's own
+ * doc comment) keeps calling this, unchanged. */
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
 }
+
+/** The three ways a read-only command's daemon request can come back:
+ * answered live, no daemon at all (the existing no-daemon direct-read
+ * fallback still applies), or a daemon that exists but would not answer
+ * health even after one retry -- servable from the store's own last-written
+ * rows, read-only, no poll, no write. */
+type DaemonReadOutcome = { kind: "available"; result: unknown } | { kind: "absent" } | { kind: "cache" };
+
+/**
+ * The read-only counterpart of `requestDaemon`, for exactly the commands
+ * that can still answer usefully from stored rows when a live daemon is slow:
+ * `status` (including bare `headroom`), `history`, `events`, `rate`, and
+ * `can` without `--lease`. Retries the health check once (a poll's own
+ * synchronous write occasionally still runs past a single 2s budget under
+ * host load -- see store.ts's `insertPoll`) before treating the daemon as
+ * unresponsive; only then does the caller open `HeadroomStore.openReadOnly()`
+ * and serve whatever is already stored, clearly flagged. Every write or
+ * dispatch path (lease start, gate with a lease, `can --lease`, `run`) must
+ * keep calling `requestDaemon` instead: this never changes what a fail-closed
+ * caller decides, only what a read-only caller may still answer from.
+ */
+async function requestDaemonReadThrough(method: string, params: Record<string, unknown> = {}): Promise<DaemonReadOutcome> {
+  const request = await daemonRequest(socketPath(), method, params, 2_000, 30_000, undefined, 2);
+  if (request.status === "available") return { kind: "available", result: request.result };
+  if (request.status === "unresponsive") return { kind: "cache" };
+  return { kind: "absent" };
+}
+
+/** Mirrors `directReadNotice()`'s stderr-only convention: a script reading
+ * only stdout never has to special-case this, and a human at a terminal
+ * still sees it regardless of --json or the human-table view. */
+function cacheReadNotice(): void { process.stderr.write("(served from cache; daemon busy, not a fresh read)\n"); }
 
 export interface ThresholdWindow {
   meter_id: string;
@@ -86,15 +126,23 @@ export { formatMeters };
 async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: headroom history <meter> [--since 24h]");
-  const disabled = await disabledMeterReason(meter);
-  if (disabled) return disabledUnknownLine(meter, disabled);
+  // Unlike can/gate/plan/fill, history cannot create capacity -- it is a
+  // read of what was already stored. A disabled principal's history remains
+  // readable (docs/vendors.md), so there is no disabled guard here.
   const at = argv.indexOf("--since");
-  const request = await requestDaemon("history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
+  const sinceValue = since(at >= 0 ? argv[at + 1] : undefined);
+  const outcome = await requestDaemonReadThrough("history", { meter, since: sinceValue });
+  if (outcome.kind === "available") { console.log(JSON.stringify(unwrapRpc(outcome.result))); return 0; }
+  if (outcome.kind === "cache") {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try { console.log(JSON.stringify(store.history(meter, sinceValue))); return 0; }
+    finally { store.close(); }
+  }
   directReadNotice();
   const store = await HeadroomStore.open();
   try {
-    const items = store.history(meter, since(at >= 0 ? argv[at + 1] : undefined));
+    const items = store.history(meter, sinceValue);
     store.audit("cli", "history", meter, "ok");
     console.log(JSON.stringify(items));
     return 0;
@@ -104,12 +152,19 @@ async function history(argv: string[]): Promise<number> {
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
   const table = argv.includes("--table");
-  const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { printEventsOutput(unwrapRpc(request) as HeadroomEvent[], table); return 0; }
+  const sinceValue = since(at >= 0 ? argv[at + 1] : undefined);
+  const outcome = await requestDaemonReadThrough("events", { since: sinceValue });
+  if (outcome.kind === "available") { printEventsOutput(unwrapRpc(outcome.result) as HeadroomEvent[], table); return 0; }
+  if (outcome.kind === "cache") {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try { printEventsOutput(store.events(sinceValue), table); return 0; }
+    finally { store.close(); }
+  }
   directReadNotice();
   const store = await HeadroomStore.open();
   try {
-    const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
+    const items = store.events(sinceValue);
     store.audit("cli", "events", null, "ok");
     printEventsOutput(items, table);
     return 0;
@@ -134,6 +189,58 @@ function printEvents(items: HeadroomEvent[]): void {
   }
 }
 
+async function models(argv: string[]): Promise<number> {
+  let principal: string | undefined;
+  let json = false;
+  let agent = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    switch (argv[index]) {
+      case "--principal": {
+        const value = argv[index + 1];
+        if (principal !== undefined || !value || value.startsWith("-")) throw new Error(COMMAND_HELP.models);
+        principal = value;
+        index += 1;
+        break;
+      }
+      case "--json":
+        if (json) throw new Error(COMMAND_HELP.models);
+        json = true;
+        break;
+      case "--agent":
+        if (agent) throw new Error(COMMAND_HELP.models);
+        agent = true;
+        break;
+      default: throw new Error(COMMAND_HELP.models);
+    }
+  }
+  if (json && agent) throw new Error(COMMAND_HELP.models);
+  const request = await requestDaemon("models", principal ? { principal } : {});
+  if (request !== undefined) { printModelsOutput(unwrapRpc(request) as KnownModel[], json, agent); return 0; }
+  directReadNotice();
+  const store = await HeadroomStore.open();
+  try {
+    const items = store.knownModels(principal);
+    store.audit("cli", "models", principal ?? null, "ok");
+    printModelsOutput(items, json, agent);
+    return 0;
+  } finally { store.close(); }
+}
+
+/** The default output is always a JSON array, empty allowed -- same
+ * contract as `printEventsOutput`. `--agent` is a dense, one-line-per-model
+ * plain-text form (no header, no padding) for a token-frugal orchestrator
+ * read; with neither flag this prints a human table instead. */
+export function printModelsOutput(items: KnownModel[], json: boolean, agent: boolean): void {
+  if (json) { console.log(JSON.stringify(items)); return; }
+  if (!items.length) { console.log(agent ? "no known models" : "No known models yet. A list appears after the first poll of a codex, claude or antigravity principal."); return; }
+  for (const item of items) {
+    const status = item.retired_at ? `retired ${formatReset(item.retired_at)}` : `first seen ${formatReset(item.first_seen_at)}`;
+    if (agent) { console.log(`${item.principal_id} ${item.model_id} ${status}`); continue; }
+    const name = item.model_name ? ` "${item.model_name}"` : "";
+    console.log(`${item.principal_id}  ${item.model_id}${name}  (${item.vendor}, ${status})`);
+  }
+}
+
 async function can(argv: string[]): Promise<number> {
   const action = argv[0];
   if (!action) throw new Error("Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]");
@@ -151,19 +258,53 @@ async function can(argv: string[]): Promise<number> {
   const accounts = await readAccounts();
   const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
   if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
-  const disabledPrincipal = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
-  if (disabledPrincipal) {
-    const reason = disabledPrincipalReason(disabledPrincipal);
-    const decision: CanDecision = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] };
-    printCan(decision, buildCostEstimate(action, expectOverride, undefined, null), undefined, argv.includes("--json"));
+  const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+  if (disabledMeter) {
+    const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+    // The deciding meter is the one actually disabled, not whichever meter
+    // happens to be first in the action class, and every requested meter is
+    // reported (not just one) so a caller can see which one blocked it.
+    const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
+    const host = await checkHostHealth(await readHostGuardPolicy());
+    printCan(decision, buildCostEstimate(action, expectOverride, undefined, null), undefined, host, argv.includes("--json"));
     return 2;
   }
 
-  const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
-  let decision: CanDecision;
-  if (request !== undefined) {
-    decision = unwrapRpc(request) as CanDecision;
+  const daemonParams = { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner };
+  // `--lease` is a dispatch path (it can reserve capacity) and must stay
+  // fail-closed exactly as before: only a plain advisory `can` (no --lease)
+  // is eligible for the read-only cached fallback below.
+  let request: unknown;
+  let decision!: CanDecision;
+  let servedFromCache = false;
+  if (leaseFlag) {
+    request = await requestDaemon("can", daemonParams);
+    if (request !== undefined) decision = unwrapRpc(request) as CanDecision;
   } else {
+    const outcome = await requestDaemonReadThrough("can", daemonParams);
+    if (outcome.kind === "available") { request = outcome.result; decision = unwrapRpc(outcome.result) as CanDecision; }
+    else if (outcome.kind === "cache") {
+      servedFromCache = true;
+      cacheReadNotice();
+      const readStore = await HeadroomStore.openReadOnly();
+      try {
+        const policy = await readPolicy();
+        const localAccounts = accounts.filter(isLocalAccount);
+        const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+        const allMeters = [...new Set([...meters, ...localMeters])];
+        const now = new Date();
+        const blocked = meters.map((item) => readStore.dispatchBlockForMeterReadOnly(item, now) ?? readStore.dispatchBlockForPrincipal(item.split(":")[0])).find(Boolean);
+        if (blocked) decision = { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+        else {
+          const rows = new Map(allMeters.map((meter) => [meter, readStore.latestPerWindow(meter)]));
+          const burn = readStore.burnRateFor([...rows.values()].flat(), now);
+          const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+          decision = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, argv.includes("--allow-unknown"), readStore.leasesReadOnly(undefined, true, now), owner, now);
+        }
+      } finally { readStore.close(); }
+    }
+  }
+  if (decision === undefined) {
     directReadNotice();
     const [policy, directStore] = await Promise.all([readPolicy(), HeadroomStore.open()]);
     try {
@@ -242,7 +383,8 @@ async function can(argv: string[]): Promise<number> {
     leasedId = payload.leases[0]?.id;
   }
 
-  printCan(decision, cost, leasedId, argv.includes("--json"));
+  const host = await checkHostHealth(await readHostGuardPolicy());
+  printCan(decision, cost, leasedId, host, argv.includes("--json"), servedFromCache);
   return decision.allowed ? 0 : 2;
 }
 
@@ -255,21 +397,26 @@ function ttl(value: string | undefined, flag = "--ttl"): number {
 
 function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
 
+// Registry reads for the disabled-principal check use readAccountsOrEmpty(),
+// never a blanket swallowing .catch(): a missing accounts.toml (before the
+// first `accounts discover`) is a normal, well-defined "no accounts
+// configured" state, but a malformed or otherwise unreadable file must still
+// fail closed (propagate, which every caller below either lets reach
+// runCli's own error handling or folds into its own existing failure shape)
+// rather than silently reporting "nothing disabled" and risking admission of
+// a parked principal's stored capacity.
 async function disabledMeterReason(meter: string): Promise<string | undefined> {
-  const principal = disabledPrincipalForMeter(await readAccounts().catch(() => []), meter);
+  const principal = disabledPrincipalForMeter(await readAccountsOrEmpty(), meter);
   return principal ? disabledPrincipalReason(principal) : undefined;
 }
 
-async function disabledMetersReason(meters: string[]): Promise<string | undefined> {
-  const accounts = await readAccounts().catch(() => []);
-  const principal = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
-  return principal ? disabledPrincipalReason(principal) : undefined;
-}
-
-function disabledUnknownLine(meter: string, reason: string, asJson = false): number {
-  if (asJson) console.log(JSON.stringify(withContract({ meter, allowed: false, unknown: true, reason })));
-  else console.log(`${meter}  UNKNOWN (${reason})`);
-  return 2;
+/** Like disabledMeterReason, but for an action class's resolved list of
+ * meters: names which specific meter is disabled (never just meters[0]),
+ * since a decision built from this must report the actual deciding meter. */
+async function disabledMeterInList(meters: string[]): Promise<{ meter: string; reason: string } | undefined> {
+  const accounts = await readAccountsOrEmpty();
+  const meter = meters.find((item) => disabledPrincipalForMeter(accounts, item) !== undefined);
+  return meter ? { meter, reason: disabledPrincipalReason(disabledPrincipalForMeter(accounts, meter)!) } : undefined;
 }
 
 function printLeases(items: Lease[]): void {
@@ -282,8 +429,12 @@ async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
     const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note"); const actionClass = option(argv, "--class");
     if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]");
+    // A write, not a read with its own "UNKNOWN" convention: refusing it the
+    // same way any other daemon-side lease_start rejection already would
+    // (an Error that runCli turns into the ordinary exit-1 failure shape)
+    // keeps this one refusal from inventing a second, undocumented shape.
     const disabled = await disabledMeterReason(meter);
-    if (disabled) return disabledUnknownLine(meter, disabled);
+    if (disabled) throw new Error(disabled);
     const expected = expect === undefined ? null : Number(expect);
     if (expected !== null && (!Number.isFinite(expected) || expected < 0 || expected > 100)) throw new Error("--expect must be 0 through 100");
     const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null, action_class: actionClass ?? null };
@@ -316,6 +467,137 @@ async function lease(argv: string[]): Promise<number> {
     directReadNotice(); const store = await HeadroomStore.open(); try { const items = store.leases(); store.audit("cli", "leases", null, "ok"); if (asJson) { console.log(JSON.stringify(withContract({ leases: items }))); return 0; } printLeases(items); return 0; } finally { store.close(); }
   }
   throw new Error("Usage: headroom lease <start|end|list> [--json]");
+}
+
+const HEARTBEAT_HELP = "Usage: headroom heartbeat --owner <name> --every <duration> [--resume \"<sentence>\"] | headroom heartbeat --owner <name> --stop | headroom heartbeat list [--json]";
+
+function printHeartbeats(items: Heartbeat[]): void {
+  if (!items.length) { console.log("no registered heartbeats"); return; }
+  for (const item of items) console.log(`${item.owner}  every ${item.interval_ms}ms  last beat ${item.last_beat_at}${item.lapsed_since ? `  LAPSED since ${item.lapsed_since}` : ""}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
+}
+
+/**
+ * `headroom heartbeat`: an orchestrator's promise to beat at least every
+ * `--every`, recorded in the daemon's own store -- the one process that
+ * survives a crashed session. The daemon's own poll loop is what notices a
+ * lapse; this command only ever records/refreshes/stops the promise or
+ * lists it.
+ */
+async function heartbeat(argv: string[]): Promise<number> {
+  if (argv[0] === "list") {
+    const asJson = argv.includes("--json");
+    const request = await requestDaemon("heartbeats");
+    if (request !== undefined) {
+      const items = unwrapRpc(request) as Heartbeat[];
+      if (asJson) { console.log(JSON.stringify(withContract({ heartbeats: items }))); return 0; }
+      printHeartbeats(items);
+      return 0;
+    }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try {
+      const items = store.heartbeats();
+      store.audit("cli", "heartbeats", null, "ok");
+      if (asJson) { console.log(JSON.stringify(withContract({ heartbeats: items }))); return 0; }
+      printHeartbeats(items);
+      return 0;
+    } finally { store.close(); }
+  }
+  const owner = option(argv, "--owner");
+  if (!owner) throw new Error(HEARTBEAT_HELP);
+  if (argv.includes("--stop")) {
+    const params = { owner };
+    const request = await requestDaemon("heartbeat_stop", params);
+    if (request !== undefined) { const result = unwrapRpc(request) as { stopped: boolean }; console.log(result.stopped ? `stopped ${owner}` : `no heartbeat registered for ${owner}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const stopped = store.heartbeatStop(owner); store.audit("cli", "heartbeat_stop", owner, "ok"); console.log(stopped ? `stopped ${owner}` : `no heartbeat registered for ${owner}`); return 0; } finally { store.close(); }
+  }
+  const every = option(argv, "--every");
+  if (!every) throw new Error(HEARTBEAT_HELP);
+  const intervalMs = ttl(every, "--every");
+  // undefined (the flag was not passed at all) keeps whatever resume
+  // sentence a prior beat registered; store.heartbeatBeat treats an
+  // explicit --resume "" the same as any other non-empty string (a plain
+  // re-beat need not repeat one every time).
+  const resumeSentence = option(argv, "--resume");
+  const params = { owner, interval_ms: intervalMs, resume_sentence: resumeSentence };
+  const request = await requestDaemon("heartbeat_beat", params);
+  if (request !== undefined) { const item = unwrapRpc(request) as Heartbeat; console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; }
+  directReadNotice();
+  const store = await HeadroomStore.open();
+  try { const item = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); store.audit("cli", "heartbeat_beat", owner, "ok"); console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; } finally { store.close(); }
+}
+
+const TIMER_HELP = [
+  "Usage: headroom timer <set|list|clear>",
+  "  set:   headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action \"<text>\" [--if-missed notify|drop]",
+  "  list:  headroom timer list [--owner <name>] [--json]",
+  "  clear: headroom timer clear --owner <name> --name <id>",
+].join("\n");
+
+function printTimers(items: Timer[]): void {
+  if (!items.length) { console.log("no pending timers"); return; }
+  for (const item of items) console.log(`${item.owner}/${item.name}  at ${item.at}  if-missed ${item.if_missed}  ${item.action}`);
+}
+
+/**
+ * `headroom timer`: a named wake-up the daemon fires (as one inbox entry to
+ * its owner, never executed -- see src/heartbeat.ts's fireDueTimers) once
+ * `--at` is due. `list` shows only pending timers (never fired, never
+ * cleared); a fired or cleared one stays in the store for history but drops
+ * out of this view, same as leases()'s activeOnly default.
+ */
+async function timer(argv: string[]): Promise<number> {
+  if (argv[0] === "set") {
+    const owner = option(argv, "--owner");
+    const name = option(argv, "--name");
+    const atRaw = option(argv, "--at");
+    const action = option(argv, "--action");
+    const ifMissedRaw = option(argv, "--if-missed");
+    if (!owner || !name || !atRaw || !action) throw new Error(TIMER_HELP);
+    if (ifMissedRaw !== undefined && ifMissedRaw !== "notify" && ifMissedRaw !== "drop") throw new Error("--if-missed must be notify or drop");
+    const ifMissed = ifMissedRaw === "drop" ? "drop" : "notify";
+    const at = parseTimerAt(atRaw);
+    const params = { owner, name, at, action, if_missed: ifMissed };
+    const request = await requestDaemon("timer_set", params);
+    if (request !== undefined) { const item = unwrapRpc(request) as Timer; console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const item = store.setTimer(owner, name, at, action, ifMissed, new Date()); store.audit("cli", "timer_set", `${owner}:${name}`, "ok"); console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "clear") {
+    const owner = option(argv, "--owner");
+    const name = option(argv, "--name");
+    if (!owner || !name) throw new Error(TIMER_HELP);
+    const params = { owner, name };
+    const request = await requestDaemon("timer_clear", params);
+    if (request !== undefined) { const result = unwrapRpc(request) as { cleared: boolean }; console.log(result.cleared ? `cleared ${owner}/${name}` : `no timer ${owner}/${name}`); return 0; }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try { const cleared = store.clearTimer(owner, name); store.audit("cli", "timer_clear", `${owner}:${name}`, "ok"); console.log(cleared ? `cleared ${owner}/${name}` : `no timer ${owner}/${name}`); return 0; } finally { store.close(); }
+  }
+  if (argv[0] === "list") {
+    const owner = option(argv, "--owner");
+    const asJson = argv.includes("--json");
+    const request = await requestDaemon("timer_list", { owner });
+    if (request !== undefined) {
+      const items = unwrapRpc(request) as Timer[];
+      if (asJson) { console.log(JSON.stringify(withContract({ timers: items }))); return 0; }
+      printTimers(items);
+      return 0;
+    }
+    directReadNotice();
+    const store = await HeadroomStore.open();
+    try {
+      const items = store.timers(owner);
+      store.audit("cli", "timer_list", owner ?? null, "ok");
+      if (asJson) { console.log(JSON.stringify(withContract({ timers: items }))); return 0; }
+      printTimers(items);
+      return 0;
+    } finally { store.close(); }
+  }
+  throw new Error(TIMER_HELP);
 }
 
 async function cost(argv: string[]): Promise<number> {
@@ -355,18 +637,28 @@ async function rate(argv: string[]): Promise<number> {
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
-  if (meter) {
-    const disabled = await disabledMeterReason(meter);
-    if (disabled) return disabledUnknownLine(meter, disabled, asJson);
-  }
-  const request = await requestDaemon("rate", { meter, minutes, owner, need });
+  const disabled = meter ? await disabledMeterReason(meter) : undefined;
   let lines: RateLine[];
-  if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
-  else {
-    directReadNotice();
-    const store = await HeadroomStore.open();
-    try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
-    finally { store.close(); }
+  if (disabled) {
+    // Same synthetic-line shape rateLines() already uses for any other
+    // meter it cannot read at all (meterUnknownReason) -- a bare RateLine[]
+    // array, exit 0 -- rather than a one-off object/exit-code just for this
+    // refusal.
+    lines = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }];
+  } else {
+    const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
+    if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
+    else if (outcome.kind === "cache") {
+      cacheReadNotice();
+      const store = await HeadroomStore.openReadOnly();
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
+      finally { store.close(); }
+    } else {
+      directReadNotice();
+      const store = await HeadroomStore.open();
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
+      finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
   if (!lines.length) { console.log(meter ? `no readings for ${meter}` : "no readings"); return 0; }
@@ -428,6 +720,71 @@ async function report(argv: string[]): Promise<number> {
   return 0;
 }
 
+function printCredits(items: CreditBalance[]): void {
+  if (!items.length) { console.log("no credits meters"); return; }
+  for (const item of items) {
+    const expiry = item.expires_at ? ` ${item.expires_at}` : "";
+    console.log(`${item.meter}  ${item.lapsed ? `${item.available} expired${expiry}` : `${item.available} available${expiry}`}  source ${item.source}`);
+  }
+}
+
+async function configuredCreditPrincipal(principal: string): Promise<void> {
+  if (!(await readAccounts()).some((account) => account.name === principal)) throw new Error(`unknown principal: ${principal}`);
+}
+
+/** A manual credits write goes through the daemon when it owns the database,
+ * so status's cached read sees it immediately; otherwise it uses the same
+ * store method directly. Both paths return the one current balance shape. */
+async function credits(argv: string[]): Promise<number> {
+  const command = argv[0];
+  const asJson = argv.includes("--json");
+  if (!command || command === "--json") {
+    if (argv.some((value) => value !== "--json")) throw new Error("Usage: headroom credits [--json]");
+    const request = await requestDaemon("credits");
+    let items: CreditBalance[];
+    if (request !== undefined) items = unwrapRpc(request) as CreditBalance[];
+    else {
+      const store = await HeadroomStore.open();
+      try { items = store.credits(); store.audit("cli", "credits", null, "ok"); }
+      finally { store.close(); }
+    }
+    if (asJson) console.log(JSON.stringify(withContract({ credits: items })));
+    else printCredits(items);
+    return 0;
+  }
+  if (command !== "set" && command !== "clear") throw new Error("Usage: headroom credits <set|clear> --principal <name> [--available <n> --expires <YYYY-MM-DD or ISO instant>] [--json]");
+  const principal = option(argv, "--principal");
+  if (!principal) throw new Error("--principal is required");
+  await configuredCreditPrincipal(principal);
+  let result: CreditBalance;
+  if (command === "set") {
+    const rawAvailable = option(argv, "--available");
+    const rawExpiry = option(argv, "--expires");
+    const available = rawAvailable === undefined ? Number.NaN : Number(rawAvailable);
+    if (!Number.isFinite(available) || available < 0 || !Number.isInteger(available)) throw new Error("--available must be a non-negative whole number");
+    if (!rawExpiry) throw new Error("--expires is required");
+    const expires = parseCreditExpiry(rawExpiry);
+    const request = await requestDaemon("credits_set", { principal, available, expires });
+    if (request !== undefined) result = unwrapRpc(request) as CreditBalance;
+    else {
+      const store = await HeadroomStore.open();
+      try { store.recordManualCredits(principal, available, expires); result = store.credits().find((item) => item.meter === `${principal}:credits`)!; store.audit("cli", "credits_set", principal, "ok"); }
+      finally { store.close(); }
+    }
+  } else {
+    const request = await requestDaemon("credits_clear", { principal });
+    if (request !== undefined) result = unwrapRpc(request) as CreditBalance;
+    else {
+      const store = await HeadroomStore.open();
+      try { store.clearManualCredits(principal); result = store.credits().find((item) => item.meter === `${principal}:credits`)!; store.audit("cli", "credits_clear", principal, "ok"); }
+      finally { store.close(); }
+    }
+  }
+  if (asJson) console.log(JSON.stringify(withContract({ credit: result })));
+  else printCredits([result]);
+  return 0;
+}
+
 async function ack(argv: string[]): Promise<number> {
   if (argv[0] !== "plan" || !argv[1]) throw new Error("Usage: headroom ack plan <principal>");
   const store = await HeadroomStore.open();
@@ -447,6 +804,20 @@ async function run(argv: string[]): Promise<number> {
   if (!owner || !command.length || (!meter && !actionClass)) throw new Error("Usage: headroom run --meter <meter> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] -- <command> [args...]");
   const needs: GateNeed[] = [];
   for (let index = 0; index < flags.length; index += 1) if (flags[index] === "--need") needs.push(parseGateNeed(flags[index + 1] ?? ""));
+  // Host guard runs before anything else in this command, including opening
+  // the store: a refusal here must never leak a lease, and checking before
+  // even the gate/admission logic keeps that ordering trivially true rather
+  // than relying on a later rollback.
+  const hostGuardPolicy = await readHostGuardPolicy();
+  const host = await checkHostHealth(hostGuardPolicy);
+  const refusal = hostGuardRefusal(host, hostGuardPolicy.mode);
+  if (refusal) {
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ host, gate: null, lease_id: null })));
+    else console.error(refusal);
+    return 2;
+  }
+  const warning = hostGuardWarning(host, hostGuardPolicy.mode);
+  if (warning) console.error(warning);
   const policy = await readPolicy();
   const store = await HeadroomStore.open();
   let leases: Lease[] = [];
@@ -462,10 +833,15 @@ async function run(argv: string[]): Promise<number> {
       if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
     }
     if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
-    const disabled = Array.isArray(target) ? await disabledMetersReason(target) : await disabledMeterReason(target);
+    const disabled = await disabledMeterInList(Array.isArray(target) ? target : [target]);
     if (disabled) {
-      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: { allowed: false, unknown: true, reason: disabled }, lease_id: null })));
-      else console.log(`${Array.isArray(target) ? target.join(", ") : target}  UNKNOWN (${disabled})`);
+      // Same CanDecision shape `run --json`'s "quota gate refuses" outcome
+      // already documents (docs/json-contract.md), including `host` -- not a
+      // one-off object that drops it.
+      const targetMeters = Array.isArray(target) ? target : [target];
+      const decision: CanDecision = { allowed: false, meter: disabled.meter, state: "UNKNOWN", reason: disabled.reason, meters: targetMeters.map((item) => ({ meter: item, state: "UNKNOWN", reason: disabled.reason })) };
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ host, gate: decision, lease_id: null })));
+      else console.log(`${targetMeters.join(", ")}  UNKNOWN (${disabled.reason})`);
       return 2;
     }
     const now = new Date();
@@ -486,12 +862,12 @@ async function run(argv: string[]): Promise<number> {
     );
     const decision = admitted.decision;
     if (!decision.allowed) {
-      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null })));
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null, host })));
       else console.error(decision.reason);
       return 2;
     }
     leases = admitted.leases;
-    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: leases[0]?.id ?? null })));
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: leases[0]?.id ?? null, host })));
   } finally { store.close(); }
   let child: ReturnType<typeof spawn>;
   try { child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env }); }
@@ -639,32 +1015,46 @@ async function planImport(argv: string[]): Promise<number> {
 async function plan(argv: string[]): Promise<number> {
   if (argv[0] === "import") return planImport(argv.slice(1));
   const meter = option(argv, "--meter");
-  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]");
+  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]");
   const until = option(argv, "--until");
   if (until !== "reset") throw new Error("--until must be 'reset' (the only supported value)");
   const reserveValue = option(argv, "--reserve");
   if (reserveValue !== undefined && (!Number.isFinite(Number(reserveValue)) || Number(reserveValue) < 0 || Number(reserveValue) > 100)) throw new Error("--reserve must be 0 through 100");
+  const targetValue = option(argv, "--target");
+  const targetPoints = targetValue === undefined ? undefined : Number(targetValue);
+  if (targetPoints !== undefined && (!Number.isFinite(targetPoints) || targetPoints < 0)) throw new Error("--target must be a non-negative number");
   const asJson = argv.includes("--json");
   const disabled = await disabledMeterReason(meter);
-  if (disabled) return disabledUnknownLine(meter, disabled, asJson);
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
-  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need });
-  let result: ({ meter: string } & PlanResult) | { meter: string; error: string };
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
-    const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+  let result: Awaited<ReturnType<typeof planFor>>;
+  if (disabled) {
+    // plan's own documented failure shape (docs/json-contract.md): `{ meter,
+    // error, notices }`, always exit 0 -- the same data state a meter with
+    // no weekly window at all already reports, not a one-off object/exit 2.
+    result = { meter, error: disabled, notices: [] };
+  } else {
+    const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need, target_points: targetPoints });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
+      const store = await HeadroomStore.open();
+      try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
   // window at all) -- that is a data state to report, not a CLI failure, so
   // it renders like status's own UNKNOWN line and exits 0 rather than 1.
   if ("error" in result) { console.log(`${result.meter}  UNKNOWN (${result.error})`); return 0; }
-  console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h`);
+  const banked = result.banked;
+  const bankedText = banked.lapsed
+    ? `banked ${banked.available} expired${banked.expires_at ? ` ${banked.expires_at}` : ""} (${banked.source ?? "vendor"})`
+    : `banked ${banked.available} available${banked.expires_at ? ` (expires ${banked.expires_at})` : ""}${banked.source ? ` (${banked.source})` : ""}`;
+  const targetText = result.target ? `  target ${result.target.points}: ${result.target.fits_now ? "fits now" : result.target.resets_needed === null ? "cannot fit: each banked reset is fully reserved" : result.target.fits_with_banked ? `needs ${result.target.resets_needed} banked reset${result.target.resets_needed === 1 ? "" : "s"}` : `needs ${result.target.resets_needed} resets`}` : "";
+  console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h  ${bankedText}${targetText}  ${result.advice.reason}`);
   return 0;
 }
 
@@ -705,22 +1095,29 @@ async function gate(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
-  const disabled = Array.isArray(target) ? await disabledMetersReason(target) : target ? await disabledMeterReason(target) : undefined;
-  if (disabled) {
-    const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass ?? model ?? "meter");
-    return disabledUnknownLine(targetLabel, disabled, asJson);
-  }
+  const disabled = target ? await disabledMeterInList(Array.isArray(target) ? target : [target]) : undefined;
   const options = { owner, planSharePercent, actionClass };
-  const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
   let result: Awaited<ReturnType<typeof gateFor>>;
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+  if (disabled) {
+    // gate's own documented refusal shape (docs/json-contract.md): `{
+    // allowed, reason, meters_checked, unknown, notices }` -- exit 2, same
+    // as any other refusal below, not a one-off object/field set.
+    result = { allowed: false, reason: disabled.reason, unknown: true, meters_checked: Array.isArray(target) ? target : target ? [target] : [], notices: [] };
+  } else {
+    const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const store = await HeadroomStore.open();
+      try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    }
   }
-  if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
+  if (asJson) {
+    const host = await checkHostHealth(await readHostGuardPolicy());
+    console.log(JSON.stringify(withContract({ ...result, host })));
+    return 0;
+  }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
   // A refusal because the meter's own usage could not be read at all (an
   // unreadable/never-seen window) is a different state than a refusal
@@ -737,7 +1134,10 @@ async function wait(argv: string[]): Promise<number> {
   if (!meter || !argv.includes("--until-reset")) throw new Error("Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]");
   const maxValue = option(argv, "--max");
   const disabled = await disabledMeterReason(meter);
-  if (disabled) return disabledUnknownLine(meter, disabled);
+  // wait has no --json and no data state of its own beyond the "resets_at
+  // unknown" line below; render disabled the exact same way, exit 0 like
+  // any other unknown reading rather than a distinct exit 2.
+  if (disabled) { console.log(`${meter}  UNKNOWN (${disabled})`); return 0; }
   const maxMs = maxValue === undefined ? null : ttl(maxValue, "--max");
   // Set whenever a poll finds no windowed reading for this meter at all: the
   // meter's own latest reason (e.g. a pending Keychain grant), so the final
@@ -783,17 +1183,23 @@ async function fill(argv: string[]): Promise<number> {
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
   const disabled = await disabledMeterReason(meter);
-  if (disabled) return disabledUnknownLine(meter, disabled, asJson);
   const need = option(argv, "--need"); if (need) parseGateNeed(`${need}:0`);
-  const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
   let result: Awaited<ReturnType<typeof fillFor>>;
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
-    const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+  if (disabled) {
+    // fill's own documented failure shape (docs/json-contract.md): `{
+    // meter, error, notices }`, exit 0 -- the same data state a meter with
+    // no enforced window at all already reports, not a one-off object/exit 2.
+    result = { meter, error: disabled, notices: [] };
+  } else {
+    const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
+      const store = await HeadroomStore.open();
+      try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -907,7 +1313,7 @@ export async function observe(argv: string[]): Promise<number> {
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
   if (argv.includes("--models")) return printModelShare(principal, argv.includes("--json"));
-  const configuredAccounts = await readAccounts().catch(() => [] as Account[]);
+  const configuredAccounts = await readAccountsOrEmpty();
   const disabledPrincipals = configuredAccounts.filter((account) => !isAccountEnabled(account) && (!principal || account.name === principal)).map((account) => account.name);
   // --ttl 0 is a synonym for --refresh: both force a fresh probe through the
   // daemon's own `refresh` method (still gated by the grant marker and the
@@ -915,26 +1321,54 @@ export async function observe(argv: string[]): Promise<number> {
   // whatever the daemon last cached. A no-daemon direct read already polls
   // fresh on every call, so this is a no-op there.
   if (argv.includes("--refresh") || option(argv, "--ttl") === "0") {
-    const refreshed = await requestDaemon("refresh", { principal });
-    if (refreshed !== undefined) {
-      const outcome = unwrapRpc(refreshed) as { rate_limited?: true } | Observation[];
-      if (outcome && !Array.isArray(outcome) && outcome.rate_limited) process.stderr.write("(refresh throttled by the daemon's own poll interval or vendor backoff; showing the latest cached reading)\n");
-    }
+    // Best-effort: a daemon too slow to force a fresh probe right now must
+    // not fail the whole status read, which may still be servable from
+    // cache below -- exactly the outcome this whole call would otherwise
+    // hide behind a thrown "unresponsive" error.
+    try {
+      const refreshed = await requestDaemon("refresh", { principal });
+      if (refreshed !== undefined) {
+        const refreshOutcome = unwrapRpc(refreshed) as { rate_limited?: true } | Observation[];
+        if (refreshOutcome && !Array.isArray(refreshOutcome) && refreshOutcome.rate_limited) process.stderr.write("(refresh throttled by the daemon's own poll interval or vendor backoff; showing the latest cached reading)\n");
+      }
+    } catch { /* handled below: the plain status request right after this retries health once. */ }
   }
-  const request = await requestDaemon("status");
-  const daemonObservations = request === undefined ? undefined : statusObservations(unwrapRpc(request));
+  const outcome = await requestDaemonReadThrough("status");
+  const daemonObservations = outcome.kind === "available" ? statusObservations(unwrapRpc(outcome.result)) : undefined;
+  const servedFromCache = outcome.kind === "cache";
+  const policy = await readPolicy();
   let observations: Observation[];
   let failures: string[];
   let resetSeen = new Map<string, string>();
   let freeResetUsed = new Map<string, string>();
   let leases: Lease[] = [];
   let planDowngraded: PlanDowngrade[] = [];
-  const direct = daemonObservations === undefined;
+  let directCatalogAccounts: ProviderAccount[] | undefined;
+  let directCatalogHome: string | undefined;
+  const direct = outcome.kind === "absent";
   if (daemonObservations) {
-    observations = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    const daemonRows = daemonObservations.filter((item) => !principal || item.principal_id === principal);
+    observations = await normalizeUnmarkedDaemonStatus(daemonRows, policy.staleness_minutes);
     failures = [];
     const leaseRequest = await requestDaemon("leases");
     leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];
+  } else if (servedFromCache) {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try {
+      const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      const now = new Date();
+      // Freshness/pace are computed against the CURRENT clock here, exactly
+      // like every other status path: a stored row served stale here stays
+      // stale, never a falsely fresh capacity reading just because it came
+      // from the cache instead of a live poll.
+      observations = withStatusInfo(rawObservations, store.burnRateFor(rawObservations, now), store.lastKnownFor(rawObservations, now), policy.staleness_minutes, now);
+      failures = [];
+      resetSeen = store.resetSeenFor(observations);
+      freeResetUsed = store.freeResetUsedFor(observations);
+      leases = store.leasesReadOnly(undefined, true, now);
+      planDowngraded = store.planDowngrades(new Set(observations.map((item) => item.principal_id)));
+    } finally { store.close(); }
   } else {
     const store = await HeadroomStore.open();
     try {
@@ -943,10 +1377,14 @@ export async function observe(argv: string[]): Promise<number> {
       failures = polled.failures;
       store.insertPoll(polled.observations);
       for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("cli", "claude_probe", principalId, outcome);
+      // Run this only after rendering below. Antigravity's catalog read can
+      // make several bounded network calls; it must never delay this direct
+      // quota result. Its own store is opened after this status store closes.
+      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
+      directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
-      const paced = withPaceInfo(rawObservations, store.burnRateFor(rawObservations, now), now);
-      observations = withLastKnown(paced, store.lastKnownFor(rawObservations, now));
+      observations = withStatusInfo(rawObservations, store.burnRateFor(rawObservations, now), store.lastKnownFor(rawObservations, now), policy.staleness_minutes, now);
       resetSeen = store.resetSeenFor(observations);
       freeResetUsed = store.freeResetUsedFor(observations);
       leases = store.leases(undefined, true);
@@ -954,7 +1392,7 @@ export async function observe(argv: string[]): Promise<number> {
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
-  if (!direct) {
+  if (outcome.kind === "available") {
     const windows = observations.map((item) => ({ meter_id: item.meter_id, minutes: item.window?.minutes, resets_at: item.resets_at }));
     const resetEvents = unwrapRpc(await requestDaemon("reset_seen", { windows })) as Record<string, string>;
     resetSeen = new Map(Object.entries(resetEvents));
@@ -969,20 +1407,67 @@ export async function observe(argv: string[]): Promise<number> {
   // The grouped view's own footer already says where the numbers came from, so
   // the stderr notice would only repeat it on the one form that carries both.
   if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
-  const policy = await readPolicy();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { const withResets = withResetsIn(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals } : { observations: withResets, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  // Additive surfaces: every registered heartbeat lease, and every pending
+  // timer already at or past its own `at` -- recomputed client-side from the
+  // same timer list a no-daemon read would use.
+  let heartbeats: Heartbeat[] = [];
+  let dueTimers: Timer[] = [];
+  if (outcome.kind === "available") {
+    // An older daemon may not answer these two methods with an array at all --
+    // treated the same as "none", never a crash, like `leases` above.
+    const heartbeatsRequest = await requestDaemon("heartbeats");
+    const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapRpc(heartbeatsRequest);
+    heartbeats = Array.isArray(unwrappedHeartbeats) ? unwrappedHeartbeats as Heartbeat[] : [];
+    const timersRequest = await requestDaemon("timer_list");
+    const unwrappedTimers = timersRequest === undefined ? [] : unwrapRpc(timersRequest);
+    const pendingTimers = Array.isArray(unwrappedTimers) ? unwrappedTimers as Timer[] : [];
+    dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
+  } else {
+    // No daemon (direct) or an unresponsive one (cache): read the store
+    // directly -- read-only in the cache case, never racing the live writer.
+    // A store from before these tables existed reads as "none".
+    try {
+      const store = direct ? await HeadroomStore.open() : await HeadroomStore.openReadOnly();
+      try { heartbeats = store.heartbeats(); dueTimers = store.timers().filter((item) => Date.parse(item.at) <= Date.now()); }
+      finally { store.close(); }
+    } catch { heartbeats = []; dueTimers = []; }
+  }
+  if (argv.includes("--json")) {
+    const lapsed = withCreditsLapsed(observations);
+    // Additive only, present only over the cached fallback -- see printCan's
+    // identical convention for `can --json`.
+    const cacheFields = servedFromCache ? { served_from: "cache" as const, daemon: "unresponsive" as const } : {};
+    console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, heartbeats, due_timers: dueTimers, ...cacheFields } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) }, ...cacheFields })));
+  }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
     const vendors = new Map(configuredAccounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
     for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded, disabled_principals: disabledPrincipals }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
+    // The dense/agent form is what a script or an orchestrator shell reads
+    // (see status-view.ts's own doc comment); a lapsed heartbeat or a due
+    // timer is squarely that reader's business, so it gets one line each
+    // here, same shape as printHeartbeats/printTimers above. The grouped
+    // human view stays unchanged -- adding a full section to renderStatus's
+    // own layout is a larger, separate change.
+    if (view.form !== "grouped") {
+      for (const item of heartbeats.filter((entry) => entry.lapsed_since)) console.log(`heartbeat ${item.owner} LAPSED since ${item.lapsed_since}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
+      for (const item of dueTimers) console.log(`timer ${item.owner}/${item.name} due ${item.at}  ${item.action}`);
+    }
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
+  }
+  if (directCatalogAccounts && directCatalogHome) {
+    await (async () => {
+      const catalogStore = await HeadroomStore.open(directCatalogHome!);
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
+      finally { catalogStore.close(); }
+    })().catch(() => undefined);
   }
   if (thresholdRows?.some((item) => item.blocking)) return 2;
   return failures.length ? observations.length ? 3 : 1 : 0;
@@ -1043,8 +1528,16 @@ function dedupeStateReason(state: string, reason: string): string {
   return match ? match[1] : reason;
 }
 
-function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
-  if (asJson) { console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null }))); return; }
+function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, host: HostHealth, asJson: boolean, servedFromCache = false): void {
+  if (asJson) {
+    // Additive only: absent unless this decision came from the read-only
+    // cached fallback (a live daemon that would not answer health even after
+    // one retry), so an existing caller matching on this object's shape sees
+    // no change at all on the ordinary path.
+    const cacheFields = servedFromCache ? { served_from: "cache" as const, daemon: "unresponsive" as const } : {};
+    console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null, host, ...cacheFields })));
+    return;
+  }
   console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
   for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
   if (cost.expected_percent !== null) {
@@ -1173,8 +1666,11 @@ function readClipboardText(): Promise<string> {
  * own percentage, and the reset both as a clock time and as a countdown. */
 export function usagePasteLine(observation: Observation, now = new Date()): string {
   const used = observation.quantity?.used ?? 0;
-  const remaining = resetsIn(observation.resets_at, now).resets_in;
-  const reset = observation.resets_at ? `resets ${formatReset(observation.resets_at)}${remaining ? ` (in ${remaining})` : ""}` : "no reset in the panel";
+  const remaining = resetsIn(observation.resets_at, now);
+  const overdue = formatOverdueReset(remaining);
+  const reset = observation.resets_at
+    ? overdue ? `↻ ${overdue}` : `resets ${formatReset(observation.resets_at)}${remaining.resets_in ? ` (in ${remaining.resets_in})` : ""}`
+    : "no reset in the panel";
   return `ingested ${observation.meter_id} ${label(observation)} ${Math.round(used)}% used, ${reset}`;
 }
 
@@ -1200,7 +1696,10 @@ async function usagePaste(argv: string[]): Promise<number> {
   const accounts = await readAccounts();
   const principal = resolveClaudePrincipal(accounts, option(argv, "--principal"));
   const disabled = disabledPrincipalForMeter(accounts, `${principal}:all`);
-  if (disabled) return disabledUnknownLine(`${principal}:all`, disabledPrincipalReason(disabled), argv.includes("--json"));
+  // A write, not a read with its own "UNKNOWN" convention: refuse it the
+  // same way any other usage_paste rejection would (an ordinary thrown
+  // Error, exit 1) rather than inventing a one-off object/exit 2.
+  if (disabled) throw new Error(disabledPrincipalReason(disabled));
   const text = fromClipboard ? await readClipboardText() : await readStdinText();
   const now = new Date();
   const panel = parseUsagePanel(text, now);
@@ -1354,17 +1853,21 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["dashboard (top)", "Live terminal dashboard from cached readings, with pause, events, and leases (--html <path> writes standalone HTML report)"],
   ["can <action-class>", "Check whether an action class can consume its meters, per routing.toml"],
   ["events", "List reset and free-reset events"],
+  ["models", "List every model id seen in a vendor's own model catalog, with first_seen (and retired_at once a vendor drops one)"],
   ["history <meter>", "List stored observations for one meter"],
   ["lease start|list|end", "Reserve, list, or release a meter lease"],
+  ["heartbeat", "Record or refresh an orchestrator's heartbeat lease with the daemon (or --stop it, or list every registered one)"],
+  ["timer set|list|clear", "Register, list, or clear a named daemon-held wake-up, delivered as one inbox entry when due"],
   ["cost [<action-class>]", "Print the learned median/IQR/sample-count spent percent per action class"],
   ["rate", "Burn in percent per hour over a recent window, and ETA to the limit"],
   ["spend", "Per-owner attributed spend on a shared meter, from the spend ledger"],
   ["export", "Export observations, events, the spend ledger, and leases for a period as JSON or CSV"],
   ["inbox", "Read this session's hand-off messages, or send one to another session"],
-  ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
+  ["plan", "Points available per remaining 5h window, banked resets, and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
   ["run", "Gate, lease, and launch one command as an atomic dispatch"],
   ["report", "Record or clear a vendor-reported exhausted meter"],
+  ["credits", "Record, clear, or list banked reset credits"],
   ["ack plan", "Acknowledge a principal plan downgrade before dispatching again"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
@@ -1396,6 +1899,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   dashboard: "Usage: headroom dashboard (alias: top) [--interval <s>] [--once] [--no-color] [--verbose] [--ascii] [--html <path>] [--force]",
   can: "Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]",
   events: "Usage: headroom events [--since 24h] [--table]",
+  models: "Usage: headroom models [--principal <id>] [--json|--agent]",
   history: "Usage: headroom history <meter> [--since 24h]",
   lease: [
     "Usage: headroom lease <start|end|list>",
@@ -1403,18 +1907,25 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "  end:   headroom lease end <id> --owner <name> [--force]",
     "  list:  headroom lease list [--json]",
   ].join("\n"),
+  heartbeat: HEARTBEAT_HELP,
+  timer: TIMER_HELP,
   cost: "Usage: headroom cost [<action-class>] [--json]",
   rate: "Usage: headroom rate [--meter <meter_id>] [--owner <name>] [--minutes 30] [--window 10m] [--json]",
   spend: SPEND_HELP,
   export: EXPORT_HELP,
   inbox: [INBOX_HELP, `  send: ${INBOX_SEND_HELP}`].join("\n"),
   plan: [
-    "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
+    "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]",
     `  import: ${PLAN_IMPORT_HELP}`,
   ].join("\n"),
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
   report: "Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]",
+  credits: [
+    "Usage: headroom credits [--json]",
+    "  set:   headroom credits set --principal <name> --available <n> --expires <YYYY-MM-DD or ISO instant> [--json]",
+    "  clear: headroom credits clear --principal <name> [--json]",
+  ].join("\n"),
   ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
@@ -1552,7 +2063,10 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "update") return runUpdate(argv.slice(1));
   if (argv[0] === "history") return history(argv.slice(1));
   if (argv[0] === "events") return events(argv.slice(1));
+  if (argv[0] === "models") return models(argv.slice(1));
   if (argv[0] === "lease") return lease(argv.slice(1));
+  if (argv[0] === "heartbeat") return heartbeat(argv.slice(1));
+  if (argv[0] === "timer") return timer(argv.slice(1));
   if (argv[0] === "can") return can(argv.slice(1));
   if (argv[0] === "cost") return cost(argv.slice(1));
   if (argv[0] === "rate") return rate(argv.slice(1));
@@ -1563,6 +2077,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "gate") return gate(argv.slice(1));
   if (argv[0] === "run") return run(argv.slice(1));
   if (argv[0] === "report") return report(argv.slice(1));
+  if (argv[0] === "credits") return credits(argv.slice(1));
   if (argv[0] === "ack") return ack(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));
   if (argv[0] === "fill") return fill(argv.slice(1));
@@ -1609,9 +2124,36 @@ export function isAccountsMissingError(error: unknown): boolean {
   return sameMissingFile(errno.path, accountsPath());
 }
 
+/**
+ * Runs `main()` the way the real CLI entry point below does, catching
+ * whatever it throws and turning that into an exit code instead of a
+ * rejection. `main()` itself keeps its existing throw-on-error contract
+ * unchanged (every `await expect(main(...)).rejects.toThrow(...)` test
+ * depends on that); this wrapper is what the entry point -- and a test that
+ * wants the entry point's own error handling, not `main()`'s raw throw --
+ * should call instead.
+ *
+ * A `--json` caller (an agent reading stdout, most of all) must never see
+ * empty stdout on a failed read: with no JSON printed here, a thrown error
+ * used to leave stdout completely empty (only the stderr line below), so "no
+ * answer at all" and "an empty but valid reading" were indistinguishable
+ * from stdout alone. This still prints the same stderr line for a human at
+ * a terminal; the JSON object on stdout is additional, not a replacement.
+ */
+export async function runCli(argv: string[]): Promise<number> {
+  const printJsonError = (message: string): void => { if (argv.includes("--json")) console.log(JSON.stringify({ error: message })); };
+  try {
+    return await main(argv);
+  } catch (error) {
+    if (isAccountsMissingError(error)) {
+      const message = "No accounts configured yet. Run: headroom accounts discover";
+      printJsonError(message); console.error(message); return 1;
+    }
+    const message = safeError(error);
+    printJsonError(message); console.error(`headroom error: ${message}`); return 1;
+  }
+}
+
 if (isMainModule(import.meta.url, process.argv[1])) {
-  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => {
-    if (isAccountsMissingError(error)) { console.error("No accounts configured yet. Run: headroom accounts discover"); process.exitCode = 1; return; }
-    console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1;
-  });
+  runCli(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

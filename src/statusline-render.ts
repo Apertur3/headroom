@@ -18,10 +18,10 @@
  */
 import { readPolicy } from "./config.js";
 import { rpc, socketPath } from "./daemon.js";
-import { withPaceInfo } from "./pace.js";
+import { withEffectiveFreshness, withStatusInfo } from "./pace.js";
 import { defaultPolicy, paceDecision, reserveFor, type Policy } from "./policy.js";
 import { readAccounts } from "./registry.js";
-import { formatResetsIn } from "./resets.js";
+import { formatOverdueReset, formatResetsIn, resetsIn, type ResetsIn } from "./resets.js";
 import { HeadroomStore } from "./store.js";
 import { isAccountEnabled, isLocalAccount, type Lease, type Observation, type PaceState } from "./types.js";
 import { formatStatuslineBar, statuslineMeterName, statuslineProfile, type StatuslineSnapshot } from "./adapters/claude-statusline.js";
@@ -102,10 +102,16 @@ const MAX_EPOCH_SECONDS = 8_640_000_000_000;
  * through the shared formatResetsIn helper. Undefined -- so the caller omits
  * the countdown entirely rather than printing a wrong one -- when there is no
  * reset, or the value is not a date at all. */
-function countdownFromEpoch(seconds: number | null | undefined, now: Date): string | undefined {
+function countdownFromEpoch(seconds: number | null | undefined, now: Date): ResetsIn | undefined {
   if (seconds === null || seconds === undefined) return undefined;
   if (!Number.isFinite(seconds) || Math.abs(seconds) > MAX_EPOCH_SECONDS) return undefined;
-  return formatResetsIn(Math.max(0, Math.round((seconds * 1000 - now.getTime()) / 1000)));
+  return resetsIn(new Date(seconds * 1000).toISOString(), now);
+}
+
+function resetTail(countdown: ResetsIn | undefined): string {
+  if (!countdown) return "";
+  const overdue = formatOverdueReset(countdown);
+  return overdue ? ` ↻ ${overdue}` : countdown.resets_in ? ` ↻${countdown.resets_in}` : "";
 }
 
 interface Segment {
@@ -203,7 +209,7 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
   const { style, color } = options;
   const policy = context.policy;
   const principal = context.principal;
-  const rows = context.observations;
+  const rows = withEffectiveFreshness(context.observations, policy.staleness_minutes, now);
   const mine = principal ? rows.filter((row) => row.principal_id === principal) : [];
   const allMeter = principal ? `${principal}:all` : undefined;
   const rowFor = (meterId: string, minutes: number): Observation | undefined =>
@@ -217,14 +223,14 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
   const weekRow = allMeter ? rowFor(allMeter, 10_080) : undefined;
   if (snapshot?.five_hour) {
     const reset = countdownFromEpoch(snapshot.five_hour.resets_at, now);
-    const body = `5h ${percent(snapshot.five_hour.used_percent)}${reset ? ` ↻${reset}` : ""}${burnTail(fiveRow, style)}`;
+    const body = `5h ${percent(snapshot.five_hour.used_percent)}${resetTail(reset)}${burnTail(fiveRow, style)}`;
     segments.push(segment(body, fiveRow ? paceDecision(fiveRow, policy, now).state : undefined, color, false));
   }
   if (snapshot?.seven_day) {
     // The weekly countdown is a days-away figure that earns its width only in
     // full style; compact keeps the weekly segment to its percentage.
     const reset = style === "full" ? countdownFromEpoch(snapshot.seven_day.resets_at, now) : undefined;
-    const body = `wk ${percent(snapshot.seven_day.used_percent)}${reset ? ` ↻${reset}` : ""}${burnTail(weekRow, style)}`;
+    const body = `wk ${percent(snapshot.seven_day.used_percent)}${resetTail(reset)}${burnTail(weekRow, style)}`;
     segments.push(segment(body, weekRow ? paceDecision(weekRow, policy, now).state : undefined, color, false));
   }
 
@@ -344,7 +350,7 @@ export async function statuslineContext(profile: string, now = new Date(), budge
     try {
       const rows = store.latestPerWindow();
       return {
-        observations: withPaceInfo(rows, store.burnRateFor(rows, now), now),
+        observations: withStatusInfo(rows, store.burnRateFor(rows, now), store.lastKnownFor(rows, now), policy.staleness_minutes, now),
         leases: store.leases(undefined, true, now),
         policy, ...(principal ? { principal } : {}), source: "store",
       };

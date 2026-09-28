@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { lstat, open, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -199,6 +199,10 @@ export class AgyKeepaliveSupervisor {
   private readonly killGraceMs: number;
   private readonly pidDiscoveryAttempts: number;
   private readonly pidDiscoveryIntervalMs: number;
+  /** Where the launch wrapper writes agy's pid (see agyPtyCommand). Known
+   * without `ps`, so stop() and an unexpected script exit can reap agy even
+   * on a host where the process table cannot be read. */
+  private readonly agyPidFile: string | undefined;
 
   constructor(options: AgyKeepaliveOptions = {}) {
     this.binary = options.binary ?? resolveAgyBinary(process.env.ANTIGRAVITY_CLI_PATH);
@@ -212,6 +216,7 @@ export class AgyKeepaliveSupervisor {
     this.killGraceMs = options.killGraceMs ?? 300;
     this.pidDiscoveryAttempts = options.pidDiscoveryAttempts ?? 20;
     this.pidDiscoveryIntervalMs = options.pidDiscoveryIntervalMs ?? 100;
+    this.agyPidFile = this.stateFilePath && this.platform !== "win32" ? `${this.stateFilePath}.agy-pid` : undefined;
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
@@ -251,10 +256,22 @@ export class AgyKeepaliveSupervisor {
     this.stopLoginWatch();
     const child = this.child;
     this.child = undefined;
-    if (child && child.exitCode === null) {
+    if (child && isAlive(child)) {
+      // Read agy's pid while script is still alive: script lives exactly as
+      // long as its PTY session, so a pid written by this launch's wrapper is
+      // proven to be agy right now, with no `ps` involved and no chance of a
+      // recycled pid.
+      const agyPid = this.agyPidFile ? await this.awaitAgyPid(child) : undefined;
       const pid = child.pid;
       if (typeof pid === "number") await killTree(pid, { graceMs: this.killGraceMs });
       else child.kill("SIGTERM");
+      // killTree reaches agy through a live `ps` walk; where that walk finds
+      // nothing (ps denied, or agy already reparented) agy would survive as an
+      // orphan holding a PTY, so reap the proven pid directly as well.
+      // Group only: agy leads its own process group, and a group with that id
+      // exists only while agy or one of its children is alive, so this cannot
+      // reach a stranger that inherited the bare pid during the grace period.
+      if (agyPid !== undefined) killGroup(agyPid, { groupOnly: true });
     }
     await this.clearState();
   }
@@ -262,6 +279,7 @@ export class AgyKeepaliveSupervisor {
   private launch(): void {
     if (this.stopping || this.child) return;
     try {
+      this.removeAgyPidFile(); // a pid left by an earlier launch must never be read as this one's
       const [command, args] = this.ptyCommand();
       const child = this.startChild(command, args, { stdio: "ignore", env: inheritedAgyEnvironment(), detached: this.platform !== "win32" });
       this.child = child;
@@ -272,6 +290,12 @@ export class AgyKeepaliveSupervisor {
       const exited = () => {
         if (handled) return;
         handled = true;
+        // script died on its own (crash, external kill): its agy is now an
+        // orphan session leader. Reap it synchronously, before any restart can
+        // launch another. The pid file was written by this launch (it is
+        // removed before every launch) and script exited only now, so the pid
+        // is agy's; stop() handles its own reap, hence the stopping check.
+        if (!this.stopping) { const agyPid = this.readAgyPid(); if (agyPid !== undefined) killGroup(agyPid); }
         if (this.child === child) { this.child = undefined; this.startedAt = undefined; this.stopLoginWatch(); }
         if (!this.stopping) this.scheduleRestart();
       };
@@ -299,8 +323,7 @@ export class AgyKeepaliveSupervisor {
       let agyPid: number | undefined;
       for (let attempt = 0; attempt < this.pidDiscoveryAttempts && agyPid === undefined; attempt += 1) {
         if (this.child !== child) return; // stopped or replaced before discovery finished
-        const processes = await listProcesses();
-        agyPid = descendantsOf(scriptPid, processes)[0]?.pid;
+        agyPid = this.readAgyPid() ?? descendantsOf(scriptPid, await listProcesses())[0]?.pid;
         if (agyPid === undefined) await sleep(this.pidDiscoveryIntervalMs);
       }
       if (this.child !== child) return;
@@ -310,11 +333,42 @@ export class AgyKeepaliveSupervisor {
         recordedAt: new Date().toISOString(),
       };
       if (agyPid !== undefined && agySignature) { state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt; }
+      // The awaits above can outlive this launch: never write a stopped or
+      // replaced launch's pids over the state a newer one (or stop) left.
+      if (this.child !== child || !isAlive(child)) return;
       await writeKeepaliveState(this.stateFilePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
   }
 
+  /** stop() right after start() can beat the wrapper to its pid file; wait
+   * (bounded) while script is alive, since agy cannot outlive an unseen pid
+   * any other way on a host where killTree's ps walk finds nothing. */
+  private async awaitAgyPid(child: ChildProcess, timeoutMs = 1_000): Promise<number | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const pid = this.readAgyPid();
+      if (pid !== undefined || !this.agyPidFile || !isAlive(child) || Date.now() >= deadline) return pid;
+      await sleep(10);
+    }
+  }
+
+  private readAgyPid(): number | undefined {
+    if (!this.agyPidFile) return undefined;
+    try {
+      const pid = Number(readFileSync(this.agyPidFile, "utf8").trim());
+      return Number.isInteger(pid) && pid > 1 ? pid : undefined;
+    } catch { return undefined; }
+  }
+
+  /** Throws unless the file is gone afterwards: launch() must never run while
+   * a stale pid from an earlier launch could still be read as this one's. */
+  private removeAgyPidFile(): void {
+    if (!this.agyPidFile) return;
+    try { unlinkSync(this.agyPidFile); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+
   private async clearState(): Promise<void> {
+    try { this.removeAgyPidFile(); } catch { /* the next launch refuses to start until it can remove it */ }
     if (!this.stateFilePath) return;
     try { await unlink(this.stateFilePath); } catch { /* already gone */ }
   }
@@ -356,7 +410,7 @@ export class AgyKeepaliveSupervisor {
     this.loginWatchStartedAt = undefined;
   }
 
-  private ptyCommand(): [string, string[]] { return agyPtyCommand(this.binary, this.platform); }
+  private ptyCommand(): [string, string[]] { return agyPtyCommand(this.binary, this.platform, this.agyPidFile); }
 }
 
 /**
@@ -367,9 +421,20 @@ export class AgyKeepaliveSupervisor {
  * including the PTY session-leader behavior issue #56 is about -- instead
  * of duplicating (and risking drifting from) this logic.
  */
-export function agyPtyCommand(binary: string, platform: NodeJS.Platform): [string, string[]] {
-  if (platform === "darwin") return ["/usr/bin/script", ["-q", "/dev/null", binary]];
-  return ["script", ["-qefc", shellQuote(binary), "/dev/null"]];
+export function agyPtyCommand(binary: string, platform: NodeJS.Platform, pidFile?: string): [string, string[]] {
+  // With a pid file, a tiny sh wrapper records its own pid and then execs
+  // agy, which keeps that pid: the supervisor learns agy's pid without `ps`.
+  const wrapped = pidFile ? ["/bin/sh", "-c", 'echo $$ > "$0" && exec "$1"', pidFile, binary] : [binary];
+  if (platform === "darwin") return ["/usr/bin/script", ["-q", "/dev/null", ...wrapped]];
+  return ["script", ["-qefc", wrapped.map(shellQuote).join(" "), "/dev/null"]];
+}
+
+function isAlive(child: ChildProcess): boolean { return child.exitCode === null && child.signalCode == null; }
+
+/** SIGKILL a pid and the process group it leads (agy is its own PTY session
+ * and group leader). Errors mean it is already gone. */
+function killGroup(pid: number, options: { groupOnly?: boolean } = {}): void {
+  for (const target of options.groupOnly ? [-pid] : [-pid, pid]) { try { process.kill(target, "SIGKILL"); } catch { /* already gone */ } }
 }
 
 /** POSIX single-quote escaping: end the quoted string, emit a literal quote

@@ -22,7 +22,7 @@ apps or single-account CLIs. Headroom owns the second and third and keeps the fi
 |---|---|
 | Principal | One credential location: `{vendor, location}`. Claude = a config dir, Codex = a `CODEX_HOME`, Antigravity = the Google login behind `agy`, local = a base URL. Stable id, e.g. `claude-main`. |
 | Meter | One vendor-enforced limit on a principal, stable id `principal:meter`. Claude Max: `all`, `fable`, `routines`. Antigravity: `gemini`, `claude-gpt`. Codex: `main`, `spark`, `credits`. Local: `capacity`. |
-| Window | A bucket inside a meter: `kind = rolling | fixed | count`, `minutes`, `enforcement = hard | soft`. Credit counts have no duration, are informational, and do not constrain `can`. |
+| Window | A bucket inside a meter: `kind = rolling | fixed | count`, `minutes`, `enforcement = hard | soft`. Credit counts have no duration and are informational. A count meter cannot be used in a consumes entry: `can`, `route`, and `gate` refuse it even with `--allow-unknown`. |
 | Observation | One sample of one window: typed quantity (`used`, `limit`, `remaining`, `unit = percent | tokens | requests | credits`), nullable `resets_at`, `observed_at` (vendor time if given) and `fetched_at`, `source`, `truth = official | estimated`, `freshness = fresh | stale | failed | not_enforced`, `confidence 0..1`, `adapter_version`, `upstream_schema_version`. `not_enforced` is a vendor-confirmed absent cap (printed `n/a`), not an unknown read. Never a whole "reading" with mixed provenance; each datum carries its own. |
 | Consumes | An action class maps to the set of meters it draws from. A Fable call on `claude-main` consumes `claude-main:all` and `claude-main:fable`. `headroom can` checks every consumed meter; one frozen meter freezes the action. |
 | Event | Separate record with id, kind (`reset_seen`, `free_reset_granted`, `free_reset_used`, `credits_changed`, `plan_changed`, `source_failed`, `source_recovered`), `origin = vendor_reported | inferred`, `confidence`, evidence (observation ids), and later corrections. Never embedded in observations. |
@@ -37,6 +37,23 @@ threshold per meter, default 15 minutes. Inferred events carry confidence and ar
 inferred; a drop from 82% to 7% during backoff is `reset_seen` with low confidence, not a fact.
 Vendor-confirmed `not_enforced` windows are ignored by `can` and `--threshold`; they are not
 reported as `UNKNOWN` because there is no vendor-enforced capacity to fail closed over.
+Informational count meters are also never capacity, but unlike a confirmed absent limit they are an
+invalid dispatch target: `can`, `route`, and `gate` refuse them rather than silently ignoring them.
+CLI and MCP clients re-enrich an unmarked status array from an older daemon using the current
+policy and local store before they show it or make a threshold decision, so compatibility with a
+running daemon cannot serve an expired stored-fresh row as capacity.
+
+## Host guard
+
+Quota is not the only reason a local dispatch can be a bad idea: `headroom run` also refuses to
+launch its child process onto a host that cannot take it (see docs/concepts.md's "Host guard"
+section for the full measurement/threshold reference and the 2026-09-27 PTY-leak incident that
+motivated it). `policy.toml`'s `[host_guard]`: `mode = "refuse"` (default) `| "warn" | "off"`,
+`warn_load_ratio` (2), `refuse_load_ratio` (3), `warn_pty_percent` (50), `refuse_pty_percent` (75).
+`headroom run --json` exits `2` when host pressure refuses the launch (`host.state: "refuse"` and
+`mode: "refuse"`), before the quota gate or any lease -- see docs/json-contract.md's `run` entry.
+`can`/`gate` (CLI and MCP) carry the same reading additively and never refuse over it; only `run`
+does.
 
 ## Architecture
 
@@ -108,11 +125,31 @@ edit only that line in place. Status renders a parked principal as
 
 - `headroom` : one line per meter, freshness always visible:
   `claude-main:all  5h 3% ↻17:10 HARVEST | wk 61% ↻Sat 14:00 CONSERVE  (fresh 2m)`
-- `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any window ≥ N),
-  `headroom events --since 24h`, `headroom can <principal> <action-class> [--allow-unknown]`.
-- `headroom mcp` : stdio MCP, sixteen tools (`quota_status`, `quota_can`, `quota_events`, and
-  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route and pasted
-  `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom --json`, `--principal X`, `--threshold N` (exit 2 if any enforced window is stale,
+  failed, or ≥ N),
+  `headroom events --since 24h`, `headroom models [--principal <id>] [--json|--agent]`
+  (one non-flag principal value at most once),
+  `headroom can <principal> <action-class> [--allow-unknown]`.
+- `headroom credits [--json]`; `headroom credits set --principal <name> --available <n> --expires
+  <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
+  date-only expiry is midnight UTC on that date.
+- `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]`.
+- `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
+  more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
+  pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"] | --stop |
+  list [--json]` (MCP `quota_heartbeat`): an orchestrator's promise to beat at least that
+  often, recorded in the daemon's own store -- the one process that survives a crashed
+  session. The daemon checks every registered heartbeat on each poll; one gone overdue by
+  more than 2x its own interval gets exactly one `heartbeat_lapsed` event (never repeated for
+  the same open lapse), delivered through the ordinary notify ledger/quiet-hours path; a later
+  beat closes the lapse and may send one short `heartbeat_restored`. See `docs/notifications.md`.
+- `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
+  [--if-missed notify|drop] | list [--owner <name>] [--json] | clear --owner <name> --name
+  <id>`: a named wake-up the daemon delivers, once, as one `headroom inbox` entry to its owner
+  when due. Headroom only ever delivers the action text; it never executes it. `--if-missed
+  notify` (default) also raises one `timer_missed` notification if the owner's heartbeat is
+  currently lapsed when it fires; `--if-missed drop` never notifies.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into

@@ -74,15 +74,20 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
   // Discovery updates locations and adapters, but an existing account is the
   // operator's configuration. In particular, rediscovery must not wake a
   // deliberately parked principal.
-  const existing = await readAccounts().catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as Account[];
-    throw error;
-  });
-  const prior = new Map(existing.map((account) => [account.name, account]));
-  // An explicitly configured entry wins wholesale; discovery only adds what
-  // it did not already know about. This is also what preserves `enabled =
-  // false` (and every other hand-written setting) for a matching name.
-  const merged = [...existing, ...accounts.filter((account) => !prior.has(account.name))];
+  const existing = await readAccountsOrEmpty();
+  // Only the operator's `enabled` flag survives a rediscovery for a name it
+  // already knew -- everything else (location, adapter, etc.) comes from the
+  // fresh scan, so a moved config dir or a changed adapter actually takes
+  // effect instead of being frozen at whatever discovery first saw. A
+  // provider account discovery no longer finds (credential removed, config
+  // dir gone) is dropped, matching docs/vendors.md's "rerunning discovery
+  // replaces the account file" -- it must stop being polled forever. Local
+  // accounts (`kind: "local"`) are never produced by discovery at all and
+  // are preserved untouched.
+  const priorEnabled = new Map(existing.map((account) => [account.name, account.enabled]));
+  const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
+  const localAccounts = existing.filter(isLocalAccount);
+  const merged = [...discovered, ...localAccounts];
   await fs.writeFile(accountsPath(), accountsToml(merged), { mode: 0o600 });
   await fs.chmod(accountsPath(), 0o600);
 }
@@ -103,6 +108,23 @@ export async function readAccounts(): Promise<Account[]> {
   }
   if (current) accounts.push(validate(current));
   return accounts.map((account) => isLocalAccount(account) ? account : { ...account, location: expandHome(account.location) });
+}
+
+/**
+ * The disabled-principal check (and anything else that only needs to know
+ * *which* principals exist, not fail a whole command over it) reads the
+ * registry through this instead of a swallowing `.catch(() => [])`: a
+ * missing `accounts.toml` (before the first `accounts discover`) is a
+ * normal, well-defined "no accounts configured" state, but a malformed or
+ * otherwise unreadable file must still fail closed -- propagated here, never
+ * silently reported as "nothing disabled," which could let a parked
+ * principal's stored capacity look admissible again.
+ */
+export async function readAccountsOrEmpty(): Promise<Account[]> {
+  return readAccounts().catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as Account[];
+    throw error;
+  });
 }
 
 function validate(value: Record<string, string>): Account {

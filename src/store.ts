@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
-import type { EventKind, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -14,6 +14,7 @@ import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion } from "./migrations.js";
 import { redact } from "./security.js";
+import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
  * carrying a leaked secret in one of its string fields is scrubbed the same
@@ -51,7 +52,7 @@ interface Database {
   prepare(sql: string): { run(...params: unknown[]): { lastInsertRowid: number | bigint }; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] };
   close(): void;
 }
-type DatabaseConstructor = new (path: string) => Database;
+type DatabaseConstructor = new (path: string, options?: { readOnly?: boolean }) => Database;
 // Node 26 ships SQLite. createRequire keeps Vitest/Vite from trying to resolve
 // this built-in as a browser module while preserving a dependency-free runtime.
 const DatabaseSync = (createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: DatabaseConstructor }).DatabaseSync;
@@ -160,6 +161,17 @@ export function sameSemanticWindow(
   return a.kind === b.kind && (a.minutes ?? null) === (b.minutes ?? null) && a.enforcement === b.enforcement;
 }
 
+/** The durable facts notification hysteresis needs for one source outage.
+ * `last_seen_at` advances only when the collector persisted another failed
+ * observation for this exact store event. */
+export interface SourceHealthOutage {
+  event_id: string;
+  meter_id: string;
+  window: Observation["window"];
+  created_at: string;
+  last_seen_at: string;
+}
+
 export function windowSqlMatch(
   window: Observation["window"] | undefined | null,
   column = "window_json"
@@ -195,6 +207,10 @@ function eventFromRow(row: Row): HeadroomEvent {
   return { id: String(row.id), kind: row.kind as EventKind, origin: row.origin as HeadroomEvent["origin"], confidence: Number(row.confidence), evidence_observation_ids: parseJson<number[]>(row.evidence_observation_ids, []), created_at: String(row.created_at), corrected_by: string(row.corrected_by), meter_id: string(row.meter_id), principal_id: string(row.principal_id), reason: string(row.reason), last_seen_at: string(row.last_seen_at), metadata: metadata && Object.keys(metadata).length ? metadata : undefined };
 }
 
+function knownModelFromRow(row: Row): KnownModel {
+  return { principal_id: String(row.principal_id), vendor: String(row.vendor), model_id: String(row.model_id), model_name: string(row.model_name), first_seen_at: String(row.first_seen_at), last_seen_at: String(row.last_seen_at), retired_at: string(row.retired_at) };
+}
+
 function notifyFromRow(row: Row): NotifyDelivery {
   return { id: Number(row.id), event_id: String(row.event_id), channel: String(row.channel), status: row.status as NotifyDelivery["status"], attempts: Number(row.attempts), text: String(row.text), detail: string(row.detail), created_at: String(row.created_at), updated_at: String(row.updated_at) };
 }
@@ -207,8 +223,27 @@ export interface PlanDowngrade {
   acknowledged: boolean;
 }
 
+/** The compact, deliberately vendor-neutral shape used by `headroom credits`.
+ * The raw observation is still available from history/status for audit detail. */
+export interface CreditBalance {
+  principal: string;
+  meter: string;
+  available: number;
+  expires_at: string | null;
+  source: BankedCreditSource;
+  lapsed: boolean;
+}
+
 function leaseFromRow(row: Row): Lease {
   return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: displayLeaseNote(string(row.note)), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+}
+
+function heartbeatFromRow(row: Row): Heartbeat {
+  return { owner: String(row.owner), interval_ms: Number(row.interval_ms), resume_sentence: string(row.resume_sentence), started_at: String(row.started_at), last_beat_at: String(row.last_beat_at), lapsed_since: string(row.lapsed_since), updated_at: String(row.updated_at) };
+}
+
+function timerFromRow(row: Row): Timer {
+  return { owner: String(row.owner), name: String(row.name), at: String(row.at), action: String(row.action), if_missed: row.if_missed === "drop" ? "drop" : "notify", created_at: String(row.created_at), fired_at: string(row.fired_at), cleared_at: string(row.cleared_at) };
 }
 
 const ATOMIC_LEASE_GROUP_PREFIX = "headroom:atomic:";
@@ -234,6 +269,32 @@ function displayLeaseNote(note: string | null): string | null {
 
 export class HeadroomStore {
   private constructor(private readonly db: Database, private readonly dbPath: string) {}
+
+  /**
+   * Every read/write method below goes through this instead of calling
+   * `this.db.prepare(sql)` directly, keyed by the exact SQL text: SQLite's
+   * own prepare step (parsing + query planning) is real, measurable CPU
+   * cost, and a single `insert()` call prepares roughly a dozen statements
+   * -- all of them the same handful of SQL strings, over and over, since
+   * this is one JS thread on one DatabaseSync connection and every caller
+   * already re-binds its own parameters on each call. Re-preparing them
+   * fresh on every observation was the dominant cost behind a poll's own
+   * synchronous writes running long enough to occasionally block a
+   * concurrent `health` reply past its 2s budget (measured ~3.4x the wall
+   * time of an equivalent poll over 1000 observations; see this repo's
+   * cached-reads work). A handful of call sites build genuinely dynamic SQL
+   * text (a `WHERE id IN (?,?,...)` list sized to its caller's argument
+   * count) -- those still cache correctly, just with one entry per distinct
+   * list length, which stays small and bounded by this project's own scale
+   * (meters, leases, or ids per batch -- never an unbounded stream), so the
+   * cache is never cleared or capped.
+   */
+  private readonly statements = new Map<string, ReturnType<Database["prepare"]>>();
+  private prepared(sql: string): ReturnType<Database["prepare"]> {
+    let statement = this.statements.get(sql);
+    if (!statement) { statement = this.db.prepare(sql); this.statements.set(sql, statement); }
+    return statement;
+  }
 
   static async open(home?: string): Promise<HeadroomStore> {
     const path = await safeDatabasePath(home);
@@ -267,6 +328,26 @@ export class HeadroomStore {
     return store;
   }
 
+  /**
+   * Read-only, non-migrating open for compatibility lookups only (currently
+   * status-normalization.ts's older-daemon path). `open()` always runs schema
+   * migrations and data repairs (migrate(), mergePriorDatabase(),
+   * normalizeExhaustedReportExpiry(), even the WAL journal-mode PRAGMA) --
+   * fine for the daemon or a CLI that owns the database, but a newer CLI
+   * reading alongside an OLDER daemon that is still running against this
+   * file must never upgrade its schema out from under it. This connection
+   * skips every one of those steps and SQLite itself refuses any write
+   * against it. It never creates a missing file either: same as any other
+   * read-only failure, a caller here must fail closed rather than fall back
+   * to a writable open.
+   */
+  static async openReadOnly(home?: string): Promise<HeadroomStore> {
+    const path = await safeDatabasePath(home);
+    const db = new DatabaseSync(path, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 5000;");
+    return new HeadroomStore(db, path);
+  }
+
   close(): void { this.db.close(); }
 
   /** Upgrade old `{ until: null }` exhausted markers in place. The original
@@ -274,7 +355,7 @@ export class HeadroomStore {
    * time as well as for newly created reports: status immediately shows the
    * expiry, even before any caller happens to run a dispatch check. */
   private normalizeExhaustedReportExpiry(now = new Date()): void {
-    const rows = this.db.prepare("SELECT key, value FROM daemon_state WHERE key LIKE 'exhausted:%'").all();
+    const rows = this.prepared("SELECT key, value FROM daemon_state WHERE key LIKE 'exhausted:%'").all();
     for (const row of rows) {
       const meterId = String(row.key).slice("exhausted:".length);
       let state: { active?: boolean; until?: string | null; note?: string | null; report_id?: string; binding_window_minutes?: number };
@@ -286,7 +367,7 @@ export class HeadroomStore {
       const expiresAt = binding?.resets_at && Number.isFinite(Date.parse(binding.resets_at))
         ? new Date(binding.resets_at).toISOString()
         : new Date(now.getTime() + 24 * 60 * 60_000).toISOString();
-      this.db.prepare("UPDATE observations SET resets_at = ? WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1 AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0")
+      this.prepared("UPDATE observations SET resets_at = ? WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1 AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0")
         .run(expiresAt, meterId);
       this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ ...state, active: true, until: expiresAt, binding_window_minutes: state.binding_window_minutes ?? binding?.window?.minutes }));
     }
@@ -323,10 +404,10 @@ export class HeadroomStore {
     let legacyCount = 0;
     let currentCount = 0;
     try {
-      const table = this.db.prepare("SELECT name FROM legacy.sqlite_master WHERE type = 'table' AND name = 'observations'").get();
-      currentCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM observations").get()?.count ?? 0);
+      const table = this.prepared("SELECT name FROM legacy.sqlite_master WHERE type = 'table' AND name = 'observations'").get();
+      currentCount = Number(this.prepared("SELECT COUNT(*) AS count FROM observations").get()?.count ?? 0);
       if (table) {
-        legacyCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM legacy.observations").get()?.count ?? 0);
+        legacyCount = Number(this.prepared("SELECT COUNT(*) AS count FROM legacy.observations").get()?.count ?? 0);
         if (legacyCount) this.db.exec(`INSERT INTO observations
           (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
           SELECT principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json FROM legacy.observations`);
@@ -360,8 +441,8 @@ export class HeadroomStore {
    */
   private async collapseDuplicateSourceFailedEvents(home: string): Promise<void> {
     const migration = "2026-09-05-collapse-source-failed-duplicates";
-    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
-    const rows = this.db.prepare("SELECT * FROM events WHERE kind IN ('source_failed', 'source_recovered') ORDER BY meter_id ASC, created_at ASC, id ASC").all();
+    if (this.prepared("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    const rows = this.prepared("SELECT * FROM events WHERE kind IN ('source_failed', 'source_recovered') ORDER BY meter_id ASC, created_at ASC, id ASC").all();
     const openByMeter = new Map<string, Row>();
     let collapsed = 0;
     for (const row of rows) {
@@ -369,8 +450,8 @@ export class HeadroomStore {
       if (row.kind === "source_recovered") { openByMeter.delete(meterId); continue; }
       const open = openByMeter.get(meterId);
       if (open) {
-        this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(String(row.created_at), String(open.id));
-        this.db.prepare("DELETE FROM events WHERE id = ?").run(String(row.id));
+        this.prepared("UPDATE events SET last_seen_at = ? WHERE id = ?").run(String(row.created_at), String(open.id));
+        this.prepared("DELETE FROM events WHERE id = ?").run(String(row.id));
         collapsed += 1;
       } else {
         openByMeter.set(meterId, row);
@@ -378,7 +459,7 @@ export class HeadroomStore {
     }
     const summary = `collapsed ${collapsed} duplicate source_failed events across ${rows.length} candidates`;
     this.audit("migration", "collapse_source_failed_duplicates", null, summary);
-    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
+    this.prepared("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
     await appendDaemonLog(summary, home);
   }
 
@@ -387,25 +468,25 @@ export class HeadroomStore {
    * inspects its event evidence rather than trusting the old event confidence. */
   private removeFalseResetSeenEvents(): void {
     const migration = "2026-09-03-reset-seen-usage-drop";
-    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    if (this.prepared("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
     const since = "2026-09-03T21:00:00.000Z";
-    const candidates = this.db.prepare("SELECT * FROM events WHERE kind = 'reset_seen' AND origin = 'inferred' AND created_at >= ?").all(since);
+    const candidates = this.prepared("SELECT * FROM events WHERE kind = 'reset_seen' AND origin = 'inferred' AND created_at >= ?").all(since);
     let removed = 0;
     for (const row of candidates) {
       const event = eventFromRow(row);
-      const evidence = event.evidence_observation_ids.map((id) => this.db.prepare("SELECT * FROM observations WHERE id = ?").get(id)).filter((item): item is Row => Boolean(item)).map(observationFromRow);
+      const evidence = event.evidence_observation_ids.map((id) => this.prepared("SELECT * FROM observations WHERE id = ?").get(id)).filter((item): item is Row => Boolean(item)).map(observationFromRow);
       const previous = evidence[0];
       const current = evidence[1];
       const usageDropped = previous?.freshness === "fresh" && current?.freshness === "fresh"
         && previous.quantity?.used !== undefined && current.quantity?.used !== undefined
         && previous.quantity.used > 0 && (current.quantity.used === 0 || current.quantity.used < previous.quantity.used * 0.5);
       if (usageDropped) continue;
-      this.db.prepare("DELETE FROM events WHERE id = ?").run(event.id);
+      this.prepared("DELETE FROM events WHERE id = ?").run(event.id);
       this.audit("migration", "remove_false_reset_seen", event.meter_id, `${event.id}: no usage drop`);
       removed += 1;
     }
     this.audit("migration", "remove_false_reset_seen_summary", null, `removed ${removed} inferred reset_seen events since ${since}`);
-    this.db.prepare("INSERT INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
+    this.prepared("INSERT INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
   }
 
   /** Re-evaluate the last 7 days of observations per meter and window with the
@@ -416,29 +497,29 @@ export class HeadroomStore {
    * have no vendor reset schedule and must never carry reset events. Runs once. */
   private async backfillResetEvents(home: string): Promise<void> {
     const migration = "2026-09-04-reset-detection-backfill";
-    if (this.db.prepare("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
-    const localEvents = this.db.prepare(`SELECT DISTINCT e.id AS id FROM events e
+    if (this.prepared("SELECT id FROM schema_migrations WHERE id = ?").get(migration)) return;
+    const localEvents = this.prepared(`SELECT DISTINCT e.id AS id FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind IN ('reset_seen', 'free_reset_used') AND json_extract(o.window_json, '$.kind') = 'state'`).all();
-    for (const row of localEvents) this.db.prepare("DELETE FROM events WHERE id = ?").run(String(row.id));
+    for (const row of localEvents) this.prepared("DELETE FROM events WHERE id = ?").run(String(row.id));
 
     const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
-    const rows = this.db.prepare("SELECT * FROM observations WHERE freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(since);
-    const beforeCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
+    const rows = this.prepared("SELECT * FROM observations WHERE freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(since);
+    const beforeCount = Number(this.prepared("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
     for (const row of rows) {
       const current = observationFromRow(row);
       const baseline = this.freshBaseline(current);
       if (baseline) this.classifyUsageDrop(baseline, current);
     }
-    const afterCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
+    const afterCount = Number(this.prepared("SELECT COUNT(*) AS count FROM events WHERE kind IN ('reset_seen', 'free_reset_used')").get()?.count ?? 0);
     const summary = `reset detection backfill: reprocessed ${rows.length} fresh observations since ${since}; removed ${localEvents.length} local-pool reset events; inserted ${afterCount - beforeCount} reset events`;
     this.audit("migration", "backfill_reset_events", null, summary);
     // Record completion before the only await in this method: two stores can
     // open the same database concurrently, and nothing may yield between the
     // "not yet run" check above and marking it run, or both would redo it and
     // the second commit would collide on the schema_migrations primary key.
-    this.db.prepare("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
+    this.prepared("INSERT OR IGNORE INTO schema_migrations (id, applied_at) VALUES (?,?)").run(migration, new Date().toISOString());
     await appendDaemonLog(summary, home);
   }
 
@@ -453,7 +534,7 @@ export class HeadroomStore {
     // if a later poll's own fresh reading were ever missing.
     if (observation.window?.minutes && observation.source.endsWith(":session-log")) {
       const match = windowSqlMatch(observation.window);
-      const existingRow = this.db.prepare(
+      const existingRow = this.prepared(
         `SELECT * FROM observations WHERE meter_id = ? AND ${match.sql} ORDER BY fetched_at DESC, id DESC LIMIT 1`,
       ).get(observation.meter_id, ...match.params);
       if (existingRow) {
@@ -489,7 +570,7 @@ export class HeadroomStore {
       : transition.kind === "flip"
         ? { ...resolved.metadata, vendor_inconsistent: true }
         : resolved.metadata) as Observation["metadata"] | undefined;
-    const result = this.db.prepare(`INSERT INTO observations
+    const result = this.prepared(`INSERT INTO observations
       (principal_id,meter_id,window_json,quantity_json,resets_at,observed_at,fetched_at,source,truth,freshness,confidence,adapter_version,upstream_schema_version,reason,metadata_json)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       resolved.principal_id, resolved.meter_id, canonicalWindowJson(resolved.window), json(resolved.quantity), resolved.resets_at ?? null,
@@ -550,6 +631,51 @@ export class HeadroomStore {
 
   insertAll(observations: Observation[]): StoredObservation[] { return normalizeObservations(observations).map((observation) => this.insert(observation)); }
 
+  /** Record a banked reset a human can see in a vendor UI but the adapter
+   * cannot read (Claude currently exposes no corresponding usage field).
+   * This is an ordinary synthetic observation rather than mutable state: a
+   * later vendor fact wins naturally and every correction remains auditable. */
+  recordManualCredits(principal: string, available: number, expiresAt: string | null, cleared = false, now = new Date()): StoredObservation {
+    const at = now.toISOString();
+    const observation: Observation = {
+      principal_id: principal, meter_id: `${principal}:credits`,
+      window: { kind: "count", minutes: null, enforcement: "hard" },
+      quantity: { used: 0, limit: null, remaining: available, unit: "credits" }, resets_at: expiresAt,
+      // A clear is a current, genuinely fresh fact -- "the operator's balance
+      // is now zero" -- not a stale reading; `stale` means "this used to be
+      // current but has aged past the threshold", which a just-recorded clear
+      // never is. `metadata.manual_cleared` alone marks it for ranking
+      // (a later manual entry supersedes it, but a later failed vendor read
+      // does not hide it) and for excluding it from banked capacity; it keeps
+      // the same observation shape a fresh entry has (see docs/json-contract.md).
+      observed_at: at, fetched_at: at, source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9,
+      adapter_version: "manual", upstream_schema_version: "manual",
+      metadata: { free_resets_available: available, manual: true, ...(cleared ? { manual_cleared: true } : {}) },
+    };
+    // insert() normally compares against this exact count window and emits
+    // the change event. The first manual fact has no predecessor, but it is
+    // still a useful operator action to audit, so seed that one event here.
+    const previous = this.previous(observation);
+    const stored = this.insert(observation);
+    if (!previous) this.addEvent("credits_changed", "inferred", 0.9, [stored.id], stored, cleared ? "manual credits cleared" : "manual credits entry");
+    return stored;
+  }
+
+  /** Clearing is a zero-valued observation, not deletion. Preserve the
+   * prior expiry where one exists so history still says which banked reset
+   * the operator closed, even though its current usable count is zero. */
+  clearManualCredits(principal: string, now = new Date()): StoredObservation {
+    const existing = this.latestPerWindow(`${principal}:credits`).find(isCreditsObservation);
+    return this.recordManualCredits(principal, 0, existing?.resets_at ?? null, true, now);
+  }
+
+  credits(now = new Date()): CreditBalance[] {
+    return this.latestPerWindow().filter(isCreditsObservation).map((row) => ({
+      principal: row.principal_id, meter: row.meter_id, available: usableCredits(row, now), expires_at: row.resets_at,
+      source: creditSource(row), lapsed: creditsLapsed(row, now),
+    })).sort((a, b) => a.meter.localeCompare(b.meter));
+  }
+
   /** Record a complete vendor poll and retire windows omitted by that poll.
    * A later vendor response for the same duration supersedes the retirement.
    * A `not_enforced` row counts as present, not omitted: it is the adapter
@@ -560,24 +686,42 @@ export class HeadroomStore {
    * omitted window would -- latestPerWindow's own ranking already lets that
    * not_enforced reading supersede an older fresh one for the same window. */
   insertPoll(observations: Observation[]): StoredObservation[] {
-    const stored = this.insertAll(observations);
-    const byMeter = new Map<string, StoredObservation[]>();
-    for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
-    for (const [meter, rows] of byMeter) {
-      // An incomplete vendor picture must not retire a sibling window while
-      // this meter is already being held for inconsistent reset identities.
-      if (rows.some((row) => this.vendorWindowSuspect(row))) continue;
-      const present = new Set(rows.map((row) => row.window!.minutes));
-      for (const old of this.latestPerWindow(meter)) {
-        const minutes = old.window?.minutes;
-        if (!minutes || present.has(minutes) || old.metadata?.retired) continue;
-        const at = rows.reduce((latest, row) => Date.parse(row.fetched_at) > Date.parse(latest.fetched_at) ? row : latest);
-        const { id: _id, ...oldObservation } = old;
-        const retired = this.insert({ ...oldObservation, observed_at: at.observed_at, fetched_at: at.fetched_at, freshness: "stale", confidence: 1, reason: "vendor no longer reports this window", metadata: { ...old.metadata, retired: true } });
-        this.addEvent("window_retired", "inferred", 0.9, [old.id, retired.id], retired, "vendor no longer reports this window");
+    // insert() runs several separate write statements per observation (the
+    // row itself, plus whatever events/markers its transition produces), and
+    // in SQLite's default autocommit mode each one is its own committed
+    // transaction. With WAL's default synchronous=FULL that is one fsync per
+    // statement -- fine individually, but a poll across several meters can
+    // add up to dozens of them, and each is a blocking syscall on the
+    // daemon's single event-loop thread. Under host disk pressure that was
+    // measured stalling a concurrent `health` reply well past its 2s budget
+    // (see docs/reports for the before/after). One transaction for the whole
+    // poll turns that into a single commit, so the event loop is blocked for
+    // one fsync's worth of time instead of one per write statement.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stored = this.insertAll(observations);
+      const byMeter = new Map<string, StoredObservation[]>();
+      for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
+      for (const [meter, rows] of byMeter) {
+        // An incomplete vendor picture must not retire a sibling window while
+        // this meter is already being held for inconsistent reset identities.
+        if (rows.some((row) => this.vendorWindowSuspect(row))) continue;
+        const present = new Set(rows.map((row) => row.window!.minutes));
+        for (const old of this.latestPerWindow(meter)) {
+          const minutes = old.window?.minutes;
+          if (!minutes || present.has(minutes) || old.metadata?.retired) continue;
+          const at = rows.reduce((latest, row) => Date.parse(row.fetched_at) > Date.parse(latest.fetched_at) ? row : latest);
+          const { id: _id, ...oldObservation } = old;
+          const retired = this.insert({ ...oldObservation, observed_at: at.observed_at, fetched_at: at.fetched_at, freshness: "stale", confidence: 1, reason: "vendor no longer reports this window", metadata: { ...old.metadata, retired: true } });
+          this.addEvent("window_retired", "inferred", 0.9, [old.id, retired.id], retired, "vendor no longer reports this window");
+        }
       }
+      this.db.exec("COMMIT");
+      return stored;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
     }
-    return stored;
   }
 
   reportExhausted(meterId: string, until: string | null, note: string | null, now = new Date()): void {
@@ -626,13 +770,13 @@ export class HeadroomStore {
   }
 
   private ignoreExhaustedRows(meterId: string, reportId?: string): void {
-    const rows = this.db.prepare("SELECT id, metadata_json FROM observations WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1").all(meterId);
+    const rows = this.prepared("SELECT id, metadata_json FROM observations WHERE meter_id = ? AND json_extract(metadata_json, '$.exhausted') = 1").all(meterId);
     for (const row of rows) {
       const metadata = parseJson<Observation["metadata"]>(row.metadata_json, undefined);
       // Legacy reports had no id. They are safe to clear as a group because a
       // meter can only have one active exhausted marker at a time.
       if (reportId && metadata?.exhausted_report_id && metadata.exhausted_report_id !== reportId) continue;
-      this.db.prepare("UPDATE observations SET metadata_json = ? WHERE id = ?").run(JSON.stringify({ ...metadata, exhausted_ignored: true }), row.id);
+      this.prepared("UPDATE observations SET metadata_json = ? WHERE id = ?").run(JSON.stringify({ ...metadata, exhausted_ignored: true }), row.id);
     }
   }
 
@@ -658,6 +802,23 @@ export class HeadroomStore {
       this.setDaemonState(`exhausted:${meterId}`, JSON.stringify({ ...state, active: false, expired_at: now.toISOString() }));
       return undefined;
     }
+    return `vendor reports the limit reached${state.until ? `; resets ${state.until}` : ""}`;
+  }
+
+  /**
+   * Same verdict as `dispatchBlockForMeter`, without its self-heal writes
+   * (`ignoreExhaustedRows`/`setDaemonState` once an exhausted report's own
+   * `until` has passed) -- for a read-only connection. An expired-but-not-
+   * yet-cleared report still reads as unblocked here, exactly like
+   * `dispatchBlockForMeter` would return; only clearing the marker itself is
+   * deferred to the next writable open.
+   */
+  dispatchBlockForMeterReadOnly(meterId: string, now = new Date()): string | undefined {
+    const state = this.exhaustedState(meterId);
+    if (!state) return this.daemonState(`exhausted:${meterId}`) ? "vendor reports the limit reached" : undefined;
+    if (state.active === false) return undefined;
+    const until = state.until ? Date.parse(state.until) : Number.NaN;
+    if (Number.isFinite(until) && until <= now.getTime()) return undefined;
     return `vendor reports the limit reached${state.until ? `; resets ${state.until}` : ""}`;
   }
 
@@ -691,7 +852,7 @@ export class HeadroomStore {
 
   planDowngrades(principals?: Iterable<string>): PlanDowngrade[] {
     const allowed = principals ? new Set(principals) : undefined;
-    return this.db.prepare("SELECT key FROM daemon_state WHERE key LIKE 'plan_drop:%'").all().flatMap((row) => {
+    return this.prepared("SELECT key FROM daemon_state WHERE key LIKE 'plan_drop:%'").all().flatMap((row) => {
       const principal = String(row.key).slice("plan_drop:".length);
       const downgrade = this.planDowngrade(principal);
       return downgrade && (!allowed || allowed.has(principal)) ? [downgrade] : [];
@@ -700,7 +861,7 @@ export class HeadroomStore {
 
   private previous(observation: Observation): StoredObservation | undefined {
     const match = windowSqlMatch(observation.window);
-    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql} ORDER BY id DESC LIMIT 1`)
+    const row = this.prepared(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql} ORDER BY id DESC LIMIT 1`)
       .get(observation.meter_id, ...match.params);
     return row ? observationFromRow(row) : undefined;
   }
@@ -739,7 +900,7 @@ export class HeadroomStore {
   private acceptedWindowBaseline(observation: Observation): StoredObservation | undefined {
     const minutes = observation.window?.minutes;
     if (!minutes) return undefined;
-    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ?
+    const row = this.prepared(`SELECT * FROM observations WHERE meter_id = ?
       AND freshness = 'fresh' AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) IS ?
       AND COALESCE(json_extract(metadata_json, '$.vendor_inconsistent'), 0) = 0
       AND COALESCE(json_extract(metadata_json, '$.vendor_window_held'), 0) = 0
@@ -858,21 +1019,21 @@ export class HeadroomStore {
   }
 
   private observationById(id: number): StoredObservation | undefined {
-    const row = this.db.prepare("SELECT * FROM observations WHERE id = ?").get(id);
+    const row = this.prepared("SELECT * FROM observations WHERE id = ?").get(id);
     return row ? observationFromRow(row) : undefined;
   }
 
   private markVendorInconsistent(id: number): void {
-    this.db.prepare("UPDATE observations SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent', json('true')) WHERE id = ?").run(id);
+    this.prepared("UPDATE observations SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent', json('true')) WHERE id = ?").run(id);
   }
 
   private clearVendorInconsistent(id: number): void {
-    this.db.prepare("UPDATE observations SET metadata_json = json_remove(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent') WHERE id = ?").run(id);
+    this.prepared("UPDATE observations SET metadata_json = json_remove(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent') WHERE id = ?").run(id);
   }
 
   private recentVendorInconsistent(meterId: string, fetchedAt: string): boolean {
     const since = new Date(Date.parse(fetchedAt) - 6 * 3_600_000).toISOString();
-    return this.db.prepare("SELECT 1 FROM events WHERE kind = 'vendor_inconsistent' AND meter_id = ? AND julianday(created_at) >= julianday(?) LIMIT 1").get(meterId, since) !== undefined;
+    return this.prepared("SELECT 1 FROM events WHERE kind = 'vendor_inconsistent' AND meter_id = ? AND julianday(created_at) >= julianday(?) LIMIT 1").get(meterId, since) !== undefined;
   }
 
   /** The most recent FRESH reading for this exact meter and window, fetched
@@ -882,7 +1043,7 @@ export class HeadroomStore {
   private recentFreshReading(observation: Observation): StoredObservation | undefined {
     const match = windowSqlMatch(observation.window);
     const since = new Date(Date.parse(observation.fetched_at) - 2 * 3_600_000).toISOString();
-    const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
+    const row = this.prepared(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
       AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
       .get(observation.meter_id, ...match.params, since);
     return row ? observationFromRow(row) : undefined;
@@ -914,7 +1075,7 @@ export class HeadroomStore {
     const id = `${kind}:${current.id}`;
     // OR IGNORE keeps the reset-detection backfill idempotent: replaying it
     // over already-classified observations must not error on a repeat id.
-    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+    this.prepared("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
       .run(id, kind, origin, confidence, JSON.stringify(evidence), created, null, current.meter_id, current.principal_id, reason, lastSeenAt, metadata ? JSON.stringify(metadata) : null);
   }
 
@@ -931,7 +1092,7 @@ export class HeadroomStore {
    * silently close, each other's event. */
   private openFailureForWindow(meterId: string, window: Observation["window"]): Row | undefined {
     const match = windowSqlMatch(window, "o.window_json");
-    const row = this.db.prepare(`SELECT e.* FROM events e
+    const row = this.prepared(`SELECT e.* FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.meter_id = ? AND e.kind IN ('source_failed', 'source_recovered')
@@ -948,13 +1109,13 @@ export class HeadroomStore {
    * next, which may carry a real window (a real window's own recordFailure /
    * recovery bookkeeping is otherwise scoped to matching windows only). */
   private openWindowlessFailure(meterId: string): Row | undefined {
-    const lastFailure = this.db.prepare(`SELECT e.* FROM events e
+    const lastFailure = this.prepared(`SELECT e.* FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.meter_id = ? AND e.kind = 'source_failed' AND (o.window_json IS NULL OR o.window_json = 'null')
       ORDER BY e.created_at DESC, e.id DESC LIMIT 1`).get(meterId);
     if (!lastFailure) return undefined;
-    const closed = this.db.prepare("SELECT 1 FROM events WHERE meter_id = ? AND kind = 'source_recovered' AND created_at > ? LIMIT 1")
+    const closed = this.prepared("SELECT 1 FROM events WHERE meter_id = ? AND kind = 'source_recovered' AND created_at > ? LIMIT 1")
       .get(meterId, String(lastFailure.created_at));
     return closed ? undefined : lastFailure;
   }
@@ -966,7 +1127,7 @@ export class HeadroomStore {
   private recordFailure(evidence: number[], current: StoredObservation): void {
     const open = current.window ? this.openFailureForWindow(current.meter_id, current.window) : this.openWindowlessFailure(current.meter_id);
     if (open) {
-      this.db.prepare("UPDATE events SET last_seen_at = ? WHERE id = ?").run(current.fetched_at, String(open.id));
+      this.prepared("UPDATE events SET last_seen_at = ? WHERE id = ?").run(current.fetched_at, String(open.id));
     } else {
       this.addSourceFailedEvent(evidence, current);
     }
@@ -1013,7 +1174,7 @@ export class HeadroomStore {
   private freshBaseline(current: StoredObservation): StoredObservation | undefined {
     const match = windowSqlMatch(current.window);
     const since = new Date(Date.parse(current.fetched_at) - 7 * 86_400_000).toISOString();
-    const lookup = (meterId: string): Row | undefined => this.db.prepare(`SELECT * FROM observations
+    const lookup = (meterId: string): Row | undefined => this.prepared(`SELECT * FROM observations
       WHERE meter_id = ? AND ${match.sql}
         AND freshness = 'fresh' AND id < ? AND fetched_at >= ?
       ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(meterId, ...match.params, current.id, since);
@@ -1036,8 +1197,8 @@ export class HeadroomStore {
   private newBucketName(observation: Observation): string | undefined {
     const kind = observation.window?.kind;
     if (!kind || kind === "count" || kind === "state") return undefined;
-    if (this.db.prepare("SELECT 1 FROM observations WHERE meter_id = ? LIMIT 1").get(observation.meter_id)) return undefined;
-    if (!this.db.prepare("SELECT 1 FROM observations WHERE principal_id = ? LIMIT 1").get(observation.principal_id)) return undefined;
+    if (this.prepared("SELECT 1 FROM observations WHERE meter_id = ? LIMIT 1").get(observation.meter_id)) return undefined;
+    if (!this.prepared("SELECT 1 FROM observations WHERE principal_id = ? LIMIT 1").get(observation.principal_id)) return undefined;
     const prefix = `${observation.principal_id}:`;
     return observation.meter_id.startsWith(prefix) ? observation.meter_id.slice(prefix.length) : observation.meter_id;
   }
@@ -1052,7 +1213,7 @@ export class HeadroomStore {
    * whether or not the reset happened inside THIS gap specifically. */
   private failedGapBetween(meterId: string, window: Observation["window"], afterId: number, beforeId: number): boolean {
     const match = windowSqlMatch(window);
-    const row = this.db.prepare(`SELECT 1 FROM observations WHERE meter_id = ? AND ${match.sql}
+    const row = this.prepared(`SELECT 1 FROM observations WHERE meter_id = ? AND ${match.sql}
       AND freshness = 'failed' AND id > ? AND id < ? LIMIT 1`).get(meterId, ...match.params, afterId, beforeId);
     return row !== undefined;
   }
@@ -1064,7 +1225,7 @@ export class HeadroomStore {
    * in principle name the same scheduled reset. */
   private resetSeenAtScheduledTime(meterId: string, window: Observation["window"], scheduledAt: string): boolean {
     const match = windowSqlMatch(window, "o.window_json");
-    const row = this.db.prepare(`SELECT 1 FROM events e
+    const row = this.prepared(`SELECT 1 FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind = 'reset_seen' AND e.meter_id = ?
@@ -1159,7 +1320,7 @@ export class HeadroomStore {
    * julianday() comparison for the same reason: an event's created_at is an
    * observation's fetched_at verbatim, not guaranteed to carry milliseconds. */
   private lastResetEventAt(meterId: string, minutes: number, sinceIso: string, nowIso: string): number | null {
-    const row = this.db.prepare(`SELECT e.created_at FROM events e
+    const row = this.prepared(`SELECT e.created_at FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind = 'reset_seen' AND e.meter_id = ?
@@ -1209,7 +1370,7 @@ export class HeadroomStore {
       // carry milliseconds (see eventEvidenceFor's identical comment above),
       // and ISO timestamps only sort lexicographically when every value
       // shares the same precision.
-      const rows = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND freshness = 'fresh' AND julianday(fetched_at) >= julianday(?) AND julianday(fetched_at) <= julianday(?) ORDER BY fetched_at ASC, id ASC")
+      const rows = this.prepared("SELECT * FROM observations WHERE meter_id = ? AND freshness = 'fresh' AND julianday(fetched_at) >= julianday(?) AND julianday(fetched_at) <= julianday(?) ORDER BY fetched_at ASC, id ASC")
         .all(observation.meter_id, since, nowIso)
         .map(observationFromRow)
         .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent" && !row.metadata?.vendor_inconsistent && !row.metadata?.vendor_window_held);
@@ -1236,7 +1397,7 @@ export class HeadroomStore {
    * CONSERVE across several polls gets one event per hour, not one per poll. */
   private recentPaceProjectionEvent(meterId: string, minutes: number, before: string): boolean {
     const since = new Date(Date.parse(before) - 3_600_000).toISOString();
-    const row = this.db.prepare(`SELECT e.id FROM events e
+    const row = this.prepared(`SELECT e.id FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind = 'pace_projection_conserve' AND e.meter_id = ?
@@ -1285,7 +1446,7 @@ export class HeadroomStore {
   learnedCost(actionClass?: string, now = new Date()): LearnedCost[] {
     this.expireLeases(now);
     const filter = actionClass ? "WHERE l.action_class = ? AND l.ended_at IS NOT NULL" : "WHERE l.action_class IS NOT NULL AND l.ended_at IS NOT NULL";
-    const rows = this.db.prepare(`SELECT l.action_class AS action_class, COALESCE(SUM(s.amount_percent), 0) AS spent
+    const rows = this.prepared(`SELECT l.action_class AS action_class, COALESCE(SUM(s.amount_percent), 0) AS spent
       FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter} GROUP BY l.id`).all(...(actionClass ? [actionClass] : []));
     const byClass = new Map<string, number[]>();
     for (const row of rows) {
@@ -1304,7 +1465,7 @@ export class HeadroomStore {
    * learnedCost excludes an in-progress one. */
   learnedCostForMeter(meterId: string, now = new Date()): LearnedCost | undefined {
     this.expireLeases(now);
-    const rows = this.db.prepare(`SELECT l.id AS id, COALESCE(SUM(s.amount_percent), 0) AS spent
+    const rows = this.prepared(`SELECT l.id AS id, COALESCE(SUM(s.amount_percent), 0) AS spent
       FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.meter_id = ? AND l.ended_at IS NOT NULL GROUP BY l.id`).all(meterId);
     return summarizeLearnedCost(meterId, rows.map((row) => Number(row.spent)));
   }
@@ -1330,9 +1491,13 @@ export class HeadroomStore {
     const previousCredits = previous.quantity?.unit === "credits" ? previous.quantity.remaining : null;
     const currentCredits = current.quantity?.unit === "credits" ? current.quantity.remaining : null;
     if (previous.window?.kind === "count" && current.window?.kind === "count" && previousCredits !== null && currentCredits !== null) {
-      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", "vendor_reported", 1, evidence, current);
-      if (currentCredits < previousCredits) this.addEvent("free_reset_used", "vendor_reported", 1, evidence, current, null, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
-      if (currentCredits !== previousCredits) this.addEvent("credits_changed", "vendor_reported", 1, evidence, current);
+      const manual = current.source === "manual";
+      const origin = manual ? "inferred" : "vendor_reported";
+      const confidence = manual ? 0.9 : 1;
+      const reason = manual ? current.metadata?.manual_cleared ? "manual credits cleared" : "manual credits entry" : null;
+      if (currentCredits > previousCredits) this.addEvent("free_reset_granted", origin, confidence, evidence, current, reason);
+      if (currentCredits < previousCredits) this.addEvent("free_reset_used", origin, confidence, evidence, current, reason, null, undefined, current.metadata?.plan === "free" ? { credit_spent_on_free_plan: true } : undefined);
+      if (currentCredits !== previousCredits) this.addEvent("credits_changed", origin, confidence, evidence, current, reason);
     }
     if (previous.metadata?.plan && current.metadata?.plan && previous.metadata.plan !== current.metadata.plan) this.recordPlanChange(previous, current, evidence);
   }
@@ -1362,7 +1527,7 @@ export class HeadroomStore {
   /** Fetch a notification batch's original facts in one query. */
   eventObservations(events: HeadroomEvent[]): Map<string, StoredObservation[]> {
     const ids = [...new Set(events.flatMap((event) => event.evidence_observation_ids))];
-    const observations = this.db.prepare("SELECT * FROM observations WHERE id IN (SELECT value FROM json_each(?)) ORDER BY fetched_at ASC, id ASC")
+    const observations = this.prepared("SELECT * FROM observations WHERE id IN (SELECT value FROM json_each(?)) ORDER BY fetched_at ASC, id ASC")
       .all(JSON.stringify(ids)).map(observationFromRow);
     const byId = new Map(observations.map((observation) => [observation.id, observation]));
     return new Map(events.map((event) => [event.id, event.evidence_observation_ids.flatMap((id) => {
@@ -1372,7 +1537,7 @@ export class HeadroomStore {
   }
 
   history(meterId: string, since: string): StoredObservation[] {
-    return this.db.prepare("SELECT * FROM observations WHERE meter_id = ? AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(meterId, since).map(observationFromRow);
+    return this.prepared("SELECT * FROM observations WHERE meter_id = ? AND fetched_at >= ? ORDER BY fetched_at ASC, id ASC").all(meterId, since).map(observationFromRow);
   }
 
   /**
@@ -1407,10 +1572,32 @@ export class HeadroomStore {
     const filter = meterId === undefined
       ? "WHERE COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0"
       : "WHERE meter_id = ? AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0";
-    return this.db.prepare(`WITH ranked AS (
+    return this.prepared(`WITH ranked AS (
       SELECT *, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
-        ORDER BY (CASE WHEN freshness = 'fresh' OR freshness = 'not_enforced' THEN 0 ELSE 1 END), fetched_at DESC, id DESC
+        -- A later manual entry supersedes an earlier one, including a clear.
+        -- A cleared/expired manual fact does not hide a newer failed poll:
+        -- rank it beside that failure so the newer row can explain the live
+        -- state rather than leaving this meter blank after filtering.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced')
+                         AND NOT (source = 'manual' AND (
+                           EXISTS (
+                             SELECT 1 FROM observations AS newer_manual
+                             WHERE newer_manual.meter_id = observations.meter_id
+                               AND COALESCE(CAST(json_extract(newer_manual.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                               AND newer_manual.source = 'manual'
+                               AND (newer_manual.fetched_at > observations.fetched_at OR (newer_manual.fetched_at = observations.fetched_at AND newer_manual.id > observations.id))
+                           )
+                           OR ((COALESCE(json_extract(metadata_json, '$.manual_cleared'), 0) = 1 OR (resets_at IS NOT NULL AND julianday(resets_at) <= julianday('now')))
+                             AND EXISTS (
+                               SELECT 1 FROM observations AS newer_failed
+                               WHERE newer_failed.meter_id = observations.meter_id
+                                 AND COALESCE(CAST(json_extract(newer_failed.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                                 AND newer_failed.freshness = 'failed'
+                                 AND (newer_failed.fetched_at > observations.fetched_at OR (newer_failed.fetched_at = observations.fetched_at AND newer_failed.id > observations.id))
+                             ))
+                         ))
+                      THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
     ) SELECT current.* FROM ranked AS current
@@ -1441,12 +1628,16 @@ export class HeadroomStore {
               OR COALESCE(CAST(json_extract(peer.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(current.window_json, '$.minutes') AS TEXT), 'none')
             )
             AND (peer.fetched_at > current.fetched_at OR (peer.fetched_at = current.fetched_at AND peer.id > current.id))
-            -- A reading the operator pasted from the vendor's own panel stays
-            -- authoritative for an hour: a failed poll in that hour (a denied
-            -- probe, a transport error) must not hide it, or the paste would be
-            -- pointless on exactly the machine where the probe cannot read.
-            AND NOT (current.source = 'paste' AND peer.freshness = 'failed'
-                     AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+            -- A pasted reading stays authoritative for an hour. A live manual
+            -- banked-reset entry stays authoritative until it is cleared,
+            -- superseded, or expires: a later failed vendor poll must never
+            -- erase the one operator fact it cannot read itself.
+            AND NOT (peer.freshness = 'failed' AND (
+              (current.source = 'paste' AND current.fetched_at > strftime('%Y-%m-%dT%H:%M:%S', 'now', '-60 minutes'))
+              OR (current.source = 'manual'
+                AND COALESCE(json_extract(current.metadata_json, '$.manual_cleared'), 0) = 0
+                AND (current.resets_at IS NULL OR julianday(current.resets_at) > julianday('now')))
+            ))
         )
       ORDER BY current.meter_id ASC, current.fetched_at DESC, current.id DESC`)
       .all(...(meterId === undefined ? [] : [meterId]))
@@ -1463,11 +1654,117 @@ export class HeadroomStore {
 
   /** Compatibility helper for callers that explicitly need one newest row. */
   latest(meterId: string): StoredObservation | undefined {
-    const row = this.db.prepare("SELECT * FROM observations WHERE meter_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId);
+    const row = this.prepared("SELECT * FROM observations WHERE meter_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId);
     return row ? observationFromRow(row) : undefined;
   }
 
-  events(since: string): HeadroomEvent[] { return this.db.prepare("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+  events(since: string): HeadroomEvent[] { return this.prepared("SELECT * FROM events WHERE created_at >= ? ORDER BY created_at ASC").all(since).map(eventFromRow); }
+
+  /** One stored event by its durable ID. Notification compatibility uses this
+   * to reconstruct the deterministic delivery ID older builds used. */
+  eventById(eventId: string): HeadroomEvent | undefined {
+    const row = this.prepared("SELECT * FROM events WHERE id = ?").get(eventId);
+    return row ? eventFromRow(row) : undefined;
+  }
+
+  /** The catalog never reports a model-to-meter mapping, so this remains a
+   * deliberately conservative hint: only a current, fresh, official meter
+   * can establish a dedicated bucket. A current generic meter supports the
+   * usual shared-pool explanation; no current evidence remains unknown. */
+  private modelMeterScope(principalId: string, modelId: string): "dedicated" | "shared" | "unknown" {
+    const generic = new Set(["main", "spark", "credits", "capacity", "all", "gemini", "claude-gpt", "state"]);
+    const buckets = this.latestPerWindow()
+      .filter((observation) => observation.principal_id === principalId && observation.freshness === "fresh" && observation.truth === "official" && !observation.metadata?.vendor_window_held && !observation.metadata?.vendor_inconsistent)
+      .map((observation) => observation.meter_id.split(":").slice(1).join(":").toLowerCase());
+    const slug = modelId.toLowerCase();
+    if (buckets.some((bucket) => bucket.length > 2 && !generic.has(bucket) && (slug.includes(bucket) || bucket.includes(slug)))) return "dedicated";
+    if (buckets.some((bucket) => generic.has(bucket))) return "shared";
+    return "unknown";
+  }
+
+  /** Writes one `model_available`/`model_retired` event directly (not
+   * through `addEvent`, which requires a `StoredObservation` for its
+   * `meter_id`/`fetched_at` -- a model-catalog fact has neither). The
+   * deterministic id (`kind:principal:modelId`) makes this idempotent under
+   * `INSERT OR IGNORE`, the same guarantee `addEvent` gives its own
+   * observation-keyed ids. */
+  private addModelEvent(kind: "model_available" | "model_retired", principalId: string, modelId: string, modelName: string | null, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName };
+    if (kind === "model_available") {
+      const scope = this.modelMeterScope(principalId, modelId);
+      if (scope === "dedicated") metadata.shares_pool = false;
+      else if (scope === "shared") metadata.shares_pool = true;
+    }
+    this.prepared("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${principalId}:${modelId}`, kind, "vendor_reported", 1, "[]", at, null, null, principalId, modelId, null, JSON.stringify(metadata));
+  }
+
+  /**
+   * Folds one vendor model-catalog read into `known_models` and emits
+   * `model_available`/`model_retired` events for what changed. The first
+   * ever call for a principal (tracked by a durable marker, not row count)
+   * seeds every id silently -- no events -- so turning this feature on never
+   * produces a burst of "new model" notifications for models the operator
+   * has already been using for months. Every later call diffs against that
+   * seed: an id with no row yet is genuinely new (`first_seen_at` = now, one
+   * `model_available` event); an id previously marked `retired_at` reappears
+   * without a fresh event (the vendor listing it again is not, by itself, as
+   * newsworthy as the very first sighting, and it keeps its original
+   * `first_seen_at`); an id no longer present is marked `retired_at` = now
+   * with one `model_retired` event (excluded from every default notify
+   * preset -- see notify.ts's `PRESET_EVENTS`).
+   */
+  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date()): { seeded: boolean; added: string[]; retired: string[] } {
+    const at = now.toISOString();
+    const initializedKey = `model_catalog_initialized:${principalId}`;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existingRows = this.prepared("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
+      const seeded = this.daemonState(initializedKey) === undefined;
+      const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
+      const seenIds = new Set(models.map((model) => model.id));
+      const added: string[] = [];
+      for (const model of models) {
+        const existing = existingById.get(model.id);
+        if (!existing) {
+          this.prepared("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
+            .run(principalId, vendor, model.id, model.name ?? null, at, at);
+          if (!seeded) {
+            added.push(model.id);
+            this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
+          }
+          continue;
+        }
+        this.prepared("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+          .run(at, model.name ?? null, vendor, principalId, model.id);
+      }
+      const retired: string[] = [];
+      if (!seeded) for (const row of existingRows) {
+        if (seenIds.has(row.model_id) || row.retired_at) continue;
+        this.prepared("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
+        retired.push(row.model_id);
+        this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
+      }
+      // This must share the transaction with rows and events. In particular,
+      // an authoritative initial empty catalog is still an initialized check.
+      this.setDaemonState(initializedKey, at);
+      this.db.exec("COMMIT");
+      return { seeded, added, retired };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
+  }
+
+  /** Every model id Headroom has ever seen in a vendor's own catalog, newest
+   * first_seen last. A retired id is kept (never deleted), so `headroom
+   * models` can still show when a model disappeared. */
+  knownModels(principalId?: string): KnownModel[] {
+    const rows = principalId
+      ? this.prepared("SELECT * FROM known_models WHERE principal_id = ? ORDER BY first_seen_at ASC, model_id ASC").all(principalId)
+      : this.prepared("SELECT * FROM known_models ORDER BY principal_id ASC, first_seen_at ASC, model_id ASC").all();
+    return rows.map(knownModelFromRow);
+  }
 
   /** Bootstrap before the daemon's first poll, without credentials or network.
    * Existing events are history; new events from that first poll are eligible.
@@ -1488,10 +1785,10 @@ export class HeadroomStore {
     try {
       const initialized = this.daemonState(NOTIFY_DISCOVERY_READY) !== undefined;
       if (initializeOnly && initialized) { this.db.exec("COMMIT"); return 0; }
-      const events = initialized ? this.db.prepare(`SELECT * FROM events WHERE ${UNDISCOVERED_EVENT} ORDER BY rowid`).all().map(eventFromRow) : undefined;
+      const events = initialized ? this.prepared(`SELECT * FROM events WHERE ${UNDISCOVERED_EVENT} ORDER BY rowid`).all().map(eventFromRow) : undefined;
       const queued = enqueue(events);
       if (!Number.isFinite(queued)) throw new Error("notification enqueue callback must return a synchronous count");
-      this.db.prepare(`UPDATE events SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$._notify_seen', 1) WHERE ${UNDISCOVERED_EVENT}`).run();
+      this.prepared(`UPDATE events SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$._notify_seen', 1) WHERE ${UNDISCOVERED_EVENT}`).run();
       this.setDaemonState(NOTIFY_DISCOVERY_READY, "true");
       this.db.exec("COMMIT");
       return queued;
@@ -1505,12 +1802,116 @@ export class HeadroomStore {
    * table the Claude probe hashes and the MCP backoff already use. The
    * notifier keeps its initialization state here. */
   daemonState(key: string): string | undefined {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = ?").get(key);
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = ?").get(key);
     return row ? String(row.value) : undefined;
   }
 
   setDaemonState(key: string, value: string): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  /** Every persisted `source_health:` marker (notify.ts's source-health
+   * hysteresis, keyed by outage event and its semantic window), for the notifier's per-poll sweep. Mirrors
+   * planDowngrades()'s own daemon_state prefix scan. This is notify-layer-only
+   * state: the events table remains the complete, undamped truth record of
+   * every source_failed/source_recovered transition regardless of what the
+   * notifier has decided to hold back so far. */
+  sourceHealthPending(): Array<{ key: string; value: string }> {
+    return this.prepared("SELECT key, value FROM daemon_state WHERE key LIKE 'source_health:%'").all()
+      .map((row) => ({ key: String(row.key), value: String(row.value) }))
+      .filter((row) => row.value !== "");
+  }
+
+  /** The failed observation that opened one source outage. A source_failed
+   * event has one opening observation; later failed polls extend only its
+   * `last_seen_at`, keeping this a stable outage identity. */
+  sourceHealthOutage(eventId: string): SourceHealthOutage | undefined {
+    const row = this.prepared(`SELECT e.id AS event_id, e.meter_id, e.created_at, e.last_seen_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_failed'
+      ORDER BY o.id ASC LIMIT 1`).get(eventId);
+    if (!row || typeof row.event_id !== "string" || typeof row.meter_id !== "string" || typeof row.created_at !== "string") return undefined;
+    return {
+      event_id: row.event_id,
+      meter_id: row.meter_id,
+      window: row.window_json ? parseJson<Observation["window"]>(row.window_json, null) : null,
+      created_at: row.created_at,
+      last_seen_at: typeof row.last_seen_at === "string" ? row.last_seen_at : row.created_at,
+    };
+  }
+
+  private sourceHealthOutageClosedBefore(outage: SourceHealthOutage, before?: string): boolean {
+    const ending = before ? "AND e.created_at < ?" : "";
+    if (!outage.window) {
+      // This mirrors recoverWindowlessFailure(): a whole-meter outage closes
+      // on the next genuine source-recovered transition, regardless of the
+      // window that finally answered.
+      const row = this.prepared(`SELECT 1 FROM events e WHERE e.meter_id = ? AND e.kind = 'source_recovered'
+        AND e.created_at > ? ${ending} LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []));
+      return Boolean(row);
+    }
+    const match = windowSqlMatch(outage.window, "o.window_json");
+    const row = this.prepared(`SELECT 1 FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.meter_id = ? AND e.kind = 'source_recovered' AND e.created_at > ? ${ending}
+        AND o.freshness = 'fresh' AND ${match.sql}
+      LIMIT 1`).get(outage.meter_id, outage.created_at, ...(before ? [before] : []), ...match.params);
+    return Boolean(row);
+  }
+
+  /** The matching source outage only while it remains open. This is scoped by
+   * the failure's own semantic window: a newer fresh weekly row cannot hide
+   * an open failed 5h row, and vice versa. */
+  sourceHealthOpenOutage(eventId: string): SourceHealthOutage | undefined {
+    const outage = this.sourceHealthOutage(eventId);
+    return outage && !this.sourceHealthOutageClosedBefore(outage) ? outage : undefined;
+  }
+
+  /** Every source failure that the supplied recovery closes. This also finds
+   * failures delivered before source-health state existed, so an upgraded
+   * daemon can still deliver their legitimate recovery per channel. */
+  sourceHealthOutagesRecoveredBy(recoveryEventId: string): SourceHealthOutage[] {
+    const recovery = this.prepared(`SELECT e.meter_id, e.created_at, o.window_json
+      FROM events e
+      JOIN json_each(e.evidence_observation_ids) evidence
+      JOIN observations o ON o.id = evidence.value
+      WHERE e.id = ? AND e.kind = 'source_recovered' AND o.freshness = 'fresh'
+      ORDER BY o.id DESC LIMIT 1`).get(recoveryEventId);
+    if (!recovery || typeof recovery.meter_id !== "string" || typeof recovery.created_at !== "string") return [];
+    const recoveryMeter = recovery.meter_id;
+    const recoveryCreated = recovery.created_at;
+    const window = recovery.window_json ? parseJson<Observation["window"]>(recovery.window_json, null) : null;
+    const candidates = this.prepared("SELECT id FROM events WHERE meter_id = ? AND kind = 'source_failed' AND created_at < ? ORDER BY created_at ASC, id ASC")
+      .all(recoveryMeter, recoveryCreated)
+      .flatMap((row) => typeof row.id === "string" ? [row.id] : [])
+      .map((id) => this.sourceHealthOutage(id))
+      .filter((outage): outage is SourceHealthOutage => Boolean(outage))
+      .filter((outage) => !outage.window || sameSemanticWindow(outage.window, window));
+    return candidates.filter((outage) => !this.sourceHealthOutageClosedBefore(outage, recoveryCreated));
+  }
+
+  /** Atomically reserves an interval before a caller starts asynchronous
+   * work. Keeping the reservation after a failed read prevents overlapping
+   * polls (or separate CLI processes) from repeatedly retrying a bad source. */
+  claimDaemonInterval(key: string, now: Date, intervalMs: number): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.daemonState(key);
+      const previousAt = previous ? Date.parse(previous) : Number.NaN;
+      if (Number.isFinite(previousAt) && now.getTime() - previousAt < intervalMs) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      this.setDaemonState(key, now.toISOString());
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
+      throw error;
+    }
   }
 
   /**
@@ -1541,21 +1942,21 @@ export class HeadroomStore {
    * constraint, not the caller, is what makes that true.
    */
   notifyEnqueue(eventId: string, channel: string, text: string, at: string): void {
-    this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'pending',0,?,NULL,?,?)")
+    this.prepared("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'pending',0,?,NULL,?,?)")
       .run(eventId, channel, text, at, at);
   }
 
   /** A visible audit row for a notification that the delivery safety net
    * deliberately held back. */
   notifySuppress(eventId: string, channel: string, text: string, detail: string, at: string): void {
-    this.db.prepare("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'suppressed',0,?,?,?,?)")
+    this.prepared("INSERT OR IGNORE INTO notify_ledger (event_id,channel,status,attempts,text,detail,created_at,updated_at) VALUES (?,?,'suppressed',0,?,?,?,?)")
       .run(eventId, channel, text, detail, at, at);
   }
 
   /** The payload contains the stable semantic delivery identity. Keeping this
    * lookup in the store makes the six-hour guard independent of event IDs. */
   notifySentSince(channel: string, deliveryIdentity: string, since: string): boolean {
-    const rows = this.db.prepare("SELECT text FROM notify_ledger WHERE channel = ? AND status = 'sent' AND updated_at >= ?").all(channel, since);
+    const rows = this.prepared("SELECT text FROM notify_ledger WHERE channel = ? AND status = 'sent' AND updated_at >= ?").all(channel, since);
     return rows.some((row) => {
       try { return (JSON.parse(String(row.text)) as { delivery_identity?: unknown }).delivery_identity === deliveryIdentity; }
       catch { return false; }
@@ -1566,7 +1967,7 @@ export class HeadroomStore {
    * Payload fields are intentionally inspected here instead of adding another
    * schema column, so older ledgers stay readable during upgrades. */
   notifyLastSentForWindow(channel: string, meter: string, windowKey: string): NotifyDelivery | undefined {
-    const rows = this.db.prepare("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'sent' ORDER BY updated_at DESC, id DESC").all(channel);
+    const rows = this.prepared("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'sent' ORDER BY updated_at DESC, id DESC").all(channel);
     for (const row of rows) {
       try {
         const payload = JSON.parse(String(row.text)) as { meter?: unknown; window_key?: unknown };
@@ -1579,7 +1980,7 @@ export class HeadroomStore {
   /** Lookup for a deterministic notification identity. Projection delivery
    * uses this ledger state to allow one plain alert and one escalation. */
   notifyDelivery(eventId: string, channel: string): NotifyDelivery | undefined {
-    const row = this.db.prepare("SELECT * FROM notify_ledger WHERE event_id = ? AND channel = ?").get(eventId, channel);
+    const row = this.prepared("SELECT * FROM notify_ledger WHERE event_id = ? AND channel = ?").get(eventId, channel);
     return row ? notifyFromRow(row) : undefined;
   }
 
@@ -1587,13 +1988,13 @@ export class HeadroomStore {
    * event a quiet-hours window held back, which the caller sends as one
    * batched message. */
   notifyPending(channel: string, maxAttempts = 3, limit = 100): NotifyDelivery[] {
-    return this.db.prepare("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'pending' AND attempts < ? ORDER BY created_at ASC, id ASC LIMIT ?")
+    return this.prepared("SELECT * FROM notify_ledger WHERE channel = ? AND status = 'pending' AND attempts < ? ORDER BY created_at ASC, id ASC LIMIT ?")
       .all(channel, maxAttempts, limit).map(notifyFromRow);
   }
 
   notifyDelivered(ids: number[], at: string): void {
     if (!ids.length) return;
-    this.db.prepare(`UPDATE notify_ledger SET status = 'sent', detail = NULL, updated_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`).run(at, ...ids);
+    this.prepared(`UPDATE notify_ledger SET status = 'sent', detail = NULL, updated_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`).run(at, ...ids);
   }
 
   /** One failed attempt for each row: the attempt counter carries the retry
@@ -1602,26 +2003,26 @@ export class HeadroomStore {
   notifyAttemptFailed(ids: number[], detail: string, at: string, maxAttempts = 3): void {
     if (!ids.length) return;
     const placeholders = ids.map(() => "?").join(",");
-    this.db.prepare(`UPDATE notify_ledger SET attempts = attempts + 1, detail = ?, updated_at = ?,
+    this.prepared(`UPDATE notify_ledger SET attempts = attempts + 1, detail = ?, updated_at = ?,
       status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE status END WHERE id IN (${placeholders})`).run(detail, at, maxAttempts, ...ids);
   }
 
   notifyLedger(limit = 20): NotifyDelivery[] {
-    return this.db.prepare("SELECT * FROM notify_ledger ORDER BY updated_at DESC, id DESC LIMIT ?").all(limit).map(notifyFromRow);
+    return this.prepared("SELECT * FROM notify_ledger ORDER BY updated_at DESC, id DESC LIMIT ?").all(limit).map(notifyFromRow);
   }
 
   private expireLeases(now = new Date()): void {
     const at = now.toISOString();
-    const expired = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.ended_at IS NULL AND l.expires_at <= ? GROUP BY l.id").all(at).map(leaseFromRow);
+    const expired = this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.ended_at IS NULL AND l.expires_at <= ? GROUP BY l.id").all(at).map(leaseFromRow);
     for (const lease of expired) {
-      this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = 'expired' WHERE id = ? AND ended_at IS NULL").run(at, lease.id);
+      this.prepared("UPDATE leases SET ended_at = ?, ended_reason = 'expired' WHERE id = ? AND ended_at IS NULL").run(at, lease.id);
       this.addLeaseEvent("lease_ended", { ...lease, ended_at: at, ended_reason: "expired" });
     }
   }
 
   private addLeaseEvent(kind: Extract<EventKind, "lease_started" | "lease_ended">, lease: Lease): void {
     const at = lease.ended_at ?? lease.started_at;
-    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
+    this.prepared("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .run(`${kind}:${lease.id}:${at}`, kind, "vendor_reported", 1, "[]", at, null, lease.meter_id, null, lease.ended_reason ?? displayLeaseNote(lease.note));
   }
 
@@ -1634,7 +2035,7 @@ export class HeadroomStore {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error("ttl must be positive");
     this.expireLeases(now);
     const lease: Lease = { id: randomUUID(), owner: owner.trim(), meter_id: meterId.trim(), expected_percent: expectedPercent, note, action_class: actionClass && actionClass.trim() ? actionClass.trim() : null, started_at: now.toISOString(), expires_at: new Date(now.getTime() + ttlMs).toISOString(), ended_at: null, ended_reason: null, spent_percent: 0 };
-    this.db.prepare("INSERT INTO leases (id,owner,meter_id,expected_percent,note,action_class,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.action_class, lease.started_at, lease.expires_at, null, null);
+    this.prepared("INSERT INTO leases (id,owner,meter_id,expected_percent,note,action_class,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.action_class, lease.started_at, lease.expires_at, null, null);
     this.addLeaseEvent("lease_started", lease);
     return lease;
   }
@@ -1687,7 +2088,7 @@ export class HeadroomStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.expireLeases(now);
-      const row = this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
+      const row = this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
       if (!row) throw new Error("lease not found");
       const lease = leaseFromRow(row);
       if (lease.ended_at) {
@@ -1698,13 +2099,13 @@ export class HeadroomStore {
       const rawNote = string(row.note);
       const group = atomicLeaseGroup(rawNote);
       const members = group
-        ? this.db.prepare("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.note = ? AND l.owner = ? AND l.ended_at IS NULL GROUP BY l.id").all(rawNote, lease.owner).map(leaseFromRow)
+        ? this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.note = ? AND l.owner = ? AND l.ended_at IS NULL GROUP BY l.id").all(rawNote, lease.owner).map(leaseFromRow)
         : [lease];
       const at = now.toISOString();
       let returned: Lease | undefined;
       for (const member of members) {
         const ended = { ...member, ended_at: at, ended_reason: "ended" };
-        this.db.prepare("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL").run(ended.ended_at, ended.ended_reason, member.id);
+        this.prepared("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL").run(ended.ended_at, ended.ended_reason, member.id);
         this.addLeaseEvent("lease_ended", ended);
         if (member.id === id) returned = ended;
       }
@@ -1718,9 +2119,205 @@ export class HeadroomStore {
 
   leases(meterId?: string, activeOnly = false, now = new Date()): Lease[] {
     this.expireLeases(now);
+    return this.selectLeases(meterId, activeOnly, now);
+  }
+
+  /**
+   * The same lease view as `leases()`, without its `expireLeases()` write.
+   * For a read-only connection (the cached-fallback path in cli.ts/mcp.ts,
+   * opened with `openReadOnly()`) that must never write: a lease past its
+   * expiry but not yet marked ended is simply excluded by the same
+   * `activeOnly` filter `leases()` applies right after expiring it, so the
+   * two agree on which leases are usable for a decision -- only the
+   * `ended_at`/`lease_ended` bookkeeping itself is deferred to the next
+   * writable open, exactly like any other write a read-only caller defers.
+   */
+  leasesReadOnly(meterId?: string, activeOnly = false, now = new Date()): Lease[] {
+    return this.selectLeases(meterId, activeOnly, now);
+  }
+
+  private selectLeases(meterId: string | undefined, activeOnly: boolean, now: Date): Lease[] {
     const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL AND l.expires_at > ?" : ""].filter(Boolean).join(" AND ");
     const params = [...(meterId ? [meterId] : []), ...(activeOnly ? [now.toISOString()] : [])];
-    return this.db.prepare(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...params).map(leaseFromRow);
+    return this.prepared(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...params).map(leaseFromRow);
+  }
+
+  /* -----------------------------------------------------------------------
+   * Orchestrator heartbeats and named wake-ups (timers). See migrations.ts's
+   * ADD_HEARTBEATS_AND_TIMERS for the schema and the reasoning: the daemon is
+   * the one process that survives a crashed orchestrator session, so it
+   * holds both.
+   * -------------------------------------------------------------------- */
+
+  private addHeartbeatEvent(kind: Extract<EventKind, "heartbeat_lapsed" | "heartbeat_restored">, heartbeat: Heartbeat, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: heartbeat.owner, interval_ms: heartbeat.interval_ms, last_beat_at: heartbeat.last_beat_at, ...(kind === "heartbeat_lapsed" ? { resume_sentence: heartbeat.resume_sentence } : {}) };
+    // Deterministic on (kind, owner, the beat instant the lapse/restore is
+    // about): a lapse and the restore that later closes it always get
+    // different last_beat_at values (a beat updates last_beat_at before the
+    // lapse marker is ever read again), so this stays idempotent under
+    // INSERT OR IGNORE the same way addModelEvent's ids do, without ever
+    // colliding a lapse with the restore that follows it.
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${heartbeat.owner}:${heartbeat.last_beat_at}`, kind, "vendor_reported", 1, "[]", at, null, null, null, heartbeat.owner, null, JSON.stringify(metadata));
+  }
+
+  private heartbeatRow(owner: string): Heartbeat | undefined {
+    const row = this.db.prepare("SELECT * FROM heartbeats WHERE owner = ?").get(owner);
+    return row ? heartbeatFromRow(row) : undefined;
+  }
+
+  /**
+   * Records or refreshes one owner's heartbeat lease. `resumeSentence`
+   * `undefined` keeps whatever was registered before (a plain re-beat need
+   * not repeat it); `null` clears it explicitly. A beat that finds this
+   * heartbeat currently lapsed closes the lapse immediately -- rather than
+   * waiting for the next poll's checkHeartbeatLapses to notice -- and emits
+   * exactly one `heartbeat_restored` event for it.
+   */
+  heartbeatBeat(owner: string, intervalMs: number, resumeSentence: string | null | undefined, now = new Date()): Heartbeat {
+    const trimmed = owner.trim();
+    if (!trimmed) throw new Error("owner is required");
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("interval must be positive");
+    const at = now.toISOString();
+    const existing = this.heartbeatRow(trimmed);
+    if (existing?.lapsed_since) this.addHeartbeatEvent("heartbeat_restored", existing, at);
+    const resume = resumeSentence === undefined ? existing?.resume_sentence ?? null : resumeSentence;
+    this.db.prepare(`INSERT INTO heartbeats (owner,interval_ms,resume_sentence,started_at,last_beat_at,lapsed_since,updated_at) VALUES (?,?,?,?,?,NULL,?)
+      ON CONFLICT(owner) DO UPDATE SET interval_ms = excluded.interval_ms, resume_sentence = excluded.resume_sentence, last_beat_at = excluded.last_beat_at, lapsed_since = NULL, updated_at = excluded.updated_at`)
+      .run(trimmed, Math.round(intervalMs), resume, existing?.started_at ?? at, at, at);
+    return this.heartbeatRow(trimmed)!;
+  }
+
+  /** Deregisters a heartbeat lease. Returns false when there was none --
+   * an idempotent stop is not an error. Does not itself emit
+   * `heartbeat_restored`: a deliberate stop is not a recovery worth a
+   * notification, and a lapsed heartbeat that is simply stopped should stay
+   * silent rather than announce a restore that never happened. */
+  heartbeatStop(owner: string): boolean {
+    const trimmed = owner.trim();
+    if (!trimmed) throw new Error("owner is required");
+    if (!this.heartbeatRow(trimmed)) return false;
+    this.db.prepare("DELETE FROM heartbeats WHERE owner = ?").run(trimmed);
+    return true;
+  }
+
+  /** Every registered heartbeat, most recently updated first. */
+  heartbeats(): Heartbeat[] {
+    return this.db.prepare("SELECT * FROM heartbeats ORDER BY updated_at DESC").all().map(heartbeatFromRow);
+  }
+
+  /**
+   * The daemon's per-poll pass: every heartbeat not already marked lapsed
+   * whose last beat is now overdue by more than 2x its own interval gets
+   * `lapsed_since` set to `now` and exactly one `heartbeat_lapsed` event --
+   * INSERT OR IGNORE on addHeartbeatEvent's deterministic id means a poll
+   * that somehow runs twice for the same lapse still produces only one.
+   * Never called from a beat/stop path, only from the daemon's own poll
+   * loop, so a heartbeat never lapses because a caller happened to invoke
+   * this at an unusual moment.
+   */
+  checkHeartbeatLapses(now = new Date()): void {
+    const at = now.toISOString();
+    for (const row of this.db.prepare("SELECT * FROM heartbeats WHERE lapsed_since IS NULL").all()) {
+      const heartbeat = heartbeatFromRow(row);
+      const elapsedMs = now.getTime() - Date.parse(heartbeat.last_beat_at);
+      if (!Number.isFinite(elapsedMs) || elapsedMs <= heartbeat.interval_ms * 2) continue;
+      this.db.prepare("UPDATE heartbeats SET lapsed_since = ?, updated_at = ? WHERE owner = ? AND lapsed_since IS NULL").run(at, at, heartbeat.owner);
+      this.addHeartbeatEvent("heartbeat_lapsed", heartbeat, at);
+    }
+  }
+
+  /** True while `owner` has a registered heartbeat currently considered
+   * lapsed. An owner with no heartbeat at all is never "lapsed" -- that is
+   * simply an orchestrator that never opted in, not a missed one. */
+  heartbeatLapsed(owner: string): boolean {
+    return this.heartbeatRow(owner.trim())?.lapsed_since != null;
+  }
+
+  private addTimerMissedEvent(timer: Timer, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: timer.owner, timer_name: timer.name, action: timer.action };
+    // meter_id and principal_id are both null, same as addHeartbeatEvent
+    // above: the owner is an orchestrator identity, not a vendor account or
+    // meter, so it belongs only in `reason`/metadata, never in the column a
+    // reader would otherwise read as "this event is about that principal".
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`timer_missed:${timer.owner}:${timer.name}:${timer.at}`, "timer_missed", "vendor_reported", 1, "[]", at, null, null, null, timer.owner, null, JSON.stringify(metadata));
+  }
+
+  /** Registers (or replaces, by the same owner+name) one named wake-up. A
+   * timer already fired or cleared under this owner+name is simply replaced
+   * by the new one, same as re-registering any other schedule. */
+  setTimer(owner: string, name: string, at: string, action: string, ifMissed: "notify" | "drop", now = new Date()): Timer {
+    const trimmedOwner = owner.trim();
+    const trimmedName = name.trim();
+    if (!trimmedOwner || !trimmedName) throw new Error("owner and name are required");
+    if (!action.trim()) throw new Error("action is required");
+    if (!Number.isFinite(Date.parse(at))) throw new Error("at must be a valid ISO instant");
+    const createdAt = now.toISOString();
+    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at) VALUES (?,?,?,?,?,?,NULL,NULL)
+      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL`)
+      .run(trimmedOwner, trimmedName, new Date(at).toISOString(), action, ifMissed, createdAt);
+    return timerFromRow(this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(trimmedOwner, trimmedName)!);
+  }
+
+  /** Pending timers (never fired, never cleared) for one owner, or every
+   * owner's when omitted, soonest due first. */
+  timers(owner?: string): Timer[] {
+    const filter = owner ? "WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL" : "WHERE fired_at IS NULL AND cleared_at IS NULL";
+    return this.db.prepare(`SELECT * FROM timers ${filter} ORDER BY at ASC`).all(...(owner ? [owner] : [])).map(timerFromRow);
+  }
+
+  /** Pending timers at or past `now`, oldest due first -- the daemon's own
+   * per-poll firing query. */
+  dueTimers(now = new Date()): Timer[] {
+    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND at <= ? ORDER BY at ASC").all(now.toISOString()).map(timerFromRow);
+  }
+
+  /**
+   * Claims one due timer for delivery, before src/heartbeat.ts's
+   * fireDueTimers ever attempts the actual inbox write (filesystem I/O this
+   * synchronous store cannot do itself): the `WHERE fired_at IS NULL` guard
+   * on the UPDATE means this is the single atomic point that decides which
+   * of two overlapping firing passes (a slow inbox write outlasting the
+   * daemon's own poll throttle) gets to deliver a given timer -- the loser's
+   * claim affects zero rows and gets `undefined` back, never a duplicate
+   * delivery. Also raises one `timer_missed` event when `if_missed` is
+   * `notify` and this owner's heartbeat is currently lapsed, so a wake-up
+   * that fired while nobody was watching still reaches a human channel, not
+   * only the inbox its crashed session will never read -- `addTimerMissedEvent`'s
+   * own deterministic id keeps this idempotent even if the claim is later
+   * released (`unclaimTimer`) and re-claimed on a retry.
+   * Returns the claimed row (with its own new `fired_at`), or `undefined`
+   * when nothing matched -- already claimed by a concurrent pass, already
+   * cleared, or gone.
+   */
+  claimTimer(owner: string, name: string, now = new Date()): Timer | undefined {
+    const at = now.toISOString();
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL").get(owner, name);
+    if (!row) return undefined;
+    this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL").run(at, owner, name);
+    const timer = { ...timerFromRow(row), fired_at: at };
+    if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, at);
+    return timer;
+  }
+
+  /** Releases a claim a delivery attempt could not honor (the inbox write
+   * failed), so a later firing pass sees this timer as pending again. Only
+   * releases the exact claim it was given (`fired_at` must still equal
+   * `claimedFiredAt`): a timer independently cleared, or reclaimed by a
+   * different pass in between, is never clobbered by a stale release. */
+  unclaimTimer(owner: string, name: string, claimedFiredAt: string): void {
+    this.db.prepare("UPDATE timers SET fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ?").run(owner, name, claimedFiredAt);
+  }
+
+  /** Idempotent: clearing an already-cleared or already-fired timer is not
+   * an error, it simply has nothing left to do. Returns false when no row
+   * matched owner+name at all. */
+  clearTimer(owner: string, name: string, now = new Date()): boolean {
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(owner, name);
+    if (!row) return false;
+    this.db.prepare("UPDATE timers SET cleared_at = ? WHERE owner = ? AND name = ? AND cleared_at IS NULL").run(now.toISOString(), owner, name);
+    return true;
   }
 
   private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {
@@ -1732,7 +2329,7 @@ export class HeadroomStore {
     const weights = leases.map((lease) => lease.expected_percent ?? 1);
     const total = weights.reduce((sum, value) => sum + value, 0);
     if (total <= 0) return;
-    for (let index = 0; index < leases.length; index += 1) this.db.prepare("INSERT INTO lease_spend (lease_id,meter_id,observation_id,amount_percent,estimated,at) VALUES (?,?,?,?,?,?)").run(leases[index].id, current.meter_id, current.id, delta * weights[index] / total, 1, current.fetched_at);
+    for (let index = 0; index < leases.length; index += 1) this.prepared("INSERT INTO lease_spend (lease_id,meter_id,observation_id,amount_percent,estimated,at) VALUES (?,?,?,?,?,?)").run(leases[index].id, current.meter_id, current.id, delta * weights[index] / total, 1, current.fetched_at);
   }
 
   /**
@@ -1766,7 +2363,7 @@ export class HeadroomStore {
       .filter((lease) => lease.started_at <= current.fetched_at && lease.expires_at > baseline.fetched_at)
       .map((lease) => ({ owner: lease.owner, expect: lease.expected_percent }));
     for (const share of attributeSpend(delta, owners)) {
-      this.db.prepare("INSERT INTO spend_ledger (meter_id,window_minutes,from_at,to_at,delta_percent,owner,share_percent,confidence) VALUES (?,?,?,?,?,?,?,?)")
+      this.prepared("INSERT INTO spend_ledger (meter_id,window_minutes,from_at,to_at,delta_percent,owner,share_percent,confidence) VALUES (?,?,?,?,?,?,?,?)")
         .run(current.meter_id, window.minutes, baseline.fetched_at, current.fetched_at, delta, share.owner, share.share_percent, share.confidence);
     }
     this.pruneSpendLedger(at);
@@ -1779,7 +2376,7 @@ export class HeadroomStore {
    * guaranteed to carry milliseconds (see eventEvidenceFor). */
   private pruneSpendLedger(now: Date): void {
     const cutoff = new Date(now.getTime() - SPEND_LEDGER_RETENTION_DAYS * 86_400_000).toISOString();
-    this.db.prepare("DELETE FROM spend_ledger WHERE julianday(to_at) < julianday(?)").run(cutoff);
+    this.prepared("DELETE FROM spend_ledger WHERE julianday(to_at) < julianday(?)").run(cutoff);
   }
 
   /**
@@ -1794,7 +2391,7 @@ export class HeadroomStore {
     if (options.meter) { filters.push("meter_id = ?"); params.push(options.meter); }
     if (options.owner) { filters.push("owner = ?"); params.push(options.owner); }
     if (options.since) { filters.push("julianday(to_at) >= julianday(?)"); params.push(options.since); }
-    const rows = this.db.prepare(`SELECT meter_id, window_minutes, owner,
+    const rows = this.prepared(`SELECT meter_id, window_minutes, owner,
       SUM(share_percent) AS attributed_percent, SUM(share_percent * confidence) AS weighted_confidence,
       COUNT(*) AS samples, MIN(from_at) AS from_at, MAX(to_at) AS to_at
       FROM spend_ledger WHERE ${filters.join(" AND ")}
@@ -1850,7 +2447,7 @@ export class HeadroomStore {
     const boundedStart = Number.isFinite(reset) ? reset - minutes * 60_000 : now.getTime() - minutes * 60_000;
     const flatStart = now.getTime() - UNSCHEDULED_RESET_HOURS * 3_600_000;
     const since = new Date(Math.min(boundedStart, flatStart)).toISOString();
-    const rows = this.db.prepare(`SELECT e.created_at AS created_at, e.metadata_json AS metadata_json FROM events e
+    const rows = this.prepared(`SELECT e.created_at AS created_at, e.metadata_json AS metadata_json FROM events e
       JOIN json_each(e.evidence_observation_ids) evidence
       JOIN observations o ON o.id = evidence.value
       WHERE e.kind = 'reset_seen' AND e.meter_id = ?
@@ -1884,7 +2481,7 @@ export class HeadroomStore {
       // an observation's fetched_at verbatim, which is not guaranteed to carry
       // milliseconds, and ISO timestamps only sort lexicographically when every
       // value shares the same precision.
-      const row = this.db.prepare(`SELECT e.created_at FROM events e
+      const row = this.prepared(`SELECT e.created_at FROM events e
         JOIN json_each(e.evidence_observation_ids) evidence
         JOIN observations o ON o.id = evidence.value
         WHERE e.kind = ? AND e.meter_id = ?
@@ -1908,7 +2505,7 @@ export class HeadroomStore {
     if (!meterIds.length) return [];
     const since = new Date(now.getTime() - UNSCHEDULED_RESET_HOURS * 3_600_000).toISOString();
     const placeholders = meterIds.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT meter_id, MAX(created_at) AS created_at FROM events
+    const rows = this.prepared(`SELECT meter_id, MAX(created_at) AS created_at FROM events
       WHERE kind = 'reset_seen' AND meter_id IN (${placeholders})
         AND julianday(created_at) >= julianday(?)
         AND json_extract(metadata_json, '$.unscheduled') = 1
@@ -1917,7 +2514,7 @@ export class HeadroomStore {
   }
 
   audit(caller: string, action: string, meterOrPrincipal: string | null, outcome: string): void {
-    this.db.prepare("INSERT INTO audit (caller,action,meter_or_principal,outcome,at) VALUES (?,?,?,?,?)").run(caller, action, meterOrPrincipal, outcome, new Date().toISOString());
+    this.prepared("INSERT INTO audit (caller,action,meter_or_principal,outcome,at) VALUES (?,?,?,?,?)").run(caller, action, meterOrPrincipal, outcome, new Date().toISOString());
   }
 
   /**
@@ -1928,25 +2525,25 @@ export class HeadroomStore {
    * explicitly runs `headroom keychain grant`, which clears the marker.
    */
   keychainGrantNeeded(principalId: string): boolean {
-    return this.db.prepare("SELECT 1 FROM keychain_grants WHERE principal_id = ?").get(principalId) !== undefined;
+    return this.prepared("SELECT 1 FROM keychain_grants WHERE principal_id = ?").get(principalId) !== undefined;
   }
 
   keychainGrantReason(principalId: string): string | undefined {
-    const row = this.db.prepare("SELECT reason FROM keychain_grants WHERE principal_id = ?").get(principalId);
+    const row = this.prepared("SELECT reason FROM keychain_grants WHERE principal_id = ?").get(principalId);
     return row ? String(row.reason) : undefined;
   }
 
   setKeychainGrantNeeded(principalId: string, reason: string, now = new Date()): void {
-    this.db.prepare("INSERT INTO keychain_grants (principal_id, reason, set_at) VALUES (?,?,?) ON CONFLICT(principal_id) DO UPDATE SET reason = excluded.reason, set_at = excluded.set_at")
+    this.prepared("INSERT INTO keychain_grants (principal_id, reason, set_at) VALUES (?,?,?) ON CONFLICT(principal_id) DO UPDATE SET reason = excluded.reason, set_at = excluded.set_at")
       .run(principalId, reason, now.toISOString());
   }
 
   clearKeychainGrantNeeded(principalId: string): void {
-    this.db.prepare("DELETE FROM keychain_grants WHERE principal_id = ?").run(principalId);
+    this.prepared("DELETE FROM keychain_grants WHERE principal_id = ?").run(principalId);
   }
 
   keychainGrantsNeeded(): Array<{ principal_id: string; reason: string; set_at: string }> {
-    return this.db.prepare("SELECT * FROM keychain_grants ORDER BY principal_id ASC").all()
+    return this.prepared("SELECT * FROM keychain_grants ORDER BY principal_id ASC").all()
       .map((row) => ({ principal_id: String(row.principal_id), reason: String(row.reason), set_at: String(row.set_at) }));
   }
 
@@ -1955,12 +2552,12 @@ export class HeadroomStore {
    * fresh grant instead of the daemon silently re-probing with the new
    * binary and popping one dialog per principal per poll. */
   probeBinaryHash(): string | undefined {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_binary_sha256'").get();
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = 'claude_probe_binary_sha256'").get();
     return row ? String(row.value) : undefined;
   }
 
   setProbeBinaryHash(hash: string): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_binary_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_binary_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
 
   /** The most recent probe binary hash that actually proved itself: recorded
@@ -1969,12 +2566,12 @@ export class HeadroomStore {
    * exempts a first-ever sync (no probeBinaryHash yet) from being treated as
    * grant-needed when it is really the same already-trusted binary. */
   probeGrantedHash(): string | undefined {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_granted_sha256'").get();
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = 'claude_probe_granted_sha256'").get();
     return row ? String(row.value) : undefined;
   }
 
   setProbeGrantedHash(hash: string): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_granted_sha256', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(hash);
   }
 
   /** The probe's designated requirement at the last sync, which is what
@@ -1983,14 +2580,14 @@ export class HeadroomStore {
    * ad-hoc signed and has no stable identity to compare against, which is
    * deliberately distinct from "never recorded". */
   probeSigningIdentity(): string | undefined {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_signing_identity'").get();
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = 'claude_probe_signing_identity'").get();
     if (!row) return undefined;
     const value = String(row.value);
     return value ? value : undefined;
   }
 
   setProbeSigningIdentity(identity: string): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_signing_identity', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(identity);
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_signing_identity', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(identity);
   }
 
   /** The exact probe binary path this Headroom home has ever been granted
@@ -2006,12 +2603,12 @@ export class HeadroomStore {
    * a resolvable-but-different candidate is reported (by doctor) rather than
    * silently substituted. */
   probePath(): string | undefined {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'claude_probe_path'").get();
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = 'claude_probe_path'").get();
     return row ? String(row.value) : undefined;
   }
 
   setProbePath(path: string): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_path', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(path);
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES ('claude_probe_path', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(path);
   }
 
   /**
@@ -2024,7 +2621,7 @@ export class HeadroomStore {
    * the vendor independently.
    */
   directPollBackoff(): { lastPollAt: number; until: number; failures: number } {
-    const row = this.db.prepare("SELECT value FROM daemon_state WHERE key = 'mcp_direct_poll_backoff'").get();
+    const row = this.prepared("SELECT value FROM daemon_state WHERE key = 'mcp_direct_poll_backoff'").get();
     if (!row) return { lastPollAt: 0, until: 0, failures: 0 };
     try {
       const parsed = JSON.parse(String(row.value)) as { lastPollAt?: number; until?: number; failures?: number };
@@ -2033,7 +2630,7 @@ export class HeadroomStore {
   }
 
   setDirectPollBackoff(state: { lastPollAt: number; until: number; failures: number }): void {
-    this.db.prepare("INSERT INTO daemon_state (key, value) VALUES ('mcp_direct_poll_backoff', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(state));
+    this.prepared("INSERT INTO daemon_state (key, value) VALUES ('mcp_direct_poll_backoff', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(state));
   }
 
   /**
@@ -2051,7 +2648,7 @@ export class HeadroomStore {
     if (options.meter) { filters.push("meter_id = ?"); params.push(options.meter); }
     if (options.since) { filters.push("julianday(to_at) >= julianday(?)"); params.push(options.since); }
     if (options.until) { filters.push("julianday(to_at) <= julianday(?)"); params.push(options.until); }
-    return this.db.prepare(`SELECT id, meter_id, window_minutes, from_at, to_at, delta_percent, owner, share_percent, confidence
+    return this.prepared(`SELECT id, meter_id, window_minutes, from_at, to_at, delta_percent, owner, share_percent, confidence
       FROM spend_ledger WHERE ${filters.join(" AND ")} ORDER BY to_at ASC, id ASC`).all(...params)
       .map((row) => ({
         id: Number(row.id), meter_id: String(row.meter_id), window_minutes: number(row.window_minutes),
@@ -2105,7 +2702,7 @@ export class HeadroomStore {
         const key = `${observation.meter_id}:none`;
         if (seen.has(key)) continue;
         seen.add(key);
-        const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ?
+        const row = this.prepared(`SELECT * FROM observations WHERE meter_id = ?
           AND window_json IS NOT NULL AND window_json <> 'null'
           AND json_extract(window_json, '$.kind') NOT IN ('state', 'count')
           AND freshness = 'fresh' AND fetched_at >= ?
@@ -2123,7 +2720,7 @@ export class HeadroomStore {
       if (seen.has(key)) continue;
       seen.add(key);
       const match = windowSqlMatch(window);
-      const row = this.db.prepare(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
+      const row = this.prepared(`SELECT * FROM observations WHERE meter_id = ? AND ${match.sql}
         AND freshness = 'fresh' AND fetched_at >= ? ORDER BY fetched_at DESC, id DESC LIMIT 1`)
         .get(observation.meter_id, ...match.params, since);
       const found = readingFrom(row);

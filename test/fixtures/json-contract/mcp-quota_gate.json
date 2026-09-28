@@ -2,6 +2,16 @@
   "allowed": "boolean",
   "contract": "string",
   "generated_at": "string",
+  "host": {
+    "load_ratio": "number",
+    "orphans": "number",
+    "pty_max": "number",
+    "pty_used": "number",
+    "reasons": [
+      "unknown (empty array in the fixture data)"
+    ],
+    "state": "string"
+  },
   "lanes_remaining_for_class": "number",
   "meters_checked": [
     "string"

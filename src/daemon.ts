@@ -11,11 +11,13 @@ import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from
 import { appendDaemonLog } from "./logs.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
-import { withResetsIn } from "./resets.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
+import { checkModelAvailability } from "./model-catalog.js";
+import { fireDueTimers } from "./heartbeat.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -175,6 +177,13 @@ export class HeadroomDaemon {
   private keepalive: AgyKeepaliveSupervisor | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
+  /** Guards against a second timer-firing pass starting while a slow one
+   * (an inbox write that outlasts the 15s poll throttle below) is still
+   * running: see poll()'s own throttled block. `store.claimTimer`'s
+   * per-timer atomicity already makes two genuinely overlapping passes safe
+   * on their own, but this avoids the wasted duplicate `dueTimers()` scan
+   * and log noise a second pass would otherwise produce. */
+  private timerFiringInFlight: Promise<number> | undefined;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
 
@@ -232,7 +241,11 @@ export class HeadroomDaemon {
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
     if (!policy.antigravity_keepalive || process.platform === "win32") return;
-    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity");
+    // Centralized here (rather than trusting every caller to pre-filter) so
+    // a disabled Antigravity account never launches its keepalive, whether
+    // this is called from startup with the raw registry read or from a
+    // scheduled poll with an already-enabled-only list.
+    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
     if (!antigravity) return;
     // agy_path is a value from accounts.toml; verify ownership, mode, and
     // that it isn't a symlink before ever spawning it, the same bar every
@@ -469,11 +482,14 @@ export class HeadroomDaemon {
       let result: unknown;
       switch (request.method) {
         case "dashboard": {
+          const policy = await readPolicy();
+          const now = new Date();
           const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
-          result = readDashboardStore(this.store, new Date(), rows); break;
+          result = readDashboardStore(this.store, now, rows, policy); break;
         }
         case "status": {
           await this.poll(undefined, false);
+          const policy = await readPolicy();
           const now = new Date();
           const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
           // A principal currently sitting out a live vendor 429 backoff (see
@@ -482,11 +498,13 @@ export class HeadroomDaemon {
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
-          const paced = withPaceInfo(withBackoff, this.store.burnRateFor(withBackoff, now), now);
-          result = {
-            observations: withResetsIn(withLastKnown(paced, this.store.lastKnownFor(withBackoff, now))),
-            disabled_principals: this.accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name),
-          };
+          // The daemon's "status" RPC result stays the plain Observation[]
+          // array it has always been -- the 1.x JSON contract forbids ever
+          // turning it into an object -- so `disabled_principals` is derived
+          // by the CLI/MCP layers from the registry instead of returned here.
+          // Disabled principals are still excluded from capacity: their rows
+          // were already dropped from `observations` above.
+          result = withCreditsLapsed(withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now), now);
           break;
         }
         case "plan_downgrades": {
@@ -497,13 +515,18 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
           if (!meter) return reject(-32602, "meter is required");
-          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
-          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
+          // Unlike can/gate/plan/fill/lease_start/rate, history cannot create
+          // capacity for a disabled principal -- it only reads what was
+          // already stored -- so it stays readable regardless of enabled.
           result = this.store.history(meter, since); break;
         }
         case "events": {
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
           result = this.store.events(since); break;
+        }
+        case "models": {
+          const principal = typeof params.principal === "string" ? params.principal : undefined;
+          result = this.store.knownModels(principal); break;
         }
         case "can": {
           const action = typeof params.action_class === "string" ? params.action_class : "";
@@ -515,8 +538,12 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
-          const disabled = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
-          if (disabled) { const reason = disabledPrincipalReason(disabled); result = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] } satisfies CanDecision; break; }
+          const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+          if (disabledMeter) {
+            const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+            result = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) } satisfies CanDecision;
+            break;
+          }
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const now = new Date();
@@ -537,8 +564,12 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
-          const disabled = meters.map((meter) => disabledPrincipalForMeter(accounts, meter)).find((item): item is string => item !== undefined);
-          if (disabled) { const reason = disabledPrincipalReason(disabled); result = { decision: { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: [{ meter: meters[0], state: "UNKNOWN", reason }] }, leases: [] }; break; }
+          const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+          if (disabledMeter) {
+            const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+            result = { decision: { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) }, leases: [] };
+            break;
+          }
           // Refreshes may happen before the transaction; the transaction is
           // deliberately only the local decision plus lease write, never a
           // credential-backed network request.
@@ -577,6 +608,41 @@ export class HeadroomDaemon {
           break;
         }
         case "leases": result = this.store.leases(undefined, true); break;
+        case "heartbeat_beat": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const intervalMs = typeof params.interval_ms === "number" ? params.interval_ms : Number.NaN;
+          if (!owner.trim()) return reject(-32602, "owner is required");
+          if (!Number.isFinite(intervalMs) || intervalMs <= 0) return reject(-32602, "interval_ms must be positive", owner);
+          const resumeSentence = params.resume_sentence === null ? null : typeof params.resume_sentence === "string" ? params.resume_sentence : undefined;
+          result = this.store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); break;
+        }
+        case "heartbeat_stop": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          if (!owner.trim()) return reject(-32602, "owner is required");
+          result = { stopped: this.store.heartbeatStop(owner) }; break;
+        }
+        case "heartbeats": result = this.store.heartbeats(); break;
+        case "timer_set": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const timerName = typeof params.name === "string" ? params.name : "";
+          const at = typeof params.at === "string" ? params.at : "";
+          const action = typeof params.action === "string" ? params.action : "";
+          const ifMissed = params.if_missed === "drop" ? "drop" : "notify";
+          if (!owner.trim() || !timerName.trim()) return reject(-32602, "owner and name are required");
+          if (!action.trim()) return reject(-32602, "action is required", `${owner}:${timerName}`);
+          if (!Number.isFinite(Date.parse(at))) return reject(-32602, "at must be a valid ISO instant", `${owner}:${timerName}`);
+          result = this.store.setTimer(owner, timerName, at, action, ifMissed, new Date()); break;
+        }
+        case "timer_list": {
+          const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          result = this.store.timers(owner); break;
+        }
+        case "timer_clear": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const timerName = typeof params.name === "string" ? params.name : "";
+          if (!owner.trim() || !timerName.trim()) return reject(-32602, "owner and name are required");
+          result = { cleared: this.store.clearTimer(owner, timerName) }; break;
+        }
         case "refresh": {
           const principal = typeof params.principal === "string" ? params.principal : undefined;
           result = await this.poll(principal, true); break;
@@ -605,14 +671,44 @@ export class HeadroomDaemon {
           const sinceValue = typeof params.since === "string" && params.since.trim() ? params.since.trim() : new Date(Date.now() - 86_400_000).toISOString();
           result = this.store.spendByOwner({ meter, owner, since: sinceValue }); break;
         }
+        case "credits": {
+          result = this.store.credits(new Date()); break;
+        }
+        case "credits_set": {
+          const principal = typeof params.principal === "string" ? params.principal.trim() : "";
+          const available = params.available;
+          if (!principal) return reject(-32602, "principal is required");
+          if (!Number.isFinite(available) || typeof available !== "number" || available < 0 || !Number.isInteger(available)) return reject(-32602, "available must be a non-negative whole number", principal);
+          if (typeof params.expires !== "string") return reject(-32602, "expires is required", principal);
+          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          let expires: string;
+          try { expires = parseCreditExpiry(params.expires); }
+          catch (error) { return reject(-32602, error instanceof Error ? error.message : "invalid expiry", principal); }
+          this.store.recordManualCredits(principal, available, expires);
+          // Audited once, by the common `ok` audit after the switch (it
+          // already reads params.principal for the subject) -- a case-local
+          // audit here would double the row for this RPC only.
+          result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
+          break;
+        }
+        case "credits_clear": {
+          const principal = typeof params.principal === "string" ? params.principal.trim() : "";
+          if (!principal) return reject(-32602, "principal is required");
+          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          this.store.clearManualCredits(principal);
+          // See credits_set above: the common `ok` audit below covers this too.
+          result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
+          break;
+        }
         case "plan": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
           const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
           if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
+          if (params.target_points !== undefined && (typeof params.target_points !== "number" || !Number.isFinite(params.target_points) || params.target_points < 0)) return reject(-32602, "target_points must be a non-negative number", meter);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -667,6 +763,8 @@ export class HeadroomDaemon {
       // request, see callerFrom) does not identify which lease was touched.
       const auditSubject = request.method === "lease_start" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.meter_id === "string" ? params.meter_id : "?"}`
         : request.method === "lease_end" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.id === "string" ? params.id : "?"}`
+        : request.method === "heartbeat_beat" || request.method === "heartbeat_stop" ? (typeof params.owner === "string" ? params.owner : "?")
+        : request.method === "timer_set" || request.method === "timer_clear" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.name === "string" ? params.name : "?"}`
         : typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null;
       this.store.audit(caller, request.method, auditSubject, "ok");
       return finish(rpcResult(request.id, result));
@@ -688,6 +786,37 @@ export class HeadroomDaemon {
   private async poll(principal: string | undefined, forced: boolean): Promise<PollResult | { rate_limited: true }> {
     const key = principal ?? "all";
     const now = Date.now();
+    // Heartbeat lapse detection and due-timer firing are independent of any
+    // vendor poll -- an owner may register a heartbeat with zero accounts
+    // configured at all -- so they run here, at the top of every poll() call
+    // (itself reached on every scheduled tick and every capacity-checking
+    // RPC), throttled to at most once every 15s so a burst of RPCs from a
+    // busy orchestrator does not turn this into a hot loop. A dedicated
+    // notification pass follows immediately: the vendor-poll notify pass
+    // below only runs once the poller itself actually executes (see the
+    // early-return branches just below this), which a heartbeat_lapsed or
+    // timer_missed event must never have to wait on.
+    if (this.store.claimDaemonInterval("heartbeat_timer_check", new Date(now), 15_000)) {
+      // Never let a defect here (or an unexpected throw from store access)
+      // abort the vendor poll this call is about to make: this whole block
+      // is best-effort background bookkeeping, not something a caller
+      // waiting on capacity should ever fail behind.
+      try { this.store.checkHeartbeatLapses(new Date(now)); }
+      catch (error) { void appendDaemonLog(`heartbeat lapse check failed: ${safeError(error)}`, this.home); }
+      // Single-flight: a slow inbox write can outlast this 15s throttle, and
+      // starting a second pass while the first is still running would let
+      // both see the same due timer as a candidate. store.claimTimer's own
+      // per-timer atomicity already makes that safe (only one claim can
+      // succeed), but skipping the second pass entirely avoids the wasted
+      // work and duplicate log lines it would otherwise produce.
+      if (!this.timerFiringInFlight) {
+        this.timerFiringInFlight = fireDueTimers(this.store, this.home, new Date(now))
+          .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
+          .finally(() => { this.timerFiringInFlight = undefined; });
+      }
+      void deliverNotifications(this.store, { home: this.home })
+        .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
+    }
     const policy = await readPolicy(); // mtime/reload safe: no cached config survives a request or SIGHUP.
     // Settings can enable notifications without restarting the daemon. Take
     // the history boundary before this poll creates its first eligible event.
@@ -741,6 +870,13 @@ export class HeadroomDaemon {
       // never delay a poll, and the ledger inside carries its own retries.
       void deliverNotifications(this.store, { home: this.home })
         .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
+      // Model-catalog reads are throttled to at most once per hour per
+      // principal on their own (see MODEL_CHECK_INTERVAL_MS), independent of
+      // this poll's own interval, so piggybacking here adds no load to the
+      // ordinary quota poll cadence. Deliberately not awaited, same reason
+      // as the notification pass above.
+      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account)))
+        .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         if (disabled.has(principalId)) continue;
         this.antigravityLocal.set(principalId, read);
@@ -827,6 +963,15 @@ export class HeadroomDaemon {
       this.backoff.delete(name);
     }
     if (this.schedulingStarted) for (const account of accounts) if (isAccountEnabled(account) && (!prior.has(account.name) || !isAccountEnabled(priorAccounts.get(account.name)!))) void this.schedulePrincipal(account.name);
+    // A running keepalive with no enabled Antigravity account left to serve
+    // (the last one was disabled, or removed outright) must stop -- an
+    // `accounts.toml` edit that disables Antigravity while the daemon is
+    // already running must not leave its `agy` process running unsupervised.
+    if (this.keepalive?.running && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
+      const keepalive = this.keepalive;
+      this.keepalive = undefined;
+      void keepalive.stop().catch((error: unknown) => appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home));
+    }
     return this.accounts;
   }
 }
@@ -862,8 +1007,17 @@ async function hasListener(path: string, timeoutMs = 1000): Promise<boolean> {
 /**
  * Probe health separately from a potentially slow request. A live daemon may
  * need to poll before answering `status`; that must not look like no daemon.
+ *
+ * `healthAttempts` (default 1, unchanged for every existing caller) lets a
+ * read-only caller that can serve a clearly-flagged cached answer ask for one
+ * retry before giving up on the daemon: a poll cycle's own synchronous write
+ * (see store.ts's `insertPoll`) can occasionally still run past a single 2s
+ * health budget under host load, and a second attempt often lands once it has
+ * finished. A write/dispatch caller must keep passing the default: retrying
+ * here only ever delays discovering "unresponsive", it never changes a
+ * fail-closed answer into anything less strict.
  */
-export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000, signal?: AbortSignal): Promise<
+export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000, signal?: AbortSignal, healthAttempts = 1): Promise<
   | { status: "available"; result: unknown }
   | { status: "absent" }
   | { status: "unresponsive" }
@@ -873,7 +1027,11 @@ export async function daemonRequest(path: string, method: string, params: Json =
   // reply -- health included -- whose transcript proof does not check out
   // comes back as `undefined`, indistinguishable here from no daemon
   // answering at all. There is nothing left for daemonRequest to double-check.
-  const health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
+  let health: unknown;
+  for (let attempt = 0; attempt < Math.max(1, healthAttempts); attempt += 1) {
+    health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
+    if (health !== undefined || signal?.aborted) break;
+  }
   if (signal?.aborted) return { status: "absent" };
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
   const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
