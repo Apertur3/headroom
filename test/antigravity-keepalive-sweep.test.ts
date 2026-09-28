@@ -8,9 +8,28 @@ import { AgyKeepaliveSupervisor, InvalidKeepaliveEvidenceError, keepaliveStateFi
 import { killTree, processSignature } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
+const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, uptime: () => 60 * 60 };
+});
+vi.mock("../src/process-tree.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/process-tree.js")>();
+  return {
+    ...actual,
+    killProcessGroup: (pid: number, options?: { groupOnly?: boolean }) => {
+      groupKillCalls.push({ pid, options });
+      actual.killProcessGroup(pid, options);
+    },
+  };
+});
+
 const temporary: string[] = [];
 useProcessReaper();
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => {
+  groupKillCalls.splice(0);
+  await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
 async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
   const start = Date.now();
@@ -411,9 +430,15 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: recoverin
         // internally-consistent fixture like this one, the ps-free tier must
         // actually reap agy outright -- not merely tolerate leaving it
         // unverified, which would let a broken tier still pass this test.
+        groupKillCalls.splice(0);
         const result = await sweepPreviousKeepalive(root);
 
         expect(result.swept).toEqual([agyPid]);
+        // The state is ps-free: the original group leader can already have
+        // exited while descendants keep its group alive, so the fallback
+        // must never also signal a bare pid that could have been recycled.
+        expect(groupKillCalls).toContainEqual({ pid: agyPid, options: { groupOnly: true } });
+        expect(groupKillCalls.every((call) => call.options?.groupOnly === true)).toBe(true);
         // scriptPid itself is a SEPARATE candidate with no ps-free evidence
         // of its own (only agy's pid file exists) -- it is correctly, not
         // spuriously, `unverified` here; this is not the tier under test.
@@ -490,6 +515,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: ps-free i
       // candidate below), not about a scriptPid/agyPid match.
       scriptPid: strayPid + 100000, scriptCommand: "", scriptStartedAt: "",
       launchedAt, recordedAt: new Date().toISOString(), verified: false,
+      launchId: "11111111-1111-4111-8111-111111111111",
     }), { mode: 0o600 });
     const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
     await writeFile(pidFilePath, String(strayPid), { mode: 0o600 });
@@ -524,6 +550,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: ps-free i
     await writeFile(keepaliveStateFilePath(root), JSON.stringify({
       scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
       launchedAt: oldLaunchedAt, recordedAt: oldLaunchedAt, verified: false,
+      launchId: "22222222-2222-4222-8222-222222222222",
     }), { mode: 0o600 });
     const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
     await writeFile(pidFilePath, String(strangerPid), { mode: 0o600 });
@@ -551,6 +578,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: ps-free i
     await writeFile(keepaliveStateFilePath(root), JSON.stringify({
       scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
       launchedAt: futureLaunchedAt, recordedAt: futureLaunchedAt, verified: false,
+      launchId: "33333333-3333-4333-8333-333333333333",
     }), { mode: 0o600 });
     const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
     await writeFile(pidFilePath, String(strangerPid), { mode: 0o600 });
@@ -581,7 +609,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: a kill th
       }, { timeout: 3_000, interval: 20 });
       await writeFile(keepaliveStateFilePath(root), JSON.stringify({
         scriptPid: pid, scriptCommand: signature.command, scriptStartedAt: signature.startedAt,
-        recordedAt: new Date().toISOString(), verified: true,
+        recordedAt: new Date().toISOString(),
       }), { mode: 0o600 });
 
       const result = await sweepPreviousKeepalive(root, {
@@ -609,7 +637,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: a kill th
       }, { timeout: 3_000, interval: 20 });
       await writeFile(keepaliveStateFilePath(root), JSON.stringify({
         scriptPid: pid, scriptCommand: signature.command, scriptStartedAt: signature.startedAt,
-        recordedAt: new Date().toISOString(), verified: true,
+        recordedAt: new Date().toISOString(),
       }), { mode: 0o600 });
 
       // A killTree that "succeeds" without touching the process at all --
@@ -716,23 +744,35 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence 
     }
   });
 
-  it("rejects malformed metadata instead of normalizing it into a legacy record that can be cleared", async () => {
-    const base = {
+  it("rejects partial, impossible, or noncanonical current metadata instead of clearing it as legacy evidence", async () => {
+    const current: Record<string, unknown> = {
       scriptPid: 12345,
       scriptCommand: "",
       scriptStartedAt: "",
       recordedAt: new Date().toISOString(),
+      launchedAt: new Date().toISOString(),
       verified: false,
+      launchId: "44444444-4444-4444-8444-444444444444",
     };
-    const malformed: Record<string, unknown>[] = [
-      { recordedAt: 1 },
-      { verified: "false" },
-      { launchedAt: 1 },
-      { launchId: 1 },
+    const missingLaunchId = { ...current }; delete missingLaunchId.launchId;
+    const missingLaunchedAt = { ...current }; delete missingLaunchedAt.launchedAt;
+    const missingVerified = { ...current }; delete missingVerified.verified;
+    const malformed = [
+      { ...current, recordedAt: "not-a-timestamp" },
+      { ...current, launchedAt: "not-a-timestamp" },
+      { ...current, launchId: "not-a-uuid" },
+      { ...current, verified: true },
+      {
+        ...current, verified: true, scriptCommand: "/usr/bin/script", scriptStartedAt: "Mon Jan 1 00:00:00 2000",
+        agyPid: 12346, agyCommand: "", agyStartedAt: "",
+      },
+      missingLaunchId,
+      missingLaunchedAt,
+      missingVerified,
     ];
-    for (const fields of malformed) {
+    for (const state of malformed) {
       const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-malformed-metadata-")); temporary.push(root);
-      const raw = JSON.stringify({ ...base, ...fields });
+      const raw = JSON.stringify(state);
       const statePath = keepaliveStateFilePath(root);
       await writeFile(statePath, raw, { mode: 0o600 });
 
@@ -813,7 +853,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): ne
       await writeFile(keepaliveStateFilePath(root), JSON.stringify({
         scriptPid: newerAgyPid + 100000, scriptCommand: "", scriptStartedAt: "",
         launchedAt: new Date().toISOString(), recordedAt: new Date().toISOString(),
-        verified: false, launchId: "a-completely-different-launch-id",
+        verified: false, launchId: "55555555-5555-4555-8555-555555555555",
       }), { mode: 0o600 });
 
       await supervisorA.stop();
@@ -826,7 +866,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): ne
       // The substituted "newer launch"'s process is never touched, and its
       // evidence survives exactly as written.
       expect(alive(newerAgyPid)).toBe(true);
-      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toContain("a-completely-different-launch-id");
+      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toContain("55555555-5555-4555-8555-555555555555");
     } finally { await supervisorA.stop(); }
   }, 15_000);
 
@@ -1055,7 +1095,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: the unexp
       await writeFile(keepaliveStateFilePath(root), JSON.stringify({
         scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
         launchedAt: new Date().toISOString(), recordedAt: new Date().toISOString(),
-        verified: false, launchId: "a-completely-different-launch-id",
+        verified: false, launchId: "66666666-6666-4666-8666-666666666666",
       }), { mode: 0o600 });
       process.kill(scriptPid, "SIGKILL");
 

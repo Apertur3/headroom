@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
+const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
+
 /**
  * Isolated from antigravity-keepalive-sweep.test.ts on purpose: this file
  * mocks process-tree.js's isProcessGroupAlive to make it always report "still
@@ -18,12 +20,22 @@ import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-p
  */
 vi.mock("../src/process-tree.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/process-tree.js")>();
-  return { ...actual, isProcessGroupAlive: () => true };
+  return {
+    ...actual,
+    isProcessGroupAlive: () => true,
+    killProcessGroup: (pid: number, options?: { groupOnly?: boolean }) => {
+      groupKillCalls.push({ pid, options });
+      actual.killProcessGroup(pid, options);
+    },
+  };
 });
 
 const temporary: string[] = [];
 useProcessReaper();
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => {
+  groupKillCalls.splice(0);
+  await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
 
 async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
   const start = Date.now();
@@ -99,6 +111,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
       await new Promise((resolve) => setTimeout(resolve, 1_300));
 
       expect(spawnCount).toBe(1); // no restart while the kill remains unconfirmed
+      expect(groupKillCalls).toContainEqual({ pid: agyPid, options: { groupOnly: true } });
       // The evidence a kill was attempted at all is what a later sweep needs
       // -- and it survives, exactly because no restart ran ahead of it.
       await expect(readFile(`${keepaliveStateFilePath(root)}.agy-pid`, "utf8")).resolves.toBeTruthy();

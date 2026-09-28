@@ -201,6 +201,10 @@ export class HeadroomDaemon {
    * its state. maybeStartKeepalive() awaits this before ever constructing a
    * new supervisor, so the two can never be in flight at once. */
   private keepaliveStopPending: Promise<void> | undefined;
+  /** Serializes a complete keepalive reconciliation. Without this, two poll
+   * completions can both sweep: the slower one may find and kill the state a
+   * faster one has just launched. Waiters re-evaluate after this settles. */
+  private keepaliveReconcilePending: Promise<void> | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
   /** Guards against a second timer-firing pass starting while a slow one
@@ -285,25 +289,30 @@ export class HeadroomDaemon {
   // guarantee: a failed reload just defers this attempt and logs, exactly
   // like the narrower catch around executablePath()/start() already did.
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
-    try {
-      await this.attemptStartKeepalive(accounts, policy);
-    } catch (error) {
-      void appendDaemonLog(`antigravity keepalive: reload failed, deferring this attempt: ${safeError(error)}`, this.home);
+    const pending = this.keepaliveReconcilePending;
+    if (pending) {
+      await pending;
+      return this.maybeStartKeepalive(accounts, policy);
+    }
+    const reconcile = this.attemptStartKeepalive(accounts, policy)
+      .catch((error) => { void appendDaemonLog(`antigravity keepalive: reload failed, deferring this attempt: ${safeError(error)}`, this.home); });
+    this.keepaliveReconcilePending = reconcile;
+    try { await reconcile; }
+    finally {
+      if (this.keepaliveReconcilePending === reconcile) this.keepaliveReconcilePending = undefined;
     }
   }
 
   private async attemptStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
-    // A running supervisor must not just short-circuit on `.running` below
-    // without first re-checking whether policy (or the accounts it serves)
-    // still justifies it existing at all -- and a non-running supervisor
-    // with a pending restart (this.restart set, or mid-reap) must not
+    // An existing supervisor must be re-checked to ensure policy and the
+    // accounts it serves still justify it. A non-running supervisor with a
+    // pending restart (this.restart set, or mid-reap) must not
     // survive `antigravity_keepalive = false` either by silently falling
     // through to the freshPolicy return further down, which only ever
     // declines to launch a NEW one and never stops an EXISTING one. Both
     // route through the exact same serialized stop path (stopKeepaliveUnless
     // / keepaliveStopPending) an accounts.toml-driven disable already uses,
-    // checked here -- before either the `.running` short-circuit or any of
-    // this function's own launch logic gets a chance to run.
+    // checked here -- before any launch logic gets a chance to run.
     if (this.keepalive) {
       const gateAccounts = await this.currentAccounts();
       const gatePolicy = await readPolicy();
@@ -311,8 +320,11 @@ export class HeadroomDaemon {
         && gateAccounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
       this.stopKeepaliveUnless(stillJustified, "policy or account disable");
       if (!stillJustified) return;
+      // An existing supervisor owns its own delayed restart and orphan-reap
+      // lifecycle. In particular, its pid-file discovery may still be
+      // pending; a daemon sweep must not clear that evidence underneath it.
+      return;
     }
-    if (this.keepalive?.running) return;
     // Never construct a new supervisor while an old one's stop() might still
     // be reading or writing the same shared home/state-file paths -- see
     // keepaliveStopPending's own doc comment.

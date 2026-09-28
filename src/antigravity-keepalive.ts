@@ -136,6 +136,19 @@ function isPlausiblePid(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 1 && value <= MAX_PID;
 }
 
+/** The state writer uses Date#toISOString(), but accept any complete,
+ * timezone-qualified ISO 8601 instant that Date can parse. Never let a
+ * locale-dependent Date.parse() success turn arbitrary text into evidence. */
+const ISO_8601_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+function isIso8601Instant(value: unknown): value is string {
+  return typeof value === "string" && ISO_8601_INSTANT.test(value) && Number.isFinite(Date.parse(value));
+}
+
+/** launchId comes from randomUUID(); accept only a canonical RFC UUID, not
+ * an arbitrary string that could make unrelated evidence look owned. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function isUuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
+
 /** Strict canonical-decimal-integer parse of a pid FILE's raw text content
  * (never used for a JSON state field, which is already a native, unambiguous
  * JS number once parsed): only plain digits, plus the one trailing newline
@@ -156,12 +169,14 @@ function parseCanonicalPid(raw: string): number | undefined {
 }
 
 /** Never trusts the file blindly: rejects a symlink, a non-regular file, or
- * a shape that doesn't match what writeKeepaliveStateSync() itself ever
- * writes -- by throwing InvalidKeepaliveEvidenceError, not by silently
- * reporting "nothing here" the way ENOENT does. A partial agy* tuple (some
- * but not all of agyPid/agyCommand/agyStartedAt present) is corruption, not
- * "no agy info recorded yet" (which has none of the three) -- it is
- * rejected the same way, rather than silently dropped. */
+ * a shape that doesn't match a state this module wrote -- by throwing
+ * InvalidKeepaliveEvidenceError, not by silently reporting "nothing here"
+ * the way ENOENT does. A state is either legacy (none of launchId,
+ * launchedAt, or verified) or current (all three, with a UUID, ISO instant,
+ * and boolean respectively). A partial agy* tuple (some but not all of
+ * agyPid/agyCommand/agyStartedAt present) is corruption, not "no agy info
+ * recorded yet" (which has none of the three) -- it is rejected the same
+ * way, rather than silently dropped. */
 async function readKeepaliveState(path: string): Promise<KeepaliveState | undefined> {
   let info;
   try { info = await lstat(path); }
@@ -185,15 +200,17 @@ async function readKeepaliveState(path: string): Promise<KeepaliveState | undefi
   }
   const has = (field: keyof KeepaliveState): boolean => Object.hasOwn(parsed, field);
   // recordedAt has been written by every version that wrote this state file.
-  // The remaining fields were added later, so their absence is legacy, but a
-  // present field with the wrong type is corrupt evidence -- never a value to
-  // coerce into a harmless-looking legacy default.
-  if (
-    typeof parsed.recordedAt !== "string"
-    || (has("verified") && typeof parsed.verified !== "boolean")
-    || (has("launchedAt") && typeof parsed.launchedAt !== "string")
-    || (has("launchId") && typeof parsed.launchId !== "string")
-  ) throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
+  // The three launch fields were added together, so accepting only one or two
+  // as a harmless legacy record would make malformed evidence clearable.
+  if (!isIso8601Instant(parsed.recordedAt)) throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
+  const hasLaunchId = has("launchId");
+  const hasLaunchedAt = has("launchedAt");
+  const hasVerified = has("verified");
+  if (hasLaunchId || hasLaunchedAt || hasVerified) {
+    if (!hasLaunchId || !hasLaunchedAt || !hasVerified || !isUuid(parsed.launchId) || !isIso8601Instant(parsed.launchedAt) || typeof parsed.verified !== "boolean") {
+      throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
+    }
+  }
   const state: KeepaliveState = {
     scriptPid: parsed.scriptPid, scriptCommand: parsed.scriptCommand, scriptStartedAt: parsed.scriptStartedAt,
     recordedAt: parsed.recordedAt,
@@ -207,6 +224,12 @@ async function readKeepaliveState(path: string): Promise<KeepaliveState | undefi
       throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has an incomplete or invalid agy pid/command/start-time tuple`);
     }
     state.agyPid = parsed.agyPid; state.agyCommand = parsed.agyCommand; state.agyStartedAt = parsed.agyStartedAt;
+  }
+  // A verified record means ps supplied signatures, not merely fields of the
+  // right type. Empty strings would otherwise suppress signature matching and
+  // let malformed current evidence fall through to clearing logic.
+  if (state.verified && (!state.scriptCommand.trim() || !state.scriptStartedAt.trim() || (agyFieldsPresent && (!state.agyCommand?.trim() || !state.agyStartedAt?.trim())))) {
+    throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has empty verified process signatures`);
   }
   return state;
 }
@@ -447,7 +470,7 @@ export async function sweepPreviousKeepalive(home: string, options: { execImpl?:
       // has no access to -- SIGKILL directly instead, the same ps-free
       // primitive stop() and the exit handler already rely on for this
       // situation.
-      else killProcessGroup(pid);
+      else killProcessGroup(pid, { groupOnly: true });
     } catch {
       // Signalling itself failed (e.g. EPERM): the pid was never actually
       // touched. Treat exactly like an unverifiable pid -- reported, not
@@ -834,7 +857,7 @@ export class AgyKeepaliveSupervisor {
     const owns = (!this.stateFilePath || this.currentLaunchId === undefined) ? true : await this.ownsCurrentEvidence();
     if (this.stopping) { this.reaping = false; return; }
     if (owns && result.kind === "found") {
-      killProcessGroup(result.pid);
+      killProcessGroup(result.pid, { groupOnly: true });
       const confirmed = await waitUntilGroupGone(result.pid);
       if (this.stopping) { this.reaping = false; return; }
       if (confirmed) { this.reaping = false; this.scheduleRestart(); return; }

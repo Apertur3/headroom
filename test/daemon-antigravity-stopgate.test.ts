@@ -58,6 +58,81 @@ const accountsToml = (enabled: boolean, agyPath: string): string => [
 ].join("\n");
 
 describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepalive() waits for a real stop() held open by a gated confirmation check", () => {
+  it("leaves a justified non-running supervisor to finish its own reap/restart lifecycle", async () => {
+    const { HeadroomDaemon } = await import("../src/daemon.js");
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-existing-reap-")); temporary.push(root);
+    await writeFile(join(root, "accounts.toml"), accountsToml(true, "/not-used"), { mode: 0o600 });
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const reapingSupervisor = { running: false, start: vi.fn(), stop: vi.fn(async () => undefined) };
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async () => ({ observations: [], failures: [] }), keepalive: reapingSupervisor as never });
+    try {
+      const internal = daemon as unknown as {
+        maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
+        sweepStaleKeepalive(): Promise<void>;
+      };
+      const sweep = vi.fn(async () => undefined);
+      internal.sweepStaleKeepalive = sweep;
+
+      await internal.maybeStartKeepalive([], {});
+
+      expect(sweep).not.toHaveBeenCalled();
+      expect(reapingSupervisor.start).not.toHaveBeenCalled();
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  });
+
+  it("serializes concurrent reconciliation before either caller can sweep a newly started supervisor", async () => {
+    const { HeadroomDaemon } = await import("../src/daemon.js");
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-singleflight-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
+    let releaseSweep: (() => void) | undefined;
+    const heldSweep = new Promise<void>((resolve) => { releaseSweep = resolve; });
+    const attempts: Promise<void>[] = [];
+    try {
+      gate.open = false;
+      const internal = daemon as unknown as {
+        keepalive: { running: boolean; pid?: number } | undefined;
+        sweepStaleKeepalive(): Promise<void>;
+        maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
+      };
+      const realSweep = internal.sweepStaleKeepalive.bind(daemon);
+      let sweepCalls = 0;
+      internal.sweepStaleKeepalive = async () => {
+        sweepCalls += 1;
+        if (sweepCalls === 1) await heldSweep;
+        await realSweep();
+      };
+
+      attempts.push(internal.maybeStartKeepalive([], {}));
+      expect(sweepCalls).toBe(1);
+      attempts.push(internal.maybeStartKeepalive([], {}));
+      expect(sweepCalls).toBe(1);
+
+      releaseSweep?.();
+      await Promise.all(attempts);
+      await vi.waitFor(() => { expect(internal.keepalive?.running).toBe(true); }, { timeout: 3_000, interval: 20 });
+      track(internal.keepalive?.pid, root);
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      expect(alive(agyPid)).toBe(true);
+    } finally {
+      releaseSweep?.();
+      await Promise.allSettled(attempts);
+      track((daemon as unknown as { keepalive: { pid?: number } | undefined }).keepalive?.pid, root);
+      const maybeAgyPid = Number(await readFile(infoFile, "utf8").catch(() => "0"));
+      if (maybeAgyPid) track(maybeAgyPid, root);
+      await daemon.stop();
+      gate.open = false;
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
+
   it("blocks while the gate is open, and proceeds (to a genuinely new supervisor) only once it is released", async () => {
     const { HeadroomDaemon } = await import("../src/daemon.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-gatedstop-")); temporary.push(root);
