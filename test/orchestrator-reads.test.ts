@@ -131,6 +131,18 @@ describe("gateFor: plain reserve and plan-line checks", () => {
     } finally { store.close(); }
   });
 
+  it("with --plan, refuses as unknown when the weekly window the plan line reads is stale", async () => {
+    const store = await open();
+    try {
+      const now = new Date("2026-09-03T12:00:00Z");
+      store.insert(fiveHour(0, "2026-09-03T12:00:00Z", "2026-09-03T15:00:00Z"));
+      store.insert(weekly(5, "2026-08-31T12:00:00Z", "2026-09-07T12:00:00Z"));
+      expect(gateFor(store, [{ window: "5h", points: 1 }], "claude-main:all", 10, true, now)).toMatchObject({ allowed: false, unknown: true, reason: expect.stringContaining("read by the plan line") });
+      store.insert(weekly(5, "2026-09-03T12:00:00Z", "2026-09-07T12:00:00Z"));
+      expect(gateFor(store, [{ window: "5h", points: 1 }], "claude-main:all", 10, true, now)).toMatchObject({ allowed: true });
+    } finally { store.close(); }
+  });
+
   it("counts another owner's active reservation before allowing a gate", async () => {
     const store = await open();
     try {

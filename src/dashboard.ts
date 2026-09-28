@@ -2,7 +2,7 @@ import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
 import { DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS, dashboardSnapshot, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
-import { readAccounts } from "./registry.js";
+import { readAccountsOrEmpty } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
@@ -11,7 +11,7 @@ import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
-import { isAccountEnabled, isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type Account, type HeadroomEvent, type Observation } from "./types.js";
 
 export interface DashboardModel extends CachedDashboardModel {
   history?: Record<string, Observation[]>;
@@ -46,9 +46,10 @@ export function readDashboardGraphs(store: HeadroomStore, rows: Observation[], n
   };
 }
 
-/** A store can retain retired principals; the dashboard only shows the registry. */
+/** A store can retain retired principals; the dashboard only shows the
+ * registry. An empty set shows no principal: callers pass the store through
+ * unfiltered only when there is no registry at all. */
 export function filterDashboardPrincipals(snapshot: DashboardSnapshot, principals: Set<string>): DashboardSnapshot {
-  if (!principals.size) return snapshot;
   const observations = snapshot.observations.filter((row) => principals.has(row.principal_id));
   return {
     ...snapshot,
@@ -58,27 +59,48 @@ export function filterDashboardPrincipals(snapshot: DashboardSnapshot, principal
   };
 }
 
+export interface DashboardRegistry { accounts: Account[]; error?: string }
+
+/** The registry the dashboard filters by. A missing accounts.toml is an
+ * empty registry; any other read failure is kept as an error, because which
+ * principals are disabled cannot be known then. */
+export async function readDashboardRegistry(): Promise<DashboardRegistry> {
+  try { return { accounts: await readAccountsOrEmpty() }; }
+  catch (error: unknown) { return { accounts: [], error: safeError(error) }; }
+}
+
+/** Shows only enabled principals, including none when every account is
+ * disabled, and none at all when the registry cannot be read. The store is
+ * shown as is only when there is no registry yet. */
+export function applyDashboardRegistry(snapshot: DashboardSnapshot, registry: DashboardRegistry): DashboardSnapshot {
+  if (registry.error) {
+    const hidden = filterDashboardPrincipals(snapshot, new Set());
+    return { ...hidden, notices: [...hidden.notices, `accounts.toml could not be read (${registry.error}); no principal is shown until it is fixed`] };
+  }
+  if (!registry.accounts.length) return snapshot;
+  const disabled = registry.accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+  const filtered = filterDashboardPrincipals(snapshot, new Set(registry.accounts.filter(isAccountEnabled).map((account) => account.name)));
+  return disabled.length ? { ...filtered, notices: [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] } : filtered;
+}
+
 export async function gatherDashboard(): Promise<DashboardModel> {
   const { daemonRequest, socketPath } = await import("./daemon.js");
   // The daemon binds its socket below the canonicalized safe home. Using the
   // same path here matters when HEADROOM_HOME itself is a filesystem alias.
   const home = await safeHeadroomDirectory();
-  const [reply, policy, accounts, version] = await Promise.all([
+  const [reply, policy, registry, version] = await Promise.all([
     // The probe needs to be quick, while the snapshot gets the full
     // interactive budget for a brief SQLite handoff.
     daemonRequest(socketPath(home), "dashboard", {}, DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS).catch(() => undefined),
-    readPolicy(), readAccounts().catch(() => []), headroomVersion(),
+    readPolicy(), readDashboardRegistry(), headroomVersion(),
   ]);
   const store = await HeadroomStore.open(home);
   try {
     const now = new Date();
     const { snapshot, direct } = await dashboardRead({ request: async () => reply, fallback: async () => readDashboardStore(store, now, undefined, policy) });
-    const disabled = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
-    const filtered = filterDashboardPrincipals(snapshot, new Set(accounts.filter(isAccountEnabled).map((account) => account.name)));
-    const observations = filtered.observations;
-    const notices = disabled.length ? [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] : filtered.notices;
-    return { ...filtered, ...readDashboardGraphs(store, observations, now), notices, direct, policy, version, now,
-      vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
+    const filtered = applyDashboardRegistry(snapshot, registry);
+    return { ...filtered, ...readDashboardGraphs(store, filtered.observations, now), direct, policy, version, now,
+      vendors: new Map(registry.accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
   } finally { store.close(); }
 }
 

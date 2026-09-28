@@ -1,9 +1,10 @@
 import { readPolicy } from "./config.js";
 import { withStatusInfo } from "./pace.js";
-import { readAccounts } from "./registry.js";
+import { readAccountsOrEmpty } from "./registry.js";
+import { safeError } from "./security.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import type { PlanDowngrade } from "./store.js";
-import { isAccountEnabled, isLocalAccount, type HeadroomEvent, type Lease, type Observation } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type Account, type HeadroomEvent, type Lease, type Observation } from "./types.js";
 import { defaultPolicy, type Policy } from "./policy.js";
 import { headroomVersion } from "./version.js";
 
@@ -98,7 +99,7 @@ export async function gatherDashboard(home?: string, timeouts: DashboardRequestT
   const { daemonRequest, socketPath } = await import("./daemon.js");
   const directory = await safeHeadroomDirectory(home);
   const policyPromise = readPolicy();
-  const [{ snapshot, direct }, policy, accounts, version] = await Promise.all([
+  const [{ snapshot, direct }, policy, registry, version] = await Promise.all([
     dashboardSnapshot({
       request: () => daemonRequest(socketPath(directory), "dashboard", {}, timeouts.healthTimeoutMs ?? DASHBOARD_HEALTH_TIMEOUT_MS, timeouts.requestTimeoutMs ?? DASHBOARD_REQUEST_TIMEOUT_MS),
       fallback: async () => {
@@ -111,16 +112,25 @@ export async function gatherDashboard(home?: string, timeouts: DashboardRequestT
         } finally { store.close(); }
       },
     }),
-    policyPromise, readAccounts().catch(() => []), headroomVersion(),
+    // A missing accounts.toml is an empty registry; any other read failure
+    // hides every principal, since which ones are disabled cannot be known.
+    policyPromise, readAccountsOrEmpty().then((accounts): { accounts: Account[]; error?: string } => ({ accounts }), (error: unknown) => ({ accounts: [], error: safeError(error) })), headroomVersion(),
   ]);
+  const accounts = registry.accounts;
   const disabled = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
   const enabled = new Set(accounts.filter(isAccountEnabled).map((account) => account.name));
-  const filtered = accounts.length ? {
+  // Filtered whenever a registry exists, even one whose accounts are all
+  // disabled; the store is shown as is only when there is no registry yet.
+  const filtered = accounts.length || registry.error ? {
     ...snapshot,
     observations: snapshot.observations.filter((row) => enabled.has(row.principal_id)),
     events: snapshot.events.filter((event) => !event.principal_id || enabled.has(event.principal_id)),
     leases: snapshot.leases.filter((lease) => enabled.has(lease.meter_id.split(":", 1)[0])),
   } : snapshot;
-  const notices = disabled.length ? [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] : filtered.notices;
+  const notices = [
+    ...filtered.notices,
+    ...(registry.error ? [`accounts.toml could not be read (${registry.error}); no principal is shown until it is fixed`] : []),
+    ...(disabled.length ? [`disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] : []),
+  ];
   return { ...filtered, notices, direct, policy, version, now: new Date(), vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
 }

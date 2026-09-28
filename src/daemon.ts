@@ -726,7 +726,7 @@ export class HeadroomDaemon {
           if (provedThisCall) { authenticated = true; if (handshakeTimer) { clearTimeout(handshakeTimer); handshakeTimer = undefined; } }
           safeWrite(`${replyLine}\n`);
           if (proofLine) safeWrite(`${proofLine}\n`);
-        });
+        }).catch(() => { socket.destroy(); }); // no reply can be built; the client sees a closed connection, never a dead daemon
       }
     });
   }
@@ -1139,10 +1139,15 @@ export class HeadroomDaemon {
       // health remains available during shutdown so callers can distinguish
       // a draining daemon from a dead socket; its informational audit must
       // not turn that otherwise store-free reply into a closed-store access.
-      if (this.canUseStore()) this.store.audit(caller, request.method, auditSubject, "ok");
+      // Best-effort, like the error path's: a read that succeeded is still
+      // answered when the audit row cannot be written (a full disk), and a
+      // mutation on such a disk has already failed on its own write.
+      try { if (this.canUseStore()) this.store.audit(caller, request.method, auditSubject, "ok"); } catch { /* answer regardless */ }
       return finish(rpcResult(request.id, result));
     } catch (error) {
-      if (this.canUseStore()) this.store.audit(caller, request.method, null, "error");
+      // A store that cannot write (a full or read-only disk) must not turn
+      // the error reply itself into a rejection.
+      try { if (this.canUseStore()) this.store.audit(caller, request.method, null, "error"); } catch { /* reply regardless */ }
       const message = this.stopping || !this.storeOpen ? "Headroom daemon is stopping" : safeError(error);
       // The client only ever sees the JSON-RPC error's message; without a
       // matching daemon-log line, a genuine handler exception (as opposed to

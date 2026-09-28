@@ -148,6 +148,16 @@ All notable changes to this project are documented here. The format follows
 - A malformed `accounts.toml` or `policy.toml` (for example an invalid `pacing` value) no longer
   ends a running daemon. Poll scheduling re-reads both files from detached calls and rejected when
   either failed to parse; it now logs the error and retries every 60 seconds until the file is fixed.
+- A full or read-only disk no longer ends the daemon. Writing the daemon log and a request's audit
+  row are now best-effort: a request is still answered when its audit row cannot be written, and a
+  lost log line is dropped instead of surfacing as an unhandled rejection.
+- `gate --plan` now applies the freshness gate to the weekly window the plan line reads, not only to
+  the windows a request names. A stale, failed or held weekly reading refuses as unknown instead of
+  loosening the plan line from outdated usage.
+- The dashboard (terminal and cached report) never shows a disabled principal: a registry whose
+  accounts are all disabled shows none, and an unreadable `accounts.toml` shows none with a notice,
+  since which principals are disabled cannot be known. Previously both cases showed every principal
+  the store retained.
 - A daemon poll cycle's own synchronous SQLite writes could occasionally stall a concurrent `health`
   reply well past its 2s budget under host load (reproduced: back-to-back `headroom status --json`
   calls, one out of twelve taking 5.1s, lining up with a poll cycle). Root cause: `insert()` prepares
