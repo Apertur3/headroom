@@ -29,6 +29,24 @@ function rollBackHeartbeatsSchema(root: string): void {
   } finally { db.close(); }
 }
 
+/** Rolls a fully-migrated database file back to exactly schema
+ * HEARTBEATS_SCHEMA_VERSION (4): the `timers` table exists (with a real
+ * pending row already in it, unlike rollBackHeartbeatsSchema's "table
+ * doesn't exist at all" case above), but not yet the `attempts`/
+ * `failed_at`/`claimed_at`/`claim_token` columns later migrations add. This
+ * is the "rolling upgrade" shape store.ts's `timers()` must keep reading
+ * correctly -- a schema-4 database has real pending timers on disk that a
+ * naive `>= TIMER_DELIVERY_SCHEMA_VERSION ? full-query : []` gate would hide
+ * entirely, even though `fired_at`/`cleared_at` (the only completion
+ * markers this shape has) are enough to answer "is this one pending". */
+function rollBackToSchema4(root: string): void {
+  const db = new RawDatabase(join(root, "headroom.db"));
+  try {
+    db.exec("ALTER TABLE timers DROP COLUMN attempts; ALTER TABLE timers DROP COLUMN failed_at; ALTER TABLE timers DROP COLUMN claimed_at; ALTER TABLE timers DROP COLUMN claim_token;");
+    db.exec(`PRAGMA user_version = ${HEARTBEATS_SCHEMA_VERSION}`);
+  } finally { db.close(); }
+}
+
 /**
  * Part 2 (read-only cached fallback) and part 3 (never empty stdout on a
  * failed --json read) of the cached-reads work, exercised against a REAL,
@@ -170,6 +188,40 @@ describe("cached read-only fallback against a genuinely unresponsive daemon", ()
       expect(payload.daemon).toBe("unresponsive");
       expect(payload.heartbeats).toEqual([]);
       expect(payload.due_timers).toEqual([]);
+    } finally {
+      logSpy.mockRestore(); errSpy.mockRestore();
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+      fake.stop();
+    }
+  }, 20_000);
+
+  // P2 fix: `timers()` used to gate on the FULL current schema
+  // (TIMER_DELIVERY_SCHEMA_VERSION) even though its query only actually
+  // needs `fired_at`/`cleared_at` to answer "is this one pending" on an
+  // older shape -- a "rolling upgrade" database sitting on exactly schema 4
+  // (the table exists, with a real pending timer in it, but not yet
+  // `attempts`/`failed_at`) read as "no timers" entirely, hiding a genuinely
+  // due one from status/timer list.
+  it.skipIf(process.platform === "win32")("`status --json` still lists a real pending timer on a database sitting on exactly schema 4", async () => {
+    const root = await tempRoot("cache-status-schema4");
+    const seeded = await HeadroomStore.open(root);
+    const at = new Date(Date.now() - 60_000); // already due
+    seeded.setTimer("orch-schema4", "wake", at.toISOString(), "check the deploy", "notify", new Date(Date.now() - 120_000));
+    seeded.close();
+    rollBackToSchema4(root);
+    const fake = await startFakeUnresponsiveDaemon(root, 5_000);
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const code = await runCli(["--json"]);
+      expect(code).toBe(0);
+      const printed = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+      const payload = JSON.parse(printed) as { due_timers: Array<{ owner: string; name: string; attempts: number; failed_at: string | null }> };
+      expect(payload.due_timers).toHaveLength(1);
+      // attempts/failed_at synthesized (the columns do not exist on this schema).
+      expect(payload.due_timers[0]).toMatchObject({ owner: "orch-schema4", name: "wake", attempts: 0, failed_at: null });
     } finally {
       logSpy.mockRestore(); errSpy.mockRestore();
       if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;

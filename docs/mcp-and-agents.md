@@ -288,10 +288,16 @@ one-shot beat other than `headroom heartbeat --owner <name> --every <duration>` 
 }
 ```
 
-The daemon checks every registered heartbeat on each poll; one gone overdue by more than 2x its
-own interval gets one `heartbeat_lapsed` notification (never repeated for the same open lapse),
-delivered the same way every other event is -- see `docs/notifications.md`. A later beat closes
-the lapse and may send one short `heartbeat_restored`. Named wake-ups (`headroom timer`) have no
+A daemon-owned maintenance pass checks every registered heartbeat and fires every due timer on its
+own schedule -- independent of any vendor poll, rescheduling itself around the next real deadline
+roughly every one to sixty seconds -- so neither depends on an account ever being polled. One
+heartbeat gone overdue by more than 2x its own interval gets one `heartbeat_lapsed` notification
+(never repeated for the same open lapse), delivered the same way every other event is -- see
+`docs/notifications.md`. A later beat closes the lapse and may send one short `heartbeat_restored`.
+A timer's delivery claim is crash-safe (a daemon restart reclaims and retries a timer it was mid-
+delivering, itself idempotent by timer identity so a retry is never sent twice) and bounded (a
+timer whose delivery keeps failing for any other reason is retried a limited number of times, then
+marked permanently failed rather than retried forever). Named wake-ups (`headroom timer`) have no
 MCP tool of their own; they are CLI-only.
 
 ## Pacing and routing tools

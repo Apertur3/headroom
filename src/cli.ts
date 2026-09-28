@@ -544,9 +544,12 @@ async function heartbeat(argv: string[]): Promise<number> {
   const params = { owner, interval_ms: intervalMs, resume_sentence: resumeSentence };
   const request = await requestDaemon("heartbeat_beat", params);
   if (request !== undefined) { const item = unwrapRpc(request) as Heartbeat; console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; }
-  undeliveredWithoutDaemonWarning("heartbeat");
   const store = await HeadroomStore.open();
-  try { const item = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); store.audit("cli", "heartbeat_beat", owner, "ok"); console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; } finally { store.close(); }
+  // The warning fires only once the write itself has actually succeeded
+  // (after heartbeatBeat, not before it): printing it up front would claim
+  // "this is stored" even for a call heartbeatBeat's own validation goes on
+  // to reject (a blank owner, a non-positive interval).
+  try { const item = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); store.audit("cli", "heartbeat_beat", owner, "ok"); undeliveredWithoutDaemonWarning("heartbeat"); console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; } finally { store.close(); }
 }
 
 const TIMER_HELP = [
@@ -582,9 +585,12 @@ async function timer(argv: string[]): Promise<number> {
     const params = { owner, name, at, action, if_missed: ifMissed };
     const request = await requestDaemon("timer_set", params);
     if (request !== undefined) { const item = unwrapRpc(request) as Timer; console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; }
-    undeliveredWithoutDaemonWarning("timer");
     const store = await HeadroomStore.open();
-    try { const item = store.setTimer(owner, name, at, action, ifMissed, new Date()); store.audit("cli", "timer_set", `${owner}:${name}`, "ok"); console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; } finally { store.close(); }
+    // The warning fires only once the write itself has actually succeeded
+    // (after setTimer, not before it): printing it up front would claim
+    // "this is stored" even for a call setTimer's own validation goes on to
+    // reject (an invalid owner, an oversized action).
+    try { const item = store.setTimer(owner, name, at, action, ifMissed, new Date()); store.audit("cli", "timer_set", `${owner}:${name}`, "ok"); undeliveredWithoutDaemonWarning("timer"); console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; } finally { store.close(); }
   }
   if (argv[0] === "clear") {
     const owner = option(argv, "--owner");

@@ -39,6 +39,25 @@ export const UNSCHEDULED_RESET_HOURS = 24;
  * delivered, without turning a permanent one into an unbounded retry loop. */
 export const MAX_TIMER_DELIVERY_ATTEMPTS = 5;
 
+/** How long a timer's delivery claim (`claimTimer`'s `claimed_at`) is
+ * honored before `dueTimers()`/`claimTimer()` treat it as abandoned and
+ * offer the row up for another attempt. Covers a delivery that hangs
+ * without crashing the process outright (a stuck filesystem call); a crash
+ * or restart is instead recovered immediately and unconditionally by
+ * `reclaimStaleTimerClaims()` on daemon start, which does not wait out this
+ * window at all. Generous relative to a local filesystem write (which
+ * normally resolves in well under a second) while still being short enough
+ * that a genuine hang self-heals within one polling cycle. */
+export const TIMER_CLAIM_STALE_MS = 2 * 60_000;
+
+/** What `claimTimer()` hands back: a `Timer` plus the one-time token proving
+ * this exact claim, which `confirmTimerDelivered`/`releaseTimerClaim` both
+ * require to act on it. Deliberately not part of the public `Timer` shape
+ * (never returned by `timers()`/`dueTimers()`'s own JSON-facing reads) --
+ * `claimed_at`/`claim_token` are an internal delivery-in-progress detail,
+ * not something a `timer list` consumer needs. */
+export interface ClaimedTimer extends Timer { claim_token: string }
+
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
  * than ordinary noise: a drop to zero, or a fall past half of what it was.
  * classifyUsageDrop uses this to recognize a reset from raw usage alone
@@ -58,7 +77,7 @@ function redactDeep(value: unknown): unknown {
 
 interface Database {
   exec(sql: string): void;
-  prepare(sql: string): { run(...params: unknown[]): { lastInsertRowid: number | bigint }; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] };
+  prepare(sql: string): { run(...params: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint }; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] };
   close(): void;
 }
 type DatabaseConstructor = new (path: string, options?: { readOnly?: boolean }) => Database;
@@ -1904,13 +1923,20 @@ export class HeadroomStore {
 
   /** Atomically reserves an interval before a caller starts asynchronous
    * work. Keeping the reservation after a failed read prevents overlapping
-   * polls (or separate CLI processes) from repeatedly retrying a bad source. */
+   * polls (or separate CLI processes) from repeatedly retrying a bad source.
+   * A backwards wall-clock step (an NTP correction, a manual clock change)
+   * makes `now - previousAt` negative rather than merely small -- treated as
+   * an already-expired interval (the stored timestamp can no longer be
+   * trusted as recent), not as "not due until the clock catches back up to
+   * the old future-dated claim", which would otherwise suppress the next
+   * poll or maintenance pass for as long as the clock had jumped back. */
   claimDaemonInterval(key: string, now: Date, intervalMs: number): boolean {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const previous = this.daemonState(key);
       const previousAt = previous ? Date.parse(previous) : Number.NaN;
-      if (Number.isFinite(previousAt) && now.getTime() - previousAt < intervalMs) {
+      const elapsedMs = now.getTime() - previousAt;
+      if (Number.isFinite(previousAt) && elapsedMs >= 0 && elapsedMs < intervalMs) {
         this.db.exec("COMMIT");
         return false;
       }
@@ -2169,15 +2195,6 @@ export class HeadroomStore {
     return this.schemaVersion() >= HEARTBEATS_SCHEMA_VERSION;
   }
 
-  /** True once this connection's own schema also has `timers.attempts`/
-   * `timers.failed_at` (see TIMER_DELIVERY_SCHEMA_VERSION's own doc comment
-   * in migrations.ts) -- `timers()` below queries `failed_at`, so it needs
-   * this stricter check, not just hasHeartbeatSchema()'s table-existence
-   * one. */
-  private hasTimerDeliverySchema(): boolean {
-    return this.schemaVersion() >= TIMER_DELIVERY_SCHEMA_VERSION;
-  }
-
   private addHeartbeatEvent(kind: Extract<EventKind, "heartbeat_lapsed" | "heartbeat_restored">, heartbeat: Heartbeat, at: string): void {
     const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: heartbeat.owner, interval_ms: heartbeat.interval_ms, last_beat_at: heartbeat.last_beat_at, ...(kind === "heartbeat_lapsed" ? { resume_sentence: heartbeat.resume_sentence } : {}) };
     // Deterministic on (kind, owner, the beat instant the lapse/restore is
@@ -2306,76 +2323,141 @@ export class HeadroomStore {
   }
 
   /** Pending timers (never fired, never cleared, never given up on) for one
-   * owner, or every owner's when omitted, soonest due first. Reads as empty
-   * on a database older than TIMER_DELIVERY_SCHEMA_VERSION (see
-   * hasTimerDeliverySchema()) rather than throwing "no such table" or "no
-   * such column". */
+   * owner, or every owner's when omitted, soonest due first. Below
+   * HEARTBEATS_SCHEMA_VERSION (the `timers` table does not exist at all)
+   * this reads as empty rather than throwing "no such table". Between that
+   * and TIMER_DELIVERY_SCHEMA_VERSION (the table exists but not yet its
+   * `failed_at` column) the `failed_at IS NULL` term is dropped from the
+   * query instead of throwing "no such column": every pending row on that
+   * older shape is genuinely pending, since a database that old can never
+   * have given up on one in the first place. `timerFromRow` already
+   * synthesizes `attempts: 0, failed_at: null` for a row missing those
+   * columns. This never needs to reason about a delivery claim
+   * (`claimed_at`/`claim_token`, see claimTimer()'s own doc comment): a
+   * timer currently mid-delivery still belongs in this list exactly like
+   * any other not-yet-fired one. */
   timers(owner?: string): Timer[] {
-    if (!this.hasTimerDeliverySchema()) return [];
-    const filter = owner ? "WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL" : "WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL";
+    const version = this.schemaVersion();
+    if (version < HEARTBEATS_SCHEMA_VERSION) return [];
+    const excludeFailed = version >= TIMER_DELIVERY_SCHEMA_VERSION ? " AND failed_at IS NULL" : "";
+    const filter = owner ? `WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL${excludeFailed}` : `WHERE fired_at IS NULL AND cleared_at IS NULL${excludeFailed}`;
     return this.db.prepare(`SELECT * FROM timers ${filter} ORDER BY at ASC`).all(...(owner ? [owner] : [])).map(timerFromRow);
   }
 
   /** Pending timers at or past `now`, oldest due first -- the daemon's own
-   * per-poll firing query. A timer `unclaimTimer` has already given up on
-   * (`failed_at` set, MAX_TIMER_DELIVERY_ATTEMPTS reached) is excluded, same
-   * as an already-fired or already-cleared one: it is never a candidate for
-   * another delivery attempt. */
-  dueTimers(now = new Date()): Timer[] {
-    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND at <= ? ORDER BY at ASC").all(now.toISOString()).map(timerFromRow);
+   * per-poll/per-maintenance-pass firing query. Excludes a timer
+   * `releaseTimerClaim` has already given up on (`failed_at` set,
+   * MAX_TIMER_DELIVERY_ATTEMPTS reached), same as an already-fired or
+   * already-cleared one. A timer whose claim (`claimed_at`) is still fresh
+   * -- another pass is presumably delivering it right now -- is also
+   * excluded; one whose claim has gone stale (older than `claimStaleMs`,
+   * covering a hang that never crashed the process outright) is offered up
+   * again. Only ever reachable through the daemon's own fully-migrated
+   * store (never `openReadOnly()`), so no schema-compat concern here the
+   * way `timers()` above has. */
+  dueTimers(now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS): Timer[] {
+    const staleThreshold = new Date(now.getTime() - claimStaleMs).toISOString();
+    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND at <= ? AND (claimed_at IS NULL OR claimed_at <= ?) ORDER BY at ASC")
+      .all(now.toISOString(), staleThreshold).map(timerFromRow);
   }
 
   /**
    * Claims one due timer for delivery, before src/heartbeat.ts's
    * fireDueTimers ever attempts the actual inbox write (filesystem I/O this
-   * synchronous store cannot do itself): the `WHERE fired_at IS NULL` guard
-   * on the UPDATE means this is the single atomic point that decides which
-   * of two overlapping firing passes (a slow inbox write outlasting the
-   * daemon's own poll throttle) gets to deliver a given timer -- the loser's
-   * claim affects zero rows and gets `undefined` back, never a duplicate
-   * delivery. Also raises one `timer_missed` event when `if_missed` is
-   * `notify` and this owner's heartbeat is currently lapsed, so a wake-up
-   * that fired while nobody was watching still reaches a human channel, not
-   * only the inbox its crashed session will never read -- `addTimerMissedEvent`'s
-   * own deterministic id keeps this idempotent even if the claim is later
-   * released (`unclaimTimer`) and re-claimed on a retry.
-   * Returns the claimed row (with its own new `fired_at`), or `undefined`
-   * when nothing matched -- already claimed by a concurrent pass, already
-   * cleared, or gone.
+   * synchronous store cannot do itself). This is a *recoverable* claim: it
+   * records `claimed_at`/a fresh `claim_token`, never the terminal
+   * `fired_at` -- that is set later, only by `confirmTimerDelivered`, once
+   * the inbox message is actually known durable. A claim a delivery attempt
+   * never resolves (process crash, or the daemon's own `stop()` racing this
+   * call) is therefore never mistaken for "delivered": it simply goes stale
+   * and `dueTimers()` offers the row again once `claimStaleMs` has passed,
+   * or immediately once this process restarts (`reclaimStaleTimerClaims()`,
+   * called unconditionally on daemon start).
+   *
+   * The same atomic `UPDATE ... WHERE claimed_at IS NULL OR claimed_at <=
+   * ?` guard that makes a stale claim reclaimable is also what makes two
+   * overlapping firing passes safe: whichever `UPDATE` lands first wins
+   * (`changes` becomes 0 for the loser, which gets `undefined` back), never
+   * a duplicate claim. Also raises one `timer_missed` event when
+   * `if_missed` is `notify` and this owner's heartbeat is currently lapsed
+   * -- `addTimerMissedEvent`'s own deterministic id keeps this idempotent
+   * even across a reclaimed retry of the same timer.
+   *
+   * Returns the claimed row plus its fresh `claim_token` (the caller's
+   * proof of this exact claim, required by both `confirmTimerDelivered` and
+   * `releaseTimerClaim`), or `undefined` when nothing matched -- already
+   * claimed by a concurrent pass, already terminal, or gone.
    */
-  claimTimer(owner: string, name: string, now = new Date()): Timer | undefined {
-    const at = now.toISOString();
-    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL").get(owner, name);
+  claimTimer(owner: string, name: string, now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS): ClaimedTimer | undefined {
+    const nowIso = now.toISOString();
+    const staleThreshold = new Date(now.getTime() - claimStaleMs).toISOString();
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)").get(owner, name, staleThreshold);
     if (!row) return undefined;
-    this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND failed_at IS NULL").run(at, owner, name);
-    const timer = { ...timerFromRow(row), fired_at: at };
-    if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, at);
+    const claimToken = randomUUID();
+    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
+      .run(nowIso, claimToken, owner, name, staleThreshold);
+    if (Number(claimed.changes) === 0) return undefined; // lost the race to a concurrent claim
+    const timer: ClaimedTimer = { ...timerFromRow(row), claim_token: claimToken };
+    if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, nowIso);
     return timer;
   }
 
-  /** Releases a claim a delivery attempt could not honor (the inbox write
-   * failed), so a later firing pass sees this timer as pending again --
-   * bounded: this also bumps `attempts`, and once it reaches
-   * `maxAttempts` the claim is never released at all. `failed_at` is set
-   * instead, permanently excluding the row from `dueTimers`/`timers`/
-   * `nextMaintenanceDeadline` (never a delete -- same reasoning as
-   * `fired_at`/`cleared_at`, the row and its now-known reason stay
-   * inspectable). Only ever acts on the exact claim it was given (`fired_at`
-   * must still equal `claimedFiredAt`): a timer independently cleared, or
-   * reclaimed by a different pass in between, is never clobbered by a stale
-   * release. Returns `undefined` when that guard did not match (nothing to
-   * update), otherwise the attempt count just recorded and whether this call
-   * is what gave up on it for good. */
-  unclaimTimer(owner: string, name: string, claimedFiredAt: string, now = new Date(), maxAttempts = MAX_TIMER_DELIVERY_ATTEMPTS): { attempts: number; permanentlyFailed: boolean } | undefined {
-    const row = this.db.prepare("SELECT attempts FROM timers WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").get(owner, name, claimedFiredAt) as { attempts: number } | undefined;
+  /** Marks a claimed timer's delivery as durable -- the one and only place
+   * `fired_at` is ever set. Called by src/heartbeat.ts's fireDueTimers only
+   * after `src/inbox.ts`'s `sendInboxMessageAt` confirms the inbox message
+   * itself is on disk (freshly written, or already there from an earlier
+   * attempt this same call recognizes and treats as already-delivered --
+   * see that function's own doc comment for why that makes the whole
+   * claim-deliver-confirm sequence idempotent by timer identity even across
+   * a crash-and-retry). Only acts when `claimToken` still matches the live
+   * claim: a confirm racing a reclaim that already gave this timer to a
+   * different pass is simply a no-op (`false`), never a stale write. */
+  confirmTimerDelivered(owner: string, name: string, claimToken: string, now = new Date()): boolean {
+    const result = this.db.prepare("UPDATE timers SET fired_at = ?, claimed_at = NULL, claim_token = NULL WHERE owner = ? AND name = ? AND claim_token = ? AND fired_at IS NULL AND cleared_at IS NULL")
+      .run(now.toISOString(), owner, name, claimToken);
+    return Number(result.changes) > 0;
+  }
+
+  /** Releases a claim a delivery attempt is known to have failed (the inbox
+   * write itself threw), so a later firing pass sees this timer as pending
+   * again immediately, without waiting out `dueTimers()`'s own staleness
+   * window -- bounded: this also bumps `attempts`, and once it reaches
+   * `maxAttempts` the claim is released into `failed_at` instead of back to
+   * pending. `failed_at` permanently excludes the row from
+   * `dueTimers`/`nextMaintenanceDeadline` (never a delete -- same reasoning
+   * as `fired_at`/`cleared_at`, the row and its now-known reason stay
+   * inspectable). Only ever acts on the exact claim it was given
+   * (`claimToken` must still match): a timer independently cleared, or
+   * reclaimed/confirmed by a different pass in between, is never clobbered
+   * by a stale release. Returns `undefined` when that guard did not match
+   * (nothing to update), otherwise the attempt count just recorded and
+   * whether this call is what gave up on it for good. */
+  releaseTimerClaim(owner: string, name: string, claimToken: string, now = new Date(), maxAttempts = MAX_TIMER_DELIVERY_ATTEMPTS): { attempts: number; permanentlyFailed: boolean } | undefined {
+    const row = this.db.prepare("SELECT attempts FROM timers WHERE owner = ? AND name = ? AND claim_token = ? AND fired_at IS NULL AND cleared_at IS NULL").get(owner, name, claimToken) as { attempts: number } | undefined;
     if (!row) return undefined;
     const attempts = row.attempts + 1;
     if (attempts >= maxAttempts) {
-      this.db.prepare("UPDATE timers SET attempts = ?, failed_at = ? WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").run(attempts, now.toISOString(), owner, name, claimedFiredAt);
+      this.db.prepare("UPDATE timers SET attempts = ?, failed_at = ?, claimed_at = NULL, claim_token = NULL WHERE owner = ? AND name = ? AND claim_token = ?").run(attempts, now.toISOString(), owner, name, claimToken);
       return { attempts, permanentlyFailed: true };
     }
-    this.db.prepare("UPDATE timers SET attempts = ?, fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").run(attempts, owner, name, claimedFiredAt);
+    this.db.prepare("UPDATE timers SET attempts = ?, claimed_at = NULL, claim_token = NULL WHERE owner = ? AND name = ? AND claim_token = ?").run(attempts, owner, name, claimToken);
     return { attempts, permanentlyFailed: false };
+  }
+
+  /** Resets every outstanding delivery claim unconditionally. Called once,
+   * by daemon.ts's `start()`, before the maintenance scheduler's first
+   * pass -- never during ordinary operation, where `dueTimers()`'s own
+   * staleness window (`claimStaleMs`) is what recovers a hung claim instead.
+   * A fresh daemon process starting up is proof that any claim found here
+   * is orphaned: this daemon refuses to start while another instance
+   * already holds its socket (see daemon.ts's `prepareSocket`), so no other
+   * process can still be mid-delivery against this store right now.
+   * Deliberately does not touch `attempts`/`failed_at`: a reclaimed timer
+   * keeps whatever delivery budget it already spent. Returns the number of
+   * rows reclaimed, for the caller's own log line. */
+  reclaimStaleTimerClaims(): number {
+    const result = this.db.prepare("UPDATE timers SET claimed_at = NULL, claim_token = NULL WHERE claimed_at IS NOT NULL AND fired_at IS NULL AND cleared_at IS NULL").run();
+    return Number(result.changes);
   }
 
   /** Idempotent: clearing an already-cleared or already-fired timer is not

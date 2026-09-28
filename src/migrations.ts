@@ -219,9 +219,37 @@ const ADD_TIMER_DELIVERY_ATTEMPTS: Migration = {
   },
 };
 
+/**
+ * `timers.claimed_at`/`timers.claim_token`: a recoverable claim. Before this,
+ * `claimTimer` wrote the terminal `fired_at` the instant a firing pass
+ * picked a timer up, *before* the async inbox write that actually delivers
+ * it -- a crash (or the daemon's own `stop()` closing the SQLite handle)
+ * between those two steps left the row permanently excluded from
+ * `dueTimers()` with no message ever sent and no failure ever recorded.
+ * `claimed_at`/`claim_token` mark a delivery attempt in progress without
+ * being terminal: `dueTimers()` still offers a row back once its claim is
+ * older than `TIMER_CLAIM_STALE_MS`, and a fresh daemon process reclaims
+ * every outstanding claim unconditionally on `start()` (any claim found
+ * there is guaranteed to be from a now-dead prior process, since a daemon
+ * refuses to start against a socket another instance already holds).
+ * `fired_at` is now set only via `confirmTimerDelivered`, after the inbox
+ * message is confirmed durable -- and that confirmation is itself idempotent
+ * by timer identity (`src/inbox.ts`'s `sendInboxMessageAt`), so a delivery
+ * that actually succeeded just before a crash, then gets retried after
+ * reclaim, still produces exactly one inbox entry.
+ */
+const ADD_TIMER_CLAIM_RECOVERY: Migration = {
+  version: 6,
+  description: "timers.claimed_at and timers.claim_token for a recoverable (crash-safe) delivery claim",
+  up(db) {
+    addColumnIfMissing(db, "ALTER TABLE timers ADD COLUMN claimed_at TEXT");
+    addColumnIfMissing(db, "ALTER TABLE timers ADD COLUMN claim_token TEXT");
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS, ADD_TIMER_CLAIM_RECOVERY];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

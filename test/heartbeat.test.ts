@@ -11,8 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
-import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
-import { readInbox, sendInboxMessage } from "../src/inbox.js";
+import { fireDueTimers, parseTimerAt, timerMessageEpoch } from "../src/heartbeat.js";
+import { readInbox, sendInboxMessageAt } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
 import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS } from "../src/store.js";
@@ -239,7 +239,7 @@ describe("timers", () => {
 // every maintenance pass forever.
 // ---------------------------------------------------------------------------
 
-describe("unclaimTimer bounded retry", () => {
+describe("releaseTimerClaim bounded retry", () => {
   it("releases the claim for retry below the attempt limit, and permanently fails it at the limit", async () => {
     const { store } = await openStore("headroom-timer-bounded-retry-");
     try {
@@ -249,7 +249,7 @@ describe("unclaimTimer bounded retry", () => {
       for (let attempt = 1; attempt < maxAttempts; attempt += 1) {
         const claimed = store.claimTimer("orch-k", "wake", at)!;
         expect(claimed).toBeDefined();
-        const outcome = store.unclaimTimer("orch-k", "wake", claimed.fired_at!, at, maxAttempts);
+        const outcome = store.releaseTimerClaim("orch-k", "wake", claimed.claim_token, at, maxAttempts);
         expect(outcome).toEqual({ attempts: attempt, permanentlyFailed: false });
         // Retryable again: dueTimers()/timers() still see it as pending.
         expect(store.dueTimers(at)).toHaveLength(1);
@@ -257,7 +257,7 @@ describe("unclaimTimer bounded retry", () => {
       }
       // The attempt that reaches the limit gives up for good.
       const finalClaim = store.claimTimer("orch-k", "wake", at)!;
-      const finalOutcome = store.unclaimTimer("orch-k", "wake", finalClaim.fired_at!, at, maxAttempts);
+      const finalOutcome = store.releaseTimerClaim("orch-k", "wake", finalClaim.claim_token, at, maxAttempts);
       expect(finalOutcome).toEqual({ attempts: maxAttempts, permanentlyFailed: true });
       // No longer offered for delivery or listed as pending -- but not
       // deleted either (findable by a direct row read, if ever needed).
@@ -267,14 +267,14 @@ describe("unclaimTimer bounded retry", () => {
     } finally { store.close(); }
   });
 
-  it("returns undefined when the claim it was given no longer matches (already cleared or reclaimed)", async () => {
+  it("returns undefined when the claim token no longer matches (already cleared, confirmed, or reclaimed)", async () => {
     const { store } = await openStore("headroom-timer-stale-unclaim-");
     try {
       const at = new Date("2026-09-28T12:00:00.000Z");
       store.setTimer("orch-l", "wake", at.toISOString(), "check", "notify", at);
       const claimed = store.claimTimer("orch-l", "wake", at)!;
       store.clearTimer("orch-l", "wake");
-      expect(store.unclaimTimer("orch-l", "wake", claimed.fired_at!, at)).toBeUndefined();
+      expect(store.releaseTimerClaim("orch-l", "wake", claimed.claim_token, at)).toBeUndefined();
     } finally { store.close(); }
   });
 
@@ -284,12 +284,145 @@ describe("unclaimTimer bounded retry", () => {
       const at = new Date("2026-09-28T12:00:00.000Z");
       store.setTimer("orch-m", "wake", at.toISOString(), "check", "notify", at);
       const claimed = store.claimTimer("orch-m", "wake", at)!;
-      const outcome = store.unclaimTimer("orch-m", "wake", claimed.fired_at!, at, 1);
+      const outcome = store.releaseTimerClaim("orch-m", "wake", claimed.claim_token, at, 1);
       expect(outcome).toEqual({ attempts: 1, permanentlyFailed: true });
       expect(store.timers("orch-m")).toHaveLength(0);
       const reset = store.setTimer("orch-m", "wake", new Date(at.getTime() + 60_000).toISOString(), "check again", "notify", at);
       expect(reset).toMatchObject({ attempts: 0, failed_at: null });
       expect(store.timers("orch-m")).toHaveLength(1);
+    } finally { store.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// store.ts: the recoverable claim itself -- claimTimer/confirmTimerDelivered/
+// reclaimStaleTimerClaims. Covers the blocker fix: claimTimer no longer sets
+// the terminal fired_at, so a crash between claim and delivery leaves a
+// recoverable claim, never a silently-lost timer.
+// ---------------------------------------------------------------------------
+
+describe("recoverable timer claim (claimTimer/confirmTimerDelivered/reclaimStaleTimerClaims)", () => {
+  it("claimTimer sets claimed_at, not fired_at -- the timer is not terminal until confirmTimerDelivered", async () => {
+    const { store } = await openStore("headroom-claim-not-terminal-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-n", "wake", at.toISOString(), "check", "notify", at);
+      const claimed = store.claimTimer("orch-n", "wake", at)!;
+      expect(claimed.fired_at).toBeNull();
+      expect(typeof claimed.claim_token).toBe("string");
+      // Still fired_at: null on a direct row read too (never set at claim time).
+      expect(store.timers("orch-n")).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  it("a fresh claim (claimed_at just set) is not offered to a second claimTimer call or dueTimers()", async () => {
+    const { store } = await openStore("headroom-claim-exclusive-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-o", "wake", at.toISOString(), "check", "notify", at);
+      store.claimTimer("orch-o", "wake", at);
+      expect(store.claimTimer("orch-o", "wake", at)).toBeUndefined();
+      expect(store.dueTimers(at)).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  it("confirmTimerDelivered sets fired_at and clears the claim; a stale/mismatched token is a no-op", async () => {
+    const { store } = await openStore("headroom-confirm-delivered-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-p", "wake", at.toISOString(), "check", "notify", at);
+      const claimed = store.claimTimer("orch-p", "wake", at)!;
+      expect(store.confirmTimerDelivered("orch-p", "wake", "not-the-real-token", at)).toBe(false);
+      expect(store.confirmTimerDelivered("orch-p", "wake", claimed.claim_token, at)).toBe(true);
+      expect(store.timers("orch-p")).toHaveLength(0); // fired, no longer pending
+      // Idempotent: confirming the same already-consumed token again is a
+      // harmless no-op, never a second effect.
+      expect(store.confirmTimerDelivered("orch-p", "wake", claimed.claim_token, at)).toBe(false);
+    } finally { store.close(); }
+  });
+
+  it("dueTimers()/claimTimer() offer a claim back up once it goes stale, without waiting for a crash", async () => {
+    const { store } = await openStore("headroom-claim-stale-reclaim-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-q", "wake", at.toISOString(), "check", "notify", at);
+      store.claimTimer("orch-q", "wake", at);
+      const staleMs = 30_000;
+      // Not yet stale: still excluded.
+      expect(store.dueTimers(new Date(at.getTime() + staleMs - 1), staleMs)).toHaveLength(0);
+      expect(store.claimTimer("orch-q", "wake", new Date(at.getTime() + staleMs - 1), staleMs)).toBeUndefined();
+      // Past the staleness window: offered again, and re-claimable.
+      const later = new Date(at.getTime() + staleMs + 1);
+      expect(store.dueTimers(later, staleMs)).toHaveLength(1);
+      const reclaimed = store.claimTimer("orch-q", "wake", later, staleMs)!;
+      expect(reclaimed).toBeDefined();
+      expect(reclaimed.claim_token).not.toBe(""); // a fresh token, not a reused one
+    } finally { store.close(); }
+  });
+
+  it("reclaimStaleTimerClaims() resets every outstanding claim unconditionally, regardless of age", async () => {
+    const { store } = await openStore("headroom-reclaim-on-start-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-r", "wake-1", at.toISOString(), "check", "notify", at);
+      store.setTimer("orch-r", "wake-2", at.toISOString(), "check", "notify", at);
+      store.claimTimer("orch-r", "wake-1", at); // claimed a moment ago -- not remotely stale
+      const secondClaim = store.claimTimer("orch-r", "wake-2", at)!;
+      store.confirmTimerDelivered("orch-r", "wake-2", secondClaim.claim_token, at); // already terminal
+      // Immediately after claiming (no staleness elapsed at all), a plain
+      // claimTimer()/dueTimers() call still correctly excludes wake-1.
+      expect(store.dueTimers(at)).toHaveLength(0);
+      expect(store.reclaimStaleTimerClaims()).toBe(1); // only wake-1 had an outstanding claim
+      // wake-1 is claimable again right away; wake-2 stays terminal (fired), untouched.
+      expect(store.dueTimers(at)).toHaveLength(1);
+      expect(store.dueTimers(at)[0]).toMatchObject({ owner: "orch-r", name: "wake-1" });
+      expect(store.reclaimStaleTimerClaims()).toBe(0); // nothing left to reclaim
+    } finally { store.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// store.ts: claimDaemonInterval -- the shared throttle both poll() and the
+// daemon's own maintenance scheduler claim heartbeat_timer_check through.
+// ---------------------------------------------------------------------------
+
+describe("claimDaemonInterval", () => {
+  it("claims on first use, then refuses within the interval, then claims again once it has genuinely elapsed", async () => {
+    const { store } = await openStore("headroom-claim-interval-basic-");
+    try {
+      const start = new Date("2026-09-28T12:00:00.000Z");
+      expect(store.claimDaemonInterval("k", start, 10_000)).toBe(true);
+      expect(store.claimDaemonInterval("k", new Date(start.getTime() + 5_000), 10_000)).toBe(false);
+      expect(store.claimDaemonInterval("k", new Date(start.getTime() + 10_000), 10_000)).toBe(true);
+    } finally { store.close(); }
+  });
+
+  // P2 fix: a backwards wall-clock step (an NTP correction, a manual clock
+  // change) made `now - previousAt` negative, which used to still satisfy
+  // `< intervalMs` and refuse the claim -- suppressing the next poll or
+  // maintenance pass until the real clock caught back up to the old,
+  // now-future-dated claim, however long that took. A negative elapsed time
+  // must instead be treated as already expired.
+  it("treats a backwards clock step as an expired interval, not a not-yet-due one", async () => {
+    const { store } = await openStore("headroom-claim-interval-clock-back-");
+    try {
+      const start = new Date("2026-09-28T12:00:00.000Z");
+      expect(store.claimDaemonInterval("k", start, 10_000)).toBe(true);
+      // The clock now reads five minutes EARLIER than the claim just made.
+      const steppedBack = new Date(start.getTime() - 5 * 60_000);
+      expect(store.claimDaemonInterval("k", steppedBack, 10_000)).toBe(true);
+      // The overwritten claim is honored going forward from the new (earlier) time.
+      expect(store.claimDaemonInterval("k", new Date(steppedBack.getTime() + 5_000), 10_000)).toBe(false);
+    } finally { store.close(); }
+  });
+
+  it("an intervalMs of 0 always claims, recording the timestamp without ever refusing", async () => {
+    const { store } = await openStore("headroom-claim-interval-zero-");
+    try {
+      const start = new Date("2026-09-28T12:00:00.000Z");
+      expect(store.claimDaemonInterval("k", start, 0)).toBe(true);
+      expect(store.claimDaemonInterval("k", start, 0)).toBe(true); // same instant, still claims
+      expect(store.claimDaemonInterval("k", new Date(start.getTime() + 1), 0)).toBe(true);
     } finally { store.close(); }
   });
 });
@@ -390,10 +523,10 @@ describe("fireDueTimers", () => {
       let releaseFirst: () => void;
       const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
       const sent: string[] = [];
-      const slowSend: typeof sendInboxMessage = async (options) => {
+      const slowSend: typeof sendInboxMessageAt = async (options) => {
         sent.push(options.to);
         await gate; // held open until the test explicitly releases it
-        return sendInboxMessage(options);
+        return sendInboxMessageAt(options);
       };
 
       // Started but not awaited: this pass claims the timer synchronously
@@ -403,9 +536,9 @@ describe("fireDueTimers", () => {
       const firstPass = fireDueTimers(store, home, at, undefined, slowSend);
       // A second, independent pass starts while the first is still stuck in
       // its slow send. Its own dueTimers() scan must no longer see the
-      // timer at all -- claimTimer already marked it fired_at the instant
-      // the first pass claimed it -- so this resolves immediately without
-      // ever touching slowSend.
+      // timer at all -- claimTimer already recorded a fresh claimed_at the
+      // instant the first pass claimed it -- so this resolves immediately
+      // without ever touching slowSend.
       const secondPass = await fireDueTimers(store, home, at, undefined, slowSend);
       expect(secondPass).toBe(0);
       expect(sent).toEqual(["orch-overlap"]); // only the first pass ever called send
@@ -424,7 +557,7 @@ describe("fireDueTimers", () => {
       const at = new Date("2026-09-28T12:05:00.000Z");
       store.setTimer("orch-retry", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
 
-      const failingSend: typeof sendInboxMessage = async () => { throw new Error("simulated inbox write failure"); };
+      const failingSend: typeof sendInboxMessageAt = async () => { throw new Error("simulated inbox write failure"); };
       const failedPass = await fireDueTimers(store, home, at, undefined, failingSend);
       expect(failedPass).toBe(0);
       // Un-claimed: the timer is pending again, not lost.
@@ -448,7 +581,7 @@ describe("fireDueTimers", () => {
     try {
       const at = new Date("2026-09-28T12:05:00.000Z");
       store.setTimer("orch-doomed", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
-      const alwaysFailingSend: typeof sendInboxMessage = async () => { throw new Error("simulated permanent inbox failure"); };
+      const alwaysFailingSend: typeof sendInboxMessageAt = async () => { throw new Error("simulated permanent inbox failure"); };
       const logged: string[] = [];
       const log = async (message: string) => { logged.push(message); };
 
@@ -469,10 +602,74 @@ describe("fireDueTimers", () => {
       // No further pass ever tries to deliver it again, however far past
       // `at` the clock runs.
       const sendCalls: string[] = [];
-      const countingSend: typeof sendInboxMessage = async (options) => { sendCalls.push(options.to); throw new Error("would still fail if tried"); };
+      const countingSend: typeof sendInboxMessageAt = async (options) => { sendCalls.push(options.to); throw new Error("would still fail if tried"); };
       await fireDueTimers(store, home, new Date(at.getTime() + 3_600_000), log, countingSend);
       expect(sendCalls).toHaveLength(0);
       expect((await readInbox({ session: "orch-doomed", home, markRead: false })).messages).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  // Blocker fix: claimTimer used to write the terminal fired_at before the
+  // async inbox write, so a crash (or the daemon's own stop() closing
+  // SQLite) between claim and delivery left the timer excluded forever with
+  // no message, retry, or failure marker. These two tests simulate that
+  // crash directly at the store/module level (a real process crash cannot
+  // be simulated in-process) and drive the recovery path a daemon restart
+  // takes: reclaimStaleTimerClaims() first, then a normal fireDueTimers pass.
+  it("crash between claim and delivery (never even attempted) -- after reclaim, a restart delivers exactly once", async () => {
+    const { store, home } = await openStore("headroom-firedue-crash-before-send-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-crash-a", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+      // Simulates the crashed process: claimed, but the inbox write never
+      // even started, let alone confirmed.
+      const crashedClaim = store.claimTimer("orch-crash-a", "wake", at)!;
+      expect(crashedClaim.fired_at).toBeNull();
+      expect((await readInbox({ session: "orch-crash-a", home, markRead: false })).messages).toHaveLength(0);
+
+      // "Restart": exactly what daemon.ts's start() does before scheduling
+      // any maintenance pass.
+      expect(store.reclaimStaleTimerClaims()).toBe(1);
+
+      const delivered = await fireDueTimers(store, home, new Date(at.getTime() + 1_000));
+      expect(delivered).toBe(1);
+      const inbox = await readInbox({ session: "orch-crash-a", home, markRead: false });
+      expect(inbox.messages).toHaveLength(1);
+      expect(inbox.messages[0].body).toMatchObject({ timer: "wake", action: "check the deploy" });
+      expect(store.timers("orch-crash-a")).toHaveLength(0); // now genuinely fired
+    } finally { store.close(); }
+  });
+
+  it("crash after the inbox write landed but before confirmTimerDelivered -- the retried delivery is idempotent, exactly one inbox entry", async () => {
+    const { store, home } = await openStore("headroom-firedue-crash-after-send-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-crash-b", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+      const crashedClaim = store.claimTimer("orch-crash-b", "wake", at)!;
+      // Simulates the crashed process's own write having actually landed on
+      // disk just before it died -- the exact same call fireDueTimers itself
+      // would have made, with the exact same deterministic identity.
+      const firstWrite = await sendInboxMessageAt({
+        to: "orch-crash-b", kind: "handoff", from: "headroom-timer",
+        text: JSON.stringify({ timer: "wake", at: crashedClaim.at, action: crashedClaim.action }),
+        at_epoch: timerMessageEpoch(crashedClaim.name, crashedClaim.at),
+        home, now: at,
+      });
+      expect(firstWrite.delivered).toBe(true);
+      // Crash: confirmTimerDelivered was never reached, so the claim is
+      // still outstanding and fired_at is still null.
+      expect(store.timers("orch-crash-b")).toHaveLength(1);
+
+      expect(store.reclaimStaleTimerClaims()).toBe(1);
+      const delivered = await fireDueTimers(store, home, new Date(at.getTime() + 1_000));
+      // The retried attempt's own send recognizes the message already on
+      // disk (delivered: false internally) and skips writing -- but
+      // confirmTimerDelivered still runs and still counts as this pass
+      // having closed the timer out.
+      expect(delivered).toBe(1);
+      const inbox = await readInbox({ session: "orch-crash-b", home, markRead: false });
+      expect(inbox.messages).toHaveLength(1); // never two
+      expect(store.timers("orch-crash-b")).toHaveLength(0);
     } finally { store.close(); }
   });
 

@@ -121,20 +121,60 @@ export interface SendOptions {
   now?: Date;
 }
 
-/** Writes one message atomically, 0600, into the recipient's inbox. */
-export async function sendInboxMessage(options: SendOptions): Promise<{ path: string; file: string; session: string }> {
+function validateSendOptions(options: Pick<SendOptions, "to" | "kind" | "text" | "from">): { session: string; from: string | null } {
   const session = assertSessionId(options.to);
   const from = options.from ? assertSessionId(options.from) : null;
   if (!isInboxKind(options.kind)) throw new Error(`kind must be one of ${INBOX_KINDS.join(", ")}`);
   const bytes = Buffer.byteLength(options.text, "utf8");
   if (!bytes) throw new Error("message body is empty");
   if (bytes > MAX_INBOX_MESSAGE_BYTES) throw new Error(`message body is ${bytes} bytes, over the ${MAX_INBOX_MESSAGE_BYTES} byte cap`);
+  return { session, from };
+}
+
+/** Writes one message atomically, 0600, into the recipient's inbox. */
+export async function sendInboxMessage(options: SendOptions): Promise<{ path: string; file: string; session: string }> {
+  const { session, from } = validateSendOptions(options);
   const now = options.now ?? new Date();
   const directory = await sessionDirectory(session, options.home);
   const { path, file } = await freeMessagePath(directory, options.kind, now.getTime());
   const envelope = { version: 1, kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) };
   await writeFileAtomic(path, `${JSON.stringify(envelope, null, 2)}\n`, 0o600);
   return { path, file, session };
+}
+
+export interface SendAtOptions extends SendOptions {
+  /** A caller-computed, deterministic identity for this message -- in place
+   * of `sendInboxMessage`'s own "now.getTime(), advance on collision"
+   * numbering, which is different on every call and therefore cannot be
+   * idempotent. Writing twice with the same `to`/`kind`/`at_epoch` is safe:
+   * the second call recognizes the message (unread, or already read and
+   * renamed) already exists and skips the write entirely (`delivered:
+   * false`) rather than creating a second entry, or silently replacing one
+   * the recipient may already have consumed. Used by src/heartbeat.ts's
+   * fireDueTimers so a timer retried after a crash (claimed, delivered, but
+   * never confirmed durable before the process died) is never delivered
+   * twice. */
+  at_epoch: number;
+}
+
+/** The idempotent-by-identity counterpart of `sendInboxMessage`. See
+ * `SendAtOptions.at_epoch`'s own doc comment for the guarantee this makes
+ * and why a plain `sendInboxMessage` retry cannot provide it. */
+export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path: string; file: string; session: string; delivered: boolean }> {
+  const { session, from } = validateSendOptions(options);
+  if (!Number.isInteger(options.at_epoch) || options.at_epoch < 0) throw new Error("at_epoch must be a non-negative integer");
+  const now = options.now ?? new Date();
+  const directory = await sessionDirectory(session, options.home);
+  const file = `${options.at_epoch}-${options.kind}.json`;
+  const path = join(directory, file);
+  // Already delivered -- either still unread, or read and renamed with
+  // READ_SUFFIX. Either way, writing again would either duplicate it (a
+  // fresh unread copy next to the read one) or silently replace content the
+  // recipient may already be acting on, so this is a no-op, not a retry.
+  if (!(await absent(path)) || !(await absent(`${path}${READ_SUFFIX}`))) return { path, file, session, delivered: false };
+  const envelope = { version: 1, kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) };
+  await writeFileAtomic(path, `${JSON.stringify(envelope, null, 2)}\n`, 0o600);
+  return { path, file, session, delivered: true };
 }
 
 function parseBody(text: string): unknown {

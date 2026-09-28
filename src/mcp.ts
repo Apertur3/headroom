@@ -683,6 +683,26 @@ async function cacheResult(method: string, arguments_: Record<string, unknown>):
   return cacheEvents(arguments_.since);
 }
 
+/**
+ * `heartbeats` and `timer_list` are additive RPCs a pre-0.2.0 daemon has
+ * never heard of: it answers both with a plain JSON-RPC `-32601 Method not
+ * found`, which is decoded here as "none registered" (an empty array) --
+ * the same convention src/cli.ts's own `unwrapAdditiveRpc` applies to the
+ * identical compatibility gap on the CLI's `status` path. Any OTHER error
+ * reply (a genuine handler failure, most commonly `-32000`, or any
+ * non-array success value) still throws, exactly like the primary-method
+ * error-envelope check just above in handleMcp -- never silently reported
+ * as "no heartbeats/timers registered", which could hide a real daemon
+ * defect behind an empty list. */
+function decodeAdditiveRpcReply(reply: unknown): unknown[] {
+  if (reply && typeof reply === "object" && "jsonrpc" in reply && "error" in reply) {
+    const error = (reply as { error?: { code?: unknown; message?: unknown } }).error;
+    if (error && typeof error === "object" && error.code === -32601) return [];
+    throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
+  }
+  return Array.isArray(reply) ? reply : [];
+}
+
 async function daemonCall(method: string, params: Record<string, unknown>): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
@@ -867,13 +887,14 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       const downgrade = await call("plan_downgrades", {});
       // Same additive fields as the direct/cache paths (heartbeatFields,
       // above), read here from the daemon instead of a local store. An older
-      // daemon that does not yet answer these two methods reads as "none",
-      // never a crash -- same defensive Array.isArray guard as src/cli.ts's
-      // own observe().
-      const heartbeatsReply = await call("heartbeats", {});
-      const heartbeats = Array.isArray(heartbeatsReply) ? heartbeatsReply as Heartbeat[] : [];
-      const timersReply = await call("timer_list", {});
-      const pendingTimers = Array.isArray(timersReply) ? timersReply as Timer[] : [];
+      // daemon that has never heard of these two additive RPCs answers
+      // -32601 Method not found, decoded as "none" -- never a crash -- by
+      // decodeAdditiveRpcReply, same convention as src/cli.ts's own
+      // unwrapAdditiveRpc. Any OTHER error (a genuine handler failure, most
+      // commonly -32000) still propagates as a real MCP tool error instead
+      // of being silently swallowed to "no heartbeats/timers registered".
+      const heartbeats = decodeAdditiveRpcReply(await call("heartbeats", {})) as Heartbeat[];
+      const pendingTimers = decodeAdditiveRpcReply(await call("timer_list", {})) as Timer[];
       const dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
       // disabled_principals is derived here, from the registry, never
       // returned by the daemon's own "status" RPC -- that stays the bare

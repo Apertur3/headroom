@@ -88,28 +88,44 @@ name appears in both. Supported names:
 
 ### Heartbeats and named wake-ups
 
+Both are checked by a daemon-owned maintenance pass that runs on its own
+schedule, independent of any vendor poll: it reschedules itself around the
+next real deadline (the soonest pending timer, or the soonest still-live
+heartbeat's own lapse instant), roughly every one to sixty seconds, so
+neither depends on an account ever being polled -- a heartbeat or timer
+registered with zero accounts configured is still checked. `headroom timer
+set`/`headroom heartbeat` refuse or warn, rather than silently succeed, when
+no daemon is running to ever act on the row they just wrote.
+
 `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]`
 registers an orchestrator's promise to beat at least that often; the daemon --
 the one process that survives a crashed session -- checks every registered
-heartbeat on each poll, and once one goes overdue by more than 2x its own
-interval it records exactly one `heartbeat_lapsed` event (never repeated
-while that lapse stays open) carrying the last beat and the `--resume`
-sentence, so the notification says what a human or a fresh session should do.
-A later beat closes the lapse immediately and may send one short
+heartbeat on each maintenance pass, and once one goes overdue by more than 2x
+its own interval it records exactly one `heartbeat_lapsed` event (never
+repeated while that lapse stays open) carrying the last beat and the
+`--resume` sentence, so the notification says what a human or a fresh session
+should do. A later beat closes the lapse immediately and may send one short
 `heartbeat_restored`. `headroom heartbeat --owner <name> --stop` deregisters
 it without announcing a restore; `headroom heartbeat list [--json]` shows
 every registered one.
 
 `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action
-"<text>"` registers a named wake-up. When it comes due, the daemon delivers it
-exactly once as one `headroom inbox` entry to its owner's session --
-**Headroom only ever delivers the action text; it never executes it.**
-`--if-missed notify` (the default) additionally raises one `timer_missed`
-notification if the owner's heartbeat is currently lapsed at that moment (a
-crashed session will never read its own inbox); `--if-missed drop` still
-delivers the inbox entry but never notifies. `headroom timer list [--owner
-<name>] [--json]` shows pending timers; `headroom timer clear --owner <name>
---name <id>` clears one.
+"<text>"` registers a named wake-up. When it comes due, the maintenance pass
+claims it, delivers it as one `headroom inbox` entry to its owner's session,
+and only then marks it fired -- **Headroom only ever delivers the action
+text; it never executes it.** That claim is crash-safe: a daemon restart
+between claiming a timer and confirming its delivery reclaims and retries it,
+and delivery itself is idempotent by timer identity, so a retried delivery is
+never sent twice. A timer whose delivery keeps failing for any other reason
+(a malformed owner, a filesystem error) is retried a bounded number of times
+before being marked permanently failed, with the reason logged, rather than
+retried on every maintenance pass forever. `--if-missed notify` (the default)
+additionally raises one `timer_missed` notification if the owner's heartbeat
+is currently lapsed at that moment (a crashed session will never read its own
+inbox); `--if-missed drop` still delivers the inbox entry but never notifies.
+`headroom timer list [--owner <name>] [--json]` shows pending timers (never
+fired, never cleared, never given up on); `headroom timer clear --owner
+<name> --name <id>` clears one.
 
 ### `model_available`: new models, separate from new quota buckets
 

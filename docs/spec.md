@@ -147,19 +147,27 @@ edit only that line in place. Status renders a parked principal as
 - `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
   pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.
+- Both heartbeats and timers are checked by a daemon-owned maintenance pass on its own schedule,
+  independent of any vendor poll: it reschedules itself around the next real deadline, roughly
+  every one to sixty seconds, so neither depends on an account ever being polled. `timer set`/
+  `heartbeat` refuse or warn, rather than silently succeed, with no daemon running to act on them.
 - `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"] | --stop |
   list [--json]` (MCP `quota_heartbeat`): an orchestrator's promise to beat at least that
   often, recorded in the daemon's own store -- the one process that survives a crashed
-  session. The daemon checks every registered heartbeat on each poll; one gone overdue by
-  more than 2x its own interval gets exactly one `heartbeat_lapsed` event (never repeated for
-  the same open lapse), delivered through the ordinary notify ledger/quiet-hours path; a later
-  beat closes the lapse and may send one short `heartbeat_restored`. See `docs/notifications.md`.
+  session. One gone overdue by more than 2x its own interval gets exactly one `heartbeat_lapsed`
+  event (never repeated for the same open lapse), delivered through the ordinary notify
+  ledger/quiet-hours path; a later beat closes the lapse and may send one short
+  `heartbeat_restored`. See `docs/notifications.md`.
 - `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
   [--if-missed notify|drop] | list [--owner <name>] [--json] | clear --owner <name> --name
   <id>`: a named wake-up the daemon delivers, once, as one `headroom inbox` entry to its owner
-  when due. Headroom only ever delivers the action text; it never executes it. `--if-missed
-  notify` (default) also raises one `timer_missed` notification if the owner's heartbeat is
-  currently lapsed when it fires; `--if-missed drop` never notifies.
+  when due. Headroom only ever delivers the action text; it never executes it. The claim on a
+  timer being delivered is crash-safe (a restart reclaims and retries it, delivery itself
+  idempotent by timer identity so a retry is never sent twice) and bounded (a timer whose
+  delivery keeps failing for any other reason is retried a limited number of times, then marked
+  permanently failed with a logged reason, rather than retried forever). `--if-missed notify`
+  (default) also raises one `timer_missed` notification if the owner's heartbeat is currently
+  lapsed when it fires; `--if-missed drop` never notifies.
 - `skills/headroom/SKILL.md` + `AGENTS.md` snippet: pick the pool by capability first, ask Headroom if
   it can afford it, walk the user's fallback list filtered by budget, harvest only fungible
   work, `local_preference = fallback | prefer | never` (default fallback), never spawn into
