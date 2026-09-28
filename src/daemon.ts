@@ -720,7 +720,7 @@ export class HeadroomDaemon {
           }
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined, policy.reserve_meta, policy.policy_mtime); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -749,7 +749,7 @@ export class HeadroomDaemon {
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -767,7 +767,7 @@ export class HeadroomDaemon {
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
           const owner = typeof params.owner === "string" ? params.owner : undefined;
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
-          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
         }
         case "health": result = {
           socket: this.path,

@@ -134,6 +134,11 @@ edit only that line in place. Status renders a parked principal as
   <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
   date-only expiry is midnight UTC on that date.
 - `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]`.
+- `headroom policy show [--json]`; `headroom policy set reserve <meter> <percent> --reason "<text>"
+  [--until <ISO|+7d>] [--unless banked_reset_available] [--json]`; `headroom policy clear reserve
+  <meter> [--json]`; `headroom policy set freeze_reserve_pct <n> [--reason "<text>"] [--until
+  <ISO|+7d>] [--json]`. Dated/reasoned reserves (see docs/concepts.md); edits policy.toml atomically
+  (0600, timestamped `.bak-` first, comments and other keys preserved).
 - `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
   pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.

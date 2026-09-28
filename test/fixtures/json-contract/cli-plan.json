@@ -21,6 +21,7 @@
   "plan_line_percent_per_hour": "number",
   "points_per_5h_window": "number",
   "remaining_5h_windows": "number",
+  "reserve_ceiling": "string",
   "reserve_percent": "number",
   "target": {
     "fits_now": "boolean",
