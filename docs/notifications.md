@@ -134,7 +134,7 @@ fired, never cleared, never given up on); `headroom timer clear --owner
 lists an id Headroom has not seen for that principal before, whether or not it
 gets its own meter. A vendor often rolls a new model out inside an account's
 *existing* shared pool (e.g. Codex adding a model to the same 5h/weekly quota
-Sol/Terra/Luna already share) -- `model_new` says nothing in that case,
+the models already in that pool share) -- `model_new` says nothing in that case,
 `model_available` does. The notification calls a model's meter dedicated only
 when there is a current fresh official model-scoped observation, and calls it
 shared only when there is a current fresh official generic pool observation.
