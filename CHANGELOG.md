@@ -7,6 +7,23 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Dated, expiring `[reserve]` entries and a new `headroom policy` command (#reserves). A reserve
+  entry may now carry metadata in a sibling table, `[reserve."<meter>"]`: `percent`, `reason`,
+  `set_at` (stamped automatically), `until` (an ISO expiry -- the reserve no longer applies at all
+  from that instant), and `unless = "banked_reset_available"` (suspends the reserve, to no floor,
+  while its principal's `:credits` meter carries a current, still-usable banked reset). The plain
+  bare `"<meter>" = N` form inside `[reserve]` keeps working exactly as before; `freeze_reserve_pct`
+  gets the same reason/set_at/until metadata in its own `[freeze_reserve]` table (informational
+  only -- its numeric value never auto-changes). Every reserve refusal (`gate`, `can`, `fill`,
+  `route`) now names the policy key, its value, and its reason/set_at when present, falling back to
+  policy.toml's own last-modified date otherwise. `headroom plan`/`headroom fill` gained an additive
+  `reserve_ceiling` field/line listing every reserve capping the meter, tightest first, with a note
+  when a banked reset is on file. New commands: `headroom policy show [--json]`; `headroom policy set
+  reserve <meter> <percent> --reason "<text>" [--until <ISO|+7d>] [--unless
+  banked_reset_available]`; `headroom policy clear reserve <meter>`; `headroom policy set
+  freeze_reserve_pct <n> [--reason ...] [--until ...]` -- all edit policy.toml atomically (0600, a
+  timestamped `.bak-` written first, every other key and comment preserved) and print a before/after
+  line. See `docs/concepts.md`'s "Dated, expiring reserves".
 - Claude adapter: log a safe, capped form of the name (never the value) of any `/api/oauth/usage` top-level key it does not yet map, once per process, under `HEADROOM_DEBUG=1` -- so a future field (e.g. a banked/free-reset credit block) is noticed instead of silently staying unmapped. This shell variable applies to a foreground `headroom daemon`, or a direct `headroom status` read when no daemon is running; installed services do not inherit it. As of 2026-09-23 the response carries no such field; see `docs/vendors.md`'s Claude section.
 - Source-health hysteresis for `source_failed`/`source_recovered` notifications: a source must stay continuously failed for `source_health_min_polls` distinct failed observations (default 2) and `source_health_min_minutes` minutes (default 15) -- both configurable in `[notify]` -- before `source_failed` is actually sent. Window-scoped outages are tracked independently, and each channel receives `source_recovered` only when its own ledger confirms the matching failure was sent. A flap that clears before both bars are met produces zero messages. The events table stays the complete, undamped truth record; only notification delivery is held back.
 - New `model_available` event (and a quieter `model_retired`): notifies when a vendor makes a *new model* available to an account, even when it shares an existing quota pool rather than getting its own meter -- separate from `model_new`, which only fires on a whole new quota bucket. Per principal, Headroom keeps a set of known model ids with `first_seen_at`; the very first check for a principal seeds that set silently (no notification burst for models already in use), and every id after that is one event, never repeated. Sources, no new credential for any of them: Codex's own local `models_cache.json` cache, Claude Code's own local model-catalog cache, and Antigravity's `fetchAvailableModels` endpoint. Checked at most once an hour per principal, independent of the ordinary quota poll. `model_available` is on by default in the `calm` and `quiet` notify presets; `model_retired` is `everything`-only. New `headroom models [--principal <id>] [--json|--agent]` lists every known model id with `first_seen_at`/`retired_at`.

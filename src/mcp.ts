@@ -459,7 +459,7 @@ async function directPlan(meter: unknown, reservePercent: unknown, need: unknown
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
-  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined, typeof targetPoints === "number" ? targetPoints : undefined); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined, typeof targetPoints === "number" ? targetPoints : undefined, policy.reserve_meta, policy.policy_mtime); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
 }
 
 /**
@@ -512,7 +512,7 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
       actionClass: typeof actionClass === "string" ? actionClass : undefined,
       pacing: policy.pacing,
       staleness_minutes: policy.staleness_minutes,
-      reserves: policy.reserve,
+      reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime,
     });
     store.audit("mcp", "gate", typeof meter === "string" ? meter : null, result.allowed ? "yes" : "no");
     return { source: "direct", ...result };
@@ -526,7 +526,7 @@ async function directFill(meter: unknown, laneCostPercent: unknown, weeklyReserv
   const laneCost = typeof laneCostPercent === "number" ? laneCostPercent : undefined;
   const store = await HeadroomStore.open();
   try {
-    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof need === "string" ? need : undefined });
+    const result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner: typeof owner === "string" ? owner : undefined, planSharePercent: typeof planSharePercent === "number" ? planSharePercent : undefined, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: typeof need === "string" ? need : undefined });
     store.audit("mcp", "fill", meter, "ok");
     return { source: "direct", ...result };
   } finally { store.close(); }

@@ -27,16 +27,17 @@ import { serveMcp } from "./mcp.js";
 import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
-import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { canRouteWithLeases, parsePolicy, reserveEntryExpired, reserveFor, reserveOnCan, unknownMeterPrincipals, type CanDecision, type ReserveEntry } from "./policy.js";
+import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry } from "./policy-configure.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
-import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, reserveSuspendedFor, routeFor, withSuspendedReserves, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { headroomHome, migrateLegacyHome } from "./paths.js";
+import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
@@ -351,8 +352,11 @@ async function can(argv: string[]): Promise<number> {
       if (admitted.leases.length) store.audit("cli", "lease_start", `${owner}:${admitted.leases.map((lease) => lease.meter_id).join(",")}`, "ok");
     } else if (!leaseFlag) {
       // A plain advisory can does not write a lease, but its expected action
-      // still must fit above the deciding meter's protected reserve.
-      decision = reserveOnCan(decision, canPolicy.reserve, remaining, cost.expected_percent);
+      // still must fit above the deciding meter's protected reserve. A
+      // reserve currently suspended by its own `unless:
+      // "banked_reset_available"` withholds nothing this call.
+      const reserves = withSuspendedReserves(store, canPolicy.reserve, canPolicy.reserve_meta, [decision.meter], canPolicy.staleness_minutes, new Date());
+      decision = reserveOnCan(decision, reserves, remaining, cost.expected_percent, canPolicy.reserve_meta, canPolicy.policy_mtime);
     }
   } finally { store.close(); }
 
@@ -547,6 +551,178 @@ async function configuredCreditPrincipal(principal: string): Promise<void> {
   if (!(await readAccounts()).some((account) => account.name === principal)) throw new Error(`unknown principal: ${principal}`);
 }
 
+const POLICY_USAGE = [
+  "Usage: headroom policy show [--json]",
+  '  headroom policy set reserve <meter> <percent> --reason "<text>" [--until <ISO|+7d>] [--unless banked_reset_available] [--json]',
+  "  headroom policy clear reserve <meter> [--json]",
+  '  headroom policy set freeze_reserve_pct <percent> [--reason "<text>"] [--until <ISO|+7d>] [--json]',
+].join("\n");
+
+function describeReserveEntry(entry: ReserveEntry | undefined): string {
+  if (!entry) return "unset";
+  const bits = [`${entry.percent}%`];
+  if (entry.reason) bits.push(entry.reason);
+  if (entry.set_at) bits.push(`set ${entry.set_at.slice(0, 10)}`);
+  if (entry.until) bits.push(`until ${entry.until.slice(0, 10)}`);
+  if (entry.unless) bits.push(`unless ${entry.unless}`);
+  return bits.join(", ");
+}
+
+async function readPolicyTextOrEmpty(path: string): Promise<string> {
+  try { return await readBoundedRegularFile(path); }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return ""; throw error; }
+}
+
+/** Writes a timestamped `.bak-<iso>` copy of the CURRENT on-disk policy.toml
+ * before any `policy set/clear` write -- skipped only when the file did not
+ * exist yet (nothing to back up). Mirrors notify-configure.ts's own
+ * atomic-write/0600 pattern, plus the backup this editor additionally makes. */
+async function backupPolicyFile(home: string, original: string): Promise<void> {
+  if (!original) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  await writeFileAtomic(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
+}
+
+interface PolicyReserveRow {
+  meter: string; percent: number; effective_percent: number; reason: string | null;
+  set_at: string | null; until: string | null; unless: string | null; expired: boolean; suspended: boolean;
+}
+
+async function policyShow(argv: string[]): Promise<number> {
+  if (argv.some((arg) => arg !== "--json")) throw new Error(POLICY_USAGE);
+  const asJson = argv.includes("--json");
+  const policy = await readPolicy();
+  const now = new Date();
+  const store = await HeadroomStore.open();
+  let rows: PolicyReserveRow[];
+  try {
+    const keys = [...new Set([...Object.keys(policy.reserve), ...Object.keys(policy.reserve_meta)])].filter((key) => key !== "freeze_reserve_pct").sort();
+    rows = keys.map((meter) => {
+      const own = policy.reserve_meta[meter];
+      const percent = own?.percent ?? reserveFor(policy.reserve, meter);
+      const expired = reserveEntryExpired(own, now);
+      const suspended = own?.unless === "banked_reset_available" && reserveSuspendedFor(store, policy.reserve_meta, meter, policy.staleness_minutes, now);
+      const effective = expired || suspended ? 0 : reserveFor(policy.reserve, meter);
+      return { meter, percent, effective_percent: effective, reason: own?.reason ?? null, set_at: own?.set_at ?? null, until: own?.until ?? null, unless: own?.unless ?? null, expired, suspended };
+    });
+  } finally { store.close(); }
+  const freezeMeta = policy.reserve_meta.freeze_reserve_pct;
+  if (asJson) {
+    console.log(JSON.stringify(withContract({
+      freeze_reserve_pct: policy.freeze_reserve_pct,
+      freeze_reserve_meta: freezeMeta ? { reason: freezeMeta.reason ?? null, set_at: freezeMeta.set_at ?? null, until: freezeMeta.until ?? null } : null,
+      reserves: rows,
+    })));
+    return 0;
+  }
+  console.log(`freeze_reserve_pct = ${policy.freeze_reserve_pct}${freezeMeta ? ` (${[freezeMeta.reason, freezeMeta.set_at ? `set ${freezeMeta.set_at.slice(0, 10)}` : undefined, freezeMeta.until ? `until ${freezeMeta.until.slice(0, 10)}` : undefined].filter(Boolean).join(", ")})` : ""}`);
+  if (!rows.length) { console.log("no [reserve] entries"); return 0; }
+  for (const row of rows) {
+    const bits: string[] = [];
+    if (row.reason) bits.push(row.reason);
+    if (row.set_at) bits.push(`set ${row.set_at.slice(0, 10)}`);
+    if (row.until) bits.push(row.expired ? `expired ${row.until.slice(0, 10)}` : `until ${row.until.slice(0, 10)}`);
+    if (row.unless) bits.push(row.suspended ? "suspended: banked reset available" : `unless ${row.unless}`);
+    const status = row.expired || row.suspended ? " (not applying)" : "";
+    console.log(`${row.meter} = ${row.percent}${status}${bits.length ? ` (${bits.join(", ")})` : ""}`);
+  }
+  return 0;
+}
+
+async function policySetReserve(argv: string[]): Promise<number> {
+  const meter = argv[0];
+  const percentRaw = argv[1];
+  const asJson = argv.includes("--json");
+  if (!meter || meter.startsWith("--") || percentRaw === undefined || percentRaw.startsWith("--")) throw new Error(POLICY_USAGE);
+  const percent = Number(percentRaw);
+  if (!Number.isFinite(percent) || percent < 0 || percent > 90) throw new Error("percent must be 0 through 90");
+  const reason = option(argv, "--reason");
+  if (!reason) throw new Error('--reason is required (e.g. --reason "stop new Codex builds at 70% used")');
+  const unlessRaw = option(argv, "--unless");
+  if (unlessRaw !== undefined && unlessRaw !== "banked_reset_available") throw new Error('--unless must be "banked_reset_available"');
+  const now = new Date();
+  const untilRaw = option(argv, "--until");
+  const until = untilRaw === undefined ? undefined : parseUntil(untilRaw, now);
+  const entry: ReserveEntry = { percent, reason, set_at: now.toISOString(), ...(until !== undefined ? { until } : {}), ...(unlessRaw !== undefined ? { unless: unlessRaw as ReserveEntry["unless"] } : {}) };
+
+  const home = headroomHome();
+  const path = join(home, "policy.toml");
+  await assertSafeAncestry(home);
+  const original = await readPolicyTextOrEmpty(path);
+  const beforePolicy = parsePolicy(original);
+  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+  const updated = upsertReserveEntry(original, meter, entry);
+  parsePolicy(updated); // validate before ever writing it
+
+  await safeOutputDirectory(home);
+  await backupPolicyFile(home, original);
+  await writeFileAtomic(path, updated, 0o600);
+  const after = describeReserveEntry(entry);
+  if (asJson) console.log(JSON.stringify(withContract({ meter, before, after })));
+  else console.log(`${meter}: ${before} -> ${after}`);
+  return 0;
+}
+
+async function policyClearReserve(argv: string[]): Promise<number> {
+  const meter = argv[0];
+  const asJson = argv.includes("--json");
+  if (!meter || meter.startsWith("--")) throw new Error(POLICY_USAGE);
+  const home = headroomHome();
+  const path = join(home, "policy.toml");
+  await assertSafeAncestry(home);
+  const original = await readPolicyTextOrEmpty(path);
+  const beforePolicy = parsePolicy(original);
+  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+  const updated = clearReserveEntry(original, meter);
+  parsePolicy(updated);
+
+  await safeOutputDirectory(home);
+  await backupPolicyFile(home, original);
+  await writeFileAtomic(path, updated, 0o600);
+  if (asJson) console.log(JSON.stringify(withContract({ meter, before, after: "cleared" })));
+  else console.log(`${meter}: ${before} -> cleared`);
+  return 0;
+}
+
+async function policySetFreeze(argv: string[]): Promise<number> {
+  const percentRaw = argv[0];
+  const asJson = argv.includes("--json");
+  if (percentRaw === undefined || percentRaw.startsWith("--")) throw new Error(POLICY_USAGE);
+  const percent = Number(percentRaw);
+  if (!Number.isFinite(percent) || percent < 0 || percent > 100) throw new Error("percent must be 0 through 100");
+  const reason = option(argv, "--reason");
+  const untilRaw = option(argv, "--until");
+  const now = new Date();
+  const until = untilRaw === undefined ? undefined : parseUntil(untilRaw, now);
+  const meta = reason !== undefined || until !== undefined ? { ...(reason !== undefined ? { reason } : {}), set_at: now.toISOString(), ...(until !== undefined ? { until } : {}) } : undefined;
+
+  const home = headroomHome();
+  const path = join(home, "policy.toml");
+  await assertSafeAncestry(home);
+  const original = await readPolicyTextOrEmpty(path);
+  const beforePolicy = parsePolicy(original);
+  const before = describeReserveEntry(beforePolicy.reserve_meta.freeze_reserve_pct ?? { percent: beforePolicy.freeze_reserve_pct });
+  const updated = setFreezeReservePct(original, percent, meta);
+  const afterPolicy = parsePolicy(updated);
+
+  await safeOutputDirectory(home);
+  await backupPolicyFile(home, original);
+  await writeFileAtomic(path, updated, 0o600);
+  const after = describeReserveEntry(afterPolicy.reserve_meta.freeze_reserve_pct ?? { percent: afterPolicy.freeze_reserve_pct });
+  if (asJson) console.log(JSON.stringify(withContract({ key: "freeze_reserve_pct", before, after })));
+  else console.log(`freeze_reserve_pct: ${before} -> ${after}`);
+  return 0;
+}
+
+async function policyCommand(argv: string[]): Promise<number> {
+  const sub = argv[0];
+  if (sub === "show") return policyShow(argv.slice(1));
+  if (sub === "set" && argv[1] === "reserve") return policySetReserve(argv.slice(2));
+  if (sub === "set" && argv[1] === "freeze_reserve_pct") return policySetFreeze(argv.slice(2));
+  if (sub === "clear" && argv[1] === "reserve") return policyClearReserve(argv.slice(2));
+  throw new Error(POLICY_USAGE);
+}
+
 /** A manual credits write goes through the daemon when it owns the database,
  * so status's cached read sees it immediately; otherwise it uses the same
  * store method directly. Both paths return the one current balance shape. */
@@ -641,7 +817,7 @@ async function run(argv: string[]): Promise<number> {
     // open leases: a single owner must not bypass shared-account protection by
     // launching several jobs in parallel.
     const admitted = store.admitAndStartLeases(
-      () => gateFor(store, needs, target, policy.freeze_reserve_pct, false, now, { owner, actionClass, includeOwnerReservations: true, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }),
+      () => gateFor(store, needs, target, policy.freeze_reserve_pct, false, now, { owner, actionClass, includeOwnerReservations: true, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }),
       owner,
       Array.isArray(target) ? target : [target],
       needs.reduce((sum, need) => sum + need.points, 0),
@@ -824,7 +1000,7 @@ async function plan(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
     const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints, policy.reserve_meta, policy.policy_mtime); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
@@ -885,7 +1061,7 @@ async function gate(argv: string[]): Promise<number> {
     directReadNotice();
     const policy = await readPolicy();
     const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
@@ -956,7 +1132,7 @@ async function fill(argv: string[]): Promise<number> {
     const policy = await readPolicy();
     const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
     const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -1561,6 +1737,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["run", "Gate, lease, and launch one command as an atomic dispatch"],
   ["report", "Record or clear a vendor-reported exhausted meter"],
   ["credits", "Record, clear, or list banked reset credits"],
+  ["policy", "Show effective reserves and their metadata, or set/clear a dated, reasoned reserve or freeze_reserve_pct"],
   ["ack plan", "Acknowledge a principal plan downgrade before dispatching again"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
@@ -1617,6 +1794,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "  set:   headroom credits set --principal <name> --available <n> --expires <YYYY-MM-DD or ISO instant> [--json]",
     "  clear: headroom credits clear --principal <name> [--json]",
   ].join("\n"),
+  policy: POLICY_USAGE,
   ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
@@ -1765,6 +1943,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "run") return run(argv.slice(1));
   if (argv[0] === "report") return report(argv.slice(1));
   if (argv[0] === "credits") return credits(argv.slice(1));
+  if (argv[0] === "policy") return policyCommand(argv.slice(1));
   if (argv[0] === "ack") return ack(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));
   if (argv[0] === "fill") return fill(argv.slice(1));
