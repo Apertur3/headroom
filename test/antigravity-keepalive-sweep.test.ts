@@ -756,8 +756,11 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence 
     const internal = supervisor as unknown as { configureLaunchDirectory(launchId: string): void; readAgyPidDetailed(): { kind: "found"; pid: number } | { kind: "absent" } | { kind: "invalid" } };
     internal.configureLaunchDirectory(launchId);
 
-    await writeFile(pidFilePath, "123\n", { mode: 0o600 });
-    expect(internal.readAgyPidDetailed()).toEqual({ kind: "found", pid: 123 });
+    // A pid that is certainly not running: a process that has already exited.
+    // (A fixed number such as 123 can be a live system process on a CI runner.)
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid as number;
+    await writeFile(pidFilePath, `${deadPid}\n`, { mode: 0o600 });
+    expect(internal.readAgyPidDetailed()).toEqual({ kind: "found", pid: deadPid });
     await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [], unverified: [] });
 
     for (const noncanonical of ["2e3", "123.0", "1 23", "+123", "0123", " 123", "123 ", "123\n\n", "123\r\n"]) {
