@@ -113,21 +113,27 @@ function trySignal(pid: number, signal: NodeJS.Signals): void {
 }
 
 /** ps-free liveness probe for a process GROUP (not just the bare pid): true
- * iff a signal-0 send to `-pid` succeeds or fails with EPERM (exists, just
- * not ours to signal -- still alive), false on ESRCH (no such group) or any
- * other error. Uses no `ps` at all, so it is the one identity signal that
- * still works when `ps` is denied or absent. Checking the GROUP specifically
- * (not the bare pid) is deliberately more specific than a plain liveness
- * check: a pid the OS recycled to an ordinary, non-leader process would
- * essentially never also happen to be a session/group leader of that exact
- * id, whereas an agy process (see antigravity-keepalive.ts) always is one.
- * It is still not a full identity proof -- see sweepPreviousKeepalive()'s use
- * of it alongside a launch-time/mtime cross-check for what that combination
- * does and does not verify. */
+ * iff a signal-0 send to `-pid` succeeds, fails with EPERM (exists, just not
+ * ours to signal -- still alive), or fails with anything else that is NOT
+ * ESRCH; false ONLY on ESRCH (kernel-confirmed: no such process group).
+ * Fails closed on purpose -- every caller treats `true` as "leave it alone"
+ * and `false` as "confirmed gone, safe to act" (reap, restart, clear
+ * evidence), so an unexpected errno (EINVAL, a sandboxed/virtualized kill(2)
+ * behaving unusually, anything not in POSIX's documented set for kill(2))
+ * must never be read as proof of death -- only ESRCH is that proof. Uses no
+ * `ps` at all, so it is the one identity signal that still works when `ps`
+ * is denied or absent. Checking the GROUP specifically (not the bare pid) is
+ * deliberately more specific than a plain liveness check: a pid the OS
+ * recycled to an ordinary, non-leader process would essentially never also
+ * happen to be a session/group leader of that exact id, whereas an agy
+ * process (see antigravity-keepalive.ts) always is one. It is still not a
+ * full identity proof -- see sweepPreviousKeepalive()'s use of it alongside
+ * a launch-time/mtime cross-check for what that combination does and does
+ * not verify. */
 export function isProcessGroupAlive(pid: number): boolean {
   if (process.platform === "win32") return false;
   try { process.kill(-pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
 /** SIGKILL a pid and, on POSIX, the process group it may lead (a PTY session

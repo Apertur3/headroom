@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { lstat, open, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
@@ -136,6 +136,22 @@ function isPlausiblePid(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 1 && value <= MAX_PID;
 }
 
+/** Strict canonical-decimal-integer parse of a pid FILE's raw text content
+ * (never used for a JSON state field, which is already a native, unambiguous
+ * JS number once parsed): only plain digits, no sign, no decimal point, no
+ * exponent, no leading zero (other than a bare "0", itself never a
+ * plausible pid), no internal whitespace. `Number(raw)` alone accepts far
+ * more than the launch wrapper's own `echo $$` could ever produce --
+ * `Number("2e3")` is 2000, `Number(" 123")` is 123 -- and none of that
+ * leniency is safe to extend to evidence a kill decision may act on: a
+ * string this loose was either never actually written by this file's own
+ * wrapper, or has been corrupted since, and either way must be rejected as
+ * invalid, not silently reinterpreted. Combined with isPlausiblePid for the
+ * numeric range check both pid readers apply on top of this. */
+function parseCanonicalPid(raw: string): number | undefined {
+  return /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : undefined;
+}
+
 /** Never trusts the file blindly: rejects a symlink, a non-regular file, or
  * a shape that doesn't match what writeKeepaliveStateSync() itself ever
  * writes -- by throwing InvalidKeepaliveEvidenceError, not by silently
@@ -199,8 +215,8 @@ async function readAgyPidFile(path: string): Promise<AgyPidFileEntry | undefined
   let raw: string;
   try { raw = await readFile(path, "utf8"); }
   catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot read agy pid file ${path}: ${(error as Error).message}`); }
-  const pid = Number(raw.trim());
-  if (!isPlausiblePid(pid)) throw new InvalidKeepaliveEvidenceError(`agy pid file ${path} does not contain a plain pid`);
+  const pid = parseCanonicalPid(raw.trim());
+  if (pid === undefined || !isPlausiblePid(pid)) throw new InvalidKeepaliveEvidenceError(`agy pid file ${path} does not contain a plain pid`);
   return { pid, mtimeMs: info.mtimeMs };
 }
 
@@ -882,23 +898,36 @@ export class AgyKeepaliveSupervisor {
   }
 
   /** Synchronous, ENOENT-vs-everything-else-distinguishing read of the
-   * launch wrapper's own pid file, with the same strict pid validation
-   * (isPlausiblePid) the async readers use -- "absent" (never written, or
-   * written by a launch that has since been cleaned up) and "invalid"
-   * (present but unreadable, non-numeric, out of the plausible pid range,
-   * or otherwise malformed) are never conflated: a caller deciding whether
-   * it is safe to restart or to trust a kill needs to tell "nothing here"
-   * apart from "something here that cannot be trusted". */
+   * launch wrapper's own pid file, with the same trust bar as the async
+   * readers: never follows a symlink, never accepts a non-regular file, and
+   * never accepts anything but a canonical decimal integer
+   * (parseCanonicalPid) within the plausible pid range (isPlausiblePid).
+   * "absent" (never written, or written by a launch that has since been
+   * cleaned up) and "invalid" (present but a symlink, not a regular file,
+   * unreadable, non-canonical, out of the plausible pid range, or otherwise
+   * malformed) are never conflated: a caller deciding whether it is safe to
+   * restart or to trust a kill needs to tell "nothing here" apart from
+   * "something here that cannot be trusted". */
   private readAgyPidDetailed(): { kind: "found"; pid: number } | { kind: "absent" } | { kind: "invalid" } {
     if (!this.agyPidFile) return { kind: "absent" };
-    let raw: string;
-    try { raw = readFileSync(this.agyPidFile, "utf8"); }
+    let info;
+    try { info = lstatSync(this.agyPidFile); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
       return { kind: "invalid" };
     }
-    const pid = Number(raw.trim());
-    return isPlausiblePid(pid) ? { kind: "found", pid } : { kind: "invalid" };
+    if (!info.isFile() || info.isSymbolicLink()) return { kind: "invalid" };
+    let raw: string;
+    try { raw = readFileSync(this.agyPidFile, "utf8"); }
+    catch (error) {
+      // Only ENOENT here (the file vanished between the lstat above and
+      // this read) still counts as "absent"; anything else found something
+      // it could not read.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      return { kind: "invalid" };
+    }
+    const pid = parseCanonicalPid(raw.trim());
+    return pid !== undefined && isPlausiblePid(pid) ? { kind: "found", pid } : { kind: "invalid" };
   }
 
   /** Throws unless the file is gone afterwards: launch() must never run while

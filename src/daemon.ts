@@ -269,7 +269,12 @@ export class HeadroomDaemon {
     catch (error) { this.keepaliveSwept = false; void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
   }
 
-  /** Start the owned agy PTY once an Antigravity poll needs it. */
+  /** Start the owned agy PTY once an Antigravity poll needs it. `accounts`/
+   * `policy` are the caller's own pre-await snapshot; kept only for
+   * signature/call-site compatibility, and deliberately NOT used for the
+   * actual launch decision, which always re-reads fresh right before it --
+   * see that re-read's own comment for why trusting these parameters here
+   * would be wrong. */
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
     // Never construct a new supervisor while an old one's stop() might still
@@ -300,12 +305,23 @@ export class HeadroomDaemon {
         return;
       }
     }
-    if (!policy.antigravity_keepalive || process.platform === "win32") return;
+    // The caller's own `accounts`/`policy` were snapshotted before every
+    // `await` this function has made so far (keepaliveStopPending, the
+    // sweep, and -- moments from now -- executablePath below): a reload
+    // that disables Antigravity partway through can land in that window,
+    // and a poll that captured its snapshot before the reload must not have
+    // its own (correct) decision overridden by THIS call finishing on
+    // stale, already-captured data. Re-read fresh, immediately before the
+    // actual decision, rather than trusting the parameters for it.
+    const freshAccounts = await this.currentAccounts();
+    const freshPolicy = await readPolicy();
+    if (this.stopping) return;
+    if (!freshPolicy.antigravity_keepalive || process.platform === "win32") return;
     // Centralized here (rather than trusting every caller to pre-filter) so
     // a disabled Antigravity account never launches its keepalive, whether
     // this is called from startup with the raw registry read or from a
     // scheduled poll with an already-enabled-only list.
-    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
+    const antigravity = freshAccounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
     if (!antigravity) return;
     // agy_path is a value from accounts.toml; verify ownership, mode, and
     // that it isn't a symlink before ever spawning it, the same bar every
@@ -1050,7 +1066,20 @@ export class HeadroomDaemon {
   private async currentAccounts(): Promise<Account[]> {
     let mtime: string;
     try { const info = await stat(accountsPath()); mtime = `${info.mtimeMs}:${info.size}`; }
-    catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { this.accounts = []; this.accountsMtime = undefined; return this.accounts; } throw error; }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.accounts = []; this.accountsMtime = undefined;
+        // No accounts.toml at all means no Antigravity account is enabled
+        // either: falls through to the SAME stop-if-nothing-enabled check
+        // the normal path below applies, rather than returning early and
+        // skipping it -- which used to leave a keepalive that was running
+        // when accounts.toml got deleted running (or endlessly retrying its
+        // own restart) forever, with nothing left in the config to justify it.
+        this.stopKeepaliveIfNoneEnabled(this.accounts);
+        return this.accounts;
+      }
+      throw error;
+    }
     if (this.accountsMtime === mtime) return this.accounts;
     const accounts = await readAccounts();
     const priorAccounts = new Map(this.accounts.map((account) => [account.name, account]));
@@ -1066,16 +1095,22 @@ export class HeadroomDaemon {
       this.backoff.delete(name);
     }
     if (this.schedulingStarted) for (const account of accounts) if (isAccountEnabled(account) && (!prior.has(account.name) || !isAccountEnabled(priorAccounts.get(account.name)!))) void this.schedulePrincipal(account.name);
-    // An existing keepalive with no enabled Antigravity account left to
-    // serve (the last one was disabled, or removed outright) must stop --
-    // an `accounts.toml` edit that disables Antigravity while the daemon is
-    // already running must not leave its `agy` process running
-    // unsupervised. Checked by EXISTENCE (`this.keepalive`), not `.running`:
-    // a supervisor that is mid-reap after a crash, or merely has a
-    // scheduled restart pending (this.restart set), reports `running` as
-    // false too, but will still relaunch on its own the moment that reap or
-    // timer resolves unless .stop() -- which clears its restart timer and
-    // sets its own `stopping` flag -- is actually called on it.
+    this.stopKeepaliveIfNoneEnabled(accounts);
+    return this.accounts;
+  }
+
+  /** An existing keepalive with no enabled Antigravity account left to serve
+   * (the last one was disabled, removed outright, or accounts.toml itself
+   * was deleted -- see both currentAccounts() call sites) must stop -- an
+   * `accounts.toml` edit that disables Antigravity while the daemon is
+   * already running must not leave its `agy` process running unsupervised.
+   * Checked by EXISTENCE (`this.keepalive`), not `.running`: a supervisor
+   * that is mid-reap after a crash, or merely has a scheduled restart
+   * pending (this.restart set), reports `running` as false too, but will
+   * still relaunch on its own the moment that reap or timer resolves unless
+   * .stop() -- which clears its restart timer and sets its own `stopping`
+   * flag -- is actually called on it. */
+  private stopKeepaliveIfNoneEnabled(accounts: Account[]): void {
     if (this.keepalive && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
       const keepalive = this.keepalive;
       this.keepalive = undefined;
@@ -1087,7 +1122,6 @@ export class HeadroomDaemon {
         .catch((error: unknown) => { void appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home); })
         .finally(() => { this.keepaliveStopPending = undefined; });
     }
-    return this.accounts;
   }
 }
 

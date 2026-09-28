@@ -694,6 +694,15 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence 
     await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
   });
 
+  it("rejects a noncanonical numeric .agy-pid file (scientific notation, decimals, padding) rather than parsing it loosely", async () => {
+    for (const noncanonical of ["2e3", "123.0", "1 23", "+123", "0123"]) {
+      const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-noncanonicalpid-")); temporary.push(root);
+      await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, noncanonical, { mode: 0o600 });
+
+      await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+    }
+  });
+
   it("rejects when the .agy-pid file is a symlink rather than a plain regular file", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-symlinkpidfile-")); temporary.push(root);
     const elsewhere = join(root, "elsewhere");
@@ -894,6 +903,83 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: the unexp
       // The invalid evidence itself is left exactly as it was -- never
       // silently "resolved" by treating it as absence.
       await expect(readFile(pidFilePath, "utf8")).resolves.toBe("not-a-pid");
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("a .agy-pid file that becomes a symlink at exit time is never followed -- its target's pid is never signalled, and no restart is permitted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-symlinkpid-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 30,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      track(Number(await waitForFile(infoFile)), root);
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnCount).toBe(1);
+
+      // A real, live, unrelated stranger process stands in for whatever a
+      // symlink might get pointed at. Replace the real pid file with a
+      // symlink naming it, right before killing script -- if this were
+      // ever followed, the stranger would be read as agy's own pid.
+      const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+      const strangerPid = track(stranger.pid, root) as number;
+      const strangerPidFile = join(root, "stranger-pid.txt");
+      await writeFile(strangerPidFile, String(strangerPid), { mode: 0o600 });
+      await rm(pidFilePath, { force: true });
+      await symlink(strangerPidFile, pidFilePath);
+      process.kill(scriptPid, "SIGKILL");
+
+      // Several retry/backoff cycles' worth of time: must never restart,
+      // and the stranger must never be touched.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(spawnCount).toBe(1);
+      expect(alive(strangerPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("a .agy-pid file containing a noncanonical number (scientific notation) at exit time is never accepted as a plain pid", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-noncanonicalpid-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 30,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      track(Number(await waitForFile(infoFile)), root);
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnCount).toBe(1);
+
+      // "2e3" reads as the number 2000 to a loose `Number(...)` parse, but
+      // is not what this file's own wrapper (a bare `echo $$`) could ever
+      // produce -- treated as invalid, exactly like "not-a-pid" above, not
+      // silently reinterpreted as pid 2000.
+      await writeFile(pidFilePath, "2e3", { mode: 0o600 });
+      process.kill(scriptPid, "SIGKILL");
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(spawnCount).toBe(1);
+      await expect(readFile(pidFilePath, "utf8")).resolves.toBe("2e3");
     } finally { await supervisor.stop(); }
   }, 15_000);
 });

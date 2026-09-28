@@ -91,9 +91,13 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
     }
   }, 15_000);
 
-  it("maybeStartKeepalive() waits for a still-in-flight keepalive stop, and the supervisor it then starts is a genuinely different instance", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-stopgate-")); temporary.push(root);
+  it("maybeStartKeepalive() waits for a REAL keepalive stop still in flight (not a substituted timer), and only then starts a genuinely different supervisor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-realstopgate-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
+    // Ignores SIGTERM (writeFakeAgy's whole point): killTree's SIGTERM phase
+    // cannot touch it, forcing the REAL killGraceMs (300ms) grace wait plus
+    // SIGKILL escalation and confirmation before stop() actually resolves --
+    // a genuine "still in flight" window, not a substitute for one.
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
@@ -106,44 +110,42 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
         throw error;
       }
       const internal = daemon as unknown as {
-        keepalive: { running: boolean; stop(): Promise<void> } | undefined;
+        keepalive: { running: boolean } | undefined;
         keepaliveStopPending: Promise<void> | undefined;
         currentAccounts(): Promise<unknown>;
         maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
       };
-      // daemon.start() already launched a real keepalive from accounts.toml
-      // (enabled from the start). Disable it through the REAL path
-      // (currentAccounts(), not a direct .stop() call) so `this.keepalive`
-      // is genuinely nulled the same way production does it -- a direct
-      // .stop() call leaves the daemon's own field pointing at the same
-      // (now-stopped) instance, which maybeStartKeepalive()'s `??=` would
-      // then just restart in place rather than replacing, defeating the
-      // identity check below for reasons unrelated to what it exists to
-      // prove.
       const firstKeepalive = internal.keepalive;
       const firstAgyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      expect(firstKeepalive).toBeDefined();
+
+      // Real disable: currentAccounts() fires the real stop() and tracks it
+      // via keepaliveStopPending WITHOUT awaiting it itself (see that
+      // field's own doc comment). Because the fake agy ignores SIGTERM, this
+      // real stop() is still genuinely running when currentAccounts() (which
+      // only takes a few ms of its own) returns.
+      const disableStartedAt = Date.now();
       await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
       await internal.currentAccounts();
-      await waitUntilDead(firstAgyPid);
-      await vi.waitFor(() => { expect(internal.keepalive).toBeUndefined(); }, { timeout: 3_000, interval: 20 });
+      expect(internal.keepalive).toBeUndefined(); // dropped synchronously, before the real stop() settles
+      expect(internal.keepaliveStopPending).toBeDefined(); // the real stop() is genuinely still running right now
       await rm(infoFile, { force: true });
 
-      // Stands in for a previous keepalive's stop() still in flight -- see
-      // currentAccounts()'s disable branch, which assigns exactly this kind
-      // of promise without waiting for it itself. A quick disable-then-
-      // re-enable must not let a new supervisor start while that stop()
-      // might still be reading or writing the same shared home/state-file
-      // paths (see keepaliveStopPending's own doc comment).
-      const stopStartedAt = Date.now();
-      internal.keepaliveStopPending = new Promise<void>((resolve) => setTimeout(resolve, 300));
+      // Re-enable immediately, WHILE that real stop() is still in flight:
+      // maybeStartKeepalive() must wait for it rather than racing it. Its
+      // own `accounts`/`policy` parameters are deliberately empty/wrong
+      // here -- the actual decision re-reads accounts.toml and policy fresh
+      // regardless (see maybeStartKeepalive's own comment), which is what
+      // lets this re-enable be picked up via nothing but that file write.
+      await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+      await internal.maybeStartKeepalive([], {});
 
-      const accounts = [{ name: "antigravity", enabled: true, vendor: "antigravity", location: "agy", adapter: "native-ts", agy_path: fakeAgy }];
-      await internal.maybeStartKeepalive(accounts, { antigravity_keepalive: true });
-
-      // Must have waited out the pending stop, not raced past it.
-      expect(Date.now() - stopStartedAt).toBeGreaterThanOrEqual(280);
+      // Must have waited out (essentially all of) the real stop(), not
+      // raced past it.
+      expect(Date.now() - disableStartedAt).toBeGreaterThanOrEqual(250);
       expect(internal.keepalive?.running).toBe(true);
       expect(internal.keepalive).not.toBe(firstKeepalive); // a genuinely different supervisor, not the stopped one
+      await waitUntilDead(firstAgyPid); // the real stop() did complete, for real, by the time the call above returned
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
       expect(alive(agyPid)).toBe(true);
     } finally {
@@ -342,4 +344,89 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
   }, 20_000);
+
+  it("a poll's already-captured enabled snapshot never launches once accounts.toml disables it before that poll's own start attempt actually runs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-stalepoll-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    // Starts disabled: daemon.start() itself must never launch anything, so
+    // `internal.keepalive` is reliably undefined going into the real
+    // scenario below.
+    await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
+      const internal = daemon as unknown as {
+        keepalive: { running: boolean } | undefined;
+        maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
+      };
+      expect(internal.keepalive).toBeUndefined();
+
+      // A poll that ran earlier (or is simply slow) captured its OWN
+      // accounts/policy snapshot back when Antigravity was enabled --
+      // standing in for exactly that snapshot, taken before anything below
+      // happened.
+      const staleAccounts = [{ name: "antigravity", enabled: true, vendor: "antigravity", location: "agy", adapter: "native-ts", agy_path: fakeAgy }];
+      const stalePolicy = { antigravity_keepalive: true };
+
+      // The real world moves on: accounts.toml disables Antigravity before
+      // that poll's own deferred call to maybeStartKeepalive() ever runs.
+      await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+
+      // The stale, already-captured call finally completes.
+      await internal.maybeStartKeepalive(staleAccounts, stalePolicy);
+
+      // Must never have launched on the strength of the stale snapshot.
+      expect(internal.keepalive).toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await expect(readFile(infoFile, "utf8")).rejects.toThrow();
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
+
+  it("deleting accounts.toml while a keepalive is running stops and discards it, the same as disabling it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-deletedaccounts-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
+      const internal = daemon as unknown as {
+        keepalive: { running: boolean } | undefined;
+        currentAccounts(): Promise<unknown>;
+      };
+      expect(internal.keepalive).toBeDefined();
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      expect(alive(agyPid)).toBe(true);
+
+      // Delete accounts.toml outright (rather than disabling the account
+      // inside it): with no file at all, no Antigravity account -- indeed
+      // no account of any kind -- is enabled, and that must stop the
+      // keepalive exactly like an explicit disable does, not skip the check
+      // via an early ENOENT return.
+      await rm(join(root, "accounts.toml"), { force: true });
+      await internal.currentAccounts();
+
+      await waitUntilDead(agyPid);
+      expect(internal.keepalive).toBeUndefined();
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
 });
