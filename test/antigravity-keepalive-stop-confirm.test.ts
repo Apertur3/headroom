@@ -13,8 +13,8 @@ import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-p
  * processes and real signals. The mock affects only the CONFIRMATION check;
  * the actual kill signals stop() sends are untouched and real, so the agy
  * this test starts genuinely dies -- the point is proving stop() does not
- * *trust* that it died without independently confirming it, using a real,
- * P0-compliant process (tracked via mortal-process.ts) throughout.
+ * *trust* that it died without independently confirming it, using a real
+ * process (tracked via mortal-process.ts, never left running) throughout.
  */
 vi.mock("../src/process-tree.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/process-tree.js")>();
@@ -105,6 +105,51 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
       // The real agy did in fact die for real (SIGKILL cannot be blocked) --
       // only the mocked confirmation lied about it.
       await waitUntilDead(agyPid);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("start() refuses to launch a replacement while the unexpected-exit path's reap is still unresolved", async () => {
+    const { spawn: realSpawn } = await import("node:child_process");
+    const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-reaping-guard-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100,
+      spawn: spyingSpawn, restartDelay: () => 0,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+      expect(spawnCount).toBe(1);
+
+      // Triggers the unexpected-exit path; isProcessGroupAlive is mocked, so
+      // its reap can never confirm the kill worked and keeps retrying.
+      process.kill(scriptPid, "SIGKILL");
+
+      // A moment for the exit handler to actually start: `running` goes
+      // false as soon as `this.child` is cleared -- exactly the state a
+      // concurrent poll cycle (elsewhere in the daemon) would observe.
+      await vi.waitFor(() => { expect(supervisor.running).toBe(false); }, { timeout: 2_000, interval: 10 });
+      expect(supervisor.pid).toBeUndefined();
+
+      // A concurrent caller seeing `running === false` right now (e.g. the
+      // daemon's own scheduled poll, via maybeStartKeepalive) must not be
+      // able to launch a replacement on top of the still-unresolved orphan.
+      supervisor.start();
+      supervisor.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(spawnCount).toBe(1); // start() refused every time, exactly as `reaping` demands
+
+      await waitUntilDead(agyPid); // the real kill still worked; only confirmation was mocked
     } finally { await supervisor.stop(); }
   }, 15_000);
 });

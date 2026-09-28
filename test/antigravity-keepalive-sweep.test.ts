@@ -536,6 +536,33 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: ps-free i
     expect(result.unverified).toContain(strangerPid); // alive, but the evidence is too old to trust
     expect(alive(strangerPid)).toBe(true);
   }, 10_000);
+
+  it("never verifies evidence whose recorded launch time is implausibly in the future", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-futurelaunch-")); temporary.push(root);
+    // A REAL, live, detached process stands in for the pid the .agy-pid file
+    // names. Its mtime is made to match the (future) launchedAt exactly --
+    // internally self-consistent, the one thing the mtime-bound check
+    // verifies -- so only an explicit "not implausibly in the future" check
+    // can reject it: without one, `now - launchedAtMs` goes negative and is
+    // trivially <= the (positive) max-age bound, for ANY future timestamp.
+    const stranger = spawn(await writeMortalShim(join(root, "future-stranger")), [], { stdio: "ignore", detached: true });
+    const strangerPid = track(stranger.pid, root) as number;
+    const futureLaunchedAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 minutes from now
+    await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+      scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
+      launchedAt: futureLaunchedAt, recordedAt: futureLaunchedAt, verified: false,
+    }), { mode: 0o600 });
+    const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+    await writeFile(pidFilePath, String(strangerPid), { mode: 0o600 });
+    const futureTime = new Date(Date.parse(futureLaunchedAt));
+    await utimes(pidFilePath, futureTime, futureTime); // mtime matches launchedAt exactly
+
+    const result = await sweepPreviousKeepalive(root);
+
+    expect(result.swept).not.toContain(strangerPid);
+    expect(result.unverified).toContain(strangerPid); // alive, but the launch time is implausible
+    expect(alive(strangerPid)).toBe(true);
+  }, 10_000);
 });
 
 describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: a kill that fails or cannot be confirmed is never trusted as reaped", () => {
@@ -681,6 +708,36 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence 
 
     await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [], unverified: [] });
   });
+
+  it("rejects a state file whose agy* tuple is only partially present, rather than silently dropping the pieces that showed up", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-partialtuple-")); temporary.push(root);
+    await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+      scriptPid: 12345, scriptCommand: "/usr/bin/script", scriptStartedAt: "Mon Jan 1 00:00:00 2000",
+      recordedAt: new Date().toISOString(), verified: true,
+      agyPid: 12346, // agyCommand and agyStartedAt are missing -- a corrupt, partial write
+    }), { mode: 0o600 });
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
+
+  it("rejects a scriptPid that is not a plain positive integer (NaN, a float, zero, or negative)", async () => {
+    for (const badPid of [Number.NaN, 1.5, 0, -5]) {
+      const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-badscriptpid-")); temporary.push(root);
+      await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+        scriptPid: badPid, scriptCommand: "/usr/bin/script", scriptStartedAt: "Mon Jan 1 00:00:00 2000",
+        recordedAt: new Date().toISOString(), verified: true,
+      }), { mode: 0o600 });
+
+      await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+    }
+  });
+
+  it("rejects a pid (in either the state file or the .agy-pid file) that is absurdly out of the plausible pid range", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-outofrangepid-")); temporary.push(root);
+    await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, "99999999999", { mode: 0o600 }); // far beyond any real pid_max
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
 });
 
 describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): never acts on evidence a different launch has since claimed", () => {
@@ -724,5 +781,119 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): ne
       expect(alive(newerAgyPid)).toBe(true);
       await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toContain("a-completely-different-launch-id");
     } finally { await supervisorA.stop(); }
+  }, 15_000);
+
+  it("treats a missing state file as NOT proof of ownership -- a stranger named only in a surviving .agy-pid file is never signalled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-missingstate-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, killGraceMs: 100 });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+
+      // Delete the JSON state (the only thing that carries this launch's
+      // own launchId) but leave the pid file in place, pointed at an
+      // unrelated, real, live process -- exactly what "missing state, but
+      // a pid file survives" looks like.
+      await rm(keepaliveStateFilePath(root), { force: true });
+      const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+      const strangerPid = track(stranger.pid, root) as number;
+      await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, String(strangerPid), { mode: 0o600 });
+
+      await supervisor.stop();
+
+      // supervisor's own script+agy still die for real, via killTree's ps
+      // walk of ITS OWN scriptPid -- unaffected by any of this.
+      await waitUntilDead(scriptPid);
+      await waitUntilDead(agyPid);
+      // The stranger named only by the surviving (now state-less) pid file
+      // is never signalled: a missing state file proves nothing, and is
+      // never treated as if it proved ownership.
+      expect(alive(strangerPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+});
+
+describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: the unexpected-exit path never restarts on the strength of a missing or malformed pid file", () => {
+  it("a pid file missing at exit time is retried (bounded) before a restart is ever allowed, not permitted immediately", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-missingpid-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    const spawnTimes: number[] = [];
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnTimes.push(Date.now());
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 30, pidDiscoveryAttempts: 5, restartDelay: () => 0,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnTimes.length).toBe(1);
+
+      // Remove the pid file right before killing script, so the exit
+      // handler finds nothing when it first looks -- "missing at exit
+      // time", not corrupted.
+      await rm(pidFilePath, { force: true });
+      process.kill(scriptPid, "SIGKILL");
+
+      // Must not restart on the very first (missing) read.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(spawnTimes.length).toBe(1);
+
+      // But must eventually restart once the bounded discovery window (5 *
+      // 30ms = 150ms) genuinely never finds anything.
+      await vi.waitFor(() => { expect(spawnTimes.length).toBe(2); }, { timeout: 3_000, interval: 20 });
+      expect(spawnTimes[1] - spawnTimes[0]).toBeGreaterThanOrEqual(140); // waited out the discovery window, not raced past it
+      track(supervisor.pid, root);
+      track(Number(await waitForFile(infoFile)), root);
+      void agyPid; // the original orphan (its pid file vanished before anything could reap it) is left for the reaper to clean up -- this test's own artificial corruption, not a production path
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("a malformed pid file at exit time is retried indefinitely and never permits a restart on its own", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-malformedpid-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 30,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      track(Number(await waitForFile(infoFile)), root);
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnCount).toBe(1);
+
+      // Corrupt the evidence right before killing script -- something DID
+      // write to this path, unlike the "missing" case above, and that must
+      // never be treated the same as "nothing here, safe to restart".
+      await writeFile(pidFilePath, "not-a-pid", { mode: 0o600 });
+      process.kill(scriptPid, "SIGKILL");
+
+      // Several retry/backoff cycles' worth of time: must never restart.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(spawnCount).toBe(1);
+      // The invalid evidence itself is left exactly as it was -- never
+      // silently "resolved" by treating it as absence.
+      await expect(readFile(pidFilePath, "utf8")).resolves.toBe("not-a-pid");
+    } finally { await supervisor.stop(); }
   }, 15_000);
 });

@@ -182,12 +182,14 @@ export class HeadroomDaemon {
    * so a possibly-live orphan is never doubled up on; cleared once none of
    * them are alive any more. */
   private keepaliveUnverifiedPids: number[] = [];
-  /** False until a sweepStaleKeepalive() call has completed WITHOUT throwing.
-   * maybeStartKeepalive() must never launch a fresh keepalive on the strength
-   * of an empty keepaliveUnverifiedPids that only looks empty because the
-   * sweep that would have populated it never actually ran to completion --
-   * that reads identically to "nothing to worry about" while actually
-   * meaning "we never checked". */
+  /** Reflects only the MOST RECENT sweepStaleKeepalive() call: true right
+   * after one completes without throwing, reset false the instant one
+   * throws. maybeStartKeepalive() re-sweeps immediately before every single
+   * launch attempt (not just once per daemon process -- see its own
+   * comment) and must never launch a fresh keepalive on the strength of an
+   * empty keepaliveUnverifiedPids that only looks empty because THAT sweep
+   * never actually ran to completion -- that reads identically to "nothing
+   * to worry about" while actually meaning "we never checked". */
   private keepaliveSwept = false;
   /** Set whenever a keepalive is stopped OUTSIDE of the daemon's own stop()
    * (currently: currentAccounts() dropping it once no enabled Antigravity
@@ -264,7 +266,7 @@ export class HeadroomDaemon {
       this.keepaliveUnverifiedPids = result.unverified;
       this.keepaliveSwept = true;
     }
-    catch (error) { void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
+    catch (error) { this.keepaliveSwept = false; void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
   }
 
   /** Start the owned agy PTY once an Antigravity poll needs it. */
@@ -274,9 +276,18 @@ export class HeadroomDaemon {
     // be reading or writing the same shared home/state-file paths -- see
     // keepaliveStopPending's own doc comment.
     if (this.keepaliveStopPending) await this.keepaliveStopPending;
-    if (!this.keepaliveSwept) await this.sweepStaleKeepalive(); // retry: a transient sweep failure must not permanently block every later cycle
+    if (this.stopping) return; // the daemon began shutting down while this call was waiting
+    // Re-swept on EVERY attempt, not just once per daemon process: evidence
+    // can appear after an earlier successful sweep -- most notably a
+    // just-disabled keepalive's own stop() leaving its state behind because
+    // it could not confirm agy was actually gone (see
+    // AgyKeepaliveSupervisor.stop's own doc comment) -- and a live daemon can
+    // disable/re-enable Antigravity any number of times without ever
+    // restarting, so "swept once, earlier" is not "still safe to trust now".
+    await this.sweepStaleKeepalive();
+    if (this.stopping) return;
     if (!this.keepaliveSwept) {
-      void appendDaemonLog("antigravity keepalive: deferring a new launch -- the startup sweep has not completed cleanly yet", this.home);
+      void appendDaemonLog("antigravity keepalive: deferring a new launch -- the sweep before this attempt did not complete cleanly", this.home);
       return;
     }
     if (this.keepaliveUnverifiedPids.length) {
@@ -301,6 +312,7 @@ export class HeadroomDaemon {
     // other executable Headroom runs must clear.
     try {
       const binary = await executablePath(resolveAgyBinary(antigravity.agy_path));
+      if (this.stopping) return; // right before start(): never launch after shutdown began
       this.keepalive ??= new AgyKeepaliveSupervisor({ binary, home: this.home });
       this.keepalive.start();
     } catch (error) {
@@ -312,6 +324,15 @@ export class HeadroomDaemon {
     this.stopping = true;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
+    // A disable cycle (currentAccounts()) may have a keepalive stop still in
+    // flight, tracked but deliberately not awaited there (see
+    // keepaliveStopPending's own doc comment) -- shutdown must wait for it
+    // too. Skipping this let a concurrent maybeStartKeepalive() (also
+    // awaiting the same promise, e.g. from a disable/re-enable poll racing
+    // this SIGTERM) resume and construct a brand new keepalive AFTER the
+    // server and store below were already closed, with nothing left running
+    // to supervise or stop it again.
+    if (this.keepaliveStopPending) await this.keepaliveStopPending;
     await this.keepalive?.stop();
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
@@ -1045,11 +1066,17 @@ export class HeadroomDaemon {
       this.backoff.delete(name);
     }
     if (this.schedulingStarted) for (const account of accounts) if (isAccountEnabled(account) && (!prior.has(account.name) || !isAccountEnabled(priorAccounts.get(account.name)!))) void this.schedulePrincipal(account.name);
-    // A running keepalive with no enabled Antigravity account left to serve
-    // (the last one was disabled, or removed outright) must stop -- an
-    // `accounts.toml` edit that disables Antigravity while the daemon is
-    // already running must not leave its `agy` process running unsupervised.
-    if (this.keepalive?.running && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
+    // An existing keepalive with no enabled Antigravity account left to
+    // serve (the last one was disabled, or removed outright) must stop --
+    // an `accounts.toml` edit that disables Antigravity while the daemon is
+    // already running must not leave its `agy` process running
+    // unsupervised. Checked by EXISTENCE (`this.keepalive`), not `.running`:
+    // a supervisor that is mid-reap after a crash, or merely has a
+    // scheduled restart pending (this.restart set), reports `running` as
+    // false too, but will still relaunch on its own the moment that reap or
+    // timer resolves unless .stop() -- which clears its restart timer and
+    // sets its own `stopping` flag -- is actually called on it.
+    if (this.keepalive && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
       const keepalive = this.keepalive;
       this.keepalive = undefined;
       // Tracked (not fired-and-forgotten): maybeStartKeepalive() awaits this
