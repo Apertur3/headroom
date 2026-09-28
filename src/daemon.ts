@@ -747,7 +747,8 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : undefined;
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
           const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
-          const disabled = meter ? disabledPrincipalForMeter(await this.currentAccounts(), meter) : undefined;
+          const accounts = await this.currentAccounts();
+          const disabled = meter ? disabledPrincipalForMeter(accounts, meter) : undefined;
           if (disabled) {
             // Same documented bare RateLine[] array `rate` always returns
             // (docs/json-contract.md) -- a synthetic UNKNOWN line, not a
@@ -755,7 +756,9 @@ export class HeadroomDaemon {
             result = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabledPrincipalReason(disabled) }] satisfies RateLine[];
             break;
           }
-          result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined); break;
+          result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined, {
+            enabledPrincipalIds: meter ? undefined : new Set(accounts.filter(isAccountEnabled).map((account) => account.name)),
+          }); break;
         }
         case "spend": {
           const meter = typeof params.meter === "string" && params.meter.trim() ? params.meter.trim() : undefined;
@@ -764,7 +767,8 @@ export class HeadroomDaemon {
           result = this.store.spendByOwner({ meter, owner, since: sinceValue }); break;
         }
         case "credits": {
-          result = this.store.credits(new Date()); break;
+          const enabledPrincipalIds = new Set((await this.currentAccounts()).filter(isAccountEnabled).map((account) => account.name));
+          result = this.store.credits(new Date()).filter((item) => enabledPrincipalIds.has(item.meter.split(":", 1)[0])); break;
         }
         case "credits_set": {
           const principal = typeof params.principal === "string" ? params.principal.trim() : "";
@@ -772,7 +776,9 @@ export class HeadroomDaemon {
           if (!principal) return reject(-32602, "principal is required");
           if (!Number.isFinite(available) || typeof available !== "number" || available < 0 || !Number.isInteger(available)) return reject(-32602, "available must be a non-negative whole number", principal);
           if (typeof params.expires !== "string") return reject(-32602, "expires is required", principal);
-          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          const account = (await this.currentAccounts()).find((item) => item.name === principal);
+          if (!account) return reject(-32602, `unknown principal: ${principal}`, principal);
+          if (!isAccountEnabled(account)) return reject(-32602, disabledPrincipalReason(account.name), principal);
           let expires: string;
           try { expires = parseCreditExpiry(params.expires); }
           catch (error) { return reject(-32602, error instanceof Error ? error.message : "invalid expiry", principal); }
@@ -786,7 +792,9 @@ export class HeadroomDaemon {
         case "credits_clear": {
           const principal = typeof params.principal === "string" ? params.principal.trim() : "";
           if (!principal) return reject(-32602, "principal is required");
-          if (!(await this.currentAccounts()).some((account) => account.name === principal)) return reject(-32602, `unknown principal: ${principal}`, principal);
+          const account = (await this.currentAccounts()).find((item) => item.name === principal);
+          if (!account) return reject(-32602, `unknown principal: ${principal}`, principal);
+          if (!isAccountEnabled(account)) return reject(-32602, disabledPrincipalReason(account.name), principal);
           this.store.clearManualCredits(principal);
           // See credits_set above: the common `ok` audit below covers this too.
           result = this.store.credits().find((item) => item.meter === `${principal}:credits`)!;
@@ -839,7 +847,7 @@ export class HeadroomDaemon {
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
           const routing = actionClass ? await readRouting() : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, capPercent: typeof params.cap_percent === "number" ? params.cap_percent : undefined, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); break;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, capPercent: typeof params.cap_percent === "number" ? params.cap_percent : undefined, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, enabledPrincipalIds: new Set(accounts.filter(isAccountEnabled).map((account) => account.name)) }); break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
@@ -994,7 +1002,7 @@ export class HeadroomDaemon {
       // this poll's own interval, so piggybacking here adds no load to the
       // ordinary quota poll cadence. Deliberately not awaited, same reason
       // as the notification pass above.
-      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account)))
+      void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && isAccountEnabled(account)))
         .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         if (disabled.has(principalId)) continue;

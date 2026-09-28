@@ -42,7 +42,7 @@ import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccount
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
-import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
@@ -290,7 +290,7 @@ async function can(argv: string[]): Promise<number> {
       const readStore = await HeadroomStore.openReadOnly();
       try {
         const policy = await readPolicy();
-        const localAccounts = accounts.filter(isLocalAccount);
+        const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
         const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
         const allMeters = [...new Set([...meters, ...localMeters])];
         const now = new Date();
@@ -658,6 +658,7 @@ async function rate(argv: string[]): Promise<number> {
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
   const disabled = meter ? await disabledMeterReason(meter) : undefined;
+  const enabledPrincipalIds = meter ? undefined : new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
   let lines: RateLine[];
   if (disabled) {
     // Same synthetic-line shape rateLines() already uses for any other
@@ -667,16 +668,16 @@ async function rate(argv: string[]): Promise<number> {
     lines = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }];
   } else {
     const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
-    if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
+    if (outcome.kind === "available") { lines = (unwrapRpc(outcome.result) as RateLine[]).filter((line) => !enabledPrincipalIds || enabledPrincipalIds.has(line.meter.split(":", 1)[0])); }
     else if (outcome.kind === "cache") {
       cacheReadNotice();
       const store = await HeadroomStore.openReadOnly();
-      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need, { enabledPrincipalIds }); }
       finally { store.close(); }
     } else {
       directReadNotice();
       const store = await HeadroomStore.open();
-      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need, { enabledPrincipalIds }); store.audit("cli", "rate", meter ?? null, "ok"); }
       finally { store.close(); }
     }
   }
@@ -749,7 +750,9 @@ function printCredits(items: CreditBalance[]): void {
 }
 
 async function configuredCreditPrincipal(principal: string): Promise<void> {
-  if (!(await readAccounts()).some((account) => account.name === principal)) throw new Error(`unknown principal: ${principal}`);
+  const account = (await readAccountsOrEmpty()).find((item) => item.name === principal);
+  if (!account) throw new Error(`unknown principal: ${principal}`);
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
 }
 
 const POLICY_USAGE = [
@@ -777,12 +780,21 @@ async function readPolicyTextOrEmpty(path: string): Promise<string> {
 /** Writes a timestamped `.bak-<iso>` copy of the CURRENT on-disk policy.toml
  * before any `policy set/clear` write -- skipped only when the file did not
  * exist yet (nothing to back up). Mirrors notify-configure.ts's own
- * atomic-write/0600 pattern, plus the backup this editor additionally makes. */
+ * atomic-write/0600 pattern, plus the backup this editor additionally makes.
+ * The name is only a starting point: two backups whose ISO stamp collides at
+ * millisecond resolution (two `policy set` calls landing in the same
+ * millisecond) each still get their own file -- writeExclusiveFile appends a
+ * counter suffix on a collision instead of one silently replacing the
+ * other's backup. */
 async function backupPolicyFile(home: string, original: string): Promise<void> {
   if (!original) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  await writeFileAtomic(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
+  await writeExclusiveFile(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
 }
+
+// withPolicyLock (used by every policy.toml writer below, and by
+// notify-configure.ts's own reread-compare-write) lives in security.js --
+// it is shared, not owned by this file.
 
 interface PolicyReserveRow {
   meter: string; percent: number; effective_percent: number; reason: string | null;
@@ -849,16 +861,18 @@ async function policySetReserve(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
-  const updated = upsertReserveEntry(original, meter, entry);
-  parsePolicy(updated); // validate before ever writing it
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
-  const after = describeReserveEntry(entry);
+  const { before, after } = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+    const updated = upsertReserveEntry(original, meter, entry);
+    parsePolicy(updated); // validate before ever writing it
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return { before: beforeLine, after: describeReserveEntry(entry) };
+  });
   if (asJson) console.log(JSON.stringify(withContract({ meter, before, after })));
   else console.log(`${meter}: ${before} -> ${after}`);
   return 0;
@@ -871,15 +885,18 @@ async function policyClearReserve(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
-  const updated = clearReserveEntry(original, meter);
-  parsePolicy(updated);
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
+  const before = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+    const updated = clearReserveEntry(original, meter);
+    parsePolicy(updated);
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return beforeLine;
+  });
   if (asJson) console.log(JSON.stringify(withContract({ meter, before, after: "cleared" })));
   else console.log(`${meter}: ${before} -> cleared`);
   return 0;
@@ -900,16 +917,18 @@ async function policySetFreeze(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta.freeze_reserve_pct ?? { percent: beforePolicy.freeze_reserve_pct });
-  const updated = setFreezeReservePct(original, percent, meta);
-  const afterPolicy = parsePolicy(updated);
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
-  const after = describeReserveEntry(afterPolicy.reserve_meta.freeze_reserve_pct ?? { percent: afterPolicy.freeze_reserve_pct });
+  const { before, after } = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta.freeze_reserve_pct ?? { percent: beforePolicy.freeze_reserve_pct });
+    const updated = setFreezeReservePct(original, percent, meta);
+    const afterPolicy = parsePolicy(updated);
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return { before: beforeLine, after: describeReserveEntry(afterPolicy.reserve_meta.freeze_reserve_pct ?? { percent: afterPolicy.freeze_reserve_pct }) };
+  });
   if (asJson) console.log(JSON.stringify(withContract({ key: "freeze_reserve_pct", before, after })));
   else console.log(`freeze_reserve_pct: ${before} -> ${after}`);
   return 0;
@@ -932,6 +951,7 @@ async function credits(argv: string[]): Promise<number> {
   const asJson = argv.includes("--json");
   if (!command || command === "--json") {
     if (argv.some((value) => value !== "--json")) throw new Error("Usage: headroom credits [--json]");
+    const enabledPrincipalIds = new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
     const request = await requestDaemon("credits");
     let items: CreditBalance[];
     if (request !== undefined) items = unwrapRpc(request) as CreditBalance[];
@@ -940,6 +960,7 @@ async function credits(argv: string[]): Promise<number> {
       try { items = store.credits(); store.audit("cli", "credits", null, "ok"); }
       finally { store.close(); }
     }
+    items = items.filter((item) => enabledPrincipalIds.has(item.meter.split(":", 1)[0]));
     if (asJson) console.log(JSON.stringify(withContract({ credits: items })));
     else printCredits(items);
     return 0;
@@ -1590,7 +1611,7 @@ export async function observe(argv: string[]): Promise<number> {
       // Run this only after rendering below. Antigravity's catalog read can
       // make several bounded network calls; it must never delay this direct
       // quota result. Its own store is opened after this status store closes.
-      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && (!principal || account.name === principal));
+      directCatalogAccounts = (await readAccounts().catch((): Account[] => [])).filter((account): account is ProviderAccount => !isLocalAccount(account) && isAccountEnabled(account) && (!principal || account.name === principal));
       directCatalogHome = headroomHome();
       const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
       const now = new Date();
@@ -1672,7 +1693,7 @@ export async function observe(argv: string[]): Promise<number> {
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
   }
-  if (directCatalogAccounts && directCatalogHome) {
+  if (directCatalogAccounts?.length && directCatalogHome) {
     await (async () => {
       const catalogStore = await HeadroomStore.open(directCatalogHome!);
       try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
@@ -1823,7 +1844,8 @@ async function statusline(argv: string[]): Promise<number> {
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { payload = undefined; }
     snapshot = snapshotFromStatuslinePayload(payload, profile, now);
-    if (snapshot) {
+    const account = (await readAccountsOrEmpty()).find((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude" && statuslineProfile(item.location) === profile);
+    if (snapshot && (!account || isAccountEnabled(account))) {
       // Resolves and verifies the same safe Headroom home every other
       // command uses (never the raw, unchecked headroomHome() this used to
       // call directly), then verifies the statusline subdirectory itself

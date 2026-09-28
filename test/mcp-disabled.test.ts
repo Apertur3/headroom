@@ -9,6 +9,24 @@ const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 describe("MCP disabled status", () => {
+  it("quota_rate without meter excludes disabled-only stored capacity and fails closed on malformed accounts", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-mcp-disabled-rate-")); temporary.push(home);
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/claude-parked"', 'adapter = "native-ts"', ''].join("\n"), { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    try {
+      store.insert({ principal_id: "claude-parked", meter_id: "claude-parked:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: new Date(Date.now() + 3_600_000).toISOString(), observed_at: new Date().toISOString(), fetched_at: new Date().toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" });
+    } finally { store.close(); }
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
+    try {
+      const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_rate", arguments: {} } });
+      const response = await handleMcp(line, async () => undefined);
+      expect(response).toMatchObject({ result: { structuredContent: { source: "direct", lines: [] } } });
+
+      await writeFile(join(home, "accounts.toml"), "not valid toml", { mode: 0o600 });
+      await expect(handleMcp(line, async () => undefined)).resolves.toMatchObject({ error: { code: -32000 } });
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
   it("omits a parked principal's stored rows and names it in quota_status", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-mcp-disabled-")); temporary.push(home);
     await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-2"', "enabled = false", 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
