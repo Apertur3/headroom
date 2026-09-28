@@ -148,63 +148,115 @@ export interface SendAtOptions extends SendOptions {
    * `sendInboxMessage`'s own "now.getTime(), advance on collision"
    * numbering, which both collides across distinct messages that happen to
    * land in the same window and cannot be idempotent (it is different on
-   * every call). Used for both the filename (collision avoidance) and the
-   * envelope's own `delivery_id` field (identity verification -- see this
-   * function's own doc comment for why the filename alone is not enough).
-   * Used by src/heartbeat.ts's fireDueTimers so a timer retried after a
-   * crash (claimed, delivered, but never confirmed durable before the
-   * process died) is never delivered twice. */
+   * every call). Appended as its own filename component (see
+   * `parseMessageName` below) and carried in the envelope's own
+   * `delivery_id` field, so a retried delivery -- which necessarily runs at
+   * a different wall-clock instant than the original attempt, and so gets a
+   * different leading `<epoch-ms>` -- can still be recognized as the same
+   * delivery by identity, not by path. Used by src/heartbeat.ts's
+   * fireDueTimers so a timer retried after a crash or a timeout (claimed,
+   * possibly delivered, but never confirmed durable) is never delivered
+   * twice. */
   delivery_id: number;
 }
 
+/*
+ * A timer delivery's filename is `<epoch-ms>-<delivery_id>-<kind>.json` --
+ * keeping the real timestamp (the delivery attempt's own send time) in the
+ * documented `<epoch-ms>` position, so `at_epoch`, oldest-first ordering and
+ * `--since` all keep working exactly like an ordinary hand-off's
+ * `<epoch-ms>-<kind>.json`. The delivery id is a second, separate
+ * component, appended rather than substituted -- it never collides with an
+ * ordinary hand-off's filename shape (which has no middle numeric component
+ * at all), and it is what idempotency is keyed on, not the timestamp, since
+ * a retry's own send time differs from the original attempt's. See
+ * `parseMessageName`'s own regex for both shapes.
+ */
+
+/** Every file already on disk (unread, or read and renamed with
+ * READ_SUFFIX) for this exact `kind`/`deliveryId`, regardless of the
+ * `<epoch-ms>` a previous attempt happened to send it under -- a directory
+ * scan, not a single-path check, precisely because a retry's own send time
+ * (and so its own filename) legitimately differs from the original
+ * attempt's. At most one is expected under normal operation; the first
+ * found is treated as authoritative. */
+async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number): Promise<{ path: string; file: string } | undefined> {
+  let entries: string[];
+  try { entries = await readdir(directory); }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  for (const entry of entries) {
+    const bare = entry.endsWith(READ_SUFFIX) ? entry.slice(0, -READ_SUFFIX.length) : entry;
+    const parsed = parseMessageName(bare);
+    if (parsed && parsed.kind === kind && parsed.deliveryId === deliveryId) return { path: join(directory, entry), file: entry };
+  }
+  return undefined;
+}
+
+/** Every currently in-flight `sendInboxMessageAt` call, keyed by exactly
+ * what identifies one delivery (home/session/kind/delivery_id). A second
+ * call for the same key -- a genuinely concurrent retry, or a crash-
+ * recovery retry that starts while the original attempt (its own send
+ * merely slow, not actually dead -- fireDueTimers's own delivery timeout
+ * only stops AWAITING it, it does not cancel it) is still running -- joins
+ * the SAME promise instead of racing its own independent
+ * check-then-write against it. Without this, two overlapping attempts
+ * could both see "no file yet" (`findExistingDelivery` finding nothing
+ * because the first attempt's write has not landed yet) and both write --
+ * or the first's file could be read and renamed to `.read` in the gap
+ * between the second's own check and its write, making the delivery
+ * reappear as a second, fresh, unread message. Cleared once the attempt
+ * itself settles (success or failure), independent of whether any
+ * particular caller is still awaiting it. */
+const inFlightTimerDeliveries = new Map<string, Promise<{ path: string; file: string; session: string; delivered: boolean }>>();
+
 /**
- * The idempotent-by-identity counterpart of `sendInboxMessage`. Writing
- * twice with the same `to`/`kind`/`delivery_id` is safe: the second call
- * finds a file already at that exact path and, having verified its
- * `delivery_id` field actually matches (not merely a filename collision
- * with something else -- an ordinary handoff, or a different timer's
- * delivery, sharing the same numeric name by coincidence), recognizes this
- * exact delivery as already made and skips the write (`delivered: false`)
- * rather than creating a second entry or silently replacing content the
- * recipient may already be acting on. A file present at that path whose
- * `delivery_id` does NOT match is a genuine identity collision -- this
- * throws rather than either overwriting an unrelated message or silently
- * treating this delivery as already done when it was never actually sent.
+ * The idempotent-by-identity counterpart of `sendInboxMessage`. Calling
+ * this twice for the same `to`/`kind`/`delivery_id` -- whether truly
+ * concurrent, or a later crash/timeout-recovery retry -- is safe: see
+ * `inFlightTimerDeliveries`'s own doc comment for how a still-running
+ * attempt is joined rather than duplicated, and `findExistingDelivery`'s
+ * for how an already-completed one (found by identity, not by the exact
+ * path a retry would otherwise have to guess) is recognized instead of
+ * re-sent.
  */
 export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path: string; file: string; session: string; delivered: boolean }> {
   const { session, from } = validateSendOptions(options);
   if (!Number.isInteger(options.delivery_id) || options.delivery_id < 0) throw new Error("delivery_id must be a non-negative integer");
-  const now = options.now ?? new Date();
-  const directory = await sessionDirectory(session, options.home);
-  const file = `${options.delivery_id}-${options.kind}.json`;
-  const path = join(directory, file);
-  const readPath = `${path}${READ_SUFFIX}`;
-  const existingPath = !(await absent(path)) ? path : !(await absent(readPath)) ? readPath : undefined;
-  if (existingPath) {
-    let matches = false;
-    try {
-      const raw = await readBoundedRegularFile(existingPath, SAFE_READ_MAX_BYTES);
-      const parsed = JSON.parse(raw) as { delivery_id?: unknown };
-      matches = parsed.delivery_id === options.delivery_id;
-    } catch { /* unreadable, oversized, or not valid JSON -- never treated as a match */ }
-    if (matches) return { path, file, session, delivered: false };
-    throw new Error(`inbox message identity collision at ${file}: an unrelated message already exists there`);
-  }
-  await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body: parseBody(options.text) }), 0o600);
-  return { path, file, session, delivered: true };
+  const key = `${options.home ?? ""}\u0000${session}\u0000${options.kind}\u0000${options.delivery_id}`;
+  const inFlight = inFlightTimerDeliveries.get(key);
+  if (inFlight) return inFlight;
+  const attempt = (async (): Promise<{ path: string; file: string; session: string; delivered: boolean }> => {
+    const now = options.now ?? new Date();
+    const directory = await sessionDirectory(session, options.home);
+    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id);
+    if (existing) return { path: existing.path, file: existing.file, session, delivered: false };
+    const file = `${now.getTime()}-${options.delivery_id}-${options.kind}.json`;
+    const path = join(directory, file);
+    await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body: parseBody(options.text) }), 0o600);
+    return { path, file, session, delivered: true };
+  })();
+  inFlightTimerDeliveries.set(key, attempt);
+  try { return await attempt; }
+  finally { inFlightTimerDeliveries.delete(key); }
 }
 
 function parseBody(text: string): unknown {
   try { return JSON.parse(text) as unknown; } catch { return text; }
 }
 
-/** `<epoch>-<kind>.json` for a known kind, or undefined for any other name --
- * a stray file in the directory is skipped, never guessed at. */
-function parseMessageName(file: string): { epoch: number; kind: InboxKind } | undefined {
-  const match = /^(\d{1,15})-([a-z]+)\.json$/.exec(file);
-  if (!match || !isInboxKind(match[2])) return undefined;
+/** `<epoch-ms>-<kind>.json` (an ordinary hand-off) or
+ * `<epoch-ms>-<delivery_id>-<kind>.json` (a timer delivery) for a known
+ * kind, or undefined for any other name --
+ * a stray file in the directory is skipped, never guessed at. `[a-z]+`
+ * never matches a digit, so the two shapes are never ambiguous: the
+ * (optional) middle numeric group only ever consumes a genuine
+ * `-<digits>-` run immediately before the kind. */
+function parseMessageName(file: string): { epoch: number; deliveryId: number | null; kind: InboxKind } | undefined {
+  const match = /^(\d{1,15})-(?:(\d{1,19})-)?([a-z]+)\.json$/.exec(file);
+  if (!match || !isInboxKind(match[3])) return undefined;
   const epoch = Number(match[1]);
-  return Number.isFinite(epoch) ? { epoch, kind: match[2] } : undefined;
+  const deliveryId = match[2] === undefined ? null : Number(match[2]);
+  return Number.isFinite(epoch) && (deliveryId === null || Number.isFinite(deliveryId)) ? { epoch, deliveryId, kind: match[3] } : undefined;
 }
 
 export interface ReadOptions {

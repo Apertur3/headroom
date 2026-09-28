@@ -246,6 +246,29 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(parsed.timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
   });
 
+  // should-fix: a malformed (non-array) SUCCESS reply to `timer_list` must
+  // fail loud, the same way it already does on the `status` path -- never
+  // silently normalized into an empty list, which would hide a real daemon
+  // defect behind "no pending timers".
+  it("`headroom timer list --json` throws on a malformed (non-array) SUCCESS reply, instead of reading it as an empty list", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-timerlist-nonarray-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    try { server = await startLegacyDaemon(path, undefined, { unexpected: "shape" }); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list non-array test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      await expect(main(["timer", "list", "--json"])).rejects.toThrow(/not an array/);
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("MCP quota_status normalizes attempts/failed_at for a due_timer from a daemon reply that predates those fields", async () => {
     const reply = await handleMcp(
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}',

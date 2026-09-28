@@ -15,7 +15,7 @@ import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
 import { readInbox, sendInboxMessageAt } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
-import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS } from "../src/store.js";
+import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS, TIMER_CLAIM_STALE_MS } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
@@ -449,11 +449,15 @@ describe("recoverable timer claim (claimTimer/confirmTimerDelivered/reclaimStale
       expect(row).toMatchObject({ fired_at: null, action: "check the NEW deploy" }); // never falsely marked fired
 
       // The replacement is claimable fresh, under its own new delivery_id
-      // and claim_token -- confirming THAT one genuinely fires it.
-      const freshClaim = store.claimTimer("orch-s", "wake", later)!;
+      // and claim_token -- once it is actually due (claimTimer now
+      // requires `at <= now` too, see its own doc comment) -- confirming
+      // THAT one genuinely fires it.
+      const muchLater = new Date(at.getTime() + 60_000);
+      expect(store.claimTimer("orch-s", "wake", later)).toBeUndefined(); // not due yet
+      const freshClaim = store.claimTimer("orch-s", "wake", muchLater)!;
       expect(freshClaim.delivery_id).not.toBe(staleClaim.delivery_id);
       expect(freshClaim.claim_token).not.toBe(staleClaim.claim_token);
-      expect(store.confirmTimerDelivered("orch-s", "wake", freshClaim.claim_token, later)).toBe(true);
+      expect(store.confirmTimerDelivered("orch-s", "wake", freshClaim.claim_token, muchLater)).toBe(true);
       expect(store.timers("orch-s")).toHaveLength(0);
     } finally { store.close(); }
   });
@@ -629,6 +633,104 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
+  // Blocker fix: dueTimers() takes one snapshot at the top of a pass, but
+  // claimTimer() used to require only that the row still be pending, never
+  // that it still be the SAME registration due at THAT snapshot -- awaiting
+  // an earlier timer's delivery in the same pass is a real window in which
+  // a LATER snapshot entry gets replaced (a fresh `setTimer` for the same
+  // owner+name, here with a future `at`). Without checking the snapshot's
+  // own delivery_id at claim time, that replacement would still be claimed
+  // and delivered under its old place in the snapshot, early.
+  it("replacing a later snapshot entry with a future registration while an earlier delivery is in flight does not deliver the replacement", async () => {
+    const { store, home } = await openStore("headroom-firedue-replaced-midpass-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      // orch-first sorts before orch-second (dueTimers() orders by `at`,
+      // then this store's own row order for ties) so the loop reaches it
+      // first and gates there while orch-second is still just a snapshot
+      // entry, not yet claimed.
+      store.setTimer("orch-first", "wake", new Date(at.getTime() - 1_000).toISOString(), "check the deploy", "notify", createdAt);
+      store.setTimer("orch-second", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+
+      let releaseFirst: () => void;
+      const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const sent: string[] = [];
+      const gatedSend: typeof sendInboxMessageAt = async (options) => {
+        sent.push(options.to);
+        if (options.to === "orch-first") await gate; // held open until released below
+        return sendInboxMessageAt(options);
+      };
+
+      const pass = fireDueTimers(store, home, at, undefined, gatedSend);
+      // While orch-first's delivery is gated (the pass has not reached
+      // orch-second's claim yet), replace orch-second with a registration
+      // due an hour from now -- a legitimate `headroom timer set` racing
+      // in, exactly like an RPC connection handler running while this same
+      // process awaits the first delivery.
+      const futureAt = new Date(at.getTime() + 3_600_000);
+      store.setTimer("orch-second", "wake", futureAt.toISOString(), "check the NEW deploy", "notify", at);
+
+      releaseFirst!();
+      const fired = await pass;
+      expect(fired).toBe(1); // only orch-first
+      expect(sent).not.toContain("orch-second"); // never even attempted
+
+      const secondInbox = await readInbox({ session: "orch-second", home, markRead: false });
+      expect(secondInbox.messages).toHaveLength(0);
+      const row = store.timers("orch-second")[0];
+      expect(row).toMatchObject({ fired_at: null, action: "check the NEW deploy", at: futureAt.toISOString() });
+    } finally { store.close(); }
+  });
+
+  // Same race, but the replacement is ALSO already due (not future) --
+  // isolating the identity (delivery_id) check from the plain `at <= now`
+  // one: a due-date check alone would let this claim through, since the
+  // replacement genuinely is due by the time the pass reaches it. Only
+  // recognizing that the snapshot's own registration no longer exists
+  // skips it, leaving it for the NEXT pass to claim (and deliver) fresh,
+  // under its own new identity.
+  it("replacing a later snapshot entry with an equally-due-but-different registration while an earlier delivery is in flight still skips the stale snapshot entry", async () => {
+    const { store, home } = await openStore("headroom-firedue-replaced-samedue-midpass-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      const createdAt = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-first", "wake", new Date(at.getTime() - 1_000).toISOString(), "check the deploy", "notify", createdAt);
+      store.setTimer("orch-second", "wake", at.toISOString(), "check the deploy", "notify", createdAt);
+
+      let releaseFirst: () => void;
+      const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const sent: string[] = [];
+      const gatedSend: typeof sendInboxMessageAt = async (options) => {
+        sent.push(options.to);
+        if (options.to === "orch-first") await gate;
+        return sendInboxMessageAt(options);
+      };
+
+      const pass = fireDueTimers(store, home, at, undefined, gatedSend);
+      // Replaced with a registration that is ALSO already due right now --
+      // `at <= now` alone would admit this claim; only the snapshot's own
+      // delivery_id no longer matching the live row's stops it.
+      store.setTimer("orch-second", "wake", at.toISOString(), "check the NEW deploy", "notify", at);
+
+      releaseFirst!();
+      const fired = await pass;
+      expect(fired).toBe(1); // only orch-first
+      expect(sent).not.toContain("orch-second"); // never even attempted this pass
+
+      const secondInbox = await readInbox({ session: "orch-second", home, markRead: false });
+      expect(secondInbox.messages).toHaveLength(0);
+      // Left pending under its own new identity for the next pass, which
+      // now correctly claims and delivers it fresh.
+      expect(store.timers("orch-second")).toHaveLength(1);
+      const delivered = await fireDueTimers(store, home, at);
+      expect(delivered).toBe(1);
+      const secondInboxAfter = await readInbox({ session: "orch-second", home, markRead: false });
+      expect(secondInboxAfter.messages).toHaveLength(1);
+      expect((secondInboxAfter.messages[0].body as { action: string }).action).toBe("check the NEW deploy");
+    } finally { store.close(); }
+  });
+
   it("un-claims a timer whose inbox delivery fails, so a later pass can retry and succeed", async () => {
     const { store, home } = await openStore("headroom-firedue-retry-");
     try {
@@ -723,6 +825,34 @@ describe("fireDueTimers", () => {
       // waiting out the real (2 minute) default.
       const later = new Date(at.getTime() + 50);
       expect(store.dueTimers(later, 10)).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  // should-fix: `attempts` (docs/json-contract.md's `timer list` entry,
+  // types.ts's own Timer comment) counts delivery attempts that completed
+  // and failed, never one that merely timed out with the outcome unknown --
+  // more consecutive timeouts than MAX_TIMER_DELIVERY_ATTEMPTS must never
+  // permanently fail a timer, since none of them was ever a KNOWN failure.
+  it("repeated timeouts never count toward MAX_TIMER_DELIVERY_ATTEMPTS -- attempts stays 0, never permanently failed", async () => {
+    const { store, home } = await openStore("headroom-firedue-timeout-not-attempt-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-timeout-loop", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+      const neverResolvingSend: typeof sendInboxMessageAt = () => new Promise(() => { /* never settles */ });
+      let now = at;
+      // More passes than MAX_TIMER_DELIVERY_ATTEMPTS would ever tolerate for
+      // a real, completed failure -- each one only times out, never throws.
+      for (let pass = 0; pass < MAX_TIMER_DELIVERY_ATTEMPTS + 3; pass += 1) {
+        const fired = await fireDueTimers(store, home, now, undefined, neverResolvingSend, 20);
+        expect(fired).toBe(0);
+        expect(store.timers("orch-timeout-loop")).toHaveLength(1); // never permanently failed
+        expect(store.timers("orch-timeout-loop")[0]).toMatchObject({ attempts: 0, failed_at: null });
+        now = new Date(now.getTime() + TIMER_CLAIM_STALE_MS + 1); // past this pass's own claim going stale (fireDueTimers/dueTimers use the default staleness)
+      }
+      // Still genuinely retryable, not stuck: a real (non-hanging) delivery
+      // still succeeds after all those timeouts.
+      const delivered = await fireDueTimers(store, home, now);
+      expect(delivered).toBe(1);
     } finally { store.close(); }
   });
 

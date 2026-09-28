@@ -92,7 +92,12 @@ export function parseTimerAt(value: string, now = new Date()): string {
 export async function fireDueTimers(store: HeadroomStore, home: string, now = new Date(), log: (message: string) => Promise<void> = (message) => appendDaemonLog(message, home), send: typeof sendInboxMessageAt = sendInboxMessageAt, deliveryTimeoutMs = DELIVERY_TIMEOUT_MS): Promise<number> {
   let fired = 0;
   for (const timer of store.dueTimers(now)) {
-    const claimed = store.claimTimer(timer.owner, timer.name, now);
+    // The snapshot's own delivery_id, not just its owner/name: a later
+    // registration for the same owner+name (replacing this exact due entry
+    // while an earlier delivery in this same pass is still in flight) must
+    // never be claimed and delivered under this snapshot entry's place --
+    // see claimTimer's own doc comment.
+    const claimed = store.claimTimer(timer.owner, timer.name, now, undefined, timer.delivery_id);
     if (!claimed) continue; // an overlapping pass already claimed it, or its claim is still fresh
     const sendPromise = send({
       to: claimed.owner, kind: TIMER_DELIVERY_KIND, from: TIMER_DELIVERY_FROM,

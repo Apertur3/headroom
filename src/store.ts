@@ -31,8 +31,10 @@ export const SPEND_LEDGER_RETENTION_DAYS = 30;
 export const UNSCHEDULED_RESET_HOURS = 24;
 
 /** How many delivery attempts a timer gets (src/heartbeat.ts's fireDueTimers,
- * via store.ts's claimTimer/unclaimTimer) before it is marked permanently
- * failed instead of retried on every future maintenance pass forever. An
+ * via store.ts's claimTimer/releaseTimerClaim) before it is marked permanently
+ * failed instead of retried on every future maintenance pass forever. Only a
+ * completed, failed attempt counts -- one that timed out with delivery still
+ * unknown does not (see releaseTimerClaim's own doc comment). An
  * undeliverable timer is almost always a static defect (an owner whose
  * inbox directory can never be created, a filesystem permission problem) --
  * a handful of tries make sure a merely transient failure still gets
@@ -77,6 +79,25 @@ function generateTimerDeliveryId(): number {
  * internal delivery-in-progress/identity details, not something a `timer
  * list` consumer needs. */
 export interface ClaimedTimer extends Timer { claim_token: string; delivery_id: number }
+
+/** `dueTimers()`'s own return shape: a plain `Timer` plus the row's
+ * `delivery_id` at scan time. `null` only for a row set before
+ * ADD_TIMER_DELIVERY_ID migrated in and never since claimed (no backfill).
+ * `fireDueTimers` hands this straight back to `claimTimer` as
+ * `expectedDeliveryId` -- see that method's own doc comment for why a
+ * timer-firing pass needs its snapshot's identity re-checked at claim time,
+ * not just re-checked for still being due. */
+export interface DueTimer extends Timer { delivery_id: number | null }
+
+/** Reads a row's `delivery_id` (present once ADD_TIMER_DELIVERY_ID has run
+ * and the row has ever been touched by `setTimer`/`claimTimer`) as
+ * `number | null`, never `undefined` -- a single, shared place for the
+ * "not a number yet" normalization `dueTimers()` and `claimTimer()` both
+ * need. */
+function deliveryIdOf(row: Row): number | null {
+  const value = (row as Row).delivery_id;
+  return typeof value === "number" ? value : null;
+}
 
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
  * than ordinary noise: a drop to zero, or a fall past half of what it was.
@@ -2391,10 +2412,11 @@ export class HeadroomStore {
    * again. Only ever reachable through the daemon's own fully-migrated
    * store (never `openReadOnly()`), so no schema-compat concern here the
    * way `timers()` above has. */
-  dueTimers(now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS): Timer[] {
+  dueTimers(now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS): DueTimer[] {
     const staleThreshold = new Date(now.getTime() - claimStaleMs).toISOString();
     return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND at <= ? AND (claimed_at IS NULL OR claimed_at <= ?) ORDER BY at ASC")
-      .all(now.toISOString(), staleThreshold).map(timerFromRow);
+      .all(now.toISOString(), staleThreshold)
+      .map((row) => ({ ...timerFromRow(row), delivery_id: deliveryIdOf(row) }));
   }
 
   /**
@@ -2422,22 +2444,37 @@ export class HeadroomStore {
    * Returns the claimed row plus its fresh `claim_token` (the caller's
    * proof of this exact claim, required by both `confirmTimerDelivered` and
    * `releaseTimerClaim`), or `undefined` when nothing matched -- already
-   * claimed by a concurrent pass, already terminal, or gone.
+   * claimed by a concurrent pass, already terminal, gone, not actually due
+   * (see `at <= now` below), or -- with `expectedDeliveryId` given --
+   * replaced by a different registration since the caller's own snapshot.
+   *
+   * `expectedDeliveryId`: fireDueTimers's own `dueTimers()` scan is a
+   * snapshot, taken before any of that pass's deliveries start; awaiting
+   * an earlier timer's delivery in the same pass is a real gap in which a
+   * LATER snapshot entry's row can be replaced (a fresh `setTimer` for the
+   * same owner+name, e.g. with a future `at`). Without this check, this
+   * call would still happily re-claim that row under its OLD place in the
+   * snapshot: `at <= now` alone is not enough (the replacement can itself
+   * already be due), only the exact registration identity is. A caller
+   * with no snapshot to protect (a direct `headroom timer` RPC, every
+   * existing test that predates this) passes `undefined` and skips the
+   * check, same as before.
    */
-  claimTimer(owner: string, name: string, now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS): ClaimedTimer | undefined {
+  claimTimer(owner: string, name: string, now = new Date(), claimStaleMs = TIMER_CLAIM_STALE_MS, expectedDeliveryId?: number | null): ClaimedTimer | undefined {
     const nowIso = now.toISOString();
     const staleThreshold = new Date(now.getTime() - claimStaleMs).toISOString();
-    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)").get(owner, name, staleThreshold);
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND at <= ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)").get(owner, name, nowIso, staleThreshold);
     if (!row) return undefined;
-    const claimToken = randomUUID();
     // A row set before ADD_TIMER_DELIVERY_ID migrated in (delivery_id
     // NULL, the column added with no backfill) gets one assigned right
     // here, atomically with the claim itself -- simpler and safer than
     // ever claiming a row with no delivery identity to hand fireDueTimers.
-    const existingDeliveryId = (row as Row).delivery_id;
-    const deliveryId = typeof existingDeliveryId === "number" ? existingDeliveryId : generateTimerDeliveryId();
-    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ?, delivery_id = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
-      .run(nowIso, claimToken, deliveryId, owner, name, staleThreshold);
+    const existingDeliveryId = deliveryIdOf(row);
+    if (expectedDeliveryId !== undefined && existingDeliveryId !== expectedDeliveryId) return undefined;
+    const claimToken = randomUUID();
+    const deliveryId = existingDeliveryId ?? generateTimerDeliveryId();
+    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ?, delivery_id = ? WHERE owner = ? AND name = ? AND at <= ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
+      .run(nowIso, claimToken, deliveryId, owner, name, nowIso, staleThreshold);
     if (Number(claimed.changes) === 0) return undefined; // lost the race to a concurrent claim
     const timer: ClaimedTimer = { ...timerFromRow(row), claim_token: claimToken, delivery_id: deliveryId };
     if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, nowIso);

@@ -47,11 +47,20 @@ export function normalizeDaemonTimer(row: unknown): TimerLike {
 }
 
 /** `normalizeDaemonTimer`, applied across a whole `timer list`/`due_timers`
- * array. A non-array input (an older daemon's reply shape this call site
- * has already reduced to `[]` before ever reaching here, or a defensive
- * cast gone wrong) returns `[]` rather than throwing. */
+ * array. `due_timers`'s two call sites (`observe()`, MCP `quota_status`)
+ * already guarantee an array here -- their own `unwrapAdditiveRpc`/
+ * `decodeAdditiveRpcReply` throw on anything else, `-32601` alone becoming
+ * `[]` -- so this is redundant defense-in-depth for them. It is NOT
+ * redundant for the CLI's `timer list` command, whose own daemon branch
+ * calls this directly on a plain `unwrapRpc()` result: a non-array success
+ * reply there (a malformed or otherwise unexpected daemon reply, never a
+ * documented compatibility case) must fail loud, the same way it already
+ * does for `heartbeats`/`timer_list` on the `status` path -- silently
+ * normalizing it into `[]` would hide a real daemon defect behind an empty
+ * list instead of surfacing it. */
 export function normalizeDaemonTimers(rows: unknown): TimerLike[] {
-  return Array.isArray(rows) ? rows.map(normalizeDaemonTimer) : [];
+  if (!Array.isArray(rows)) throw new Error("Daemon reply was not an array");
+  return rows.map(normalizeDaemonTimer);
 }
 
 /** A structural stand-in for `types.ts`'s `Timer`: `normalizeDaemonTimer`

@@ -6,6 +6,7 @@ import { main } from "../src/cli.js";
 import { budgetPlanLeases, parseBudgetPlan } from "../src/budget-plan.js";
 import { assertSessionId, readInbox, sendInboxMessage, sendInboxMessageAt, sessionDirectory, MAX_INBOX_MESSAGE_BYTES } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
+import * as securityModule from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 
 const temporary: string[] = [];
@@ -130,21 +131,27 @@ describe("inbox send and read", () => {
 // ---------------------------------------------------------------------------
 
 describe("sendInboxMessageAt", () => {
-  it("writes the envelope with a delivery_id field, named <delivery_id>-<kind>.json", async () => {
+  it("writes the envelope with a delivery_id field, named <epoch-ms>-<delivery_id>-<kind>.json", async () => {
     const path = await home();
     const sent = await sendInboxMessageAt({ to: "session-c", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 123456789012345, home: path, now: new Date(1_757_000_000_000) });
     expect(sent.delivered).toBe(true);
-    expect(sent.file).toBe("123456789012345-handoff.json");
+    // The real send time stays the documented <epoch-ms> field (see the
+    // "order and a --since cursor" test below for why this matters); the
+    // delivery id is a separate, appended component.
+    expect(sent.file).toBe("1757000000000-123456789012345-handoff.json");
     const envelope = JSON.parse(await readFile(sent.path, "utf8")) as Record<string, unknown>;
-    expect(envelope).toMatchObject({ version: 1, kind: "handoff", to: "session-c", from: "headroom-timer", delivery_id: 123456789012345, body: { timer: "wake", action: "check" } });
+    expect(envelope).toMatchObject({ version: 1, kind: "handoff", to: "session-c", from: "headroom-timer", at: "2025-09-04T15:33:20.000Z", delivery_id: 123456789012345, body: { timer: "wake", action: "check" } });
   });
 
-  it("is idempotent: a second call with the same delivery_id skips the write and reports delivered: false", async () => {
+  it("is idempotent: a retry with the same delivery_id but a different send time skips the write and reports delivered: false", async () => {
     const path = await home();
     const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 42, home: path };
     const first = await sendInboxMessageAt({ ...options, now: new Date(1000) });
     expect(first.delivered).toBe(true);
-    const second = await sendInboxMessageAt({ ...options, now: new Date(2000) });
+    // A retry's own send time necessarily differs from the original
+    // attempt's -- this is exactly what a directory scan by identity (not
+    // a single expected path) has to tolerate.
+    const second = await sendInboxMessageAt({ ...options, now: new Date(99_000) });
     expect(second.delivered).toBe(false);
     expect(second.path).toBe(first.path);
     // Exactly one file, one message -- never a duplicate.
@@ -157,41 +164,96 @@ describe("sendInboxMessageAt", () => {
     const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 7, home: path, now: new Date(1000) };
     await sendInboxMessageAt(options);
     await readInbox({ session: "session-c", home: path }); // marks it read (renamed with .read)
-    const retried = await sendInboxMessageAt(options);
+    const retried = await sendInboxMessageAt({ ...options, now: new Date(50_000) });
     expect(retried.delivered).toBe(false);
     const messages = await readdir(join(path, "inbox", "session-c"));
-    expect(messages).toEqual(["7-handoff.json.read"]);
+    expect(messages).toEqual(["1000-7-handoff.json.read"]);
   });
 
-  // The blocker this whole mechanism exists to close: a path already
-  // occupied by an UNRELATED message (here, written exactly the way an
-  // ordinary `headroom inbox send` would -- ordinary hand-offs and timer
-  // deliveries share the same directory and the same numeric filename
-  // space) must never be silently treated as "this timer's delivery already
-  // happened". Verified by content (the `delivery_id` field), not merely by
-  // the file existing at the expected path.
-  it("throws an identity collision rather than treating an unrelated message at the same path as already delivered", async () => {
-    const path = await home();
-    const directory = await sessionDirectory("orch-collide", path);
-    const collidingId = 555_000_000_000_000;
-    await writeFile(join(directory, `${collidingId}-handoff.json`), `${JSON.stringify({ version: 1, kind: "handoff", to: "orch-collide", from: "a-human", at: new Date().toISOString(), body: "an unrelated hand-off, not from any timer" }, null, 2)}\n`, { mode: 0o600 });
-    await expect(sendInboxMessageAt({
-      to: "orch-collide", kind: "handoff", from: "headroom-timer",
-      text: JSON.stringify({ timer: "wake", at: new Date().toISOString(), action: "check the deploy" }),
-      delivery_id: collidingId, home: path,
-    })).rejects.toThrow(/identity collision/);
-    // The unrelated message is untouched -- never overwritten.
-    const stored = JSON.parse(await readFile(join(directory, `${collidingId}-handoff.json`), "utf8")) as { body: unknown };
-    expect(stored.body).toBe("an unrelated hand-off, not from any timer");
-  });
-
-  it("an ordinary hand-off and a timer delivery with different delivery_ids never interfere, even for the same recipient", async () => {
+  // The structural fix this filename shape closes: an ordinary hand-off's
+  // name (`<epoch-ms>-<kind>.json`) and a timer delivery's
+  // (`<epoch-ms>-<delivery_id>-<kind>.json`) can never coincide -- one has a
+  // middle numeric component, the other never does -- so the two message
+  // classes no longer share a filename space at all, in either direction.
+  it("an ordinary hand-off and a timer delivery never interfere, even sent in the same millisecond to the same recipient", async () => {
     const path = await home();
     await sendInboxMessage({ to: "session-d", kind: "handoff", text: '{"note":"from a human"}', from: "a-human", home: path, now: new Date(9_000) });
-    await sendInboxMessageAt({ to: "session-d", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 999_000_000_000_000, home: path, now: new Date(9_500) });
+    await sendInboxMessageAt({ to: "session-d", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 999, home: path, now: new Date(9_000) });
     const result = await readInbox({ session: "session-d", home: path });
     expect(result.messages).toHaveLength(2);
     expect(result.messages.map((item) => item.from).sort()).toEqual(["a-human", "headroom-timer"]);
+  });
+
+  // The blocker this filename shape closes: the delivery id used to sit in
+  // the documented <epoch-ms> field itself, so at_epoch, oldest-first
+  // ordering and --since all read a random value instead of a real
+  // timestamp for a timer delivery. Mixing ordinary and timer messages
+  // proves both now sort and filter correctly by real send time.
+  it("orders ordinary and timer messages by real send time, and --since filters both correctly, despite the delivery id embedded in the filename", async () => {
+    const path = await home();
+    // A delivery_id far larger than any of these timestamps -- if it ever
+    // leaked into the ordering/filter key, "second" would sort first and
+    // --since would wrongly include or exclude entries.
+    await sendInboxMessageAt({ to: "session-e", kind: "handoff", text: '{"timer":"a","at":"2026-01-01T00:00:00.000Z","action":"first"}', delivery_id: 999_999_999_999, home: path, now: new Date(1_000) });
+    await sendInboxMessage({ to: "session-e", kind: "note", text: "second", home: path, now: new Date(2_000) });
+    await sendInboxMessageAt({ to: "session-e", kind: "handoff", text: '{"timer":"b","at":"2026-01-01T00:00:00.000Z","action":"third"}', delivery_id: 1, home: path, now: new Date(3_000) });
+
+    const all = await readInbox({ session: "session-e", home: path, markRead: false });
+    expect(all.messages.map((item) => item.at_epoch)).toEqual([1_000, 2_000, 3_000]);
+    expect(all.messages.map((item) => (item.kind === "note" ? item.body : (item.body as { action: string }).action))).toEqual(["first", "second", "third"]);
+
+    const since = await readInbox({ session: "session-e", home: path, since: 2_000, markRead: false });
+    expect(since.messages.map((item) => item.at_epoch)).toEqual([2_000, 3_000]);
+  });
+
+  // should-fix: the check-then-write race a timed-out (but not actually
+  // dead) delivery leaves open -- a retry starting while the original send
+  // is merely slow, not cancelled, must join it rather than racing its own
+  // independent check against it, and must recognize the original's file
+  // (however it eventually lands, read or unread) as this same delivery.
+  it("a retry for a delivery id already in flight joins the original attempt instead of writing a second file", async () => {
+    const path = await home();
+    let releaseOriginal: () => void;
+    const gate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode) => {
+      await gate; // held open until this test explicitly releases it
+      return realWriteFileAtomic(writePath, data, mode);
+    });
+    try {
+      const options = { to: "session-f", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 55, home: path, now: new Date(1_000) };
+      // Started but not awaited: the original attempt's own write is held
+      // open by the gate -- exactly like fireDueTimers's delivery timeout
+      // abandoning a wait on a send that is slow, not dead.
+      const original = sendInboxMessageAt(options);
+      // The retry starts while the original is still in flight (a stale
+      // claim reclaimed and retried before the original's own write
+      // landed). It must join the SAME promise, not perform its own
+      // directory scan (which would see nothing yet and start a second,
+      // independent write under a different <epoch-ms>).
+      const retry = sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      releaseOriginal!();
+      const [originalResult, retryResult] = await Promise.all([original, retry]);
+      expect(originalResult.delivered).toBe(true);
+      expect(retryResult).toEqual(originalResult); // the exact same outcome, not a second write
+      const messages = await readdir(join(path, "inbox", "session-f"));
+      expect(messages).toHaveLength(1);
+    } finally { writeSpy.mockRestore(); }
+  });
+
+  it("a retry that starts only after the original attempt's write has already landed and been read still recognizes it as delivered", async () => {
+    const path = await home();
+    const options = { to: "session-g", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 66, home: path };
+    const original = await sendInboxMessageAt({ ...options, now: new Date(1_000) });
+    expect(original.delivered).toBe(true);
+    // The recipient reads (and so renames to .read) the message before any
+    // retry ever starts -- the sequence a fully-completed-but-unconfirmed
+    // original delivery, followed by a later stale-claim retry, produces.
+    await readInbox({ session: "session-g", home: path });
+    const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+    expect(retry.delivered).toBe(false);
+    const messages = await readdir(join(path, "inbox", "session-g"));
+    expect(messages).toEqual(["1000-66-handoff.json.read"]); // never a second, fresh, unread copy
   });
 
   it("rejects a negative or non-integer delivery_id", async () => {
