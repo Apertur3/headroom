@@ -5,8 +5,10 @@
     {
       "action": "string",
       "at": "string",
+      "attempts": "number",
       "cleared_at": "null",
       "created_at": "string",
+      "failed_at": "null",
       "fired_at": "null",
       "if_missed": "string",
       "name": "string",

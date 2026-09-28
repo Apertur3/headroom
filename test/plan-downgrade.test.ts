@@ -141,7 +141,16 @@ describe("plan downgrade protection", () => {
     expect(renderStatus({ observations: [row], policy: defaultPolicy, planDowngraded: [downgrade], now: new Date("2026-09-09T15:14:00Z") }, { form: "plain", verbose: false, color: false, width: 120, direct: false })[0]).toBe(`PLAN DOWNGRADED: codex-main free since ${formatClockTime(new Date(downgrade.since))} (ack: headroom ack plan codex-main)`);
     const model: DashboardModel = { observations: [row], events: [], leases: [], resetSeen: {}, burns: {}, notices: [], planDowngraded: [downgrade], now: new Date("2026-09-09T15:14:00Z"), version: "test", direct: false, policy: defaultPolicy, vendors: new Map([["codex-main", "codex"]]) };
     expect(renderDashboard(model, { width: 120, height: 30, verbose: false, eventsWide: false })[0]).toContain(`PLAN DOWNGRADED: codex-main free since ${formatClockTime(new Date(downgrade.since))}`);
-    const response = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_status", arguments: {} } }), async (method) => method === "status" ? [row] : [downgrade]);
+    // `plan_downgrades` is the only additive RPC this test cares about --
+    // `heartbeats`/`timer_list` must answer their own documented shape
+    // (an array of rows, empty here), not the plan-downgrade payload:
+    // normalizeDaemonTimer now validates a timer_list row's required
+    // fields, and a PlanDowngrade object satisfies none of them.
+    const response = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_status", arguments: {} } }), async (method) => {
+      if (method === "status") return [row];
+      if (method === "plan_downgrades") return [downgrade];
+      return [];
+    });
     expect(response?.result).toBeDefined();
     const payload = response?.result as { structuredContent: { plan_downgraded: PlanDowngrade } };
     expect(payload.structuredContent.plan_downgraded).toEqual(downgrade);

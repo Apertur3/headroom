@@ -28,6 +28,102 @@ export const JSON_CONTRACT_VERSION = "1.0";
  * docs/notifications.md."). */
 export const JSON_CONTRACT_DOC_PATH = "docs/json-contract.md";
 
+/** Every Timer field that predates `attempts`/`failed_at` -- the two this
+ * normalizer defaults for an older daemon (see its own doc comment below).
+ * Checked, not defaulted: a row missing one of THESE is not an older-shape
+ * compatibility case, it is a malformed reply, and normalizing it into a
+ * contract-invalid object (an `owner` of `undefined`, an `if_missed` of
+ * anything at all) would just move the defect one layer further from where
+ * it happened. */
+const REQUIRED_STRING_TIMER_FIELDS = ["owner", "name", "at", "action", "created_at"] as const;
+const NULLABLE_STRING_TIMER_FIELDS = ["fired_at", "cleared_at"] as const;
+const REQUIRED_STRING_HEARTBEAT_FIELDS = ["owner", "started_at", "last_beat_at", "updated_at"] as const;
+const NULLABLE_STRING_HEARTBEAT_FIELDS = ["resume_sentence", "lapsed_since"] as const;
+
+/** Normalizes one timer row from a daemon JSON-RPC reply to the current
+ * additive shape: `attempts`/`failed_at` default to `0`/`null` when a still-
+ * running OLDER daemon's own reply predates those two fields (see
+ * docs/json-contract.md's `timer list` entry) -- the same defaulting
+ * store.ts's own `timerFromRow` already applies to a row read straight off
+ * an older on-disk schema. Used at every protocol boundary a timer can
+ * arrive at from a daemon RPC reply rather than a local store read: the CLI's
+ * `timer list` command and `observe()`'s `due_timers`, and MCP's
+ * `quota_status`.
+ *
+ * Every OTHER (pre-additive) Timer field is required and type-checked --
+ * this only ever adds or defaults the two additive ones, it never invents
+ * or silently drops any other field. A row missing or misshaping one of
+ * those throws instead of being normalized into a contract-invalid object
+ * (e.g. an `owner` of `undefined`): a caller that already trusts this
+ * reply enough to treat its shape as a Timer must never see it silently
+ * hollowed out by a defect a fresh daemon bug, a corrupt reply, or a
+ * genuinely incompatible future protocol version would produce. */
+export function normalizeDaemonTimer(row: unknown): TimerLike {
+  const record = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : undefined;
+  if (!record) throw new Error("Daemon timer row was not an object");
+  for (const field of REQUIRED_STRING_TIMER_FIELDS) {
+    if (typeof record[field] !== "string") throw new Error(`Daemon timer row is missing required field "${field}"`);
+  }
+  if (record.if_missed !== "notify" && record.if_missed !== "drop") throw new Error(`Daemon timer row has an invalid if_missed: ${JSON.stringify(record.if_missed)}`);
+  for (const field of NULLABLE_STRING_TIMER_FIELDS) {
+    if (record[field] !== null && typeof record[field] !== "string") throw new Error(`Daemon timer row has an invalid "${field}"`);
+  }
+  const hasAttempts = Object.hasOwn(record, "attempts");
+  if (hasAttempts && typeof record.attempts !== "number") throw new Error('Daemon timer row has an invalid "attempts"');
+  const hasFailedAt = Object.hasOwn(record, "failed_at");
+  if (hasFailedAt && record.failed_at !== null && typeof record.failed_at !== "string") throw new Error('Daemon timer row has an invalid "failed_at"');
+  return { ...record, attempts: hasAttempts ? record.attempts : 0, failed_at: hasFailedAt ? record.failed_at : null } as TimerLike;
+}
+
+/** `normalizeDaemonTimer`, applied across a whole `timer list`/`due_timers`
+ * array. `due_timers`'s two call sites (`observe()`, MCP `quota_status`)
+ * already guarantee an array here -- their own `unwrapAdditiveRpc`/
+ * `decodeAdditiveRpcReply` throw on anything else, `-32601` alone becoming
+ * `[]` -- so this is redundant defense-in-depth for them. It is NOT
+ * redundant for the CLI's `timer list` command, whose own daemon branch
+ * calls this directly on a plain `unwrapRpc()` result: a non-array success
+ * reply there (a malformed or otherwise unexpected daemon reply, never a
+ * documented compatibility case) must fail loud, the same way it already
+ * does for `heartbeats`/`timer_list` on the `status` path -- silently
+ * normalizing it into `[]` would hide a real daemon defect behind an empty
+ * list instead of surfacing it. */
+export function normalizeDaemonTimers(rows: unknown): TimerLike[] {
+  if (!Array.isArray(rows)) throw new Error("Daemon reply was not an array");
+  return rows.map(normalizeDaemonTimer);
+}
+
+/** Validates a heartbeat row before a daemon-sourced list reaches a versioned
+ * JSON result. Unlike Timer's two additive compatibility fields, every
+ * Heartbeat field is part of its original shape and must be present. */
+export function validateDaemonHeartbeat(row: unknown): HeartbeatLike {
+  const record = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : undefined;
+  if (!record) throw new Error("Daemon heartbeat row was not an object");
+  for (const field of REQUIRED_STRING_HEARTBEAT_FIELDS) {
+    if (typeof record[field] !== "string") throw new Error(`Daemon heartbeat row is missing required field "${field}"`);
+  }
+  if (typeof record.interval_ms !== "number" || !Number.isFinite(record.interval_ms)) throw new Error('Daemon heartbeat row has an invalid "interval_ms"');
+  for (const field of NULLABLE_STRING_HEARTBEAT_FIELDS) {
+    if (record[field] !== null && typeof record[field] !== "string") throw new Error(`Daemon heartbeat row has an invalid "${field}"`);
+  }
+  return record;
+}
+
+/** Structural validation for every member of a daemon-sourced heartbeat
+ * list. The array check remains here as defense in depth for callers that
+ * did not use their additive-RPC decoder first. */
+export function validateDaemonHeartbeats(rows: unknown): HeartbeatLike[] {
+  if (!Array.isArray(rows)) throw new Error("Daemon reply was not an array");
+  return rows.map(validateDaemonHeartbeat);
+}
+
+/** A structural stand-in for `types.ts`'s `Timer`: `normalizeDaemonTimer`
+ * only ever adds/defaults two fields onto whatever object it was given, so
+ * it cannot itself prove the daemon reply carried every other required
+ * field -- callers already trust that reply enough to cast it, same as
+ * before this normalizer existed. */
+type TimerLike = Record<string, unknown>;
+type HeartbeatLike = Record<string, unknown>;
+
 /** True for a plain JSON object eligible for the contract envelope: not an
  * array, not null. Used at the single points that assemble a CLI `--json`
  * result or an MCP tool result so the same rule decides, uniformly, which
