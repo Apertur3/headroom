@@ -138,18 +138,21 @@ function isPlausiblePid(value: unknown): value is number {
 
 /** Strict canonical-decimal-integer parse of a pid FILE's raw text content
  * (never used for a JSON state field, which is already a native, unambiguous
- * JS number once parsed): only plain digits, no sign, no decimal point, no
- * exponent, no leading zero (other than a bare "0", itself never a
- * plausible pid), no internal whitespace. `Number(raw)` alone accepts far
- * more than the launch wrapper's own `echo $$` could ever produce --
- * `Number("2e3")` is 2000, `Number(" 123")` is 123 -- and none of that
- * leniency is safe to extend to evidence a kill decision may act on: a
- * string this loose was either never actually written by this file's own
- * wrapper, or has been corrupted since, and either way must be rejected as
- * invalid, not silently reinterpreted. Combined with isPlausiblePid for the
- * numeric range check both pid readers apply on top of this. */
+ * JS number once parsed): only plain digits, plus the one trailing newline
+ * the launch wrapper's `echo $$` may write. No sign, decimal point, exponent,
+ * leading zero (other than a bare "0", itself never a plausible pid), or
+ * whitespace is accepted. `Number(raw)` alone accepts far more than the
+ * launch wrapper could ever produce -- `Number("2e3")` is 2000,
+ * `Number(" 123")` is 123 -- and none of that leniency is safe to extend to
+ * evidence a kill decision may act on: a string this loose was either never
+ * actually written by this file's own wrapper, or has been corrupted since,
+ * and either way must be rejected as invalid, not silently reinterpreted.
+ * Combined with isPlausiblePid for the numeric range check both pid readers
+ * apply on top of this. */
 function parseCanonicalPid(raw: string): number | undefined {
-  return /^(0|[1-9][0-9]*)$/.test(raw) ? Number(raw) : undefined;
+  const digits = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  if (!digits || [...digits].some((character) => character < "0" || character > "9")) return undefined;
+  return digits === "0" || !digits.startsWith("0") ? Number(digits) : undefined;
 }
 
 /** Never trusts the file blindly: rejects a symlink, a non-regular file, or
@@ -171,18 +174,33 @@ async function readKeepaliveState(path: string): Promise<KeepaliveState | undefi
   try { raw = await readFile(path, "utf8"); }
   catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot read keepalive state ${path}: ${(error as Error).message}`); }
   let parsed: Partial<KeepaliveState>;
-  try { parsed = JSON.parse(raw) as Partial<KeepaliveState>; }
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("not an object");
+    parsed = value as Partial<KeepaliveState>;
+  }
   catch (error) { throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} is not valid JSON: ${(error as Error).message}`); }
   if (!isPlausiblePid(parsed.scriptPid) || typeof parsed.scriptCommand !== "string" || typeof parsed.scriptStartedAt !== "string") {
     throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} does not match the recorded shape`);
   }
+  const has = (field: keyof KeepaliveState): boolean => Object.hasOwn(parsed, field);
+  // recordedAt has been written by every version that wrote this state file.
+  // The remaining fields were added later, so their absence is legacy, but a
+  // present field with the wrong type is corrupt evidence -- never a value to
+  // coerce into a harmless-looking legacy default.
+  if (
+    typeof parsed.recordedAt !== "string"
+    || (has("verified") && typeof parsed.verified !== "boolean")
+    || (has("launchedAt") && typeof parsed.launchedAt !== "string")
+    || (has("launchId") && typeof parsed.launchId !== "string")
+  ) throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
   const state: KeepaliveState = {
     scriptPid: parsed.scriptPid, scriptCommand: parsed.scriptCommand, scriptStartedAt: parsed.scriptStartedAt,
-    recordedAt: typeof parsed.recordedAt === "string" ? parsed.recordedAt : "",
-    verified: parsed.verified === true,
+    recordedAt: parsed.recordedAt,
+    verified: parsed.verified ?? false,
   };
-  if (typeof parsed.launchedAt === "string") state.launchedAt = parsed.launchedAt;
-  if (typeof parsed.launchId === "string") state.launchId = parsed.launchId;
+  if (has("launchedAt")) state.launchedAt = parsed.launchedAt;
+  if (has("launchId")) state.launchId = parsed.launchId;
   const agyFieldsPresent = "agyPid" in parsed || "agyCommand" in parsed || "agyStartedAt" in parsed;
   if (agyFieldsPresent) {
     if (!isPlausiblePid(parsed.agyPid) || typeof parsed.agyCommand !== "string" || typeof parsed.agyStartedAt !== "string") {
@@ -215,7 +233,7 @@ async function readAgyPidFile(path: string): Promise<AgyPidFileEntry | undefined
   let raw: string;
   try { raw = await readFile(path, "utf8"); }
   catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot read agy pid file ${path}: ${(error as Error).message}`); }
-  const pid = parseCanonicalPid(raw.trim());
+  const pid = parseCanonicalPid(raw);
   if (pid === undefined || !isPlausiblePid(pid)) throw new InvalidKeepaliveEvidenceError(`agy pid file ${path} does not contain a plain pid`);
   return { pid, mtimeMs: info.mtimeMs };
 }
@@ -961,7 +979,7 @@ export class AgyKeepaliveSupervisor {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
       return { kind: "invalid" };
     }
-    const pid = parseCanonicalPid(raw.trim());
+    const pid = parseCanonicalPid(raw);
     return pid !== undefined && isPlausiblePid(pid) ? { kind: "found", pid } : { kind: "invalid" };
   }
 

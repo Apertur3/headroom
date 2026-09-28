@@ -94,7 +94,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
       // killTree still reaches agy for real, through its own ps-based walk
       // of script's tree -- entirely independent of the pid file -- but
       // stop() itself never proved that on its own terms, so it must not
-      // have cleared its evidence on the strength of merely finding nothing.
+      // have cleared its evidence on the strength of merely observing no file.
       await waitUntilDead(agyPid);
       await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
     } finally { await supervisor.stop(); }
@@ -694,12 +694,50 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence 
     await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
   });
 
-  it("rejects a noncanonical numeric .agy-pid file (scientific notation, decimals, padding) rather than parsing it loosely", async () => {
-    for (const noncanonical of ["2e3", "123.0", "1 23", "+123", "0123"]) {
+  it("accepts only the launch wrapper's optional trailing newline in pid evidence, in both readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-pid-newline-")); temporary.push(root);
+    const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+    const supervisor = new AgyKeepaliveSupervisor({ home: root });
+    const internal = supervisor as unknown as { readAgyPidDetailed(): { kind: "found"; pid: number } | { kind: "absent" } | { kind: "invalid" } };
+
+    await writeFile(pidFilePath, "123\n", { mode: 0o600 });
+    expect(internal.readAgyPidDetailed()).toEqual({ kind: "found", pid: 123 });
+    await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [], unverified: [] });
+
+    for (const noncanonical of ["2e3", "123.0", "1 23", "+123", "0123", " 123", "123 ", "123\n\n", "123\r\n"]) {
       const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-noncanonicalpid-")); temporary.push(root);
-      await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, noncanonical, { mode: 0o600 });
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      const supervisor = new AgyKeepaliveSupervisor({ home: root });
+      const internal = supervisor as unknown as { readAgyPidDetailed(): { kind: "found"; pid: number } | { kind: "absent" } | { kind: "invalid" } };
+      await writeFile(pidFilePath, noncanonical, { mode: 0o600 });
+
+      expect(internal.readAgyPidDetailed()).toEqual({ kind: "invalid" });
+      await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+    }
+  });
+
+  it("rejects malformed metadata instead of normalizing it into a legacy record that can be cleared", async () => {
+    const base = {
+      scriptPid: 12345,
+      scriptCommand: "",
+      scriptStartedAt: "",
+      recordedAt: new Date().toISOString(),
+      verified: false,
+    };
+    const malformed: Record<string, unknown>[] = [
+      { recordedAt: 1 },
+      { verified: "false" },
+      { launchedAt: 1 },
+      { launchId: 1 },
+    ];
+    for (const fields of malformed) {
+      const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-malformed-metadata-")); temporary.push(root);
+      const raw = JSON.stringify({ ...base, ...fields });
+      const statePath = keepaliveStateFilePath(root);
+      await writeFile(statePath, raw, { mode: 0o600 });
 
       await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+      await expect(readFile(statePath, "utf8")).resolves.toBe(raw);
     }
   });
 

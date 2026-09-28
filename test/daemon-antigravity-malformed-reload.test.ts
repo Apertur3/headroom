@@ -12,8 +12,8 @@ import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
  * from inside a custom poller callback -- so the corruption lands exactly
  * between poll()'s own successful earlier read (the one that decided a
  * keepalive attempt is warranted) and the fresh re-read maybeStartKeepalive()
- * does for itself moments later, which is the actual race the finding
- * describes. A real process-level `unhandledRejection` listener is the
+ * does for itself moments later, which is the actual race under test.
+ * A real process-level `unhandledRejection` listener is the
  * proof: if the fix regresses, this fires for real (and, separately,
  * vitest's own default unhandled-error handling would also fail the run).
  */

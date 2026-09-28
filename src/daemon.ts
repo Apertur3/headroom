@@ -382,6 +382,11 @@ export class HeadroomDaemon {
       if (!finalPolicy.antigravity_keepalive) return;
       const finalAntigravity = finalAccounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
       if (!finalAntigravity) return;
+      // The executable was validated for the earlier selected account. A
+      // reload can replace that account or its agy_path while executablePath()
+      // awaits filesystem work; do not start the stale binary merely because
+      // some enabled Antigravity account still exists.
+      if (finalAntigravity.name !== antigravity.name || finalAntigravity.agy_path !== antigravity.agy_path) return;
       this.keepalive ??= new AgyKeepaliveSupervisor({ binary, home: this.home });
       this.keepalive.start();
     } catch (error) {
@@ -1062,7 +1067,7 @@ export class HeadroomDaemon {
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
-      if (this.schedulingStarted && !this.keepalive?.running && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+      if (this.schedulingStarted && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
         // maybeStartKeepalive() itself never rejects (see its own doc
         // comment), but this detached call is guarded again here anyway --
         // defense in depth, not reliance on that guarantee alone -- so a

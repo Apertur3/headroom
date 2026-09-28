@@ -1,14 +1,13 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
 /**
  * Isolated from the other daemon tests on purpose: this file gates
  * paths.js's executablePath() so a real maybeStartKeepalive() call can be
- * held open, mid-await, at the exact point Sol's partial-item-2 finding
- * named -- AFTER the fresh accounts/policy re-read earlier in the
+ * held open, mid-await, after the fresh accounts/policy re-read earlier in the
  * function, but BEFORE the supervisor is ever constructed or started.
  * While the gate is held, the account is disabled for real (a genuine
  * accounts.toml rewrite through currentAccounts()); the point is proving
@@ -48,6 +47,17 @@ const accountsToml = (enabled: boolean, agyPath: string): string => [
   'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
 ].join("\n");
 
+async function trackPidIfWritten(path: string, root: string, timeoutMs = 300): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number((await readFile(path, "utf8")).trim());
+      if (Number.isInteger(pid) && pid > 1) { track(pid, root); return; }
+    } catch { /* not written yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepalive() re-checks freshness after executablePath()'s own await, not just before it", () => {
   it("never constructs or starts a supervisor when the account is disabled while executablePath() is still resolving", async () => {
     const { HeadroomDaemon } = await import("../src/daemon.js");
@@ -62,7 +72,11 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await daemon.start();
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
       const internal = daemon as unknown as {
         keepalive: { running: boolean } | undefined;
         currentAccounts(): Promise<unknown[]>;
@@ -92,10 +106,61 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       gate.release();
       await attempt;
 
+      // If this assertion regresses and a fixture does start, register it
+      // before failing so the process reaper can clean it up reliably.
+      await trackPidIfWritten(infoFile, root);
+
       expect(resolved).toBe(true);
       // The fix: a fresh re-read AFTER executablePath()'s own await must
       // have seen the disable and refused to construct/start anything.
       expect(internal.keepalive).toBeUndefined();
+    } finally {
+      gate.release();
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
+
+  it("never constructs or starts a supervisor with an executable selected before its account path changed", async () => {
+    const { HeadroomDaemon } = await import("../src/daemon.js");
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-deferredpath-")); temporary.push(root);
+    const firstInfoFile = join(root, "agy-first-pid.txt");
+    const secondInfoFile = join(root, "agy-second-pid.txt");
+    const firstAgy = await writeFakeAgy(root, firstInfoFile);
+    const secondAgy = await writeFakeAgy(root, secondInfoFile);
+    await writeFile(join(root, "accounts.toml"), accountsToml(false, firstAgy), { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
+      const internal = daemon as unknown as {
+        keepalive: { running: boolean } | undefined;
+        currentAccounts(): Promise<unknown[]>;
+        maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
+      };
+      await writeFile(join(root, "accounts.toml"), accountsToml(true, firstAgy), { mode: 0o600 });
+      const enabledAccounts = await internal.currentAccounts();
+
+      gate.armed = true;
+      const attempt = internal.maybeStartKeepalive(enabledAccounts, {});
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      // The selected account remains enabled, but its executable changes
+      // while the old path is still being validated.
+      await writeFile(join(root, "accounts.toml"), accountsToml(true, secondAgy), { mode: 0o600 });
+      gate.release();
+      await attempt;
+
+      await trackPidIfWritten(firstInfoFile, root);
+      await trackPidIfWritten(secondInfoFile, root);
+      expect(internal.keepalive).toBeUndefined();
+      await expect(readFile(firstInfoFile, "utf8")).rejects.toThrow();
+      await expect(readFile(secondInfoFile, "utf8")).rejects.toThrow();
     } finally {
       gate.release();
       await daemon.stop();
