@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   checkModelAvailability, fetchAntigravityModelCatalog, MODEL_CATALOG_MAX_AGE_MS, MODEL_CHECK_INTERVAL_MS,
@@ -225,8 +225,8 @@ describe("checkModelAvailability orchestration", () => {
       await checkModelAvailability(store, [
         account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
       ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
-      expect(readCodex).toHaveBeenCalledWith("/tmp/codex-live", undefined, expect.any(Date));
-      expect(readClaude).toHaveBeenCalledWith("/tmp/claude-live", undefined, undefined, expect.any(Date));
+      expect(readCodex).toHaveBeenCalledWith(resolve("/tmp/codex-live"), undefined, expect.any(Date));
+      expect(readClaude).toHaveBeenCalledWith(resolve("/tmp/claude-live"), undefined, undefined, expect.any(Date));
       expect(fetchAntigravity).toHaveBeenCalledTimes(1);
       expect(store.knownModels("codex-live")).toHaveLength(1);
       expect(store.knownModels("claude-live")).toHaveLength(1);

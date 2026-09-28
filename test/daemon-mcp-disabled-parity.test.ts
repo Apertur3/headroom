@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { cacheCan, handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
+import type { Observation } from "../src/types.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
@@ -21,7 +22,7 @@ async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
  * daemon's own socket handler calls) HeadroomDaemon, converting a JSON-RPC
  * error reply into the same `{jsonrpc, error}` envelope the real socket
  * transport would hand back, so handleMcp's own error-propagation logic
- * (finding #5) still applies exactly as it does against a live daemon.
+ * still applies exactly as it does against a live daemon.
  */
 function daemonCallVia(daemon: HeadroomDaemon) {
   return async (method: string, params: Record<string, unknown>): Promise<unknown> => {
@@ -49,33 +50,40 @@ function structuredContentOf(response: Record<string, unknown> | undefined): Rec
 }
 
 const DISABLED_ACCOUNTS_TOML = ['[[accounts]]', 'name = "claude-2"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ''].join("\n");
+const ENABLED_AND_DISABLED_ACCOUNTS_TOML = ['[[accounts]]', 'name = "claude-live"', 'vendor = "claude"', 'location = "/fixture/.claude-live"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "claude-2"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ''].join("\n");
 const ROUTING_TOML = ['[consumes]', 'parked = ["claude-2:all"]', ''].join("\n");
 
-async function seedDisabledReading(home: string): Promise<void> {
+function percentReading(principalId: string, used: number, at: Date): Observation {
+  return { principal_id: principalId, meter_id: `${principalId}:all`, window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: new Date(at.getTime() + 3_600_000).toISOString(), observed_at: at.toISOString(), fetched_at: at.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" };
+}
+
+async function seedReading(home: string, principalId: string): Promise<void> {
   const store = await HeadroomStore.open(home);
   try {
-    const now = new Date();
-    store.insert({ principal_id: "claude-2", meter_id: "claude-2:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: new Date(now.getTime() + 3_600_000).toISOString(), observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" });
+    store.insert(percentReading(principalId, 10, new Date()));
   } finally { store.close(); }
 }
 
 describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
-  it("unscoped quota_rate and quota_gate ignore disabled-only historical capacity", async () => {
+  it("unscoped quota_rate and quota_gate retain enabled capacity while excluding disabled history", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-parity-unscoped-")); temporary.push(home);
-    await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
-    await seedDisabledReading(home);
+    await writeFile(join(home, "accounts.toml"), ENABLED_AND_DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
+    await seedReading(home, "claude-live");
+    await seedReading(home, "claude-2");
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
       await withHome(home, async () => {
         const rateLine = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_rate", arguments: {} } });
-        expect(stableFields(structuredContentOf(await handleMcp(rateLine, daemonCallVia(daemon))))).toEqual({ lines: [] });
-        expect(stableFields(structuredContentOf(await handleMcp(rateLine, async () => undefined)))).toEqual({ lines: [] });
+        const daemonRate = stableFields(structuredContentOf(await handleMcp(rateLine, daemonCallVia(daemon))));
+        const directRate = stableFields(structuredContentOf(await handleMcp(rateLine, async () => undefined)));
+        expect(daemonRate).toEqual(directRate);
+        expect(daemonRate).toEqual({ lines: [expect.objectContaining({ meter: "claude-live:all", used_percent: 10 })] });
 
         const gateLine = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quota_gate", arguments: { needs: ["5h:1"] } } });
         const daemonResult = structuredContentOf(await handleMcp(gateLine, daemonCallVia(daemon)));
         const directResult = structuredContentOf(await handleMcp(gateLine, async () => undefined));
         expect(stableFields(daemonResult)).toEqual(stableFields(directResult));
-        expect(stableFields(daemonResult)).toEqual({ allowed: false, reason: "no meters configured", meters_checked: [], notices: [] });
+        expect(stableFields(daemonResult)).toEqual({ allowed: true, reason: "fits", meters_checked: ["claude-live:all"], notices: [] });
       });
     } finally { await daemon.stop().catch(() => undefined); }
   });
@@ -143,14 +151,19 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     } finally { await daemon.stop().catch(() => undefined); }
   });
 
-  it("quota_can uses the same disabled refusal wrapper and unknown cost in daemon, direct, and cached paths", async () => {
+  it("quota_can returns the disabled refusal and unknown cost across each available path", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-parity-can-")); temporary.push(home);
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     await writeFile(join(home, "routing.toml"), ROUTING_TOML, { mode: 0o600 });
     const store = await HeadroomStore.open(home);
     try {
-      const lease = store.startLease("test", "claude-2:all", null, 60_000, null, new Date(), "parked");
-      store.endLease(lease.id, "test");
+      const startedAt = new Date(Date.now() - 2_000);
+      store.insert(percentReading("claude-2", 10, startedAt));
+      const lease = store.startLease("test", "claude-2:all", null, 60_000, null, startedAt, "parked");
+      const observedAt = new Date(startedAt.getTime() + 1_000);
+      store.insert(percentReading("claude-2", 17, observedAt));
+      store.endLease(lease.id, "test", false, observedAt);
+      expect(store.learnedCost("parked")).toMatchObject([{ median_percent: 7, sample_count: 1 }]);
     } finally { store.close(); }
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
@@ -162,6 +175,12 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
         expect(daemonResult).toEqual(directResult);
         expect(daemonResult).toEqual(cachedResult);
         expect(daemonResult).toMatchObject({ decision: { allowed: false, meter: "claude-2:all", reason: expect.stringContaining("disabled") }, cost: { source: "unknown", expected_percent: null, sample_count: 0 }, leased_id: null });
+
+        const leaseLine = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quota_can", arguments: { action_class: "parked", owner: "test", lease: true } } });
+        const daemonLeaseResult = stableFields(structuredContentOf(await handleMcp(leaseLine, daemonCallVia(daemon))));
+        const directLeaseResult = stableFields(structuredContentOf(await handleMcp(leaseLine, async () => undefined)));
+        expect(daemonLeaseResult).toEqual(directLeaseResult);
+        expect(daemonLeaseResult).toMatchObject({ decision: { allowed: false, meter: "claude-2:all", reason: expect.stringContaining("disabled") }, cost: { source: "unknown", expected_percent: null, sample_count: 0 }, leased_id: null });
       });
     } finally { await daemon.stop().catch(() => undefined); }
   });

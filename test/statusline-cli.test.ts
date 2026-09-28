@@ -73,7 +73,7 @@ describe("headroom statusline", () => {
     const home = join(root, ".headroom");
     const configDir = join(root, "parked-profile");
     await mkdir(home, { recursive: true, mode: 0o700 });
-    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', `location = "${configDir}"`, 'adapter = "native-ts"', ''].join("\n"), { mode: 0o600 });
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', `location = ${JSON.stringify(configDir)}`, 'adapter = "native-ts"', ''].join("\n"), { mode: 0o600 });
     const payload = JSON.stringify({ rate_limits: { five_hour: { used_percentage: 5, resets_at: null } } });
     await withHeadroomHome(home, () => withConfigDir(configDir, async () => {
       const { code, stdout } = await runStatusline([], payload);

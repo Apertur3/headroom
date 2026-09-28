@@ -352,7 +352,7 @@ function remainingForDecision(store: HeadroomStore, decision: CanDecision): numb
 function canResult(store: HeadroomStore, action: string, expectOverride: number | null, decision: CanDecision, leases: ReturnType<HeadroomStore["leases"]> = [], useLearnedCost = true, requestedCost?: ReturnType<typeof buildCostEstimate>): Record<string, unknown> {
   const learned = useLearnedCost ? store.learnedCost(action)[0] : undefined;
   const cost = buildCostEstimate(action, expectOverride, learned, useLearnedCost ? remainingForDecision(store, decision) : null);
-  if (requestedCost?.expected_percent !== undefined && cost.expected_percent !== requestedCost.expected_percent) cost.expected_percent = requestedCost.expected_percent;
+  if (useLearnedCost && requestedCost?.expected_percent !== undefined && cost.expected_percent !== requestedCost.expected_percent) cost.expected_percent = requestedCost.expected_percent;
   return { decision, cost, leased_id: leases[0]?.id ?? null };
 }
 
