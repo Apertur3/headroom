@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +65,21 @@ describe("headroom statusline", () => {
       expect(code).toBe(0);
       const written = JSON.parse(await readFile(join(home, "statusline", ".claude2.json"), "utf8"));
       expect(written.five_hour.used_percent).toBe(5);
+    }));
+  });
+
+  it("does not persist a snapshot for a configured disabled profile", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-cli-disabled-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const configDir = join(root, "parked-profile");
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', `location = "${configDir}"`, 'adapter = "native-ts"', ''].join("\n"), { mode: 0o600 });
+    const payload = JSON.stringify({ rate_limits: { five_hour: { used_percentage: 5, resets_at: null } } });
+    await withHeadroomHome(home, () => withConfigDir(configDir, async () => {
+      const { code, stdout } = await runStatusline([], payload);
+      expect(code).toBe(0);
+      expect(stdout.join("\n")).toContain("5h 5%");
+      await expect(lstat(join(home, "statusline", "parked-profile.json"))).rejects.toMatchObject({ code: "ENOENT" });
     }));
   });
 

@@ -205,23 +205,31 @@ describe("checkModelAvailability orchestration", () => {
     } finally { store.close(); }
   });
 
-  it("never invokes cache readers or the Antigravity fetcher for a disabled principal", async () => {
+  it("never invokes readers for disabled-only inputs, then uses each live account's own path", async () => {
     const home = await tempDir("headroom-model-check-disabled-");
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
-      const readCodex = vi.fn().mockResolvedValue([]);
-      const readClaude = vi.fn().mockResolvedValue([]);
+      const readCodex = vi.fn().mockResolvedValue([{ id: "gpt-6-astra", name: "GPT-6-Astra" }]);
+      const readClaude = vi.fn().mockResolvedValue([{ id: "claude-sonnet-5", name: "Sonnet 5" }]);
       const fetchAntigravity = vi.fn().mockResolvedValue([]);
       await checkModelAvailability(store, [
         account("codex-parked", "codex", false), account("claude-parked", "claude", false), account("antigravity-parked", "antigravity", false),
-        account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
       ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
-      expect(readCodex).toHaveBeenCalledTimes(1);
-      expect(readClaude).toHaveBeenCalledTimes(1);
-      expect(fetchAntigravity).toHaveBeenCalledTimes(1);
+      expect(readCodex).not.toHaveBeenCalled();
+      expect(readClaude).not.toHaveBeenCalled();
+      expect(fetchAntigravity).not.toHaveBeenCalled();
       expect(store.knownModels("codex-parked")).toEqual([]);
       expect(store.knownModels("claude-parked")).toEqual([]);
       expect(store.knownModels("antigravity-parked")).toEqual([]);
+
+      await checkModelAvailability(store, [
+        account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
+      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
+      expect(readCodex).toHaveBeenCalledWith("/tmp/codex-live", undefined, expect.any(Date));
+      expect(readClaude).toHaveBeenCalledWith("/tmp/claude-live", undefined, undefined, expect.any(Date));
+      expect(fetchAntigravity).toHaveBeenCalledTimes(1);
+      expect(store.knownModels("codex-live")).toHaveLength(1);
+      expect(store.knownModels("claude-live")).toHaveLength(1);
     } finally { store.close(); }
   });
 

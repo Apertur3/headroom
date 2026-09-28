@@ -658,6 +658,7 @@ async function rate(argv: string[]): Promise<number> {
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
   const disabled = meter ? await disabledMeterReason(meter) : undefined;
+  const enabledPrincipalIds = meter ? undefined : new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
   let lines: RateLine[];
   if (disabled) {
     // Same synthetic-line shape rateLines() already uses for any other
@@ -667,16 +668,16 @@ async function rate(argv: string[]): Promise<number> {
     lines = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }];
   } else {
     const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
-    if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
+    if (outcome.kind === "available") { lines = (unwrapRpc(outcome.result) as RateLine[]).filter((line) => !enabledPrincipalIds || enabledPrincipalIds.has(line.meter.split(":", 1)[0])); }
     else if (outcome.kind === "cache") {
       cacheReadNotice();
       const store = await HeadroomStore.openReadOnly();
-      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need, { enabledPrincipalIds }); }
       finally { store.close(); }
     } else {
       directReadNotice();
       const store = await HeadroomStore.open();
-      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need, { enabledPrincipalIds }); store.audit("cli", "rate", meter ?? null, "ok"); }
       finally { store.close(); }
     }
   }
@@ -749,7 +750,9 @@ function printCredits(items: CreditBalance[]): void {
 }
 
 async function configuredCreditPrincipal(principal: string): Promise<void> {
-  if (!(await readAccounts()).some((account) => account.name === principal)) throw new Error(`unknown principal: ${principal}`);
+  const account = (await readAccountsOrEmpty()).find((item) => item.name === principal);
+  if (!account) throw new Error(`unknown principal: ${principal}`);
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
 }
 
 const POLICY_USAGE = [
@@ -932,6 +935,7 @@ async function credits(argv: string[]): Promise<number> {
   const asJson = argv.includes("--json");
   if (!command || command === "--json") {
     if (argv.some((value) => value !== "--json")) throw new Error("Usage: headroom credits [--json]");
+    const enabledPrincipalIds = new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
     const request = await requestDaemon("credits");
     let items: CreditBalance[];
     if (request !== undefined) items = unwrapRpc(request) as CreditBalance[];
@@ -940,6 +944,7 @@ async function credits(argv: string[]): Promise<number> {
       try { items = store.credits(); store.audit("cli", "credits", null, "ok"); }
       finally { store.close(); }
     }
+    items = items.filter((item) => enabledPrincipalIds.has(item.meter.split(":", 1)[0]));
     if (asJson) console.log(JSON.stringify(withContract({ credits: items })));
     else printCredits(items);
     return 0;
@@ -1823,7 +1828,8 @@ async function statusline(argv: string[]): Promise<number> {
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch { payload = undefined; }
     snapshot = snapshotFromStatuslinePayload(payload, profile, now);
-    if (snapshot) {
+    const account = (await readAccountsOrEmpty()).find((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude" && statuslineProfile(item.location) === profile);
+    if (snapshot && (!account || isAccountEnabled(account))) {
       // Resolves and verifies the same safe Headroom home every other
       // command uses (never the raw, unchecked headroomHome() this used to
       // call directly), then verifies the statusline subdirectory itself

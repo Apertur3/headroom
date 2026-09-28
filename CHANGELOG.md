@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - Parked principals are now excluded at the model-catalog credential/cache boundary and by both daemon and direct-status callers, so a disabled account cannot read a vendor cache, credential, or model-list endpoint. Cached `can`/`quota_can` also exclude disabled local pools, and cached `quota_rate` returns the same disabled-meter UNKNOWN line as daemon and direct reads.
+- Exclude parked principals from unscoped `rate` and `quota_gate` capacity reads, statusline snapshot discovery and stored-row fallback rendering, and current manual-credit reads; credit writes now refuse a disabled principal in both the CLI and daemon.
+- `quota_can` now uses one `{ decision, cost, leased_id }` wrapper for daemon, direct, and cached replies, with disabled decisions reporting unknown learned cost. `usage import` also checks its exact principal before opening either its input file or usage database.
 
 ## [0.2.0] - 2026-09-28
 

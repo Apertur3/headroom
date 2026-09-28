@@ -13,6 +13,8 @@
 import { parseUsageImportOptions } from "./usage-import-options.js";
 import { CollectInputError, collectUsageFile, type CollectResult } from "./usage-collector.js";
 import { NewerUsageSchemaError, UsageStateError, UsagePersistenceError, UsageStore, type CursorRow, type GroupedTotal, type InterruptReason, type SafeSum } from "./usage-store.js";
+import { readAccountsOrEmpty } from "./registry.js";
+import { disabledPrincipalReason, isAccountEnabled } from "./types.js";
 
 export const USAGE_IMPORT_HELP =
   "Usage: headroom usage import --source <alias> --principal <alias> --path <file> [--job <alias>] [--max-bytes N] [--format auto|claude|codex] [--json]";
@@ -128,6 +130,13 @@ function importHumanLines(result: CollectResult, format: "claude" | "codex" | "a
 export async function usageImportCommand(argv: string[]): Promise<number> {
   const options = parseUsageImportOptions(argv);
   if (options.command !== "import") throw new Error(USAGE_IMPORT_HELP);
+
+  // This exact alias is about to be associated with a local usage database
+  // and an input transcript. Resolve a configured parked principal before
+  // opening either path; an absent registry remains the documented
+  // pre-onboarding state, while malformed configuration propagates closed.
+  const account = (await readAccountsOrEmpty()).find((item) => item.name === options.principal);
+  if (account && !isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
 
   let store: UsageStore | undefined;
   try {

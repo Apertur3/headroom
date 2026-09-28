@@ -56,6 +56,10 @@ describe("MCP cached disabled-principal boundary", () => {
         source: "cache", daemon: "unresponsive",
         lines: [expect.objectContaining({ meter: "codex-parked:main", reason: expect.stringContaining("disabled") })],
       });
+
+      const aggregate = await cacheRate(undefined, 30, undefined, undefined) as { source: string; daemon: string; lines: Array<{ meter: string }> };
+      expect(aggregate).toMatchObject({ source: "cache", daemon: "unresponsive", lines: [expect.objectContaining({ meter: "codex-live:main" })] });
+      expect(aggregate.lines).not.toEqual(expect.arrayContaining([expect.objectContaining({ meter: "codex-parked:main" })]));
     });
   });
 });

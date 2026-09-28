@@ -290,7 +290,7 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
     if (disabledMeter) {
       const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
       const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
-      return { source: "direct", decision, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
+      return { source: "direct", ...canResult(store, action, expectOverride, decision, [], false) };
     }
     const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
     store.insertAll(await Promise.all(localAccounts.map(observeLocal)));
@@ -324,9 +324,8 @@ async function directCan(action: string, allowUnknown: boolean, owner: string | 
       leases = admitted.leases;
       if (leases.length) store.audit("mcp", "lease_start", `${owner}:${meters.join(",")}`, "ok");
     }
-    const cost = buildCostEstimate(action, expectOverride, learned, remainingForDecision(store, decision));
     store.audit("mcp", "can", action, decision.allowed ? "yes" : "no");
-    return { source: "direct", decision, cost, leased_id: leases[0]?.id ?? null };
+    return { source: "direct", ...canResult(store, action, expectOverride, decision, leases) };
   } finally { store.close(); }
 }
 
@@ -345,6 +344,16 @@ function directCanDecision(store: HeadroomStore, meters: string[], localMeters: 
 function remainingForDecision(store: HeadroomStore, decision: CanDecision): number | null {
   const deciding = pickDecidingObservation(store.latestPerWindow(decision.meter));
   return deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
+}
+
+/** The documented quota_can payload, shared by direct, cached, and daemon
+ * reads. A disabled decision deliberately has no learned-cost evidence: its
+ * historical samples are not current dispatch capacity. */
+function canResult(store: HeadroomStore, action: string, expectOverride: number | null, decision: CanDecision, leases: ReturnType<HeadroomStore["leases"]> = [], useLearnedCost = true, requestedCost?: ReturnType<typeof buildCostEstimate>): Record<string, unknown> {
+  const learned = useLearnedCost ? store.learnedCost(action)[0] : undefined;
+  const cost = buildCostEstimate(action, expectOverride, learned, useLearnedCost ? remainingForDecision(store, decision) : null);
+  if (requestedCost?.expected_percent !== undefined && cost.expected_percent !== requestedCost.expected_percent) cost.expected_percent = requestedCost.expected_percent;
+  return { decision, cost, leased_id: leases[0]?.id ?? null };
 }
 
 /** The read-only counterpart of `directCanDecision`: `dispatchBlockForMeter`
@@ -386,14 +395,12 @@ export async function cacheCan(action: string, allowUnknown: boolean, owner: str
     if (disabledMeter) {
       const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
       const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
-      return { source: "cache", daemon: "unresponsive", decision, cost: buildCostEstimate(action, expectOverride, undefined, null), leased_id: null };
+      return { source: "cache", daemon: "unresponsive", ...canResult(store, action, expectOverride, decision, [], false) };
     }
     const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
     const now = new Date();
     const decision = directCanDecisionReadOnly(store, meters, localMeters, routing.local_preference, policy, allowUnknown, owner, now);
-    const learned = store.learnedCost(action)[0];
-    const cost = buildCostEstimate(action, expectOverride, learned, remainingForDecision(store, decision));
-    return { source: "cache", daemon: "unresponsive", decision, cost, leased_id: null };
+    return { source: "cache", daemon: "unresponsive", ...canResult(store, action, expectOverride, decision) };
   } finally { store.close(); }
 }
 
@@ -492,9 +499,10 @@ async function directCost(actionClass: unknown): Promise<DirectResult> {
 async function directRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
   const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
   if (disabled) return { source: "direct", lines: [{ meter, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }] };
+  const enabledPrincipalIds = typeof meter === "string" ? undefined : new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
   const store = await HeadroomStore.open();
   try {
-    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
+    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined, { enabledPrincipalIds });
     store.audit("mcp", "rate", typeof meter === "string" ? meter : null, "ok");
     return { source: "direct", lines };
   } finally { store.close(); }
@@ -505,9 +513,10 @@ async function directRate(meter: unknown, minutes: unknown, owner: unknown, need
 export async function cacheRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
   const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
   if (disabled) return { source: "cache", daemon: "unresponsive", lines: [{ meter, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }] };
+  const enabledPrincipalIds = typeof meter === "string" ? undefined : new Set((await readAccountsOrEmpty()).filter(isAccountEnabled).map((account) => account.name));
   const store = await HeadroomStore.openReadOnly();
   try {
-    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
+    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined, { enabledPrincipalIds });
     return { source: "cache", daemon: "unresponsive", lines };
   } finally { store.close(); }
 }
@@ -599,7 +608,9 @@ async function directRoute(actionClass: unknown, owner: unknown, allowUnknown: u
 async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, reservePercent: unknown, owner: unknown, planSharePercent: unknown, actionClass: unknown, allowance: unknown, capPercent: unknown, durationMinutes: unknown): Promise<DirectResult> {
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
-  const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
+  const accounts = await readAccountsOrEmpty();
+  const disabledPrincipal = typeof meter === "string" ? disabledPrincipalForMeter(accounts, meter) : undefined;
+  const disabled = disabledPrincipal ? disabledPrincipalReason(disabledPrincipal) : undefined;
   // meters_checked names the meter actually examined, matching gateFor's own
   // convention (and the daemon's identical disabled-gate branch) -- never a
   // hard-coded empty array.
@@ -619,6 +630,7 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
       durationMinutes: typeof durationMinutes === "number" ? durationMinutes : routing?.costs[typeof actionClass === "string" ? actionClass : ""]?.duration_minutes,
       staleness_minutes: policy.staleness_minutes,
       reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime,
+      enabledPrincipalIds: new Set(accounts.filter(isAccountEnabled).map((account) => account.name)),
     });
     store.audit("mcp", "gate", typeof meter === "string" ? meter : null, result.allowed ? "yes" : "no");
     return { source: "direct", ...result };
@@ -936,13 +948,7 @@ async function annotateDaemonCan(raw: unknown, action: string, expectOverride: n
     : { decision: raw as CanDecision, leases: [] as ReturnType<HeadroomStore["leases"]> };
   const store = await HeadroomStore.open();
   try {
-    const cost = buildCostEstimate(action, expectOverride, store.learnedCost(action)[0], remainingForDecision(store, admitted.decision));
-    const leases = admitted.leases ?? [];
-    // requestedCost is deliberately kept in the call signature: its expected
-    // value is what the daemon admitted atomically, while the returned cost
-    // below recomputes max_more from the final deciding meter for parity with
-    // the direct fallback.
-    if (requestedCost?.expected_percent !== undefined && cost.expected_percent !== requestedCost.expected_percent) cost.expected_percent = requestedCost.expected_percent;
-    return { ...admitted.decision, cost, leased_id: leases[0]?.id ?? null };
+    const disabled = disabledPrincipalForMeter(await readAccountsOrEmpty(), admitted.decision.meter) !== undefined;
+    return canResult(store, action, expectOverride, admitted.decision, admitted.leases ?? [], !disabled, requestedCost);
   } finally { store.close(); }
 }
