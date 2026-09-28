@@ -410,11 +410,12 @@ that a banked reset would restore").
 
 `headroom policy set reserve <meter> <percent> --reason "<text>" [--until <ISO|+7d>] [--unless
 banked_reset_available]`, `headroom policy clear reserve <meter>`, and `headroom policy set
-freeze_reserve_pct <n> [--reason ...] [--until ...]` edit policy.toml safely: an exclusive lock file
-serializes concurrent writers (so two `policy set` invocations can never have one's edit silently
-erased by the other's), atomic write (0600 mode on POSIX; Windows has no equivalent permission bit),
-a `policy.toml.bak-<timestamp>` backup written first (a collision-proof name even when two backups
-land in the same millisecond), every other key and comment preserved, and a before/after line
+freeze_reserve_pct <n> [--reason ...] [--until ...]` edit policy.toml safely: an exclusive lock
+(shared with `headroom notify configure`'s own policy.toml edit, so the two can never interleave
+either) serializes concurrent writers, so two invocations can never have one's edit silently erased
+by the other's; atomic write (0600 mode on POSIX; Windows has no equivalent permission bit); a
+`policy.toml.bak-<timestamp>` backup written first (a collision-proof name even when two backups
+land in the same millisecond); every other key and comment preserved; and a before/after line
 printed. `headroom policy show` prints every reserve's effective percent, metadata, and whether it
 is currently expired or suspended.
 

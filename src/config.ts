@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, open, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { headroomHome } from "./paths.js";
@@ -90,37 +90,64 @@ function packageRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-async function writeSeededFile(path: string, text: string): Promise<void> {
+/**
+ * Creates `path` exclusively (`open(..., "wx")`, O_EXCL) and writes `text`
+ * to it, returning whether this call actually created it. `EEXIST` -- the
+ * file was already there, whether from an earlier seed or a concurrent
+ * `accounts discover`/`policy set` racing this one -- is treated as "already
+ * seeded", not an error: unlike a check-then-write (`optionalText(path) ===
+ * undefined` followed by a plain `writeFile`), this can never overwrite a
+ * file a concurrent writer created in the gap between the two. A failed
+ * write or close after a successful create removes the partial file before
+ * rethrowing, so it can never wedge every future seed attempt.
+ */
+async function seedFileExclusive(path: string, text: string): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, text, { mode: 0o600 });
-  await chmod(path, 0o600); // writeFile's mode is umask-masked; make the intent explicit
+  let handle;
+  try { handle = await open(path, "wx", 0o600); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await handle.writeFile(text, "utf8");
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(path).catch(() => {});
+    throw error;
+  }
+  try {
+    await handle.close();
+  } catch (error) {
+    await unlink(path).catch(() => {});
+    throw error;
+  }
+  return true;
 }
 
 /**
  * Seeds ~/.headroom/policy.toml and routing.toml from examples/ the first
  * time either is absent, so `headroom can <class>` works from a fresh
  * `accounts discover` without an extra manual copy step. Never overwrites an
- * existing file. Returns one human-readable line per file actually written,
- * empty when both were already present (or examples/ is unexpectedly
- * missing, which never blocks discovery on its own).
+ * existing file -- exclusive creation (see seedFileExclusive) makes this
+ * race-free against a concurrent writer, unlike an earlier check-then-write
+ * version of this function. Returns one human-readable line per file
+ * actually written, empty when both were already present (or examples/ is
+ * unexpectedly missing, which never blocks discovery on its own).
  */
 export async function seedExampleConfig(home = headroomHome()): Promise<string[]> {
   const root = packageRoot();
   const messages: string[] = [];
-  const policyTarget = join(home, "policy.toml");
-  if ((await optionalText(policyTarget)) === undefined) {
-    const source = await optionalText(join(root, "examples", "policy.toml"));
-    if (source !== undefined) {
-      await writeSeededFile(policyTarget, source);
-      messages.push(`Seeded ${policyTarget} from examples/policy.toml.`);
-    }
+  const policySource = await optionalText(join(root, "examples", "policy.toml"));
+  if (policySource !== undefined) {
+    const policyTarget = join(home, "policy.toml");
+    if (await seedFileExclusive(policyTarget, policySource)) messages.push(`Seeded ${policyTarget} from examples/policy.toml.`);
   }
-  const routingTarget = join(home, "routing.toml");
-  if ((await optionalText(routingTarget)) === undefined) {
-    const source = await optionalText(join(root, "examples", "routing.toml"));
-    if (source !== undefined) {
-      await writeSeededFile(routingTarget, source);
-      const classes = Object.keys(parseRouting(source).consumes);
+  const routingSource = await optionalText(join(root, "examples", "routing.toml"));
+  if (routingSource !== undefined) {
+    const routingTarget = join(home, "routing.toml");
+    if (await seedFileExclusive(routingTarget, routingSource)) {
+      const classes = Object.keys(parseRouting(routingSource).consumes);
       messages.push(`Seeded ${routingTarget} from examples/routing.toml (action classes: ${classes.join(", ")}). Edit to match your accounts.`);
     }
   }

@@ -333,7 +333,7 @@ describe("headroom gate", () => {
     });
   });
 
-  it("still evaluates --allowance fill under policy pacing \"none\" for gate, fill and run (review finding 3)", async () => {
+  it("still evaluates --allowance fill under policy pacing \"none\" for gate, fill and run", async () => {
     const home = await seededHome();
     await writeFile(join(home, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
     const store = await HeadroomStore.open(home);

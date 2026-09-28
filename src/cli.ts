@@ -42,7 +42,7 @@ import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccount
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
-import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withExclusiveLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
@@ -789,16 +789,9 @@ async function backupPolicyFile(home: string, original: string): Promise<void> {
   await writeExclusiveFile(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
 }
 
-/** Serializes every `policy set`/`policy clear` writer through one lock file:
- * without it, two concurrent CLI invocations can both read the same
- * on-disk policy.toml, compute two different updates from it, and have the
- * second writer's rename silently erase the first writer's edit -- neither
- * ever saw the other's change. `fn` must contain the whole read-modify-write
- * (readPolicyTextOrEmpty through writeFileAtomic): the lock only protects
- * what runs inside it. */
-async function withPolicyLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
-  return withExclusiveLock(join(home, "policy.toml.lock"), fn);
-}
+// withPolicyLock (used by every policy.toml writer below, and by
+// notify-configure.ts's own reread-compare-write) lives in security.js --
+// it is shared, not owned by this file.
 
 interface PolicyReserveRow {
   meter: string; percent: number; effective_percent: number; reason: string | null;

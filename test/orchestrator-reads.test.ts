@@ -640,7 +640,7 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
   });
 });
 
-describe("gateFor/fillFor: explicit fill allowance is independent of pacing (review finding 3)", () => {
+describe("gateFor/fillFor: explicit fill allowance is independent of pacing", () => {
   const meter = "claude-main:all";
   const now = new Date("2026-09-03T12:00:00Z");
   const resetsAt = "2026-09-03T16:30:00Z"; // 4.5h left

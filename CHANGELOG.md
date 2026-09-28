@@ -18,13 +18,17 @@ All notable changes to this project are documented here. The format follows
   truncate it. The write also refuses outright if `accounts.toml` is a symlink instead of following
   it, and both reads that precede a write now use the same no-follow, bounded reader instead of a
   plain `readFile` that would itself follow a symlink or block on a FIFO planted at that path.
-- `headroom policy set`/`clear` writers are now serialized through an exclusive lock file, so two
-  concurrent invocations editing `policy.toml` can no longer have the second writer's rename
-  silently erase the first writer's edit. The lock carries an ownership token and a heartbeat that
-  refreshes it while held, so a legitimately long-running edit is never mistaken for an abandoned
-  one, a stale lock is reclaimed by at most one waiter, and a lock is only ever released by the call
-  that still owns it. Timestamped `.bak-` backups taken in the same millisecond no longer collide
-  either; a colliding name gets a counter suffix instead of overwriting the earlier backup.
+- Every `policy.toml` writer -- `headroom policy set`/`clear` and `headroom notify configure`'s own
+  edit -- now shares one exclusive lock, so two of them can no longer interleave a read and a write
+  across each other and have one's edit silently erased by the other's rename. The lock is an
+  ownership-tokened directory reclaimed only once its owning process is confirmed dead or it has sat
+  past a 10-minute hard bound -- never merely because an edit (always a few milliseconds in practice)
+  is still running -- and is only ever released by the call that still owns it. Seeding a fresh
+  `policy.toml`/`routing.toml` from `examples/` on first `accounts discover` is now a single
+  exclusive-create instead of a separate check-then-write, so it can no longer overwrite a reserve a
+  concurrent `policy set` just added. Timestamped `.bak-` backups taken in the same millisecond no
+  longer collide either; a colliding name gets a counter suffix instead of overwriting the earlier
+  backup.
 
 ## [0.2.0] - 2026-09-28
 

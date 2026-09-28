@@ -1,8 +1,19 @@
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, setAccountEnabled, writeDiscoveredAccounts } from "../src/registry.js";
+
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
+
+afterEach(async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  const mocked = await import("node:fs/promises");
+  vi.mocked(mocked.rename).mockReset().mockImplementation(actual.rename);
+});
 
 describe("account discovery", () => {
   let root = "";
@@ -160,6 +171,30 @@ describe("accounts.toml writes: atomic, 0600, symlink-safe", () => {
       // never left one behind.
       const entries = await readdir(root);
       expect(entries).toEqual(["accounts.toml"]);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  // Not skipped on Windows either: an injected failure between the temp
+  // file's successful write and the rename into place must leave the
+  // original file byte-for-byte intact and no temp file behind. A plain,
+  // non-atomic `writeFile(path, data)` (no temp file, no rename call at
+  // all) would instead already have overwritten the original before this
+  // test ever gets to inject anything -- this is the assertion that would
+  // actually fail against that naive implementation, unlike a test that
+  // only checks the end state of an uninterrupted write.
+  it("leaves the original content and mode fully intact, with no stray temp file, when rename fails after the temp file is written", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-rename-fail-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      const mocked = await import("node:fs/promises");
+      vi.mocked(mocked.rename).mockImplementationOnce(async () => { throw new Error("simulated rename failure"); });
+
+      await expect(setAccountEnabled("claude-main", false)).rejects.toThrow("simulated rename failure");
+
+      expect(await readFile(accountsPath(), "utf8")).toBe(source);
+      const entries = await readdir(root);
+      expect(entries).toEqual(["accounts.toml"]); // the temp file was cleaned up, not left behind
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 });

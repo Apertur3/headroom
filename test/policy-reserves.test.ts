@@ -411,9 +411,9 @@ describe("headroom policy CLI: concurrent-safe edits", () => {
     await withHeadroomHome(home, async () => {
       // Both invocations start from the same on-disk policy.toml. Without
       // serialization, both read it before either writes, and the second
-      // writer's rename silently erases the first writer's edit -- exactly
-      // the race described in review finding 10. Promise.all runs both
-      // main() calls genuinely concurrently within this one process. This is
+      // writer's rename silently erases the first writer's edit. Promise.all
+      // runs both main() calls genuinely concurrently within this one
+      // process. This is
       // an integration smoke test that withPolicyLock is actually wired into
       // the CLI commands -- Promise.all alone does not force a genuine
       // interleaving, so it is not, on its own, proof that the lock actually
