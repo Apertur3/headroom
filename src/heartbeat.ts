@@ -24,17 +24,26 @@
  * unrecoverable: the claim simply goes stale and a later pass (or a fresh
  * daemon process, via `reclaimStaleTimerClaims`) tries again. That retry is
  * safe even if the original attempt's inbox write actually landed just
- * before the crash: `sendInboxMessageAt`'s deterministic, identity-based
- * filename makes the write itself idempotent, so a retried delivery for the
- * same claim never produces a second inbox entry.
+ * before the crash: `sendInboxMessageAt`'s identity-verified filename (keyed
+ * by the timer's own unique, persisted `delivery_id`, see store.ts's
+ * `claimTimer`/`setTimer`) makes the write itself idempotent, so a retried
+ * delivery for the same claim never produces a second inbox entry.
  */
-import { createHash } from "node:crypto";
 import { appendDaemonLog } from "./logs.js";
 import { sendInboxMessageAt } from "./inbox.js";
-import { safeError } from "./security.js";
+import { safeError, TIMER_DELIVERY_FROM, TIMER_DELIVERY_KIND } from "./security.js";
 import type { HeadroomStore } from "./store.js";
 
 const RELATIVE_AT = /^\+(\d+)(s|m|h|d)$/;
+
+/** How long fireDueTimers waits for one timer's inbox write before giving
+ * up on that specific attempt and moving on to the next due timer -- see
+ * fireDueTimers's own doc comment for what happens to the claim after a
+ * timeout. Generous relative to a local filesystem write (normally well
+ * under a second) while still bounding the whole pass -- and the daemon's
+ * maintenance scheduler, which awaits it -- against a single stuck delivery
+ * blocking every other timer and every heartbeat check behind it. */
+export const DELIVERY_TIMEOUT_MS = 10_000;
 
 /** `--at`'s two accepted spellings: an ISO instant, or `+<n><s|m|h|d>`
  * relative to `now`. Always returns a normalized ISO string, never the raw
@@ -48,22 +57,6 @@ export function parseTimerAt(value: string, now = new Date()): string {
   const parsed = Date.parse(value.trim());
   if (!Number.isFinite(parsed)) throw new Error("--at must be an ISO instant or a relative duration like +30m, +2h, +1d");
   return new Date(parsed).toISOString();
-}
-
-/**
- * A deterministic inbox message identity for one timer's delivery, stable
- * across every retry of the same (owner, name, at) row -- what makes
- * `sendInboxMessageAt` able to recognize a re-delivery attempt and skip
- * writing a duplicate rather than creating a second inbox entry. Built from
- * the timer's own `at` (so the message still sorts close to when it was
- * actually due, same as a plain send's `now.getTime()` would) with the low
- * 3 digits replaced by a hash of `name`: `at` alone does not disambiguate
- * two different timers for the same owner sharing the same due instant.
- */
-export function timerMessageEpoch(name: string, at: string): number {
-  const base = Date.parse(at);
-  const suffix = createHash("sha256").update(name, "utf8").digest().readUInt16BE(0) % 1000;
-  return base - (base % 1000) + suffix;
 }
 
 /**
@@ -81,19 +74,44 @@ export function timerMessageEpoch(name: string, at: string): number {
  * `send` is a test seam (defaults to the real `sendInboxMessageAt`): a test
  * that wants to exercise two genuinely overlapping passes, or a crash
  * between claim and delivery, injects a slow or throwing one.
+ *
+ * Each delivery is itself bounded by `deliveryTimeoutMs`: a `send` call that
+ * never settles at all (a stuck filesystem, not merely a slow one) would
+ * otherwise leave this whole pass -- and every other due timer still queued
+ * behind it -- waiting forever, and the daemon's own maintenance scheduler
+ * awaits this same pass before it can re-arm for the next one (see
+ * daemon.ts's own bounded wait around `timerFiringInFlight`). On timeout
+ * this simply moves on without confirming or releasing the claim: its true
+ * outcome is unknown (the write may still land after this function returns,
+ * unobserved), so the claim is left exactly as a crash would leave it --
+ * recoverable once it goes stale (`TIMER_CLAIM_STALE_MS`), and safe to retry
+ * either way because `sendInboxMessageAt`'s delivery-id verification makes a
+ * retry idempotent even if the abandoned attempt's write does eventually
+ * succeed.
  */
-export async function fireDueTimers(store: HeadroomStore, home: string, now = new Date(), log: (message: string) => Promise<void> = (message) => appendDaemonLog(message, home), send: typeof sendInboxMessageAt = sendInboxMessageAt): Promise<number> {
+export async function fireDueTimers(store: HeadroomStore, home: string, now = new Date(), log: (message: string) => Promise<void> = (message) => appendDaemonLog(message, home), send: typeof sendInboxMessageAt = sendInboxMessageAt, deliveryTimeoutMs = DELIVERY_TIMEOUT_MS): Promise<number> {
   let fired = 0;
   for (const timer of store.dueTimers(now)) {
     const claimed = store.claimTimer(timer.owner, timer.name, now);
     if (!claimed) continue; // an overlapping pass already claimed it, or its claim is still fresh
+    const sendPromise = send({
+      to: claimed.owner, kind: TIMER_DELIVERY_KIND, from: TIMER_DELIVERY_FROM,
+      text: JSON.stringify({ timer: claimed.name, at: claimed.at, action: claimed.action }),
+      delivery_id: claimed.delivery_id,
+      home, now,
+    });
+    // A late settlement from an abandoned (timed-out) attempt is expected,
+    // not a defect: by the time it happens this loop has already moved on,
+    // and nothing here awaits it a second time. Without this, Node would
+    // report an unhandled rejection for a `send` that eventually fails
+    // after its own timeout already gave up on it.
+    sendPromise.catch(() => { /* handled by the race below, or abandoned on timeout */ });
     try {
-      await send({
-        to: claimed.owner, kind: "handoff", from: "headroom-timer",
-        text: JSON.stringify({ timer: claimed.name, at: claimed.at, action: claimed.action }),
-        at_epoch: timerMessageEpoch(claimed.name, claimed.at),
-        home, now,
-      });
+      const timedOut = await raceDeliveryTimeout(sendPromise, deliveryTimeoutMs);
+      if (timedOut) {
+        await log(`timer ${claimed.owner}/${claimed.name} delivery timed out after ${deliveryTimeoutMs}ms; abandoning this attempt, its claim will go stale and be retried`);
+        continue;
+      }
       // Durable only once the message is confirmed on disk -- freshly
       // written just now, or already there from an earlier attempt this
       // same idempotent send recognized (see sendInboxMessageAt's own doc
@@ -115,4 +133,21 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
     }
   }
   return fired;
+}
+
+/** Races `promise` against a `timeoutMs` timer; returns `true` when the
+ * timeout wins (the promise is left running, unobserved, exactly as
+ * fireDueTimers's own doc comment describes), `false` when `promise` itself
+ * settles first. A rejection from `promise` before the timeout propagates
+ * normally through `Promise.race`, unaffected by this wrapper. */
+async function raceDeliveryTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timedOut = false;
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => { timedOut = true; resolve(); }, timeoutMs);
+    timer.unref?.();
+  });
+  await Promise.race([promise, timeout]);
+  clearTimeout(timer!);
+  return timedOut;
 }

@@ -20,13 +20,14 @@
  * in-flight pass, and a fresh daemon delivering a timer a crashed one left
  * claimed -- is covered here.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import * as inboxModule from "../src/inbox.js";
 import { readInbox } from "../src/inbox.js";
+import { tailDaemonLog } from "../src/logs.js";
 import { HeadroomStore } from "../src/store.js";
 
 const temporary: string[] = [];
@@ -105,28 +106,43 @@ describe("daemon-owned maintenance scheduler", () => {
 
   // Unlike the first test above (whose timer is already due the instant the
   // daemon starts, so the very first immediate pass delivers it without ever
-  // exercising the reschedule/wait logic at all), this one registers a timer
-  // due only after startup, so it is provably NOT delivered by that first
-  // pass -- only by the scheduler correctly re-arming itself around the new
-  // deadline and firing again once it is actually reached.
-  it("a timer due only after startup is not delivered early, and fires once the scheduler's re-armed tick reaches it", async () => {
+  // exercising the reschedule/wait logic at all), this one registers its
+  // target timer only AFTER daemon.start() has already returned -- proving
+  // the scheduler's own re-armed tick (not the initial pass inside start())
+  // is what discovers and delivers it. A short-lived "bootstrap" timer,
+  // registered before start() and due a little sooner, exists only to give
+  // the very first pass something nearby to reschedule around (otherwise,
+  // with nothing pending at all, that first pass would reschedule for the
+  // full MAINTENANCE_MAX_DELAY_MS ceiling -- 60s -- and this test would need
+  // to wait that long for its own timer, registered moments later, to ever
+  // be noticed). The bootstrap timer's own delivery is incidental, not what
+  // this test is about.
+  it("a timer registered strictly after daemon.start() is not delivered early, and fires once the scheduler's re-armed tick reaches it", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-rearm-")); temporary.push(root);
     const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-rearm"), poller: async () => ({ observations: [], failures: [] }) });
     const internal = daemon as unknown as { store: HeadroomStore };
-    const now = new Date();
-    internal.store.setTimer("orch-future", "wake", new Date(now.getTime() + 2_000).toISOString(), "check status", "notify", now);
+    const before = new Date();
+    internal.store.setTimer("orch-bootstrap", "wake", new Date(before.getTime() + 800).toISOString(), "check status", "notify", before);
     try {
       await daemon.start();
-      // Not due yet: the first (immediate) pass must not have delivered it.
-      // A short, fixed wait -- not a race against the eventual delivery --
-      // since we are asserting the ABSENCE of something at this point.
+      // Registered only now, strictly after start() has already returned --
+      // this daemon process has never seen this timer exist until this call.
+      const after = new Date();
+      internal.store.setTimer("orch-future", "wake", new Date(after.getTime() + 2_200).toISOString(), "check status", "notify", after);
+
+      // Not due yet: neither the pass inside start() (which predates this
+      // timer entirely) nor an immediate re-check can have delivered it. A
+      // short, fixed wait -- not a race against the eventual delivery --
+      // since this asserts the ABSENCE of something at this point.
       await new Promise((resolve) => setTimeout(resolve, 300));
       expect((await readInbox({ session: "orch-future", home: root, markRead: false })).messages).toHaveLength(0);
       expect(internal.store.timers("orch-future")).toHaveLength(1);
 
-      // The scheduler's own re-armed tick (computed by its first pass from
-      // nextMaintenanceDeadline()) must reach and fire it on its own, with
-      // nothing here ever calling fireDueTimers directly.
+      // The scheduler's own re-armed tick (computed fresh each pass from
+      // nextMaintenanceDeadline(), which by now includes this timer even
+      // though it did not exist at the moment the FIRST tick was armed)
+      // must reach and fire it on its own, with nothing here ever calling
+      // fireDueTimers directly.
       await waitForDelivery("orch-future", root);
       expect(internal.store.timers("orch-future")).toHaveLength(0);
     } finally { await daemon.stop(); }
@@ -158,6 +174,39 @@ describe("daemon-owned maintenance scheduler", () => {
         expect(inbox.messages.filter((message) => message.kind === "handoff")).toHaveLength(1);
         expect(internal.store.timers(owner)).toHaveLength(0);
       }
+    } finally { await daemon.stop(); }
+  });
+
+  // A malformed (or otherwise unreadable) notification config introduced
+  // AFTER startup -- a policy.toml edit while the daemon keeps running, no
+  // restart -- used to throw out of runMaintenancePass's own
+  // readNotifyConfig call before checkHeartbeatLapses()/fireDueTimers() ever
+  // ran, so every maintenance pass from that point on silently did nothing
+  // at all: no heartbeat lapse ever noticed, no timer ever fired.
+  it("a malformed notification config written after startup never stops heartbeat checks or timer firing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-bad-notify-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-bad-notify"), poller: async () => ({ observations: [], failures: [] }) });
+    const internal = daemon as unknown as { store: HeadroomStore };
+    const now = new Date();
+    // Not yet due (registered before start(), like the re-armed-schedule
+    // test above): the first, immediate pass inside start() must not
+    // process these before the malformed config below is even written, or
+    // this would never actually exercise a maintenance pass that hits it.
+    internal.store.heartbeatBeat("orch-badnotify", 200, undefined, new Date(now.getTime() - 100));
+    internal.store.setTimer("orch-badnotify", "wake", new Date(now.getTime() + 900).toISOString(), "check status", "notify", now);
+    try {
+      await daemon.start();
+      // Introduced only now, well after the daemon is already running --
+      // exactly a policy.toml edit with no restart, the case this guards.
+      await writeFile(join(root, "policy.toml"), '[notify]\nchannels = ["telegram"]\nnot_a_real_key = "x"\n', { mode: 0o600 });
+
+      await waitFor(() => internal.store.heartbeatLapsed("orch-badnotify"));
+      await waitForDelivery("orch-badnotify", root);
+      expect(internal.store.timers("orch-badnotify")).toHaveLength(0);
+
+      // The malformed config's own failure is still visible, just isolated.
+      const log = await tailDaemonLog(200, root);
+      expect(log).toContain("notification config read failed");
     } finally { await daemon.stop(); }
   });
 
@@ -210,6 +259,45 @@ describe("daemon-owned maintenance scheduler", () => {
     } finally {
       sendSpy.mockRestore();
       await daemon.stop().catch(() => { /* already stopped above in the success path */ });
+    }
+  });
+
+  // should-fix: a delivery that never settles at all (not merely a slow
+  // one) must never stall the scheduler out of processing every OTHER due
+  // timer or heartbeat behind it -- proven here by a second, distinct timer
+  // becoming due shortly after the first one's delivery hangs, and still
+  // being delivered on its own, later pass. The stuck timer itself is left
+  // exactly as a crash would leave it: still claimed, never confirmed or
+  // permanently failed.
+  it("a delivery that never resolves does not stall the scheduler from delivering other due timers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-hung-delivery-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-hung"), poller: async () => ({ observations: [], failures: [] }), deliveryTimeoutMs: 150 });
+    const internal = daemon as unknown as { store: HeadroomStore };
+    const now = new Date();
+    internal.store.setTimer("orch-hung", "wake", new Date(now.getTime() - 500).toISOString(), "check status", "notify", now);
+    internal.store.setTimer("orch-continues", "wake", new Date(now.getTime() + 900).toISOString(), "check status", "notify", now);
+
+    const realSend = inboxModule.sendInboxMessageAt;
+    const sendSpy = vi.spyOn(inboxModule, "sendInboxMessageAt").mockImplementation(async (options) => {
+      if (options.to === "orch-hung") return new Promise(() => { /* never settles */ });
+      return realSend(options);
+    });
+    try {
+      await daemon.start();
+      // The second timer, due after the first one's delivery hangs, is
+      // still delivered on a later pass -- proof the scheduler kept
+      // ticking and re-arming rather than being stuck awaiting the first.
+      await waitForDelivery("orch-continues", root);
+
+      // The stuck one is left recoverable, not confirmed and not given up
+      // on: still pending, never fired, never permanently failed.
+      expect(internal.store.timers("orch-hung")).toHaveLength(1);
+      expect(internal.store.timers("orch-hung")[0]).toMatchObject({ fired_at: null, failed_at: null });
+      const log = await tailDaemonLog(200, root);
+      expect(log).toContain("delivery timed out after 150ms");
+    } finally {
+      sendSpy.mockRestore();
+      await daemon.stop();
     }
   });
 

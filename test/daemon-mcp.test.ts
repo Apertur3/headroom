@@ -110,7 +110,13 @@ describe("daemon JSON-RPC", () => {
         status: "available" as const,
         result: method === "status" ? [oldDaemonRow]
           : method === "leases" || method === "plan_downgrades" ? []
-            : {},
+            // Realistic for an older daemon that has never heard of these
+            // two methods: a plain JSON-RPC -32601, not a bare `{}` --
+            // see src/cli.ts's own unwrapAdditiveRpc for why anything else
+            // non-array now throws as a protocol error instead of silently
+            // becoming "no heartbeats/timers registered".
+            : method === "heartbeats" || method === "timer_list" ? { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } }
+              : {},
       }));
       const output: string[] = [];
       const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });

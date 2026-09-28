@@ -17,7 +17,7 @@ import { admitCanCost, fillFor, gateFor, planFor, rateLines, type GateOutcome, t
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { checkModelAvailability } from "./model-catalog.js";
-import { fireDueTimers } from "./heartbeat.js";
+import { fireDueTimers, DELIVERY_TIMEOUT_MS } from "./heartbeat.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -60,8 +60,35 @@ const MAINTENANCE_MIN_DELAY_MS = 1_000;
  * local inbox write (normally well under a second) while still bounding
  * shutdown against a genuinely stuck filesystem call. */
 const STOP_DRAIN_TIMEOUT_MS = 5_000;
+/** How long scheduleMaintenance() waits for an in-flight timer-firing pass
+ * (timerFiringInFlight) before reading the next deadline and re-arming
+ * anyway. fireDueTimers already bounds each individual delivery
+ * (heartbeat.ts's DELIVERY_TIMEOUT_MS); this is the outer cap on the whole
+ * pass, several due timers included, so the scheduler itself -- the one
+ * thing still running heartbeat checks and firing other timers when no
+ * account is enabled at all -- can never be stalled indefinitely by
+ * awaiting it. */
+const MAINTENANCE_TIMER_WAIT_TIMEOUT_MS = 30_000;
 
 function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+/** Awaits every promise in `pending`, capped at `timeoutMs` -- used
+ * wherever this daemon would otherwise wait on work it does not fully
+ * control the duration of (an in-flight timer delivery, a notifier pass):
+ * never blocks longer than the cap, whether or not every promise has
+ * settled by then. Every caller's own promises are already wrapped with
+ * their own `.catch()` at the point they are created, so this never itself
+ * throws. */
+async function boundedWait(pending: Promise<unknown>[], timeoutMs: number): Promise<void> {
+  if (!pending.length) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => { if (settled) return; settled = true; resolve(); };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    void Promise.allSettled(pending).then(() => { clearTimeout(timer); finish(); });
+  });
+}
 
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   // joinForPlatform, not a bare join(): join() always uses the *host* OS's
@@ -207,11 +234,11 @@ export class HeadroomDaemon {
    * timerFiringInFlight. */
   private readonly notifyInFlight = new Set<Promise<unknown>>();
 
-  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
+  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits, private readonly deliveryTimeoutMs: number = DELIVERY_TIMEOUT_MS) { this.keepalive = keepalive; }
 
-  static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor; connectionLimits?: Partial<ConnectionLimits> } = {}): Promise<HeadroomDaemon> {
+  static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor; connectionLimits?: Partial<ConnectionLimits>; deliveryTimeoutMs?: number } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
-    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive, { ...DEFAULT_CONNECTION_LIMITS, ...options.connectionLimits });
+    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive, { ...DEFAULT_CONNECTION_LIMITS, ...options.connectionLimits }, options.deliveryTimeoutMs);
   }
 
   async start(): Promise<void> {
@@ -326,13 +353,7 @@ export class HeadroomDaemon {
     const pending: Promise<unknown>[] = [...this.notifyInFlight];
     if (this.timerFiringInFlight) pending.push(this.timerFiringInFlight);
     if (!pending.length) return;
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = (): void => { if (settled) return; settled = true; resolve(); };
-      const timer = setTimeout(finish, STOP_DRAIN_TIMEOUT_MS);
-      timer.unref?.();
-      void Promise.allSettled(pending).then(() => { clearTimeout(timer); finish(); });
-    });
+    await boundedWait(pending, STOP_DRAIN_TIMEOUT_MS);
   }
 
   /** Build a capacity decision from the current SQLite snapshot. The caller
@@ -917,8 +938,13 @@ export class HeadroomDaemon {
     // own vendor-triggered path, which zero enabled accounts -- or simply no
     // vendor poll happening to run first -- could leave unreached, letting
     // the very first lapse or missed timer after enabling notifications be
-    // swallowed as "historical backlog" instead of delivered.
-    if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents();
+    // swallowed as "historical backlog" instead of delivered. Its own
+    // failure (a malformed or otherwise unreadable notify/policy config)
+    // must never take heartbeat checks and timer firing down with it -- caught
+    // and logged on its own, same as checkHeartbeatLapses's own guard just
+    // below, rather than left to propagate and abort the rest of this pass.
+    try { if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents(); }
+    catch (error) { void appendDaemonLog(`notification config read failed: ${safeError(error)}`, this.home); }
     // Never let a defect here (or an unexpected throw from store access)
     // abort the vendor poll this call is about to make: this whole block
     // is best-effort background bookkeeping, not something a caller
@@ -932,7 +958,7 @@ export class HeadroomDaemon {
     // succeed), but skipping the second pass entirely avoids the wasted
     // work and duplicate log lines it would otherwise produce.
     if (!this.timerFiringInFlight) {
-      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now)
+      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now, undefined, undefined, this.deliveryTimeoutMs)
         .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
         .finally(() => { this.timerFiringInFlight = undefined; });
     }
@@ -986,8 +1012,13 @@ export class HeadroomDaemon {
       // Wait for whichever timer-firing pass is in flight (this call's own,
       // or one a concurrent poll() already started) so the deadline read
       // just below reflects timers that pass just fired, not ones still
-      // mid-claim.
-      if (this.timerFiringInFlight) await this.timerFiringInFlight.catch(() => 0);
+      // mid-claim -- bounded (MAINTENANCE_TIMER_WAIT_TIMEOUT_MS), since a
+      // stuck delivery this pass's own send happens to be waiting out
+      // (fireDueTimers has its own per-delivery timeout, but several due
+      // timers in one pass still stack) must never stall this scheduler,
+      // the one thing still running heartbeat checks with no account
+      // enabled at all.
+      if (this.timerFiringInFlight) await boundedWait([this.timerFiringInFlight], MAINTENANCE_TIMER_WAIT_TIMEOUT_MS);
       const now = Date.now();
       const deadline = this.store.nextMaintenanceDeadline(new Date(now));
       const untilDeadline = deadline ? deadline.getTime() - now : MAINTENANCE_MAX_DELAY_MS;

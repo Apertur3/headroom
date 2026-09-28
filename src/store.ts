@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
@@ -13,7 +13,7 @@ import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
 import { CURRENT_SCHEMA_VERSION, HEARTBEATS_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion, TIMER_DELIVERY_SCHEMA_VERSION } from "./migrations.js";
-import { isReservedSessionId, redact, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
+import { isReservedSessionId, redact, serializeInboxEnvelope, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN, TIMER_DELIVERY_FROM, TIMER_DELIVERY_KIND } from "./security.js";
 import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
@@ -50,13 +50,33 @@ export const MAX_TIMER_DELIVERY_ATTEMPTS = 5;
  * that a genuine hang self-heals within one polling cycle. */
 export const TIMER_CLAIM_STALE_MS = 2 * 60_000;
 
+/** Bounds for `setTimer`'s random per-registration `delivery_id`: always
+ * exactly 15 decimal digits (the max `inbox.ts`'s own filename pattern
+ * allows -- the range width is `node:crypto`'s own `randomInt` ceiling,
+ * 2^48 - 1, so it cannot span the full 15-digit space, but every value
+ * drawn still falls between 1.0e14 and 3.8e14 and is always 15 digits long),
+ * so two things stay true regardless of the actual value drawn -- it can
+ * never numerically collide with a millisecond-based ordinary hand-off
+ * filename by construction narrowing (deliberately not relied on alone;
+ * `sendInboxMessageAt` still verifies identity by content, see its own doc
+ * comment), and its string length is fixed, which is what makes
+ * `setTimer`'s pre-write size check byte-exact against the real envelope
+ * `src/heartbeat.ts`'s fireDueTimers will eventually serialize. */
+const TIMER_DELIVERY_ID_MIN = 100_000_000_000_000;
+const TIMER_DELIVERY_ID_MAX = TIMER_DELIVERY_ID_MIN + 281_474_976_710_655; // node:crypto randomInt's own max range width (2^48 - 1)
+
+function generateTimerDeliveryId(): number {
+  return randomInt(TIMER_DELIVERY_ID_MIN, TIMER_DELIVERY_ID_MAX);
+}
+
 /** What `claimTimer()` hands back: a `Timer` plus the one-time token proving
- * this exact claim, which `confirmTimerDelivered`/`releaseTimerClaim` both
- * require to act on it. Deliberately not part of the public `Timer` shape
- * (never returned by `timers()`/`dueTimers()`'s own JSON-facing reads) --
- * `claimed_at`/`claim_token` are an internal delivery-in-progress detail,
- * not something a `timer list` consumer needs. */
-export interface ClaimedTimer extends Timer { claim_token: string }
+ * this exact claim (required by `confirmTimerDelivered`/`releaseTimerClaim`)
+ * and the row's own `delivery_id` (required by `sendInboxMessageAt` to
+ * deliver it). Deliberately not part of the public `Timer` shape (never
+ * returned by `timers()`/`dueTimers()`'s own JSON-facing reads) -- these are
+ * internal delivery-in-progress/identity details, not something a `timer
+ * list` consumer needs. */
+export interface ClaimedTimer extends Timer { claim_token: string; delivery_id: number }
 
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
  * than ordinary noise: a drop to zero, or a fall past half of what it was.
@@ -2295,16 +2315,26 @@ export class HeadroomStore {
 
   /** Registers (or replaces, by the same owner+name) one named wake-up. A
    * timer already fired or cleared under this owner+name is simply replaced
-   * by the new one, same as re-registering any other schedule (attempts and
-   * failed_at reset too, so a re-set timer always gets a fresh delivery
-   * budget). `owner` must be a valid inbox session id (the same
-   * SESSION_ID_PATTERN rule inbox.ts's own assertSessionId enforces) since a
-   * timer is always delivered there -- refused up front rather than stored
-   * and left to fail every delivery attempt forever. Likewise, the exact
-   * `{ timer, at, action }` envelope src/heartbeat.ts's fireDueTimers will
-   * build for delivery must already fit under the inbox's own per-message
-   * byte cap, checked here before the row is ever written rather than
-   * discovered only once delivery itself starts failing. */
+   * by the new one, same as re-registering any other schedule -- attempts
+   * and failed_at reset too, so a re-set timer always gets a fresh delivery
+   * budget, and so do claimed_at/claim_token/delivery_id: an in-flight
+   * delivery of the OLD registration must never be able to confirm the NEW
+   * one as fired (its claim_token no longer matches any live row), and a
+   * fresh delivery_id means its inbox identity can never collide with
+   * whatever the old registration's own (possibly still in-flight) delivery
+   * already wrote.
+   *
+   * `owner` must be a valid inbox session id (the same SESSION_ID_PATTERN
+   * rule inbox.ts's own assertSessionId enforces) since a timer is always
+   * delivered there -- refused up front rather than stored and left to fail
+   * every delivery attempt forever. Likewise, the exact file
+   * `src/inbox.ts`'s `sendInboxMessageAt` will write for delivery --
+   * envelope wrapper, pretty-print whitespace, and all, not just the inner
+   * `{ timer, at, action }` body -- must already fit under the inbox's own
+   * per-message byte cap, checked here (via the same `serializeInboxEnvelope`
+   * inbox.ts itself writes with) before the row is ever stored, rather than
+   * discovered only once delivery starts failing and readInbox() silently
+   * refuses the oversized file it already wrote. */
   setTimer(owner: string, name: string, at: string, action: string, ifMissed: "notify" | "drop", now = new Date()): Timer {
     const trimmedOwner = owner.trim();
     const trimmedName = name.trim();
@@ -2313,12 +2343,18 @@ export class HeadroomStore {
     if (!action.trim()) throw new Error("action is required");
     if (!Number.isFinite(Date.parse(at))) throw new Error("at must be a valid ISO instant");
     const isoAt = new Date(at).toISOString();
-    const envelopeBytes = Buffer.byteLength(JSON.stringify({ timer: trimmedName, at: isoAt, action }), "utf8");
-    if (envelopeBytes > SAFE_READ_MAX_BYTES) throw new Error(`timer action is too large to ever be delivered: the serialized inbox envelope would be ${envelopeBytes} bytes, over the ${SAFE_READ_MAX_BYTES} byte cap`);
+    const deliveryId = generateTimerDeliveryId();
+    // The real send (src/heartbeat.ts's fireDueTimers) uses `now.toISOString()`
+    // at delivery time, not this one -- but every ISO instant serializes to
+    // the same 24-character length, so this estimate's byte count is exact
+    // regardless of the gap between "set" and "delivered".
+    const fileText = serializeInboxEnvelope({ kind: TIMER_DELIVERY_KIND, to: trimmedOwner, from: TIMER_DELIVERY_FROM, at: now.toISOString(), deliveryId, body: { timer: trimmedName, at: isoAt, action } });
+    const fileBytes = Buffer.byteLength(fileText, "utf8");
+    if (fileBytes > SAFE_READ_MAX_BYTES) throw new Error(`timer action is too large to ever be delivered: the serialized inbox file would be ${fileBytes} bytes, over the ${SAFE_READ_MAX_BYTES} byte cap`);
     const createdAt = now.toISOString();
-    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at,attempts,failed_at) VALUES (?,?,?,?,?,?,NULL,NULL,0,NULL)
-      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL, attempts = 0, failed_at = NULL`)
-      .run(trimmedOwner, trimmedName, isoAt, action, ifMissed, createdAt);
+    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at,attempts,failed_at,claimed_at,claim_token,delivery_id) VALUES (?,?,?,?,?,?,NULL,NULL,0,NULL,NULL,NULL,?)
+      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL, attempts = 0, failed_at = NULL, claimed_at = NULL, claim_token = NULL, delivery_id = excluded.delivery_id`)
+      .run(trimmedOwner, trimmedName, isoAt, action, ifMissed, createdAt, deliveryId);
     return timerFromRow(this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(trimmedOwner, trimmedName)!);
   }
 
@@ -2394,10 +2430,16 @@ export class HeadroomStore {
     const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)").get(owner, name, staleThreshold);
     if (!row) return undefined;
     const claimToken = randomUUID();
-    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
-      .run(nowIso, claimToken, owner, name, staleThreshold);
+    // A row set before ADD_TIMER_DELIVERY_ID migrated in (delivery_id
+    // NULL, the column added with no backfill) gets one assigned right
+    // here, atomically with the claim itself -- simpler and safer than
+    // ever claiming a row with no delivery identity to hand fireDueTimers.
+    const existingDeliveryId = (row as Row).delivery_id;
+    const deliveryId = typeof existingDeliveryId === "number" ? existingDeliveryId : generateTimerDeliveryId();
+    const claimed = this.db.prepare("UPDATE timers SET claimed_at = ?, claim_token = ?, delivery_id = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?)")
+      .run(nowIso, claimToken, deliveryId, owner, name, staleThreshold);
     if (Number(claimed.changes) === 0) return undefined; // lost the race to a concurrent claim
-    const timer: ClaimedTimer = { ...timerFromRow(row), claim_token: claimToken };
+    const timer: ClaimedTimer = { ...timerFromRow(row), claim_token: claimToken, delivery_id: deliveryId };
     if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, nowIso);
     return timer;
   }

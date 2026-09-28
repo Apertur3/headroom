@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { budgetPlanLeases, parseBudgetPlan } from "../src/budget-plan.js";
-import { assertSessionId, readInbox, sendInboxMessage, sessionDirectory, MAX_INBOX_MESSAGE_BYTES } from "../src/inbox.js";
+import { assertSessionId, readInbox, sendInboxMessage, sendInboxMessageAt, sessionDirectory, MAX_INBOX_MESSAGE_BYTES } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
 
@@ -112,6 +112,92 @@ describe("inbox send and read", () => {
     await expect(sendInboxMessage({ to: "session-b", kind: "note", text: "", home: path })).rejects.toThrow(/empty/);
     await expect(sendInboxMessage({ to: "session-b", kind: "shout" as "note", text: "x", home: path })).rejects.toThrow(/kind must be one of/);
     await expect(sendInboxMessage({ to: "session-b", kind: "note", text: "x".repeat(MAX_INBOX_MESSAGE_BYTES + 1), home: path })).rejects.toThrow(/over the 65536 byte cap/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendInboxMessageAt: the idempotent-by-identity counterpart src/heartbeat.ts's
+// fireDueTimers uses. Its predecessor derived the filename from a hash of the
+// timer's own name/at (~1000 distinct values per owner per second) and shared
+// that filename space with ordinary hand-offs sent via `headroom inbox send`
+// -- two unrelated messages could land on the exact same path, and the old
+// "a file already exists here" check alone would then treat the SECOND
+// message's delivery as already done without ever writing it. `delivery_id`
+// (a random, per-registration identity, both in the filename and in the
+// envelope's own `delivery_id` field) removes the collision risk and lets
+// this verify identity by content, not merely by path, before ever treating
+// an existing file as a match.
+// ---------------------------------------------------------------------------
+
+describe("sendInboxMessageAt", () => {
+  it("writes the envelope with a delivery_id field, named <delivery_id>-<kind>.json", async () => {
+    const path = await home();
+    const sent = await sendInboxMessageAt({ to: "session-c", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 123456789012345, home: path, now: new Date(1_757_000_000_000) });
+    expect(sent.delivered).toBe(true);
+    expect(sent.file).toBe("123456789012345-handoff.json");
+    const envelope = JSON.parse(await readFile(sent.path, "utf8")) as Record<string, unknown>;
+    expect(envelope).toMatchObject({ version: 1, kind: "handoff", to: "session-c", from: "headroom-timer", delivery_id: 123456789012345, body: { timer: "wake", action: "check" } });
+  });
+
+  it("is idempotent: a second call with the same delivery_id skips the write and reports delivered: false", async () => {
+    const path = await home();
+    const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 42, home: path };
+    const first = await sendInboxMessageAt({ ...options, now: new Date(1000) });
+    expect(first.delivered).toBe(true);
+    const second = await sendInboxMessageAt({ ...options, now: new Date(2000) });
+    expect(second.delivered).toBe(false);
+    expect(second.path).toBe(first.path);
+    // Exactly one file, one message -- never a duplicate.
+    const messages = await readdir(join(path, "inbox", "session-c"));
+    expect(messages).toHaveLength(1);
+  });
+
+  it("still recognizes an already-read message (renamed .read) as delivered, not as free to overwrite", async () => {
+    const path = await home();
+    const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 7, home: path, now: new Date(1000) };
+    await sendInboxMessageAt(options);
+    await readInbox({ session: "session-c", home: path }); // marks it read (renamed with .read)
+    const retried = await sendInboxMessageAt(options);
+    expect(retried.delivered).toBe(false);
+    const messages = await readdir(join(path, "inbox", "session-c"));
+    expect(messages).toEqual(["7-handoff.json.read"]);
+  });
+
+  // The blocker this whole mechanism exists to close: a path already
+  // occupied by an UNRELATED message (here, written exactly the way an
+  // ordinary `headroom inbox send` would -- ordinary hand-offs and timer
+  // deliveries share the same directory and the same numeric filename
+  // space) must never be silently treated as "this timer's delivery already
+  // happened". Verified by content (the `delivery_id` field), not merely by
+  // the file existing at the expected path.
+  it("throws an identity collision rather than treating an unrelated message at the same path as already delivered", async () => {
+    const path = await home();
+    const directory = await sessionDirectory("orch-collide", path);
+    const collidingId = 555_000_000_000_000;
+    await writeFile(join(directory, `${collidingId}-handoff.json`), `${JSON.stringify({ version: 1, kind: "handoff", to: "orch-collide", from: "a-human", at: new Date().toISOString(), body: "an unrelated hand-off, not from any timer" }, null, 2)}\n`, { mode: 0o600 });
+    await expect(sendInboxMessageAt({
+      to: "orch-collide", kind: "handoff", from: "headroom-timer",
+      text: JSON.stringify({ timer: "wake", at: new Date().toISOString(), action: "check the deploy" }),
+      delivery_id: collidingId, home: path,
+    })).rejects.toThrow(/identity collision/);
+    // The unrelated message is untouched -- never overwritten.
+    const stored = JSON.parse(await readFile(join(directory, `${collidingId}-handoff.json`), "utf8")) as { body: unknown };
+    expect(stored.body).toBe("an unrelated hand-off, not from any timer");
+  });
+
+  it("an ordinary hand-off and a timer delivery with different delivery_ids never interfere, even for the same recipient", async () => {
+    const path = await home();
+    await sendInboxMessage({ to: "session-d", kind: "handoff", text: '{"note":"from a human"}', from: "a-human", home: path, now: new Date(9_000) });
+    await sendInboxMessageAt({ to: "session-d", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 999_000_000_000_000, home: path, now: new Date(9_500) });
+    const result = await readInbox({ session: "session-d", home: path });
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.map((item) => item.from).sort()).toEqual(["a-human", "headroom-timer"]);
+  });
+
+  it("rejects a negative or non-integer delivery_id", async () => {
+    const path = await home();
+    await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: -1, home: path })).rejects.toThrow(/delivery_id/);
+    await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: 1.5, home: path })).rejects.toThrow(/delivery_id/);
   });
 });
 

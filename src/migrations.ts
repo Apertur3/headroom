@@ -247,9 +247,35 @@ const ADD_TIMER_CLAIM_RECOVERY: Migration = {
   },
 };
 
+/**
+ * `timers.delivery_id`: a unique identity for one timer's inbox delivery,
+ * generated once by `setTimer` (and regenerated whenever the same owner+name
+ * is re-set -- see setTimer's own doc comment) and carried through to the
+ * inbox message itself (its filename and its own `delivery_id` field --
+ * `src/inbox.ts`'s `sendInboxMessageAt`). Before this, the filename alone
+ * was derived from a hash of the timer's own `name` and `at`: with only
+ * ~1000 distinct values per owner per second, and sharing its filename
+ * space with ordinary hand-off messages sent via `headroom inbox send`, two
+ * unrelated messages could land on the exact same path -- and
+ * `sendInboxMessageAt`'s own idempotency check, trusting "a file already
+ * exists here" alone, would then treat the SECOND timer's delivery as
+ * already done (returning `delivered: false`) without ever actually
+ * writing its content, while the daemon still marked it fired. A random,
+ * per-registration `delivery_id` removes the collision risk, and
+ * `sendInboxMessageAt` now verifies the existing file's own `delivery_id`
+ * field before ever treating it as a match.
+ */
+const ADD_TIMER_DELIVERY_ID: Migration = {
+  version: 7,
+  description: "timers.delivery_id, a unique per-registration inbox delivery identity",
+  up(db) {
+    addColumnIfMissing(db, "ALTER TABLE timers ADD COLUMN delivery_id INTEGER");
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS, ADD_TIMER_CLAIM_RECOVERY];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS, ADD_TIMER_CLAIM_RECOVERY, ADD_TIMER_DELIVERY_ID];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

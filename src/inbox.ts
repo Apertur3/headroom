@@ -20,7 +20,7 @@
  */
 import { lstat, readdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { isReservedSessionId, readBoundedRegularFile, safeOutputDirectory, writeFileAtomic, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
+import { isReservedSessionId, readBoundedRegularFile, safeOutputDirectory, serializeInboxEnvelope, writeFileAtomic, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
 import { safeHeadroomDirectory } from "./store.js";
 
 export const INBOX_KINDS = ["budget", "note", "handoff"] as const;
@@ -137,43 +137,60 @@ export async function sendInboxMessage(options: SendOptions): Promise<{ path: st
   const now = options.now ?? new Date();
   const directory = await sessionDirectory(session, options.home);
   const { path, file } = await freeMessagePath(directory, options.kind, now.getTime());
-  const envelope = { version: 1, kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) };
-  await writeFileAtomic(path, `${JSON.stringify(envelope, null, 2)}\n`, 0o600);
+  await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) }), 0o600);
   return { path, file, session };
 }
 
 export interface SendAtOptions extends SendOptions {
-  /** A caller-computed, deterministic identity for this message -- in place
-   * of `sendInboxMessage`'s own "now.getTime(), advance on collision"
-   * numbering, which is different on every call and therefore cannot be
-   * idempotent. Writing twice with the same `to`/`kind`/`at_epoch` is safe:
-   * the second call recognizes the message (unread, or already read and
-   * renamed) already exists and skips the write entirely (`delivered:
-   * false`) rather than creating a second entry, or silently replacing one
-   * the recipient may already have consumed. Used by src/heartbeat.ts's
-   * fireDueTimers so a timer retried after a crash (claimed, delivered, but
-   * never confirmed durable before the process died) is never delivered
-   * twice. */
-  at_epoch: number;
+  /** A unique identity for this exact delivery, generated once by store.ts's
+   * `setTimer` and persisted on the timer row (never derived here, and never
+   * shared with any other timer or ordinary handoff) -- in place of
+   * `sendInboxMessage`'s own "now.getTime(), advance on collision"
+   * numbering, which both collides across distinct messages that happen to
+   * land in the same window and cannot be idempotent (it is different on
+   * every call). Used for both the filename (collision avoidance) and the
+   * envelope's own `delivery_id` field (identity verification -- see this
+   * function's own doc comment for why the filename alone is not enough).
+   * Used by src/heartbeat.ts's fireDueTimers so a timer retried after a
+   * crash (claimed, delivered, but never confirmed durable before the
+   * process died) is never delivered twice. */
+  delivery_id: number;
 }
 
-/** The idempotent-by-identity counterpart of `sendInboxMessage`. See
- * `SendAtOptions.at_epoch`'s own doc comment for the guarantee this makes
- * and why a plain `sendInboxMessage` retry cannot provide it. */
+/**
+ * The idempotent-by-identity counterpart of `sendInboxMessage`. Writing
+ * twice with the same `to`/`kind`/`delivery_id` is safe: the second call
+ * finds a file already at that exact path and, having verified its
+ * `delivery_id` field actually matches (not merely a filename collision
+ * with something else -- an ordinary handoff, or a different timer's
+ * delivery, sharing the same numeric name by coincidence), recognizes this
+ * exact delivery as already made and skips the write (`delivered: false`)
+ * rather than creating a second entry or silently replacing content the
+ * recipient may already be acting on. A file present at that path whose
+ * `delivery_id` does NOT match is a genuine identity collision -- this
+ * throws rather than either overwriting an unrelated message or silently
+ * treating this delivery as already done when it was never actually sent.
+ */
 export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path: string; file: string; session: string; delivered: boolean }> {
   const { session, from } = validateSendOptions(options);
-  if (!Number.isInteger(options.at_epoch) || options.at_epoch < 0) throw new Error("at_epoch must be a non-negative integer");
+  if (!Number.isInteger(options.delivery_id) || options.delivery_id < 0) throw new Error("delivery_id must be a non-negative integer");
   const now = options.now ?? new Date();
   const directory = await sessionDirectory(session, options.home);
-  const file = `${options.at_epoch}-${options.kind}.json`;
+  const file = `${options.delivery_id}-${options.kind}.json`;
   const path = join(directory, file);
-  // Already delivered -- either still unread, or read and renamed with
-  // READ_SUFFIX. Either way, writing again would either duplicate it (a
-  // fresh unread copy next to the read one) or silently replace content the
-  // recipient may already be acting on, so this is a no-op, not a retry.
-  if (!(await absent(path)) || !(await absent(`${path}${READ_SUFFIX}`))) return { path, file, session, delivered: false };
-  const envelope = { version: 1, kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) };
-  await writeFileAtomic(path, `${JSON.stringify(envelope, null, 2)}\n`, 0o600);
+  const readPath = `${path}${READ_SUFFIX}`;
+  const existingPath = !(await absent(path)) ? path : !(await absent(readPath)) ? readPath : undefined;
+  if (existingPath) {
+    let matches = false;
+    try {
+      const raw = await readBoundedRegularFile(existingPath, SAFE_READ_MAX_BYTES);
+      const parsed = JSON.parse(raw) as { delivery_id?: unknown };
+      matches = parsed.delivery_id === options.delivery_id;
+    } catch { /* unreadable, oversized, or not valid JSON -- never treated as a match */ }
+    if (matches) return { path, file, session, delivered: false };
+    throw new Error(`inbox message identity collision at ${file}: an unrelated message already exists there`);
+  }
+  await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body: parseBody(options.text) }), 0o600);
   return { path, file, session, delivered: true };
 }
 

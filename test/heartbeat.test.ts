@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
-import { fireDueTimers, parseTimerAt, timerMessageEpoch } from "../src/heartbeat.js";
+import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
 import { readInbox, sendInboxMessageAt } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
@@ -221,6 +221,43 @@ describe("timers", () => {
     } finally { store.close(); }
   });
 
+  // P2 fix: the size check used to validate only the inner `{ timer, at,
+  // action }` body, so an action that fit under the cap could still produce
+  // a fully serialized FILE (envelope wrapper, pretty-print whitespace,
+  // delivery_id and all) over it -- readBoundedRegularFile (what every
+  // inbox reader uses) refuses to even read a file past the cap, so that
+  // timer would be confirmed fired without ever being readable. This finds
+  // the real byte boundary end to end, through setTimer itself (a binary
+  // search, not a hand-computed offset, so it stays correct if the envelope
+  // shape ever changes), and proves a message right at that boundary is
+  // both storable and actually deliverable/readable.
+  it("accepts an action that lands the fully serialized file exactly at the cap, rejects one byte more, and the boundary message is actually deliverable", async () => {
+    const { store, home } = await openStore("headroom-timer-boundary-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      const owner = "orch-boundary";
+      let low = 0;
+      let high = 66 * 1024; // definitely fits .. definitely does not
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        try { store.setTimer(owner, "wake", now.toISOString(), "x".repeat(mid), "notify", now); low = mid; }
+        catch { high = mid - 1; }
+      }
+      expect(low).toBeGreaterThan(0);
+      const boundary = store.setTimer(owner, "wake", now.toISOString(), "x".repeat(low), "notify", now);
+      expect(boundary.action).toHaveLength(low);
+      expect(() => store.setTimer(owner, "wake", now.toISOString(), "x".repeat(low + 1), "notify", now)).toThrow(/too large to ever be delivered/);
+      // The rejected attempt never touched the still-stored boundary row.
+      expect(store.timers(owner)[0]).toMatchObject({ action: "x".repeat(low) });
+
+      const fired = await fireDueTimers(store, home, now);
+      expect(fired).toBe(1);
+      const inbox = await readInbox({ session: owner, home, markRead: false });
+      expect(inbox.messages).toHaveLength(1);
+      expect((inbox.messages[0].body as { action: string }).action).toHaveLength(low);
+    } finally { store.close(); }
+  });
+
   it("a fresh timer starts at zero delivery attempts, never failed", async () => {
     const { store } = await openStore("headroom-timer-fresh-attempts-");
     try {
@@ -377,6 +414,47 @@ describe("recoverable timer claim (claimTimer/confirmTimerDelivered/reclaimStale
       expect(store.dueTimers(at)).toHaveLength(1);
       expect(store.dueTimers(at)[0]).toMatchObject({ owner: "orch-r", name: "wake-1" });
       expect(store.reclaimStaleTimerClaims()).toBe(0); // nothing left to reclaim
+    } finally { store.close(); }
+  });
+
+  // Blocker fix: replacing a timer (the same owner+name re-set while an OLD
+  // delivery for the PREVIOUS registration is still in flight) used to leave
+  // claimed_at/claim_token untouched, so that old, now-orphaned delivery's
+  // eventual confirmTimerDelivered call would match the NEW row's guard
+  // (claim_token unchanged) and mark the REPLACEMENT fired -- without the
+  // replacement's own content ever having been delivered.
+  it("re-setting a timer clears the old claim and delivery_id, so an in-flight old delivery can never confirm the replacement as fired", async () => {
+    const { store } = await openStore("headroom-replace-inflight-claim-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-s", "wake", at.toISOString(), "check the old deploy", "notify", at);
+      // An in-flight delivery for the ORIGINAL registration: claimed, not
+      // yet confirmed -- exactly the window setTimer must protect against.
+      // delivery_id/claim_token are internal (ClaimedTimer-only, not part
+      // of the plain Timer setTimer itself returns), so they are only ever
+      // observed here through a claim.
+      const staleClaim = store.claimTimer("orch-s", "wake", at)!;
+      expect(typeof staleClaim.delivery_id).toBe("number");
+
+      // The timer gets replaced (a fresh `headroom timer set` for the same
+      // owner+name) while that old delivery is still outstanding.
+      const later = new Date(at.getTime() + 5_000);
+      const replaced = store.setTimer("orch-s", "wake", new Date(at.getTime() + 60_000).toISOString(), "check the NEW deploy", "notify", later);
+      expect(replaced.fired_at).toBeNull();
+
+      // The stale (pre-replace) claim's own eventual confirm must be a
+      // gated no-op: its claim_token no longer matches anything live.
+      expect(store.confirmTimerDelivered("orch-s", "wake", staleClaim.claim_token, later)).toBe(false);
+      const row = store.timers("orch-s")[0];
+      expect(row).toMatchObject({ fired_at: null, action: "check the NEW deploy" }); // never falsely marked fired
+
+      // The replacement is claimable fresh, under its own new delivery_id
+      // and claim_token -- confirming THAT one genuinely fires it.
+      const freshClaim = store.claimTimer("orch-s", "wake", later)!;
+      expect(freshClaim.delivery_id).not.toBe(staleClaim.delivery_id);
+      expect(freshClaim.claim_token).not.toBe(staleClaim.claim_token);
+      expect(store.confirmTimerDelivered("orch-s", "wake", freshClaim.claim_token, later)).toBe(true);
+      expect(store.timers("orch-s")).toHaveLength(0);
     } finally { store.close(); }
   });
 });
@@ -609,6 +687,45 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
+  // should-fix: a `send` that never settles at all (a stuck filesystem, not
+  // merely a slow one) used to leave fireDueTimers -- and every other due
+  // timer queued behind it in the same pass, and the daemon's own
+  // maintenance scheduler, which awaits this whole pass before it can
+  // re-arm -- waiting forever. A bounded per-delivery timeout means this
+  // now moves on instead, leaving the claim exactly as a crash would (never
+  // confirmed, never released): recoverable once it goes stale.
+  it("does not hang forever on a sender that never resolves, and leaves the claim recoverable rather than confirmed or released", async () => {
+    const { store, home } = await openStore("headroom-firedue-never-resolves-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-stuck", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+      const neverResolvingSend: typeof sendInboxMessageAt = () => new Promise(() => { /* never settles */ });
+      const logged: string[] = [];
+      const log = async (message: string) => { logged.push(message); };
+
+      const start = Date.now();
+      const fired = await fireDueTimers(store, home, at, log, neverResolvingSend, 100); // 100ms delivery timeout
+      const elapsed = Date.now() - start;
+      expect(fired).toBe(0);
+      expect(elapsed).toBeLessThan(5_000); // bounded, nowhere near a real hang
+      expect(logged.at(-1)).toMatch(/delivery timed out after 100ms/);
+
+      // Neither confirmed nor released: still claimed (not fired_at, not
+      // failed_at, attempts unchanged), same state a genuine crash would
+      // leave it in -- store.timers() (which does not filter on claim
+      // freshness) still lists it as pending.
+      expect(store.timers("orch-stuck")).toHaveLength(1);
+      expect(store.timers("orch-stuck")[0]).toMatchObject({ fired_at: null, failed_at: null, attempts: 0 });
+      // Still fresh (just claimed): not yet offered back up.
+      expect(store.dueTimers(at)).toHaveLength(0);
+      // Once its claim goes stale, it is recoverable exactly like a crash
+      // would leave it -- proven with a short claimStaleMs rather than
+      // waiting out the real (2 minute) default.
+      const later = new Date(at.getTime() + 50);
+      expect(store.dueTimers(later, 10)).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
   // Blocker fix: claimTimer used to write the terminal fired_at before the
   // async inbox write, so a crash (or the daemon's own stop() closing
   // SQLite) between claim and delivery left the timer excluded forever with
@@ -652,7 +769,7 @@ describe("fireDueTimers", () => {
       const firstWrite = await sendInboxMessageAt({
         to: "orch-crash-b", kind: "handoff", from: "headroom-timer",
         text: JSON.stringify({ timer: "wake", at: crashedClaim.at, action: crashedClaim.action }),
-        at_epoch: timerMessageEpoch(crashedClaim.name, crashedClaim.at),
+        delivery_id: crashedClaim.delivery_id,
         home, now: at,
       });
       expect(firstWrite.delivered).toBe(true);

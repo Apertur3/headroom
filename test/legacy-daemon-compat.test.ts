@@ -34,8 +34,16 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
  * different code (most usefully `-32000`, a genuine handler exception) lets
  * a test simulate a real daemon-side failure on these two RPCs specifically,
  * as opposed to the compatibility gap this file otherwise covers. Every
- * other unknown method still answers a plain -32601, unaffected. */
-function startLegacyDaemon(path: string, additiveError: { code: number; message: string } = { code: -32601, message: "Method not found" }): Promise<Server> {
+ * other unknown method still answers a plain -32601, unaffected.
+ *
+ * `additiveResult`, when given, replaces the *result* (a genuine success,
+ * never an error envelope) `heartbeats`/`timer_list` answer with instead of
+ * the default `-32601` error -- used to simulate a daemon old enough to
+ * predate a field on the Timer shape (but not the RPC itself), or one whose
+ * reply is a malformed non-array value. Mutually exclusive with
+ * `additiveError`: passing both is a test-writing mistake, not a scenario
+ * being modeled. */
+function startLegacyDaemon(path: string, additiveError: { code: number; message: string } = { code: -32601, message: "Method not found" }, additiveResult?: unknown): Promise<Server> {
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
     let buffer = "";
@@ -50,7 +58,7 @@ function startLegacyDaemon(path: string, additiveError: { code: number; message:
         const reply = known.includes(request.method)
           ? { jsonrpc: "2.0", id: request.id, result: request.method === "status" ? [] : request.method === "reset_seen" || request.method === "free_reset_used" ? {} : [] }
           : request.method === "heartbeats" || request.method === "timer_list"
-            ? { jsonrpc: "2.0", id: request.id, error: additiveError }
+            ? (additiveResult !== undefined ? { jsonrpc: "2.0", id: request.id, result: additiveResult } : { jsonrpc: "2.0", id: request.id, error: additiveError })
             : { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } };
         socket.write(`${JSON.stringify(reply)}\n`);
       }
@@ -142,5 +150,113 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(reply.result).toBeUndefined();
     expect(reply.error).toMatchObject({ code: -32000 });
     expect(reply.error?.message).toContain("simulated heartbeats handler failure");
+  });
+
+  it("`headroom status --json` throws when `heartbeats` answers a non-array SUCCESS reply, instead of reading it as empty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-nonarray-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    // A malformed (non-array) success value, not a JSON-RPC error at all --
+    // only -32601 (the documented compatibility gap) may become "none".
+    try { server = await startLegacyDaemon(path, undefined, { unexpected: "shape" }); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI non-array test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      await expect(main(["--json"])).rejects.toThrow(/not an array/);
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("MCP quota_status throws when `heartbeats` answers a non-array SUCCESS reply, instead of reading it as empty", async () => {
+    const reply = await handleMcp(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}',
+      async (method) => {
+        if (method === "status") return [];
+        if (method === "plan_downgrades") return { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } };
+        if (method === "heartbeats") return { unexpected: "shape" }; // malformed success, no error envelope
+        return undefined;
+      },
+    ) as { error?: { code: number; message: string }; result?: unknown };
+    expect(reply.result).toBeUndefined();
+    expect(reply.error?.message).toContain("not an array");
+  });
+
+  // should-fix: a timer row from a daemon that predates the attempts/
+  // failed_at fields (still-running, still answers `timer_list`, just an
+  // older Timer shape) must read the same way an older on-disk schema's row
+  // already does (store.ts's own timerFromRow default) at every protocol
+  // boundary -- not just the local-store read path.
+  const timerRowMissingDeliveryFields = { owner: "orch-oldshape", name: "wake", at: "2020-01-01T00:00:00.000Z", action: "check the deploy", if_missed: "notify", created_at: "2019-12-31T23:00:00.000Z", fired_at: null, cleared_at: null };
+
+  it("`headroom status --json` normalizes attempts/failed_at for a due_timer from a daemon reply that predates those fields", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-oldtimer-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    try { server = await startLegacyDaemon(path, undefined, [timerRowMissingDeliveryFields]); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI old-timer-shape test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const logSpy: string[] = [];
+    const originalLog = console.log;
+    console.log = (line: string) => { logSpy.push(line); };
+    try {
+      const code = await main(["--json"]);
+      expect(code).toBe(0);
+    } finally {
+      console.log = originalLog;
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    const parsed = JSON.parse(logSpy.at(-1)!) as { due_timers: Array<{ owner: string; attempts: number; failed_at: string | null }> };
+    expect(parsed.due_timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
+  });
+
+  it("`headroom timer list --json` normalizes attempts/failed_at for a row from a daemon reply that predates those fields", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-oldtimer-list-")); temporary.push(root);
+    const path = join(root, "headroom.sock");
+    let server: Server;
+    try { server = await startLegacyDaemon(path, undefined, [timerRowMissingDeliveryFields]); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list old-shape test: sandbox forbids listen(2)\n"); return; }
+      throw error;
+    }
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const logSpy: string[] = [];
+    const originalLog = console.log;
+    console.log = (line: string) => { logSpy.push(line); };
+    try {
+      const code = await main(["timer", "list", "--json"]);
+      expect(code).toBe(0);
+    } finally {
+      console.log = originalLog;
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    const parsed = JSON.parse(logSpy.at(-1)!) as { timers: Array<{ owner: string; attempts: number; failed_at: string | null }> };
+    expect(parsed.timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
+  });
+
+  it("MCP quota_status normalizes attempts/failed_at for a due_timer from a daemon reply that predates those fields", async () => {
+    const reply = await handleMcp(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}',
+      async (method) => {
+        if (method === "status") return [];
+        if (method === "plan_downgrades") return { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } };
+        if (method === "heartbeats") return [];
+        if (method === "timer_list") return [timerRowMissingDeliveryFields];
+        return undefined;
+      },
+    ) as { result: { structuredContent: { due_timers: Array<{ owner: string; attempts: number; failed_at: string | null }> } } };
+    expect(reply.result.structuredContent.due_timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
   });
 });

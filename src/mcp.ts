@@ -16,7 +16,7 @@ import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
-import { isEnvelopable, withContract } from "./json-contract.js";
+import { isEnvelopable, normalizeDaemonTimers, withContract } from "./json-contract.js";
 import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
 import { HeadroomStore } from "./store.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Heartbeat, type Timer } from "./types.js";
@@ -700,7 +700,8 @@ function decodeAdditiveRpcReply(reply: unknown): unknown[] {
     if (error && typeof error === "object" && error.code === -32601) return [];
     throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
   }
-  return Array.isArray(reply) ? reply : [];
+  if (!Array.isArray(reply)) throw new Error("Daemon reply was not an array");
+  return reply;
 }
 
 async function daemonCall(method: string, params: Record<string, unknown>): Promise<unknown | undefined> {
@@ -894,7 +895,10 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       // commonly -32000) still propagates as a real MCP tool error instead
       // of being silently swallowed to "no heartbeats/timers registered".
       const heartbeats = decodeAdditiveRpcReply(await call("heartbeats", {})) as Heartbeat[];
-      const pendingTimers = decodeAdditiveRpcReply(await call("timer_list", {})) as Timer[];
+      // normalizeDaemonTimers defaults attempts/failed_at for a row from a
+      // still-running daemon whose own JSON-RPC reply predates those two
+      // fields (see docs/json-contract.md's `timer list` entry).
+      const pendingTimers = normalizeDaemonTimers(decodeAdditiveRpcReply(await call("timer_list", {}))) as unknown as Timer[];
       const dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
       // disabled_principals is derived here, from the registry, never
       // returned by the daemon's own "status" RPC -- that stays the bare

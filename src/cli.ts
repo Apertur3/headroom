@@ -45,7 +45,7 @@ import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
-import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
+import { isEnvelopable, normalizeDaemonTimers, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
@@ -608,7 +608,7 @@ async function timer(argv: string[]): Promise<number> {
     const asJson = argv.includes("--json");
     const request = await requestDaemon("timer_list", { owner });
     if (request !== undefined) {
-      const items = unwrapRpc(request) as Timer[];
+      const items = normalizeDaemonTimers(unwrapRpc(request)) as unknown as Timer[];
       if (asJson) { console.log(JSON.stringify(withContract({ timers: items }))); return 0; }
       printTimers(items);
       return 0;
@@ -1631,14 +1631,17 @@ export async function observe(argv: string[]): Promise<number> {
   let heartbeats: Heartbeat[] = [];
   let dueTimers: Timer[] = [];
   if (outcome.kind === "available") {
-    // An older daemon may not answer these two methods with an array at all --
-    // treated the same as "none", never a crash, like `leases` above.
+    // A daemon too old to have ever heard of these two methods (-32601) is
+    // the one, documented compatibility gap -- treated as "none", never a
+    // crash, like `leases` above. Any other reply that is not an array
+    // (a genuine handler failure, or a malformed non-error reply) is a
+    // protocol error `unwrapAdditiveRpc` now throws on, never silently
+    // folded into "no heartbeats/timers registered" alongside it.
     const heartbeatsRequest = await requestDaemon("heartbeats");
-    const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapAdditiveRpc(heartbeatsRequest);
-    heartbeats = Array.isArray(unwrappedHeartbeats) ? unwrappedHeartbeats as Heartbeat[] : [];
+    heartbeats = heartbeatsRequest === undefined ? [] : unwrapAdditiveRpc(heartbeatsRequest) as Heartbeat[];
     const timersRequest = await requestDaemon("timer_list");
     const unwrappedTimers = timersRequest === undefined ? [] : unwrapAdditiveRpc(timersRequest);
-    const pendingTimers = Array.isArray(unwrappedTimers) ? unwrappedTimers as Timer[] : [];
+    const pendingTimers = normalizeDaemonTimers(unwrappedTimers) as unknown as Timer[];
     dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
   } else {
     // No daemon (direct) or an unresponsive one (cache): read the store
@@ -1729,13 +1732,19 @@ function unwrapRpc(value: unknown): unknown {
  * here is treated the same as "no heartbeats/timers registered", an empty
  * array, while every other error (a genuine handler failure, a different
  * JSON-RPC code, anything else) still propagates exactly like unwrapRpc's
- * own callers expect. */
-function unwrapAdditiveRpc(value: unknown): unknown {
+ * own callers expect. A non-error reply that is not an array is likewise
+ * never folded into "none registered": it is a protocol error (a malformed
+ * or otherwise unexpected reply shape), not a compatibility gap, so this
+ * throws on it too rather than returning it as-is for a caller to
+ * (possibly) silently discard. */
+function unwrapAdditiveRpc(value: unknown): unknown[] {
   if (value && typeof value === "object" && "jsonrpc" in value && "error" in value) {
     const error = (value as { error?: { code?: unknown } }).error;
     if (error && typeof error === "object" && error.code === -32601) return [];
   }
-  return unwrapRpc(value);
+  const unwrapped = unwrapRpc(value);
+  if (!Array.isArray(unwrapped)) throw new Error("Daemon reply was not an array");
+  return unwrapped;
 }
 
 function statusObservations(value: unknown): Observation[] {
