@@ -17,6 +17,7 @@ import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
+import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount } from "./types.js";
 
@@ -743,6 +744,16 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);
       const downgrade = await call("plan_downgrades", {});
       finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+    }
+    // `can` and `gate` additionally carry the same host-pressure reading
+    // `headroom can`/`gate --json` and `doctor` report (src/host-health.ts):
+    // an orchestrator sharing this machine sees local pressure alongside the
+    // quota decision, whether that decision itself came from the daemon or a
+    // direct read. Purely additive and never a refusal here -- only `headroom
+    // run`, which launches locally, refuses on host pressure.
+    if ((method === "can" || method === "gate") && isEnvelopable(finalResult)) {
+      const hostGuardPolicy = await readHostGuardPolicy();
+      finalResult = { ...finalResult, host: await checkHostHealth(hostGuardPolicy) };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself
