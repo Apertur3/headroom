@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useProcessReaper, writeMortalShim } from "./helpers/mortal-process.js";
+import { useProcessReaper } from "./helpers/mortal-process.js";
 import { checkHostHealth, defaultHostGuardPolicy, readHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "../src/host-health.js";
 import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
@@ -168,13 +168,12 @@ describe("headroom run: host guard", () => {
     await seedRunHome(home);
     const reported = health({ state: "refuse", reasons: ["load_ratio 5.00 exceeds host_guard.refuse_load_ratio (3)"], load_ratio: 5 });
     mockHealthAndPolicy(reported, policy({ mode: "warn" }));
-    const shim = await writeMortalShim(join(home, "..", "mortal-shim"), { lifetimeSeconds: 1 });
     const { lines, restore } = captureError();
     let code: number;
     try {
-      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", shim]));
+      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", process.execPath, "-e", "process.exit(0)"]));
     } finally { restore(); }
-    expect(code).toBe(0); // the mortal shim exits 0 on its own
+    expect(code).toBe(0); // the child (node -e "process.exit(0)") exits 0 on its own
     expect(lines.join("\n")).toContain("host guard warning");
     expect(lines.join("\n")).toContain("load_ratio 5.00");
   }, 10_000);
@@ -185,11 +184,10 @@ describe("headroom run: host guard", () => {
     await seedRunHome(home);
     const reported = health({ state: "refuse", reasons: ["load_ratio 5.00 exceeds host_guard.refuse_load_ratio (3)"], load_ratio: 5 });
     mockHealthAndPolicy(reported, policy({ mode: "off" }));
-    const shim = await writeMortalShim(join(home, "..", "mortal-shim-off"), { lifetimeSeconds: 1 });
     const { lines, restore } = captureError();
     let code: number;
     try {
-      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", shim]));
+      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", process.execPath, "-e", "process.exit(0)"]));
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
@@ -201,11 +199,10 @@ describe("headroom run: host guard", () => {
     await seedRunHome(home);
     const reported = health({ state: "warn", reasons: ["1 orphaned agy/script process(es) found"], orphans: 1 });
     mockHealthAndPolicy(reported, policy({ mode: "refuse" }));
-    const shim = await writeMortalShim(join(home, "..", "mortal-shim-warn"), { lifetimeSeconds: 1 });
     const { lines, restore } = captureError();
     let code: number;
     try {
-      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", shim]));
+      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", process.execPath, "-e", "process.exit(0)"]));
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).toContain("host guard warning");
@@ -217,11 +214,10 @@ describe("headroom run: host guard", () => {
     await writeFile(join(home, "accounts.toml"), "");
     await seedRunHome(home);
     mockHealthAndPolicy(health({ state: "ok" }), policy({ mode: "refuse" }));
-    const shim = await writeMortalShim(join(home, "..", "mortal-shim-ok"), { lifetimeSeconds: 1 });
     const { lines, restore } = captureError();
     let code: number;
     try {
-      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", shim]));
+      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", process.execPath, "-e", "process.exit(0)"]));
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
@@ -232,11 +228,10 @@ describe("headroom run: host guard", () => {
     await writeFile(join(home, "accounts.toml"), "");
     await seedRunHome(home);
     mockHealthAndPolicy(health({ state: "unknown", reasons: ["no host pressure measurements available on this platform"], load_ratio: null, pty_used: null, pty_max: null, orphans: null }), policy({ mode: "refuse" }));
-    const shim = await writeMortalShim(join(home, "..", "mortal-shim-unknown"), { lifetimeSeconds: 1 });
     const { lines, restore } = captureError();
     let code: number;
     try {
-      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", shim]));
+      code = await withHeadroomHome(home, () => main(["run", "--meter", "claude-main:fable", "--need", "5h:10", "--owner", "owner-a", "--", process.execPath, "-e", "process.exit(0)"]));
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
