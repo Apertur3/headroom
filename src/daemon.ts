@@ -13,7 +13,7 @@ import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform 
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
-import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, planFor, rateLines, type GateOutcome, type RateLine } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { checkModelAvailability } from "./model-catalog.js";
@@ -662,7 +662,13 @@ export class HeadroomDaemon {
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
           const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
           const disabled = meter ? disabledPrincipalForMeter(await this.currentAccounts(), meter) : undefined;
-          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
+          if (disabled) {
+            // Same documented bare RateLine[] array `rate` always returns
+            // (docs/json-contract.md) -- a synthetic UNKNOWN line, not a
+            // JSON-RPC error -- so the daemon, CLI, and direct paths agree.
+            result = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabledPrincipalReason(disabled) }] satisfies RateLine[];
+            break;
+          }
           result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined); break;
         }
         case "spend": {
@@ -703,9 +709,15 @@ export class HeadroomDaemon {
         case "plan": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
-          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
-          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           if (params.target_points !== undefined && (typeof params.target_points !== "number" || !Number.isFinite(params.target_points) || params.target_points < 0)) return reject(-32602, "target_points must be a non-negative number", meter);
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) {
+            // Same documented { meter, error, notices } failure shape `plan`
+            // always returns (docs/json-contract.md), not a JSON-RPC error,
+            // so the daemon, CLI, and direct paths agree.
+            result = { meter, error: disabledPrincipalReason(disabled), notices: [] };
+            break;
+          }
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
           result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined); break;
@@ -723,7 +735,14 @@ export class HeadroomDaemon {
           const targetMeters = meter === undefined ? [] : Array.isArray(meter) ? meter : [meter];
           const accounts = await this.currentAccounts();
           const disabled = targetMeters.map((item) => disabledPrincipalForMeter(accounts, item)).find((item): item is string => item !== undefined);
-          if (disabled) return reject(-32000, disabledPrincipalReason(disabled));
+          if (disabled) {
+            // Same documented refused GateOutcome shape `gate` always
+            // returns (docs/json-contract.md: allowed, reason,
+            // meters_checked, unknown, notices), not a JSON-RPC error, so
+            // the daemon, CLI, and direct paths agree.
+            result = { allowed: false, reason: disabledPrincipalReason(disabled), unknown: true, meters_checked: targetMeters, notices: [] } satisfies GateOutcome;
+            break;
+          }
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
@@ -736,7 +755,13 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
           const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
-          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
+          if (disabled) {
+            // Same documented { meter, error, notices } failure shape `fill`
+            // always returns (docs/json-contract.md), not a JSON-RPC error,
+            // so the daemon, CLI, and direct paths agree.
+            result = { meter, error: disabledPrincipalReason(disabled), notices: [] };
+            break;
+          }
           const laneCost = typeof params.lane_cost_percent === "number" ? params.lane_cost_percent : undefined;
           const policy = await readPolicy();
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;

@@ -28,4 +28,30 @@ describe("MCP disabled status", () => {
       expect(content.structuredContent.observations).not.toContainEqual(expect.objectContaining({ principal_id: "claude-2" }));
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
+
+  it("quota_lease_start on a disabled meter is an MCP tool error, not a { allowed: false } object", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-mcp-disabled-lease-")); temporary.push(home);
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-2"', "enabled = false", 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
+    try {
+      const response = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_lease_start", arguments: { meter_id: "claude-2:all", owner: "test" } } }), async () => undefined);
+      // A write, with no "UNKNOWN" convention of its own: this must be a
+      // standard MCP tool error (same as any other daemon-side lease_start
+      // rejection), never a bespoke { allowed: false } payload only this
+      // one path would ever produce.
+      expect(response).toMatchObject({ error: { code: -32000, message: expect.stringContaining("principal claude-2 is disabled") } });
+      expect(response).not.toHaveProperty("result");
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it("quota_usage_paste for a disabled principal is an MCP tool error, not a { allowed: false } object", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-mcp-disabled-usagepaste-")); temporary.push(home);
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-2"', "enabled = false", 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
+    try {
+      const response = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_usage_paste", arguments: { text: "Current session\n10% used" } } }), async () => undefined);
+      expect(response).toMatchObject({ error: { code: -32000, message: expect.stringContaining("principal claude-2 is disabled") } });
+      expect(response).not.toHaveProperty("result");
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
 });

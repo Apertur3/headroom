@@ -408,7 +408,12 @@ async function cacheEvents(since: unknown): Promise<DirectResult> {
 async function directLeaseStart(arguments_: Record<string, unknown>): Promise<DirectResult> {
   const meterId = String(arguments_.meter_id ?? "");
   const disabled = meterId ? await disabledMeterReason(meterId) : undefined;
-  if (disabled) return { source: "direct", meter_id: meterId, allowed: false, unknown: true, reason: disabled };
+  // A write, not a read with its own "UNKNOWN" convention: refuse it the
+  // same way the daemon's own lease_start RPC rejection already does (a
+  // thrown error, which handleMcp's own catch turns into a standard MCP
+  // tool error), never a one-off { allowed: false } object only this path
+  // would ever produce.
+  if (disabled) throw new Error(disabled);
   const store = await HeadroomStore.open();
   try {
     const owner = String(arguments_.owner ?? "");
@@ -525,7 +530,10 @@ async function directInbox(session: unknown, since: unknown): Promise<DirectResu
 async function directPlan(meter: unknown, reservePercent: unknown, need: unknown, targetPoints: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
   const disabled = await disabledMeterReason(meter);
-  if (disabled) return { source: "direct", meter, error: disabled, unknown: true };
+  // Same documented { meter, error, notices } failure shape `plan` always
+  // returns (docs/json-contract.md) -- no `unknown` field (plan's contract
+  // has none), matching the daemon's identical disabled-plan branch.
+  if (disabled) return { source: "direct", meter, error: disabled, notices: [] };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
@@ -542,7 +550,11 @@ async function directUsagePaste(principal: unknown, text: unknown): Promise<Dire
   if (typeof text !== "string" || !text.trim()) throw new Error("text is required: paste the /usage panel");
   const resolved = resolveClaudePrincipal(await readAccounts(), typeof principal === "string" && principal.trim() ? principal.trim() : undefined);
   const disabled = await disabledMeterReason(`${resolved}:all`);
-  if (disabled) return { source: "direct", principal: resolved, allowed: false, unknown: true, reason: disabled };
+  // A write, not a read with its own "UNKNOWN" convention: refuse it as an
+  // ordinary thrown error (handleMcp's own catch turns it into a standard
+  // MCP tool error), matching the CLI's usage --paste refusal, never a
+  // one-off { allowed: false } object only this path would ever produce.
+  if (disabled) throw new Error(disabled);
   const now = new Date();
   const panel = parseUsagePanel(text, now);
   if (!panel.windows.length) throw new Error('no usage window in the pasted text; expected a line like "Current session" or "Current week (all models)" with a percent');
@@ -575,7 +587,10 @@ async function directGate(rawNeeds: unknown, meter: unknown, usePlan: unknown, r
   const needs: GateNeed[] = Array.isArray(rawNeeds) ? rawNeeds.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [];
   if (!needs.length) throw new Error("needs is required (e.g. [\"5h:15\"])");
   const disabled = typeof meter === "string" ? await disabledMeterReason(meter) : undefined;
-  if (disabled) return { source: "direct", allowed: false, unknown: true, reason: disabled, meters_checked: [], notices: [] };
+  // meters_checked names the meter actually examined, matching gateFor's own
+  // convention (and the daemon's identical disabled-gate branch) -- never a
+  // hard-coded empty array.
+  if (disabled) return { source: "direct", allowed: false, unknown: true, reason: disabled, meters_checked: typeof meter === "string" ? [meter] : [], notices: [] };
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
