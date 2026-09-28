@@ -982,4 +982,89 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: the unexp
       await expect(readFile(pidFilePath, "utf8")).resolves.toBe("2e3");
     } finally { await supervisor.stop(); }
   }, 15_000);
+
+  it("never signals or restarts based on evidence a newer (different) launch has since superseded", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-superseded-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 30,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      track(Number(await waitForFile(infoFile)), root);
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnCount).toBe(1);
+
+      // A real, live, unrelated stranger process stands in for a NEWER
+      // launch's own agy -- as if a genuinely different
+      // AgyKeepaliveSupervisor instance, sharing this same `home`, had
+      // since started and overwritten both shared files with its own
+      // launchId. Killing script now triggers the unexpected-exit path on
+      // this OLD (now superseded) instance.
+      const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+      const strangerPid = track(stranger.pid, root) as number;
+      await writeFile(pidFilePath, String(strangerPid), { mode: 0o600 });
+      await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+        scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
+        launchedAt: new Date().toISOString(), recordedAt: new Date().toISOString(),
+        verified: false, launchId: "a-completely-different-launch-id",
+      }), { mode: 0o600 });
+      process.kill(scriptPid, "SIGKILL");
+
+      // Several retry/backoff cycles' worth of time: must never restart,
+      // and the stranger (the "newer launch"'s own agy) must never be
+      // touched.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(spawnCount).toBe(1);
+      expect(alive(strangerPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("never signals or restarts when the shared JSON state is corrupt, even though the pid file alone looks valid", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-corruptstate-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { spawn: realSpawn } = await import("node:child_process");
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 30,
+      spawn: spyingSpawn,
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      await waitForFile(pidFilePath);
+      expect(spawnCount).toBe(1);
+
+      // Corrupt the JSON state right before killing script -- the pid file
+      // alone, read in isolation, still names a genuine, currently-live,
+      // correct pid.
+      await writeFile(keepaliveStateFilePath(root), "{ not valid json", { mode: 0o600 });
+      process.kill(scriptPid, "SIGKILL");
+
+      // Several retry/backoff cycles' worth of time: must never restart,
+      // and the real (still legitimately this launch's own) agy must never
+      // be signalled either -- ownership could not be confirmed, so
+      // nothing is assumed safe on the strength of the pid file alone.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(spawnCount).toBe(1);
+      expect(alive(agyPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
 });

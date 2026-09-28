@@ -739,6 +739,16 @@ export class AgyKeepaliveSupervisor {
    * (see stop()'s doc comment); this method only ever runs synchronously off
    * script's own 'exit'/'error' event, so that proof still holds here.
    *
+   * That covers the pid file's CONTENT, but not that the file itself is
+   * still this launch's to read: a newer launch (this same instance's own
+   * next one, or -- see ownsCurrentEvidence's own doc comment -- a
+   * completely different AgyKeepaliveSupervisor instance sharing this
+   * `home`) can have replaced both shared files with its own launchId at
+   * any point after script exited, and this reap runs asynchronously,
+   * across a real bounded discovery wait -- ownsCurrentEvidence() is
+   * checked again right before ever acting on the pid file's content, not
+   * assumed once up front.
+   *
    * The pid file itself can be in one of three states, each handled
    * differently (readAgyPidDetailed distinguishes them):
    *  - found: killed and its liveness polled; confirmed dead lets this
@@ -781,21 +791,46 @@ export class AgyKeepaliveSupervisor {
       }
     }
     if (this.stopping) { this.reaping = false; return; }
-    if (result.kind === "found") {
+    // Before ever signalling anything the pid file names, OR restarting on
+    // the strength of it being merely absent, confirm the shared JSON state
+    // still names THIS launch's own launchId. Without this, a NEWER launch
+    // (this same instance's own, from a launch this reap attempt started
+    // before, or -- see ownsCurrentEvidence's own doc comment -- a
+    // completely different AgyKeepaliveSupervisor instance sharing this
+    // `home`) that has since replaced both shared files would have its own,
+    // unrelated agy killed by this OLDER attempt, or its restart wrongly
+    // permitted on the strength of "absent" evidence that was never this
+    // launch's own to interpret. Missing, invalid, or mismatched state is
+    // treated exactly like invalid pid-file evidence: retried indefinitely,
+    // never signalled, never restarted.
+    // No `home`/state-file configured at all (the whole shared-evidence
+    // mechanism is off for this instance, e.g. a unit test driving the
+    // supervisor directly with fake timers and a mocked spawn) means
+    // ownership is trivially this launch's own -- and, just as importantly,
+    // must resolve with NO extra microtask hop: ownsCurrentEvidence() itself
+    // already takes this exact shortcut internally, but going through an
+    // `await` on it regardless would defer the found/absent branch below by
+    // one full turn even in this trivial case, which a caller that never
+    // awaits reapOrphanedAgyThenRestart()'s own returned promise (the exit
+    // handler above is fire-and-forget) can never itself wait out.
+    const owns = (!this.stateFilePath || this.currentLaunchId === undefined) ? true : await this.ownsCurrentEvidence();
+    if (this.stopping) { this.reaping = false; return; }
+    if (owns && result.kind === "found") {
       killProcessGroup(result.pid);
       const confirmed = await waitUntilGroupGone(result.pid);
       if (this.stopping) { this.reaping = false; return; }
       if (confirmed) { this.reaping = false; this.scheduleRestart(); return; }
-    } else if (result.kind === "absent") {
+    } else if (owns && result.kind === "absent") {
       // Never appeared across the whole bounded discovery window: nothing
       // was reasonably ever spawned for this launch.
       this.reaping = false;
       this.scheduleRestart();
       return;
     }
-    // Either a found pid could not be confirmed dead, or the evidence is
-    // present but invalid -- `this.reaping` stays true, and this retries
-    // rather than ever letting a restart proceed past unresolved evidence.
+    // Either a found pid could not be confirmed dead, the evidence is
+    // present but invalid, or ownership of the shared files could not be
+    // confirmed -- `this.reaping` stays true, and this retries rather than
+    // ever letting a restart proceed past unresolved or superseded evidence.
     const timeout = setTimeout(() => { void this.reapOrphanedAgyThenRestart(attempt + 1); }, this.delay(Math.min(attempt, 6)));
     timeout.unref();
   }

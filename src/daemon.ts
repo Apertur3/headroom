@@ -275,7 +275,43 @@ export class HeadroomDaemon {
    * actual launch decision, which always re-reads fresh right before it --
    * see that re-read's own comment for why trusting these parameters here
    * would be wrong. */
+  // Never lets its own promise reject: currentAccounts()/readPolicy() below
+  // (called both here and inside the try block further down) can throw on
+  // a malformed accounts.toml/policy.toml, and this method is called
+  // fire-and-forget (no rejection handler) from the poll path -- an
+  // unguarded throw there becomes an unhandled promise rejection, which can
+  // terminate the whole daemon process over nothing worse than a bad edit
+  // to a config file. Every caller, awaited or detached, gets the same
+  // guarantee: a failed reload just defers this attempt and logs, exactly
+  // like the narrower catch around executablePath()/start() already did.
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
+    try {
+      await this.attemptStartKeepalive(accounts, policy);
+    } catch (error) {
+      void appendDaemonLog(`antigravity keepalive: reload failed, deferring this attempt: ${safeError(error)}`, this.home);
+    }
+  }
+
+  private async attemptStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
+    // A running supervisor must not just short-circuit on `.running` below
+    // without first re-checking whether policy (or the accounts it serves)
+    // still justifies it existing at all -- and a non-running supervisor
+    // with a pending restart (this.restart set, or mid-reap) must not
+    // survive `antigravity_keepalive = false` either by silently falling
+    // through to the freshPolicy return further down, which only ever
+    // declines to launch a NEW one and never stops an EXISTING one. Both
+    // route through the exact same serialized stop path (stopKeepaliveUnless
+    // / keepaliveStopPending) an accounts.toml-driven disable already uses,
+    // checked here -- before either the `.running` short-circuit or any of
+    // this function's own launch logic gets a chance to run.
+    if (this.keepalive) {
+      const gateAccounts = await this.currentAccounts();
+      const gatePolicy = await readPolicy();
+      const stillJustified = gatePolicy.antigravity_keepalive
+        && gateAccounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
+      this.stopKeepaliveUnless(stillJustified, "policy or account disable");
+      if (!stillJustified) return;
+    }
     if (this.keepalive?.running) return;
     // Never construct a new supervisor while an old one's stop() might still
     // be reading or writing the same shared home/state-file paths -- see
@@ -329,6 +365,23 @@ export class HeadroomDaemon {
     try {
       const binary = await executablePath(resolveAgyBinary(antigravity.agy_path));
       if (this.stopping) return; // right before start(): never launch after shutdown began
+      // executablePath() above is itself an await -- a disable that lands
+      // in ITS window is exactly as real a race as the ones the fresh
+      // read above this try block already guards against, and checking
+      // only `this.stopping` here missed it: nothing re-confirmed the
+      // account/policy were still enabled after that specific await, so a
+      // disable during the (potentially slow, filesystem-bound) lstat/stat
+      // work inside executablePath could still fall through to a launch.
+      // Re-read one last time, as the very last step before ever
+      // constructing or starting the supervisor.
+      const finalAccounts = await this.currentAccounts();
+      const finalPolicy = await readPolicy();
+      if (this.stopping) return;
+      // process.platform === "win32" was already ruled out by the fresh
+      // check above this try block, and the platform cannot change mid-run.
+      if (!finalPolicy.antigravity_keepalive) return;
+      const finalAntigravity = finalAccounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
+      if (!finalAntigravity) return;
       this.keepalive ??= new AgyKeepaliveSupervisor({ binary, home: this.home });
       this.keepalive.start();
     } catch (error) {
@@ -1010,7 +1063,13 @@ export class HeadroomDaemon {
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
       if (this.schedulingStarted && !this.keepalive?.running && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-        void this.maybeStartKeepalive(enabledAccounts, policy);
+        // maybeStartKeepalive() itself never rejects (see its own doc
+        // comment), but this detached call is guarded again here anyway --
+        // defense in depth, not reliance on that guarantee alone -- so a
+        // future change to that method can never turn this fire-and-forget
+        // call into an unhandled rejection by accident.
+        void this.maybeStartKeepalive(enabledAccounts, policy)
+          .catch((error: unknown) => appendDaemonLog(`antigravity keepalive: unexpected error from a poll-triggered start attempt: ${safeError(error)}`, this.home));
       }
       // A gate-blocked skip renders the exact same failed observation reason
       // as a real denial on purpose (see PollResult.claudeProbeOutcomes), so
@@ -1112,14 +1171,27 @@ export class HeadroomDaemon {
    * was deleted -- see both currentAccounts() call sites) must stop -- an
    * `accounts.toml` edit that disables Antigravity while the daemon is
    * already running must not leave its `agy` process running unsupervised.
+   * A thin wrapper over stopKeepaliveUnless() -- see that method's own doc
+   * comment for why EXISTENCE, not `.running`, is the right gate. */
+  private stopKeepaliveIfNoneEnabled(accounts: Account[]): void {
+    this.stopKeepaliveUnless(accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity"), "disabled");
+  }
+
+  /** Shared serialized-stop path for every reason an existing keepalive can
+   * stop being justified: no enabled Antigravity account left (accounts.toml,
+   * via stopKeepaliveIfNoneEnabled) or the policy itself now disables it
+   * (policy.toml, via attemptStartKeepalive's own top-of-function check) --
+   * a policy-level disable must stop an existing supervisor exactly as
+   * surely as an account-level one already did, through this one path,
+   * rather than each caller growing its own ad hoc stop logic.
    * Checked by EXISTENCE (`this.keepalive`), not `.running`: a supervisor
    * that is mid-reap after a crash, or merely has a scheduled restart
    * pending (this.restart set), reports `running` as false too, but will
    * still relaunch on its own the moment that reap or timer resolves unless
    * .stop() -- which clears its restart timer and sets its own `stopping`
    * flag -- is actually called on it. */
-  private stopKeepaliveIfNoneEnabled(accounts: Account[]): void {
-    if (this.keepalive && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
+  private stopKeepaliveUnless(justified: boolean, reason: string): void {
+    if (this.keepalive && !justified) {
       const keepalive = this.keepalive;
       this.keepalive = undefined;
       // Tracked (not fired-and-forgotten): maybeStartKeepalive() awaits this
@@ -1127,7 +1199,7 @@ export class HeadroomDaemon {
       // disable-then-re-enable can never start a new one while this stop()
       // is still reading or writing the shared home/state-file paths.
       this.keepaliveStopPending = keepalive.stop()
-        .catch((error: unknown) => { void appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home); })
+        .catch((error: unknown) => { void appendDaemonLog(`antigravity keepalive stop (${reason}): ${safeError(error)}`, this.home); })
         .finally(() => { this.keepaliveStopPending = undefined; });
     }
   }
