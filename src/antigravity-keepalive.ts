@@ -697,6 +697,9 @@ export class AgyKeepaliveSupervisor {
    * evidence is invalid or any recorded process remains unresolved. */
   private async reapOrphanedAgyThenRestart(attempt = 0): Promise<void> {
     if (this.stopping) { this.reaping = false; return; }
+    // Without a Headroom home there is no launch evidence to reap or
+    // reconcile: schedule the restart synchronously, as before.
+    if (!this.home) { this.reaping = false; this.scheduleRestart(); return; }
     this.reaping = true;
     if (await this.waitForOwnPidEvidence() && await this.reapOwnPidFileGroup() && await this.reconcileOwnLaunchDirectory()) {
       this.forgetLaunchDirectory();
@@ -941,6 +944,9 @@ export class AgyKeepaliveSupervisor {
    * before spawn and leaves the restart pending when it cannot prove safety. */
   private async restartAfterDelay(): Promise<void> {
     if (this.stopping) { this.restart = undefined; return; }
+    // Without a Headroom home there is no launch evidence to reconcile, so
+    // restart synchronously (no extra await between the timer and spawn).
+    if (!this.home) { this.restart = undefined; this.launch(); return; }
     this.reaping = true;
     const clean = await this.waitForOwnPidEvidence() && await this.reconcileOwnLaunchDirectory();
     this.reaping = false;

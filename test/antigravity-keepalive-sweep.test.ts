@@ -104,7 +104,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
     } finally { await supervisor.stop(); }
   }, 15_000);
 
-  it("treats a missing agy pid file as unconfirmed, not as proof no agy exists, even though the real agy dies via killTree's own ps walk", async () => {
+  it("with the pid file gone, clears a launch's evidence only after the agy pid its own state recorded is confirmed dead", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-missingpid-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -114,18 +114,42 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
       track(supervisor.pid, root);
       await waitForFile(launchPidPath(root, supervisor));
-      // Simulate the pid file becoming unreadable right before stop() -- it
-      // must not read this as "there is no agy to worry about".
+      await vi.waitFor(async () => {
+        expect(JSON.parse(await readFile(launchStatePath(root, supervisor), "utf8")).agyPid).toBe(agyPid);
+      }, { timeout: 3_000, interval: 20 });
+      const statePath = launchStatePath(root, supervisor);
       await rm(launchPidPath(root, supervisor), { force: true });
 
       await supervisor.stop();
 
-      // killTree still reaches agy for real, through its own ps-based walk
-      // of script's tree -- entirely independent of the pid file -- but
-      // stop() itself never proved that on its own terms, so it must not
-      // have cleared its evidence on the strength of merely observing no file.
       await waitUntilDead(agyPid);
-      await expect(readFile(launchStatePath(root, supervisor), "utf8")).resolves.toBeTruthy();
+      await expect(readFile(statePath, "utf8")).rejects.toThrow();
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("keeps a launch's evidence when neither its pid file nor its state ever recorded agy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-noagy-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, killGraceMs: 100 });
+    try {
+      supervisor.start();
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      track(supervisor.pid, root);
+      await waitForFile(launchPidPath(root, supervisor));
+      const statePath = launchStatePath(root, supervisor);
+      await vi.waitFor(async () => { expect(JSON.parse(await readFile(statePath, "utf8")).agyPid).toBe(agyPid); }, { timeout: 3_000, interval: 20 });
+      // Strip what the state learned about agy, then lose the pid file: from
+      // stop()'s point of view nothing ever recorded agy.
+      const state = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+      for (const key of ["agyPid", "agyCommand", "agyStartedAt"]) delete state[key];
+      await writeFile(statePath, JSON.stringify(state), { mode: 0o600 });
+      await rm(launchPidPath(root, supervisor), { force: true });
+
+      await supervisor.stop();
+
+      await waitUntilDead(agyPid); // killTree's own walk still reaches it
+      await expect(readFile(statePath, "utf8")).resolves.toBeTruthy();
     } finally { await supervisor.stop(); }
   }, 15_000);
 });
