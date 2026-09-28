@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { main } from "../src/cli.js";
 import { fillFor, gateFor, planFor } from "../src/orchestrator-reads.js";
 import { defaultPolicy, parsePolicy, reserveFor } from "../src/policy.js";
 import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry } from "../src/policy-configure.js";
+import { policyLockPath } from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -401,6 +402,63 @@ describe("headroom policy CLI", () => {
     const line = logs.find((entry) => entry.startsWith("codex-main:main"));
     expect(line).toContain("not applying");
     expect(line).toContain("expired 2000-01-01");
+  });
+});
+
+describe("headroom policy CLI: concurrent-safe edits", () => {
+  it("serializes two concurrent `policy set reserve` writers so neither erases the other's edit", async () => {
+    const home = await tempHome();
+    await writeFile(join(home, "policy.toml"), "freeze_reserve_pct = 10\n", { mode: 0o600 });
+    await withHeadroomHome(home, async () => {
+      // Both invocations start from the same on-disk policy.toml. Without
+      // serialization, both read it before either writes, and the second
+      // writer's rename silently erases the first writer's edit. Promise.all
+      // runs both main() calls genuinely concurrently within this one
+      // process. This is
+      // an integration smoke test that withPolicyLock is actually wired into
+      // the CLI commands -- Promise.all alone does not force a genuine
+      // interleaving, so it is not, on its own, proof that the lock actually
+      // serializes anything (a passing run here could still happen to get
+      // lucky). test/exclusive-lock.test.ts tests withExclusiveLock itself
+      // with explicit deferred barriers for that.
+      const [codeA, codeB] = await Promise.all([
+        main(["policy", "set", "reserve", "codex-main:main", "30", "--reason", "stop new Codex builds at 70% used"]),
+        main(["policy", "set", "reserve", "claude-main:all", "20", "--reason", "stop new Claude builds at 80% used"]),
+      ]);
+      expect(codeA).toBe(0);
+      expect(codeB).toBe(0);
+    });
+    const written = await readFile(join(home, "policy.toml"), "utf8");
+    const parsed = parsePolicy(written);
+    expect(parsed.reserve["codex-main:main"]).toBe(30);
+    expect(parsed.reserve["claude-main:all"]).toBe(20);
+    // No lock directory left behind once both writers finish -- checked at
+    // the real production path (policyLockPath), not a filename this test
+    // guessed at: a stale assertion against the wrong path would pass
+    // trivially even if the real lock were left behind.
+    await expect(stat(policyLockPath(home))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("gives two backups that land in the same millisecond their own distinct files", async () => {
+    const home = await tempHome();
+    const original = "freeze_reserve_pct = 10\n";
+    await writeFile(join(home, "policy.toml"), original, { mode: 0o600 });
+    const fixedStamp = "2026-09-28T00:00:00.000Z";
+    const isoSpy = vi.spyOn(Date.prototype, "toISOString").mockReturnValue(fixedStamp);
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["policy", "set", "reserve", "codex-main:main", "30", "--reason", "a"])).toBe(0);
+        expect(await main(["policy", "set", "reserve", "claude-main:all", "20", "--reason", "b"])).toBe(0);
+      });
+    } finally { isoSpy.mockRestore(); }
+    const files = await readdir(home);
+    const backups = files.filter((name) => name.startsWith("policy.toml.bak-2026-09-28T00-00-00-000Z"));
+    // A plain writeFile at the same stamped name would have left only one
+    // backup, the second call's write silently replacing the first's.
+    expect(backups).toHaveLength(2);
+    const contents = await Promise.all(backups.map((name) => readFile(join(home, name), "utf8")));
+    expect(contents).toContain(original); // the pre-first-edit backup survives intact
+    expect(new Set(contents).size).toBe(2); // the two backups are genuinely different snapshots
   });
 });
 

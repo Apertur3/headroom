@@ -306,10 +306,15 @@ export interface GateOptions {
    * informational, no gating effect of its own. */
   actionClass?: string;
   /** policy.toml's pacing: "even" (default) enforces the pro-rata line and
-   * the burst check for a 5h need; "none" skips both. */
+   * the burst check for a 5h need; "none" skips both. The explicit `fill`
+   * allowance below is independent of this setting -- it still runs, and
+   * can still refuse, under pacing "none". */
   pacing?: "even" | "none";
-  /** The even-pacing allowance basis. `fill` is opt-in: it projects the
-   * current window to the lane's end instead of rationing a plan share. */
+  /** The allowance basis for a 5h need. `pro_rata` (the default) is subject
+   * to `pacing`: it only rations a plan share under "even" pacing, and is a
+   * no-op under "none". `fill` is opt-in and evaluated regardless of
+   * `pacing`: it always projects the current window's use and burn to the
+   * lane's end instead of rationing a plan share. */
   allowance?: "pro_rata" | "fill";
   /** A caller may tighten, never raise, the reserve-derived gate ceiling. */
   capPercent?: number;
@@ -486,7 +491,12 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     lastResult = { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 
     const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
-    if (pacing === "even" && fiveHourNeed && fiveHourRow) {
+    // The explicit fill allowance is evaluated independently of pacing: it is
+    // an opt-in request-time projection, not part of the even-pacing
+    // smoothing pacing "none" is meant to disable. Only the pro-rata line and
+    // burst check below (the "smoothing" pacing actually governs) are
+    // restricted to pacing "even".
+    if (fiveHourNeed && fiveHourRow) {
       if (allowance === "fill") {
         // The explicit fill allowance is opt-in and must apply whenever it is
         // requested: never silently skipped because no --owner was given (a
@@ -530,7 +540,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
           return { allowed: false, reason: `${fill.reason}${attribution}`, meters_checked: checked, ...fillFields, ...(fill.unknown ? { unknown: true as const } : {}) };
         }
         lastResult = { allowed: true, reason: fill.reason, ...(notEnforced.length ? { not_enforced: notEnforced } : {}), ...fillFields };
-      } else if (fiveHourRow.resets_at && fiveHourRow.window?.minutes && options.owner) {
+      } else if (pacing === "even" && fiveHourRow.resets_at && fiveHourRow.window?.minutes && options.owner) {
         const windowStart = new Date(Date.parse(fiveHourRow.resets_at) - fiveHourRow.window.minutes * 60_000);
         const windowHours = fiveHourRow.window.minutes / 60;
         const ownerLeases = store.leases(id, true, now).filter((lease) => lease.owner === options.owner);
@@ -741,18 +751,21 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   // mechanism, and a from-scratch pro-rata line computed over a 7-day span
   // (with no owner plan share on file yet) would otherwise collapse the
   // allowance to near zero for no real reason.
-  const evenPacingApplies = pacing === "even" && isFiveHour && tight.window?.minutes;
+  const fillApplies = isFiveHour && tight.window?.minutes;
+  const evenPacingApplies = pacing === "even" && fillApplies;
   let used5hForLanes = used5h;
   let allowanceBasis: FillOutcome["allowance_basis"] = "full";
-  if (evenPacingApplies && allowance === "fill") {
+  if (fillApplies && allowance === "fill") {
     // Unlike pro-rata smoothing, the explicit fill allowance must apply
     // whenever it is requested: never silently skipped for lack of --owner
     // (a caller checking generic dispatch capacity, not one owner's lane,
-    // still needs the projection to run), and never silently skipped once
-    // the window is in its final stretch before reset -- that is exactly
-    // when a burst against the cap matters most. A window with no finite,
-    // future reset, or with no recent burn history to project from, fails
-    // closed to an error rather than falling through to "full" capacity.
+    // still needs the projection to run), never silently skipped once the
+    // window is in its final stretch before reset (that is exactly when a
+    // burst against the cap matters most), and never silently skipped under
+    // pacing "none" (pacing only ever governed the pro-rata smoothing below,
+    // never this opt-in projection). A window with no finite, future reset,
+    // or with no recent burn history to project from, fails closed to an
+    // error rather than falling through to "full" capacity.
     const finiteReset = tight.resets_at && Number.isFinite(Date.parse(tight.resets_at)) && Date.parse(tight.resets_at) > now.getTime();
     if (!finiteReset) return { meter, error: `fill needs a finite future reset for ${meter}` };
     const minutesToReset = Math.max(0, secondsLeft ?? 0) / 60;

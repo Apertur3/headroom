@@ -7,15 +7,18 @@ poll_interval_minutes = 5
 # Keep the daemon-owned `agy` pseudo-terminal warm for real local quota summaries.
 # This keeps one background process and pseudo-terminal alive (small but continuous energy cost).
 antigravity_keepalive = true
-# "even" (default): `gate` enforces the pro-rata line and a 10-minute burst
-# check for a 5h request; `fill` only offers a window's full remaining
-# points in its last 45 minutes, the pro-rata allowance before that.
-# "none" skips both, leaving only the plain reserve/plan-line checks.
+# "even" (default): under the default "pro_rata" allowance below, `gate`
+# enforces the pro-rata line and a 10-minute burst check for a 5h request;
+# `fill` only offers a window's full remaining points in its last 45
+# minutes, the pro-rata allowance before that. "none" skips both, leaving
+# only the plain reserve/plan-line checks under "pro_rata".
 pacing = "even"
 # "pro_rata" (default) protects an even planned share throughout a 5h
-# window. "fill" is for an orchestrator that intentionally spends a
-# use-it-or-lose-it window before reset; it projects current usage, open
-# leases, and recent burn to the lane end while retaining the cap.
+# window, subject to `pacing` above (a no-op under "none"). "fill" is for an
+# orchestrator that intentionally spends a use-it-or-lose-it window before
+# reset; it projects current usage, open leases, and recent burn to the
+# lane end while retaining the cap -- unlike "pro_rata", this always runs
+# and can always refuse, regardless of `pacing`.
 # allowance = "pro_rata"
 # Check the npm registry at most once every 24 hours for a newer headroomd
 # and print a one-line notice from `status`/`doctor`. Never installs

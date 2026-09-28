@@ -49,8 +49,9 @@ headroom accounts discover
 ```
 
 This scans for `~/.claude*` and `~/.codex*` directories; Antigravity's `agy`; and the credential locations used by `grok login` and `kimi login`. It writes what it
-finds to `~/.headroom/accounts.toml` (mode 0600), and prints the same TOML to stdout so you can
-check it before trusting it, followed by a confirmation line:
+finds to `~/.headroom/accounts.toml` atomically (mode 0600 on POSIX; Windows has no equivalent
+permission bit), and prints the same TOML to stdout so you can check it before trusting it,
+followed by a confirmation line:
 
 ```
 Wrote /Users/you/.headroom/accounts.toml (4 accounts). Next: headroom doctor

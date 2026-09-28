@@ -1,9 +1,14 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseRouting, seedExampleConfig } from "../src/config.js";
 import { defaultAntigravityKeepalive, parsePolicy } from "../src/policy.js";
+
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
 
 describe("policy defaults", () => {
   it("keeps Antigravity alive when the key is absent on macOS and Linux", () => {
@@ -29,7 +34,12 @@ describe("policy defaults", () => {
 
 describe("seedExampleConfig", () => {
   const temporary: string[] = [];
-  afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+  afterEach(async () => {
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const mocked = await import("node:fs/promises");
+    vi.mocked(mocked.open).mockReset().mockImplementation(actual.open);
+    await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  });
 
   it("copies policy.toml and routing.toml from examples/ into a fresh home, naming the seeded action classes", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-seed-"));
@@ -77,5 +87,65 @@ describe("seedExampleConfig", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]).toContain("routing.toml");
     expect(await readFile(join(home, "policy.toml"), "utf8")).toContain("poll_interval_minutes = 9");
+  });
+
+  it("seeds exclusively: two concurrent calls on a fresh home never corrupt policy.toml, and only one reports having written it", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-seed-concurrent-"));
+    temporary.push(home);
+    // A real race, not a simulated one: both calls run genuinely
+    // concurrently, so exactly one's exclusive create (`open(path, "wx")`)
+    // can win -- the loser sees EEXIST and reports nothing for that file,
+    // never overwriting what the winner already wrote. The check-then-write
+    // version this replaced could instead have both calls decide the file
+    // was absent and both write it, with one clobbering (or, on a badly
+    // timed interleaving, partially corrupting) the other's content --
+    // exactly the race a concurrent `headroom policy set` landing in the
+    // same gap could also have won.
+    const [messagesA, messagesB] = await Promise.all([seedExampleConfig(home), seedExampleConfig(home)]);
+    const policySeeders = [messagesA, messagesB].filter((messages) => messages.some((line) => line.includes("policy.toml")));
+    expect(policySeeders).toHaveLength(1);
+    const policyText = await readFile(join(home, "policy.toml"), "utf8");
+    expect(policyText).toContain("freeze_reserve_pct"); // fully intact example content, never interleaved or truncated
+    const routingSeeders = [messagesA, messagesB].filter((messages) => messages.some((line) => line.includes("routing.toml")));
+    expect(routingSeeders).toHaveLength(1);
+  });
+
+  // Windows refuses to rename over a file another handle still holds open, so this interleaving
+  // (a concurrent writer replacing the path while the seed's handle is open) cannot occur there.
+  it.skipIf(process.platform === "win32")("never deletes a concurrent policy set's already-landed write when the seed's own write fails after its exclusive create", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-seed-race-"));
+    temporary.push(home);
+    const policyTarget = join(home, "policy.toml");
+    const concurrentContent = '[reserve]\n"codex-main:main" = 30\n';
+
+    const mocked = await import("node:fs/promises");
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    // Simulates the exact race this guards against: the seed's
+    // `open(path, "wx")` has already succeeded (this call's `open` mock
+    // only fires for that one exclusive create), and in the narrow window
+    // before its own writeFile reports failure, a concurrent `headroom
+    // policy set`'s writeFileAtomic finishes and rename()s its own
+    // completed file over this exact path -- rename() does not care what
+    // was there before. The seed's write is made to fail right after.
+    vi.mocked(mocked.open).mockImplementationOnce(async (...args: Parameters<typeof actual.open>) => {
+      const handle = await actual.open(...args);
+      return Object.assign(Object.create(Object.getPrototypeOf(handle) as object), handle, {
+        writeFile: async () => {
+          const concurrentTemp = `${policyTarget}.concurrent-tmp`;
+          await actual.writeFile(concurrentTemp, concurrentContent, { mode: 0o600 });
+          await actual.rename(concurrentTemp, policyTarget);
+          throw new Error("simulated seed write failure");
+        },
+      }) as typeof handle;
+    });
+
+    await expect(seedExampleConfig(home)).rejects.toThrow("simulated seed write failure");
+
+    // The concurrent writer's file must survive byte-for-byte: cleanup only
+    // ever removes a file it can prove (same inode as the one it opened)
+    // is still its own empty, failed attempt -- never whatever now sits at
+    // the path. The pre-fix version compared nothing and unconditionally
+    // unlinked `path`, which would have destroyed this reserve here.
+    expect(await readFile(policyTarget, "utf8")).toBe(concurrentContent);
   });
 });
