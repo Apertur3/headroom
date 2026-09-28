@@ -500,9 +500,13 @@ source, stopped: boolean }` with `stop: true`.
 
 `{ contract, generated_at, timers: Timer[] }`. `Timer` is `{ owner: string,
 name: string, at: string, action: string, if_missed: "notify" | "drop",
-created_at: string, fired_at: string | null, cleared_at: string | null }`.
-Only pending timers (never fired, never cleared) are listed. `status`'s own
-`due_timers` (above) is the subset of this already at or past `at`.
+created_at: string, fired_at: string | null, cleared_at: string | null,
+attempts: number, failed_at: string | null }`. `attempts` counts inbox
+delivery tries; `failed_at` is set once a timer has failed delivery
+`MAX_TIMER_DELIVERY_ATTEMPTS` times in a row, permanently giving up on it
+(never retried again). Only pending timers (never fired, never cleared,
+never given up on) are listed. `status`'s own `due_timers` (above) is the
+subset of this already at or past `at`.
 
 `timer set`/`timer clear` have no `--json` output of their own (a plain
 confirmation line); `timer list --json` always exits `0`.

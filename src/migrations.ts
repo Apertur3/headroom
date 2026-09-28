@@ -196,12 +196,56 @@ const ADD_HEARTBEATS_AND_TIMERS: Migration = {
   },
 };
 
+/**
+ * `timers.attempts`/`timers.failed_at`: bounded retry for a timer whose
+ * inbox delivery keeps failing (an owner whose session directory can no
+ * longer be created, a filesystem error, ...). Before this, `fireDueTimers`
+ * always released a failed claim back to pending (`unclaimTimer`), so a
+ * permanently-undeliverable timer was retried on every single maintenance
+ * pass forever. `attempts` counts delivery tries (bumped in
+ * `unclaimTimer`); once it reaches `MAX_TIMER_DELIVERY_ATTEMPTS`,
+ * `failed_at` is set instead of releasing the claim, and every timer query
+ * (`dueTimers`, `timers`, `nextMaintenanceDeadline`) excludes a row with
+ * `failed_at` set, the same way they already exclude `cleared_at`. Never a
+ * delete, same reasoning as `fired_at`/`cleared_at`: the row (and its
+ * now-known reason) stays inspectable.
+ */
+const ADD_TIMER_DELIVERY_ATTEMPTS: Migration = {
+  version: 5,
+  description: "timers.attempts and timers.failed_at for bounded delivery retry",
+  up(db) {
+    addColumnIfMissing(db, "ALTER TABLE timers ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(db, "ALTER TABLE timers ADD COLUMN failed_at TEXT");
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
+
+/** The schema version at or above which the `heartbeats`/`timers` tables
+ * exist (ADD_HEARTBEATS_AND_TIMERS, above). `HeadroomStore.open()` always
+ * migrates up to CURRENT_SCHEMA_VERSION before returning, so this only
+ * matters for `openReadOnly()`'s non-migrating connection (the cached-status
+ * path in mcp.ts/cli.ts): a database written by a pre-0.2.0 daemon and never
+ * since opened for a write is still on an older `PRAGMA user_version`, and
+ * querying either table on that connection would fail with "no such table"
+ * rather than the empty-list-shaped "no heartbeats/timers registered" a
+ * caller expects from a plain compatibility gap. */
+export const HEARTBEATS_SCHEMA_VERSION = ADD_HEARTBEATS_AND_TIMERS.version;
+
+/** The schema version at or above which `timers` also has its `attempts`/
+ * `failed_at` columns (ADD_TIMER_DELIVERY_ATTEMPTS, above). Store.ts's
+ * `timers()` -- the one timer read reachable through `openReadOnly()`'s
+ * non-migrating connection, via the cached-status path -- gates on this
+ * rather than HEARTBEATS_SCHEMA_VERSION: a database on exactly schema 4 (the
+ * `timers` table exists, but not yet these two columns) would otherwise
+ * fail that query with "no such column: failed_at", the same class of bug
+ * HEARTBEATS_SCHEMA_VERSION exists to prevent, just one migration later. */
+export const TIMER_DELIVERY_SCHEMA_VERSION = ADD_TIMER_DELIVERY_ATTEMPTS.version;
 
 /** Thrown by runMigrations when a database's own `PRAGMA user_version` is
  * higher than this binary understands -- almost always a database a newer

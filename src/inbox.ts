@@ -20,14 +20,16 @@
  */
 import { lstat, readdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { readBoundedRegularFile, safeOutputDirectory, writeFileAtomic, SAFE_READ_MAX_BYTES } from "./security.js";
+import { isReservedSessionId, readBoundedRegularFile, safeOutputDirectory, writeFileAtomic, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
 import { safeHeadroomDirectory } from "./store.js";
 
 export const INBOX_KINDS = ["budget", "note", "handoff"] as const;
 export type InboxKind = (typeof INBOX_KINDS)[number];
 
-/** One path segment, no separators, no drive letters, no percent escapes. */
-export const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/** Re-exported from security.js, which now hosts the pattern so store.ts's
+ * timer owner validation can share it without importing this module (see
+ * security.ts's own doc comment on SESSION_ID_PATTERN for why). */
+export { SESSION_ID_PATTERN };
 
 /** Bytes accepted for one message body, matching security.ts's own bound. */
 export const MAX_INBOX_MESSAGE_BYTES = SAFE_READ_MAX_BYTES;
@@ -68,7 +70,7 @@ export function isInboxKind(value: string): value is InboxKind {
 export function assertSessionId(value: string): string {
   const session = value.trim();
   if (!SESSION_ID_PATTERN.test(session)) throw new Error("session id must be 1 to 64 characters of A-Z a-z 0-9 . _ -");
-  if (session === "." || session === "..") throw new Error("session id must not be a directory reference");
+  if (isReservedSessionId(session)) throw new Error("session id must not be a directory reference");
   return session;
 }
 

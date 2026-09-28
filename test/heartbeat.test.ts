@@ -15,7 +15,7 @@ import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
 import { readInbox, sendInboxMessage } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
-import { HeadroomStore } from "../src/store.js";
+import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
@@ -183,8 +183,160 @@ describe("timers", () => {
       store.clearTimer("orch-f", "wake");
       expect(store.timers("orch-f")).toHaveLength(0);
       const replaced = store.setTimer("orch-f", "wake", "2026-09-28T13:00:00.000Z", "second", "drop", now);
-      expect(replaced).toMatchObject({ action: "second", if_missed: "drop", fired_at: null, cleared_at: null });
+      expect(replaced).toMatchObject({ action: "second", if_missed: "drop", fired_at: null, cleared_at: null, attempts: 0, failed_at: null });
       expect(store.timers("orch-f")).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  // P2 fix: an invalid owner id was previously stored and left
+  // to fail every inbox delivery forever (inbox.ts's assertSessionId refuses
+  // it at delivery time, never at set time). setTimer now applies the same
+  // SESSION_ID_PATTERN rule up front and refuses to store the row at all.
+  it("refuses an owner that is not a valid inbox session id", async () => {
+    const { store } = await openStore("headroom-timer-bad-owner-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      for (const bad of ["has spaces", "slash/in/it", "../escape", ".", "..", "a".repeat(65)]) {
+        expect(() => store.setTimer(bad, "wake", now.toISOString(), "check", "notify", now)).toThrow(/valid inbox session id/);
+      }
+      expect(store.timers()).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
+  // P2 fix: an oversized action was previously stored and then
+  // failed inbox delivery forever (sendInboxMessage's own size cap, applied
+  // only once fireDueTimers tries to deliver it). setTimer now rejects it
+  // up front, computing the exact envelope fireDueTimers will build.
+  it("refuses an action too large for the serialized envelope to ever be delivered", async () => {
+    const { store } = await openStore("headroom-timer-oversized-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      const huge = "x".repeat(70 * 1024); // comfortably over the 64 KiB inbox cap
+      expect(() => store.setTimer("orch-big", "wake", now.toISOString(), huge, "notify", now)).toThrow(/too large to ever be delivered/);
+      expect(store.timers()).toHaveLength(0);
+      // Just under the cap still succeeds -- this is a size check, not a
+      // blanket refusal of long actions.
+      const fits = "x".repeat(1024);
+      expect(() => store.setTimer("orch-big", "wake", now.toISOString(), fits, "notify", now)).not.toThrow();
+    } finally { store.close(); }
+  });
+
+  it("a fresh timer starts at zero delivery attempts, never failed", async () => {
+    const { store } = await openStore("headroom-timer-fresh-attempts-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      const timer = store.setTimer("orch-j", "wake", now.toISOString(), "check", "notify", now);
+      expect(timer.attempts).toBe(0);
+      expect(timer.failed_at).toBeNull();
+    } finally { store.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// store.ts: unclaimTimer's bounded retry (P2 fix) -- an
+// undeliverable timer stops being offered by dueTimers()/timers() once it
+// has failed MAX_TIMER_DELIVERY_ATTEMPTS times, instead of being retried on
+// every maintenance pass forever.
+// ---------------------------------------------------------------------------
+
+describe("unclaimTimer bounded retry", () => {
+  it("releases the claim for retry below the attempt limit, and permanently fails it at the limit", async () => {
+    const { store } = await openStore("headroom-timer-bounded-retry-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-k", "wake", at.toISOString(), "check", "notify", at);
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt < maxAttempts; attempt += 1) {
+        const claimed = store.claimTimer("orch-k", "wake", at)!;
+        expect(claimed).toBeDefined();
+        const outcome = store.unclaimTimer("orch-k", "wake", claimed.fired_at!, at, maxAttempts);
+        expect(outcome).toEqual({ attempts: attempt, permanentlyFailed: false });
+        // Retryable again: dueTimers()/timers() still see it as pending.
+        expect(store.dueTimers(at)).toHaveLength(1);
+        expect(store.timers("orch-k")).toHaveLength(1);
+      }
+      // The attempt that reaches the limit gives up for good.
+      const finalClaim = store.claimTimer("orch-k", "wake", at)!;
+      const finalOutcome = store.unclaimTimer("orch-k", "wake", finalClaim.fired_at!, at, maxAttempts);
+      expect(finalOutcome).toEqual({ attempts: maxAttempts, permanentlyFailed: true });
+      // No longer offered for delivery or listed as pending -- but not
+      // deleted either (findable by a direct row read, if ever needed).
+      expect(store.dueTimers(at)).toHaveLength(0);
+      expect(store.timers("orch-k")).toHaveLength(0);
+      expect(store.claimTimer("orch-k", "wake", at)).toBeUndefined();
+    } finally { store.close(); }
+  });
+
+  it("returns undefined when the claim it was given no longer matches (already cleared or reclaimed)", async () => {
+    const { store } = await openStore("headroom-timer-stale-unclaim-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-l", "wake", at.toISOString(), "check", "notify", at);
+      const claimed = store.claimTimer("orch-l", "wake", at)!;
+      store.clearTimer("orch-l", "wake");
+      expect(store.unclaimTimer("orch-l", "wake", claimed.fired_at!, at)).toBeUndefined();
+    } finally { store.close(); }
+  });
+
+  it("re-setting a permanently-failed timer clears failed_at/attempts and makes it deliverable again", async () => {
+    const { store } = await openStore("headroom-timer-reset-after-fail-");
+    try {
+      const at = new Date("2026-09-28T12:00:00.000Z");
+      store.setTimer("orch-m", "wake", at.toISOString(), "check", "notify", at);
+      const claimed = store.claimTimer("orch-m", "wake", at)!;
+      const outcome = store.unclaimTimer("orch-m", "wake", claimed.fired_at!, at, 1);
+      expect(outcome).toEqual({ attempts: 1, permanentlyFailed: true });
+      expect(store.timers("orch-m")).toHaveLength(0);
+      const reset = store.setTimer("orch-m", "wake", new Date(at.getTime() + 60_000).toISOString(), "check again", "notify", at);
+      expect(reset).toMatchObject({ attempts: 0, failed_at: null });
+      expect(store.timers("orch-m")).toHaveLength(1);
+    } finally { store.close(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// store.ts: nextMaintenanceDeadline -- what daemon.ts's independent
+// maintenance timer (scheduleMaintenance) reschedules itself around.
+// ---------------------------------------------------------------------------
+
+describe("nextMaintenanceDeadline", () => {
+  it("returns undefined with no pending timer and no live heartbeat", async () => {
+    const { store } = await openStore("headroom-deadline-empty-");
+    try { expect(store.nextMaintenanceDeadline(new Date())).toBeUndefined(); } finally { store.close(); }
+  });
+
+  it("picks the soonest pending timer's `at` over a later heartbeat lapse deadline", async () => {
+    const { store } = await openStore("headroom-deadline-timer-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      // Lapses at 12:10 (2x a 5-minute interval), later than the timer.
+      store.heartbeatBeat("orch-g", 5 * 60_000, undefined, now);
+      const timerAt = new Date("2026-09-28T12:03:00.000Z");
+      store.setTimer("orch-g", "wake", timerAt.toISOString(), "check", "notify", now);
+      expect(store.nextMaintenanceDeadline(now)).toEqual(timerAt);
+    } finally { store.close(); }
+  });
+
+  it("picks the soonest heartbeat lapse deadline over a later pending timer", async () => {
+    const { store } = await openStore("headroom-deadline-heartbeat-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      // Lapses at 12:00:20 (2x a 10-second interval).
+      store.heartbeatBeat("orch-h", 10_000, undefined, now);
+      store.setTimer("orch-h", "wake", new Date("2026-09-28T13:00:00.000Z").toISOString(), "check", "notify", now);
+      expect(store.nextMaintenanceDeadline(now)).toEqual(new Date(now.getTime() + 20_000));
+    } finally { store.close(); }
+  });
+
+  it("ignores an already-lapsed heartbeat and a fired/cleared timer", async () => {
+    const { store } = await openStore("headroom-deadline-ignore-");
+    try {
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      store.heartbeatBeat("orch-i", 1_000, undefined, new Date(now.getTime() - 10_000));
+      store.checkHeartbeatLapses(now); // marks orch-i lapsed_since
+      store.setTimer("orch-i", "wake", new Date(now.getTime() - 1_000).toISOString(), "check", "notify", now);
+      store.clearTimer("orch-i", "wake");
+      expect(store.nextMaintenanceDeadline(now)).toBeUndefined();
     } finally { store.close(); }
   });
 });
@@ -283,6 +435,44 @@ describe("fireDueTimers", () => {
       expect(retryPass).toBe(1);
       expect(store.timers("orch-retry")).toHaveLength(0);
       expect((await readInbox({ session: "orch-retry", home, markRead: false })).messages).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  // P2 fix: a timer whose delivery NEVER succeeds (an invalid
+  // owner that slipped past setTimer's own validation via an older row, or
+  // any other permanent inbox failure) used to be un-claimed and retried on
+  // every single maintenance pass forever. It now stops being offered after
+  // MAX_TIMER_DELIVERY_ATTEMPTS failed passes, with a logged reason.
+  it("gives up on a timer whose delivery always fails after MAX_TIMER_DELIVERY_ATTEMPTS passes, and logs why", async () => {
+    const { store, home } = await openStore("headroom-firedue-permanent-fail-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-doomed", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+      const alwaysFailingSend: typeof sendInboxMessage = async () => { throw new Error("simulated permanent inbox failure"); };
+      const logged: string[] = [];
+      const log = async (message: string) => { logged.push(message); };
+
+      for (let pass = 1; pass < MAX_TIMER_DELIVERY_ATTEMPTS; pass += 1) {
+        const fired = await fireDueTimers(store, home, at, log, alwaysFailingSend);
+        expect(fired).toBe(0);
+        expect(store.timers("orch-doomed")).toHaveLength(1); // still pending, still retryable
+      }
+      expect(logged.at(-1)).toMatch(/failed to deliver \(attempt \d+\)/);
+
+      // The pass that reaches the limit gives up for good.
+      const finalPass = await fireDueTimers(store, home, at, log, alwaysFailingSend);
+      expect(finalPass).toBe(0);
+      expect(logged.at(-1)).toMatch(/permanently failed after \d+ delivery attempts, giving up/);
+      expect(store.timers("orch-doomed")).toHaveLength(0);
+      expect(store.dueTimers(new Date(at.getTime() + 3_600_000))).toHaveLength(0);
+
+      // No further pass ever tries to deliver it again, however far past
+      // `at` the clock runs.
+      const sendCalls: string[] = [];
+      const countingSend: typeof sendInboxMessage = async (options) => { sendCalls.push(options.to); throw new Error("would still fail if tried"); };
+      await fireDueTimers(store, home, new Date(at.getTime() + 3_600_000), log, countingSend);
+      expect(sendCalls).toHaveLength(0);
+      expect((await readInbox({ session: "orch-doomed", home, markRead: false })).messages).toHaveLength(0);
     } finally { store.close(); }
   });
 

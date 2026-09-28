@@ -143,6 +143,20 @@ export async function assertSafeReadableDirectory(dir: string): Promise<void> {
  * quoted in the security review. */
 export const SAFE_READ_MAX_BYTES = 64 * 1024;
 
+/** The character-class rule inbox.ts's own `assertSessionId` applies to a
+ * session id (one path segment, no separators, no drive letters, no percent
+ * escapes), hosted here rather than in inbox.ts so a module with no
+ * business reading a session's messages -- store.ts's timer owner
+ * validation, since a timer's owner is always an inbox delivery target --
+ * can enforce the identical rule without importing inbox.ts, which itself
+ * imports from store.ts (a cycle). */
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** `.` and `..` satisfy SESSION_ID_PATTERN's character class but are
+ * directory references, not names -- refused by every session-id validator
+ * that shares this rule (see SESSION_ID_PATTERN's own doc comment). */
+export function isReservedSessionId(value: string): boolean { return value === "." || value === ".."; }
+
 /** Reads `path` only after an lstat proves it is a regular file, not a
  * symlink, FIFO, or device -- and refuses it outright if it is already
  * larger than `maxBytes`, before ever opening a descriptor. A second check on

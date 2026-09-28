@@ -48,6 +48,13 @@ const MAX_CONCURRENT_CONNECTIONS = 64;
 // even though the inactivity timer keeps resetting on every byte it sends.
 const MAX_RPC_RESPONSE_BYTES = 256 * 1024;
 const RPC_ABSOLUTE_DEADLINE_MS = 10_000;
+/** Bounds for the daemon-owned maintenance timer (scheduleMaintenance): never
+ * sleeps past a minute even with nothing registered yet, and never re-arms
+ * faster than once a second even when a deadline just passed, so a stuck
+ * clock or a deadline computed slightly in the past cannot turn this into a
+ * hot loop. */
+const MAINTENANCE_MAX_DELAY_MS = 60_000;
+const MAINTENANCE_MIN_DELAY_MS = 1_000;
 
 function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 
@@ -184,6 +191,10 @@ export class HeadroomDaemon {
    * on their own, but this avoids the wasted duplicate `dueTimers()` scan
    * and log noise a second pass would otherwise produce. */
   private timerFiringInFlight: Promise<number> | undefined;
+  /** The single live handle for scheduleMaintenance()'s self-re-arming
+   * timer; cleared in stop() so a pending tick never fires (or reschedules)
+   * after shutdown. */
+  private maintenanceTimer: NodeJS.Timeout | undefined;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
 
@@ -227,6 +238,11 @@ export class HeadroomDaemon {
     catch (error) { void appendDaemonLog(`antigravity startup: ${safeError(error)}`, this.home); }
     await this.schedulePrincipals();
     this.schedulingStarted = true;
+    // Independent of account polling above -- see scheduleMaintenance's own
+    // doc comment for why heartbeat lapse checks and timer firing cannot
+    // wait on it. Not awaited: startup must not block on delivering
+    // whatever timers or lapses are already due.
+    void this.scheduleMaintenance().catch((error: unknown) => appendDaemonLog(`maintenance scheduler failed: ${safeError(error)}`, this.home));
   }
 
   /** Best-effort; a failed sweep never blocks the daemon from starting its
@@ -263,6 +279,8 @@ export class HeadroomDaemon {
     this.stopping = true;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
+    if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
+    this.maintenanceTimer = undefined;
     await this.keepalive?.stop();
     await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
     this.store.close();
@@ -816,40 +834,101 @@ export class HeadroomDaemon {
     }
   }
 
+  /**
+   * Heartbeat lapse detection and due-timer firing, throttled to at most once
+   * every 15s (`claimDaemonInterval`'s own atomic claim serializes this
+   * across every caller, so a burst of RPCs racing the independent
+   * maintenance scheduler below never turns this into a hot loop or a
+   * double-fire). Called from two independent places: the top of every
+   * poll() -- an owner may register a heartbeat with zero accounts
+   * configured, so a vendor poll must never be a prerequisite -- and
+   * scheduleMaintenance()'s own timer, which runs regardless of whether any
+   * account is enabled at all and is what actually guarantees this runs
+   * promptly even when poll() itself is never reached (see that method's own
+   * doc comment).
+   */
+  private async runMaintenancePass(now: Date): Promise<void> {
+    if (!this.store.claimDaemonInterval("heartbeat_timer_check", now, 15_000)) return;
+    // Never let a defect here (or an unexpected throw from store access)
+    // abort the vendor poll this call is about to make: this whole block
+    // is best-effort background bookkeeping, not something a caller
+    // waiting on capacity should ever fail behind.
+    try { this.store.checkHeartbeatLapses(now); }
+    catch (error) { void appendDaemonLog(`heartbeat lapse check failed: ${safeError(error)}`, this.home); }
+    // Single-flight: a slow inbox write can outlast this 15s throttle, and
+    // starting a second pass while the first is still running would let
+    // both see the same due timer as a candidate. store.claimTimer's own
+    // per-timer atomicity already makes that safe (only one claim can
+    // succeed), but skipping the second pass entirely avoids the wasted
+    // work and duplicate log lines it would otherwise produce.
+    if (!this.timerFiringInFlight) {
+      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now)
+        .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
+        .finally(() => { this.timerFiringInFlight = undefined; });
+    }
+    // A dedicated notification pass follows immediately: the vendor-poll
+    // notify pass in poll() below only runs once the poller itself actually
+    // executes (see the early-return branches just below this call site in
+    // poll()), which a heartbeat_lapsed or timer_missed event must never
+    // have to wait on.
+    void deliverNotifications(this.store, { home: this.home })
+      .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
+  }
+
+  /**
+   * The daemon-owned maintenance timer: heartbeat lapse checks, timer firing
+   * and the notifier pass must not depend on account polling -- with zero
+   * enabled accounts, poll() is never reached at all, and even
+   * with accounts enabled a due timer could wait a full poll interval,
+   * 4-6 minutes at the default cadence). Runs a pass immediately, then
+   * reschedules itself around the next real deadline: the soonest pending
+   * timer's `at`, or the soonest still-live heartbeat's own lapse instant
+   * (`store.nextMaintenanceDeadline`), clamped to [MAINTENANCE_MIN_DELAY_MS,
+   * MAINTENANCE_MAX_DELAY_MS] so it neither busy-loops on a deadline that
+   * just passed nor sleeps past a minute even with nothing registered yet (a
+   * `timer_set` or `heartbeat_beat` racing in right after this tick must
+   * still be picked up within that ceiling). Single-flight and self
+   * re-arming: only one of these timers is ever live at a time (the old one
+   * is always cleared, in `stop()` or implicitly by firing), and the actual
+   * work is unref'd so it never by itself keeps the process alive.
+   */
+  private async scheduleMaintenance(): Promise<void> {
+    if (this.stopping) return;
+    // A defect here must re-arm the next tick on the default cadence rather
+    // than killing this self-re-arming loop outright -- unlike poll()'s own
+    // fire-and-forget call to runMaintenancePass (which simply logs and lets
+    // the next scheduled poll try again), this timer is the only thing that
+    // still runs when no account is enabled at all, so it must never die
+    // silently.
+    let delay = MAINTENANCE_MAX_DELAY_MS;
+    try {
+      await this.runMaintenancePass(new Date());
+      // Wait for whichever timer-firing pass is in flight (this call's own,
+      // or one a concurrent poll() already started) so the deadline read
+      // just below reflects timers that pass just fired, not ones still
+      // mid-claim.
+      if (this.timerFiringInFlight) await this.timerFiringInFlight.catch(() => 0);
+      const now = Date.now();
+      const deadline = this.store.nextMaintenanceDeadline(new Date(now));
+      const untilDeadline = deadline ? deadline.getTime() - now : MAINTENANCE_MAX_DELAY_MS;
+      delay = Math.min(MAINTENANCE_MAX_DELAY_MS, Math.max(MAINTENANCE_MIN_DELAY_MS, untilDeadline));
+    } catch (error) {
+      void appendDaemonLog(`maintenance pass failed: ${safeError(error)}`, this.home);
+    }
+    if (this.stopping) return;
+    const timer = setTimeout(() => { void this.scheduleMaintenance(); }, delay);
+    timer.unref();
+    this.maintenanceTimer = timer;
+  }
+
   private async poll(principal: string | undefined, forced: boolean): Promise<PollResult | { rate_limited: true }> {
     const key = principal ?? "all";
     const now = Date.now();
-    // Heartbeat lapse detection and due-timer firing are independent of any
-    // vendor poll -- an owner may register a heartbeat with zero accounts
-    // configured at all -- so they run here, at the top of every poll() call
-    // (itself reached on every scheduled tick and every capacity-checking
-    // RPC), throttled to at most once every 15s so a burst of RPCs from a
-    // busy orchestrator does not turn this into a hot loop. A dedicated
-    // notification pass follows immediately: the vendor-poll notify pass
-    // below only runs once the poller itself actually executes (see the
-    // early-return branches just below this), which a heartbeat_lapsed or
-    // timer_missed event must never have to wait on.
-    if (this.store.claimDaemonInterval("heartbeat_timer_check", new Date(now), 15_000)) {
-      // Never let a defect here (or an unexpected throw from store access)
-      // abort the vendor poll this call is about to make: this whole block
-      // is best-effort background bookkeeping, not something a caller
-      // waiting on capacity should ever fail behind.
-      try { this.store.checkHeartbeatLapses(new Date(now)); }
-      catch (error) { void appendDaemonLog(`heartbeat lapse check failed: ${safeError(error)}`, this.home); }
-      // Single-flight: a slow inbox write can outlast this 15s throttle, and
-      // starting a second pass while the first is still running would let
-      // both see the same due timer as a candidate. store.claimTimer's own
-      // per-timer atomicity already makes that safe (only one claim can
-      // succeed), but skipping the second pass entirely avoids the wasted
-      // work and duplicate log lines it would otherwise produce.
-      if (!this.timerFiringInFlight) {
-        this.timerFiringInFlight = fireDueTimers(this.store, this.home, new Date(now))
-          .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
-          .finally(() => { this.timerFiringInFlight = undefined; });
-      }
-      void deliverNotifications(this.store, { home: this.home })
-        .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
-    }
+    // See runMaintenancePass's own doc comment: this call and the
+    // independent maintenance timer both funnel through the same
+    // claimDaemonInterval-guarded pass, so racing the two is safe.
+    void this.runMaintenancePass(new Date(now))
+      .catch((error: unknown) => appendDaemonLog(`maintenance pass failed: ${safeError(error)}`, this.home));
     const policy = await readPolicy(); // mtime/reload safe: no cached config survives a request or SIGHUP.
     // Settings can enable notifications without restarting the daemon. Take
     // the history boundary before this poll creates its first eligible event.

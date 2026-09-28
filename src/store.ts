@@ -12,8 +12,8 @@ import { defaultPolicy, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
-import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion } from "./migrations.js";
-import { redact } from "./security.js";
+import { CURRENT_SCHEMA_VERSION, HEARTBEATS_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion, TIMER_DELIVERY_SCHEMA_VERSION } from "./migrations.js";
+import { isReservedSessionId, redact, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
 import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
 /** Applies redact() to every string leaf of a value, so a metadata object
@@ -29,6 +29,15 @@ export const SPEND_LEDGER_RETENTION_DAYS = 30;
  * fill's `notices` all share this one window, so a human and an
  * orchestrator agree on how long "recent" means. */
 export const UNSCHEDULED_RESET_HOURS = 24;
+
+/** How many delivery attempts a timer gets (src/heartbeat.ts's fireDueTimers,
+ * via store.ts's claimTimer/unclaimTimer) before it is marked permanently
+ * failed instead of retried on every future maintenance pass forever. An
+ * undeliverable timer is almost always a static defect (an owner whose
+ * inbox directory can never be created, a filesystem permission problem) --
+ * a handful of tries make sure a merely transient failure still gets
+ * delivered, without turning a permanent one into an unbounded retry loop. */
+export const MAX_TIMER_DELIVERY_ATTEMPTS = 5;
 
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
  * than ordinary noise: a drop to zero, or a fall past half of what it was.
@@ -243,7 +252,7 @@ function heartbeatFromRow(row: Row): Heartbeat {
 }
 
 function timerFromRow(row: Row): Timer {
-  return { owner: String(row.owner), name: String(row.name), at: String(row.at), action: String(row.action), if_missed: row.if_missed === "drop" ? "drop" : "notify", created_at: String(row.created_at), fired_at: string(row.fired_at), cleared_at: string(row.cleared_at) };
+  return { owner: String(row.owner), name: String(row.name), at: String(row.at), action: String(row.action), if_missed: row.if_missed === "drop" ? "drop" : "notify", created_at: String(row.created_at), fired_at: string(row.fired_at), cleared_at: string(row.cleared_at), attempts: typeof row.attempts === "number" ? row.attempts : 0, failed_at: string(row.failed_at) };
 }
 
 const ATOMIC_LEASE_GROUP_PREFIX = "headroom:atomic:";
@@ -2149,6 +2158,26 @@ export class HeadroomStore {
    * holds both.
    * -------------------------------------------------------------------- */
 
+  /** True once this connection's own schema includes the heartbeats/timers
+   * tables. `open()` always migrates up first, so this is only ever false on
+   * a read-only, non-migrating connection (`openReadOnly()`) against a
+   * database a pre-0.2.0 daemon wrote and nothing has migrated since --
+   * queried by `heartbeats()`/`timers()` below so the cached-status path
+   * (mcp.ts's `cacheStatus`, cli.ts's `observe()`) reads that compatibility
+   * gap as "none registered" instead of throwing "no such table". */
+  private hasHeartbeatSchema(): boolean {
+    return this.schemaVersion() >= HEARTBEATS_SCHEMA_VERSION;
+  }
+
+  /** True once this connection's own schema also has `timers.attempts`/
+   * `timers.failed_at` (see TIMER_DELIVERY_SCHEMA_VERSION's own doc comment
+   * in migrations.ts) -- `timers()` below queries `failed_at`, so it needs
+   * this stricter check, not just hasHeartbeatSchema()'s table-existence
+   * one. */
+  private hasTimerDeliverySchema(): boolean {
+    return this.schemaVersion() >= TIMER_DELIVERY_SCHEMA_VERSION;
+  }
+
   private addHeartbeatEvent(kind: Extract<EventKind, "heartbeat_lapsed" | "heartbeat_restored">, heartbeat: Heartbeat, at: string): void {
     const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: heartbeat.owner, interval_ms: heartbeat.interval_ms, last_beat_at: heartbeat.last_beat_at, ...(kind === "heartbeat_lapsed" ? { resume_sentence: heartbeat.resume_sentence } : {}) };
     // Deterministic on (kind, owner, the beat instant the lapse/restore is
@@ -2201,8 +2230,11 @@ export class HeadroomStore {
     return true;
   }
 
-  /** Every registered heartbeat, most recently updated first. */
+  /** Every registered heartbeat, most recently updated first. Reads as empty
+   * on a pre-migration-4 schema (see hasHeartbeatSchema()) rather than
+   * throwing "no such table". */
   heartbeats(): Heartbeat[] {
+    if (!this.hasHeartbeatSchema()) return [];
     return this.db.prepare("SELECT * FROM heartbeats ORDER BY updated_at DESC").all().map(heartbeatFromRow);
   }
 
@@ -2246,31 +2278,51 @@ export class HeadroomStore {
 
   /** Registers (or replaces, by the same owner+name) one named wake-up. A
    * timer already fired or cleared under this owner+name is simply replaced
-   * by the new one, same as re-registering any other schedule. */
+   * by the new one, same as re-registering any other schedule (attempts and
+   * failed_at reset too, so a re-set timer always gets a fresh delivery
+   * budget). `owner` must be a valid inbox session id (the same
+   * SESSION_ID_PATTERN rule inbox.ts's own assertSessionId enforces) since a
+   * timer is always delivered there -- refused up front rather than stored
+   * and left to fail every delivery attempt forever. Likewise, the exact
+   * `{ timer, at, action }` envelope src/heartbeat.ts's fireDueTimers will
+   * build for delivery must already fit under the inbox's own per-message
+   * byte cap, checked here before the row is ever written rather than
+   * discovered only once delivery itself starts failing. */
   setTimer(owner: string, name: string, at: string, action: string, ifMissed: "notify" | "drop", now = new Date()): Timer {
     const trimmedOwner = owner.trim();
     const trimmedName = name.trim();
     if (!trimmedOwner || !trimmedName) throw new Error("owner and name are required");
+    if (!SESSION_ID_PATTERN.test(trimmedOwner) || isReservedSessionId(trimmedOwner)) throw new Error("owner must be a valid inbox session id: 1 to 64 characters of A-Z a-z 0-9 . _ - (not a bare . or ..), since a timer is delivered there");
     if (!action.trim()) throw new Error("action is required");
     if (!Number.isFinite(Date.parse(at))) throw new Error("at must be a valid ISO instant");
+    const isoAt = new Date(at).toISOString();
+    const envelopeBytes = Buffer.byteLength(JSON.stringify({ timer: trimmedName, at: isoAt, action }), "utf8");
+    if (envelopeBytes > SAFE_READ_MAX_BYTES) throw new Error(`timer action is too large to ever be delivered: the serialized inbox envelope would be ${envelopeBytes} bytes, over the ${SAFE_READ_MAX_BYTES} byte cap`);
     const createdAt = now.toISOString();
-    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at) VALUES (?,?,?,?,?,?,NULL,NULL)
-      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL`)
-      .run(trimmedOwner, trimmedName, new Date(at).toISOString(), action, ifMissed, createdAt);
+    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at,attempts,failed_at) VALUES (?,?,?,?,?,?,NULL,NULL,0,NULL)
+      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL, attempts = 0, failed_at = NULL`)
+      .run(trimmedOwner, trimmedName, isoAt, action, ifMissed, createdAt);
     return timerFromRow(this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(trimmedOwner, trimmedName)!);
   }
 
-  /** Pending timers (never fired, never cleared) for one owner, or every
-   * owner's when omitted, soonest due first. */
+  /** Pending timers (never fired, never cleared, never given up on) for one
+   * owner, or every owner's when omitted, soonest due first. Reads as empty
+   * on a database older than TIMER_DELIVERY_SCHEMA_VERSION (see
+   * hasTimerDeliverySchema()) rather than throwing "no such table" or "no
+   * such column". */
   timers(owner?: string): Timer[] {
-    const filter = owner ? "WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL" : "WHERE fired_at IS NULL AND cleared_at IS NULL";
+    if (!this.hasTimerDeliverySchema()) return [];
+    const filter = owner ? "WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL" : "WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL";
     return this.db.prepare(`SELECT * FROM timers ${filter} ORDER BY at ASC`).all(...(owner ? [owner] : [])).map(timerFromRow);
   }
 
   /** Pending timers at or past `now`, oldest due first -- the daemon's own
-   * per-poll firing query. */
+   * per-poll firing query. A timer `unclaimTimer` has already given up on
+   * (`failed_at` set, MAX_TIMER_DELIVERY_ATTEMPTS reached) is excluded, same
+   * as an already-fired or already-cleared one: it is never a candidate for
+   * another delivery attempt. */
   dueTimers(now = new Date()): Timer[] {
-    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND at <= ? ORDER BY at ASC").all(now.toISOString()).map(timerFromRow);
+    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL AND at <= ? ORDER BY at ASC").all(now.toISOString()).map(timerFromRow);
   }
 
   /**
@@ -2293,21 +2345,37 @@ export class HeadroomStore {
    */
   claimTimer(owner: string, name: string, now = new Date()): Timer | undefined {
     const at = now.toISOString();
-    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL").get(owner, name);
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL").get(owner, name);
     if (!row) return undefined;
-    this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL").run(at, owner, name);
+    this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL AND failed_at IS NULL").run(at, owner, name);
     const timer = { ...timerFromRow(row), fired_at: at };
     if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, at);
     return timer;
   }
 
   /** Releases a claim a delivery attempt could not honor (the inbox write
-   * failed), so a later firing pass sees this timer as pending again. Only
-   * releases the exact claim it was given (`fired_at` must still equal
-   * `claimedFiredAt`): a timer independently cleared, or reclaimed by a
-   * different pass in between, is never clobbered by a stale release. */
-  unclaimTimer(owner: string, name: string, claimedFiredAt: string): void {
-    this.db.prepare("UPDATE timers SET fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ?").run(owner, name, claimedFiredAt);
+   * failed), so a later firing pass sees this timer as pending again --
+   * bounded: this also bumps `attempts`, and once it reaches
+   * `maxAttempts` the claim is never released at all. `failed_at` is set
+   * instead, permanently excluding the row from `dueTimers`/`timers`/
+   * `nextMaintenanceDeadline` (never a delete -- same reasoning as
+   * `fired_at`/`cleared_at`, the row and its now-known reason stay
+   * inspectable). Only ever acts on the exact claim it was given (`fired_at`
+   * must still equal `claimedFiredAt`): a timer independently cleared, or
+   * reclaimed by a different pass in between, is never clobbered by a stale
+   * release. Returns `undefined` when that guard did not match (nothing to
+   * update), otherwise the attempt count just recorded and whether this call
+   * is what gave up on it for good. */
+  unclaimTimer(owner: string, name: string, claimedFiredAt: string, now = new Date(), maxAttempts = MAX_TIMER_DELIVERY_ATTEMPTS): { attempts: number; permanentlyFailed: boolean } | undefined {
+    const row = this.db.prepare("SELECT attempts FROM timers WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").get(owner, name, claimedFiredAt) as { attempts: number } | undefined;
+    if (!row) return undefined;
+    const attempts = row.attempts + 1;
+    if (attempts >= maxAttempts) {
+      this.db.prepare("UPDATE timers SET attempts = ?, failed_at = ? WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").run(attempts, now.toISOString(), owner, name, claimedFiredAt);
+      return { attempts, permanentlyFailed: true };
+    }
+    this.db.prepare("UPDATE timers SET attempts = ?, fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ? AND cleared_at IS NULL").run(attempts, owner, name, claimedFiredAt);
+    return { attempts, permanentlyFailed: false };
   }
 
   /** Idempotent: clearing an already-cleared or already-fired timer is not
@@ -2318,6 +2386,28 @@ export class HeadroomStore {
     if (!row) return false;
     this.db.prepare("UPDATE timers SET cleared_at = ? WHERE owner = ? AND name = ? AND cleared_at IS NULL").run(now.toISOString(), owner, name);
     return true;
+  }
+
+  /**
+   * The earliest instant the daemon's own maintenance scheduler (daemon.ts's
+   * `scheduleMaintenance`) needs to wake up for: whichever comes first of the
+   * soonest pending timer's `at`, or the soonest still-live heartbeat's own
+   * lapse deadline (`last_beat_at + interval_ms * 2`, the same threshold
+   * `checkHeartbeatLapses` uses). `undefined` when neither a pending timer
+   * nor a non-lapsed heartbeat exists -- the scheduler falls back to its own
+   * capped default poll in that case rather than sleeping forever, since a
+   * `timer_set` or `heartbeat_beat` racing in right after this read must
+   * still be picked up promptly.
+   */
+  nextMaintenanceDeadline(now = new Date()): Date | undefined {
+    const soonestTimer = this.db.prepare("SELECT at FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND failed_at IS NULL ORDER BY at ASC LIMIT 1").get() as { at: string } | undefined;
+    let earliest = soonestTimer ? Date.parse(soonestTimer.at) : undefined;
+    for (const row of this.db.prepare("SELECT interval_ms, last_beat_at FROM heartbeats WHERE lapsed_since IS NULL").all() as { interval_ms: number; last_beat_at: string }[]) {
+      const deadline = Date.parse(row.last_beat_at) + row.interval_ms * 2;
+      if (!Number.isFinite(deadline)) continue;
+      if (earliest === undefined || deadline < earliest) earliest = deadline;
+    }
+    return earliest === undefined ? undefined : new Date(earliest);
   }
 
   private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {

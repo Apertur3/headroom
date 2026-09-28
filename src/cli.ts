@@ -544,7 +544,7 @@ async function heartbeat(argv: string[]): Promise<number> {
   const params = { owner, interval_ms: intervalMs, resume_sentence: resumeSentence };
   const request = await requestDaemon("heartbeat_beat", params);
   if (request !== undefined) { const item = unwrapRpc(request) as Heartbeat; console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; }
-  directReadNotice();
+  undeliveredWithoutDaemonWarning("heartbeat");
   const store = await HeadroomStore.open();
   try { const item = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); store.audit("cli", "heartbeat_beat", owner, "ok"); console.log(`beat ${item.owner} (every ${item.interval_ms}ms)`); return 0; } finally { store.close(); }
 }
@@ -582,7 +582,7 @@ async function timer(argv: string[]): Promise<number> {
     const params = { owner, name, at, action, if_missed: ifMissed };
     const request = await requestDaemon("timer_set", params);
     if (request !== undefined) { const item = unwrapRpc(request) as Timer; console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; }
-    directReadNotice();
+    undeliveredWithoutDaemonWarning("timer");
     const store = await HeadroomStore.open();
     try { const item = store.setTimer(owner, name, at, action, ifMissed, new Date()); store.audit("cli", "timer_set", `${owner}:${name}`, "ok"); console.log(`set ${item.owner}/${item.name} at ${item.at}`); return 0; } finally { store.close(); }
   }
@@ -1628,10 +1628,10 @@ export async function observe(argv: string[]): Promise<number> {
     // An older daemon may not answer these two methods with an array at all --
     // treated the same as "none", never a crash, like `leases` above.
     const heartbeatsRequest = await requestDaemon("heartbeats");
-    const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapRpc(heartbeatsRequest);
+    const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapAdditiveRpc(heartbeatsRequest);
     heartbeats = Array.isArray(unwrappedHeartbeats) ? unwrappedHeartbeats as Heartbeat[] : [];
     const timersRequest = await requestDaemon("timer_list");
-    const unwrappedTimers = timersRequest === undefined ? [] : unwrapRpc(timersRequest);
+    const unwrappedTimers = timersRequest === undefined ? [] : unwrapAdditiveRpc(timersRequest);
     const pendingTimers = Array.isArray(unwrappedTimers) ? unwrappedTimers as Timer[] : [];
     dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
   } else {
@@ -1713,6 +1713,25 @@ function unwrapRpc(value: unknown): unknown {
   return value;
 }
 
+/**
+ * `heartbeats` and `timer_list` are additive RPCs a pre-0.2.0 daemon has
+ * never heard of: it answers both with a plain JSON-RPC `-32601 Method not
+ * found`, which plain `unwrapRpc` (correctly) turns into a thrown error for
+ * every other RPC. For exactly these two optional, additive reads that would
+ * break `status`/`observe` against an otherwise perfectly healthy older
+ * daemon over nothing worse than "it predates this feature" -- so `-32601`
+ * here is treated the same as "no heartbeats/timers registered", an empty
+ * array, while every other error (a genuine handler failure, a different
+ * JSON-RPC code, anything else) still propagates exactly like unwrapRpc's
+ * own callers expect. */
+function unwrapAdditiveRpc(value: unknown): unknown {
+  if (value && typeof value === "object" && "jsonrpc" in value && "error" in value) {
+    const error = (value as { error?: { code?: unknown } }).error;
+    if (error && typeof error === "object" && error.code === -32601) return [];
+  }
+  return unwrapRpc(value);
+}
+
 function statusObservations(value: unknown): Observation[] {
   if (Array.isArray(value)) return value as Observation[]; // pre-#73 daemon
   if (value && typeof value === "object" && Array.isArray((value as { observations?: unknown }).observations)) return (value as { observations: Observation[] }).observations;
@@ -1759,6 +1778,16 @@ function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | 
 }
 
 function directReadNotice(): void { process.stderr.write("(direct read, no daemon)\n"); }
+
+/** `heartbeat` and `timer set` both write a row a daemon is meant to act on
+ * later (lapse-checking a heartbeat, firing a timer): with no daemon
+ * running, that row is stored but nothing will ever notice it lapse or come
+ * due until one starts. directReadNotice()'s generic "(direct read, no
+ * daemon)" does not say that, so these two writes get their own explicit
+ * warning instead of silently looking like they succeeded end to end. */
+function undeliveredWithoutDaemonWarning(kind: "heartbeat" | "timer"): void {
+  process.stderr.write(`(no daemon running -- this ${kind} is stored but nothing will ${kind === "heartbeat" ? "watch for a lapse" : "deliver it when due"} until a daemon starts)\n`);
+}
 
 function readStdinText(): Promise<string> {
   return new Promise((resolve, reject) => {

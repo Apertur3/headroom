@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Heartbeat lapse checks, timer firing, and the notifier pass now run on a daemon-owned maintenance
+  timer independent of account polling: with zero enabled accounts they previously never ran at all,
+  and even with accounts enabled a due timer could wait a full poll interval (4-6 minutes at the
+  default cadence). The new timer runs immediately on daemon start and reschedules itself around the
+  next real deadline (the soonest pending timer or heartbeat lapse instant), capped at 60s and never
+  below 1s, and is cleared on daemon stop. `headroom timer set` and `headroom heartbeat` now print an
+  explicit warning when writing directly with no daemon running, since nothing will deliver or watch
+  that row until one starts.
+- A 0.2.0 CLI or MCP client talking to a still-running 0.1.7 daemon no longer fails `status`/
+  `quota_status` outright: the additive `heartbeats`/`timer_list` RPCs an older daemon has never
+  heard of now answer with an empty list on a JSON-RPC `-32601 Method not found`, instead of
+  throwing and taking the whole status read down with them. Every other RPC error still propagates
+  unchanged.
+- MCP's cached (read-only) status path no longer fails with "no such table" when a database was
+  last written by a pre-0.2.0 daemon and has never since been opened for a write: `heartbeats()`/
+  `timers()` now schema-check before querying and read as "none registered" on an older schema,
+  matching the CLI's own cached fallback.
+- A timer with an invalid owner id or an action too large to ever fit in one inbox message was
+  previously stored successfully and then retried on every single maintenance pass forever, since
+  inbox delivery could never succeed. `headroom timer set` (CLI, MCP RPC, and the direct fallback)
+  now validates the owner against the inbox's own session-id rule and rejects an oversized action
+  before the timer is ever stored. A timer whose delivery keeps failing for any other reason is now
+  retried a bounded number of times before being marked permanently failed (with a logged reason)
+  instead of retried forever.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

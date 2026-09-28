@@ -73,8 +73,16 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
       });
       fired += 1;
     } catch (error) {
-      store.unclaimTimer(claimed.owner, claimed.name, claimed.fired_at!);
-      await log(`timer ${claimed.owner}/${claimed.name} failed to deliver: ${safeError(error)}`);
+      // Bounded retry (store.ts's own MAX_TIMER_DELIVERY_ATTEMPTS): past the
+      // limit, unclaimTimer sets failed_at instead of releasing the claim,
+      // so dueTimers() never offers this row again -- an undeliverable
+      // timer (an invalid owner, an oversized action) stops being retried on
+      // every future maintenance pass rather than forever.
+      const outcome = store.unclaimTimer(claimed.owner, claimed.name, claimed.fired_at!, now);
+      const reason = safeError(error);
+      await log(outcome?.permanentlyFailed
+        ? `timer ${claimed.owner}/${claimed.name} permanently failed after ${outcome.attempts} delivery attempts, giving up: ${reason}`
+        : `timer ${claimed.owner}/${claimed.name} failed to deliver (attempt ${outcome?.attempts ?? "?"}): ${reason}`);
     }
   }
   return fired;

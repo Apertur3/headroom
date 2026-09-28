@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,8 +7,27 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli.js";
 import { socketPath } from "../src/daemon.js";
 import { handleMcp } from "../src/mcp.js";
+import { HEARTBEATS_SCHEMA_VERSION } from "../src/migrations.js";
 import { HeadroomStore } from "../src/store.js";
 import { track, useProcessReaper } from "./helpers/mortal-process.js";
+
+const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlite") as {
+  DatabaseSync: new (path: string) => { exec(sql: string): void; close(): void };
+};
+
+/** Rolls a fully-migrated database file back to the schema shape a pre-0.2.0
+ * daemon left on disk: the `heartbeats`/`timers` tables (migration
+ * HEARTBEATS_SCHEMA_VERSION, ADD_HEARTBEATS_AND_TIMERS) dropped, and
+ * `PRAGMA user_version` set one below that migration -- exactly what
+ * `openReadOnly()`'s own doc comment describes as "a database a pre-0.2.0
+ * daemon wrote and nothing has migrated since". */
+function rollBackHeartbeatsSchema(root: string): void {
+  const db = new RawDatabase(join(root, "headroom.db"));
+  try {
+    db.exec("DROP TABLE IF EXISTS heartbeats; DROP TABLE IF EXISTS timers;");
+    db.exec(`PRAGMA user_version = ${HEARTBEATS_SCHEMA_VERSION - 1}`);
+  } finally { db.close(); }
+}
 
 /**
  * Part 2 (read-only cached fallback) and part 3 (never empty stdout on a
@@ -128,6 +148,35 @@ describe("cached read-only fallback against a genuinely unresponsive daemon", ()
     }
   }, 20_000);
 
+  // P2 fix: openReadOnly() never migrates, so a database a
+  // pre-0.2.0 daemon last wrote (no heartbeats/timers tables yet) hitting
+  // this exact cached path used to throw "no such table" instead of serving
+  // the rest of status with those two fields empty.
+  it.skipIf(process.platform === "win32")("`status --json` still succeeds from the cache on a pre-heartbeats-migration database", async () => {
+    const root = await tempRoot("cache-status-old-schema");
+    (await HeadroomStore.open(root)).close();
+    rollBackHeartbeatsSchema(root);
+    const fake = await startFakeUnresponsiveDaemon(root, 5_000);
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const code = await runCli(["--json"]);
+      expect(code).toBe(0);
+      const printed = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+      const payload = JSON.parse(printed) as Record<string, unknown>;
+      expect(payload.served_from).toBe("cache");
+      expect(payload.daemon).toBe("unresponsive");
+      expect(payload.heartbeats).toEqual([]);
+      expect(payload.due_timers).toEqual([]);
+    } finally {
+      logSpy.mockRestore(); errSpy.mockRestore();
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+      fake.stop();
+    }
+  }, 20_000);
+
   it.skipIf(process.platform === "win32")("`can --lease` (a dispatch path) still fails closed against the same unresponsive daemon", async () => {
     const root = await tempRoot("cache-lease-failclosed");
     await writeFile(join(root, "routing.toml"), '[consumes]\nreview = ["codex-main:main"]\n', { mode: 0o600 });
@@ -202,6 +251,29 @@ describe("MCP cached read-only fallback against a genuinely unresponsive daemon"
       expect(content.observations).toEqual([]);
       // CLI/MCP parity: quota_status's cache path carries these two
       // additive fields exactly like `headroom status --json` does.
+      expect(content.heartbeats).toEqual([]);
+      expect(content.due_timers).toEqual([]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+      fake.stop();
+    }
+  }, 20_000);
+
+  // P2 fix: src/mcp.ts's cacheStatus/heartbeatFields hit the
+  // same openReadOnly() connection as the CLI's cached path above, so a
+  // pre-heartbeats-migration database must not fail `quota_status` either.
+  it.skipIf(process.platform === "win32")("`quota_status` still succeeds from the cache on a pre-heartbeats-migration database", async () => {
+    const root = await tempRoot("mcp-cache-status-old-schema");
+    (await HeadroomStore.open(root)).close();
+    rollBackHeartbeatsSchema(root);
+    const fake = await startFakeUnresponsiveDaemon(root, 5_000);
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      const reply = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_status", arguments: {} } })) as { result: { structuredContent: Record<string, unknown> } };
+      const content = reply.result.structuredContent;
+      expect(content.source).toBe("cache");
+      expect(content.daemon).toBe("unresponsive");
       expect(content.heartbeats).toEqual([]);
       expect(content.due_timers).toEqual([]);
     } finally {
