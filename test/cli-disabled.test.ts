@@ -82,6 +82,30 @@ describe("disabled meter decisions", () => {
     expect(fill).toEqual(expect.objectContaining({ meter: "claude-2:all", error: expect.stringContaining("disabled"), notices: [] }));
   });
 
+  it("keeps disabled rows out of aggregate rate and credits, and refuses credit writes", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-cli-disabled-aggregate-")); temporary.push(home);
+    await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    try {
+      const now = new Date();
+      store.insert({ principal_id: "claude-2", meter_id: "claude-2:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: new Date(now.getTime() + 3_600_000).toISOString(), observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" });
+      store.recordManualCredits("claude-2", 1, new Date(now.getTime() + 86_400_000).toISOString());
+    } finally { store.close(); }
+    const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
+    const errors: string[] = []; const err = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(line); });
+    try {
+      await withHome(home, async () => {
+        expect(await main(["rate", "--json"])).toBe(0);
+        expect(await main(["credits", "--json"])).toBe(0);
+        expect(await runCli(["credits", "set", "--principal", "claude-2", "--available", "1", "--expires", "2026-10-01"])).toBe(1);
+        expect(await runCli(["credits", "clear", "--principal", "claude-2"])).toBe(1);
+      });
+    } finally { log.mockRestore(); err.mockRestore(); }
+    expect(JSON.parse(output[0])).toEqual([]);
+    expect(JSON.parse(output[1]).credits).toEqual([]);
+    expect(errors.join("\n")).toContain("principal claude-2 is disabled");
+  });
+
   it("keeps history readable for a disabled principal: it cannot create capacity", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-cli-disabled-history-")); temporary.push(home);
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });

@@ -34,7 +34,7 @@ import {
   modelsFromAvailableModels, postAvailableModels, readCredential, refreshCredential, resolveProjectId,
   secureRead as secureCredentialRead, type CodeAssistDependencies,
 } from "./adapters/google-code-assist.js";
-import type { ProviderAccount } from "./types.js";
+import { isAccountEnabled, type ProviderAccount } from "./types.js";
 import type { HeadroomStore } from "./store.js";
 
 export interface CatalogModel { id: string; name: string | null; }
@@ -175,6 +175,9 @@ async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabil
 export async function checkModelAvailability(store: HeadroomStore, accounts: readonly ProviderAccount[], dependencies: ModelAvailabilityDependencies = {}): Promise<void> {
   const now = dependencies.now?.() ?? new Date();
   for (const account of accounts) {
+    // This is the credential and cache-read boundary. Callers filter too,
+    // but this guard makes a parked principal safe even for a new caller.
+    if (!isAccountEnabled(account)) continue;
     if (account.vendor !== "codex" && account.vendor !== "claude" && account.vendor !== "antigravity") continue;
     const key = daemonStateKey(account.name);
     // Claim before the reader's first await. This is a BEGIN IMMEDIATE

@@ -61,6 +61,7 @@ describe("direct status model catalog check", () => {
         // A cold Windows runner can take well over vi.waitFor's 1 s default
         // just to open the store and poll; give it a realistic budget.
         await vi.waitFor(() => expect(mocks.checkModelAvailability).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
+        expect(mocks.checkModelAvailability).toHaveBeenCalledWith(expect.anything(), [account]);
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]).observations).toHaveLength(1);
         release?.();
@@ -73,6 +74,24 @@ describe("direct status model catalog check", () => {
         await running.catch(() => undefined);
         log.mockRestore();
       }
+    });
+  });
+
+  it("does not pass a disabled account to the direct-status catalog check", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-direct-catalog-disabled-"));
+    temporary.push(root);
+    const account: ProviderAccount = { name: "codex-parked", enabled: false, vendor: "codex", location: join(root, ".codex"), adapter: "native-ts" };
+    mocks.daemonRequest.mockResolvedValue({ status: "unavailable" });
+    mocks.readAccounts.mockResolvedValue([account]);
+    mocks.pollAccounts.mockResolvedValue({ observations: [], failures: [], claudeProbeOutcomes: {} });
+    mocks.checkModelAvailability.mockResolvedValue(undefined);
+
+    await withHeadroomHome(join(root, ".headroom"), async () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      try {
+        expect(await main(["--json"])).toBe(0);
+        expect(mocks.checkModelAvailability).not.toHaveBeenCalled();
+      } finally { log.mockRestore(); }
     });
   });
 });
