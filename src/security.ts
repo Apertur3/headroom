@@ -1,4 +1,4 @@
-import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { assertSafeAncestry } from "./paths.js";
@@ -182,12 +182,15 @@ export function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
 /**
  * Writes `data` into `path` atomically and never through a link: a uniquely
  * named temporary file is created (exclusively, so it cannot itself already
- * be a link) in the same directory with the requested mode, then renamed
+ * be a link) in the same directory with the requested `mode`, then renamed
  * into place. `rename()` replaces whatever directory entry currently sits at
  * `path` -- including a symlink -- without ever dereferencing it, but an
  * existing symlink at `path` is refused outright rather than silently
  * replaced, since a link there is itself a sign the destination is not what
- * Headroom last wrote.
+ * Headroom last wrote. The atomic-replace guarantee holds on every platform;
+ * `mode`'s POSIX permission bits are meaningless on Windows (`fs.open`
+ * accepts the argument there but the resulting file has no such bits to
+ * set), which has no directly equivalent per-file ACL this project sets.
  */
 export async function writeFileAtomic(path: string, data: string, mode: number): Promise<void> {
   try {
@@ -232,15 +235,59 @@ export async function writeExclusiveFile(path: string, data: string, mode: numbe
 const LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_TIMEOUT_MS = 5_000;
+/** Well inside staleMs, so a legitimately long-running holder's own refresh
+ * always lands before any waiter's staleness check could fire. */
+const LOCK_HEARTBEAT_DIVISOR = 3;
 
 export interface ExclusiveLockOptions {
-  /** A lock file older than this is assumed abandoned by a writer that
-   * crashed mid-edit (never one merely slow -- see LOCK_TIMEOUT_MS for the
-   * per-call wait) and is reclaimed rather than wedging every future edit
-   * forever. */
+  /** A lock whose own heartbeat (see below) has not refreshed it in this
+   * long is assumed abandoned by a writer that crashed or hung mid-edit --
+   * never one merely slow, since a live holder's heartbeat keeps refreshing
+   * it well within this window -- and is reclaimed rather than wedging
+   * every future edit forever. */
   staleMs?: number;
   retryMs?: number;
   timeoutMs?: number;
+}
+
+function lockErrorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+/** A random id (never just the pid, which a crashed-and-restarted process
+ * could reuse) identifying the one call that currently holds a given lock
+ * file. Written as the file's first line; read back before every reclaim
+ * decision and before release, so one holder's lock is never mistaken for,
+ * reclaimed as, or released in place of, another's. */
+function newLockToken(): string {
+  return `${process.pid}:${randomBytes(8).toString("hex")}`;
+}
+
+async function readLockToken(lockPath: string): Promise<string | undefined> {
+  try { return (await readFile(lockPath, "utf8")).split("\n", 1)[0]; }
+  catch (error: unknown) { if (lockErrorCode(error) === "ENOENT") return undefined; throw error; }
+}
+
+/** Creates (`flag: "wx"`, exclusive) or refreshes (`flag: "w"`, a heartbeat)
+ * the lock file with this holder's own token and the current time. On a
+ * failed create, cleans up any partially written file before rethrowing --
+ * a lock left behind by a failed write or close would otherwise wedge every
+ * future caller for a full staleMs with no live holder to blame it on. */
+async function writeLockPayload(lockPath: string, token: string, flag: "wx" | "w"): Promise<void> {
+  const handle = await open(lockPath, flag, 0o600);
+  try {
+    await handle.writeFile(`${token}\n${new Date().toISOString()}\n`, "utf8");
+  } catch (error) {
+    await handle.close().catch(() => {});
+    if (flag === "wx") await unlink(lockPath).catch(() => {});
+    throw error;
+  }
+  try {
+    await handle.close();
+  } catch (error) {
+    if (flag === "wx") await unlink(lockPath).catch(() => {});
+    throw error;
+  }
 }
 
 /**
@@ -251,30 +298,86 @@ export interface ExclusiveLockOptions {
  * "wx")` can ever succeed -- so a second writer never reads the same
  * pre-edit source a first writer already replaced, and the first writer's
  * edit is never silently erased by the second's rename.
+ *
+ * The lock carries an ownership token and a heartbeat (a timer that
+ * refreshes it every staleMs/3 while `fn` runs): staleness is judged by
+ * "has this lock's own heartbeat gone quiet", not merely "how old is it",
+ * so a genuinely long-running `fn` is never reclaimed out from under its
+ * holder. A stale lock is reclaimed by renaming it away first -- rename()
+ * on a given source path succeeds for at most one racing reclaimer, so at
+ * most one waiter ever deletes a given stale lock, never a fresh
+ * replacement another waiter (or the original holder's own late heartbeat)
+ * created a moment later -- and release only ever unlinks the lock file
+ * when it still carries this call's own token.
  */
 export async function withExclusiveLock<T>(lockPath: string, fn: () => Promise<T>, options: ExclusiveLockOptions = {}): Promise<T> {
   const staleMs = options.staleMs ?? LOCK_STALE_MS;
   const retryMs = options.retryMs ?? LOCK_RETRY_MS;
   const deadline = Date.now() + (options.timeoutMs ?? LOCK_TIMEOUT_MS);
+  const token = newLockToken();
+
   for (;;) {
     try {
-      const handle = await open(lockPath, "wx", 0o600);
-      try { await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8"); }
-      finally { await handle.close(); }
+      await writeLockPayload(lockPath, token, "wx");
       break;
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        const info = await lstat(lockPath);
-        if (Date.now() - info.mtimeMs > staleMs) { await unlink(lockPath).catch(() => {}); continue; }
-      } catch (statError: unknown) {
-        if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue; // released between our open() and lstat()
+      if (lockErrorCode(error) !== "EEXIST") throw error;
+      // Check the deadline before spending any more time on this attempt --
+      // a stuck reclaim (a denied delete, a busy directory) must fail
+      // closed once timeoutMs is up, never busy-loop past it.
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for a lock: ${lockPath}`);
+      let info;
+      try { info = await lstat(lockPath); }
+      catch (statError: unknown) {
+        if (lockErrorCode(statError) === "ENOENT") continue; // released between our open() and lstat(): retry the create right away
         throw statError;
       }
-      if (Date.now() > deadline) throw new Error(`Timed out waiting for a lock: ${lockPath}`);
+      if (Date.now() - info.mtimeMs > staleMs) {
+        const claimPath = `${lockPath}.stale-${randomBytes(4).toString("hex")}`;
+        try { await rename(lockPath, claimPath); }
+        catch (renameError: unknown) {
+          // Someone else's reclaim (or the real holder's own release) already
+          // moved or removed it first -- not our stale lock to delete, so
+          // retry the create rather than touching whatever is there now.
+          if (lockErrorCode(renameError) === "ENOENT") continue;
+          throw renameError;
+        }
+        await unlink(claimPath).catch(() => {});
+        continue; // the name is free; retry the exclusive create right away
+      }
+      // A live lock: back off before the next attempt, which re-checks the
+      // deadline at the top of the loop.
       await new Promise((resolve) => setTimeout(resolve, retryMs));
     }
   }
-  try { return await fn(); }
-  finally { await unlink(lockPath).catch(() => {}); }
+
+  // Capped at 1s (no need to refresh more often than that for the real
+  // default staleMs=30s) but never allowed to exceed staleMs/3 -- a small,
+  // test-configured staleMs must still get a heartbeat fast enough to beat
+  // it, or a live holder would be reclaimed out from under itself.
+  const heartbeatMs = Math.max(1, Math.min(1_000, Math.floor(staleMs / LOCK_HEARTBEAT_DIVISOR)));
+  const heartbeat = setInterval(() => {
+    void (async () => {
+      // Only ever refresh a lock still carrying this call's own token --
+      // never revive one a reclaimer has since taken over (which would
+      // silently steal it back out from under the new, legitimate holder).
+      const owner = await readLockToken(lockPath).catch(() => undefined);
+      if (owner !== token) { clearInterval(heartbeat); return; }
+      await writeLockPayload(lockPath, token, "w").catch(() => {}); // a missed refresh only risks reclaim; never fatal to fn() itself
+    })();
+  }, heartbeatMs);
+  heartbeat.unref?.();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(heartbeat);
+    const owner = await readLockToken(lockPath).catch(() => undefined);
+    if (owner === token) {
+      await unlink(lockPath).catch((error: unknown) => {
+        console.error(`headroom: failed to release lock ${lockPath}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    // else: reclaimed as stale while fn() ran -- it is no longer ours to
+    // release, and unlinking it now would delete whoever holds it next.
+  }
 }

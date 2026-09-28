@@ -283,10 +283,11 @@ be read at all, not because a known usage simply does not fit -- render it
 like an UNKNOWN reading, not a plain "no". `lanes_remaining_for_class` is
 present only with `--class`/`action_class` and a learned cost for it. The
 `allowance_basis`, `projected_percent`, and `cap_percent` fields are present
-together when an even-paced 5h gate used the explicit `fill` allowance: the
-projection is the usage expected at the selected lane horizon before the
-request, and the cap is the reserve-derived ceiling after any lower per-call
-cap. `notices`
+together when a 5h gate used the explicit `fill` allowance -- independently
+of `pacing`, which only ever governs the default `pro_rata` allowance's own
+pro-rata line and burst check: the projection is the usage expected at the
+selected lane horizon before the request, and the cap is the reserve-derived
+ceiling after any lower per-call cap. `notices`
 is one line per meter this call checked (`meters_checked`) with an
 unscheduled reset (issue #20) in the last 24 hours -- `["unscheduled reset on
 codex-main:main at 2026-09-08T01:24:26Z; capacity appeared, re-plan"]` --

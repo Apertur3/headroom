@@ -50,14 +50,20 @@ export interface Policy {
   reserve_meta: Record<string, ReserveEntry>;
   /** Keep one daemon-owned `agy` PTY alive for warm local Antigravity reads. */
   antigravity_keepalive: boolean;
-  /** "even" (default): `gate` enforces the pro-rata line and burst check for
-   * a 5h need, and `fill` only offers the window's full remaining points in
-   * its last 45 minutes (otherwise it offers the pro-rata allowance).
-   * "none": neither restriction applies -- gate falls back to the plain
-   * reserve/plan-line checks, and fill always offers the full remainder. */
+  /** "even" (default): under the default "pro_rata" allowance (see below),
+   * `gate` enforces the pro-rata line and burst check for a 5h need, and
+   * `fill` only offers the window's full remaining points in its last 45
+   * minutes (otherwise it offers the pro-rata allowance). "none": that
+   * pro-rata/burst restriction is dropped -- gate falls back to the plain
+   * reserve/plan-line checks, and fill always offers the full remainder.
+   * Either way, the explicit "fill" allowance below is unaffected by this
+   * setting: it always runs its own use-and-burn projection and can still
+   * refuse a request that crosses the cap, under "even" or "none" alike. */
   pacing: "even" | "none";
-  /** The even-pacing allowance basis. "pro_rata" preserves a planned share
-   * through the window; "fill" projects use to a lane's end so an explicit
+  /** The allowance basis for a 5h need. "pro_rata" (default) preserves a
+   * planned share through the window, subject to `pacing` above (a no-op
+   * under "none"). "fill" is opt-in and independent of `pacing`: it always
+   * projects current use and recent burn to a lane's end so an explicit
    * caller can spend a use-it-or-lose-it window without crossing its cap. */
   allowance: "pro_rata" | "fill";
   proxy?: string;

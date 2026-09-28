@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -132,6 +132,34 @@ describe("accounts.toml writes: atomic, 0600, symlink-safe", () => {
       await chmod(root, 0o700);
       expect(await readFile(accountsPath(), "utf8")).toBe(source);
       expect((await stat(accountsPath())).mode & 0o777).toBe(0o600);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  // Not skipped on Windows: this is about the atomic-replace guarantee
+  // itself (temp file + rename leaves the file either fully old or fully
+  // new content, never partial, and never a stray temp file behind), which
+  // writeFileAtomic's doc comment says holds on every platform -- only the
+  // POSIX mode-bit assertions above are platform-specific.
+  it("replaces accounts.toml's content atomically on every platform, leaving no partial state or stray temp file", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-atomic-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      await setAccountEnabled("claude-main", false);
+      expect(await readAccounts()).toEqual([expect.objectContaining({ name: "claude-main", enabled: false })]);
+
+      await writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "~/.claude", adapter: "native-ts" }, { name: "codex-main", vendor: "codex", location: "~/.codex", adapter: "native-ts" }]);
+      const afterDiscovery = await readAccounts();
+      expect(afterDiscovery.map((account) => account.name).sort()).toEqual(["claude-main", "codex-main"]);
+      // enabled: false survived the rediscovery, same guarantee
+      // writeDiscoveredAccounts already promises elsewhere in this file.
+      expect(afterDiscovery.find((account) => account.name === "claude-main")).toMatchObject({ enabled: false });
+
+      // No leftover `.accounts.toml.<hex>.tmp` from either write -- every
+      // successful writeFileAtomic call renamed its temp file into place,
+      // never left one behind.
+      const entries = await readdir(root);
+      expect(entries).toEqual(["accounts.toml"]);
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 });

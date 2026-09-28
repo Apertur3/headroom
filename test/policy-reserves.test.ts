@@ -413,7 +413,13 @@ describe("headroom policy CLI: concurrent-safe edits", () => {
       // serialization, both read it before either writes, and the second
       // writer's rename silently erases the first writer's edit -- exactly
       // the race described in review finding 10. Promise.all runs both
-      // main() calls genuinely concurrently within this one process.
+      // main() calls genuinely concurrently within this one process. This is
+      // an integration smoke test that withPolicyLock is actually wired into
+      // the CLI commands -- Promise.all alone does not force a genuine
+      // interleaving, so it is not, on its own, proof that the lock actually
+      // serializes anything (a passing run here could still happen to get
+      // lucky). test/exclusive-lock.test.ts tests withExclusiveLock itself
+      // with explicit deferred barriers for that.
       const [codeA, codeB] = await Promise.all([
         main(["policy", "set", "reserve", "codex-main:main", "30", "--reason", "stop new Codex builds at 70% used"]),
         main(["policy", "set", "reserve", "claude-main:all", "20", "--reason", "stop new Claude builds at 80% used"]),

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
 import { assertSafeAncestry, expandHome, headroomHome, vendorHome } from "./paths.js";
-import { writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, writeFileAtomic } from "./security.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { kimiCliCredentialPath, kimiTokenPath } from "./adapters/kimi.js";
 
@@ -95,8 +95,10 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
   const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
   const localAccounts = existing.filter(isLocalAccount);
   const merged = [...discovered, ...localAccounts];
-  // Atomic (temp file + rename) and always 0600: a plain writeFile's `mode`
-  // option only applies the first time the path is created -- an existing
+  // Atomic (temp file + rename) on every platform, and 0600 on POSIX (mode
+  // bits are meaningless on Windows, which has no equivalent here -- see
+  // writeFileAtomic's own doc comment): a plain writeFile's `mode` option
+  // only applies the first time the path is created -- an existing
   // accounts.toml left permissive by an older Headroom, or by an operator's
   // own editor, would otherwise stay permissive forever, and a write
   // interrupted mid-truncate could leave a corrupt file. writeFileAtomic
@@ -107,7 +109,12 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
 }
 
 export async function readAccounts(): Promise<Account[]> {
-  const text = await fs.readFile(accountsPath(), "utf8");
+  // No-follow and bounded: accounts.toml names every principal's credential
+  // location, and both registry mutations below read it before ever
+  // reaching writeFileAtomic's own symlink check on the write side -- a
+  // plain readFile here would still follow a symlink planted at this path,
+  // or block indefinitely reading a FIFO someone left there instead.
+  const text = await readBoundedRegularFile(accountsPath());
   const accounts: Account[] = [];
   let current: Record<string, string> | undefined;
   for (const rawLine of text.split("\n")) {
@@ -159,7 +166,11 @@ function validate(value: Record<string, string>): Account {
 export async function setAccountEnabled(name: string, enabled: boolean): Promise<void> {
   const path = accountsPath();
   await assertSafeAncestry(headroomHome());
-  const text = await fs.readFile(path, "utf8");
+  // Same no-follow, bounded read as readAccounts() above -- setAccountEnabled
+  // has its own direct read (it edits raw lines rather than the parsed
+  // form), so it needs the same guard before it, not just writeFileAtomic's
+  // symlink refusal on the write that follows.
+  const text = await readBoundedRegularFile(path);
   const lines = text.split(/(?<=\n)/);
   const bare = (line: string): string => line.replace(/\r?\n$/, "");
   const starts = lines.map((line, index) => /^\s*\[\[accounts\]\]\s*(?:#.*)?$/.test(bare(line)) ? index : -1).filter((index) => index >= 0);
@@ -183,7 +194,7 @@ export async function setAccountEnabled(name: string, enabled: boolean): Promise
     if (!lines[nameLine].endsWith("\n")) lines[nameLine] += newline;
     lines.splice(nameLine + 1, 0, `enabled = ${enabled}${newline}`);
   }
-  // Atomic (temp file + rename) and always 0600 -- see writeDiscoveredAccounts'
+  // Atomic on every platform, 0600 on POSIX -- see writeDiscoveredAccounts'
   // own comment: a plain writeFile here would leave an existing permissive
   // mode untouched, could truncate the file on an interrupted write, and
   // would follow a symlink at this path instead of refusing it.

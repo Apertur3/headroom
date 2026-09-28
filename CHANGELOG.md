@@ -12,15 +12,19 @@ All notable changes to this project are documented here. The format follows
   with no burn projection at all. `fill` now runs independently of pacing; pacing still restricts
   only the pro-rata line and burst check it was always meant to.
 - `accounts.toml` enable/disable and rediscovery writes are now atomic (temp file + rename) and
-  always end up `0600`, matching the pattern already used for `policy.toml`: a plain `writeFile`'s
-  mode only applied the first time the file was created, so a pre-existing permissive file stayed
-  permissive, and an interrupted write could truncate it. The write also refuses outright if
-  `accounts.toml` is a symlink instead of following it.
+  always end up `0600` on POSIX (Windows has no equivalent permission bit), matching the pattern
+  already used for `policy.toml`: a plain `writeFile`'s mode only applied the first time the file
+  was created, so a pre-existing permissive file stayed permissive, and an interrupted write could
+  truncate it. The write also refuses outright if `accounts.toml` is a symlink instead of following
+  it, and both reads that precede a write now use the same no-follow, bounded reader instead of a
+  plain `readFile` that would itself follow a symlink or block on a FIFO planted at that path.
 - `headroom policy set`/`clear` writers are now serialized through an exclusive lock file, so two
   concurrent invocations editing `policy.toml` can no longer have the second writer's rename
-  silently erase the first writer's edit. Timestamped `.bak-` backups taken in the same millisecond
-  no longer collide either; a colliding name gets a counter suffix instead of overwriting the
-  earlier backup.
+  silently erase the first writer's edit. The lock carries an ownership token and a heartbeat that
+  refreshes it while held, so a legitimately long-running edit is never mistaken for an abandoned
+  one, a stale lock is reclaimed by at most one waiter, and a lock is only ever released by the call
+  that still owns it. Timestamped `.bak-` backups taken in the same millisecond no longer collide
+  either; a colliding name gets a counter suffix instead of overwriting the earlier backup.
 
 ## [0.2.0] - 2026-09-28
 

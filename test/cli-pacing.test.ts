@@ -368,10 +368,23 @@ describe("headroom gate", () => {
     const store = await HeadroomStore.open(home);
     store.insert(fiveHour(1, 0, 4.5 * HOUR)); // a lone sample: no burn history to project from
     store.close();
-    await withHeadroomHome(home, async () => {
-      expect(await main(["gate", "--need", "5h:5", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill"])).toBe(2);
-      expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x", "--allowance", "fill"])).toBe(0); // fill CLI reports the error line and still exits 0
-    });
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["gate", "--need", "5h:5", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill"])).toBe(2);
+        // fill's own documented UNKNOWN shape (`{ meter, error }`, exit 0) is
+        // also what a genuinely successful, non-UNKNOWN result renders as --
+        // the exit code alone does not distinguish them. Capture and assert
+        // the printed line names both the UNKNOWN state and the burn-related
+        // reason, so this test cannot pass on a successful "fits" result too.
+        expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x", "--allowance", "fill"])).toBe(0);
+      });
+    } finally { restore(); }
+    // logs[0] is gate's own UNKNOWN line; logs[1] is fill's.
+    expect(logs).toHaveLength(2);
+    const fillLine = logs[1];
+    expect(fillLine).toContain("claude-main:all  UNKNOWN (");
+    expect(fillLine).toContain("burn");
   });
 });
 

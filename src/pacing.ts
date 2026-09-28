@@ -80,9 +80,11 @@ export interface GateUsage {
 export interface GateResult {
   allowed: boolean;
   reason: string;
-  /** Present when even pacing used the explicit fill allowance rather than
-   * the default pro-rata/burst checks. The two numbers make that decision
-   * scriptable without parsing its explanatory reason. */
+  /** Present when the explicit fill allowance was used for a 5h need,
+   * instead of the default pro-rata/burst checks -- under either pacing
+   * setting, since `pacing` only ever governs those default checks, never
+   * this opt-in one. The two numbers make that decision scriptable without
+   * parsing its explanatory reason. */
   allowance_basis?: "fill";
   projected_percent?: number;
   cap_percent?: number;
