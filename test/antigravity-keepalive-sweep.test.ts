@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -450,4 +450,140 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2
     expect(result.unverified).toEqual([strangerPid]); // alive, but never provably ours: reported, not touched
     expect(alive(strangerPid)).toBe(true);
   }, 10_000);
+});
+
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review round 2 -- mtime bound, kill-failure handling, confirm-before-cleanup, launch generation", () => {
+  it("(1) never verifies a .agy-pid file whose mtime is long AFTER the recorded launch time (no upper bound regression)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-futuremtime-")); temporary.push(root);
+    // A real, live, detached (so its own process-group leader) process
+    // stands in for "the pid the .agy-pid file names, still alive" -- the
+    // one piece of ps-free evidence isProcessGroupAlive can genuinely see.
+    const stray = spawn(await writeMortalShim(join(root, "stray")), [], { stdio: "ignore", detached: true });
+    const strayPid = track(stray.pid, root) as number;
+    const launchedAt = new Date(Date.now() - 60_000).toISOString(); // a minute ago
+    await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+      // scriptPid deliberately distinct from strayPid: this test is only
+      // about the pid the .agy-pid file itself names (added as its own
+      // candidate below), not about a scriptPid/agyPid match.
+      scriptPid: strayPid + 100000, scriptCommand: "", scriptStartedAt: "",
+      launchedAt, recordedAt: new Date().toISOString(), verified: false,
+    }), { mode: 0o600 });
+    const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+    await writeFile(pidFilePath, String(strayPid), { mode: 0o600 });
+    // Backdate the pid file's mtime to well AFTER launchedAt -- as if it were
+    // actually written by some later, unrelated event, not the launch
+    // `launchedAt` describes. The old (buggy) check only had a lower bound
+    // (mtime >= launchedAt - tolerance) and so had no upper bound at all;
+    // this is exactly the case it would have wrongly accepted.
+    const farAfter = new Date(Date.parse(launchedAt) + 10 * 60_000); // ten minutes after
+    await utimes(pidFilePath, farAfter, farAfter);
+
+    const result = await sweepPreviousKeepalive(root);
+
+    expect(result.swept).not.toContain(strayPid);
+    expect(result.unverified).toContain(strayPid); // alive, but the mtime doesn't match this launch
+    expect(alive(strayPid)).toBe(true);
+  }, 10_000);
+
+  it("(2) a signalling failure (kill throwing) does not reject the whole sweep -- the pid is reported unverified, never trusted as swept", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-killthrows-")); temporary.push(root);
+    const infoFile = join(root, "pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const child = spawn(fakeAgy, [], { stdio: "ignore", detached: true });
+    const pid = track(child.pid, root) as number;
+    try {
+      await waitForFile(infoFile);
+      const signature = await vi.waitFor(async () => {
+        const value = await processSignature(pid);
+        expect(value).toBeDefined();
+        return value!;
+      }, { timeout: 3_000, interval: 20 });
+      await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+        scriptPid: pid, scriptCommand: signature.command, scriptStartedAt: signature.startedAt,
+        recordedAt: new Date().toISOString(), verified: true,
+      }), { mode: 0o600 });
+
+      const result = await sweepPreviousKeepalive(root, {
+        killTree: async () => { throw new Error("EPERM (simulated): not permitted to signal this pid"); },
+      });
+
+      expect(result.swept).toEqual([]);
+      expect(result.unverified).toEqual([pid]); // never counted as reaped when signalling itself failed
+      expect(alive(pid)).toBe(true); // never actually touched
+    } finally { if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
+  }, 15_000);
+
+  it("(3) keeps the evidence files and reports unverified when a signalled pid cannot be confirmed dead", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-unconfirmed-")); temporary.push(root);
+    const infoFile = join(root, "pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const child = spawn(fakeAgy, [], { stdio: "ignore", detached: true });
+    const pid = track(child.pid, root) as number;
+    try {
+      await waitForFile(infoFile);
+      const signature = await vi.waitFor(async () => {
+        const value = await processSignature(pid);
+        expect(value).toBeDefined();
+        return value!;
+      }, { timeout: 3_000, interval: 20 });
+      await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+        scriptPid: pid, scriptCommand: signature.command, scriptStartedAt: signature.startedAt,
+        recordedAt: new Date().toISOString(), verified: true,
+      }), { mode: 0o600 });
+
+      // A killTree that "succeeds" without touching the process at all --
+      // standing in, deterministically, for a real SIGKILL that has been
+      // sent but not yet taken effect by the time this returns (SIGKILL is
+      // asynchronous: the kernel still has to schedule and reap it).
+      const result = await sweepPreviousKeepalive(root, { killTree: async () => { /* no-op: still "exiting" */ } });
+
+      expect(result.swept).toEqual([]);
+      expect(result.unverified).toEqual([pid]);
+      expect(alive(pid)).toBe(true);
+      // The evidence must survive so a LATER sweep can still finish the job
+      // -- discarding it here, before confirmation, would be exactly the bug.
+      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
+    } finally { if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
+  }, 15_000);
+
+  it("(4) recordState() never overwrites a newer launch's record with a stale (superseded-generation) one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-generation-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100 });
+    const internal = supervisor as unknown as {
+      launchGeneration: number;
+      child: unknown;
+      recordState(child: unknown, generation: number): Promise<void>;
+    };
+    try {
+      supervisor.start();
+      track(Number(await waitForFile(infoFile)), root);
+      track(supervisor.pid, root);
+      // Let the real, current launch's own recordState() finish and write
+      // its verified record first, so there is a known-good baseline to
+      // protect against being clobbered.
+      await vi.waitFor(async () => {
+        const state = JSON.parse(await readFile(keepaliveStateFilePath(root), "utf8"));
+        expect(state.verified).toBe(true);
+      }, { timeout: 3_000, interval: 20 });
+      const goodState = await readFile(keepaliveStateFilePath(root), "utf8");
+
+      // Simulate a newer launch having since started (bumping the
+      // generation) -- exactly what a crash+restart does -- without an
+      // actual restart, so the race window is deterministic rather than
+      // timing-dependent.
+      const staleGeneration = internal.launchGeneration;
+      internal.launchGeneration += 1;
+
+      // Directly invoke recordState() again, standing in for that OLD
+      // launch's own (delayed) call finally resolving after a newer launch
+      // has already taken over -- exactly the race this generation check
+      // exists to close.
+      await internal.recordState(internal.child, staleGeneration);
+
+      // The stale call must never have overwritten anything.
+      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBe(goodState);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
 });

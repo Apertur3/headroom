@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { lstat, open, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { lstat, open, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processSignature, type ExecFile } from "./process-tree.js";
@@ -13,6 +13,8 @@ export type AgyLoginState = "unknown" | "logged_in" | "not_logged_in";
  * enough to catch the auth-state markers even past rotation noise, small
  * enough that a growing (or adversarial) log can never make this unbounded. */
 const LOG_TAIL_BYTES = 64 * 1024;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Regular files only (lstat, never followed through a symlink), and never
  * more than LOG_TAIL_BYTES read regardless of how large the log has grown. */
@@ -80,12 +82,19 @@ export function keepaliveStateFilePath(home: string): string { return join(home,
  * can look for it even when the JSON state never got far enough to record it. */
 function agyPidFilePathFor(stateFilePath: string): string { return `${stateFilePath}.agy-pid`; }
 
-async function writeKeepaliveState(path: string, state: KeepaliveState): Promise<void> {
-  await writeFile(path, JSON.stringify(state), { mode: 0o600, flag: "w" });
+/** Synchronous, deliberately: recordState() checks its launch generation is
+ * still current and calls this in the same synchronous step, with nothing
+ * else able to run in between (single-threaded JS) -- an async write here
+ * would reopen exactly the race it exists to close (see recordState's own
+ * comment: an older launch's write landing, via the fs layer's own timing,
+ * after a newer launch's synchronous provisional record). */
+function writeKeepaliveStateSync(path: string, state: KeepaliveState): void {
+  writeFileSync(path, JSON.stringify(state), { mode: 0o600 });
 }
 
 /** Never trusts the file blindly: rejects a symlink, a non-regular file, or
- * a shape that doesn't match what writeKeepaliveState() itself ever writes. */
+ * a shape that doesn't match what writeKeepaliveStateSync() itself ever
+ * writes. */
 async function readKeepaliveState(path: string): Promise<KeepaliveState | undefined> {
   try {
     const info = await lstat(path);
@@ -128,16 +137,43 @@ async function readAgyPidFile(path: string): Promise<AgyPidFileEntry | undefined
  * process and the launch wrapper's own `echo` in the separate child process
  * it just spawned -- both happen at launch, but never at the exact same
  * instant. Wide enough to absorb that gap, narrow enough that a `.agy-pid`
- * file left by a much older, unrelated launch cannot pass it. */
+ * file left by a much older, unrelated launch cannot pass it. Symmetric: a
+ * mtime long AFTER launchedAt is just as disqualifying as one long before --
+ * either direction means this file was not written by the launch this record
+ * describes. */
 const AGY_PID_FILE_MTIME_TOLERANCE_MS = 5_000;
 
+/** How long to poll (ps-free, via isProcessGroupAlive) for a signalled pid to
+ * actually disappear before trusting that it has. SIGKILL is asynchronous --
+ * the kernel still has to schedule and reap the target -- so neither a pid's
+ * evidence (its state-file entry, its `.agy-pid` file) nor its membership in
+ * `swept` may be settled the instant a signal is sent; only once this confirms
+ * the process (or its group) is actually gone. */
+const KILL_CONFIRM_TIMEOUT_MS = 1_000;
+const KILL_CONFIRM_POLL_MS = 25;
+
+/** Polls isProcessGroupAlive until it reports false (confirmed gone) or
+ * `timeoutMs` elapses. See KILL_CONFIRM_TIMEOUT_MS for why this exists at
+ * all rather than trusting a kill call's return to mean "gone now". */
+async function waitUntilGroupGone(pid: number, timeoutMs = KILL_CONFIRM_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessGroupAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await sleep(KILL_CONFIRM_POLL_MS);
+  }
+  return true;
+}
+
 export interface SweepResult {
-  /** Pids this sweep proved were ours and killed. */
+  /** Pids this sweep proved were ours, signalled, and confirmed dead
+   * (waitUntilGroupGone) before returning. */
   swept: number[];
-  /** Pids found alive (by process-group signal, ps-free) that could NOT be
-   * proven ours by any tier of evidence -- left running untouched. The
-   * caller must not start a fresh keepalive while any of these are still
-   * alive (see the daemon's own re-check before every launch attempt). */
+  /** Pids that either could not be proven ours by any tier of evidence, or
+   * WERE signalled but could not be confirmed dead (signalling itself failed,
+   * e.g. EPERM, or the process outlived the confirm timeout) -- left running
+   * (or possibly running) untouched. The caller must not start a fresh
+   * keepalive while any of these might still be alive (see the daemon's own
+   * re-check before every launch attempt). */
   unverified: number[];
 }
 
@@ -164,18 +200,28 @@ export interface SweepResult {
  *     names, when no exact recorded signature could settle it (no `ps`
  *     answer, or nothing was ever recorded to compare against): the file's
  *     mtime falls within AGY_PID_FILE_MTIME_TOLERANCE_MS of the launch time
- *     recorded alongside it, AND the pid's process GROUP is still alive
- *     (checked with a signal-0 send, isProcessGroupAlive -- no `ps`
- *     involved). This is NOT a full identity proof: a pid the OS recycled,
- *     in between, to an unrelated new session/group leader would pass it
- *     too. It is the strongest evidence obtainable without `ps`, which is
- *     why it is only ever applied to this one specific, freshly-orphaned
- *     pid -- never used to positively identify some other stranger pid.
+ *     recorded alongside it IN EITHER DIRECTION (a mtime long after the
+ *     recorded launch is just as disqualifying as one long before -- both
+ *     mean this file was not written by that launch), AND the pid's process
+ *     GROUP is still alive (checked with a signal-0 send, isProcessGroupAlive
+ *     -- no `ps` involved). This is NOT a full identity proof: a pid the OS
+ *     recycled, in between, to an unrelated new session/group leader would
+ *     pass it too. It is the strongest evidence obtainable without `ps`,
+ *     which is why it is only ever applied to this one specific,
+ *     freshly-orphaned pid -- never used to positively identify some other
+ *     stranger pid.
+ *
+ * Signalling a verified pid can itself fail (EPERM) or simply not have taken
+ * effect yet by the time this returns (SIGKILL is asynchronous): either way
+ * the pid moves to `unverified` rather than `swept`, via waitUntilGroupGone's
+ * bounded confirmation poll -- a pid is never counted as reaped, and its
+ * evidence never discarded, until it is actually confirmed gone.
  *
  * A pid that clears neither tier but is still alive (by process-group
- * signal) is reported in `unverified`, never signalled, and both files are
- * left in place so this same evidence is available to reconcile it again
- * later. Both files are removed only once nothing remains unverified.
+ * signal), OR that was signalled but never confirmed dead, is reported in
+ * `unverified`, and both files are left in place so this same evidence is
+ * available to reconcile it again later. Both files are removed only once
+ * nothing remains unverified.
  * A user's own interactively-started agy is never in either file to begin
  * with, since only launch() ever writes them. Never called on win32 (no
  * `script`, so nothing this daemon could have started to sweep).
@@ -220,7 +266,7 @@ export async function sweepPreviousKeepalive(home: string, options: { execImpl?:
     }
     if (pidFileEntry && pidFileEntry.pid === pid && state?.launchedAt) {
       const launchedAtMs = Date.parse(state.launchedAt);
-      if (Number.isFinite(launchedAtMs) && pidFileEntry.mtimeMs >= launchedAtMs - AGY_PID_FILE_MTIME_TOLERANCE_MS && isProcessGroupAlive(pid)) {
+      if (Number.isFinite(launchedAtMs) && Math.abs(pidFileEntry.mtimeMs - launchedAtMs) <= AGY_PID_FILE_MTIME_TOLERANCE_MS && isProcessGroupAlive(pid)) {
         verified.push({ pid, tier: "ps-free" });
         continue;
       }
@@ -229,24 +275,42 @@ export async function sweepPreviousKeepalive(home: string, options: { execImpl?:
   }
 
   const kill = options.killTree ?? killTree;
+  const swept: number[] = [];
   for (const { pid, tier } of verified) {
-    if (tier === "ps") await kill(pid);
-    // killTree()'s SIGKILL escalation re-lists via `ps` to decide who
-    // survived the SIGTERM, which is exactly what a ps-free verification has
-    // no access to -- SIGKILL directly instead, the same ps-free primitive
-    // stop() and the exit handler already rely on for this situation.
-    else killProcessGroup(pid);
+    try {
+      if (tier === "ps") await kill(pid);
+      // killTree()'s SIGKILL escalation re-lists via `ps` to decide who
+      // survived the SIGTERM, which is exactly what a ps-free verification
+      // has no access to -- SIGKILL directly instead, the same ps-free
+      // primitive stop() and the exit handler already rely on for this
+      // situation.
+      else killProcessGroup(pid);
+    } catch {
+      // Signalling itself failed (e.g. EPERM): the pid was never actually
+      // touched. Treat exactly like an unverifiable pid -- reported, not
+      // counted as reaped, and left alone rather than assumed dead.
+      unverified.push(pid);
+      continue;
+    }
+    // A kill call returning (or killProcessGroup's fire-and-forget signal)
+    // does not mean the target is actually gone yet -- SIGKILL is
+    // asynchronous. Confirm before this pid is trusted as swept, so a launch
+    // decided moments later never races a process that is still exiting.
+    if (await waitUntilGroupGone(pid)) swept.push(pid);
+    else unverified.push(pid);
   }
   if (unverified.length) {
-    log(`antigravity keepalive sweep: pid(s) ${unverified.join(", ")} left by a previous run could not be verified (no ps signature match and ps-free evidence was incomplete) -- left running untouched; a new keepalive will not launch until they are confirmed gone`);
+    log(`antigravity keepalive sweep: pid(s) ${unverified.join(", ")} left by a previous run could not be verified, or could not be confirmed dead after signalling -- left alone; a new keepalive will not launch until they are confirmed gone`);
   } else {
+    // Only reached once every candidate this sweep found alive is either
+    // confirmed dead or was never alive to begin with -- never while
+    // anything remains unverified, so the evidence that would let a later
+    // sweep finish the job is never discarded while it might still be needed.
     try { await unlink(path); } catch { /* already gone */ }
     try { await unlink(pidFilePath); } catch { /* already gone */ }
   }
-  return { swept: verified.map((entry) => entry.pid), unverified };
+  return { swept, unverified };
 }
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Reads only auth-state markers, never credentials or quota values, from
  * agy's newest log -- a bounded tail of a verified regular file, never a
@@ -295,6 +359,12 @@ export class AgyKeepaliveSupervisor {
   private stopping = false;
   private failures = 0;
   private startedAt: number | undefined;
+  /** Incremented, synchronously, on every launch(). recordState()'s eventual
+   * (async, `ps`-dependent) write checks this immediately before writing, in
+   * the same synchronous step, so a stale write from an OLDER launch can
+   * never land after (and clobber) a NEWER launch's own synchronous
+   * provisional record, however the two async chains happen to interleave. */
+  private launchGeneration = 0;
   private readonly binary: string;
   private readonly platform: NodeJS.Platform;
   private readonly startChild: Spawn;
@@ -370,6 +440,12 @@ export class AgyKeepaliveSupervisor {
     this.stopLoginWatch();
     const child = this.child;
     this.child = undefined;
+    // Only cleared once agy is actually confirmed gone (or there was never
+    // one to confirm): SIGKILL is asynchronous, and discarding the evidence
+    // files while agy might still be alive would strip the one identity a
+    // future sweep needs to finish the job, should this process somehow
+    // outlive this method.
+    let agyConfirmedGone = true;
     if (child && isAlive(child)) {
       // Read agy's pid while script is still alive: script lives exactly as
       // long as its PTY session, so a pid written by this launch's wrapper is
@@ -385,9 +461,15 @@ export class AgyKeepaliveSupervisor {
       // Group only: agy leads its own process group, and a group with that id
       // exists only while agy or one of its children is alive, so this cannot
       // reach a stranger that inherited the bare pid during the grace period.
-      if (agyPid !== undefined) killProcessGroup(agyPid, { groupOnly: true });
+      if (agyPid !== undefined) {
+        killProcessGroup(agyPid, { groupOnly: true });
+        agyConfirmedGone = await waitUntilGroupGone(agyPid);
+      }
     }
-    await this.clearState();
+    if (agyConfirmedGone) await this.clearState();
+    // else: leave the state and pid files in place -- exactly the same
+    // evidence a crash would have left, for the next sweepPreviousKeepalive()
+    // to pick up and finish reconciling.
   }
 
   private launch(): void {
@@ -398,13 +480,19 @@ export class AgyKeepaliveSupervisor {
       const child = this.startChild(command, args, { stdio: "ignore", env: inheritedAgyEnvironment(), detached: this.platform !== "win32" });
       this.child = child;
       this.startedAt = Date.now();
+      // Bumped synchronously, before anything else about this launch is
+      // recorded: recordState()'s eventual write checks this is still the
+      // current generation, immediately before writing, so it can never
+      // clobber a newer launch's record (see the field's own doc comment).
+      this.launchGeneration += 1;
+      const generation = this.launchGeneration;
       // Synchronous and ps-free, in the same tick as spawn(): a crash at ANY
       // point from here on -- even before this method's own next line, let
       // alone recordState()'s first `await` -- still leaves durable evidence
       // of this launch behind for the next daemon start's sweep to find.
       this.recordProvisionalState(child);
       this.startLoginWatch();
-      void this.recordState(child);
+      void this.recordState(child, generation);
       let handled = false;
       const exited = () => {
         if (handled) return;
@@ -446,7 +534,7 @@ export class AgyKeepaliveSupervisor {
       recordedAt: new Date().toISOString(),
       verified: false,
     };
-    try { writeFileSync(this.stateFilePath, JSON.stringify(state), { mode: 0o600 }); }
+    try { writeKeepaliveStateSync(this.stateFilePath, state); }
     catch { /* best-effort; recordState() may still succeed once ps answers */ }
   }
 
@@ -460,8 +548,21 @@ export class AgyKeepaliveSupervisor {
    * unverified record recordProvisionalState() already wrote in place -- the
    * next daemon start still has that to sweep with, just without a `ps`
    * signature to match against.
+   *
+   * `generation` is this launch's own launchGeneration, captured by launch()
+   * before any `await`; it is checked again immediately before the final
+   * write, IN THE SAME SYNCHRONOUS STEP as that write (writeKeepaliveStateSync
+   * is synchronous specifically for this), so nothing else can run in
+   * between. Without that, `this.child !== child` alone is not enough: two
+   * recordState() calls can each pass their own check and then have their
+   * actual disk writes complete in either order (an async writeFile's I/O is
+   * dispatched to a thread pool the instant it is called, so nothing about
+   * which call's *check* passed first controls which call's *bytes* land on
+   * disk last) -- an older launch's stale, `ps`-verified write could then
+   * land after a newer launch's synchronous provisional record and clobber
+   * it, silently erasing the newer launch's identity from disk.
    */
-  private async recordState(child: ChildProcess): Promise<void> {
+  private async recordState(child: ChildProcess, generation: number): Promise<void> {
     if (!this.stateFilePath || this.platform === "win32") return;
     const scriptPid = child.pid;
     if (typeof scriptPid !== "number") return;
@@ -482,10 +583,13 @@ export class AgyKeepaliveSupervisor {
         launchedAt, recordedAt: new Date().toISOString(), verified: true,
       };
       if (agyPid !== undefined && agySignature) { state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt; }
-      // The awaits above can outlive this launch: never write a stopped or
-      // replaced launch's pids over the state a newer one (or stop) left.
-      if (this.child !== child || !isAlive(child)) return;
-      await writeKeepaliveState(this.stateFilePath, state);
+      // The awaits above can outlive this launch: never write a stopped,
+      // replaced, or superseded launch's pids over the state a newer one (or
+      // stop) left. Checked and written synchronously together -- see this
+      // method's own doc comment for why the generation check alone,
+      // followed by an async write, would not be enough.
+      if (this.launchGeneration !== generation || this.child !== child || !isAlive(child)) return;
+      writeKeepaliveStateSync(this.stateFilePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
   }
 

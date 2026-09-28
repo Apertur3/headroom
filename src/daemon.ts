@@ -182,6 +182,13 @@ export class HeadroomDaemon {
    * so a possibly-live orphan is never doubled up on; cleared once none of
    * them are alive any more. */
   private keepaliveUnverifiedPids: number[] = [];
+  /** False until a sweepStaleKeepalive() call has completed WITHOUT throwing.
+   * maybeStartKeepalive() must never launch a fresh keepalive on the strength
+   * of an empty keepaliveUnverifiedPids that only looks empty because the
+   * sweep that would have populated it never actually ran to completion --
+   * that reads identically to "nothing to worry about" while actually
+   * meaning "we never checked". */
+  private keepaliveSwept = false;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
   /** Guards against a second timer-firing pass starting while a slow one
@@ -236,13 +243,16 @@ export class HeadroomDaemon {
     this.schedulingStarted = true;
   }
 
-  /** Best-effort; a failed sweep never blocks the daemon from starting its
-   * own keepalive -- worst case a prior leftover survives one more run and
-   * shows up in `headroom doctor`. */
+  /** A sweep that throws leaves keepaliveUnverifiedPids exactly as it was
+   * (never emptied by a run that did not actually finish), and
+   * keepaliveSwept false, so maybeStartKeepalive() below treats a rejected
+   * sweep the same as one that found something unverified: refuse to launch
+   * this cycle, not "nothing to worry about". */
   private async sweepStaleKeepalive(): Promise<void> {
     try {
       const result = await sweepPreviousKeepalive(this.home, { log: (message) => { void appendDaemonLog(message, this.home); } });
       this.keepaliveUnverifiedPids = result.unverified;
+      this.keepaliveSwept = true;
     }
     catch (error) { void appendDaemonLog(`antigravity keepalive sweep: ${safeError(error)}`, this.home); }
   }
@@ -250,6 +260,11 @@ export class HeadroomDaemon {
   /** Start the owned agy PTY once an Antigravity poll needs it. */
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
+    if (!this.keepaliveSwept) await this.sweepStaleKeepalive(); // retry: a transient sweep failure must not permanently block every later cycle
+    if (!this.keepaliveSwept) {
+      void appendDaemonLog("antigravity keepalive: deferring a new launch -- the startup sweep has not completed cleanly yet", this.home);
+      return;
+    }
     if (this.keepaliveUnverifiedPids.length) {
       // "until the next check": re-probe (ps-free) rather than trusting a
       // sweep result that may be stale by now -- once every unverified pid
