@@ -276,6 +276,11 @@ describe("headroom gate", () => {
     const home = await seededHome();
     await writeFile(join(home, "policy.toml"), 'allowance = "fill"\n', { mode: 0o600 });
     const store = await HeadroomStore.open(home);
+    // Two same-used samples inside the 60-minute lookback: a real, measured
+    // zero burn (history exists) rather than a lone sample's null (no
+    // history to derive a rate from at all) -- the fill projection now
+    // refuses on the latter, so every "fill" scenario here needs the former.
+    store.insert(fiveHour(1, -3 * 60_000, 4.5 * HOUR));
     store.insert(fiveHour(1, 0, 4.5 * HOUR));
     store.close();
     const { logs, restore } = captureLog();
@@ -293,6 +298,9 @@ describe("headroom gate", () => {
   it("passes --allowance fill into run's atomic gate", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
+    // Same zero-burn seeding as the test above -- a lone sample would leave
+    // burn null and the fill projection would now refuse it outright.
+    store.insert(fiveHour(1, -3 * 60_000, 4.5 * HOUR));
     store.insert(fiveHour(1, 0, 4.5 * HOUR));
     store.close();
     const { logs, restore } = captureLog();

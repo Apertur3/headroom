@@ -362,6 +362,12 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     // evaluateGate below already skips its need instead of failing it.
     const reported = knownPercentWindows(store, id);
     const notEnforced: string[] = [];
+    // The exact 300-minute row matched for a 5h need below -- never the
+    // meter's merely-shortest window (meterWindows' `short`), which on a
+    // meter that also enforces something narrower than 5h (a 90m window,
+    // say) would silently substitute that window's usage, reset and burn
+    // into the even-pacing/fill math for what is actually a 5h request.
+    let fiveHourRow: StoredObservation | undefined;
     for (const need of needs) {
       const minutes = windowNeedMinutes(need.window);
       const label = minutes === undefined ? need.window : windowNeedLabel(minutes);
@@ -373,6 +379,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       if (row.freshness === "not_enforced") { notEnforced.push(label); continue; }
       const freshness = freshnessGate(row, staleMinutes, now);
       if (!freshness.ok) return { allowed: false, reason: `${label} ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
+      if (minutes === 300) fiveHourRow = row;
       const observedUsed = row.quantity?.used;
       const used = observedUsed === undefined ? undefined : Math.min(100, observedUsed + reservedPercent);
       if (used === undefined) return { allowed: false, reason: `${label} usage unknown`, meters_checked: checked, unknown: true };
@@ -404,15 +411,25 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     lastResult = { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 
     const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
-    if (pacing === "even" && fiveHourNeed && short?.resets_at && short.window?.minutes && options.owner) {
+    if (pacing === "even" && fiveHourNeed && fiveHourRow) {
       if (allowance === "fill") {
+        // The explicit fill allowance is opt-in and must apply whenever it is
+        // requested: never silently skipped because no --owner was given (a
+        // caller checking dispatch capacity generically, not on behalf of one
+        // owner, still needs this projection to run) and never silently
+        // skipped once the window is close to reset (that is exactly when a
+        // burst against the cap matters most). A window with no finite,
+        // future reset -- or with no recent burn history to project from --
+        // fails closed as UNKNOWN rather than falling through to "fits".
+        const finiteReset = fiveHourRow.resets_at && Number.isFinite(Date.parse(fiveHourRow.resets_at)) && Date.parse(fiveHourRow.resets_at) > now.getTime();
+        if (!finiteReset) return { allowed: false, reason: `5h fill needs a finite future reset for ${id}`, meters_checked: checked, unknown: true };
         const meterReserve = reserveFor(options.reserves ?? {}, id);
         const cap = Math.min(100 - Math.max(reservePercent, meterReserve), options.capPercent ?? 100);
-        const minutesToReset = Math.max(0, (Date.parse(short.resets_at) - now.getTime()) / 60_000);
+        const minutesToReset = Math.max(0, (Date.parse(fiveHourRow.resets_at!) - now.getTime()) / 60_000);
         const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
-        const burn = store.burnRateFor([short], now, 60).get(`${id}:${short.window.minutes}`);
+        const burn = store.burnRateFor([fiveHourRow], now, 60).get(`${id}:${fiveHourRow.window!.minutes}`);
         const fill = evaluateFillAllowance({
-          usedPercent: short.quantity!.used,
+          usedPercent: fiveHourRow.quantity!.used,
           reservedByOthersPercent: reservedPercent,
           burnPercentPerHour: burn?.burn_percent_per_hour ?? null,
           laneHours: durationMinutes / 60,
@@ -420,18 +437,18 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
           requestPercent: fiveHourNeed.points,
         });
         const fillFields = { allowance_basis: "fill" as const, projected_percent: fill.projected_percent, cap_percent: fill.cap_percent };
-        if (!fill.allowed) return { allowed: false, reason: fill.reason, meters_checked: checked, ...fillFields };
+        if (!fill.allowed) return { allowed: false, reason: fill.reason, meters_checked: checked, ...fillFields, ...(fill.unknown ? { unknown: true as const } : {}) };
         lastResult = { allowed: true, reason: fill.reason, ...(notEnforced.length ? { not_enforced: notEnforced } : {}), ...fillFields };
-      } else {
-        const windowStart = new Date(Date.parse(short.resets_at) - short.window.minutes * 60_000);
-        const windowHours = short.window.minutes / 60;
+      } else if (fiveHourRow.resets_at && fiveHourRow.window?.minutes && options.owner) {
+        const windowStart = new Date(Date.parse(fiveHourRow.resets_at) - fiveHourRow.window.minutes * 60_000);
+        const windowHours = fiveHourRow.window.minutes / 60;
         const ownerLeases = store.leases(id, true, now).filter((lease) => lease.owner === options.owner);
         const plannedShare = options.planSharePercent ?? (ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0) + fiveHourNeed.points);
         const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
         const proRata = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: fiveHourNeed.points, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now });
         if (!proRata.allowed) return { allowed: false, reason: proRata.reason, meters_checked: checked };
-        const burst10m = store.burnRateFor([short], now, 10).get(`${id}:${short.window.minutes}`);
-        const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: Math.min(100, short.quantity!.used + reservedPercent), windowStart });
+        const burst10m = store.burnRateFor([fiveHourRow], now, 10).get(`${id}:${fiveHourRow.window.minutes}`);
+        const burst = evaluateBurst({ burnPercentPerHour10m: burst10m?.burn_percent_per_hour ?? null, plannedSharePercent: plannedShare, windowDurationHours: windowHours, usedPercent: Math.min(100, fiveHourRow.quantity!.used + reservedPercent), windowStart });
         if (!burst.allowed) return { allowed: false, reason: burst.reason, meters_checked: checked };
       }
     }
@@ -502,9 +519,13 @@ export interface FillOutcome {
   lane_cost_percent: number | null;
   lane_cost_source: "given" | "learned" | "unknown";
   /** "full": the window's whole remaining points, offered outside even
-   * pacing or inside the last 45 minutes before reset (nothing left to
-   * smooth by then). "pro_rata" preserves the planned-share default;
-   * "fill" projects actual use and burn to a lane's end. */
+   * pacing, with no --owner given, or inside the last 45 minutes before
+   * reset (nothing left to smooth by then) -- this fallback only ever
+   * applies to the "pro_rata" basis. "fill" projects actual use and burn to
+   * a lane's end instead, and is never silently replaced by "full": it
+   * applies with no owner and inside the final stretch too (see
+   * fillForCore), failing closed to an `error` result rather than falling
+   * back when the projection itself cannot be computed. */
   allowance_basis: "full" | "pro_rata" | "fill";
   /** The tightest enforced window the lane math actually used -- "5h" on a
    * normal meter; "wk" (or another label) when the 5h window is not
@@ -611,41 +632,52 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   const pacing = options.pacing ?? "even";
   const allowance = options.allowance ?? "pro_rata";
   const inFinalStretch = secondsLeft !== null && secondsLeft <= EVEN_PACING_FULL_BURST_MINUTES * 60;
-  // Pro-rata smoothing only makes sense for a genuine 5h window: it rations a
-  // short window's own budget across the hours until IT resets. Once the
-  // tight window IS the weekly one (5h not enforced), there is no shorter
-  // window left to smooth -- the weekly reserve check in computeFill below is
-  // already the whole mechanism, and a from-scratch pro-rata line computed
-  // over a 7-day span (with no owner plan share on file yet) would otherwise
-  // collapse the allowance to near zero for no real reason.
-  const restrictedByPacing = pacing === "even" && isFiveHour && !inFinalStretch && tight.window?.minutes && tight.resets_at && options.owner;
+  // Pro-rata smoothing (and, below, the explicit fill projection) only makes
+  // sense for a genuine 5h window: it rations a short window's own budget
+  // across the hours until IT resets. Once the tight window IS the weekly
+  // one (5h not enforced), there is no shorter window left to smooth -- the
+  // weekly reserve check in computeFill below is already the whole
+  // mechanism, and a from-scratch pro-rata line computed over a 7-day span
+  // (with no owner plan share on file yet) would otherwise collapse the
+  // allowance to near zero for no real reason.
+  const evenPacingApplies = pacing === "even" && isFiveHour && tight.window?.minutes;
   let used5hForLanes = used5h;
   let allowanceBasis: FillOutcome["allowance_basis"] = "full";
-  if (restrictedByPacing) {
-    if (allowance === "fill") {
-      const minutesToReset = Math.max(0, secondsLeft ?? 0) / 60;
-      const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
-      const burn = store.burnRateFor([tight], now, 60).get(`${meter}:${tight.window!.minutes}`);
-      used5hForLanes = evaluateFillAllowance({
-        usedPercent: tight.quantity!.used,
-        reservedByOthersPercent: reservedPercent,
-        burnPercentPerHour: burn?.burn_percent_per_hour ?? null,
-        laneHours: durationMinutes / 60,
-        capPercent: 100,
-        requestPercent: 0,
-      }).projected_percent;
-      allowanceBasis = "fill";
-    } else {
-      const windowStart = new Date(Date.parse(tight.resets_at!) - (tight.window!.minutes as number) * 60_000);
-      const windowHours = (tight.window!.minutes as number) / 60;
-      const ownerLeases = store.leases(meter, true, now).filter((lease) => lease.owner === options.owner);
-      const plannedShare = options.planSharePercent ?? ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
-      const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
-      const line = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: 0, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now }).line_percent;
-      const proRataRemaining = Math.max(0, line - usedSoFar);
-      used5hForLanes = Math.max(used5h, 100 - proRataRemaining);
-      allowanceBasis = "pro_rata";
-    }
+  if (evenPacingApplies && allowance === "fill") {
+    // Unlike pro-rata smoothing, the explicit fill allowance must apply
+    // whenever it is requested: never silently skipped for lack of --owner
+    // (a caller checking generic dispatch capacity, not one owner's lane,
+    // still needs the projection to run), and never silently skipped once
+    // the window is in its final stretch before reset -- that is exactly
+    // when a burst against the cap matters most. A window with no finite,
+    // future reset, or with no recent burn history to project from, fails
+    // closed to an error rather than falling through to "full" capacity.
+    const finiteReset = tight.resets_at && Number.isFinite(Date.parse(tight.resets_at)) && Date.parse(tight.resets_at) > now.getTime();
+    if (!finiteReset) return { meter, error: `fill needs a finite future reset for ${meter}` };
+    const minutesToReset = Math.max(0, secondsLeft ?? 0) / 60;
+    const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
+    const burn = store.burnRateFor([tight], now, 60).get(`${meter}:${tight.window!.minutes}`);
+    const fillEval = evaluateFillAllowance({
+      usedPercent: tight.quantity!.used,
+      reservedByOthersPercent: reservedPercent,
+      burnPercentPerHour: burn?.burn_percent_per_hour ?? null,
+      laneHours: durationMinutes / 60,
+      capPercent: 100,
+      requestPercent: 0,
+    });
+    if (fillEval.unknown) return { meter, error: fillEval.reason };
+    used5hForLanes = fillEval.projected_percent;
+    allowanceBasis = "fill";
+  } else if (evenPacingApplies && !inFinalStretch && tight.resets_at && options.owner) {
+    const windowStart = new Date(Date.parse(tight.resets_at!) - (tight.window!.minutes as number) * 60_000);
+    const windowHours = (tight.window!.minutes as number) / 60;
+    const ownerLeases = store.leases(meter, true, now).filter((lease) => lease.owner === options.owner);
+    const plannedShare = options.planSharePercent ?? ownerLeases.reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
+    const usedSoFar = ownerLeases.reduce((sum, lease) => sum + lease.spent_percent, 0);
+    const line = evaluateProRataLine({ usedSoFarByOwnerPercent: usedSoFar, requestPercent: 0, plannedSharePercent: plannedShare, windowStart, windowDurationHours: windowHours, now }).line_percent;
+    const proRataRemaining = Math.max(0, line - usedSoFar);
+    used5hForLanes = Math.max(used5h, 100 - proRataRemaining);
+    allowanceBasis = "pro_rata";
   }
   // computeFill's default weekly-cost-per-lane is the 5h-to-weekly
   // calibration ratio, which only makes sense between two distinct windows.

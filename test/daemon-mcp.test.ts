@@ -503,11 +503,16 @@ describe("MCP tool arguments are validated against their own schema before dispa
     await mkdir(home, { recursive: true, mode: 0o700 });
     const now = new Date();
     const store = await HeadroomStore.open(home);
-    store.insert({
-      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-      quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
-      observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
-    });
+    // Two same-used samples inside the 60-minute lookback: a real, measured
+    // zero burn (history exists), never a lone sample's null (no history at
+    // all) -- the fill projection now refuses on the latter.
+    for (const fetchedAt of [new Date(now.getTime() - 3 * 60_000).toISOString(), now.toISOString()]) {
+      store.insert({
+        principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+        observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+    }
     store.close();
     await withHeadroomHome(home, async () => {
       const listed = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
@@ -558,11 +563,14 @@ describe("fill allowance through daemon RPC", () => {
       const daemon = await HeadroomDaemon.create({ home, path: testSocketPath(root, "fill-allowance") });
       const now = new Date();
       const store = await HeadroomStore.open(home);
-      store.insert({
-        principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-        quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
-        observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
-      });
+      // Zero-burn seeding, same reasoning as the direct-MCP test above.
+      for (const fetchedAt of [new Date(now.getTime() - 3 * 60_000).toISOString(), now.toISOString()]) {
+        store.insert({
+          principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+          quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+          observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+        });
+      }
       store.close();
       try {
         const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"gate","params":{"needs":[{"window":"5h","points":50}],"meter":"claude-main:all","owner":"x","allowance":"fill"}}');
@@ -587,11 +595,14 @@ describe("fill allowance through daemon RPC", () => {
     }
     const now = new Date();
     const store = await HeadroomStore.open(home);
-    store.insert({
-      principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-      quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
-      observed_at: now.toISOString(), fetched_at: now.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
-    });
+    // Zero-burn seeding, same reasoning as the direct-MCP/daemon-RPC tests above.
+    for (const fetchedAt of [new Date(now.getTime() - 3 * 60_000).toISOString(), now.toISOString()]) {
+      store.insert({
+        principal_id: "claude-main", meter_id: "claude-main:all", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 1, limit: 100, remaining: 99, unit: "percent" }, resets_at: new Date(now.getTime() + 4.5 * 3_600_000).toISOString(),
+        observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+    }
     store.close();
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });

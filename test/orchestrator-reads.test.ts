@@ -459,10 +459,20 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
   const now = new Date("2026-09-03T12:00:00Z");
   const resetsAt = "2026-09-03T16:30:00Z"; // 4.5h left, outside the final stretch
 
+  /** Two same-used 5h samples inside the 60-minute burn lookback: a real,
+   * measured zero burn (history exists, the rate just happens to be flat),
+   * never the "no observation to derive a rate from at all" case a lone
+   * sample produces. Every test below that expects the fill projection to
+   * actually run seeds this rather than a single insert. */
+  function seedZeroBurn(store: HeadroomStore, used: number, resets = resetsAt): void {
+    store.insert(fiveHour(used, new Date(now.getTime() - 3 * 60_000).toISOString(), resets, meter));
+    store.insert(fiveHour(used, now.toISOString(), resets, meter));
+  }
+
   it("keeps the pro-rata default but lets an explicit caller spend the unclaimed window", async () => {
     const store = await open();
     try {
-      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      seedZeroBurn(store, 1);
       const proRataGate = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even" });
       const fillGate = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
       const proRataFill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even" });
@@ -472,6 +482,15 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
       expect("error" in proRataFill ? null : proRataFill.lanes?.lanes).toBe(0);
       expect(fill).toMatchObject({ allowance_basis: "fill" });
       expect("error" in fill ? null : fill.lanes?.lanes).toBe(Math.floor((100 - 1 - 5) / 2));
+    } finally { store.close(); }
+  });
+
+  it("applies the fill projection even with no owner given -- it is never gated on one", async () => {
+    const store = await open();
+    try {
+      seedZeroBurn(store, 1);
+      const result = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { pacing: "even", allowance: "fill" });
+      expect(result).toMatchObject({ allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
     } finally { store.close(); }
   });
 
@@ -489,15 +508,87 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
     } finally { store.close(); }
   });
 
-  it("never crosses the reserve-derived cap, honours a tighter cap, and stays full in the final stretch", async () => {
+  it("never crosses the reserve-derived cap and honours a tighter cap", async () => {
     const store = await open();
     try {
-      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      seedZeroBurn(store, 1);
       expect(gateFor(store, [{ window: "5h", points: 95 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" }).allowed).toBe(false);
       expect(gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill", capPercent: 50 }).allowed).toBe(false);
-      store.insert(fiveHour(1, "2026-09-03T15:50:00Z", resetsAt, meter));
-      const finalStretch = await fillFor(store, meter, 2, 10, new Date("2026-09-03T15:50:00Z"), { owner: "orchestrator", pacing: "even", allowance: "fill" });
-      expect(finalStretch).toMatchObject({ allowance_basis: "full" });
+    } finally { store.close(); }
+  });
+
+  it("keeps applying the fill projection through the final stretch, catching a burst the old full-capacity fallback would have missed", async () => {
+    const store = await open();
+    try {
+      const nowFinal = new Date("2026-09-03T15:50:00Z");
+      const resetSoon = "2026-09-03T16:10:00Z"; // 20 minutes left: inside the 45-minute final stretch
+      store.insert(fiveHour(10, "2026-09-03T15:00:00Z", resetSoon, meter));
+      store.insert(fiveHour(50, nowFinal.toISOString(), resetSoon, meter)); // 48 pts/h over the last 50 minutes
+      const gate = gateFor(store, [{ window: "5h", points: 40 }], meter, 10, false, nowFinal, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      // Projected ~50 + 48 pts/h * (20/60)h ~= 66; +40 requested is over the
+      // 90% reserve-derived cap. The old code instead fell back to a plain
+      // reserve check on the raw 50% used once inside the final stretch,
+      // silently dropping the burn projection exactly when it matters most.
+      expect(gate).toMatchObject({ allowed: false, allowance_basis: "fill" });
+      const fill = await fillFor(store, meter, 2, 10, nowFinal, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(fill).toMatchObject({ allowance_basis: "fill" });
+      expect("error" in fill ? null : fill.lanes?.lanes).toBeLessThan(Math.floor((100 - 50 - 5) / 2));
+    } finally { store.close(); }
+  });
+
+  it("refuses as UNKNOWN rather than assuming zero burn when the 60-minute burn cannot be computed", async () => {
+    const store = await open();
+    try {
+      // A single sample gives leastSquaresBurnPerHour nothing to fit a slope
+      // to -- burn is null, not a measured zero.
+      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      const gate = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(gate).toMatchObject({ allowed: false, unknown: true });
+      expect(gate.reason).toContain("burn");
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect("error" in fill).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it("refuses as UNKNOWN when the 5h window has no finite future reset", async () => {
+    const store = await open();
+    try {
+      store.insert({ ...fiveHour(1, now.toISOString(), resetsAt, meter), resets_at: null });
+      const gate = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(gate).toMatchObject({ allowed: false, unknown: true });
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect("error" in fill).toBe(true);
+      // A reset already in the past is just as unusable a horizon to project to.
+      store.insert({ ...fiveHour(1, now.toISOString(), resetsAt, meter), resets_at: "2026-09-03T11:00:00Z" });
+      const pastReset = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(pastReset).toMatchObject({ allowed: false, unknown: true });
+    } finally { store.close(); }
+  });
+
+  it("treats a held/vendor-inconsistent 5h row as unknown for fill even at a fresh age", async () => {
+    const store = await open();
+    try {
+      store.insert({ ...fiveHour(1, now.toISOString(), resetsAt, meter), metadata: { vendor_window_held: true } });
+      const gate = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect(gate).toMatchObject({ allowed: false, unknown: true });
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      expect("error" in fill).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it("uses the exact 5h row's usage, reset and burn -- never the meter's merely-shortest window", async () => {
+    const store = await open();
+    try {
+      // A 90-minute window narrower than the 5h one: meterWindows' `short`
+      // (the meter's shortest window under a day) would resolve to THIS
+      // row, not the 300-minute one a 5h --need is actually asking about.
+      store.insert({ ...fiveHour(90, now.toISOString(), "2026-09-03T13:00:00Z", meter), window: { kind: "rolling", minutes: 90, enforcement: "hard" } });
+      // The real 300-minute window: barely used, reset far away, zero burn.
+      seedZeroBurn(store, 1);
+      const result = gateFor(store, [{ window: "5h", points: 50 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill" });
+      // Using the 90m row's 90% used and its 1h-away reset would refuse this
+      // outright; the correct 300-minute row (1% used, 4.5h away) fits.
+      expect(result).toMatchObject({ allowed: true, allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
     } finally { store.close(); }
   });
 

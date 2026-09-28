@@ -28,10 +28,19 @@ describe("evaluateProRataLine", () => {
 });
 
 describe("evaluateFillAllowance", () => {
-  it("uses observed usage and reservations when burn history is absent", () => {
+  it("refuses rather than assuming zero burn when history is absent (null)", () => {
     const result = evaluateFillAllowance({ usedPercent: 1, reservedByOthersPercent: 20, burnPercentPerHour: null, laneHours: 2, capPercent: 90, requestPercent: 49 });
+    expect(result.allowed).toBe(false);
+    expect(result.unknown).toBe(true);
+    expect(result.reason).toContain("recent burn history is unknown");
+    expect(result.reason).toContain("refusing rather than assuming zero burn");
+  });
+
+  it("accepts a real, measured zero burn (distinct from absent history)", () => {
+    const result = evaluateFillAllowance({ usedPercent: 1, reservedByOthersPercent: 20, burnPercentPerHour: 0, laneHours: 2, capPercent: 90, requestPercent: 49 });
+    expect(result.unknown).toBeUndefined();
     expect(result).toMatchObject({ allowed: true, projected_percent: 21, allowance_percent: 69, cap_percent: 90 });
-    expect(result.reason).toContain("no burn history");
+    expect(result.reason).toContain("burn 0.0 pts/h x 2.0 h");
     expect(result.reason).toContain("69.0 under the 90 cap");
   });
 

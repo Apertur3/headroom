@@ -205,8 +205,10 @@ export function evaluateProRataLine(input: ProRataInput): ProRataResult {
 export interface FillAllowanceInput {
   usedPercent: number;
   reservedByOthersPercent: number;
-  /** The 60-minute least-squares burn; an absent history is deliberately
-   * treated as no projected burn, and named as such in the explanation. */
+  /** The 60-minute least-squares burn. Null means no history to derive a
+   * rate from at all -- evaluateFillAllowance refuses on that rather than
+   * assuming zero, distinct from a real, measured zero (history exists, the
+   * rate is flat), which is accepted normally. */
   burnPercentPerHour: number | null;
   laneHours: number;
   capPercent: number;
@@ -218,20 +220,37 @@ export interface FillAllowanceResult {
   projected_percent: number;
   allowance_percent: number;
   cap_percent: number;
+  /** True only when refused because the 60-minute burn could not be computed
+   * at all -- distinct from a real, observed zero burn (no activity in the
+   * lookback, but history exists). Callers render this like any other
+   * UNKNOWN reading, never as a plain "no". */
+  unknown?: true;
 }
 
 export function evaluateFillAllowance(input: FillAllowanceInput): FillAllowanceResult {
-  const burn = Math.max(0, input.burnPercentPerHour ?? 0);
-  const laneHours = Math.max(0, input.laneHours);
-  const projected = Math.min(100, input.usedPercent + input.reservedByOthersPercent + burn * laneHours);
   const cap = Math.max(0, Math.min(100, input.capPercent));
   const capLabel = Number.isInteger(cap) ? cap.toFixed(0) : cap.toFixed(1);
+  // Missing burn history (no observations in the lookback to derive a rate
+  // from) is not the same fact as a measured zero burn, and must not be
+  // silently treated as one: a zero fallback here would let fill authorize
+  // capacity precisely when the projection has nothing to go on. Refuse
+  // instead, and say so distinctly from an ordinary cap refusal.
+  if (input.burnPercentPerHour === null) {
+    return {
+      allowed: false,
+      unknown: true,
+      reason: `fill: recent burn history is unknown; refusing rather than assuming zero burn`,
+      projected_percent: Math.min(100, input.usedPercent + input.reservedByOthersPercent),
+      allowance_percent: 0,
+      cap_percent: cap,
+    };
+  }
+  const burn = Math.max(0, input.burnPercentPerHour);
+  const laneHours = Math.max(0, input.laneHours);
+  const projected = Math.min(100, input.usedPercent + input.reservedByOthersPercent + burn * laneHours);
   const allowance = Math.max(0, cap - projected);
   const allowed = input.requestPercent <= allowance;
-  const burnTerm = input.burnPercentPerHour === null
-    ? "no burn history"
-    : `burn ${burn.toFixed(1)} pts/h x ${laneHours.toFixed(1)} h`;
-  const terms = `used ${input.usedPercent.toFixed(1)} + reserved ${input.reservedByOthersPercent.toFixed(1)} + ${burnTerm}`;
+  const terms = `used ${input.usedPercent.toFixed(1)} + reserved ${input.reservedByOthersPercent.toFixed(1)} + burn ${burn.toFixed(1)} pts/h x ${laneHours.toFixed(1)} h`;
   const reason = allowed
     ? `fill: projected ${projected.toFixed(1)} pts at lane end (${terms}) leaves ${allowance.toFixed(1)} under the ${capLabel} cap`
     : `fill: projected ${projected.toFixed(1)} pts at lane end (${terms}); request ${input.requestPercent.toFixed(1)} exceeds the ${capLabel} cap by ${(input.requestPercent - allowance).toFixed(1)}`;
