@@ -47,6 +47,10 @@ read the same way.
 
 `history` (a command with no equivalent MCP tool) is also a bare array and is
 out of scope for this version of the contract; it is not enveloped either.
+Like `rate`/`events`, a daemon socket that exists but did not answer health
+even after one retry still serves this same bare array, read-only from the
+store's last-written rows -- flagged only on stderr, never a field on the
+array itself.
 
 ## Shared vocabulary
 
@@ -105,9 +109,13 @@ cases) are marked; every other field is always present, though its value may
 be `null`.
 
 **Exit codes that apply everywhere**: `0` success; `1` a CLI usage error or an
-unhandled exception (printed to stderr as `headroom error: ...`, never as
-JSON). Where a command's own exit codes differ from that, they are called out
-below.
+unhandled exception, printed to stderr as `headroom error: ...`. A `--json`
+invocation additionally prints `{"error": "<message>"}` to stdout in this
+case (nothing else on stdout that run) -- added so a `--json` caller can never
+see empty stdout and mistake "no answer at all" for "a reading with nothing in
+it" (an empty `observations`/bare-array result is still valid JSON, just a
+different shape than this error object). Where a command's own exit codes
+differ from the `0`/`1` pair above, they are called out below.
 
 ### `status` (`headroom --json` / `--threshold N --json`, MCP `quota_status`)
 
@@ -185,10 +193,20 @@ Exit codes: `2` when `--threshold` finds a blocking window; `3` when at least
 one source failed but at least one observation still exists; `1` when at
 least one source failed and there are no observations at all; `0` otherwise.
 
-MCP `quota_status`: `{ contract, generated_at, source?: "direct",
-observations: Observation[], plan_downgraded: { principal, from, to, since,
-acknowledged } | null, failures?: string[] }`. Direct reads carry `source` and
-`failures`; daemon reads omit them. There is no `--threshold` equivalent.
+`served_from: "cache"` and `daemon: "unresponsive"` are additive fields, present
+only when a daemon socket exists but did not answer `health` even after one
+retry: the reading was served from the store's own last-written rows,
+read-only, with freshness/pace still computed against the current clock (a
+stale row still serves stale). Absent on every other read, daemon-answered or
+direct alike.
+
+MCP `quota_status`: `{ contract, generated_at, source?: "direct" | "cache",
+daemon?: "unresponsive", observations: Observation[], plan_downgraded: {
+principal, from, to, since, acknowledged } | null, failures?: string[] }`.
+Direct reads carry `source: "direct"` and `failures`; a cached read (daemon
+present but unresponsive after one retry) carries `source: "cache"`,
+`daemon: "unresponsive"`, and `failures: []`; daemon reads omit `source` and
+`daemon` entirely. There is no `--threshold` equivalent.
 
 ### `can` (`headroom can <class> --owner X --json`, MCP `quota_can`)
 
@@ -204,12 +222,19 @@ max_more_before_reset: number | null }`.
 
 Exit codes: `2` when refused (`allowed: false`); `0` when allowed.
 
-MCP `quota_can`: `{ contract, generated_at, source?: "direct", decision:
-CanDecision, cost: CostEstimate, leased_id: string | null }` -- the same
-`allowed`/`meter`/`state`/`reason`/`meters`/`local_preference`/
-`local_meter_considered` fields as the CLI's top level, nested one level
-under `decision` instead. `source` is present only over the direct (no
-daemon) fallback.
+`served_from: "cache"`/`daemon: "unresponsive"` apply here exactly as
+documented under `status` above, and only without `--lease`: a `can --lease`
+call is a dispatch path (it can reserve capacity) and stays fail-closed,
+never served from cache.
+
+MCP `quota_can`: `{ contract, generated_at, source?: "direct" | "cache",
+daemon?: "unresponsive", decision: CanDecision, cost: CostEstimate, leased_id:
+string | null }` -- the same `allowed`/`meter`/`state`/`reason`/`meters`/
+`local_preference`/`local_meter_considered` fields as the CLI's top level,
+nested one level under `decision` instead. `source`/`daemon` are present only
+over the direct (no daemon) or cached (daemon present but unresponsive)
+fallback, never over a daemon-lease (`lease: true`) call, which stays
+fail-closed.
 
 ### `gate` (`headroom gate --need ... --json`, MCP `quota_gate`)
 
@@ -391,8 +416,17 @@ owner's ledger-attributed share of the same lookback window. Exit codes:
 always `0` for a real reading; a genuine usage error (e.g. `--minutes` not a
 number) throws and exits `1`.
 
-MCP `quota_rate`: enveloped, `{ contract, generated_at, source?: "direct",
-lines: RateLine[] }`; over a daemon, the bare `RateLine[]` instead.
+The CLI's bare array is unchanged when a daemon socket exists but did not
+answer health even after one retry: this reading is still the same bare
+array, served read-only from the store's last-written rows -- flagged only on
+stderr (`(served from cache; daemon busy, not a fresh read)`), the same
+convention the no-daemon direct-read notice already uses, since a bare array
+has nowhere to carry a field (see "Array-shaped outputs" above).
+
+MCP `quota_rate`: enveloped, `{ contract, generated_at, source?: "direct" |
+"cache", daemon?: "unresponsive", lines: RateLine[] }`; over a daemon, the
+bare `RateLine[]` instead. A cached read (daemon present but unresponsive
+after one retry) carries `source: "cache"` and `daemon: "unresponsive"`.
 
 ### `spend` (bare array -- see "Array-shaped outputs")
 
@@ -440,8 +474,15 @@ when neither relationship is observed; absence is UNKNOWN, never capacity.
 Metadata is absent when an event has no such fact. Exit codes:
 always `0`.
 
-MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct",
-events: HeadroomEvent[] }`; over a daemon, the bare `HeadroomEvent[]` instead.
+Same cached-read behavior as `rate` above applies here: the CLI's bare array
+is unchanged, flagged only on stderr, when a daemon socket exists but did not
+answer health even after one retry.
+
+MCP `quota_events`: enveloped, `{ contract, generated_at, source?: "direct" |
+"cache", daemon?: "unresponsive", events: HeadroomEvent[] }`; over a daemon,
+the bare `HeadroomEvent[]` instead. A cached read carries `source: "cache"`
+and `daemon: "unresponsive"`, the same convention `quota_status`/`quota_can`/
+`quota_rate` use.
 
 ### `models` (bare array -- see "Array-shaped outputs")
 
@@ -515,7 +556,7 @@ contract 1.0
 docs/json-contract.md
 ```
 
-## CLI vs MCP: daemon vs direct
+## CLI vs MCP: daemon vs direct vs cache
 
 A handful of commands/tools (`status`/`quota_status`, `cost`/`quota_cost`,
 `rate`/`quota_rate`, `spend`/`quota_spend`, `events`/`quota_events`,
@@ -524,8 +565,15 @@ none running, read the store directly. For every one of these, a **daemon**
 answer is the bare array the underlying store method returns; a **direct**
 (no daemon) answer is wrapped as `{ source: "direct", ... }` by `src/mcp.ts`'s
 own `direct*` handlers -- a pre-existing convention from before this contract.
-This contract's envelope only ever applies to an object, so it stacks
-differently depending on the command:
+Four of them (`status`/`quota_status`, `history`, `events`/`quota_events`,
+`rate`/`quota_rate`, and `can`/`quota_can` without a lease) have a third
+answer, **cache**: a daemon socket exists but did not answer health even after
+one retry, so the reading is served read-only from the store's last-written
+rows instead, wrapped the same way direct is (`source: "cache"`, plus
+`daemon: "unresponsive"`) wherever the shape is already an object -- see
+"cache" under each of those commands above for the exact fields. This
+contract's envelope only ever applies to an object, so it stacks differently
+depending on the command:
 
 - **CLI** `status` and `lease list` always end up enveloped: `src/cli.ts`
   reshapes both into an object (`{ observations, leases }` /
