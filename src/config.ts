@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { headroomHome } from "./paths.js";
@@ -8,9 +8,20 @@ async function optionalText(path: string): Promise<string | undefined> {
   try { return await readFile(path, "utf8"); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
 
+/** policy.toml's own mtime, ISO -- null when it does not exist. Read
+ * alongside the file's text so a reserve refusal that names no reason/set_at
+ * of its own can still say when the file itself last changed (see
+ * policy.ts's reserveAttributionSuffix). */
+async function optionalMtime(path: string): Promise<string | null> {
+  try { return (await stat(path)).mtime.toISOString(); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+}
+
 export async function readPolicy(): Promise<Policy> {
-  const text = await optionalText(join(headroomHome(), "policy.toml"));
-  return text === undefined ? defaultPolicy : parsePolicy(text);
+  const path = join(headroomHome(), "policy.toml");
+  const [text, mtime] = await Promise.all([optionalText(path), optionalMtime(path)]);
+  if (text === undefined) return defaultPolicy;
+  const now = new Date();
+  return { ...parsePolicy(text, now), policy_mtime: mtime };
 }
 
 export type LocalPreference = "fallback" | "prefer" | "never";
