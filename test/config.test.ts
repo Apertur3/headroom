@@ -110,7 +110,9 @@ describe("seedExampleConfig", () => {
     expect(routingSeeders).toHaveLength(1);
   });
 
-  it("never deletes a concurrent policy set's already-landed write when the seed's own write fails after its exclusive create", async () => {
+  // Windows refuses to rename over a file another handle still holds open, so this interleaving
+  // (a concurrent writer replacing the path while the seed's handle is open) cannot occur there.
+  it.skipIf(process.platform === "win32")("never deletes a concurrent policy set's already-landed write when the seed's own write fails after its exclusive create", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-seed-race-"));
     temporary.push(home);
     const policyTarget = join(home, "policy.toml");
