@@ -106,7 +106,14 @@ export interface Observation {
     /** Codex endpoint idle zero: reset is fetch time plus the window, so the
      * timestamp moves each poll and is not a durable window identity. */
     codex_idle_window?: boolean;
+    /** A human recorded a banked reset the vendor does not expose. A clear is
+     * also a real zero-valued row so the prior count stays auditable. */
+    manual?: boolean;
+    manual_cleared?: boolean;
   };
+  /** Computed at response time for a credits count whose recorded expiry has
+   * passed. Raw stored observations never gain this field or get rewritten. */
+  credits_lapsed?: boolean;
   /** Computed, never persisted: least-squares burn rate from this window's
    * fresh samples in the last lookback minutes (60 by default), the
    * projected time to 100% used at that rate, and the straight-line percent

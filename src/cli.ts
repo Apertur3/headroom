@@ -33,16 +33,17 @@ import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
-import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed, type PlanResult } from "./pacing.js";
+import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor, type RateLine, type RouteResult } from "./orchestrator-reads.js";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { headroomHome, migrateLegacyHome } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
+import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
-import { HeadroomStore, safeHeadroomDirectory, type PlanDowngrade } from "./store.js";
+import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
 import { isLocalAccount, type Account, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
@@ -450,6 +451,71 @@ async function report(argv: string[]): Promise<number> {
   return 0;
 }
 
+function printCredits(items: CreditBalance[]): void {
+  if (!items.length) { console.log("no credits meters"); return; }
+  for (const item of items) {
+    const expiry = item.expires_at ? ` ${item.expires_at}` : "";
+    console.log(`${item.meter}  ${item.lapsed ? `${item.available} expired${expiry}` : `${item.available} available${expiry}`}  source ${item.source}`);
+  }
+}
+
+async function configuredCreditPrincipal(principal: string): Promise<void> {
+  if (!(await readAccounts()).some((account) => account.name === principal)) throw new Error(`unknown principal: ${principal}`);
+}
+
+/** A manual credits write goes through the daemon when it owns the database,
+ * so status's cached read sees it immediately; otherwise it uses the same
+ * store method directly. Both paths return the one current balance shape. */
+async function credits(argv: string[]): Promise<number> {
+  const command = argv[0];
+  const asJson = argv.includes("--json");
+  if (!command || command === "--json") {
+    if (argv.some((value) => value !== "--json")) throw new Error("Usage: headroom credits [--json]");
+    const request = await requestDaemon("credits");
+    let items: CreditBalance[];
+    if (request !== undefined) items = unwrapRpc(request) as CreditBalance[];
+    else {
+      const store = await HeadroomStore.open();
+      try { items = store.credits(); store.audit("cli", "credits", null, "ok"); }
+      finally { store.close(); }
+    }
+    if (asJson) console.log(JSON.stringify(withContract({ credits: items })));
+    else printCredits(items);
+    return 0;
+  }
+  if (command !== "set" && command !== "clear") throw new Error("Usage: headroom credits <set|clear> --principal <name> [--available <n> --expires <YYYY-MM-DD or ISO instant>] [--json]");
+  const principal = option(argv, "--principal");
+  if (!principal) throw new Error("--principal is required");
+  await configuredCreditPrincipal(principal);
+  let result: CreditBalance;
+  if (command === "set") {
+    const rawAvailable = option(argv, "--available");
+    const rawExpiry = option(argv, "--expires");
+    const available = rawAvailable === undefined ? Number.NaN : Number(rawAvailable);
+    if (!Number.isFinite(available) || available < 0 || !Number.isInteger(available)) throw new Error("--available must be a non-negative whole number");
+    if (!rawExpiry) throw new Error("--expires is required");
+    const expires = parseCreditExpiry(rawExpiry);
+    const request = await requestDaemon("credits_set", { principal, available, expires });
+    if (request !== undefined) result = unwrapRpc(request) as CreditBalance;
+    else {
+      const store = await HeadroomStore.open();
+      try { store.recordManualCredits(principal, available, expires); result = store.credits().find((item) => item.meter === `${principal}:credits`)!; store.audit("cli", "credits_set", principal, "ok"); }
+      finally { store.close(); }
+    }
+  } else {
+    const request = await requestDaemon("credits_clear", { principal });
+    if (request !== undefined) result = unwrapRpc(request) as CreditBalance;
+    else {
+      const store = await HeadroomStore.open();
+      try { store.clearManualCredits(principal); result = store.credits().find((item) => item.meter === `${principal}:credits`)!; store.audit("cli", "credits_clear", principal, "ok"); }
+      finally { store.close(); }
+    }
+  }
+  if (asJson) console.log(JSON.stringify(withContract({ credit: result })));
+  else printCredits([result]);
+  return 0;
+}
+
 async function ack(argv: string[]): Promise<number> {
   if (argv[0] !== "plan" || !argv[1]) throw new Error("Usage: headroom ack plan <principal>");
   const store = await HeadroomStore.open();
@@ -655,30 +721,38 @@ async function planImport(argv: string[]): Promise<number> {
 async function plan(argv: string[]): Promise<number> {
   if (argv[0] === "import") return planImport(argv.slice(1));
   const meter = option(argv, "--meter");
-  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]");
+  if (!meter) throw new Error("Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]");
   const until = option(argv, "--until");
   if (until !== "reset") throw new Error("--until must be 'reset' (the only supported value)");
   const reserveValue = option(argv, "--reserve");
   if (reserveValue !== undefined && (!Number.isFinite(Number(reserveValue)) || Number(reserveValue) < 0 || Number(reserveValue) > 100)) throw new Error("--reserve must be 0 through 100");
+  const targetValue = option(argv, "--target");
+  const targetPoints = targetValue === undefined ? undefined : Number(targetValue);
+  if (targetPoints !== undefined && (!Number.isFinite(targetPoints) || targetPoints < 0)) throw new Error("--target must be a non-negative number");
   const asJson = argv.includes("--json");
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
-  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need });
-  let result: ({ meter: string } & PlanResult) | { meter: string; error: string };
+  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need, target_points: targetPoints });
+  let result: Awaited<ReturnType<typeof planFor>>;
   if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
   else {
     directReadNotice();
     const policy = await readPolicy();
     const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
     const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
   // window at all) -- that is a data state to report, not a CLI failure, so
   // it renders like status's own UNKNOWN line and exits 0 rather than 1.
   if ("error" in result) { console.log(`${result.meter}  UNKNOWN (${result.error})`); return 0; }
-  console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h`);
+  const banked = result.banked;
+  const bankedText = banked.lapsed
+    ? `banked ${banked.available} expired${banked.expires_at ? ` ${banked.expires_at}` : ""} (${banked.source ?? "vendor"})`
+    : `banked ${banked.available} available${banked.expires_at ? ` (expires ${banked.expires_at})` : ""}${banked.source ? ` (${banked.source})` : ""}`;
+  const targetText = result.target ? `  target ${result.target.points}: ${result.target.fits_now ? "fits now" : result.target.resets_needed === null ? "cannot fit: each banked reset is fully reserved" : result.target.fits_with_banked ? `needs ${result.target.resets_needed} banked reset${result.target.resets_needed === 1 ? "" : "s"}` : `needs ${result.target.resets_needed} resets`}` : "";
+  console.log(`${result.meter}  ${result.points_per_5h_window.toFixed(2)} pts/5h-window over ${result.remaining_5h_windows} window${result.remaining_5h_windows === 1 ? "" : "s"} (weekly remaining ${result.weekly_remaining_percent.toFixed(1)}%, reserve ${result.reserve_percent}%)  plan line ${result.plan_line_percent_per_hour.toFixed(2)}%/h  ${bankedText}${targetText}  ${result.advice.reason}`);
   return 0;
 }
 
@@ -978,7 +1052,7 @@ export async function observe(argv: string[]): Promise<number> {
   if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  if (argv.includes("--json")) { console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
+  if (argv.includes("--json")) { const lapsed = withCreditsLapsed(observations); console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } }))); }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
@@ -1360,10 +1434,11 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["spend", "Per-owner attributed spend on a shared meter, from the spend ledger"],
   ["export", "Export observations, events, the spend ledger, and leases for a period as JSON or CSV"],
   ["inbox", "Read this session's hand-off messages, or send one to another session"],
-  ["plan", "Points available per remaining 5h window and the plan line to hold (plan import <file> loads a budget plan)"],
+  ["plan", "Points available per remaining 5h window, banked resets, and the plan line to hold (plan import <file> loads a budget plan)"],
   ["gate", "Pre-dispatch check: do these points fit the current window (and the plan)"],
   ["run", "Gate, lease, and launch one command as an atomic dispatch"],
   ["report", "Record or clear a vendor-reported exhausted meter"],
+  ["credits", "Record, clear, or list banked reset credits"],
   ["ack plan", "Acknowledge a principal plan downgrade before dispatching again"],
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
@@ -1409,12 +1484,17 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   export: EXPORT_HELP,
   inbox: [INBOX_HELP, `  send: ${INBOX_SEND_HELP}`].join("\n"),
   plan: [
-    "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--json]",
+    "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]",
     `  import: ${PLAN_IMPORT_HELP}`,
   ].join("\n"),
   gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
   run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
   report: "Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]",
+  credits: [
+    "Usage: headroom credits [--json]",
+    "  set:   headroom credits set --principal <name> --available <n> --expires <YYYY-MM-DD or ISO instant> [--json]",
+    "  clear: headroom credits clear --principal <name> [--json]",
+  ].join("\n"),
   ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
@@ -1562,6 +1642,7 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "gate") return gate(argv.slice(1));
   if (argv[0] === "run") return run(argv.slice(1));
   if (argv[0] === "report") return report(argv.slice(1));
+  if (argv[0] === "credits") return credits(argv.slice(1));
   if (argv[0] === "ack") return ack(argv.slice(1));
   if (argv[0] === "wait") return wait(argv.slice(1));
   if (argv[0] === "fill") return fill(argv.slice(1));

@@ -126,6 +126,12 @@ top-level field in the response is either the two account-wide windows, a `seven
 the `limits[]` array, or a spend/dollar-denominated block (`extra_usage`, `spend`) -- none of which
 carries "how many free resets do I have left" semantics. This adapter does not invent one.
 
+Claude's usage endpoint does not expose banked reset credits. If a human sees one in Claude's UI,
+record that fact explicitly: `headroom credits set --principal claude-main --available 1 --expires
+2026-10-05`. `headroom credits clear --principal claude-main` records its later removal without
+erasing the original entry. These manual observations are marked estimated/manual and are advisory
+to `plan --target`; Headroom never uses a reset itself.
+
 Because the response's schema evidently keeps changing (new top-level keys have appeared across
 Claude Code releases without warning), `observationsFromClaudeUsage` checks every top-level key
 against the ones it actually reads and logs a safe, capped form of the name -- never the value --
