@@ -7,6 +7,35 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- The explicit `fill` allowance for `gate`, `run`, and `fill --allowance fill` was silently skipped
+  whenever policy pacing was `"none"`, letting a caller over-dispatch past the reserve-derived cap
+  with no burn projection at all. `fill` now runs independently of pacing; pacing still restricts
+  only the pro-rata line and burst check it was always meant to.
+- `accounts.toml` enable/disable and rediscovery writes are now atomic (temp file + rename) and
+  always end up `0600` on POSIX (Windows has no equivalent permission bit), matching the pattern
+  already used for `policy.toml`: a plain `writeFile`'s mode only applied the first time the file
+  was created, so a pre-existing permissive file stayed permissive, and an interrupted write could
+  truncate it. The write also refuses outright if `accounts.toml` is a symlink instead of following
+  it, and both reads that precede a write now use the same no-follow, bounded reader instead of a
+  plain `readFile` that would itself follow a symlink or block on a FIFO planted at that path.
+- Every `policy.toml` writer -- `headroom policy set`/`clear` and `headroom notify configure`'s own
+  edit -- now shares one exclusive lock, so two of them can no longer interleave a read and a write
+  across each other and have one's edit silently erased by the other's rename. The lock is an
+  ownership-tokened directory reclaimed only once its owning process is confirmed dead or it has sat
+  past a 10-minute hard bound -- never merely because an edit (always a few milliseconds in practice)
+  is still running -- and is only ever released by the call that still owns it. Seeding a fresh
+  `policy.toml`/`routing.toml` from `examples/` on first `accounts discover` is now a single
+  exclusive-create under the same shared lock instead of a separate check-then-write, so it can no
+  longer overwrite a reserve a concurrent `policy set` just added; if the seed's own write still fails
+  after that exclusive create, cleanup now proves (by comparing the open file handle's own inode
+  against whatever currently sits at the path) that the file it is about to delete is still the one it
+  created, rather than unconditionally deleting whatever is there. Timestamped `.bak-` backups taken
+  in the same millisecond no longer collide either; a colliding name gets a counter suffix instead of
+  overwriting the earlier backup.
+- `headroom accounts enable`/`disable` and rediscovery are two independent read-modify-write paths on
+  `accounts.toml`; without serialization, a rediscovery reading before a concurrent `disable`'s write
+  landed, then writing after, could silently re-enable a principal an operator just parked. Both now
+  share one exclusive lock (the same design as `policy.toml`'s, a separate lock directory).
 - Parked principals are now excluded at the model-catalog credential/cache boundary and by both daemon and direct-status callers, so a disabled account cannot read a vendor cache, credential, or model-list endpoint. Cached `can`/`quota_can` also exclude disabled local pools, and cached `quota_rate` returns the same disabled-meter UNKNOWN line as daemon and direct reads.
 - Exclude parked principals from unscoped `rate` and `quota_gate` capacity reads, statusline snapshot discovery and stored-row fallback rendering, and current manual-credit reads; credit writes now refuse a disabled principal in both the CLI and daemon.
 - `quota_can` now uses one `{ decision, cost, leased_id }` wrapper for daemon, direct, and cached replies, with disabled decisions reporting unknown learned cost. `usage import` also checks its exact principal before opening either its input file or usage database.

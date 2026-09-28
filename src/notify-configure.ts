@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { headroomHome, assertSafeAncestry } from "./paths.js";
-import { readBoundedRegularFile, safeOutputDirectory, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, safeOutputDirectory, withPolicyLock, writeFileAtomic } from "./security.js";
 import {
   DEFAULT_SOURCE_HEALTH_MIN_MINUTES, DEFAULT_SOURCE_HEALTH_MIN_POLLS,
   NOTIFY_EVENT_NAMES, PRESET_EVENTS, TELEGRAM_SECRET, notifyTest, parseNotifyConfig,
@@ -167,13 +167,22 @@ export async function configureNotifications(argv: string[], options: ConfigureO
     print(`${dryRun ? "Would write" : "Notification settings for"} ${path}:\n${table}`);
     if (config.channels.includes("telegram")) print(`Store the bot token in another terminal (hidden prompt):\n${secretStoreHint(TELEGRAM_SECRET, options.platform)}`);
     if (dryRun) { print("Dry run: no file write, secret lookup or test delivery."); return 0; }
-    // A long-running picker must not overwrite an edit made while it was open.
-    let latest = "";
-    try { latest = await readBoundedRegularFile(path); }
-    catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (latest !== original) throw new Error("policy.toml changed while configuring; run the picker again");
     await safeOutputDirectory(home);
-    await writeFileAtomic(path, rewriteNotifyTable(original, table), 0o600);
+    // The interactive picker above can run for as long as a human takes to
+    // answer prompts, so it deliberately runs outside the lock -- only the
+    // actual commit (reread, compare, write) needs to be atomic against
+    // every other policy.toml writer (headroom policy set/clear shares the
+    // same lock). A long-running picker must not overwrite an edit made
+    // elsewhere while it was open; wrapping the reread-compare-write in the
+    // shared lock closes the gap a plain reread could otherwise still leave
+    // between "confirmed unchanged" and "written".
+    await withPolicyLock(home, async () => {
+      let latest = "";
+      try { latest = await readBoundedRegularFile(path); }
+      catch (error: unknown) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (latest !== original) throw new Error("policy.toml changed while configuring; run the picker again");
+      await writeFileAtomic(path, rewriteNotifyTable(original, table), 0o600);
+    });
     print(`Wrote ${path}.`);
     if (config.channels.length && await yesNo(ask, "Send a test message now?")) {
       const status = await prepareChannels(config, options);

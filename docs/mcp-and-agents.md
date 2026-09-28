@@ -326,10 +326,12 @@ that shape), optional `meter`, `plan`, `reserve_percent` (0-100), `cap_percent` 
 `duration_minutes` (> 0), `allowance` (`"pro_rata" | "fill"`), `owner`, `plan_share_percent`
 (>= 0), `action_class` (adds a `lanes_remaining_for_class` figure from the learned cost for that
 class, when one exists). The pre-dispatch check: `fits: true` when the requested points fit
-the current window (and, with `plan`, the plan line); under even pacing a 5h need is also checked
-against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
-`allowance: "fill"` replaces those two pacing checks with an end-of-lane projection of use, other
-owners' leases, and recent burn under the reserve-derived (and optionally tightened) cap.
+the current window (and, with `plan`, the plan line); under even pacing (the default `pro_rata`
+allowance) a 5h need is also checked against the pro-rata share of the window that has elapsed, and
+a burst is refused with a reason. `allowance: "fill"` replaces those two pacing-gated checks with an
+end-of-lane projection of use, other owners' leases, and recent burn under the reserve-derived (and
+optionally tightened) cap -- this projection runs, and can refuse, under either pacing setting; only
+the pro-rata/burst pair above is ever gated by `pacing`.
 Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
 older than `staleness_minutes`, or if `meter` resolves to several meters and one of them has never
 produced a windowed reading at all. Also carries an additive `host` object (same shape and meaning

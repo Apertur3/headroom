@@ -1,8 +1,9 @@
-import { readFile, writeFile, mkdir, chmod, stat } from "node:fs/promises";
+import { readFile, writeFile, mkdir, lstat, open, stat, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { headroomHome } from "./paths.js";
 import { defaultPolicy, parsePolicy, type Policy } from "./policy.js";
+import { withPolicyLock } from "./security.js";
 
 async function optionalText(path: string): Promise<string | undefined> {
   try { return await readFile(path, "utf8"); } catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
@@ -90,39 +91,100 @@ function packageRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-async function writeSeededFile(path: string, text: string): Promise<void> {
+/**
+ * Best-effort cleanup for a file `seedFileExclusive` itself just created
+ * via `open(..., "wx")`, after a later write or close on it failed. Proves
+ * ownership before deleting anything: `handle`'s own fstat (taken while its
+ * fd is still open, so it reflects the exact inode this call created,
+ * regardless of whether the write/close that follows succeeds) is compared
+ * against an `lstat` of `path` right before the unlink. Only a match is
+ * removed -- if they differ, some other writer has since replaced `path`
+ * (e.g. a concurrent `headroom policy set`'s `writeFileAtomic`, whose
+ * `rename()` does not care what previously sat at the destination), and
+ * deleting it would silently destroy that writer's already-committed edit
+ * instead of the failed, empty-or-partial file this call actually owns.
+ * Every step here is swallowed: a cleanup failure must never mask the
+ * original write/close error this is already being called to handle.
+ */
+async function cleanupOwnFailedSeed(handle: FileHandle, path: string): Promise<void> {
+  let ownInfo: Awaited<ReturnType<FileHandle["stat"]>> | undefined;
+  try { ownInfo = await handle.stat(); } catch { /* fd already unusable: nothing to prove ownership with -- leave the file rather than risk deleting someone else's */ }
+  await handle.close().catch(() => {});
+  if (!ownInfo) return;
+  try {
+    const currentInfo = await lstat(path);
+    if (currentInfo.dev === ownInfo.dev && currentInfo.ino === ownInfo.ino) await unlink(path);
+  } catch { /* ENOENT (already gone) or any other lstat/unlink failure: nothing more to do */ }
+}
+
+/**
+ * Creates `path` exclusively (`open(..., "wx")`, O_EXCL) and writes `text`
+ * to it, returning whether this call actually created it. `EEXIST` -- the
+ * file was already there, whether from an earlier seed or a concurrent
+ * `accounts discover`/`policy set` racing this one -- is treated as "already
+ * seeded", not an error: unlike a check-then-write (`optionalText(path) ===
+ * undefined` followed by a plain `writeFile`), this can never overwrite a
+ * file a concurrent writer created in the gap between the two. A failed
+ * write or close after a successful create cleans up (see
+ * cleanupOwnFailedSeed) rather than leaving a partial file behind to wedge
+ * every future seed attempt -- callers additionally hold the shared policy
+ * lock for `policy.toml` (see seedExampleConfig) so a concurrent
+ * `headroom policy` writer's own write can never even attempt to land in
+ * this same window.
+ */
+async function seedFileExclusive(path: string, text: string): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, text, { mode: 0o600 });
-  await chmod(path, 0o600); // writeFile's mode is umask-masked; make the intent explicit
+  let handle;
+  try { handle = await open(path, "wx", 0o600); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await handle.writeFile(text, "utf8");
+    await handle.close();
+    return true;
+  } catch (error) {
+    await cleanupOwnFailedSeed(handle, path);
+    throw error;
+  }
 }
 
 /**
  * Seeds ~/.headroom/policy.toml and routing.toml from examples/ the first
  * time either is absent, so `headroom can <class>` works from a fresh
  * `accounts discover` without an extra manual copy step. Never overwrites an
- * existing file. Returns one human-readable line per file actually written,
- * empty when both were already present (or examples/ is unexpectedly
- * missing, which never blocks discovery on its own).
+ * existing file -- exclusive creation (see seedFileExclusive) makes this
+ * race-free against a concurrent writer, unlike an earlier check-then-write
+ * version of this function. Runs under the same shared policy lock every
+ * other `policy.toml` writer (headroom policy set/clear, notify configure)
+ * takes, held from the exclusive create through any cleanup: without it, a
+ * concurrent `policy set` could rename its own completed policy.toml over
+ * this call's exclusively-created (but not yet written) one, and a
+ * subsequent write/close failure here would then delete that writer's
+ * already-committed reserve instead of this call's own empty file.
+ * Returns one human-readable line per file actually written, empty when
+ * both were already present (or examples/ is unexpectedly missing, which
+ * never blocks discovery on its own).
  */
 export async function seedExampleConfig(home = headroomHome()): Promise<string[]> {
+  await mkdir(home, { recursive: true, mode: 0o700 });
   const root = packageRoot();
-  const messages: string[] = [];
-  const policyTarget = join(home, "policy.toml");
-  if ((await optionalText(policyTarget)) === undefined) {
-    const source = await optionalText(join(root, "examples", "policy.toml"));
-    if (source !== undefined) {
-      await writeSeededFile(policyTarget, source);
-      messages.push(`Seeded ${policyTarget} from examples/policy.toml.`);
+  const policySource = await optionalText(join(root, "examples", "policy.toml"));
+  const routingSource = await optionalText(join(root, "examples", "routing.toml"));
+  return withPolicyLock(home, async () => {
+    const messages: string[] = [];
+    if (policySource !== undefined) {
+      const policyTarget = join(home, "policy.toml");
+      if (await seedFileExclusive(policyTarget, policySource)) messages.push(`Seeded ${policyTarget} from examples/policy.toml.`);
     }
-  }
-  const routingTarget = join(home, "routing.toml");
-  if ((await optionalText(routingTarget)) === undefined) {
-    const source = await optionalText(join(root, "examples", "routing.toml"));
-    if (source !== undefined) {
-      await writeSeededFile(routingTarget, source);
-      const classes = Object.keys(parseRouting(source).consumes);
-      messages.push(`Seeded ${routingTarget} from examples/routing.toml (action classes: ${classes.join(", ")}). Edit to match your accounts.`);
+    if (routingSource !== undefined) {
+      const routingTarget = join(home, "routing.toml");
+      if (await seedFileExclusive(routingTarget, routingSource)) {
+        const classes = Object.keys(parseRouting(routingSource).consumes);
+        messages.push(`Seeded ${routingTarget} from examples/routing.toml (action classes: ${classes.join(", ")}). Edit to match your accounts.`);
+      }
     }
-  }
-  return messages;
+    return messages;
+  });
 }
