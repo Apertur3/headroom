@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-28
+
 ### Added
 - Opt-in `fill` allowance basis for `gate`, `fill`, and `run`: it projects current use, open leases, and recent burn to a lane's end while retaining reserve-derived caps; pro-rata pacing remains the default. (#70)
 - Principals can be parked with `enabled = false` in `accounts.toml`, or with `headroom accounts disable <name>`, without removing their configuration. Disabled principals are not polled, scheduled, or considered capacity -- including the Antigravity keepalive, which never launches for a disabled account and stops an already-running one the moment the last enabled Antigravity account is disabled -- while `history` stays readable (it cannot create capacity) and `rediscovery` only carries over the prior `enabled` flag, not a frozen location/adapter. Status and JSON name disabled principals explicitly via an additive `disabled_principals` field derived from the registry (the daemon's own `status` RPC result stays the plain `Observation[]` array the 1.x JSON contract requires); `can`/`gate`/`plan`/`fill`/`rate`/`run` each report a disabled meter in that command's own existing shape and exit code rather than a new one, and `headroom accounts enable <name>` restores a parked principal. A config read failure (a malformed or otherwise unreadable `accounts.toml`, as opposed to one that simply does not exist yet) fails closed rather than being treated as "nothing disabled". (#73)
