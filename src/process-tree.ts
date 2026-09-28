@@ -55,14 +55,33 @@ export async function listProcesses(execImpl?: ExecFile): Promise<ProcessEntry[]
   if (process.platform === "win32" && !execImpl) return [];
   const runner = execImpl ?? execFileAsync;
   try {
-    const { stdout } = await runner("ps", ["-Ao", "pid=,ppid=,rss=,comm="], { maxBuffer: 8 * 1024 * 1024 });
+    // A short timeout, not just a maxBuffer cap: this call also backs
+    // host-health.ts's host-pressure probe, which must never block a `run`
+    // dispatch decision on a hung or wedged `ps` -- an overloaded host is
+    // exactly the condition most likely to make one hang.
+    const { stdout } = await runner("ps", ["-Ao", "pid=,ppid=,rss=,comm="], { maxBuffer: 8 * 1024 * 1024, timeout: 2000 });
     return parsePsOutput(stdout);
   } catch {
-    // ps missing, or refused (e.g. a locked-down sandbox): callers treat an
-    // empty list the same as "no descendants found", never as a signal to
-    // give up entirely -- killTree still signals the root pid it was given.
+    // ps missing, refused (e.g. a locked-down sandbox), or timed out:
+    // callers treat an empty list the same as "no descendants found", never
+    // as a signal to give up entirely -- killTree still signals the root pid
+    // it was given.
     return [];
   }
+}
+
+/** Matches the command name (comm, no path/args) of a leaked keepalive
+ * process: either the `agy` binary Antigravity's CLI ultimately execs, or
+ * the `script` PTY wrapper Headroom itself spawns to keep it warm (see
+ * antigravity-keepalive.ts's agyPtyCommand). A live one is always still
+ * parented by that same `script` (or an interactive shell); once ppid is 1,
+ * its actual PTY owner is gone -- the exact leak shape issue #56, and the
+ * P0 test-side incident (see .claude/INCIDENT-2026-09-27-pty-leak.md), both
+ * reproduced. Shared by doctor.ts's antigravityOrphanCheck and
+ * host-health.ts's host-pressure probe so both count exactly the same leak
+ * instead of maintaining two patterns that could drift apart. */
+export function isOrphanedAgentProcess(entry: ProcessEntry): boolean {
+  return entry.ppid === 1 && /(^|[\\/])(agy(\.exe)?|script)$/.test(entry.command);
 }
 
 /** Every transitive child of `rootPid` (rootPid itself is not included),

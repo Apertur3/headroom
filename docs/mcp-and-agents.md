@@ -97,7 +97,8 @@ expected or learned percent, same as `can --lease`).
         "iqr_high": 5.0,
         "max_more_before_reset": 23
       },
-      "leased_id": null
+      "leased_id": null,
+      "host": { "state": "ok", "reasons": [], "load_ratio": 0.4, "pty_used": 3, "pty_max": 512, "orphans": 0 }
     }
   }
 }
@@ -106,7 +107,9 @@ expected or learned percent, same as `can --lease`).
 `owner` is required. It's how Headroom excludes your own open leases from the reservation check,
 so calling `quota_can` doesn't get blocked by a lease you started yourself. `cost` is always
 present (its fields are `null` with no learned or given expectation yet); `leased_id` is the new
-lease's id when `lease: true` was passed and the call was allowed, otherwise `null`.
+lease's id when `lease: true` was passed and the call was allowed, otherwise `null`. `host` is a
+fresh, additive read of local host pressure (see docs/concepts.md's "Host guard" section) --
+`quota_can` never refuses over it; only `headroom run`, which launches locally, does.
 
 ### `quota_events`
 
@@ -268,7 +271,9 @@ the current window (and, with `plan`, the plan line); under even pacing a 5h nee
 against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
 Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
 older than `staleness_minutes`, or if `meter` resolves to several meters and one of them has never
-produced a windowed reading at all. CLI: `headroom gate` (exit 2 when it does not fit).
+produced a windowed reading at all. Also carries an additive `host` object (same shape and meaning
+as `quota_can`'s, above) -- a fresh read of local host pressure that never affects `fits`/`allowed`
+here either. CLI: `headroom gate` (exit 2 when it does not fit).
 
 ### `quota_wait`
 

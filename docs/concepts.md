@@ -247,6 +247,44 @@ different orchestrator has already spoken for.
 Example: `headroom lease start --owner triage-bot --meter codex-main:main --expect 15 --ttl 30m`
 reserves 15 points of `codex-main:main` for 30 minutes.
 
+## Host guard
+
+Quota is not the only thing that can make dispatching more local work a bad idea: on 2026-09-27 a
+developer machine running several agent lanes was taken down by leaked processes -- about 290
+orphaned PTY-holding processes, kernel at 96% system CPU, load around 180 on 16 cores -- while
+every quota read and every dispatch kept going, because nothing was watching the host itself.
+Headroom already gates dispatch on quota; the host guard (`src/host-health.ts`) gates `headroom
+run`'s local launch on host pressure the same way, from one cheap, never-throwing read:
+
+| Measurement | What it is | Unknown when |
+|---|---|---|
+| `load_ratio` | `os.loadavg()[0] / os.cpus().length` | win32 (`os.loadavg()` always reports zeros there) |
+| `pty_used` / `pty_max` | In-use / configured pseudo-terminals (macOS: `sysctl kern.tty.ptmx_max` and `/dev/ttys*`; Linux: `/proc/sys/kernel/pty/{max,nr}`) | Not POSIX, or the probe itself failed |
+| `orphans` | Processes with ppid 1 whose command is the leaked `agy`/`script` shape (the same pattern `doctor`'s antigravity-orphan check uses -- see `isOrphanedAgentProcess` in `process-tree.ts`) | win32 (no PTY tree to walk there) |
+
+Every probe carries its own short timeout and never throws; a probe that fails or does not apply
+on this platform reports `null` ("unknown") rather than a number, and unknown measurements never
+contribute to a warn or refuse verdict -- exactly the same fail-closed-but-never-blocking rule the
+rest of Headroom applies to a stale quota reading, just inverted (here, "unknown" means "don't
+act," not "don't trust").
+
+`[host_guard]` in `policy.toml` sets `mode = "refuse"` (default) `| "warn" | "off"` and the
+thresholds: `warn_load_ratio` (default 2), `refuse_load_ratio` (default 3), `warn_pty_percent`
+(default 50), `refuse_pty_percent` (default 75). Orphans alone only ever warn, never refuse, at
+any count above zero -- a user's own stray `agy` left over from a normal Antigravity session is not
+proof the host is dying, and `doctor` already has a dedicated check (and a kill command) for that
+specific leak.
+
+`headroom run` is the only surface that actually refuses: it checks host pressure before it even
+opens the store, so a refusal can never leak a lease, and it refuses (exit 2) only when the reading
+is `state: "refuse"` **and** `host_guard.mode = "refuse"`. A `"warn"` reading -- or a `"refuse"`
+reading under `mode: "warn"` -- prints one stderr line and still launches; `mode: "off"` disables
+the guard outright (no message, no refusal). `headroom can`, `quota_can`, `headroom gate`, and
+`quota_gate` (which can gate remote-account work, not just this machine) carry the same reading as
+an additive `host` object in their JSON so an orchestrator can see local pressure alongside its
+quota decision, but never refuse over it themselves. `headroom doctor` reports it too, as a "host
+pressure" check, so it is visible without dispatching anything at all.
+
 ## Plan line, gate and fill
 
 `headroom plan --meter M --reserve N` splits the weekly window's remaining percent (after the

@@ -28,6 +28,7 @@ import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, reserveOnCan, unknownMeterPrincipals, type CanDecision } from "./policy.js";
+import { checkHostHealth, hostGuardRefusal, hostGuardWarning, readHostGuardPolicy, type HostHealth } from "./host-health.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
@@ -288,7 +289,8 @@ async function can(argv: string[]): Promise<number> {
     leasedId = payload.leases[0]?.id;
   }
 
-  printCan(decision, cost, leasedId, argv.includes("--json"));
+  const host = await checkHostHealth(await readHostGuardPolicy());
+  printCan(decision, cost, leasedId, host, argv.includes("--json"));
   return decision.allowed ? 0 : 2;
 }
 
@@ -535,6 +537,20 @@ async function run(argv: string[]): Promise<number> {
   if (!owner || !command.length || (!meter && !actionClass)) throw new Error("Usage: headroom run --meter <meter> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] -- <command> [args...]");
   const needs: GateNeed[] = [];
   for (let index = 0; index < flags.length; index += 1) if (flags[index] === "--need") needs.push(parseGateNeed(flags[index + 1] ?? ""));
+  // Host guard runs before anything else in this command, including opening
+  // the store: a refusal here must never leak a lease, and checking before
+  // even the gate/admission logic keeps that ordering trivially true rather
+  // than relying on a later rollback.
+  const hostGuardPolicy = await readHostGuardPolicy();
+  const host = await checkHostHealth(hostGuardPolicy);
+  const refusal = hostGuardRefusal(host, hostGuardPolicy.mode);
+  if (refusal) {
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ host, gate: null, lease_id: null })));
+    else console.error(refusal);
+    return 2;
+  }
+  const warning = hostGuardWarning(host, hostGuardPolicy.mode);
+  if (warning) console.error(warning);
   const policy = await readPolicy();
   const store = await HeadroomStore.open();
   let leases: Lease[] = [];
@@ -568,12 +584,12 @@ async function run(argv: string[]): Promise<number> {
     );
     const decision = admitted.decision;
     if (!decision.allowed) {
-      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null })));
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: null, host })));
       else console.error(decision.reason);
       return 2;
     }
     leases = admitted.leases;
-    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: leases[0]?.id ?? null })));
+    if (flags.includes("--json")) console.log(JSON.stringify(withContract({ gate: decision, lease_id: leases[0]?.id ?? null, host })));
   } finally { store.close(); }
   let child: ReturnType<typeof spawn>;
   try { child = spawn(command[0], command.slice(1), { stdio: ["inherit", "pipe", "pipe"], env: process.env }); }
@@ -803,7 +819,11 @@ async function gate(argv: string[]): Promise<number> {
     const store = await HeadroomStore.open();
     try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
   }
-  if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
+  if (asJson) {
+    const host = await checkHostHealth(await readHostGuardPolicy());
+    console.log(JSON.stringify(withContract({ ...result, host })));
+    return 0;
+  }
   const targetLabel = meter ?? (Array.isArray(target) ? target.join(", ") : actionClass);
   // A refusal because the meter's own usage could not be read at all (an
   // unreadable/never-seen window) is a different state than a refusal
@@ -1123,8 +1143,8 @@ function dedupeStateReason(state: string, reason: string): string {
   return match ? match[1] : reason;
 }
 
-function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
-  if (asJson) { console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null }))); return; }
+function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, host: HostHealth, asJson: boolean): void {
+  if (asJson) { console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null, host }))); return; }
   console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
   for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
   if (cost.expected_percent !== null) {

@@ -97,6 +97,20 @@ needs the JSON meaning.
   or a strict union type should have a default/fallback arm for a state added
   after it was written.
 
+- **`host`** (`HostHealth`) -- `{ state: "ok" | "warn" | "refuse" | "unknown",
+  reasons: string[], load_ratio: number | null, pty_used: number | null,
+  pty_max: number | null, orphans: number | null }`. One read of local host
+  pressure (`src/host-health.ts`; see docs/concepts.md's "Host guard" section
+  and `.claude/INCIDENT-2026-09-27-pty-leak.md` for why it exists): CPU
+  load-per-core, pseudo-terminal usage, and leaked `agy`/`script` orphans. Any
+  measurement is `null` ("unknown") when its probe is unsupported on this
+  platform or itself failed -- never treated as pressure. Carried, purely
+  additively, on `can` and `gate` (CLI and MCP) so an orchestrator sharing this
+  machine can see local pressure alongside a quota decision; neither of those
+  two ever refuses over it. Only `headroom run`, which launches a child
+  process on this machine, actually refuses on `state: "refuse"`, and only
+  when `host_guard.mode = "refuse"` (the default) in policy.toml.
+
 ## Per-output reference
 
 Each entry gives the shape and, where the CLI has an exit code beyond the
@@ -195,17 +209,22 @@ acknowledged } | null, failures?: string[] }`. Direct reads carry `source` and
 CLI: `{ contract, generated_at, allowed: boolean, meter: string, state:
 PaceState, reason: string, meters: MeterPaceDecision[], local_preference?:
 "fallback" | "prefer" | "never", local_meter_considered?: boolean, cost:
-CostEstimate, leased_id: string | null }`. `MeterPaceDecision` is `{ meter,
+CostEstimate, leased_id: string | null, host: HostHealth }`.
+`MeterPaceDecision` is `{ meter,
 state, reason }`. `CostEstimate` is `{ action_class: string, expected_percent:
 number | null, source: "given" | "learned" | "unknown", confidence: "none" |
 "low" | "medium" | "high", sample_count: number, median_percent: number |
 null, iqr_low: number | null, iqr_high: number | null,
-max_more_before_reset: number | null }`.
+max_more_before_reset: number | null }`. `host` is additive (see "Shared
+vocabulary" above) -- a fresh local read on every call, regardless of whether
+the decision itself came from the daemon or a direct read; it never affects
+`allowed`.
 
 Exit codes: `2` when refused (`allowed: false`); `0` when allowed.
 
 MCP `quota_can`: `{ contract, generated_at, source?: "direct", decision:
-CanDecision, cost: CostEstimate, leased_id: string | null }` -- the same
+CanDecision, cost: CostEstimate, leased_id: string | null, host: HostHealth }`
+-- the same
 `allowed`/`meter`/`state`/`reason`/`meters`/`local_preference`/
 `local_meter_considered` fields as the CLI's top level, nested one level
 under `decision` instead. `source` is present only over the direct (no
@@ -215,7 +234,9 @@ daemon) fallback.
 
 `{ contract, generated_at, allowed: boolean, reason: string, meters_checked:
 string[], not_enforced?: Array<"5h" | "wk">, unknown?: true,
-lanes_remaining_for_class?: number | null, notices: string[] }`. `not_enforced`
+lanes_remaining_for_class?: number | null, notices: string[], host: HostHealth
+}`. `host` is additive (see "Shared vocabulary" above); it never affects
+`allowed`. `not_enforced`
 lists needs skipped because their window is not enforced on the deciding meter
 -- informational, never a refusal on its own. `unknown: true` (present only on
 some refusals) means the refusal is because a needed window's usage could not
@@ -232,6 +253,33 @@ Exit codes: `2` when refused (`allowed: false`, `unknown` or not); `0` when
 allowed.
 
 MCP `quota_gate` adds `source?: "direct"` over the same fields.
+
+### `run` (`headroom run --meter M --need ... --owner X -- <command> --json`)
+
+`{ contract, generated_at, host: HostHealth, gate: CanDecision | null,
+lease_id: string | null }`. `host` is always the first thing this command
+computes, before the store even opens (see docs/concepts.md's "Host guard"
+section). Three distinct outcomes share this shape:
+
+- **Host guard refuses** (`host.state: "refuse"` and `host_guard.mode =
+  "refuse"` in policy.toml, the default): `gate: null`, `lease_id: null`,
+  nothing was ever gated or leased. The one-line reason (naming the
+  measurement and the `host_guard.*` policy key) goes to stderr; `--json`
+  suppresses it there and callers should read `host.reasons` instead.
+- **Quota gate refuses** (host guard did not refuse, but the vendor-reported
+  window does not fit): `gate: CanDecision` with `allowed: false`, `lease_id:
+  null`.
+- **Launched**: `gate: CanDecision` with `allowed: true`, `lease_id` the
+  reservation covering the child process's run.
+
+A `host.state: "warn"` reading (or a `"refuse"` reading under `host_guard.mode
+= "warn"`) never changes this shape or the exit code -- it only adds a
+stderr warning line, in every case above, including a successful launch.
+
+Exit codes: `2` for either refusal above (host guard or quota gate); otherwise
+the launched child process's own exit code (`1` if the executable itself
+could not start; `130`/`143` if this `headroom run` process received
+SIGINT/SIGTERM while the child was running).
 
 ### `credits` (`headroom credits [set|clear] --json`)
 
