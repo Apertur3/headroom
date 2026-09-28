@@ -10,11 +10,14 @@ import { resolve } from "node:path";
 import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
-import { canConsume, defaultPolicy, freshnessGate, reserveFor, withOtherOwnerReservations, type CanDecision, type Policy } from "./policy.js";
+import {
+  canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
+  withOtherOwnerReservations, type CanDecision, type Policy, type ReserveEntry,
+} from "./policy.js";
 import { withPaceInfo } from "./pace.js";
 import { creditSource, creditsLapsed, isCurrentBankedResetObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 import type { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
+import { disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
 
 /** The enforced, fresh, percent-quantity window with the highest used% for a
  * meter -- an approximation of "the window that decided this", good enough
@@ -56,6 +59,41 @@ function knownPercentWindows(store: HeadroomStore, meterId: string): StoredObser
 function meterUnknownReason(store: HeadroomStore, meterId: string, fallback: string): string {
   const latest = store.latestPerWindow(meterId)[0];
   return latest?.reason ? latest.reason : fallback;
+}
+
+/** True when `meterId`'s reserve (its own, or `"*"`'s, `[reserve]` entry) is
+ * currently suspended: it sets `unless = "banked_reset_available"` and the
+ * meter's principal currently carries a usable banked reset -- a manual
+ * `headroom credits set` entry, or a fresh, unheld vendor-confirmed one (see
+ * credits.ts's isCurrentBankedResetObservation). This is deliberately
+ * call-time (needs the live store), unlike expiry, which parsePolicy already
+ * resolves into Policy.reserve itself. */
+export function reserveSuspendedFor(store: HeadroomStore, reserveMeta: Record<string, ReserveEntry>, meterId: string, staleMinutes: number, now: Date): boolean {
+  const meta = reserveEntryFor(reserveMeta, meterId);
+  if (meta?.unless !== "banked_reset_available") return false;
+  const principal = meterId.slice(0, meterId.indexOf(":") >= 0 ? meterId.indexOf(":") : meterId.length);
+  // isCurrentBankedResetObservation alone only says this row is ELIGIBLE to
+  // be treated as a banked-reset reading (a manual entry, or a fresh, unheld
+  // vendor one) -- a lapsed manual entry still qualifies there (planFor's own
+  // `banked.lapsed` flag layers on top of the same row for display). Actual
+  // suspension needs a reset that is still spendable right now.
+  return store.latestPerWindow(`${principal}:credits`).some((row) => isCurrentBankedResetObservation(row, staleMinutes, now) && usableCredits(row, now) > 0);
+}
+
+/** Applies reserveSuspendedFor to every meter listed, returning a fresh
+ * reserves record -- cloned only once at least one meter is actually
+ * suspended -- with a suspended meter's own floor set to 0 for this one
+ * call. gate/fill/plan/can/route never lose real capacity to a reserve
+ * whose own `unless` clause the caller's current banked reset already
+ * satisfies. */
+export function withSuspendedReserves(store: HeadroomStore, reserves: Record<string, number>, reserveMeta: Record<string, ReserveEntry>, meterIds: string[], staleMinutes: number, now: Date): Record<string, number> {
+  let resolved = reserves;
+  for (const meter of meterIds) {
+    if (!reserveSuspendedFor(store, reserveMeta, meter, staleMinutes, now)) continue;
+    if (resolved === reserves) resolved = { ...reserves };
+    resolved[meter] = 0;
+  }
+  return resolved;
 }
 
 export interface MeterWindows { short?: StoredObservation; long?: StoredObservation; }
@@ -164,7 +202,12 @@ export interface PlanAdvice {
   use_before: string | null;
 }
 
-export type PlanSuccess = { meter: string } & PlanResult & { banked: BankedPlan; target?: PlanTarget; advice: PlanAdvice };
+export type PlanSuccess = { meter: string } & PlanResult & {
+  banked: BankedPlan; target?: PlanTarget; advice: PlanAdvice;
+  /** Every reserve capping this meter, tightest first, as one line --
+   * empty string when none applies. See policy.ts's formatReserveCeiling. */
+  reserve_ceiling: string;
+};
 type PlanCore = PlanSuccess | { meter: string; error: string };
 
 /** Adds gate/plan/fill's shared `notices` (issue #20): for
@@ -183,7 +226,7 @@ export type PlanOutcome = PlanCore & { notices: string[] };
 /** `reserves` is policy.toml's `[reserve]` table: the plan line is drawn
  * above the larger of the caller's own reserve percent and this meter's
  * protected floor, so `plan` never budgets points `gate` would then refuse. */
-function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>, needWindow?: string, targetPoints?: number): PlanCore {
+function planForCore(store: HeadroomStore, meter: string, reservePercent: number, now: Date, staleMinutes: number, reserves: Record<string, number>, needWindow?: string, targetPoints?: number, reserveMeta: Record<string, ReserveEntry> = {}, policyMtime: string | null = null): PlanCore {
   const { short, long } = meterWindows(store, meter);
   const target = needWindow ? knownPercentWindows(store, meter).find((row) => row.window?.minutes === windowNeedMinutes(needWindow)) : long;
   if (!target || !target.resets_at) return { meter, error: meterUnknownReason(store, meter, `no ${needWindow ?? "weekly"} window for ${meter}`) };
@@ -194,7 +237,9 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
   const freshness = freshnessGate(target, staleMinutes, now);
   if (!freshness.ok) return { meter, error: freshness.reason };
   const hoursPerWindow = short?.window?.minutes ? short.window.minutes / 60 : 5;
-  const plan = computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(reserves, meter)), now);
+  const meterSuspended = reserveSuspendedFor(store, reserveMeta, meter, staleMinutes, now);
+  const resolvedReserves = meterSuspended ? { ...reserves, [meter]: 0 } : reserves;
+  const plan = computePlan(target.quantity!.used, target.resets_at, hoursPerWindow, Math.max(reservePercent, reserveFor(resolvedReserves, meter)), now);
   const credits = store.latestPerWindow(`${target.principal_id}:credits`)
     .find((row) => isCurrentBankedResetObservation(row, staleMinutes, now));
   const lapsed = credits ? creditsLapsed(credits, now) : false;
@@ -233,11 +278,12 @@ function planForCore(store: HeadroomStore, meter: string, reservePercent: number
           : hoursUntilReset <= 24
             ? { use_now: false, reason: `reset in ${resetHours} h; wait for it`, use_before: null }
             : { use_now: false, reason: "no target given; nothing is blocked", use_before: null };
-  return { meter, ...plan, banked, ...(targetResult ? { target: targetResult } : {}), advice };
+  const reserveCeiling = formatReserveCeiling(reserveCeilingSteps({ reserve: reserves, reserve_meta: reserveMeta, freeze_reserve_pct: reservePercent }, meter, meterSuspended), policyMtime, banked.available > 0 && !banked.lapsed);
+  return { meter, ...plan, banked, ...(targetResult ? { target: targetResult } : {}), advice, reserve_ceiling: reserveCeiling };
 }
 
-export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}, needWindow?: string, targetPoints?: number): PlanOutcome {
-  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves, needWindow, targetPoints);
+export function planFor(store: HeadroomStore, meter: string, reservePercent: number, now = new Date(), staleMinutes = defaultPolicy.staleness_minutes, reserves: Record<string, number> = {}, needWindow?: string, targetPoints?: number, reserveMeta: Record<string, ReserveEntry> = {}, policyMtime: string | null = null): PlanOutcome {
+  const result = planForCore(store, meter, reservePercent, now, staleMinutes, reserves, needWindow, targetPoints, reserveMeta, policyMtime);
   return { ...result, notices: unscheduledResetNotices(store, [meter], now) };
 }
 
@@ -276,6 +322,15 @@ export interface GateOptions {
    * this gate must never dip into. The larger of that floor and the
    * caller's own reserve percent applies. */
   reserves?: Record<string, number>;
+  /** policy.toml's reserve_meta (the dated/reasoned `[reserve."<meter>"]`
+   * entries, plus `"freeze_reserve_pct"`'s own `[freeze_reserve]`): resolves
+   * `unless: "banked_reset_available"` suspension (needs the live store, so
+   * it cannot be pre-baked into `reserves` the way expiry already is) and
+   * names the reason/set_at a reserve refusal attributes itself to. */
+  reserveMeta?: Record<string, ReserveEntry>;
+  /** policy.toml's own mtime -- the fallback attribution for a reserve
+   * refusal that names no reason/set_at of its own. */
+  policyMtime?: string | null;
 }
 
 interface GateOutcomeCore extends GateResult {
@@ -313,6 +368,8 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
   const pacing = options.pacing ?? "even";
   const allowance = options.allowance ?? "pro_rata";
   const staleMinutes = options.staleness_minutes ?? defaultPolicy.staleness_minutes;
+  const reserveMeta = options.reserveMeta ?? {};
+  const policyMtime = options.policyMtime ?? null;
   let lastShort: StoredObservation | undefined;
   let lastReservedPercent = 0;
   let lastResult: GateResult | undefined;
@@ -343,6 +400,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     }
     checked.push(id);
     lastShort = short ?? lastShort;
+    const suspended = reserveSuspendedFor(store, reserveMeta, id, staleMinutes, now);
     // A lease reserves capacity on the meter, rather than on one particular
     // vendor window. Apply it to every enforced percent window that the gate
     // evaluates: the same action consumes both a 5h and a weekly allowance.
@@ -383,8 +441,13 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       const observedUsed = row.quantity?.used;
       const used = observedUsed === undefined ? undefined : Math.min(100, observedUsed + reservedPercent);
       if (used === undefined) return { allowed: false, reason: `${label} usage unknown`, meters_checked: checked, unknown: true };
-      const meterReserve = reserveFor(options.reserves ?? {}, id);
+      const meterReserve = suspended ? 0 : reserveFor(options.reserves ?? {}, id);
       const reserve = Math.max(reservePercent, meterReserve);
+      // The tighter of the reserve-derived ceiling and a caller-supplied
+      // capPercent (see GateOptions.capPercent) always wins: a fill caller's
+      // cap must never let a request past the policy reserve floor, and the
+      // reserve floor must never silently override a caller's own, tighter
+      // cap either.
       const reserveCeiling = 100 - reserve;
       const ceiling = Math.min(reserveCeiling, options.capPercent ?? 100);
       if (used + need.points > ceiling) {
@@ -392,8 +455,8 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         const reserveReason = ceiling < reserveCeiling
           ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${ceiling}% cap`
           : meterReserve >= reservePercent && meterReserve > 0
-            ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id}`
-            : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve`;
+            ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id} ${reserveAttributionBracket(id, reserveEntryFor(reserveMeta, id), policyMtime)}`
+            : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve ${reserveAttributionBracket("freeze_reserve_pct", reserveMeta["freeze_reserve_pct"], policyMtime)}`;
         return { allowed: false, reason: reserveReason, meters_checked: checked };
       }
       if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
@@ -407,7 +470,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     // dispatching that model rather than to retry with fewer points. The
     // larger of the two reserves then applies to everything else the gate
     // checks, including the plan line.
-    const meterReserve = reserveFor(options.reserves ?? {}, id);
+    const meterReserve = suspended ? 0 : reserveFor(options.reserves ?? {}, id);
     lastResult = { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 
     const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
@@ -423,8 +486,12 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         // fails closed as UNKNOWN rather than falling through to "fits".
         const finiteReset = fiveHourRow.resets_at && Number.isFinite(Date.parse(fiveHourRow.resets_at)) && Date.parse(fiveHourRow.resets_at) > now.getTime();
         if (!finiteReset) return { allowed: false, reason: `5h fill needs a finite future reset for ${id}`, meters_checked: checked, unknown: true };
-        const meterReserve = reserveFor(options.reserves ?? {}, id);
-        const cap = Math.min(100 - Math.max(reservePercent, meterReserve), options.capPercent ?? 100);
+        const meterReserve = suspended ? 0 : reserveFor(options.reserves ?? {}, id);
+        // The tighter of the reserve-derived ceiling and a caller-supplied
+        // capPercent always wins -- same rule as the plain (non-fill) need
+        // check above.
+        const reserveCeiling = 100 - Math.max(reservePercent, meterReserve);
+        const cap = Math.min(reserveCeiling, options.capPercent ?? 100);
         const minutesToReset = Math.max(0, (Date.parse(fiveHourRow.resets_at!) - now.getTime()) / 60_000);
         const durationMinutes = Math.min(minutesToReset, Math.max(0, options.durationMinutes ?? minutesToReset));
         const burn = store.burnRateFor([fiveHourRow], now, 60).get(`${id}:${fiveHourRow.window!.minutes}`);
@@ -437,7 +504,19 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
           requestPercent: fiveHourNeed.points,
         });
         const fillFields = { allowance_basis: "fill" as const, projected_percent: fill.projected_percent, cap_percent: fill.cap_percent };
-        if (!fill.allowed) return { allowed: false, reason: fill.reason, meters_checked: checked, ...fillFields, ...(fill.unknown ? { unknown: true as const } : {}) };
+        if (!fill.allowed) {
+          // Name the reserve's own reason/set_at the same way the plain
+          // ceiling check above does, but only when the reserve (not a
+          // caller-supplied, tighter capPercent, and not an UNKNOWN burn/
+          // reset) is actually what's binding -- a caller's own cap or an
+          // unknown projection has no reserve to attribute to.
+          const attribution = !fill.unknown && cap === reserveCeiling && reserveCeiling < 100
+            ? ` ${meterReserve >= reservePercent && meterReserve > 0
+                ? reserveAttributionBracket(id, reserveEntryFor(reserveMeta, id), policyMtime)
+                : reserveAttributionBracket("freeze_reserve_pct", reserveMeta["freeze_reserve_pct"], policyMtime)}`
+            : "";
+          return { allowed: false, reason: `${fill.reason}${attribution}`, meters_checked: checked, ...fillFields, ...(fill.unknown ? { unknown: true as const } : {}) };
+        }
         lastResult = { allowed: true, reason: fill.reason, ...(notEnforced.length ? { not_enforced: notEnforced } : {}), ...fillFields };
       } else if (fiveHourRow.resets_at && fiveHourRow.window?.minutes && options.owner) {
         const windowStart = new Date(Date.parse(fiveHourRow.resets_at) - fiveHourRow.window.minutes * 60_000);
@@ -488,17 +567,20 @@ export function admitCanCost(store: HeadroomStore, decision: CanDecision, meters
   if (!decision.allowed || expectedPercent === null) return decision;
   for (const meter of meters) {
     const reserved = store.leases(meter, true, now).reduce((sum, lease) => sum + (lease.expected_percent ?? 0), 0);
-    const reserve = Math.max(policy.freeze_reserve_pct, reserveFor(policy.reserve, meter));
+    const suspended = reserveSuspendedFor(store, policy.reserve_meta, meter, policy.staleness_minutes, now);
+    const meterReserve = suspended ? 0 : reserveFor(policy.reserve, meter);
+    const reserve = Math.max(policy.freeze_reserve_pct, meterReserve);
     for (const row of enforcedPercentWindows(store, meter)) {
       if (row.freshness === "not_enforced") continue;
       const remaining = Math.max(0, (row.quantity!.remaining ?? (100 - row.quantity!.used)) - reserved);
       const usable = Math.max(0, remaining - reserve);
       if (expectedPercent > usable) {
+        const attributeTo = meterReserve >= policy.freeze_reserve_pct && meterReserve > 0 ? meter : "freeze_reserve_pct";
         return {
           ...decision,
           allowed: false,
           meter,
-          reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${meter} (${usable.toFixed(1)}% usable of ${remaining.toFixed(1)}% remaining)`,
+          reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${meter} (${usable.toFixed(1)}% usable of ${remaining.toFixed(1)}% remaining) ${reserveAttributionBracket(attributeTo, (attributeTo === "freeze_reserve_pct" ? policy.reserve_meta.freeze_reserve_pct : reserveEntryFor(policy.reserve_meta, attributeTo)), policy.policy_mtime)}`,
         };
       }
     }
@@ -532,6 +614,9 @@ export interface FillOutcome {
    * enforced and the tightest enforced window found was the weekly one
    * instead (Codex's main pool, for one). */
   window_used: string;
+  /** Same as PlanSuccess.reserve_ceiling: every reserve capping this meter,
+   * tightest first, one line -- empty string when none applies. */
+  reserve_ceiling: string;
 }
 
 export interface FillOptions {
@@ -556,6 +641,10 @@ export interface FillOptions {
   reserves?: Record<string, number>;
   /** Select the vendor-reported window fill works against. */
   needWindow?: string;
+  /** See GateOptions.reserveMeta. */
+  reserveMeta?: Record<string, ReserveEntry>;
+  /** See GateOptions.policyMtime. */
+  policyMtime?: string | null;
 }
 
 const EVEN_PACING_FULL_BURST_MINUTES = 45;
@@ -686,8 +775,12 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   const weeklyCostPerLaneOverride = !wider && !isFiveHour ? laneCost : undefined;
   // The meter's protected reserve (policy.toml [reserve]) is withheld from
   // both windows before any lane is counted: lanes only fit above it, and
-  // the per-class list below reads the same reduced remainder.
-  const meterReserve = reserveFor(options.reserves ?? {}, meter);
+  // the per-class list below reads the same reduced remainder. A reserve
+  // whose `unless: "banked_reset_available"` is currently satisfied (the
+  // meter's principal carries a usable banked reset) is suspended: it
+  // withholds nothing this call.
+  const suspended = reserveSuspendedFor(store, options.reserveMeta ?? {}, meter, staleMinutes, now);
+  const meterReserve = suspended ? 0 : reserveFor(options.reserves ?? {}, meter);
   if (meterReserve > 0) used5hForLanes = Math.min(100, used5hForLanes + meterReserve);
   const lanes = laneCost === undefined ? null : computeFill(used5hForLanes, usedWeekly, laneCost, Math.max(weeklyReservePercent, meterReserve), weeklyCostPerLaneOverride, 5, windowUsed);
   const lanesError = laneCost === undefined ? `no learned cost for ${meter}; pass --lane-cost` : null;
@@ -700,8 +793,14 @@ async function fillForCore(store: HeadroomStore, meter: string, laneCostOverride
   const remainingPercent = Math.max(0, 100 - used5hForLanes) - 5; // same 5-point safety margin as the lane count
   const remainingMinutes = secondsLeft === null ? 0 : secondsLeft / 60;
   const classes = fillClassFits(Math.max(0, remainingPercent), remainingMinutes, costs);
+  const principal = meter.slice(0, meter.indexOf(":") >= 0 ? meter.indexOf(":") : meter.length);
+  const bankedAvailable = store.latestPerWindow(`${principal}:credits`).some((row) => isCurrentBankedResetObservation(row, staleMinutes, now));
+  const reserveCeiling = formatReserveCeiling(
+    reserveCeilingSteps({ reserve: options.reserves ?? {}, reserve_meta: options.reserveMeta ?? {}, freeze_reserve_pct: weeklyReservePercent }, meter, suspended),
+    options.policyMtime ?? null, bankedAvailable,
+  );
 
-  return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis, window_used: windowUsed };
+  return { meter, lanes, lanes_error: lanesError, classes, used_5h_percent: used5h, used_weekly_percent: usedWeekly, resets_in_seconds: secondsLeft, lane_cost_percent: laneCost ?? null, lane_cost_source: source, allowance_basis: allowanceBasis, window_used: windowUsed, reserve_ceiling: reserveCeiling };
 }
 
 export async function fillFor(store: HeadroomStore, meter: string, laneCostOverride: number | undefined, weeklyReservePercent: number, now = new Date(), options: FillOptions = {}): Promise<FillCore & { notices: string[] }> {
@@ -773,7 +872,15 @@ const routeFits = (state: PaceState, allowUnknown: boolean): boolean =>
 export function routeFor(store: HeadroomStore, meters: string[], accounts: Account[], policy: Policy, allowUnknown: boolean, now = new Date(), owner?: string): RouteResult {
   const principals = [...new Set(meters.map((meter) => meter.slice(0, meter.indexOf(":") >= 0 ? meter.indexOf(":") : meter.length)))];
   const leases = store.leases(undefined, true, now);
+  // Not part of RouteCandidate's own (JSON-contract) shape: kept only to
+  // attribute the winner's own reserve note below to the actual meter it
+  // came from, rather than guessing from `meters` again.
+  const decidingMeterByPrincipal = new Map<string, string | undefined>();
   const candidates: RouteCandidate[] = principals.map((principal) => {
+    const account = accounts.find((item) => item.name === principal);
+    // `--allow-unknown` is a diagnostic escape hatch for a read failure, not
+    // permission to spend an account the operator deliberately parked.
+    if (account && !isAccountEnabled(account)) return { principal, state: "UNKNOWN", reason: disabledPrincipalReason(principal), remaining_percent: null, reserve_percent: 0, window_minutes: null };
     const principalMeters = meters.filter((meter) => meter.startsWith(`${principal}:`));
     const observationMap = new Map(principalMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
     const rows = [...observationMap.values()].flat();
@@ -788,9 +895,13 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
     // The deciding meter's protected reserve (policy.toml [reserve]) is
     // removed before ranking, so a principal is compared on the capacity it
     // may actually spend. The pace state is deliberately left alone: the
-    // reserve is a decision floor, not a pace rule.
-    const reserve = deciding ? reserveFor(policy.reserve, deciding.meter_id) : 0;
+    // reserve is a decision floor, not a pace rule. A reserve currently
+    // suspended by its own `unless: "banked_reset_available"` (see
+    // reserveSuspendedFor) withholds nothing here either.
+    const suspended = deciding ? reserveSuspendedFor(store, policy.reserve_meta, deciding.meter_id, policy.staleness_minutes, now) : false;
+    const reserve = deciding && !suspended ? reserveFor(policy.reserve, deciding.meter_id) : 0;
     const usable = remaining === null ? null : Math.max(0, remaining - reserve);
+    decidingMeterByPrincipal.set(principal, deciding?.meter_id);
     return { principal, state: decision.state, reason: decision.reason, remaining_percent: usable, reserve_percent: reserve, window_minutes: deciding?.window?.minutes ?? null };
   });
   // A meter whose whole remainder is inside its reserve has nothing to
@@ -800,8 +911,12 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
   const winner = eligible[0];
   if (!winner) return { principal: null, environment: {}, reason: candidates.length ? "no candidate fits" : "no principals for this class", candidates };
   const account = accounts.find((item) => item.name === winner.principal);
+  const winningMeter = decidingMeterByPrincipal.get(winner.principal) ?? winner.principal;
+  const reserveNote = winner.reserve_percent > 0
+    ? ` after the ${winner.reserve_percent}% reserve ${reserveAttributionBracket(winningMeter, reserveEntryFor(policy.reserve_meta, winningMeter), policy.policy_mtime)}`
+    : "";
   return {
     principal: winner.principal, environment: account ? launchEnvironment(account) : {},
-    reason: `${windowShortLabel(winner.window_minutes)} ${winner.remaining_percent!.toFixed(1)}% remaining${winner.reserve_percent > 0 ? ` after the ${winner.reserve_percent}% reserve` : ""}`, candidates,
+    reason: `${windowShortLabel(winner.window_minutes)} ${winner.remaining_percent!.toFixed(1)}% remaining${reserveNote}`, candidates,
   };
 }

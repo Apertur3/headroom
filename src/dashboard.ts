@@ -11,7 +11,7 @@ import { paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
-import { isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type HeadroomEvent, type Observation } from "./types.js";
 
 export interface DashboardModel extends CachedDashboardModel {
   history?: Record<string, Observation[]>;
@@ -73,9 +73,11 @@ export async function gatherDashboard(): Promise<DashboardModel> {
   try {
     const now = new Date();
     const { snapshot, direct } = await dashboardRead({ request: async () => reply, fallback: async () => readDashboardStore(store, now, undefined, policy) });
-    const filtered = filterDashboardPrincipals(snapshot, new Set(accounts.map((account) => account.name)));
+    const disabled = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
+    const filtered = filterDashboardPrincipals(snapshot, new Set(accounts.filter(isAccountEnabled).map((account) => account.name)));
     const observations = filtered.observations;
-    return { ...filtered, ...readDashboardGraphs(store, observations, now), direct, policy, version, now,
+    const notices = disabled.length ? [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] : filtered.notices;
+    return { ...filtered, ...readDashboardGraphs(store, observations, now), notices, direct, policy, version, now,
       vendors: new Map(accounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor])) };
   } finally { store.close(); }
 }

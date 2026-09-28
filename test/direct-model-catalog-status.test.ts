@@ -56,14 +56,23 @@ describe("direct status model catalog check", () => {
     await withHeadroomHome(join(root, ".headroom"), async () => {
       const logs: string[] = [];
       const log = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
+      const running = main(["--json"]);
       try {
-        const running = main(["--json"]);
-        await vi.waitFor(() => expect(mocks.checkModelAvailability).toHaveBeenCalledTimes(1));
+        // A cold Windows runner can take well over vi.waitFor's 1 s default
+        // just to open the store and poll; give it a realistic budget.
+        await vi.waitFor(() => expect(mocks.checkModelAvailability).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]).observations).toHaveLength(1);
         release?.();
         expect(await running).toBe(0);
-      } finally { log.mockRestore(); }
+      } finally {
+        // Always let main() finish and close its store before cleanup, even
+        // after a failed assertion: an open handle makes Windows refuse to
+        // delete the temp directory (EBUSY).
+        release?.();
+        await running.catch(() => undefined);
+        log.mockRestore();
+      }
     });
   });
 });

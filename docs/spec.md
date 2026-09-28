@@ -84,6 +84,16 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   reports and never runs. State `UP | BUSY | DOWN`, model id, vLLM queue depth.
 - **Registry.** `~/.headroom/accounts.toml`, auto-discovered from `~/.claude*`, `~/.codex*`,
   `~/.gemini`, confirmed by the user. Committed example in `examples/`.
+
+### `accounts.toml` principal keys
+
+Every `[[accounts]]` block has `name` and either provider `vendor`, `location`, and `adapter`, or
+local `kind = "local"`, `base_url`, and `adapter = "native"`. Provider blocks may also set
+`agy_path` and `alias`; local blocks may set `wake`. `enabled` is optional on both shapes: absent
+means enabled, while `enabled = false` keeps the principal configured but prevents every poll and
+current-capacity decision. `headroom accounts disable <name>` and `headroom accounts enable <name>`
+edit only that line in place. Status renders a parked principal as
+`<name>  disabled (enabled = false in accounts.toml)` instead of its meter rows.
 - **Daemon.** Unix socket `~/.headroom/headroom.sock` on macOS and Linux, or named pipe
   `\\.\pipe\headroom-<username>-<home digest>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
   named pipes use the current process token's default DACL, which Node does not expose for further
@@ -129,6 +139,11 @@ statusline ─┘        │            ├── native:local adapter (OpenAI-c
   <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
   date-only expiry is midnight UTC on that date.
 - `headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]`.
+- `headroom policy show [--json]`; `headroom policy set reserve <meter> <percent> --reason "<text>"
+  [--until <ISO|+7d>] [--unless banked_reset_available] [--json]`; `headroom policy clear reserve
+  <meter> [--json]`; `headroom policy set freeze_reserve_pct <n> [--reason "<text>"] [--until
+  <ISO|+7d>] [--json]`. Dated/reasoned reserves (see docs/concepts.md); edits policy.toml atomically
+  (0600, timestamped `.bak-` first, comments and other keys preserved).
 - `headroom mcp` : stdio MCP, seventeen tools (`quota_status`, `quota_can`, `quota_events`, and
   more covering leases, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats and
   pasted `/usage` ingestion); see `docs/mcp-and-agents.md` for the full list and field shapes.

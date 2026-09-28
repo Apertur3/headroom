@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "../src/orchestrator-reads.js";
-import { defaultPolicy } from "../src/policy.js";
+import { defaultPolicy, type ReserveEntry } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -601,6 +601,41 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
       const classDuration = gateFor(store, [{ window: "5h", points: 60 }], meter, 10, false, now, { owner: "orchestrator", pacing: "even", allowance: "fill", actionClass: "review", durationMinutes: 60 });
       expect(fullHorizon.allowed).toBe(false);
       expect(classDuration).toMatchObject({ allowed: true, projected_percent: 21, cap_percent: 90 });
+    } finally { store.close(); }
+  });
+
+  it("threads a dated reserve's ceiling and attribution through the fill cap -- the tighter of the two always wins", async () => {
+    const store = await open();
+    try {
+      // 20 pts/h burn over the last 3 minutes (49% -> 50%), reset far away.
+      store.insert(fiveHour(49, new Date(now.getTime() - 3 * 60_000).toISOString(), resetsAt, meter));
+      store.insert(fiveHour(50, now.toISOString(), resetsAt, meter));
+      const reserveMeta: Record<string, ReserveEntry> = {
+        [meter]: { percent: 20, reason: "protect burst headroom", set_at: "2026-08-01T00:00:00.000Z" },
+      };
+      const commonOptions = { owner: "orchestrator", pacing: "even" as const, allowance: "fill" as const, reserves: { [meter]: 20 }, reserveMeta, durationMinutes: 60 };
+
+      const fits = gateFor(store, [{ window: "5h", points: 5 }], meter, 0, false, now, commonOptions);
+      // The 20% reserve caps this meter at 80%; projected 50 + 20 pts/h x 1h
+      // = 70, leaving 10 points under the cap for the 5-point request.
+      expect(fits).toMatchObject({ allowed: true, allowance_basis: "fill", cap_percent: 80 });
+
+      const overReserve = gateFor(store, [{ window: "5h", points: 15 }], meter, 0, false, now, commonOptions);
+      // 50 + 15 = 65 alone would fit comfortably under the plain 80% ceiling
+      // -- this is exactly the case the fill basis exists to catch: once the
+      // 20 pts/h burn is projected to the lane end (70) the 15-point request
+      // crosses the cap, and the refusal still names the reserve's own
+      // reason/set_at the same way the plain (non-fill) reserve refusal does.
+      expect(overReserve).toMatchObject({ allowed: false, allowance_basis: "fill", cap_percent: 80 });
+      expect(overReserve.reason).toContain("protect burst headroom");
+      expect(overReserve.reason).toContain("set 2026-08-01");
+      expect(overReserve.reason).toContain(`[${meter}:`);
+
+      // A caller-supplied capPercent tighter than the reserve floor wins
+      // instead, and carries no reserve attribution (there is none to name).
+      const tighterCallerCap = gateFor(store, [{ window: "5h", points: 5 }], meter, 0, false, now, { ...commonOptions, capPercent: 65 });
+      expect(tighterCallerCap).toMatchObject({ allowed: false, allowance_basis: "fill", cap_percent: 65 });
+      expect(tighterCallerCap.reason).not.toContain("protect burst headroom");
     } finally { store.close(); }
   });
 });

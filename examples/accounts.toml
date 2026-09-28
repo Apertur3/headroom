@@ -18,6 +18,8 @@ name = "claude-2"
 vendor = "claude"
 location = "~/.claude2"
 adapter = "native-ts"
+# Set this to false to keep an optional or logged-out profile configured but never poll it.
+# enabled = false
 
 [[accounts]]
 name = "antigravity"

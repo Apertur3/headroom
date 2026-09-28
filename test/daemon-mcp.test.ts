@@ -287,9 +287,13 @@ describe("daemon JSON-RPC", () => {
         throw error;
       }
       try {
+        // The daemon's own "status" RPC stays a bare Observation[] array
+        // under the 1.x JSON contract (docs/json-contract.md) -- never an
+        // object -- so both replies are compared directly, not unwrapped
+        // from an `.observations` field.
         const [first, second] = await Promise.all([rpc(path, "status"), rpc(path, "status")]);
-        expect(first).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
-        expect(second).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
+        expect(first as Observation[]).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
+        expect(second as Observation[]).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "codex-main:main" })]));
         expect(polls).toBe(1);
       } finally { await daemon.stop(); }
     });
@@ -884,6 +888,8 @@ describe("daemon status names the real backoff deadline on a live 429", () => {
         // and sets the daemon's in-memory backoff for this cycle) and reads it
         // straight back -- the backoff is already live by the time the store
         // read below happens, so the rewrite applies within this one call.
+        // The daemon's own "status" RPC stays a bare Observation[] array
+        // under the 1.x JSON contract (docs/json-contract.md).
         const reply = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"status"}');
         const row = (reply.result as Observation[]).find((item) => item.meter_id === "codex-main:main");
         expect(row?.reason).toMatch(/^rate limited by the vendor \(429\); backing off until \d\d:\d\d$/);

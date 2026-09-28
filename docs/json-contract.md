@@ -135,10 +135,17 @@ differ from the `0`/`1` pair above, they are called out below.
 
 CLI: `{ contract, generated_at, observations: Observation[], leases: Lease[],
 plan_downgraded: { principal, from, to, since, acknowledged } | null,
-heartbeats: Heartbeat[], due_timers: Timer[], threshold?: {...} }`.
-`heartbeats` is every registered orchestrator heartbeat (see `heartbeat list`
-below); `due_timers` is every pending `Timer` (see `timer list` below) already
-at or past its own `at`.
+disabled_principals: string[], heartbeats: Heartbeat[], due_timers: Timer[],
+threshold?: {...} }`. `disabled_principals` is always present (empty when
+none): its principals are configured with `enabled = false`, so their stored
+observations are omitted rather than reported as current capacity. MCP
+`quota_status` carries the same additive field. The daemon JSON-RPC `status`
+result stays the `Observation[]` array it has always been -- the 1.x contract
+forbids turning it into an object -- so `disabled_principals` is derived by
+the CLI and MCP layers from the registry, not returned by the daemon method
+itself. `heartbeats` is every registered orchestrator heartbeat (see
+`heartbeat list` below); `due_timers` is every pending `Timer` (see `timer
+list` below) already at or past its own `at`.
 `threshold` is present only with `--threshold N`:
 `{ percent: number, windows: ThresholdWindow[], any_crossed: boolean,
 any_blocking: boolean }`, where each `ThresholdWindow` is `{ meter_id: string,
@@ -337,6 +344,25 @@ manual: true } }`. `clear` keeps the same shape with `remaining: 0` and adds
 A date-only `expires` input is stored as midnight UTC and credit status renders its UTC calendar
 day, so the displayed day and lapse boundary do not change with the machine timezone.
 
+### `policy` (`headroom policy show|set|clear ... --json`) -- new
+
+`show`: `{ contract, generated_at, freeze_reserve_pct: number, freeze_reserve_meta: { reason: string
+| null, set_at: string | null, until: string | null } | null, reserves: [{ meter: string, percent:
+number, effective_percent: number, reason: string | null, set_at: string | null, until: string |
+null, unless: string | null, expired: boolean, suspended: boolean }] }`. `percent` is the entry's own
+configured value; `effective_percent` is what `gate`/`fill`/`plan`/`route`/`can` actually enforce
+right now (0 once `expired` or `suspended` is true) -- see docs/concepts.md's "Dated, expiring
+reserves". `set reserve`/`clear reserve`/`set freeze_reserve_pct` all return `{ contract,
+generated_at, meter?: string, key?: string, before: string, after: string }` -- `before`/`after` are
+the same human-readable "N%, reason, set date" line the CLI text output prints, `after` is the
+literal string `"cleared"` for `clear reserve`. Every write is additive to the JSON contract only in
+the sense that these are brand new outputs; the underlying `reserve`/`reserve_meta` keys in
+`Policy` are themselves additive over the pre-existing plain-numeric `[reserve]` table.
+
+Exit codes: always `0` (a bad flag or a validation failure, e.g. an out-of-range percent or a
+missing `--reason`, throws before any output and the process exits non-zero the same way any other
+CLI usage error does).
+
 ### `plan` (`headroom plan --meter M --until reset [--target P] --json`, MCP `quota_plan`)
 
 Success: `{ contract, generated_at, meter: string, weekly_remaining_percent:
@@ -346,7 +372,8 @@ plan_line_percent_per_hour: number, usable_now_percent: number, banked: {
 available: number, expires_at: string | null, source: "vendor" | "manual" |
 null, lapsed: boolean, worth_percent: number }, target?: { points: number,
 fits_now: boolean, fits_with_banked: boolean, resets_needed: number | null }, advice:
-{ use_now: boolean, reason: string, use_before: string | null }, notices:
+{ use_now: boolean, reason: string, use_before: string | null },
+reserve_ceiling: string, notices:
 string[] }`. Failure (the meter
 has no weekly window, or it is stale/failed/unpolled too long): `{ contract,
 generated_at, meter: string, error: string, notices: string[] }` -- a data
@@ -357,6 +384,9 @@ exits `0`. `notices` is the same unscheduled-reset line `gate` carries above
 target does not already fit; `advice.use_now` is then always `false`. A banked count is only a
 manual entry or a fresh, unheld vendor observation marked `free_resets_available`; other credits
 counts remain informational and contribute zero.
+`reserve_ceiling` (additive) is one line listing every reserve capping this meter -- its own (or
+`"*"`'s) `[reserve]` entry and `freeze_reserve_pct` -- tightest first, each with its reason/set_at
+when set (see docs/concepts.md's "Dated, expiring reserves"); empty string when neither applies.
 
 Exit codes: always `0`.
 
@@ -370,7 +400,8 @@ classes: FillClassFit[], used_5h_percent: number | null,
 used_weekly_percent: number | null, resets_in_seconds: number | null,
 lane_cost_percent: number | null, lane_cost_source: "given" | "learned" |
 "unknown", allowance_basis: "full" | "pro_rata" | "fill", window_used: string,
-notices: string[] }`. `lanes` is `null` only with no `--lane-cost` and no
+reserve_ceiling: string,
+notices: string[] }`. `reserve_ceiling` is the same additive field `plan` carries above. `lanes` is `null` only with no `--lane-cost` and no
 learned cost for the meter yet (`lanes_error` then names why); the per-class
 `classes` list stands on its own either way. `FillClassFit` is `{
 action_class: string, percent: number, duration_minutes: number, fits:

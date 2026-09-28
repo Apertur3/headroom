@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,6 +64,24 @@ describe("headroom accounts discover", () => {
     await expect(readFile(join(headroomHome, "accounts.toml"), "utf8")).resolves.toContain("claude-main");
     await expect(readFile(join(headroomHome, "policy.toml"), "utf8")).resolves.toContain("freeze_reserve_pct");
     await expect(readFile(join(headroomHome, "routing.toml"), "utf8")).resolves.toContain("claude-fable");
+  });
+});
+
+describe("headroom accounts enable and disable", () => {
+  it("changes only the target entry's enabled line and refuses an unknown account", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-accounts-toggle-")); temporary.push(home);
+    const source = ['# keep this comment', '[[accounts]]', 'name = "claude-main"', 'vendor = "claude"', 'location = "~/.claude"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "claude-2"', '# leave this too', 'vendor = "claude"', 'location = "~/.claude2"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "codex-main"', 'vendor = "codex"', 'location = "~/.codex"', 'adapter = "native-ts"', ''].join("\n");
+    await writeFile(join(home, "accounts.toml"), source, { mode: 0o600 });
+    await withEnv({ HEADROOM_HOME: home }, async () => {
+      expect(await main(["accounts", "disable", "claude-2"])).toBe(0);
+      const disabled = await readFile(join(home, "accounts.toml"), "utf8");
+      expect(disabled).toContain('name = "claude-2"\nenabled = false\n# leave this too');
+      expect(disabled.replace("enabled = false\n", "")).toBe(source);
+      expect(await main(["accounts", "enable", "claude-2"])).toBe(0);
+      const enabled = await readFile(join(home, "accounts.toml"), "utf8");
+      expect(enabled.replace("enabled = true\n", "")).toBe(source);
+      await expect(main(["accounts", "disable", "missing"])).rejects.toThrow("Unknown account: missing");
+    });
   });
 });
 

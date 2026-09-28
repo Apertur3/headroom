@@ -2,6 +2,28 @@ import { expandHome } from "./paths.js";
 import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetSecondsRemaining } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
+/** One `[reserve."<meter>"]` (or the top-level `freeze_reserve_pct`'s own
+ * `[freeze_reserve]`, under the synthetic key `"freeze_reserve_pct"`) entry:
+ * a reserve percent plus the metadata that answers "who set this, why, and
+ * until when" -- the exact context missing from the plain numeric form that
+ * made two silently contradicting reserves take an hour to notice. `until` is an expiry instant: once
+ * passed, the entry's contribution to `Policy.reserve` resolves to 0 (see
+ * parsePolicy) though this record is kept so `policy show`/a refusal can
+ * still say it existed and lapsed. `unless: "banked_reset_available"` -- per
+ * meter only, not on freeze_reserve_pct -- suspends the reserve (also
+ * resolved to 0) while its principal's `:credits` meter currently carries a
+ * usable banked reset (see credits.ts's isCurrentBankedResetObservation);
+ * this is call-time and store-dependent, so it is NOT resolved into
+ * `Policy.reserve` at parse time -- see orchestrator-reads.ts's
+ * reserveSuspendedFor/withSuspendedReserves. */
+export interface ReserveEntry {
+  percent: number;
+  reason?: string;
+  set_at?: string;
+  until?: string;
+  unless?: "banked_reset_available";
+}
+
 export interface Policy {
   freeze_reserve_pct: number;
   pace_grace_fraction: number;
@@ -13,8 +35,19 @@ export interface Policy {
    * dip into. Keys are meter ids (`"claude-main:fable"`); the key `"*"` is
    * the default for every meter without its own entry. Distinct from
    * freeze_reserve_pct, which is the FREEZE pace threshold -- see
-   * docs/concepts.md. */
+   * docs/concepts.md. Already resolved for expiry (an entry whose `until`
+   * has passed reads as 0 here) -- every existing reader of this field is
+   * automatically expiry-correct with no changes of its own. NOT resolved
+   * for `unless` suspension, which needs live store data; see ReserveEntry. */
   reserve: Record<string, number>;
+  /** Metadata for every `reserve` key that carries more than a bare number:
+   * entries set through `[reserve."<meter>"]` (reason/set_at/until/unless),
+   * plus a plain `[reserve]` bare entry too (as a `{ percent }`-only record,
+   * so every reserve key resolves uniformly through reserveEntryFor), plus
+   * `"freeze_reserve_pct"` when a `[freeze_reserve]` table is present. Unlike
+   * `reserve`, an expired entry's ORIGINAL percent is kept here (not zeroed)
+   * so `policy show` and a refusal's attribution can still name what lapsed. */
+  reserve_meta: Record<string, ReserveEntry>;
   /** Keep one daemon-owned `agy` PTY alive for warm local Antigravity reads. */
   antigravity_keepalive: boolean;
   /** "even" (default): `gate` enforces the pro-rata line and burst check for
@@ -42,6 +75,12 @@ export interface Policy {
    * notice line. Never affects `headroom update` itself, which is always an
    * explicit, human-initiated check. */
   update_check: boolean;
+  /** policy.toml's own mtime, ISO, as read by config.ts's readPolicy() --
+   * null when the file does not exist (defaults in force) or this Policy
+   * came straight from parsePolicy() with no file behind it (most unit
+   * tests). The fallback attribution for a reserve refusal that names no
+   * reason/set_at of its own (see reserveAttributionSuffix). */
+  policy_mtime: string | null;
 }
 
 /** Keep the local Antigravity reader warm by default wherever `script` is available. */
@@ -50,17 +89,71 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 }
 
 export const defaultPolicy: Policy = {
-  freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", allowance: "pro_rata", statusline_snapshot_dirs: [], update_check: true,
+  freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {}, reserve_meta: {},
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", allowance: "pro_rata", statusline_snapshot_dirs: [], update_check: true, policy_mtime: null,
 };
 
-/** Minimal TOML scalar reader for Headroom's deliberately small policy surface. */
-export function parsePolicy(text: string): Policy {
+/** True once `entry.until` (an ISO instant) is at or before `now`. Entries
+ * with no `until` never expire. */
+export function reserveEntryExpired(entry: ReserveEntry | undefined, now: Date): boolean {
+  return Boolean(entry?.until && now.getTime() >= Date.parse(entry.until));
+}
+
+/** The metadata record for a meter's own key, falling back to `"*"` --
+ * mirrors reserveFor's own per-meter-then-default lookup, so a meter with no
+ * entry of its own still inherits `"*"`'s reason/until/unless. */
+/** Drops a trailing `# comment` but never a `#` inside a double-quoted
+ * string (a reason such as "stop #123 builds"), honouring backslash escapes. */
+export function stripTomlComment(raw: string): string {
+  let quoted = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (quoted && char === "\\") { i += 1; continue; }
+    if (char === '"') quoted = !quoted;
+    else if (char === "#" && !quoted) return raw.slice(0, i);
+  }
+  return raw;
+}
+
+export function reserveEntryFor(meta: Record<string, ReserveEntry>, meterId: string): ReserveEntry | undefined {
+  return meta[meterId] ?? meta["*"];
+}
+
+/** The extra detail a reserve refusal or `policy show` appends after naming
+ * the key and its value: the entry's own reason and set_at date when
+ * present, otherwise the policy file's own mtime date -- so every reserve
+ * refusal traces back to *something*, never a bare unexplained number. */
+export function reserveAttributionSuffix(entry: Pick<ReserveEntry, "reason" | "set_at"> | undefined, policyMtimeIso: string | null | undefined): string | undefined {
+  const bits: string[] = [];
+  if (entry?.reason) bits.push(entry.reason);
+  if (entry?.set_at) bits.push(`set ${entry.set_at.slice(0, 10)}`);
+  if (bits.length) return bits.join(", ");
+  return policyMtimeIso ? `policy.toml updated ${policyMtimeIso.slice(0, 10)}` : undefined;
+}
+
+/** `[key: reason, set date]`, or plain `[key]` when neither the entry nor
+ * the policy file's mtime has anything to add. Appended after an existing
+ * reserve refusal's own "...reserve on X"/"...the N% reserve" wording. */
+export function reserveAttributionBracket(key: string, entry: Pick<ReserveEntry, "reason" | "set_at"> | undefined, policyMtimeIso: string | null | undefined): string {
+  const suffix = reserveAttributionSuffix(entry, policyMtimeIso);
+  return suffix ? `[${key}: ${suffix}]` : `[${key}]`;
+}
+
+/** Minimal TOML scalar reader for Headroom's deliberately small policy surface.
+ * `now` resolves an expiring `[reserve."<meter>"]` entry's `until` against the
+ * moment of the read -- readPolicy() calls this immediately after loading the
+ * file, so "now" here and "now" at the point a caller acts on the result are
+ * effectively the same instant. */
+export function parsePolicy(text: string, now: Date = new Date()): Policy {
   const values: Record<string, number> = {};
   const principalIntervals: Record<string, number> = {};
   const reserves: Record<string, number> = {};
+  const reserveMeta: Record<string, ReserveEntry> = {};
   let principal: string | undefined;
   let inReserve = false;
+  let reserveEntryKey: string | undefined;
+  let inFreezeReserve = false;
+  let freezeReserveMeta: { reason?: string; set_at?: string; until?: string } | undefined;
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
   let updateCheck: boolean | undefined;
@@ -68,11 +161,19 @@ export function parsePolicy(text: string): Policy {
   let allowance: Policy["allowance"] | undefined;
   let statuslineSnapshotDirs: string[] | undefined;
   for (const raw of text.split("\n")) {
-    const line = raw.replace(/#.*/, "").trim();
+    const line = stripTomlComment(raw).trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
-    if (section) { principal = section[1]; inReserve = false; continue; }
-    if (/^\[reserve\]$/.test(line)) { principal = undefined; inReserve = true; continue; }
-    if (/^\[.*\]$/.test(line)) { principal = undefined; inReserve = false; continue; }
+    if (section) { principal = section[1]; inReserve = false; reserveEntryKey = undefined; inFreezeReserve = false; continue; }
+    if (/^\[reserve\]$/.test(line)) { principal = undefined; inReserve = true; reserveEntryKey = undefined; inFreezeReserve = false; continue; }
+    // A dated/reasoned reserve entry: `[reserve."codex-main:main"]` or
+    // `[reserve.*]` (an unquoted bare word is also accepted, like the plain
+    // form's own key). A sibling section of `[reserve]`, not nested inside
+    // it -- mirrors how `[principal.X]` already sits beside no `[principal]`
+    // table of its own.
+    const reserveEntry = /^\[reserve\.(?:"([^"\\]+)"|([A-Za-z0-9_.*-]+))\]$/.exec(line);
+    if (reserveEntry) { reserveEntryKey = (reserveEntry[1] ?? reserveEntry[2]) as string; principal = undefined; inReserve = false; inFreezeReserve = false; continue; }
+    if (/^\[freeze_reserve\]$/.test(line)) { principal = undefined; inReserve = false; reserveEntryKey = undefined; inFreezeReserve = true; continue; }
+    if (/^\[.*\]$/.test(line)) { principal = undefined; inReserve = false; reserveEntryKey = undefined; inFreezeReserve = false; continue; }
     if (inReserve && line) {
       // Meter ids carry a colon and the default key is a bare `*`, so both
       // have to be quoted in TOML; a plain word key is accepted too. Any
@@ -80,8 +181,33 @@ export function parsePolicy(text: string): Policy {
       // than silently drop a protected floor the caller believes is set.
       const entry = /^(?:"([^"\\]+)"|([A-Za-z0-9_.*-]+))\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
       if (!entry) throw new Error("Invalid Headroom policy");
-      reserves[(entry[1] ?? entry[2]) as string] = Number(entry[3]);
+      reserveMeta[(entry[1] ?? entry[2]) as string] = { percent: Number(entry[3]) };
       continue;
+    }
+    if (reserveEntryKey && line) {
+      const current = reserveMeta[reserveEntryKey] ?? { percent: Number.NaN };
+      const percentMatch = /^percent\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
+      const reasonMatch = /^reason\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(line);
+      const setAtMatch = /^set_at\s*=\s*"([^"\\]+)"\s*$/.exec(line);
+      const untilMatch = /^until\s*=\s*"([^"\\]+)"\s*$/.exec(line);
+      const unlessMatch = /^unless\s*=\s*"([^"\\]*)"\s*$/.exec(line);
+      if (percentMatch) current.percent = Number(percentMatch[1]);
+      else if (reasonMatch) current.reason = JSON.parse(`"${reasonMatch[1]}"`);
+      else if (setAtMatch) { if (!Number.isFinite(Date.parse(setAtMatch[1]))) throw new Error("Invalid Headroom policy"); current.set_at = new Date(setAtMatch[1]).toISOString(); }
+      else if (untilMatch) { if (!Number.isFinite(Date.parse(untilMatch[1]))) throw new Error("Invalid Headroom policy"); current.until = new Date(untilMatch[1]).toISOString(); }
+      else if (unlessMatch) { if (unlessMatch[1] !== "banked_reset_available") throw new Error("Invalid Headroom policy"); current.unless = "banked_reset_available"; }
+      else throw new Error("Invalid Headroom policy");
+      reserveMeta[reserveEntryKey] = current;
+      continue;
+    }
+    if (inFreezeReserve && line) {
+      const reasonMatch = /^reason\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/.exec(line);
+      const setAtMatch = /^set_at\s*=\s*"([^"\\]+)"\s*$/.exec(line);
+      const untilMatch = /^until\s*=\s*"([^"\\]+)"\s*$/.exec(line);
+      if (reasonMatch) { freezeReserveMeta = { ...freezeReserveMeta, reason: JSON.parse(`"${reasonMatch[1]}"`) }; continue; }
+      if (setAtMatch) { if (!Number.isFinite(Date.parse(setAtMatch[1]))) throw new Error("Invalid Headroom policy"); freezeReserveMeta = { ...freezeReserveMeta, set_at: new Date(setAtMatch[1]).toISOString() }; continue; }
+      if (untilMatch) { if (!Number.isFinite(Date.parse(untilMatch[1]))) throw new Error("Invalid Headroom policy"); freezeReserveMeta = { ...freezeReserveMeta, until: new Date(untilMatch[1]).toISOString() }; continue; }
+      throw new Error("Invalid Headroom policy");
     }
     const interval = /^interval_minutes\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$/.exec(line);
     if (principal && interval) { principalIntervals[principal] = Number(interval[1]); continue; }
@@ -109,8 +235,26 @@ export function parsePolicy(text: string): Policy {
   const grace = values.pace_grace_fraction ?? defaultPolicy.pace_grace_fraction;
   const stale = values.staleness_minutes ?? defaultPolicy.staleness_minutes;
   const interval = values.poll_interval_minutes ?? defaultPolicy.poll_interval_minutes;
+  // Fail closed on an unparseable percent (an entry whose `percent = ` line
+  // was omitted entirely resolves to NaN here, same as a plain [reserve]
+  // entry with a non-numeric value already did) -- never silently drop a
+  // protected floor the operator believes is set. Checked against the
+  // ORIGINAL configured percent, not the expiry-resolved one below, so an
+  // out-of-range entry is still caught once it lapses.
+  if (Object.entries(reserveMeta).some(([key, entry]) => key !== "freeze_reserve_pct" && (!Number.isFinite(entry.percent) || entry.percent < 0 || entry.percent > 90))) throw new Error("Invalid Headroom policy");
+  // Resolve every reserve_meta entry (both the plain bare form and the
+  // dated/reasoned one -- both now live in reserveMeta uniformly) into the
+  // plain numeric `reserve` record every existing caller already reads. An
+  // entry whose `until` has passed no longer applies (fail-open toward "no
+  // floor", not fail-closed -- see the spec: "no longer applies"); its
+  // metadata is kept as-is so `policy show`/a refusal can still name it.
+  for (const [key, entry] of Object.entries(reserveMeta)) {
+    if (key === "freeze_reserve_pct") continue;
+    reserves[key] = reserveEntryExpired(entry, now) ? 0 : entry.percent;
+  }
+  if (freezeReserveMeta) reserveMeta.freeze_reserve_pct = { percent: freeze, ...freezeReserveMeta };
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0) || Object.values(reserves).some((value) => !Number.isFinite(value) || value < 0 || value > 90)) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, allowance: allowance ?? defaultPolicy.allowance, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, reserve_meta: reserveMeta, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, allowance: allowance ?? defaultPolicy.allowance, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, policy_mtime: null, ...(proxy ? { proxy } : {}) };
 }
 
 /** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from
@@ -295,6 +439,58 @@ export function reserveNote(reservePercent: number): string {
   return reservePercent > 0 ? ` (reserve ${reservePercent}%)` : "";
 }
 
+/** One reserve capping a meter, as `plan`/`fill`'s ceiling line lists it:
+ * either the meter's own (or `"*"`'s) `[reserve]` entry, or the global
+ * `freeze_reserve_pct`. `usable_to` is what a window could still spend if
+ * this were the ONLY reserve in force -- plan/fill's actual ceiling always
+ * enforces the larger (tightest) percent among every step, same as
+ * gate/can/route; this list exists so a caller can see the whole stack, not
+ * just the one that happened to bind. */
+export interface ReserveCeilingStep { key: string; percent: number; usable_to: number; reason?: string; set_at?: string; suspended?: boolean; }
+
+/** `meterSuspended` -- from reserveSuspendedFor (orchestrator-reads.ts), since
+ * that needs live store/credits data this pure function does not have --
+ * zeroes the meter's own step (and marks it) rather than dropping it, so a
+ * caller can still see that a reserve exists but is currently suspended. */
+export function reserveCeilingSteps(policy: Pick<Policy, "reserve" | "reserve_meta" | "freeze_reserve_pct">, meterId: string, meterSuspended: boolean): ReserveCeilingStep[] {
+  const meterEntry = reserveEntryFor(policy.reserve_meta, meterId);
+  const basePercent = reserveFor(policy.reserve, meterId);
+  const meterPercent = meterSuspended ? 0 : basePercent;
+  const freezeEntry = policy.reserve_meta.freeze_reserve_pct;
+  const steps: ReserveCeilingStep[] = [];
+  // Test the configured percent, not the effective one: a suspended reserve
+  // stays listed (zeroed and marked) so a caller sees it exists.
+  if (basePercent > 0) {
+    steps.push({ key: meterId, percent: meterPercent, usable_to: 100 - meterPercent, reason: meterEntry?.reason, set_at: meterEntry?.set_at, suspended: meterSuspended && meterEntry?.unless === "banked_reset_available" });
+  }
+  if (policy.freeze_reserve_pct > 0) {
+    steps.push({ key: "freeze_reserve_pct", percent: policy.freeze_reserve_pct, usable_to: 100 - policy.freeze_reserve_pct, reason: freezeEntry?.reason, set_at: freezeEntry?.set_at });
+  }
+  // Tightest (lowest usable ceiling, i.e. highest percent) first, matching
+  // the spec's own example ordering ("usable to 70%: ...; then to 90%: ...").
+  return steps.sort((a, b) => b.percent - a.percent);
+}
+
+/** Renders reserveCeilingSteps as `plan`/`fill`'s one-line ceiling summary.
+ * Empty string when no reserve applies at all. `bankedAvailable` appends the
+ * "the reserves block N points a banked reset would restore" note (spec item
+ * 3): a banked reset's own vendor/manual grant is worth up to 100% of a
+ * window, but the tightest reserve still standing withholds `N` of those
+ * points from ever being spendable, banked or not. */
+export function formatReserveCeiling(steps: ReserveCeilingStep[], policyMtimeIso: string | null, bankedAvailable: boolean): string {
+  if (!steps.length) return "";
+  const rendered = steps.map((step, index) => {
+    const suffix = reserveAttributionSuffix(step, policyMtimeIso);
+    const label = step.key === "freeze_reserve_pct" ? `freeze_reserve_pct = ${step.percent}` : `[reserve] ${step.key} = ${step.percent}`;
+    const lead = index === 0 ? `usable to ${step.usable_to}%` : `then to ${step.usable_to}%`;
+    const suspendedNote = step.suspended ? "; suspended while a banked reset is available" : "";
+    return `${lead}: ${label}${suffix ? ` (${suffix})` : ""}${suspendedNote}`;
+  });
+  const blocked = steps[0]?.percent ?? 0;
+  const bankedNote = bankedAvailable && blocked > 0 ? `; the reserves block ${blocked} points that a banked reset would restore` : "";
+  return `${rendered.join("; ")}${bankedNote}`;
+}
+
 /**
  * Turns an allowed `can` decision into a refusal when the expected cost of
  * the action would cross into the deciding meter's reserve. The pace state
@@ -302,12 +498,13 @@ export function reserveNote(reservePercent: number): string {
  * withholds capacity -- so the printed line still shows the real state
  * alongside a reason that names the reserve.
  */
-export function reserveOnCan(decision: CanDecision, reserves: Record<string, number>, remainingPercent: number | null, expectedPercent: number | null): CanDecision {
+export function reserveOnCan(decision: CanDecision, reserves: Record<string, number>, remainingPercent: number | null, expectedPercent: number | null, reserveMeta: Record<string, ReserveEntry> = {}, policyMtime: string | null = null): CanDecision {
   const reserve = reserveFor(reserves, decision.meter);
   if (!decision.allowed || reserve <= 0 || remainingPercent === null || expectedPercent === null) return decision;
   const usable = Math.max(0, remainingPercent - reserve);
   if (expectedPercent <= usable) return decision;
-  return { ...decision, allowed: false, reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${decision.meter} (${usable.toFixed(1)}% usable of ${remainingPercent.toFixed(1)}% remaining)` };
+  const attribution = reserveAttributionBracket(decision.meter, reserveEntryFor(reserveMeta, decision.meter), policyMtime);
+  return { ...decision, allowed: false, reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${decision.meter} (${usable.toFixed(1)}% usable of ${remainingPercent.toFixed(1)}% remaining) ${attribution}` };
 }
 
 /** The percent of a meter already reserved by every OTHER owner's active

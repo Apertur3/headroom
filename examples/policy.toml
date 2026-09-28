@@ -37,6 +37,21 @@ update_check = true
 # [reserve]
 # "claude-main:fable" = 10
 # "*" = 5
+#
+# A reserve entry can instead carry a reason and an expiry, in its own
+# sibling table (headroom policy set/clear reserve manages this for you):
+# [reserve."codex-main:main"]
+# percent = 30
+# reason = "stop new Codex builds at 70% used"
+# set_at = "2026-09-23T09:00:00Z"
+# until = "2026-09-30T00:00:00Z"          # optional: no longer applies once past
+# unless = "banked_reset_available"       # optional: suspended while a banked reset is usable
+#
+# freeze_reserve_pct can carry the same reason/set_at/until, informationally,
+# in its own table:
+# [freeze_reserve]
+# reason = "burn the week to 100%, then press a banked reset"
+# set_at = "2026-09-27T08:00:00Z"
 
 # Host guard: `headroom run` refuses to launch its child process onto a host
 # that cannot take it (see docs/concepts.md's "Host guard" section). `can` and

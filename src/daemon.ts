@@ -13,13 +13,13 @@ import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform 
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
-import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrator-reads.js";
+import { admitCanCost, fillFor, gateFor, planFor, rateLines, type GateOutcome, type RateLine } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { checkModelAvailability } from "./model-catalog.js";
 import { fireDueTimers } from "./heartbeat.js";
 import { accountsPath, readAccounts } from "./registry.js";
-import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
 
@@ -170,7 +170,7 @@ export class HeadroomDaemon {
   private readonly backoff = new Map<string, { failures: number; until: number }>();
   private readonly schedulers = new Map<string, NodeJS.Timeout>();
   private accounts: Account[] = [];
-  private accountsMtime: number | undefined;
+  private accountsMtime: string | undefined;
   private schedulingStarted = false;
   private stopping = false;
   private sessionToken: string | undefined;
@@ -241,7 +241,11 @@ export class HeadroomDaemon {
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
     if (!policy.antigravity_keepalive || process.platform === "win32") return;
-    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity");
+    // Centralized here (rather than trusting every caller to pre-filter) so
+    // a disabled Antigravity account never launches its keepalive, whether
+    // this is called from startup with the raw registry read or from a
+    // scheduled poll with an already-enabled-only list.
+    const antigravity = accounts.find((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "antigravity" && isAccountEnabled(account));
     if (!antigravity) return;
     // agy_path is a value from accounts.toml; verify ownership, mode, and
     // that it isn't a symlink before ever spawning it, the same bar every
@@ -271,7 +275,7 @@ export class HeadroomDaemon {
   private canDecision(meters: string[], accounts: Account[], localPreference: "fallback" | "prefer" | "never", policy: Policy, allowUnknown: boolean, owner: string, now: Date, includeOwnerReservations = false): CanDecision {
     const blocked = meters.map((meter) => this.store.dispatchBlockForMeter(meter, now) ?? this.store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
     if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
-    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
     const allMeters = [...new Set([...meters, ...localMeters])];
     const rows = new Map(allMeters.map((meter) => [meter, this.store.latestPerWindow(meter)]));
     const burn = this.store.burnRateFor([...rows.values()].flat(), now);
@@ -480,20 +484,26 @@ export class HeadroomDaemon {
         case "dashboard": {
           const policy = await readPolicy();
           const now = new Date();
-          const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          const rows = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
           result = readDashboardStore(this.store, now, rows, policy); break;
         }
         case "status": {
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const now = new Date();
-          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id));
+          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
           // A principal currently sitting out a live vendor 429 backoff (see
           // poll()'s own backoff bookkeeping) still serves whatever it last
           // read, unchanged, except its reason: naming the real deadline this
           // backoff actually lifts at beats repeating the original failure
           // message, which only grows staler while the backoff runs.
           const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
+          // The daemon's "status" RPC result stays the plain Observation[]
+          // array it has always been -- the 1.x JSON contract forbids ever
+          // turning it into an object -- so `disabled_principals` is derived
+          // by the CLI/MCP layers from the registry instead of returned here.
+          // Disabled principals are still excluded from capacity: their rows
+          // were already dropped from `observations` above.
           result = withCreditsLapsed(withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now), now);
           break;
         }
@@ -505,6 +515,9 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : "";
           const since = typeof params.since === "string" ? params.since : new Date(Date.now() - 86_400_000).toISOString();
           if (!meter) return reject(-32602, "meter is required");
+          // Unlike can/gate/plan/fill/lease_start/rate, history cannot create
+          // capacity for a disabled principal -- it only reads what was
+          // already stored -- so it stays readable regardless of enabled.
           result = this.store.history(meter, since); break;
         }
         case "events": {
@@ -525,6 +538,12 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
+          const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+          if (disabledMeter) {
+            const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+            result = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) } satisfies CanDecision;
+            break;
+          }
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const now = new Date();
@@ -545,6 +564,12 @@ export class HeadroomDaemon {
           const accounts = await this.currentAccounts();
           const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
           if (unknownMeters.length) return reject(-32602, `Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`, action);
+          const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+          if (disabledMeter) {
+            const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+            result = { decision: { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) }, leases: [] };
+            break;
+          }
           // Refreshes may happen before the transaction; the transaction is
           // deliberately only the local decision plus lease write, never a
           // credential-backed network request.
@@ -553,10 +578,10 @@ export class HeadroomDaemon {
           const now = new Date();
           const admitted = this.store.admitAndStartLeases(() => {
             const raw = this.canDecision(meters, accounts, routing.local_preference, policy, params.allow_unknown === true, owner, now, true);
-            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
             return admitCanCost(this.store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, policy, expected, now);
           }, owner, (admittedDecision) => {
-            const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+            const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
             return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
           }, expected, ttl, `can:${action}`, now, action);
           result = { decision: admitted.decision, leases: admitted.leases };
@@ -568,6 +593,8 @@ export class HeadroomDaemon {
           const expected = typeof params.expected_percent === "number" ? params.expected_percent : null;
           const ttl = typeof params.ttl_ms === "number" ? params.ttl_ms : 30 * 60_000;
           const actionClass = typeof params.action_class === "string" && params.action_class.trim() ? params.action_class.trim() : null;
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) return reject(-32000, disabledPrincipalReason(disabled), meter);
           result = this.store.startLease(owner, meter, expected, ttl, typeof params.note === "string" ? params.note : null, new Date(), actionClass); break;
         }
         case "lease_end": {
@@ -634,6 +661,14 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : undefined;
           const minutes = typeof params.minutes === "number" && params.minutes > 0 ? params.minutes : 30;
           const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          const disabled = meter ? disabledPrincipalForMeter(await this.currentAccounts(), meter) : undefined;
+          if (disabled) {
+            // Same documented bare RateLine[] array `rate` always returns
+            // (docs/json-contract.md) -- a synthetic UNKNOWN line, not a
+            // JSON-RPC error -- so the daemon, CLI, and direct paths agree.
+            result = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabledPrincipalReason(disabled) }] satisfies RateLine[];
+            break;
+          }
           result = rateLines(this.store, meter, minutes, new Date(), owner, typeof params.need === "string" ? params.need : undefined); break;
         }
         case "spend": {
@@ -675,9 +710,17 @@ export class HeadroomDaemon {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
           if (params.target_points !== undefined && (typeof params.target_points !== "number" || !Number.isFinite(params.target_points) || params.target_points < 0)) return reject(-32602, "target_points must be a non-negative number", meter);
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) {
+            // Same documented { meter, error, notices } failure shape `plan`
+            // always returns (docs/json-contract.md), not a JSON-RPC error,
+            // so the daemon, CLI, and direct paths agree.
+            result = { meter, error: disabledPrincipalReason(disabled), notices: [] };
+            break;
+          }
           const policy = await readPolicy();
           const reserve = typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct;
-          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined); break;
+          result = planFor(this.store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof params.need === "string" ? params.need : undefined, typeof params.target_points === "number" ? params.target_points : undefined, policy.reserve_meta, policy.policy_mtime); break;
         }
         case "gate": {
           const meter: string | string[] | undefined = typeof params.meter === "string" ? params.meter
@@ -692,6 +735,17 @@ export class HeadroomDaemon {
           if (params.allowance !== undefined && params.allowance !== "pro_rata" && params.allowance !== "fill") return reject(-32602, "allowance must be pro_rata or fill");
           if (params.cap_percent !== undefined && (typeof params.cap_percent !== "number" || !Number.isFinite(params.cap_percent) || params.cap_percent < 0 || params.cap_percent > 100)) return reject(-32602, "cap_percent must be 0 through 100");
           if (params.duration_minutes !== undefined && (typeof params.duration_minutes !== "number" || !Number.isFinite(params.duration_minutes) || params.duration_minutes <= 0)) return reject(-32602, "duration_minutes must be greater than 0");
+          const targetMeters = meter === undefined ? [] : Array.isArray(meter) ? meter : [meter];
+          const accounts = await this.currentAccounts();
+          const disabled = targetMeters.map((item) => disabledPrincipalForMeter(accounts, item)).find((item): item is string => item !== undefined);
+          if (disabled) {
+            // Same documented refused GateOutcome shape `gate` always
+            // returns (docs/json-contract.md: allowed, reason,
+            // meters_checked, unknown, notices), not a JSON-RPC error, so
+            // the daemon, CLI, and direct paths agree.
+            result = { allowed: false, reason: disabledPrincipalReason(disabled), unknown: true, meters_checked: targetMeters, notices: [] } satisfies GateOutcome;
+            break;
+          }
           await this.poll(undefined, false);
           const policy = await readPolicy();
           const reserve = Math.max(policy.freeze_reserve_pct, typeof params.reserve_percent === "number" ? params.reserve_percent : policy.freeze_reserve_pct);
@@ -699,13 +753,21 @@ export class HeadroomDaemon {
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
           const routing = actionClass ? await readRouting() : undefined;
-          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, capPercent: typeof params.cap_percent === "number" ? params.cap_percent : undefined, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve }); break;
+          result = gateFor(this.store, needs, meter, reserve, params.plan === true, new Date(), { owner, planSharePercent: planShare, actionClass, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, capPercent: typeof params.cap_percent === "number" ? params.cap_percent : undefined, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); break;
         }
         case "fill": {
           const meter = typeof params.meter === "string" ? params.meter : "";
           if (!meter) return reject(-32602, "meter is required");
           if (params.allowance !== undefined && params.allowance !== "pro_rata" && params.allowance !== "fill") return reject(-32602, "allowance must be pro_rata or fill");
           if (params.duration_minutes !== undefined && (typeof params.duration_minutes !== "number" || !Number.isFinite(params.duration_minutes) || params.duration_minutes <= 0)) return reject(-32602, "duration_minutes must be greater than 0");
+          const disabled = disabledPrincipalForMeter(await this.currentAccounts(), meter);
+          if (disabled) {
+            // Same documented { meter, error, notices } failure shape `fill`
+            // always returns (docs/json-contract.md), not a JSON-RPC error,
+            // so the daemon, CLI, and direct paths agree.
+            result = { meter, error: disabledPrincipalReason(disabled), notices: [] };
+            break;
+          }
           const laneCost = typeof params.lane_cost_percent === "number" ? params.lane_cost_percent : undefined;
           const policy = await readPolicy();
           const weeklyReserve = typeof params.weekly_reserve_percent === "number" ? params.weekly_reserve_percent : policy.freeze_reserve_pct;
@@ -713,7 +775,7 @@ export class HeadroomDaemon {
           const planShare = typeof params.plan_share_percent === "number" ? params.plan_share_percent : undefined;
           const actionClass = typeof params.action_class === "string" ? params.action_class : undefined;
           const routing = actionClass ? await readRouting() : undefined;
-          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, actionClass, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
+          result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, actionClass, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
         }
         case "health": result = {
           socket: this.path,
@@ -801,12 +863,16 @@ export class HeadroomDaemon {
     if (!forced && principal === undefined && !warmOnly) {
       try {
         const accounts = await this.currentAccounts();
-        if (accounts.length && accounts.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
+        const enabled = accounts.filter(isAccountEnabled);
+        if (enabled.length && enabled.every((account) => (this.lastPoll.get(account.name) ?? 0) + (policy.principal_intervals[account.name] ?? policy.poll_interval_minutes) * 60_000 > now)) return { observations: [], failures: [] };
       } catch { /* A collection pass returns the useful configuration error. */ }
     }
     if (forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { rate_limited: true };
     if (!forced && (this.lastPoll.get(key) ?? 0) + interval > now && !warmOnly) return { observations: [], failures: [] };
     const accounts = await this.currentAccounts();
+    const enabledAccounts = accounts.filter(isAccountEnabled);
+    if (principal && accounts.some((account) => account.name === principal && !isAccountEnabled(account))) return { observations: [], failures: [] };
+    if (!principal && accounts.length && !enabledAccounts.length) return { observations: [], failures: [] };
     // Records which probe binary this poll is about to run, before it runs.
     // Idempotent, so two concurrent poll() calls racing here (before the
     // inFlight check/set pair right below, which must stay await-free to keep
@@ -819,7 +885,15 @@ export class HeadroomDaemon {
       skipRemoteAntigravity: warmOnly,
       antigravityLoginState: this.keepalive?.loginState ?? "unknown",
       claudeGrant: claudeGrantGate(this.store),
-    }).then((result) => {
+    }).then((rawResult) => {
+      // Keep the daemon's bookkeeping closed even for an injected poller:
+      // disabled rows must not create observations, source events, or alerts.
+      const disabled = new Set(accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name));
+      const result = {
+        ...rawResult,
+        observations: rawResult.observations.filter((item) => !disabled.has(item.principal_id)),
+        failures: rawResult.failures.filter((failure) => ![...disabled].some((name) => failure.startsWith(`${name} source failed`))),
+      };
       this.lastPoll.set(key, Date.now());
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertPoll(result.observations);
@@ -837,17 +911,20 @@ export class HeadroomDaemon {
       void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account)))
         .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
+        if (disabled.has(principalId)) continue;
         this.antigravityLocal.set(principalId, read);
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
       }
-      if (this.schedulingStarted && !this.keepalive?.running && accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-        void this.maybeStartKeepalive(accounts, policy);
+      if (this.schedulingStarted && !this.keepalive?.running && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+        void this.maybeStartKeepalive(enabledAccounts, policy);
       }
       // A gate-blocked skip renders the exact same failed observation reason
       // as a real denial on purpose (see PollResult.claudeProbeOutcomes), so
       // the audit outcome comes from the collector's own record of what it
       // did, never from inspecting the observations after the fact.
-      for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) this.store.audit("daemon", "claude_probe", principalId, outcome);
+      for (const [principalId, outcome] of Object.entries(result.claudeProbeOutcomes ?? {})) {
+        if (!disabled.has(principalId)) this.store.audit("daemon", "claude_probe", principalId, outcome);
+      }
       // Every scheduled vendor poll is audited, not only Claude's (which
       // already gets its own claude_probe row above): a non-Claude principal
       // that failed to fetch must leave the same evidence trail.
@@ -876,11 +953,15 @@ export class HeadroomDaemon {
     if (this.stopping) return;
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
-    try { for (const account of await this.currentAccounts()) this.schedulePrincipal(account.name); }
+    try { for (const account of (await this.currentAccounts()).filter(isAccountEnabled)) this.schedulePrincipal(account.name); }
     catch { this.schedulePrincipal("all"); }
   }
 
   private async schedulePrincipal(principal: string): Promise<void> {
+    if (principal !== "all") {
+      const account = (await this.currentAccounts()).find((item) => item.name === principal);
+      if (!account || !isAccountEnabled(account)) { this.schedulers.delete(principal); return; }
+    }
     const policy = await readPolicy();
     const minutes = policy.principal_intervals[principal] ?? policy.poll_interval_minutes;
     const delay = Math.max(1_000, minutes * 60_000 * (0.8 + Math.random() * 0.4));
@@ -897,23 +978,33 @@ export class HeadroomDaemon {
 
   /** Reloads principal scheduling when accounts.toml changes without a restart. */
   private async currentAccounts(): Promise<Account[]> {
-    let mtime: number;
-    try { mtime = (await stat(accountsPath())).mtimeMs; }
+    let mtime: string;
+    try { const info = await stat(accountsPath()); mtime = `${info.mtimeMs}:${info.size}`; }
     catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { this.accounts = []; this.accountsMtime = undefined; return this.accounts; } throw error; }
     if (this.accountsMtime === mtime) return this.accounts;
     const accounts = await readAccounts();
-    const prior = new Set(this.accounts.map((account) => account.name));
+    const priorAccounts = new Map(this.accounts.map((account) => [account.name, account]));
+    const prior = new Set(priorAccounts.keys());
     const next = new Set(accounts.map((account) => account.name));
     this.accounts = accounts;
     this.accountsMtime = mtime;
-    for (const name of prior) if (!next.has(name)) {
+    for (const name of prior) if (!next.has(name) || !isAccountEnabled(accounts.find((account) => account.name === name)!)) {
       const timer = this.schedulers.get(name);
       if (timer) clearTimeout(timer);
       this.schedulers.delete(name);
       this.lastPoll.delete(name);
       this.backoff.delete(name);
     }
-    if (this.schedulingStarted) for (const account of accounts) if (!prior.has(account.name)) void this.schedulePrincipal(account.name);
+    if (this.schedulingStarted) for (const account of accounts) if (isAccountEnabled(account) && (!prior.has(account.name) || !isAccountEnabled(priorAccounts.get(account.name)!))) void this.schedulePrincipal(account.name);
+    // A running keepalive with no enabled Antigravity account left to serve
+    // (the last one was disabled, or removed outright) must stop -- an
+    // `accounts.toml` edit that disables Antigravity while the daemon is
+    // already running must not leave its `agy` process running unsupervised.
+    if (this.keepalive?.running && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
+      const keepalive = this.keepalive;
+      this.keepalive = undefined;
+      void keepalive.stop().catch((error: unknown) => appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home));
+    }
     return this.accounts;
   }
 }
