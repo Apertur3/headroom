@@ -259,6 +259,20 @@ describe("CLI --json field shapes", () => {
     await compareToFixture("cli-gate", JSON.parse(logs[0]));
   });
 
+  // The explicit fill allowance basis adds an optional trio (allowance_basis,
+  // projected_percent, cap_percent) that the plain pro-rata "gate" fixture
+  // above never exercises -- seedBasic's own burn history (three 5h samples
+  // within the last 25 minutes) makes the projection computable here, so
+  // this fixture actually carries the new fields rather than falling through
+  // to an early UNKNOWN refusal.
+  it("gate --allowance fill", async () => {
+    const home = await newHome("gate-fill");
+    await seedBasic(home);
+    const { logs, restore } = captureLog();
+    try { await withHeadroomHome(home, () => main(["gate", "--need", "5h:1", "--meter", "claude-main:all", "--owner", "cadence", "--allowance", "fill", "--json"])); } finally { restore(); }
+    await compareToFixture("cli-gate-fill", JSON.parse(logs[0]));
+  });
+
   it("plan", async () => {
     const home = await newHome("plan");
     await seedBasic(home);
@@ -539,6 +553,15 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
     await seedBasic(home);
     const result = await withHeadroomHome(home, () => call("quota_gate", { needs: ["5h:1"], meter: "claude-main:all", owner: "cadence", action_class: "claude-fable" }));
     await compareToFixture("mcp-quota_gate", result);
+  });
+
+  // See the CLI "gate --allowance fill" test above: locks in the same
+  // additive allowance_basis/projected_percent/cap_percent trio over MCP.
+  it("quota_gate allowance fill", async () => {
+    const home = await newHome("mcp-gate-fill");
+    await seedBasic(home);
+    const result = await withHeadroomHome(home, () => call("quota_gate", { needs: ["5h:1"], meter: "claude-main:all", owner: "cadence", allowance: "fill" }));
+    await compareToFixture("mcp-quota_gate-fill", result);
   });
 
   it("quota_wait", async () => {

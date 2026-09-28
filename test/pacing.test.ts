@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { computeFill, computePlan, evaluateBurst, evaluateGate, evaluateProRataLine, fillClassFits, parseGateNeed, waitForReset } from "../src/pacing.js";
+import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateGate, evaluateProRataLine, fillClassFits, parseGateNeed, waitForReset } from "../src/pacing.js";
 
 describe("evaluateProRataLine", () => {
   it("allows spend that stays under the elapsed-fraction line plus tolerance", () => {
@@ -24,6 +24,43 @@ describe("evaluateProRataLine", () => {
     const now = windowStart; // line = 0 right at window start
     expect(evaluateProRataLine({ usedSoFarByOwnerPercent: 0, requestPercent: 5, plannedSharePercent: 20, windowStart, windowDurationHours: 5, now }).allowed).toBe(true);
     expect(evaluateProRataLine({ usedSoFarByOwnerPercent: 0, requestPercent: 5.1, plannedSharePercent: 20, windowStart, windowDurationHours: 5, now }).allowed).toBe(false);
+  });
+});
+
+describe("evaluateFillAllowance", () => {
+  it("refuses rather than assuming zero burn when history is absent (null)", () => {
+    const result = evaluateFillAllowance({ usedPercent: 1, reservedByOthersPercent: 20, burnPercentPerHour: null, laneHours: 2, capPercent: 90, requestPercent: 49 });
+    expect(result.allowed).toBe(false);
+    expect(result.unknown).toBe(true);
+    expect(result.reason).toContain("recent burn history is unknown");
+    expect(result.reason).toContain("refusing rather than assuming zero burn");
+  });
+
+  it("accepts a real, measured zero burn (distinct from absent history)", () => {
+    const result = evaluateFillAllowance({ usedPercent: 1, reservedByOthersPercent: 20, burnPercentPerHour: 0, laneHours: 2, capPercent: 90, requestPercent: 49 });
+    expect(result.unknown).toBeUndefined();
+    expect(result).toMatchObject({ allowed: true, projected_percent: 21, allowance_percent: 69, cap_percent: 90 });
+    expect(result.reason).toContain("burn 0.0 pts/h x 2.0 h");
+    expect(result.reason).toContain("69.0 under the 90 cap");
+  });
+
+  it("projects a non-negative burn to the end of the lane", () => {
+    const result = evaluateFillAllowance({ usedPercent: 1, reservedByOthersPercent: 20, burnPercentPerHour: 10, laneHours: 2, capPercent: 90, requestPercent: 49 });
+    expect(result).toMatchObject({ allowed: true, projected_percent: 41, allowance_percent: 49 });
+    expect(result.reason).toBe("fill: projected 41.0 pts at lane end (used 1.0 + reserved 20.0 + burn 10.0 pts/h x 2.0 h) leaves 49.0 under the 90 cap");
+  });
+
+  it("clamps a projection at 100 and refuses without a tolerance", () => {
+    const result = evaluateFillAllowance({ usedPercent: 80, reservedByOthersPercent: 30, burnPercentPerHour: 20, laneHours: 2, capPercent: 90, requestPercent: 0.1 });
+    expect(result).toMatchObject({ allowed: false, projected_percent: 100, allowance_percent: 0, cap_percent: 90 });
+    expect(result.reason).toContain("exceeds the 90 cap by 0.1");
+  });
+
+  it("honours a lower per-call cap and names both the projection and cap on refusal", () => {
+    const result = evaluateFillAllowance({ usedPercent: 10, reservedByOthersPercent: 0, burnPercentPerHour: 5, laneHours: 2, capPercent: 25, requestPercent: 6 });
+    expect(result).toMatchObject({ allowed: false, projected_percent: 20, allowance_percent: 5, cap_percent: 25 });
+    expect(result.reason).toContain("projected 20.0");
+    expect(result.reason).toContain("25 cap");
   });
 });
 

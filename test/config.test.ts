@@ -19,6 +19,12 @@ describe("policy defaults", () => {
     expect(parsePolicy('pacing = "even"\n').pacing).toBe("even");
     expect(parsePolicy('pacing = "none"\n').pacing).toBe("none");
   });
+
+  it("defaults allowance to pro_rata, accepts fill, and rejects an invalid value", () => {
+    expect(parsePolicy("").allowance).toBe("pro_rata");
+    expect(parsePolicy('allowance = "fill"\n').allowance).toBe("fill");
+    expect(() => parsePolicy('allowance = "burst"\n')).toThrow("Invalid Headroom policy");
+  });
 });
 
 describe("seedExampleConfig", () => {

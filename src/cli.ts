@@ -401,6 +401,22 @@ function ttl(value: string | undefined, flag = "--ttl"): number {
 
 function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
 
+function allowanceOption(value: string | undefined): "pro_rata" | "fill" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "pro_rata" || value === "fill") return value;
+  throw new Error("--allowance must be pro_rata or fill");
+}
+
+function boundedNumberOption(value: string | undefined, flag: string, minimum: number, maximum: number, exclusiveMinimum = false): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed > maximum || (exclusiveMinimum ? parsed <= minimum : parsed < minimum)) {
+    const range = maximum < Infinity ? `${minimum} through ${maximum}` : `greater than ${minimum}`;
+    throw new Error(`${flag} must be ${exclusiveMinimum ? `greater than ${minimum}` : range}`);
+  }
+  return parsed;
+}
+
 // Registry reads for the disabled-principal check use readAccountsOrEmpty(),
 // never a blanket swallowing .catch(): a missing accounts.toml (before the
 // first `accounts discover`) is a normal, well-defined "no accounts
@@ -977,7 +993,10 @@ async function run(argv: string[]): Promise<number> {
   const meter = option(flags, "--meter");
   const owner = option(flags, "--owner");
   const actionClass = option(flags, "--class");
-  if (!owner || !command.length || (!meter && !actionClass)) throw new Error("Usage: headroom run --meter <meter> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] -- <command> [args...]");
+  const allowance = allowanceOption(option(flags, "--allowance"));
+  const capPercent = boundedNumberOption(option(flags, "--cap"), "--cap", 0, 100);
+  const durationMinutes = boundedNumberOption(option(flags, "--duration"), "--duration", 0, Infinity, true);
+  if (!owner || !command.length || (!meter && !actionClass)) throw new Error("Usage: headroom run --meter <meter> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--cap <N>] [--duration <minutes>] [--allowance pro_rata|fill] [--ttl 3h] -- <command> [args...]");
   const needs: GateNeed[] = [];
   for (let index = 0; index < flags.length; index += 1) if (flags[index] === "--need") needs.push(parseGateNeed(flags[index + 1] ?? ""));
   // Host guard runs before anything else in this command, including opening
@@ -999,9 +1018,11 @@ async function run(argv: string[]): Promise<number> {
   let leases: Lease[] = [];
   try {
     let target: string | string[] = meter ?? [];
+    let actionDurationMinutes: number | undefined;
+    const routing = actionClass ? await readRouting() : undefined;
+    if (actionClass) actionDurationMinutes = routing?.costs[actionClass]?.duration_minutes;
     if (!meter && actionClass) {
-      const routing = await readRouting();
-      const meters = routing.consumes[actionClass];
+      const meters = routing?.consumes[actionClass];
       if (!meters?.length) throw new Error(`Unknown action class: ${actionClass}`);
       target = meters;
       const learned = store.learnedCost(actionClass)[0];
@@ -1027,7 +1048,7 @@ async function run(argv: string[]): Promise<number> {
     // open leases: a single owner must not bypass shared-account protection by
     // launching several jobs in parallel.
     const admitted = store.admitAndStartLeases(
-      () => gateFor(store, needs, target, policy.freeze_reserve_pct, false, now, { owner, actionClass, includeOwnerReservations: true, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }),
+      () => gateFor(store, needs, target, policy.freeze_reserve_pct, false, now, { owner, actionClass, includeOwnerReservations: true, pacing: policy.pacing, allowance: allowance ?? policy.allowance, capPercent, durationMinutes: durationMinutes ?? actionDurationMinutes, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }),
       owner,
       Array.isArray(target) ? target : [target],
       needs.reduce((sum, need) => sum + need.points, 0),
@@ -1237,7 +1258,7 @@ async function plan(argv: string[]): Promise<number> {
 async function gate(argv: string[]): Promise<number> {
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share N] [--json]";
+  const usage = "Usage: headroom gate --need 5h:N [--need wk:N] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share N] [--reserve N] [--cap N] [--duration <minutes>] [--allowance pro_rata|fill] [--json]";
   if (!owner) throw new Error(usage);
   const needs: GateNeed[] = [];
   for (let index = 0; index < argv.length; index += 1) if (argv[index] === "--need") needs.push(parseGateNeed(argv[index + 1] ?? ""));
@@ -1245,16 +1266,24 @@ async function gate(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
   const actionClass = option(argv, "--class");
   const model = option(argv, "--model");
+  const allowance = allowanceOption(option(argv, "--allowance"));
+  const capPercent = boundedNumberOption(option(argv, "--cap"), "--cap", 0, 100);
+  const durationMinutes = boundedNumberOption(option(argv, "--duration"), "--duration", 0, Infinity, true);
+  const reserveValue = boundedNumberOption(option(argv, "--reserve"), "--reserve", 0, 100);
   // An omitted target used to fail closed silently over every known meter,
   // which read as a plain "NO" against whichever meter happened to sort
   // first rather than the one the caller actually meant.
   if (!meter && !actionClass && !model) throw new Error(usage);
   let target: string | string[] | undefined = meter;
+  let actionDurationMinutes: number | undefined;
   if (!meter && actionClass) {
     const routing = await readRouting();
     const meters = routing.consumes[actionClass];
     if (!meters) throw new Error(`Unknown action class: ${actionClass}`);
     target = meters;
+    actionDurationMinutes = routing.costs[actionClass]?.duration_minutes;
+  } else if (actionClass) {
+    actionDurationMinutes = (await readRouting()).costs[actionClass]?.duration_minutes;
   }
   // `--model fable` is a resolved shorthand for every configured Claude
   // principal's own `<principal>:fable` (or any other model-scoped) meter --
@@ -1272,7 +1301,7 @@ async function gate(argv: string[]): Promise<number> {
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
   const disabled = target ? await disabledMeterInList(Array.isArray(target) ? target : [target]) : undefined;
-  const options = { owner, planSharePercent, actionClass };
+  const options = { owner, planSharePercent, actionClass, allowance, capPercent, durationMinutes: durationMinutes ?? actionDurationMinutes };
   let result: Awaited<ReturnType<typeof gateFor>>;
   if (disabled) {
     // gate's own documented refusal shape (docs/json-contract.md): `{
@@ -1280,13 +1309,14 @@ async function gate(argv: string[]): Promise<number> {
     // as any other refusal below, not a one-off object/field set.
     result = { allowed: false, reason: disabled.reason, unknown: true, meters_checked: Array.isArray(target) ? target : target ? [target] : [], notices: [] };
   } else {
-    const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
+    const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, reserve_percent: reserveValue, owner, plan_share_percent: planSharePercent, action_class: actionClass, allowance, cap_percent: capPercent, duration_minutes: durationMinutes });
     if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
     else {
       directReadNotice();
       const policy = await readPolicy();
       const store = await HeadroomStore.open();
-      try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+      const reserve = Math.max(policy.freeze_reserve_pct, reserveValue ?? policy.freeze_reserve_pct);
+      try { result = gateFor(store, needs, target, reserve, usePlan, new Date(), { ...options, pacing: policy.pacing, allowance: allowance ?? policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
     }
   }
   if (asJson) {
@@ -1348,7 +1378,7 @@ async function fill(argv: string[]): Promise<number> {
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
   const meter = option(argv, "--meter");
-  if (!meter || !owner || !argv.includes("--until-reset")) throw new Error("Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] --owner <name> [--json]");
+  if (!meter || !owner || !argv.includes("--until-reset")) throw new Error("Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--class <action-class>] [--duration <minutes>] [--allowance pro_rata|fill] --owner <name> [--json]");
   const laneCostValue = option(argv, "--lane-cost");
   const laneCost = laneCostValue === undefined ? undefined : Number(laneCostValue);
   if (laneCost !== undefined && (!Number.isFinite(laneCost) || laneCost <= 0)) throw new Error("--lane-cost must be a positive percent");
@@ -1357,6 +1387,10 @@ async function fill(argv: string[]): Promise<number> {
   const planShareValue = option(argv, "--plan-share");
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
+  const actionClass = option(argv, "--class");
+  const allowance = allowanceOption(option(argv, "--allowance"));
+  const durationMinutes = boundedNumberOption(option(argv, "--duration"), "--duration", 0, Infinity, true);
+  const actionDurationMinutes = actionClass ? (await readRouting()).costs[actionClass]?.duration_minutes : undefined;
   const asJson = argv.includes("--json");
   const disabled = await disabledMeterReason(meter);
   const need = option(argv, "--need"); if (need) parseGateNeed(`${need}:0`);
@@ -1367,14 +1401,14 @@ async function fill(argv: string[]): Promise<number> {
     // no enforced window at all already reports, not a one-off object/exit 2.
     result = { meter, error: disabled, notices: [] };
   } else {
-    const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
+    const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, action_class: actionClass, allowance, duration_minutes: durationMinutes, need });
     if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
     else {
       directReadNotice();
       const policy = await readPolicy();
       const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
       const store = await HeadroomStore.open();
-      try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+      try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, actionClass, durationMinutes: durationMinutes ?? actionDurationMinutes, pacing: policy.pacing, allowance: allowance ?? policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
     }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
@@ -2095,8 +2129,8 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
     "Usage: headroom plan --meter <meter_id> --until reset [--reserve <percent>] [--target <points>] [--json]",
     `  import: ${PLAN_IMPORT_HELP}`,
   ].join("\n"),
-  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--json]",
-  run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--ttl 3h] [--json] -- <command> [args...]",
+  gate: "Usage: headroom gate --need 5h:<N> [--need wk:<N>] (--meter <meter_id> | --class <action-class> | --model <slug>) --owner <name> [--plan] [--plan-share <N>] [--reserve <N>] [--cap <N>] [--duration <minutes>] [--allowance pro_rata|fill] [--json]",
+  run: "Usage: headroom run --meter <meter_id> --need <window>:<points> [--need ...] --owner <name> [--class <action-class>] [--cap <N>] [--duration <minutes>] [--allowance pro_rata|fill] [--ttl 3h] [--json] -- <command> [args...]",
   report: "Usage: headroom report --meter <meter_id> (--exhausted [--until <iso or vendor date>] | --recovered) [--note <text>]",
   credits: [
     "Usage: headroom credits [--json]",
@@ -2106,7 +2140,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   policy: POLICY_USAGE,
   ack: "Usage: headroom ack plan <principal>",
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
-  fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
+  fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] [--class <action-class>] [--duration <minutes>] [--allowance pro_rata|fill] --owner <name> [--json]",
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
   accounts: "Usage: headroom accounts <discover|enable|disable> [<name>]",
   doctor: "Usage: headroom doctor [--bundle [path]]",

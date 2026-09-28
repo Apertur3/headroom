@@ -1,0 +1,26 @@
+{
+  "allowance_basis": "string",
+  "allowed": "boolean",
+  "cap_percent": "number",
+  "contract": "string",
+  "generated_at": "string",
+  "host": {
+    "load_ratio": "number",
+    "orphans": "number",
+    "pty_max": "number",
+    "pty_used": "number",
+    "reasons": [
+      "unknown (empty array in the fixture data)"
+    ],
+    "state": "string"
+  },
+  "meters_checked": [
+    "string"
+  ],
+  "notices": [
+    "unknown (empty array in the fixture data)"
+  ],
+  "projected_percent": "number",
+  "reason": "string",
+  "source": "string"
+}

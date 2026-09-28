@@ -338,11 +338,25 @@ check would allow it. The burst check looks at the meter's own last-10-minutes b
 any plan: more than twice the plan rate refuses with a reason naming when the line would catch up.
 `pacing = "none"` skips both, leaving only the plain reserve/plan-line checks. `headroom fill --meter
 M --until-reset [--lane-cost N] --owner X` answers "how many more lanes fit before this window's
-unspent points are lost at reset": under even pacing it only offers the window's full remainder in
-the last 45 minutes before reset, offering the pro-rata allowance instead any earlier than that. It
-also lists, per `routing.toml` `[cost.<class>]` entry, how many runs of that class fit the window's
-remaining points and remaining minutes (a learned median cost overrides the static config number
-once samples exist).
+unspent points are lost at reset": under even pacing, with the default pro-rata basis, it only offers
+the window's full remainder in the last 45 minutes before reset, offering the pro-rata allowance
+instead any earlier than that. It also lists, per `routing.toml` `[cost.<class>]` entry, how many
+runs of that class fit the window's remaining points and remaining minutes (a learned median cost
+overrides the static config number once samples exist).
+
+The allowance basis is `"pro_rata"` by default. An orchestrator may set policy `allowance = "fill"`
+or pass `--allowance fill` when it deliberately wants to spend a use-it-or-lose-it 5h window before
+its reset and no other work needs that capacity. The fill basis keeps the gate cap (including the
+reserve floor), projects other owners' open leases and the meter's recent 60-minute burn to the lane
+end, and refuses if the requested work would cross that cap. `--duration <minutes>` (or a routing
+class's configured duration) defines that horizon, never beyond the reset. `fill` keeps its existing
+5-point safety margin and meter reserve while making its lane offer. Unlike the pro-rata basis, an
+explicit `fill` request is never silently skipped: it applies with no `--owner` given and inside the
+final 45 minutes before reset too (that is exactly when a burst against the cap matters most), and it
+fails closed -- UNKNOWN on `gate`, an `error` on `fill` -- rather than quietly falling back to full
+capacity, whenever the window has no finite future reset to project to or its last 60 minutes carry
+no burn history to project from (a real, measured zero burn is not the same fact as an absent one,
+and is accepted normally). Leave the default pro-rata basis in place for ordinary paced work.
 
 `policy.toml`'s `[reserve]` table is a different thing from `freeze_reserve_pct`, and the two names
 are easy to confuse. `freeze_reserve_pct` is a **pace** threshold: once a window's used percent

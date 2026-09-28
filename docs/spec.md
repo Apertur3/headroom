@@ -130,6 +130,11 @@ edit only that line in place. Status renders a parked principal as
   `headroom events --since 24h`, `headroom models [--principal <id>] [--json|--agent]`
   (one non-flag principal value at most once),
   `headroom can <principal> <action-class> [--allow-unknown]`.
+- `headroom gate --need 5h:N --meter M --owner X [--reserve N] [--cap N] [--duration minutes]
+  [--allowance pro_rata|fill]`, `headroom fill --meter M --until-reset --owner X [--class C]
+  [--duration minutes] [--allowance pro_rata|fill]`, and `headroom run ... --owner X
+  [--cap N] [--duration minutes] [--allowance pro_rata|fill] -- <command>` use pro-rata
+  allowance by default; `fill` is the explicit use-it-or-lose-it basis.
 - `headroom credits [--json]`; `headroom credits set --principal <name> --available <n> --expires
   <YYYY-MM-DD|ISO instant> [--json]`; `headroom credits clear --principal <name> [--json]`. A
   date-only expiry is midnight UTC on that date.

@@ -272,6 +272,7 @@ fail-closed.
 
 `{ contract, generated_at, allowed: boolean, reason: string, meters_checked:
 string[], not_enforced?: Array<"5h" | "wk">, unknown?: true,
+allowance_basis?: "fill", projected_percent?: number, cap_percent?: number,
 lanes_remaining_for_class?: number | null, notices: string[], host: HostHealth
 }`. `host` is additive (see "Shared vocabulary" above); it never affects
 `allowed`. `not_enforced`
@@ -280,7 +281,12 @@ lists needs skipped because their window is not enforced on the deciding meter
 some refusals) means the refusal is because a needed window's usage could not
 be read at all, not because a known usage simply does not fit -- render it
 like an UNKNOWN reading, not a plain "no". `lanes_remaining_for_class` is
-present only with `--class`/`action_class` and a learned cost for it. `notices`
+present only with `--class`/`action_class` and a learned cost for it. The
+`allowance_basis`, `projected_percent`, and `cap_percent` fields are present
+together when an even-paced 5h gate used the explicit `fill` allowance: the
+projection is the usage expected at the selected lane horizon before the
+request, and the cap is the reserve-derived ceiling after any lower per-call
+cap. `notices`
 is one line per meter this call checked (`meters_checked`) with an
 unscheduled reset (issue #20) in the last 24 hours -- `["unscheduled reset on
 codex-main:main at 2026-09-08T01:24:26Z; capacity appeared, re-plan"]` --
@@ -393,7 +399,7 @@ points_used: number, reason: string } | null, lanes_error: string | null,
 classes: FillClassFit[], used_5h_percent: number | null,
 used_weekly_percent: number | null, resets_in_seconds: number | null,
 lane_cost_percent: number | null, lane_cost_source: "given" | "learned" |
-"unknown", allowance_basis: "full" | "pro_rata", window_used: string,
+"unknown", allowance_basis: "full" | "pro_rata" | "fill", window_used: string,
 reserve_ceiling: string,
 notices: string[] }`. `reserve_ceiling` is the same additive field `plan` carries above. `lanes` is `null` only with no `--lane-cost` and no
 learned cost for the meter yet (`lanes_error` then names why); the per-class
