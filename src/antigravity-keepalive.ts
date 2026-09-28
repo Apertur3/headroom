@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { lstat, open, readdir, readFile, unlink } from "node:fs/promises";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { lstat, open, readdir, readFile, rmdir, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
 import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processSignature, type ExecFile } from "./process-tree.js";
@@ -40,12 +40,10 @@ export interface AgyKeepaliveOptions {
   logPollIntervalMs?: number;
   logWatchMs?: number;
   /** Headroom's own state directory. When set (production always sets it),
-   * stop() persists nothing itself, but launch() records the owned pids
-   * here so a *future* daemon start can find and reap them if this one
+   * launch() creates a private directory beneath it and records the owned
+   * pids there so a *future* daemon start can find and reap them if this one
    * never gets to call stop() (crash, SIGKILL, forced service restart). */
   home?: string;
-  /** Overrides the state file path derived from `home`; mainly for tests. */
-  stateFile?: string;
   /** How long stop() waits after SIGTERM before escalating to SIGKILL. */
   killGraceMs?: number;
   /** How many times launch() polls for agy's pid (script's child) before
@@ -65,7 +63,7 @@ export interface KeepaliveState {
   agyStartedAt?: string;
   /** ISO timestamp of Date.now() at spawn, known the instant the ChildProcess
    * exists -- no `ps` call needed. This is the only start-time evidence a
-   * later sweep has for the pid named by the launch wrapper's `.agy-pid` file
+   * later sweep has for the pid named by the launch wrapper's `agy.pid` file
    * when `ps` was never reachable in between (see sweepPreviousKeepalive). */
   launchedAt?: string;
   recordedAt: string;
@@ -74,26 +72,22 @@ export interface KeepaliveState {
    * writes synchronously at spawn, before any `ps` call has had a chance to
    * run or answer. */
   verified: boolean;
-  /** A fresh random id, generated once per launch() call (never reused,
-   * never derived from a pid or a counter that resets per-instance).
-   * Persisted so a supervisor INSTANCE that is stopping can tell, by
-   * re-reading this file, whether the shared state/pid file paths still
-   * belong to the launch it itself made -- an in-memory generation counter
-   * (see launchGeneration) only disambiguates between launches of the SAME
-   * instance; it is invisible to (and no protection against) a DIFFERENT
-   * AgyKeepaliveSupervisor instance that has since started using the same
-   * `home`. Optional only for backward compatibility with an on-disk record
-   * written before this field existed; every write from this version on
-   * always includes it. */
+  /** The UUID naming this launch's private evidence directory. Optional only
+   * for compatibility with evidence written before launch directories. */
   launchId?: string;
 }
 
+/** The pre-directory-layout paths are deliberately retained only for startup
+ * migration. New launches never write either path. */
 export function keepaliveStateFilePath(home: string): string { return join(home, "antigravity-keepalive-state.json"); }
+function legacyAgyPidFilePath(home: string): string { return `${keepaliveStateFilePath(home)}.agy-pid`; }
 
-/** Path of the ps-independent pid file the launch wrapper writes (see
- * agyPtyCommand). Deterministic from `home` alone, so sweepPreviousKeepalive
- * can look for it even when the JSON state never got far enough to record it. */
-function agyPidFilePathFor(stateFilePath: string): string { return `${stateFilePath}.agy-pid`; }
+export function keepaliveDirectoryPath(home: string): string { return join(home, "keepalive"); }
+export function keepaliveLaunchDirectoryPath(home: string, launchId: string): string { return join(keepaliveDirectoryPath(home), launchId); }
+export function keepaliveLaunchStateFilePath(home: string, launchId: string): string { return join(keepaliveLaunchDirectoryPath(home, launchId), "state.json"); }
+export function keepaliveLaunchAgyPidFilePath(home: string, launchId: string): string { return join(keepaliveLaunchDirectoryPath(home, launchId), "agy.pid"); }
+function launchStateFilePath(directory: string): string { return join(directory, "state.json"); }
+function launchAgyPidFilePath(directory: string): string { return join(directory, "agy.pid"); }
 
 /** Synchronous, deliberately: recordState() checks its launch generation is
  * still current and calls this in the same synchronous step, with nothing
@@ -139,9 +133,23 @@ function isPlausiblePid(value: unknown): value is number {
 /** The state writer uses Date#toISOString(), but accept any complete,
  * timezone-qualified ISO 8601 instant that Date can parse. Never let a
  * locale-dependent Date.parse() success turn arbitrary text into evidence. */
-const ISO_8601_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ISO_8601_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
 function isIso8601Instant(value: unknown): value is string {
-  return typeof value === "string" && ISO_8601_INSTANT.test(value) && Number.isFinite(Date.parse(value));
+  if (typeof value !== "string") return false;
+  const match = ISO_8601_INSTANT.exec(value);
+  if (!match || !Number.isFinite(Date.parse(value))) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const offsetHour = match[7] === undefined ? 0 : Number(match[7]);
+  const offsetMinute = match[8] === undefined ? 0 : Number(match[8]);
+  // Date.parse normalizes impossible calendar values (for example February
+  // 31) instead of rejecting them. Round-trip the wall-clock date through
+  // UTC before accepting it as durable identity evidence.
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  return calendar.getUTCFullYear() === year
+    && calendar.getUTCMonth() === month - 1
+    && calendar.getUTCDate() === day
+    && hour <= 23 && minute <= 59 && second <= 59
+    && offsetHour <= 23 && offsetMinute <= 59;
 }
 
 /** launchId comes from randomUUID(); accept only a canonical RFC UUID, not
@@ -168,15 +176,11 @@ function parseCanonicalPid(raw: string): number | undefined {
   return digits === "0" || !digits.startsWith("0") ? Number(digits) : undefined;
 }
 
-/** Never trusts the file blindly: rejects a symlink, a non-regular file, or
- * a shape that doesn't match a state this module wrote -- by throwing
- * InvalidKeepaliveEvidenceError, not by silently reporting "nothing here"
- * the way ENOENT does. A state is either legacy (none of launchId,
- * launchedAt, or verified) or current (all three, with a UUID, ISO instant,
- * and boolean respectively). A partial agy* tuple (some but not all of
- * agyPid/agyCommand/agyStartedAt present) is corruption, not "no agy info
- * recorded yet" (which has none of the three) -- it is rejected the same
- * way, rather than silently dropped. */
+/** Never trusts the file blindly: it must be one exact evidence variant.
+ * Legacy records predate launch directories. Current provisional records
+ * have no ps signatures at all; current verified records have complete,
+ * non-empty signatures. This prevents a malformed mixture from being
+ * mistaken for the harmless provisional form. */
 async function readKeepaliveState(path: string): Promise<KeepaliveState | undefined> {
   let info;
   try { info = await lstat(path); }
@@ -195,42 +199,39 @@ async function readKeepaliveState(path: string): Promise<KeepaliveState | undefi
     parsed = value as Partial<KeepaliveState>;
   }
   catch (error) { throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} is not valid JSON: ${(error as Error).message}`); }
-  if (!isPlausiblePid(parsed.scriptPid) || typeof parsed.scriptCommand !== "string" || typeof parsed.scriptStartedAt !== "string") {
+  if (!isPlausiblePid(parsed.scriptPid) || typeof parsed.scriptCommand !== "string" || typeof parsed.scriptStartedAt !== "string" || !isIso8601Instant(parsed.recordedAt)) {
     throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} does not match the recorded shape`);
   }
   const has = (field: keyof KeepaliveState): boolean => Object.hasOwn(parsed, field);
-  // recordedAt has been written by every version that wrote this state file.
-  // The three launch fields were added together, so accepting only one or two
-  // as a harmless legacy record would make malformed evidence clearable.
-  if (!isIso8601Instant(parsed.recordedAt)) throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
   const hasLaunchId = has("launchId");
   const hasLaunchedAt = has("launchedAt");
   const hasVerified = has("verified");
-  if (hasLaunchId || hasLaunchedAt || hasVerified) {
-    if (!hasLaunchId || !hasLaunchedAt || !hasVerified || !isUuid(parsed.launchId) || !isIso8601Instant(parsed.launchedAt) || typeof parsed.verified !== "boolean") {
-      throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
-    }
+  const current = hasLaunchId || hasLaunchedAt || hasVerified;
+  if (current && (!hasLaunchId || !hasLaunchedAt || !hasVerified || !isUuid(parsed.launchId) || !isIso8601Instant(parsed.launchedAt) || typeof parsed.verified !== "boolean")) {
+    throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has malformed recorded metadata`);
   }
-  const state: KeepaliveState = {
-    scriptPid: parsed.scriptPid, scriptCommand: parsed.scriptCommand, scriptStartedAt: parsed.scriptStartedAt,
-    recordedAt: parsed.recordedAt,
-    verified: parsed.verified ?? false,
-  };
-  if (has("launchedAt")) state.launchedAt = parsed.launchedAt;
-  if (has("launchId")) state.launchId = parsed.launchId;
-  const agyFieldsPresent = "agyPid" in parsed || "agyCommand" in parsed || "agyStartedAt" in parsed;
+  const agyFieldsPresent = has("agyPid") || has("agyCommand") || has("agyStartedAt");
   if (agyFieldsPresent) {
     if (!isPlausiblePid(parsed.agyPid) || typeof parsed.agyCommand !== "string" || typeof parsed.agyStartedAt !== "string") {
       throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has an incomplete or invalid agy pid/command/start-time tuple`);
     }
-    state.agyPid = parsed.agyPid; state.agyCommand = parsed.agyCommand; state.agyStartedAt = parsed.agyStartedAt;
   }
-  // A verified record means ps supplied signatures, not merely fields of the
-  // right type. Empty strings would otherwise suppress signature matching and
-  // let malformed current evidence fall through to clearing logic.
-  if (state.verified && (!state.scriptCommand.trim() || !state.scriptStartedAt.trim() || (agyFieldsPresent && (!state.agyCommand?.trim() || !state.agyStartedAt?.trim())))) {
-    throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has empty verified process signatures`);
+  const allowed = new Set(["scriptPid", "scriptCommand", "scriptStartedAt", "recordedAt", ...(current ? ["launchId", "launchedAt", "verified"] : []), ...(agyFieldsPresent ? ["agyPid", "agyCommand", "agyStartedAt"] : [])]);
+  if (Object.keys(parsed).some((field) => !allowed.has(field))) throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has unexpected fields`);
+  if (current && parsed.verified === false && (parsed.scriptCommand !== "" || parsed.scriptStartedAt !== "" || agyFieldsPresent)) {
+    throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} mixes provisional and verified fields`);
   }
+  if ((current && parsed.verified === true) || !current) {
+    if (!parsed.scriptCommand.trim() || !parsed.scriptStartedAt.trim() || (agyFieldsPresent && (!parsed.agyCommand?.trim() || !parsed.agyStartedAt?.trim()))) {
+      throw new InvalidKeepaliveEvidenceError(`keepalive state ${path} has empty verified process signatures`);
+    }
+  }
+  const state: KeepaliveState = {
+    scriptPid: parsed.scriptPid, scriptCommand: parsed.scriptCommand, scriptStartedAt: parsed.scriptStartedAt,
+    recordedAt: parsed.recordedAt, verified: current ? parsed.verified as boolean : true,
+  };
+  if (current) { state.launchedAt = parsed.launchedAt; state.launchId = parsed.launchId; }
+  if (agyFieldsPresent) { state.agyPid = parsed.agyPid; state.agyCommand = parsed.agyCommand; state.agyStartedAt = parsed.agyStartedAt; }
   return state;
 }
 
@@ -261,13 +262,13 @@ async function readAgyPidFile(path: string): Promise<AgyPidFileEntry | undefined
   return { pid, mtimeMs: info.mtimeMs };
 }
 
-/** How far a `.agy-pid` file's mtime may precede the `launchedAt` recorded
+/** How far an `agy.pid` file's mtime may precede the `launchedAt` recorded
  * alongside it and still count as "written by that same launch": filesystem
  * mtime resolution (as coarse as 1s on some volumes) plus the real (small)
  * gap between recordProvisionalState()'s synchronous write in the daemon
  * process and the launch wrapper's own `echo` in the separate child process
  * it just spawned -- both happen at launch, but never at the exact same
- * instant. Wide enough to absorb that gap, narrow enough that a `.agy-pid`
+ * instant. Wide enough to absorb that gap, narrow enough that an `agy.pid`
  * file left by a much older, unrelated launch cannot pass it. Symmetric: a
  * mtime long AFTER launchedAt is just as disqualifying as one long before --
  * either direction means this file was not written by the launch this record
@@ -311,7 +312,7 @@ function isLaunchEvidenceFresh(launchedAtMs: number, now = Date.now()): boolean 
 /** How long to poll (ps-free, via isProcessGroupAlive) for a signalled pid to
  * actually disappear before trusting that it has. SIGKILL is asynchronous --
  * the kernel still has to schedule and reap the target -- so neither a pid's
- * evidence (its state-file entry, its `.agy-pid` file) nor its membership in
+ * evidence (its state-file entry, its `agy.pid` file) nor its membership in
  * `swept` may be settled the instant a signal is sent; only once this confirms
  * the process (or its group) is actually gone. */
 const KILL_CONFIRM_TIMEOUT_MS = 1_000;
@@ -342,83 +343,79 @@ export interface SweepResult {
   unverified: number[];
 }
 
-/**
- * Reap whatever a previous daemon's keepalive left behind, before this
- * daemon launches its own. Reconciles TWO independent sources left by that
- * daemon's own AgyKeepaliveSupervisor: the JSON state file (written by
- * recordState(), see below, once `ps` confirms a signature -- or, at minimum,
- * the provisional record recordProvisionalState() writes synchronously at
- * spawn, before recordState ever gets to run) and the launch wrapper's OWN
- * `.agy-pid` file (written by the spawned shell itself, so it can exist even
- * when the JSON state never got written at all, e.g. `ps` was denied for the
- * whole run). Neither file alone is trusted to be the last word; both are
- * read before anything is decided.
- *
- * Two tiers of proof, tried per candidate pid, strongest first:
- *  1. Exact `ps` signature match against a *recorded* command+start time.
- *     The strongest proof -- used whenever a prior signature was recorded
- *     AND `ps` answers now (it does not have to have answered back then). A
- *     live signature that comes back but does NOT match is definitive proof
- *     this is a different (recycled) process: it is rejected outright, never
- *     falling through to the weaker tier below.
- *  2. ps-free evidence, tried only for the pid the `.agy-pid` file itself
- *     names, when no exact recorded signature could settle it (no `ps`
- *     answer, or nothing was ever recorded to compare against): the launch
- *     time recorded alongside it is still FRESH (isLaunchEvidenceFresh --
- *     after the current boot and within AGY_PID_FILE_MAX_EVIDENCE_AGE_MS of
- *     now; without this bound the proof below never expires, and a pid the
- *     OS recycles long after the original agy exited would eventually pass
- *     it), AND the file's mtime falls within AGY_PID_FILE_MTIME_TOLERANCE_MS
- *     of that launch time IN EITHER DIRECTION (a mtime long after the
- *     recorded launch is just as disqualifying as one long before -- both
- *     mean this file was not written by that launch), AND the pid's process
- *     GROUP is still alive (checked with a signal-0 send, isProcessGroupAlive
- *     -- no `ps` involved). This is NOT a full identity proof even when
- *     fresh: a pid the OS recycled in the meantime to an unrelated new
- *     session/group leader would still pass it. It is the strongest evidence
- *     obtainable without `ps`, which is why it is only ever applied to this
- *     one specific, freshly-orphaned pid -- never used to positively
- *     identify some other stranger pid.
- *
- * Signalling a verified pid can itself fail (EPERM) or simply not have taken
- * effect yet by the time this returns (SIGKILL is asynchronous): either way
- * the pid moves to `unverified` rather than `swept`, via waitUntilGroupGone's
- * bounded confirmation poll -- a pid is never counted as reaped, and its
- * evidence never discarded, until it is actually confirmed gone.
- *
- * A pid that clears neither tier but is still alive (by process-group
- * signal), OR that was signalled but never confirmed dead, is reported in
- * `unverified`, and both files are left in place so this same evidence is
- * available to reconcile it again later. Both files are removed only once
- * nothing remains unverified.
- *
- * Evidence that is PRESENT but cannot be trusted (a symlink, a non-regular
- * or unreadable file, content that doesn't parse) is a different case from
- * evidence that is simply absent (ENOENT, the normal, expected case): the
- * two readers this function calls throw InvalidKeepaliveEvidenceError for
- * the former rather than returning "nothing here" for it, and that error is
- * deliberately left uncaught here -- reporting a clean sweep over evidence
- * that could not actually be read would let the daemon launch a fresh
- * keepalive over a possibly-live orphan this sweep never really got to look
- * at. The daemon's own sweepStaleKeepalive() treats this exactly like a
- * failed kill: this cycle's launch is refused and the sweep is retried.
- *
- * A user's own interactively-started agy is never in either file to begin
- * with, since only launch() ever writes them. Never called on win32 (no
- * `script`, so nothing this daemon could have started to sweep).
- */
-export async function sweepPreviousKeepalive(home: string, options: { execImpl?: ExecFile; killTree?: typeof killTree; log?: (message: string) => void } = {}): Promise<SweepResult> {
-  if (process.platform === "win32") return { swept: [], unverified: [] };
-  const path = keepaliveStateFilePath(home);
-  const pidFilePath = agyPidFilePathFor(path);
-  const state = await readKeepaliveState(path);
-  const pidFileEntry = await readAgyPidFile(pidFilePath);
-  if (!state && !pidFileEntry) return { swept: [], unverified: [] };
-  const log = options.log ?? ((): void => undefined);
+interface EvidenceLocation {
+  statePath: string;
+  pidPath: string;
+  /** Set for the private, per-launch layout. Legacy shared files have none. */
+  directory?: string;
+}
 
-  // Every candidate pid this run might need to reconcile, keyed by pid so
-  // the common case (the state file and the pid file both naming agy's same
-  // pid) is examined once, not twice.
+interface SweepOptions {
+  execImpl?: ExecFile;
+  killTree?: typeof killTree;
+  log?: (message: string) => void;
+  /** Never sweep the live supervisor's own directory. */
+  skipLaunchId?: string;
+}
+
+async function unlinkIfPresent(path: string): Promise<void> {
+  try { await unlink(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new InvalidKeepaliveEvidenceError(`cannot remove keepalive evidence ${path}: ${(error as Error).message}`);
+  }
+}
+
+async function removeEvidence(location: EvidenceLocation): Promise<void> {
+  await unlinkIfPresent(location.statePath);
+  await unlinkIfPresent(location.pidPath);
+  if (!location.directory) return;
+  try { await rmdir(location.directory); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new InvalidKeepaliveEvidenceError(`cannot remove keepalive launch directory ${location.directory}: ${(error as Error).message}`);
+  }
+}
+
+async function launchEvidenceLocations(home: string, skipLaunchId?: string): Promise<EvidenceLocation[]> {
+  const root = keepaliveDirectoryPath(home);
+  let rootInfo;
+  try { rootInfo = await lstat(root); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new InvalidKeepaliveEvidenceError(`cannot stat keepalive directory ${root}: ${(error as Error).message}`);
+  }
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new InvalidKeepaliveEvidenceError(`keepalive directory ${root} is not a plain directory`);
+  let entries: string[];
+  try { entries = await readdir(root); }
+  catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot read keepalive directory ${root}: ${(error as Error).message}`); }
+  const locations: EvidenceLocation[] = [];
+  for (const launchId of entries) {
+    if (launchId === skipLaunchId) continue;
+    const directory = join(root, launchId);
+    let info;
+    try { info = await lstat(directory); }
+    catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot stat keepalive launch directory ${directory}: ${(error as Error).message}`); }
+    if (!isUuid(launchId) || !info.isDirectory() || info.isSymbolicLink()) throw new InvalidKeepaliveEvidenceError(`keepalive launch directory ${directory} is invalid`);
+    let files: string[];
+    try { files = await readdir(directory); }
+    catch (error) { throw new InvalidKeepaliveEvidenceError(`cannot read keepalive launch directory ${directory}: ${(error as Error).message}`); }
+    if (files.some((name) => name !== "state.json" && name !== "agy.pid")) throw new InvalidKeepaliveEvidenceError(`keepalive launch directory ${directory} has unexpected evidence`);
+    locations.push({ directory, statePath: launchStateFilePath(directory), pidPath: launchAgyPidFilePath(directory) });
+  }
+  return locations;
+}
+
+/** Reconciles exactly one isolated evidence location. All identity decisions
+ * are made from its own files before any signal is sent; the private launch
+ * directory is the ownership boundary, so no launch-id compare-and-act dance
+ * is needed. */
+async function reconcileEvidence(location: EvidenceLocation, options: SweepOptions = {}): Promise<SweepResult> {
+  const state = await readKeepaliveState(location.statePath);
+  const pidFileEntry = await readAgyPidFile(location.pidPath);
+  if (!state && !pidFileEntry) { await removeEvidence(location); return { swept: [], unverified: [] }; }
+  if (state?.agyPid !== undefined && pidFileEntry && pidFileEntry.pid !== state.agyPid) {
+    throw new InvalidKeepaliveEvidenceError(`keepalive evidence ${location.directory ?? location.statePath} has conflicting agy pids`);
+  }
+
   const candidates = new Map<number, { command?: string; startedAt?: string }>();
   if (state) {
     candidates.set(state.scriptPid, { command: state.scriptCommand || undefined, startedAt: state.scriptStartedAt || undefined });
@@ -426,38 +423,28 @@ export async function sweepPreviousKeepalive(home: string, options: { execImpl?:
   }
   if (pidFileEntry && !candidates.has(pidFileEntry.pid)) candidates.set(pidFileEntry.pid, {});
 
-  // Verify every candidate's identity BEFORE killing any of them: script and
-  // agy are killed independently, but killing one legitimately reaps the
-  // other as its descendant, and doing that interleaved with verification
-  // could make an already-reaped candidate look like "pid not found; never
-  // recorded" and get silently skipped from the result, undercounting a
-  // sweep that in fact fully succeeded.
   const verified: Array<{ pid: number; tier: "ps" | "ps-free" }> = [];
-  const unverified: number[] = [];
+  const unverified = new Set<number>();
   for (const [pid, recorded] of candidates) {
     if (recorded.command && recorded.startedAt) {
       const live = await processSignature(pid, options.execImpl);
       if (live) {
         if (live.command === recorded.command && live.startedAt === recorded.startedAt) verified.push({ pid, tier: "ps" });
-        // else: `ps` just proved this pid is something else now (reuse) --
-        // never touch it, and never fall through to the weaker tier either.
+        // A different live signature proves the recorded process is gone;
+        // never fall through to weaker evidence for a recycled pid.
         continue;
       }
-      // `ps` did not answer for this pid (denied/unavailable): fall through.
     }
     if (pidFileEntry && pidFileEntry.pid === pid && state?.launchedAt) {
       const launchedAtMs = Date.parse(state.launchedAt);
-      if (
-        Number.isFinite(launchedAtMs) &&
-        isLaunchEvidenceFresh(launchedAtMs) &&
-        Math.abs(pidFileEntry.mtimeMs - launchedAtMs) <= AGY_PID_FILE_MTIME_TOLERANCE_MS &&
-        isProcessGroupAlive(pid)
-      ) {
+      if (isLaunchEvidenceFresh(launchedAtMs)
+        && Math.abs(pidFileEntry.mtimeMs - launchedAtMs) <= AGY_PID_FILE_MTIME_TOLERANCE_MS
+        && isProcessGroupAlive(pid)) {
         verified.push({ pid, tier: "ps-free" });
         continue;
       }
     }
-    if (isProcessGroupAlive(pid)) unverified.push(pid);
+    if (isProcessGroupAlive(pid)) unverified.add(pid);
   }
 
   const kill = options.killTree ?? killTree;
@@ -465,37 +452,35 @@ export async function sweepPreviousKeepalive(home: string, options: { execImpl?:
   for (const { pid, tier } of verified) {
     try {
       if (tier === "ps") await kill(pid);
-      // killTree()'s SIGKILL escalation re-lists via `ps` to decide who
-      // survived the SIGTERM, which is exactly what a ps-free verification
-      // has no access to -- SIGKILL directly instead, the same ps-free
-      // primitive stop() and the exit handler already rely on for this
-      // situation.
       else killProcessGroup(pid, { groupOnly: true });
-    } catch {
-      // Signalling itself failed (e.g. EPERM): the pid was never actually
-      // touched. Treat exactly like an unverifiable pid -- reported, not
-      // counted as reaped, and left alone rather than assumed dead.
-      unverified.push(pid);
-      continue;
-    }
-    // A kill call returning (or killProcessGroup's fire-and-forget signal)
-    // does not mean the target is actually gone yet -- SIGKILL is
-    // asynchronous. Confirm before this pid is trusted as swept, so a launch
-    // decided moments later never races a process that is still exiting.
+    } catch { unverified.add(pid); continue; }
     if (await waitUntilGroupGone(pid)) swept.push(pid);
-    else unverified.push(pid);
+    else unverified.add(pid);
   }
-  if (unverified.length) {
-    log(`antigravity keepalive sweep: pid(s) ${unverified.join(", ")} left by a previous run could not be verified, or could not be confirmed dead after signalling -- left alone; a new keepalive will not launch until they are confirmed gone`);
-  } else {
-    // Only reached once every candidate this sweep found alive is either
-    // confirmed dead or was never alive to begin with -- never while
-    // anything remains unverified, so the evidence that would let a later
-    // sweep finish the job is never discarded while it might still be needed.
-    try { await unlink(path); } catch { /* already gone */ }
-    try { await unlink(pidFilePath); } catch { /* already gone */ }
+  const unresolved = [...unverified];
+  if (!unresolved.length) await removeEvidence(location);
+  return { swept, unverified: unresolved };
+}
+
+/** Reap all stale launch directories plus the old shared pair (migration
+ * only). Invalid or unresolved evidence is deliberately left in place and
+ * blocks the next launch. */
+export async function sweepPreviousKeepalive(home: string, options: SweepOptions = {}): Promise<SweepResult> {
+  if (process.platform === "win32") return { swept: [], unverified: [] };
+  const locations = await launchEvidenceLocations(home, options.skipLaunchId);
+  // The shared paths are never written by this version. Treat them as one
+  // final legacy launch until it can be proven gone and removed.
+  locations.push({ statePath: keepaliveStateFilePath(home), pidPath: legacyAgyPidFilePath(home) });
+  const swept: number[] = [];
+  const unverified = new Set<number>();
+  for (const location of locations) {
+    const result = await reconcileEvidence(location, options);
+    swept.push(...result.swept);
+    for (const pid of result.unverified) unverified.add(pid);
   }
-  return { swept, unverified };
+  const unresolved = [...unverified];
+  if (unresolved.length) (options.log ?? (() => undefined))(`antigravity keepalive sweep: pid(s) ${unresolved.join(", ")} could not be verified, or could not be confirmed dead after signalling -- left alone; a new keepalive will not launch until they are confirmed gone`);
+  return { swept, unverified: unresolved };
 }
 
 /** Reads only auth-state markers, never credentials or quota values, from
@@ -551,34 +536,16 @@ export class AgyKeepaliveSupervisor {
    * never land after (and clobber) a NEWER launch's own synchronous
    * provisional record, however the two async chains happen to interleave. */
   private launchGeneration = 0;
-  /** A fresh random id generated per launch() call, persisted into the
-   * written state (KeepaliveState.launchId) -- see that field's own doc
-   * comment for why an in-memory generation counter alone cannot protect
-   * cleanup decisions that read shared, on-disk evidence: it disambiguates
-   * only between launches of THIS instance, never between this instance and
-   * a completely different AgyKeepaliveSupervisor sharing the same `home`. */
+  /** Names this launch's private evidence directory. */
   private currentLaunchId: string | undefined;
-  /** True from the first successful launch() onward, never reset. Lets
-   * stop() tell "this instance never launched anything" (safe to clear
-   * whatever stray evidence exists, nothing of ours to protect) apart from
-   * "this instance's child has since exited" (its own 'exit' handler owns
-   * reaping it; script no longer being alive means a pid found in the
-   * shared pid file right now cannot be proven to still be agy's -- see
-   * stop()'s own doc comment). Both leave `this.child` equally undefined,
-   * which is why this field, not a null check on `child`, is what stop()
-   * branches on. */
-  private everLaunched = false;
   /** True from the moment the unexpected-exit path (reapOrphanedAgyThenRestart)
    * starts, until it either confirms the old agy is gone (or never existed)
    * and is about to restart, or a real stop() takes over. `this.child` is
    * ALSO cleared synchronously at that same moment (so `running` correctly
    * goes false right away), which otherwise leaves a window where a
    * concurrent caller sees `running === false` and `start()`'s own guard
-   * (`!this.child && !this.restart`) sees nothing to stop it either --
-   * letting it launch a replacement on top of the old pid file before the
-   * reap even finishes, so a later reap retry can end up killing the
-   * replacement instead of the orphan it was actually after. start() checks
-   * this flag too, so it refuses (no-ops) for as long as it is true. */
+   * (`!this.child && !this.restart`) sees nothing to stop it either. start()
+   * checks this flag too, so it refuses while reconciliation is unresolved. */
   private reaping = false;
   private readonly binary: string;
   private readonly platform: NodeJS.Platform;
@@ -594,14 +561,16 @@ export class AgyKeepaliveSupervisor {
   /** a sample already in flight skips the next tick instead of
    * starting a second concurrent read of the same log file. */
   private sampling = false;
-  private readonly stateFilePath: string | undefined;
+  private readonly home: string | undefined;
+  private launchDirectory: string | undefined;
+  private stateFilePath: string | undefined;
   private readonly killGraceMs: number;
   private readonly pidDiscoveryAttempts: number;
   private readonly pidDiscoveryIntervalMs: number;
   /** Where the launch wrapper writes agy's pid (see agyPtyCommand). Known
    * without `ps`, so stop() and an unexpected script exit can reap agy even
    * on a host where the process table cannot be read. */
-  private readonly agyPidFile: string | undefined;
+  private agyPidFile: string | undefined;
 
   constructor(options: AgyKeepaliveOptions = {}) {
     this.binary = options.binary ?? resolveAgyBinary(process.env.ANTIGRAVITY_CLI_PATH);
@@ -611,11 +580,10 @@ export class AgyKeepaliveSupervisor {
     this.logDirectory = options.logDirectory ?? join(homedir(), ".gemini", "antigravity-cli", "log");
     this.logPollIntervalMs = options.logPollIntervalMs ?? 1_000;
     this.logWatchMs = options.logWatchMs ?? 60_000;
-    this.stateFilePath = options.stateFile ?? (options.home ? keepaliveStateFilePath(options.home) : undefined);
+    this.home = options.home;
     this.killGraceMs = options.killGraceMs ?? 300;
     this.pidDiscoveryAttempts = options.pidDiscoveryAttempts ?? 20;
     this.pidDiscoveryIntervalMs = options.pidDiscoveryIntervalMs ?? 100;
-    this.agyPidFile = this.stateFilePath && this.platform !== "win32" ? agyPidFilePathFor(this.stateFilePath) : undefined;
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
@@ -627,43 +595,22 @@ export class AgyKeepaliveSupervisor {
   get pid(): number | undefined { return this.running ? this.child?.pid : undefined; }
   get uptimeMs(): number | undefined { return this.running && this.startedAt !== undefined ? Date.now() - this.startedAt : undefined; }
   get loginState(): AgyLoginState { return this._loginState; }
+  get launchId(): string | undefined { return this.currentLaunchId; }
 
   start(): void {
     this.stopping = false;
-    if (!this.child && !this.restart && !this.reaping) this.launch();
+    if (this.child || this.restart || this.reaping) return;
+    if (!this.launchDirectory) { this.launch(); return; }
+    // A caller can explicitly start us again after a failed stop. Do not let
+    // that bypass the same own-directory reconciliation a timered restart
+    // receives.
+    this.reaping = true;
+    void this.reconcileThenLaunch();
   }
 
-  /**
-   * Stops the owned PTY and, on POSIX, everything descended from it --
-   * including agy itself, which (see the module doc above `killTree`) is
-   * commonly its OWN process-group and session leader once `script` starts
-   * it, so a plain SIGTERM to `script` alone reliably leaves it running,
-   * reparented to init, at ~100 MB resident (issue #56). killTree() is what
-   * actually reaches agy, verified against a live process snapshot rather
-   * than assumed from how the tree was spawned -- and it, not this method,
-   * must send script's own first SIGTERM: signalling script directly here
-   * first would let it die and reparent agy to init *before* killTree ever
-   * takes that snapshot, which would make agy's parent no longer be script
-   * by the time the tree is walked and let it slip through uncaught (this
-   * was a real bug caught by antigravity-keepalive-sweep.test.ts, not a
-   * hypothetical). child.kill() is only a fallback for when there is no
-   * real numeric pid to walk a tree from at all (a test double). Awaiting
-   * the returned promise waits out the SIGTERM grace period and any SIGKILL
-   * escalation; callers that only need `running` to go false (most of this
-   * file's existing tests) can ignore it, since that flips synchronously,
-   * before this function's first `await`.
-   *
-   * Only ever tries to discover and signal an agy pid while `child` (script)
-   * is CONFIRMED ALIVE at the moment this method starts: script's own
-   * liveness is what proves a pid found in the shared `.agy-pid` file right
-   * now is still agy's (see the block below). Once script has already
-   * exited on its own, that proof no longer holds -- the file could since
-   * name anything -- so this method does NOT look it up at all in that case
-   * (antigravity-keepalive-sweep.test.ts's "never signals a pid it cannot
-   * prove is agy" fixture exercises exactly this), and `agyConfirmedGone`
-   * is never defaulted to true just because there was nothing for THIS call
-   * to confirm: see the `everLaunched` branch below.
-   */
+  /** Stops only this launch's PTY tree, then reconciles only this launch's
+   * directory. The directory is removed by reconcileEvidence() solely after
+   * every recorded process is confirmed gone. */
   async stop(): Promise<void> {
     this.stopping = true;
     if (this.restart) clearTimeout(this.restart);
@@ -671,75 +618,51 @@ export class AgyKeepaliveSupervisor {
     this.stopLoginWatch();
     const child = this.child;
     this.child = undefined;
-    // Only cleared once agy is actually confirmed gone (or there was never
-    // one to launch in the first place): SIGKILL is asynchronous, and
-    // discarding the evidence files while agy might still be alive -- or
-    // while this method never even had proof-backed grounds to look for it
-    // -- would strip the one identity a future sweep needs to finish the
-    // job.
-    let agyConfirmedGone: boolean;
+    let pidFileNeverAppeared = false;
     if (child && isAlive(child)) {
-      // Read agy's pid while script is still alive: script lives exactly as
-      // long as its PTY session, so a pid written by this launch's wrapper is
-      // proven to be agy right now, with no `ps` involved and no chance of a
-      // recycled pid. Bounded wait first (rather than reading once,
-      // immediately) so the wrapper gets a real chance to have run at all
-      // before anything is killed.
+      // Give the wrapper a bounded chance to leave its evidence before the
+      // tree starts exiting. It may otherwise write during shutdown.
       let agyPid = this.agyPidFile ? await this.awaitAgyPid(child) : undefined;
       const pid = child.pid;
       if (typeof pid === "number") await killTree(pid, { graceMs: this.killGraceMs });
       else child.kill("SIGTERM");
-      // Re-read AFTER killTree() ran: the wrapper can still manage to write
-      // its pid file only while dying from killTree's own signal, which the
-      // lookup above (which ran before killTree ever fired) would otherwise
-      // miss entirely, leaving a freshly-orphaned agy with no evidence this
-      // method ever tried to find it.
+      // killTree's descendant snapshot can be unavailable when ps is denied.
+      // This is still this launch's private wrapper file, captured while its
+      // script was alive, so its group is safe to reap directly. Confirm the
+      // result before considering its directory clearable.
       if (agyPid === undefined) { const detailed = this.readAgyPidDetailed(); if (detailed.kind === "found") agyPid = detailed.pid; }
-      if (agyPid !== undefined && await this.ownsCurrentEvidence()) {
-        // killTree reaches agy through a live `ps` walk; where that walk
-        // finds nothing (ps denied, or agy already reparented) agy would
-        // survive as an orphan holding a PTY, so reap the proven pid
-        // directly as well. Group only: agy leads its own process group,
-        // and a group with that id exists only while agy or one of its
-        // children is alive, so this cannot reach a stranger that inherited
-        // the bare pid during the grace period.
-        killProcessGroup(agyPid, { groupOnly: true });
-        agyConfirmedGone = await waitUntilGroupGone(agyPid);
-      } else {
-        // Either this launch tracks a pid file and neither lookup found
-        // anything in it (a missing pid is not proof no agy exists, only
-        // that this method failed to discover it), or a newer launch has
-        // since claimed the shared files (ownsCurrentEvidence() said no) and
-        // whatever the pid file names is no longer provably agy's: never
-        // assumed safe on its own.
-        agyConfirmedGone = agyPid === undefined && this.agyPidFile === undefined;
+      if (agyPid === undefined && this.agyPidFile) {
+        try { pidFileNeverAppeared = (await readKeepaliveState(this.stateFilePath!))?.agyPid === undefined; }
+        catch { return; } // unreadable state is unresolved evidence
       }
-    } else if (this.everLaunched) {
-      // script had already exited by the time stop() ran: its own 'exit'
-      // handler (reapOrphanedAgyThenRestart) owns reaping it and may still
-      // be mid-retry. Nothing is looked up or signalled here -- see this
-      // method's own doc comment -- so there is nothing this call itself
-      // confirmed.
-      agyConfirmedGone = false;
-    } else {
-      // This instance never successfully launched anything: nothing of
-      // ours could exist to protect.
-      agyConfirmedGone = true;
+      let pidMatchesState = false;
+      if (agyPid !== undefined && this.stateFilePath) {
+        try {
+          const state = await readKeepaliveState(this.stateFilePath);
+          pidMatchesState = state !== undefined && (state.agyPid === undefined || state.agyPid === agyPid);
+        } catch { /* invalid or missing state is never authority to signal */ }
+      }
+      if (agyPid !== undefined && pidMatchesState) {
+        killProcessGroup(agyPid, { groupOnly: true });
+        if (!(await waitUntilGroupGone(agyPid))) return;
+      }
     }
-    if (agyConfirmedGone) await this.clearState();
-    // else: leave the state and pid files in place -- exactly the same
-    // evidence a crash would have left, for the next sweepPreviousKeepalive()
-    // to pick up and finish reconciling.
+    // A wrapper that never left a pid file and whose state never learned agy
+    // remains unresolved even if killTree happened to reap it. Discarding
+    // that directory would turn a missed descendant into an unrecoverable
+    // orphan; a later sweep can make the same conservative decision again.
+    if (pidFileNeverAppeared) return;
+    if (await this.reconcileOwnLaunchDirectory()) this.forgetLaunchDirectory();
   }
 
   private launch(): void {
     if (this.stopping || this.child) return;
     try {
-      this.removeAgyPidFile(); // a pid left by an earlier launch must never be read as this one's
+      const launchId = randomUUID();
+      this.configureLaunchDirectory(launchId); // must exist, mode 0700, before spawn
       const [command, args] = this.ptyCommand();
       const child = this.startChild(command, args, { stdio: "ignore", env: inheritedAgyEnvironment(), detached: this.platform !== "win32" });
       this.child = child;
-      this.everLaunched = true;
       this.startedAt = Date.now();
       // Bumped synchronously, before anything else about this launch is
       // recorded: recordState()'s eventual write checks this is still the
@@ -747,15 +670,14 @@ export class AgyKeepaliveSupervisor {
       // clobber a newer launch's record (see the field's own doc comment).
       this.launchGeneration += 1;
       const generation = this.launchGeneration;
-      this.currentLaunchId = randomUUID();
-      const launchId = this.currentLaunchId;
       // Synchronous and ps-free, in the same tick as spawn(): a crash at ANY
       // point from here on -- even before this method's own next line, let
       // alone recordState()'s first `await` -- still leaves durable evidence
       // of this launch behind for the next daemon start's sweep to find.
-      this.recordProvisionalState(child, launchId);
+      const statePath = this.stateFilePath;
+      this.recordProvisionalState(child, launchId, statePath);
       this.startLoginWatch();
-      void this.recordState(child, generation, launchId);
+      void this.recordState(child, generation, launchId, statePath);
       let handled = false;
       const exited = () => {
         if (handled) return;
@@ -770,113 +692,19 @@ export class AgyKeepaliveSupervisor {
     } catch { this.scheduleRestart(); }
   }
 
-  /**
-   * script died on its own (crash, external kill): its agy is now an orphan
-   * session leader. Reaped here, confirmed dead (waitUntilGroupGone),
-   * BEFORE any restart is scheduled -- scheduling first would let
-   * removeAgyPidFile() (at the top of the next launch()) delete the only
-   * evidence of a kill that had not actually taken effect yet, leaving that
-   * orphan permanently unrecoverable beside its own freshly-spawned
-   * replacement (exactly the accumulation issue #56 / the leak this whole
-   * file exists to prevent). The pid file was written by this launch
-   * (removed before every launch) and script exited only now, so a pid
-   * actually found in it is proven to be agy's -- unlike stop()'s own reap,
-   * which can no longer assume that once script itself is no longer alive
-   * (see stop()'s doc comment); this method only ever runs synchronously off
-   * script's own 'exit'/'error' event, so that proof still holds here.
-   *
-   * That covers the pid file's CONTENT, but not that the file itself is
-   * still this launch's to read: a newer launch (this same instance's own
-   * next one, or -- see ownsCurrentEvidence's own doc comment -- a
-   * completely different AgyKeepaliveSupervisor instance sharing this
-   * `home`) can have replaced both shared files with its own launchId at
-   * any point after script exited, and this reap runs asynchronously,
-   * across a real bounded discovery wait -- ownsCurrentEvidence() is
-   * checked again right before ever acting on the pid file's content, not
-   * assumed once up front.
-   *
-   * The pid file itself can be in one of three states, each handled
-   * differently (readAgyPidDetailed distinguishes them):
-   *  - found: killed and its liveness polled; confirmed dead lets this
-   *    proceed to restart, unconfirmed retries (below) exactly like the
-   *    other two "never restart yet" cases.
-   *  - absent: the wrapper can legitimately still be a moment away from
-   *    writing it (script only just exited) -- retried, rapidly and
-   *    bounded (reusing pidDiscoveryAttempts/pidDiscoveryIntervalMs, the
-   *    same budget recordState()'s own discovery loop gets), and ONLY once
-   *    it never appears across that whole bounded window is it reasonably
-   *    concluded that nothing was ever spawned for this launch, and a
-   *    restart is safe.
-   *  - invalid (present but unreadable or malformed): unlike "absent", this
-   *    means something DID write to that path -- treating it the same as
-   *    "nothing to worry about" is exactly the hazard this case exists to
-   *    close. Retried indefinitely, with the same backoff as an unconfirmed
-   *    kill, and NEVER allowed to fall through to a restart on its own.
-   *
-   * `this.reaping` is true for the whole of this method's lifetime (across
-   * every retry), so start() refuses to launch a replacement while a
-   * previous orphan is still unresolved -- see that field's own doc comment
-   * for the race this closes. `this.stopping` (set by stop()) ends this
-   * loop the moment a real stop() takes over; every exit path clears
-   * `reaping` except the one that schedules another retry, since that is
-   * the only case still actually in progress.
-   */
+  /** An exited script can have left agy in a separate PTY session. Reconcile
+   * this launch directory before scheduling any replacement, and retry while
+   * evidence is invalid or any recorded process remains unresolved. */
   private async reapOrphanedAgyThenRestart(attempt = 0): Promise<void> {
     if (this.stopping) { this.reaping = false; return; }
     this.reaping = true;
-    let result = this.readAgyPidDetailed();
-    // No agyPidFile configured at all (no `home`/`stateFile` option -- the
-    // whole evidence-file mechanism is off for this instance) means there is
-    // fundamentally nothing a bounded wait could ever discover: skip it
-    // rather than waiting out pidDiscoveryAttempts for no reason.
-    if (this.agyPidFile) {
-      for (let discovery = 0; result.kind === "absent" && discovery < this.pidDiscoveryAttempts; discovery += 1) {
-        if (this.stopping) { this.reaping = false; return; }
-        await sleep(this.pidDiscoveryIntervalMs);
-        result = this.readAgyPidDetailed();
-      }
-    }
-    if (this.stopping) { this.reaping = false; return; }
-    // Before ever signalling anything the pid file names, OR restarting on
-    // the strength of it being merely absent, confirm the shared JSON state
-    // still names THIS launch's own launchId. Without this, a NEWER launch
-    // (this same instance's own, from a launch this reap attempt started
-    // before, or -- see ownsCurrentEvidence's own doc comment -- a
-    // completely different AgyKeepaliveSupervisor instance sharing this
-    // `home`) that has since replaced both shared files would have its own,
-    // unrelated agy killed by this OLDER attempt, or its restart wrongly
-    // permitted on the strength of "absent" evidence that was never this
-    // launch's own to interpret. Missing, invalid, or mismatched state is
-    // treated exactly like invalid pid-file evidence: retried indefinitely,
-    // never signalled, never restarted.
-    // No `home`/state-file configured at all (the whole shared-evidence
-    // mechanism is off for this instance, e.g. a unit test driving the
-    // supervisor directly with fake timers and a mocked spawn) means
-    // ownership is trivially this launch's own -- and, just as importantly,
-    // must resolve with NO extra microtask hop: ownsCurrentEvidence() itself
-    // already takes this exact shortcut internally, but going through an
-    // `await` on it regardless would defer the found/absent branch below by
-    // one full turn even in this trivial case, which a caller that never
-    // awaits reapOrphanedAgyThenRestart()'s own returned promise (the exit
-    // handler above is fire-and-forget) can never itself wait out.
-    const owns = (!this.stateFilePath || this.currentLaunchId === undefined) ? true : await this.ownsCurrentEvidence();
-    if (this.stopping) { this.reaping = false; return; }
-    if (owns && result.kind === "found") {
-      killProcessGroup(result.pid, { groupOnly: true });
-      const confirmed = await waitUntilGroupGone(result.pid);
-      if (this.stopping) { this.reaping = false; return; }
-      if (confirmed) { this.reaping = false; this.scheduleRestart(); return; }
-    } else if (owns && result.kind === "absent") {
-      // Never appeared across the whole bounded discovery window: nothing
-      // was reasonably ever spawned for this launch.
+    if (await this.waitForOwnPidEvidence() && await this.reapOwnPidFileGroup() && await this.reconcileOwnLaunchDirectory()) {
+      this.forgetLaunchDirectory();
       this.reaping = false;
       this.scheduleRestart();
       return;
     }
-    // Either a found pid could not be confirmed dead, the evidence is
-    // present but invalid, or ownership of the shared files could not be
-    // confirmed -- `this.reaping` stays true, and this retries rather than
-    // ever letting a restart proceed past unresolved or superseded evidence.
+    if (this.stopping) { this.reaping = false; return; }
     const timeout = setTimeout(() => { void this.reapOrphanedAgyThenRestart(attempt + 1); }, this.delay(Math.min(attempt, 6)));
     timeout.unref();
   }
@@ -889,13 +717,13 @@ export class AgyKeepaliveSupervisor {
    * below ever gets to run its `ps` calls, which can take up to
    * pidDiscoveryAttempts * pidDiscoveryIntervalMs to resolve or simply never
    * resolve at all when `ps` is denied. Without this, a crash inside that
-   * window left only the launch wrapper's bare `.agy-pid` file on disk, with
+   * window left only the launch wrapper's bare `agy.pid` file on disk, with
    * no launch time to cross-check it against -- see sweepPreviousKeepalive's
    * ps-free tier. recordState() overwrites this with a `ps`-verified record
    * once (if) one becomes available; until then, this is what a sweep has.
    */
-  private recordProvisionalState(child: ChildProcess, launchId: string): void {
-    if (!this.stateFilePath || this.platform === "win32") return;
+  private recordProvisionalState(child: ChildProcess, launchId: string, statePath = this.stateFilePath): void {
+    if (!statePath || this.platform === "win32") return;
     const scriptPid = child.pid;
     if (typeof scriptPid !== "number" || this.startedAt === undefined) return;
     const state: KeepaliveState = {
@@ -905,7 +733,7 @@ export class AgyKeepaliveSupervisor {
       verified: false,
       launchId,
     };
-    try { writeKeepaliveStateSync(this.stateFilePath, state); }
+    try { writeKeepaliveStateSync(statePath, state); }
     catch { /* best-effort; recordState() may still succeed once ps answers */ }
   }
 
@@ -933,8 +761,8 @@ export class AgyKeepaliveSupervisor {
    * land after a newer launch's synchronous provisional record and clobber
    * it, silently erasing the newer launch's identity from disk.
    */
-  private async recordState(child: ChildProcess, generation: number, launchId: string): Promise<void> {
-    if (!this.stateFilePath || this.platform === "win32") return;
+  private async recordState(child: ChildProcess, generation: number, launchId: string, statePath = this.stateFilePath): Promise<void> {
+    if (!statePath || this.platform === "win32") return;
     const scriptPid = child.pid;
     if (typeof scriptPid !== "number") return;
     const launchedAt = this.startedAt !== undefined ? new Date(this.startedAt).toISOString() : undefined;
@@ -961,7 +789,7 @@ export class AgyKeepaliveSupervisor {
       // method's own doc comment for why the generation check alone,
       // followed by an async write, would not be enough.
       if (this.launchGeneration !== generation || this.child !== child || !isAlive(child)) return;
-      writeKeepaliveStateSync(this.stateFilePath, state);
+      writeKeepaliveStateSync(statePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
   }
 
@@ -1011,51 +839,119 @@ export class AgyKeepaliveSupervisor {
     return pid !== undefined && isPlausiblePid(pid) ? { kind: "found", pid } : { kind: "invalid" };
   }
 
-  /** Throws unless the file is gone afterwards: launch() must never run while
-   * a stale pid from an earlier launch could still be read as this one's. */
-  private removeAgyPidFile(): void {
-    if (!this.agyPidFile) return;
-    try { unlinkSync(this.agyPidFile); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  /** Creates a UUID-named directory before spawn. It is intentionally the
+   * only ownership mechanism: no other supervisor ever has a reason to read
+   * or replace a file in this directory. */
+  private configureLaunchDirectory(launchId: string): void {
+    this.currentLaunchId = launchId;
+    this.launchDirectory = undefined;
+    this.stateFilePath = undefined;
+    this.agyPidFile = undefined;
+    if (!this.home || this.platform === "win32") return;
+    const root = keepaliveDirectoryPath(this.home);
+    try { mkdirSync(root, { mode: 0o700 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    const rootInfo = lstatSync(root);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new InvalidKeepaliveEvidenceError(`keepalive directory ${root} is not a plain directory`);
+    const directory = keepaliveLaunchDirectoryPath(this.home, launchId);
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+    this.launchDirectory = directory;
+    this.stateFilePath = launchStateFilePath(directory);
+    this.agyPidFile = launchAgyPidFilePath(directory);
   }
 
-  /**
-   * True ONLY if the on-disk state still names THIS launch's own launchId.
-   * False for every other case, including the state being missing: a
-   * missing file is NOT evidence of ownership, only the absence of
-   * evidence -- it could mean this launch's own record was already cleared
-   * (fine, there is nothing left to act on anyway), but it could just as
-   * easily mean a DIFFERENT launch (a newer one from this same instance's
-   * own restart, or -- despite the daemon's own serialization around
-   * stop()/maybeStartKeepalive() -- some other AgyKeepaliveSupervisor
-   * instance sharing this `home`) removed and has not yet rewritten it, or
-   * removed it entirely, leaving the separate `.agy-pid` file's pid with no
-   * corroborating proof at all. Treating "missing" as "still owned" would
-   * let stop() sign off on killing whatever that pid file currently names
-   * on the strength of nothing. `launchGeneration` alone cannot make this
-   * call either: it is invisible to (and no protection against) a different
-   * supervisor INSTANCE, since each instance's counter starts at its own
-   * zero. Unreadable/invalid evidence where our own record should be is
-   * treated the same as "not owned" (never crashes this check -- always the
-   * conservative answer instead).
-   */
-  private async ownsCurrentEvidence(): Promise<boolean> {
-    if (!this.stateFilePath || this.currentLaunchId === undefined) return true;
+  private ownEvidenceLocation(): EvidenceLocation | undefined {
+    if (!this.launchDirectory || !this.stateFilePath || !this.agyPidFile) return undefined;
+    return { directory: this.launchDirectory, statePath: this.stateFilePath, pidPath: this.agyPidFile };
+  }
+
+  /** Missing pid evidence needs its historical bounded wait only when the
+   * state has not already recorded agy's pid. A recorded agyPid is reconciled
+   * through its state signature instead of being mistaken for permission to
+   * spawn another wrapper. */
+  private async waitForOwnPidEvidence(): Promise<boolean> {
+    const location = this.ownEvidenceLocation();
+    if (!location) return true;
     try {
-      const onDisk = await readKeepaliveState(this.stateFilePath);
-      return onDisk !== undefined && onDisk.launchId === this.currentLaunchId;
+      let state = await readKeepaliveState(location.statePath);
+      let pid = await readAgyPidFile(location.pidPath);
+      if (pid || state?.agyPid !== undefined) return true;
+      for (let attempt = 0; attempt < this.pidDiscoveryAttempts && !pid && state?.agyPid === undefined; attempt += 1) {
+        if (this.stopping) return false;
+        await sleep(this.pidDiscoveryIntervalMs);
+        state = await readKeepaliveState(location.statePath);
+        pid = await readAgyPidFile(location.pidPath);
+      }
+      return true;
     } catch { return false; }
   }
 
-  private async clearState(): Promise<void> {
-    if (!(await this.ownsCurrentEvidence())) return; // a newer launch has since claimed these files; not ours to touch
-    try { this.removeAgyPidFile(); } catch { /* the next launch refuses to start until it can remove it */ }
-    if (!this.stateFilePath) return;
-    try { await unlink(this.stateFilePath); } catch { /* already gone */ }
+  /** Reconciles just this supervisor's directory. Invalid evidence and any
+   * still-live process fail closed, leaving that directory untouched. */
+  private async reconcileOwnLaunchDirectory(): Promise<boolean> {
+    const location = this.ownEvidenceLocation();
+    if (!location) return true;
+    try { return (await reconcileEvidence(location)).unverified.length === 0; }
+    catch { return false; }
+  }
+
+  /** Fast ps-free reap for the wrapper pid after script exit. If state has
+   * already learned agy's pid, the two sources must agree before a signal;
+   * otherwise corruption is left for the normal fail-closed reconciliation. */
+  private async reapOwnPidFileGroup(): Promise<boolean> {
+    const location = this.ownEvidenceLocation();
+    const detailed = this.readAgyPidDetailed();
+    if (!location || detailed.kind === "absent") return true;
+    if (detailed.kind === "invalid") return false;
+    try {
+      const state = await readKeepaliveState(location.statePath);
+      if (state?.agyPid !== undefined && state.agyPid !== detailed.pid) return false;
+    } catch { return false; }
+    killProcessGroup(detailed.pid, { groupOnly: true });
+    return waitUntilGroupGone(detailed.pid);
+  }
+
+  private forgetLaunchDirectory(): void {
+    this.launchDirectory = undefined;
+    this.stateFilePath = undefined;
+    this.agyPidFile = undefined;
+  }
+
+  private async reconcileThenLaunch(): Promise<void> {
+    if (await this.waitForOwnPidEvidence() && await this.reconcileOwnLaunchDirectory()) {
+      this.forgetLaunchDirectory();
+      this.reaping = false;
+      if (!this.stopping) this.launch();
+      return;
+    }
+    this.reaping = false;
+    this.scheduleRestart();
   }
 
   private scheduleRestart(): void {
     if (this.stopping || this.restart) return;
-    const timeout = setTimeout(() => { this.restart = undefined; this.launch(); }, this.delay(this.failures++));
+    const timeout = setTimeout(() => { void this.restartAfterDelay(); }, this.delay(this.failures++));
+    timeout.unref();
+    this.restart = timeout;
+  }
+
+  /** The timer does not launch directly. Evidence can change during its
+   * delay, so this repeats the own-directory reconciliation immediately
+   * before spawn and leaves the restart pending when it cannot prove safety. */
+  private async restartAfterDelay(): Promise<void> {
+    if (this.stopping) { this.restart = undefined; return; }
+    this.reaping = true;
+    const clean = await this.waitForOwnPidEvidence() && await this.reconcileOwnLaunchDirectory();
+    this.reaping = false;
+    if (this.stopping) { this.restart = undefined; return; }
+    if (clean) {
+      this.restart = undefined;
+      this.forgetLaunchDirectory();
+      this.launch();
+      return;
+    }
+    const timeout = setTimeout(() => { void this.restartAfterDelay(); }, this.delay(this.failures++));
     timeout.unref();
     this.restart = timeout;
   }

@@ -19,6 +19,22 @@ Use this for an optional profile that is deliberately logged out; restore it
 with `headroom accounts enable <name>`. Decisions fail closed while it is
 parked and routing reports it as skipped.
 
+## Antigravity keepalive
+
+On POSIX, an enabled Antigravity principal can keep its local `agy` CLI warm
+inside a `script` PTY. Each keepalive launch creates a private `0700`
+directory at `<state-dir>/keepalive/<launch-id>/` before starting the PTY. Its
+`state.json` and `agy.pid` evidence live only in that directory, so a later
+launch cannot replace, delete, or signal through an earlier launch's files.
+
+At daemon startup, Headroom sweeps stale launch directories before starting a
+new keepalive. It reaps only evidence it can identify from a matching process
+signature or fresh process-group evidence; unreadable, malformed, or still-live
+evidence remains in place and blocks a replacement. The old shared state and
+pid files are read only as a one-time migration input and are removed only
+after their recorded processes are confirmed gone. New launches never write
+those shared paths.
+
 ## Meter
 
 A meter is one vendor-enforced limit on a principal, addressed as `principal:meter`. Claude always

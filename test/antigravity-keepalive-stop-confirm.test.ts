@@ -59,7 +59,7 @@ async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
 
 describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirming a kill worked before trusting or acting on it", () => {
   it("stop() does not clear the recorded state when the confirmation check keeps reporting the target alive after signalling", async () => {
-    const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
+    const { AgyKeepaliveSupervisor, keepaliveLaunchStateFilePath } = await import("../src/antigravity-keepalive.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-unconfirmed-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -77,12 +77,12 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
     // to SIGKILL -- but stop() was told (via the mock) that it could never
     // confirm that, so it must not have discarded the evidence.
     expect(alive(agyPid)).toBe(false);
-    await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
+    await expect(readFile(keepaliveLaunchStateFilePath(root, supervisor.launchId!), "utf8")).resolves.toBeTruthy();
   }, 15_000);
 
   it("the unexpected-exit path retries reaping, rather than scheduling a restart, when it cannot confirm the kill worked", async () => {
     const { spawn: realSpawn } = await import("node:child_process");
-    const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
+    const { AgyKeepaliveSupervisor, keepaliveLaunchAgyPidFilePath } = await import("../src/antigravity-keepalive.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-unconfirmed-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -99,7 +99,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
       supervisor.start();
       const scriptPid = track(supervisor.pid, root) as number;
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
-      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+      await waitForFile(keepaliveLaunchAgyPidFilePath(root, supervisor.launchId!));
       expect(spawnCount).toBe(1);
 
       process.kill(scriptPid, "SIGKILL"); // triggers the unexpected-exit path
@@ -114,7 +114,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
       expect(groupKillCalls).toContainEqual({ pid: agyPid, options: { groupOnly: true } });
       // The evidence a kill was attempted at all is what a later sweep needs
       // -- and it survives, exactly because no restart ran ahead of it.
-      await expect(readFile(`${keepaliveStateFilePath(root)}.agy-pid`, "utf8")).resolves.toBeTruthy();
+      await expect(readFile(keepaliveLaunchAgyPidFilePath(root, supervisor.launchId!), "utf8")).resolves.toBeTruthy();
       // The real agy did in fact die for real (SIGKILL cannot be blocked) --
       // only the mocked confirmation lied about it.
       await waitUntilDead(agyPid);
@@ -123,7 +123,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
 
   it("start() refuses to launch a replacement while the unexpected-exit path's reap is still unresolved", async () => {
     const { spawn: realSpawn } = await import("node:child_process");
-    const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
+    const { AgyKeepaliveSupervisor, keepaliveLaunchAgyPidFilePath } = await import("../src/antigravity-keepalive.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-reaping-guard-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -140,7 +140,7 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirmin
       supervisor.start();
       const scriptPid = track(supervisor.pid, root) as number;
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
-      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+      await waitForFile(keepaliveLaunchAgyPidFilePath(root, supervisor.launchId!));
       expect(spawnCount).toBe(1);
 
       // Triggers the unexpected-exit path; isProcessGroupAlive is mocked, so

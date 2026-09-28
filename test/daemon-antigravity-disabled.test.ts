@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { keepaliveStateFilePath } from "../src/antigravity-keepalive.js";
+import { keepaliveLaunchAgyPidFilePath, keepaliveLaunchStateFilePath } from "../src/antigravity-keepalive.js";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
@@ -60,7 +60,7 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
         throw error;
       }
       const internal = daemon as unknown as {
-        keepalive: { running: boolean; pid?: number } | undefined;
+        keepalive: { running: boolean; pid?: number; launchId?: string } | undefined;
         currentAccounts(): Promise<unknown>;
       };
       // Give any (wrongly) started keepalive a moment to actually spawn.
@@ -298,7 +298,8 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
       expect(firstKeepalive).toBeDefined();
       const scriptPid = track(firstKeepalive?.pid, root) as number;
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
-      const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+      const launchId = firstKeepalive?.launchId!;
+      const pidFilePath = keepaliveLaunchAgyPidFilePath(root, launchId);
       await waitForFile(pidFilePath);
 
       // Kill script externally and immediately corrupt the pid file
@@ -331,7 +332,7 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
       // Resolve it (what an operator, or `headroom doctor`, would do) and
       // re-enable again: NOW a genuinely new supervisor must start.
       await rm(pidFilePath, { force: true });
-      await rm(keepaliveStateFilePath(root), { force: true });
+      await rm(keepaliveLaunchStateFilePath(root, launchId), { force: true });
       await rm(infoFile, { force: true });
       await internal.maybeStartKeepalive(enabledAccounts, { antigravity_keepalive: true });
       const secondAgyPid = track(Number(await waitForFile(infoFile)), root) as number;

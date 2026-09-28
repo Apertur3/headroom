@@ -266,7 +266,12 @@ export class HeadroomDaemon {
    * this cycle, not "nothing to worry about". */
   private async sweepStaleKeepalive(): Promise<void> {
     try {
-      const result = await sweepPreviousKeepalive(this.home, { log: (message) => { void appendDaemonLog(message, this.home); } });
+      const result = await sweepPreviousKeepalive(this.home, {
+        log: (message) => { void appendDaemonLog(message, this.home); },
+        // An injected/already-running supervisor owns its UUID directory;
+        // startup reconciliation must never inspect that live launch.
+        skipLaunchId: this.keepalive?.launchId,
+      });
       this.keepaliveUnverifiedPids = result.unverified;
       this.keepaliveSwept = true;
     }
