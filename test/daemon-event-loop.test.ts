@@ -88,7 +88,8 @@ describe("store.insertPoll event-loop cost (the poll-cycle stall)", () => {
   }, 20_000);
 });
 
-describe("daemon event-loop responsiveness through a real poll", () => {
+// A Unix socket on POSIX; Windows uses a named pipe (covered in pipe-auth.test.ts).
+describe.skipIf(process.platform === "win32")("daemon event-loop responsiveness through a real poll", () => {
   it("keeps `health` available while a forced poll writes many observations over the real socket", async () => {
     const root = await tempRoot("evtloop");
     const path = socketPath(root);
