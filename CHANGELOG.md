@@ -13,6 +13,30 @@ All notable changes to this project are documented here. The format follows
 - Add auditable manual banked-reset entries (`headroom credits`), reset-aware `plan --target` advice, and matching daemon/MCP/status support (#71).
 
 ### Fixed
+- A daemon poll cycle's own synchronous SQLite writes could occasionally stall a concurrent `health`
+  reply well past its 2s budget under host load (reproduced: back-to-back `headroom status --json`
+  calls, one out of twelve taking 5.1s, lining up with a poll cycle). Root cause: `insert()` prepares
+  roughly a dozen SQL statements per observation, and every one was re-prepared (re-parsed, re-planned
+  by SQLite) fresh on every call instead of being cached and reused; a poll's several observations each
+  ran their own autocommit transaction on top of that. `HeadroomStore` now caches every prepared
+  statement by its exact SQL text, and `insertPoll()` runs as one `BEGIN IMMEDIATE`/`COMMIT` instead
+  of one autocommit per observation -- measured (on this project's own machine, no artificial delay)
+  an 8x reduction in wall time for an equivalent poll (a 1000-observation `insertPoll()` went from
+  469ms to 60ms; a 2000-observation one from 963ms to 148ms).
+- Read-only commands (`status`/bare `headroom`, `history`, `events`, `rate`, and `can` without
+  `--lease`) no longer fail outright when a daemon socket exists but does not answer `health` within
+  its 2s budget: the CLI and the equivalent MCP tools (`quota_status`, `quota_events`, `quota_rate`,
+  `quota_can`) now retry health once, then -- if still unresponsive -- open the store read-only
+  (`HeadroomStore.openReadOnly()`, which never migrates or writes) and serve the stored rows,
+  clearly flagged (`served_from: "cache"`/`daemon: "unresponsive"` on the CLI's enveloped outputs,
+  `source: "cache"`/`daemon: "unresponsive"` on the equivalent MCP tool results, a stderr note on the
+  CLI's bare-array outputs). Freshness and pace are still computed against the current clock, so a
+  stale reading still serves stale. Every write or dispatch path (`lease start`, `gate`, `can --lease`,
+  `run`) is unchanged and still fails closed the same way it always has.
+- A failed `--json` CLI read no longer leaves stdout completely empty: `runCli` (the real entry
+  point's own error handling, now exported and testable) prints `{"error": "<message>"}` to stdout,
+  in addition to the existing human message on stderr, whenever a command throws -- so an agent
+  reading only stdout can always tell "no answer at all" apart from "a reading with nothing in it."
 - Antigravity local quota reads that came back incomplete (agy's warm quota summary still populating, most often while the machine was busy) are now retried once within the same daemon poll instead of being reported as a failure immediately. Only a complete retry replaces the first read, missing lanes remain failed rather than using cached capacity, and both attempts share the native reader's original 90-second budget. This was the main driver of the `source_failed`/`source_recovered` flapping roughly every 15-30 minutes. The Swift engine's own per-poll readiness wait for agy's local summary also grew from 15s to 30s.
 - Make model-catalog availability fail closed: stale or malformed local catalog timestamps and malformed Antigravity model-list responses leave known models unchanged; an initial empty catalog is still initialized; interval claims occur before catalog I/O; and direct status output is not delayed by model-list network reads. Model meter wording now distinguishes a current dedicated/shared meter from no dedicated meter observed (UNKNOWN), and separate model ids no longer suppress each other's delivery. `headroom models --principal` now requires exactly one non-flag value.
 - Serve an old stored-fresh percent observation as stale, including its age and any held-window explanation; invalid fetch timestamps now fail closed too, while local state and count rows keep their policy semantics. Served status carries its enrichment instant (`status_enriched_at`) so a caller can see when it was last evaluated.
