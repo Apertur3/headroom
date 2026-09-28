@@ -29,11 +29,17 @@ export async function rotateDaemonLog(path = daemonLogPath()): Promise<void> {
   await rename(path, `${path}.1`);
 }
 
+/** Best-effort, and never rejects: the daemon calls this from detached
+ * promises and from its own error paths, where a full or read-only disk
+ * would otherwise turn a lost log line into an unhandled rejection that ends
+ * the process. */
 export async function appendDaemonLog(message: string, home = headroomHome()): Promise<void> {
-  const path = daemonLogPath(home);
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await rotateDaemonLog(path);
-  await writeFile(path, `${new Date().toISOString()} ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
+  try {
+    const path = daemonLogPath(home);
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await rotateDaemonLog(path);
+    await writeFile(path, `${new Date().toISOString()} ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" });
+  } catch { /* the log is diagnostic; losing a line must never cost the daemon */ }
 }
 
 export async function tailDaemonLog(lines = 50, home = headroomHome()): Promise<string> {

@@ -6,13 +6,13 @@ import { join } from "node:path";
 import { createServer, type Socket } from "node:net";
 import type { ReadStream, WriteStream } from "node:tty";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, decodeDashboardKeys, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO, canConnect, usableCurrentPoints, defaultFocusedMeterIndex } from "../src/dashboard.js";
+import { applyDashboardRegistry, dashboardCommand, dashboardOptions, dashboardPanelOffset, dashboardRead, decodeDashboardKeys, filterDashboardPrincipals, gatherDashboard, readDashboardGraphs, renderBurndown, renderWeekly, type DashboardModel, ENTER_DASHBOARD, handleDashboardKey, LEAVE_DASHBOARD, renderDashboard, type DashboardIO, canConnect, usableCurrentPoints, defaultFocusedMeterIndex } from "../src/dashboard.js";
 import { burnBuckets, dashboardSnapshot, gatherDashboard as gatherCachedDashboard, readDashboardStore } from "../src/dashboard-data.js";
 import { daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
-import type { Observation } from "../src/types.js";
+import type { Account, Observation } from "../src/types.js";
 
 const now = new Date("2026-09-08T12:00:00Z");
 function row(overrides: Partial<Observation> = {}): Observation {
@@ -350,6 +350,60 @@ describe("dashboard terminal", () => {
     expect(dashboardOptions(["--interval", "2"], true, {}).interval).toBe(2000);
     for (const value of ["1", "NaN", "Infinity", "", "2147484"]) expect(() => dashboardOptions(["--interval", value], true, {})).toThrow();
     const fake = terminal(); expect(await dashboardCommand(["--help"], fake.io)).toBe(0); expect(fake.io.gather).not.toHaveBeenCalled();
+  });
+});
+
+describe("dashboard registry filtering fails closed", () => {
+  const disabledAccount = { name: "account-a", enabled: false, vendor: "claude", location: "/fixture/.claude", adapter: "native-ts" } as Account;
+
+  it("shows no principal when every account is disabled, and names them", () => {
+    const shown = applyDashboardRegistry(fixedModel(), { accounts: [disabledAccount], present: true });
+    expect(shown.observations).toEqual([]);
+    expect(shown.notices).toContainEqual(expect.stringContaining("disabled principals: account-a"));
+  });
+
+  it("shows no principal when accounts.toml cannot be read, and says so", () => {
+    const shown = applyDashboardRegistry(fixedModel(), { accounts: [], present: true, error: "Invalid account entry in accounts.toml" });
+    expect(shown.observations).toEqual([]);
+    expect(shown.notices).toContainEqual(expect.stringContaining("accounts.toml could not be read"));
+  });
+
+  it("shows the store as is only when there is no accounts.toml at all", () => {
+    expect(applyDashboardRegistry(fixedModel(), { accounts: [], present: false }).observations).toHaveLength(fixedModel().observations.length);
+    expect(applyDashboardRegistry(fixedModel(), { accounts: [], present: true }).observations).toEqual([]);
+  });
+
+  it("hides plan downgrades and reset notices of principals that are not shown", () => {
+    const snapshot = { ...fixedModel(), planDowngraded: [{ principal: "account-a", from: "Max", to: "Pro", since: "2026-09-08T11:00:00Z", acknowledged: false }], notices: ["unscheduled reset on account-a:all; capacity appeared, re-plan", "an unattributed notice"] };
+    const shown = applyDashboardRegistry(snapshot, { accounts: [disabledAccount], present: true });
+    expect(shown.planDowngraded).toEqual([]);
+    expect(shown.notices).not.toContainEqual(expect.stringContaining("account-a:all"));
+    const unreadable = applyDashboardRegistry(snapshot, { accounts: [], present: true, error: "unreadable" });
+    expect(unreadable.planDowngraded).toEqual([]);
+    expect(unreadable.notices).toEqual([expect.stringContaining("accounts.toml could not be read")]);
+  });
+
+  it("the cached report hides every principal behind a malformed, empty or all-disabled accounts.toml", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-registry-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      const store = await HeadroomStore.open(root);
+      const at = new Date().toISOString();
+      store.insert(row({ observed_at: at, fetched_at: at, resets_at: new Date(Date.now() + 4 * 3_600_000).toISOString() }));
+      store.close();
+      const timeouts = { healthTimeoutMs: 200, requestTimeoutMs: 200 };
+      await writeFile(join(root, "accounts.toml"), "[[accounts]\nnot valid", { mode: 0o600 });
+      const unreadable = await gatherCachedDashboard(root, timeouts);
+      expect(unreadable.observations).toEqual([]);
+      expect(unreadable.notices).toContainEqual(expect.stringContaining("accounts.toml could not be read"));
+      await writeFile(join(root, "accounts.toml"), "", { mode: 0o600 });
+      expect((await gatherCachedDashboard(root, timeouts)).observations).toEqual([]);
+      await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "account-a"', "enabled = false", 'vendor = "claude"', 'location = "/fixture/.claude"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
+      expect((await gatherCachedDashboard(root, timeouts)).observations).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

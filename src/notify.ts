@@ -7,7 +7,7 @@ import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
 import { HeadroomStore } from "./store.js";
-import type { EventKind, HeadroomEvent, NotifyDelivery, Observation } from "./types.js";
+import type { EventKind, HeadroomEvent, NotifyDelivery, Observation, StoredObservation } from "./types.js";
 
 /** Telegram rejects a message body over 4096 characters. 3800 leaves room for
  * the batch header a combined quiet-hours message adds. */
@@ -590,10 +590,10 @@ export function wantsEvent(event: HeadroomEvent, config: NotifyConfig): boolean 
  * next higher configured threshold. A window whose reset is unknown notifies
  * once and then stays quiet, which is the safe direction.
  */
-export function thresholdItems(store: HeadroomStore, configured: number | readonly number[]): NotifyItem[] {
+export function thresholdItems(store: HeadroomStore, configured: number | readonly number[], latest: StoredObservation[] = store.latestPerWindow()): NotifyItem[] {
   const thresholds = [...new Set(typeof configured === "number" ? [configured] : configured)].sort((left, right) => left - right);
   const items: NotifyItem[] = [];
-  for (const observation of store.latestPerWindow()) {
+  for (const observation of latest) {
     const quantity = observation.quantity;
     if (observation.freshness !== "fresh" || quantity?.unit !== "percent") continue;
     if (observation.window?.enforcement !== "hard" || !observation.window.minutes) continue;
@@ -627,7 +627,7 @@ function collectItems(store: HeadroomStore, config: NotifyConfig, discovered: He
     ? (projectionItem(store, event, evidence.get(event.id) ?? [], siblings) ?? [])
     : [eventItem(store, event, evidence.get(event.id), siblings)]);
   const thresholds = config.thresholds ?? (config.threshold_percent === null ? [] : [config.threshold_percent]);
-  if (wanted.has("threshold") && thresholds.length) items.push(...thresholdItems(store, thresholds));
+  if (wanted.has("threshold") && thresholds.length) items.push(...thresholdItems(store, thresholds, siblings));
   return items;
 }
 
