@@ -135,18 +135,37 @@ describe("daemon JSON-RPC", () => {
 
   it("keeps a warm local Antigravity read running while its remote source is backed off", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-warm-")); temporary.push(root);
-    const options: Array<Record<string, unknown> | undefined> = [];
-    const keepalive = { running: true, pid: 17, uptimeMs: 2_000, start() {}, stop() {} } as never;
-    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), keepalive, poller: async (_principal, option) => {
-      options.push(option as Record<string, unknown> | undefined);
-      return { observations: [], failures: [], antigravityLocal: { antigravity: { outcome: "failed", payload_kind: "placeholder", at: "2026-09-03T12:00:00Z" } } };
-    } });
-    const internal = daemon as unknown as { backoff: Map<string, { failures: number; until: number }>; poll(principal: string | undefined, forced: boolean): Promise<unknown>; antigravityLocal: Map<string, unknown> };
-    internal.backoff.set("all", { failures: 1, until: Date.now() + 60_000 });
-    await internal.poll(undefined, false);
-    expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
-    expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "placeholder" });
-    await daemon.stop();
+    // An enabled Antigravity account must be on file, at the SAME home
+    // currentAccounts() actually reads (HEADROOM_HOME, not the `home` option
+    // handed to HeadroomDaemon.create -- accountsPath() resolves independently
+    // of it): currentAccounts() now stops (and discards) any keepalive the
+    // CURRENT config does not justify, including one injected directly, as
+    // this fixture's is, and an absent/non-antigravity accounts.toml would
+    // otherwise stop this one out from under the assertions below before
+    // they ever run.
+    await writeFile(join(root, "accounts.toml"), [
+      "[[accounts]]", 'name = "antigravity"', "enabled = true",
+      'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', 'agy_path = "/bin/true"', "",
+    ].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(root, async () => {
+      const options: Array<Record<string, unknown> | undefined> = [];
+      // stop() must return a real Promise, matching AgyKeepaliveSupervisor's
+      // own signature: currentAccounts() may legitimately try to stop this
+      // keepalive (e.g. once the account above is filtered out again), and a
+      // synchronous no-op stop() here would throw when daemon code awaits or
+      // chains it.
+      const keepalive = { running: true, pid: 17, uptimeMs: 2_000, start() {}, stop() { return Promise.resolve(); } } as never;
+      const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), keepalive, poller: async (_principal, option) => {
+        options.push(option as Record<string, unknown> | undefined);
+        return { observations: [], failures: [], antigravityLocal: { antigravity: { outcome: "failed", payload_kind: "placeholder", at: "2026-09-03T12:00:00Z" } } };
+      } });
+      const internal = daemon as unknown as { backoff: Map<string, { failures: number; until: number }>; poll(principal: string | undefined, forced: boolean): Promise<unknown>; antigravityLocal: Map<string, unknown> };
+      internal.backoff.set("all", { failures: 1, until: Date.now() + 60_000 });
+      await internal.poll(undefined, false);
+      expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
+      expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "placeholder" });
+      await daemon.stop();
+    });
   });
 
   it("never spawns the Claude probe in the poll path once a keychain grant marker exists for the principal", async () => {

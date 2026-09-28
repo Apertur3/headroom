@@ -2,8 +2,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { descendantsOf, killTree, listProcesses, processSignature, type ProcessEntry } from "../src/process-tree.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { descendantsOf, isProcessGroupAlive, killTree, listProcesses, processSignature, type ProcessEntry } from "../src/process-tree.js";
 import { agyPtyCommand } from "../src/antigravity-keepalive.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
@@ -182,4 +182,42 @@ describe.skipIf(process.platform === "win32")("processSignature", () => {
     // runner, and never one this test itself started.
     await expect(processSignature(999_999)).resolves.toBeUndefined();
   });
+});
+
+describe.skipIf(process.platform === "win32")("isProcessGroupAlive", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  function mockKillError(code: string): void {
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      const error = new Error(`simulated ${code}`) as NodeJS.ErrnoException;
+      error.code = code;
+      throw error;
+    });
+  }
+
+  it("treats ESRCH as confirmed dead -- the only error that means so", () => {
+    mockKillError("ESRCH");
+    expect(isProcessGroupAlive(999_999)).toBe(false);
+  });
+
+  it("treats EPERM as still alive (exists, just not ours to signal)", () => {
+    mockKillError("EPERM");
+    expect(isProcessGroupAlive(1)).toBe(true);
+  });
+
+  it("fails closed on any OTHER error -- never assumed dead just because it isn't EPERM", () => {
+    for (const code of ["EIO", "EINVAL", "ENOMEM", "EAGAIN"]) {
+      mockKillError(code);
+      expect(isProcessGroupAlive(123)).toBe(true);
+    }
+  });
+
+  it("still reports a genuinely live process group alive without any mocking", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-isgroupalive-")); temporary.push(root);
+    const shim = await writeMortalShim(join(root, "shim"));
+    const child = spawn(shim, [], { stdio: "ignore", detached: true });
+    const pid = track(child.pid, root) as number;
+    try { expect(isProcessGroupAlive(pid)).toBe(true); }
+    finally { await killTree(pid, { graceMs: 100 }); await waitUntilDead(pid); }
+  }, 10_000);
 });

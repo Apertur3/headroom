@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Antigravity keepalive evidence is now isolated per launch in private UUID
+  directories. Startup reconciles each stale directory (and the retired shared
+  files as migration-only evidence), while stop and restart paths touch only
+  their own directory and keep a replacement blocked until recorded processes
+  are confirmed gone.
+- Antigravity keepalive reconciliation is now single-flight, preserves a justified supervisor's own restart/reap lifecycle, rejects partial or noncanonical state evidence, and uses process-group-only signals in ps-free recovery paths so a recycled bare PID is never signalled.
+- Antigravity keepalive evidence is now parsed without normalization: malformed state metadata and pid-file whitespace are retained as unresolved evidence, so a daemon cannot clear it, claim it, or launch a replacement over it. Each poll also reconciles an already-running keepalive against live policy, and an executable validated for one Antigravity account cannot be launched if that account or its configured path changes during validation.
+- Antigravity keepalive: a daemon that died (or ran with `ps` denied) before its process record was fully written could leave an orphaned `agy` unrecoverable -- the next daemon start ignored the launch wrapper's own pid file and deleted it before launching a replacement. The supervisor now writes a ps-independent provisional record synchronously at spawn, and the startup sweep reconciles both that record and the leftover pid file, using a `ps` signature match when available and process-group/mtime evidence when it is not; a pid it cannot verify is left alone, logged, and blocks a fresh launch until it is confirmed gone.
 - Daemon shutdown now drains complete maintenance passes and already accepted RPC handlers, not
   only their timer-delivery and notification children. Work resuming after configuration I/O is
   guarded from the closed store and returns a clean stopping error instead of touching SQLite.

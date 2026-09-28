@@ -462,7 +462,7 @@ describe("headroom policy CLI: concurrent-safe edits", () => {
   });
 });
 
-describe("reserve review fixes", () => {
+describe("reserve parsing and presentation", () => {
   it("keeps a # inside a quoted reason instead of treating it as a comment", async () => {
     const { parsePolicy } = await import("../src/policy.js");
     const policy = parsePolicy('[reserve."codex-main:main"]\npercent = 30\nreason = "stop #123 builds" # trailing comment\n');
@@ -485,4 +485,3 @@ describe("reserve review fixes", () => {
     expect(freeze?.reason).toBeUndefined();
   });
 });
-
