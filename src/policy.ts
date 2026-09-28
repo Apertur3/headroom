@@ -98,6 +98,19 @@ export function reserveEntryExpired(entry: ReserveEntry | undefined, now: Date):
 /** The metadata record for a meter's own key, falling back to `"*"` --
  * mirrors reserveFor's own per-meter-then-default lookup, so a meter with no
  * entry of its own still inherits `"*"`'s reason/until/unless. */
+/** Drops a trailing `# comment` but never a `#` inside a double-quoted
+ * string (a reason such as "stop #123 builds"), honouring backslash escapes. */
+export function stripTomlComment(raw: string): string {
+  let quoted = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (quoted && char === "\\") { i += 1; continue; }
+    if (char === '"') quoted = !quoted;
+    else if (char === "#" && !quoted) return raw.slice(0, i);
+  }
+  return raw;
+}
+
 export function reserveEntryFor(meta: Record<string, ReserveEntry>, meterId: string): ReserveEntry | undefined {
   return meta[meterId] ?? meta["*"];
 }
@@ -143,7 +156,7 @@ export function parsePolicy(text: string, now: Date = new Date()): Policy {
   let pacing: Policy["pacing"] | undefined;
   let statuslineSnapshotDirs: string[] | undefined;
   for (const raw of text.split("\n")) {
-    const line = raw.replace(/#.*/, "").trim();
+    const line = stripTomlComment(raw).trim();
     const section = /^\[principal\.([A-Za-z0-9_-]+)\]$/.exec(line);
     if (section) { principal = section[1]; inReserve = false; reserveEntryKey = undefined; inFreezeReserve = false; continue; }
     if (/^\[reserve\]$/.test(line)) { principal = undefined; inReserve = true; reserveEntryKey = undefined; inFreezeReserve = false; continue; }
@@ -432,10 +445,13 @@ export interface ReserveCeilingStep { key: string; percent: number; usable_to: n
  * caller can still see that a reserve exists but is currently suspended. */
 export function reserveCeilingSteps(policy: Pick<Policy, "reserve" | "reserve_meta" | "freeze_reserve_pct">, meterId: string, meterSuspended: boolean): ReserveCeilingStep[] {
   const meterEntry = reserveEntryFor(policy.reserve_meta, meterId);
-  const meterPercent = meterSuspended ? 0 : reserveFor(policy.reserve, meterId);
+  const basePercent = reserveFor(policy.reserve, meterId);
+  const meterPercent = meterSuspended ? 0 : basePercent;
   const freezeEntry = policy.reserve_meta.freeze_reserve_pct;
   const steps: ReserveCeilingStep[] = [];
-  if (meterPercent > 0) {
+  // Test the configured percent, not the effective one: a suspended reserve
+  // stays listed (zeroed and marked) so a caller sees it exists.
+  if (basePercent > 0) {
     steps.push({ key: meterId, percent: meterPercent, usable_to: 100 - meterPercent, reason: meterEntry?.reason, set_at: meterEntry?.set_at, suspended: meterSuspended && meterEntry?.unless === "banked_reset_available" });
   }
   if (policy.freeze_reserve_pct > 0) {

@@ -402,3 +402,28 @@ describe("headroom policy CLI", () => {
     expect(line).toContain("expired 2000-01-01");
   });
 });
+
+describe("reserve review fixes", () => {
+  it("keeps a # inside a quoted reason instead of treating it as a comment", async () => {
+    const { parsePolicy } = await import("../src/policy.js");
+    const policy = parsePolicy('[reserve."codex-main:main"]\npercent = 30\nreason = "stop #123 builds" # trailing comment\n');
+    expect(policy.reserve_meta["codex-main:main"]?.reason).toBe("stop #123 builds");
+    expect(policy.reserve["codex-main:main"]).toBe(30);
+  });
+
+  it("lists a suspended reserve in the ceiling steps, zeroed and marked, instead of dropping it", async () => {
+    const { parsePolicy, reserveCeilingSteps } = await import("../src/policy.js");
+    const policy = parsePolicy('freeze_reserve_pct = 0\n[reserve."codex-main:main"]\npercent = 30\nreason = "hold"\nunless = "banked_reset_available"\n');
+    const steps = reserveCeilingSteps(policy, "codex-main:main", true);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toMatchObject({ key: "codex-main:main", percent: 0, usable_to: 100, suspended: true });
+  });
+
+  it("never gives the freeze reserve the wildcard entry's reason", async () => {
+    const { parsePolicy, reserveCeilingSteps } = await import("../src/policy.js");
+    const policy = parsePolicy('freeze_reserve_pct = 10\n[reserve."*"]\npercent = 5\nreason = "wildcard reason"\n');
+    const freeze = reserveCeilingSteps(policy, "codex-main:main", false).find((step) => step.key === "freeze_reserve_pct");
+    expect(freeze?.reason).toBeUndefined();
+  });
+});
+

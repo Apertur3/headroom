@@ -431,7 +431,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         const left = Math.max(0, 100 - reserve - used);
         const reserveReason = meterReserve >= reservePercent && meterReserve > 0
           ? `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix}: that would use the ${meterReserve}% reserve on ${id} ${reserveAttributionBracket(id, reserveEntryFor(reserveMeta, id), policyMtime)}`
-          : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve ${reserveAttributionBracket("freeze_reserve_pct", reserveEntryFor(reserveMeta, "freeze_reserve_pct"), policyMtime)}`;
+          : `${label} needs ${need.points} more but only ${left.toFixed(1)} left${reservedSuffix} before the ${reserve}% reserve ${reserveAttributionBracket("freeze_reserve_pct", reserveMeta["freeze_reserve_pct"], policyMtime)}`;
         return { allowed: false, reason: reserveReason, meters_checked: checked };
       }
       if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
@@ -510,7 +510,7 @@ export function admitCanCost(store: HeadroomStore, decision: CanDecision, meters
           ...decision,
           allowed: false,
           meter,
-          reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${meter} (${usable.toFixed(1)}% usable of ${remaining.toFixed(1)}% remaining) ${reserveAttributionBracket(attributeTo, reserveEntryFor(policy.reserve_meta, attributeTo), policy.policy_mtime)}`,
+          reason: `${expectedPercent.toFixed(1)}% expected would use the ${reserve}% reserve on ${meter} (${usable.toFixed(1)}% usable of ${remaining.toFixed(1)}% remaining) ${reserveAttributionBracket(attributeTo, (attributeTo === "freeze_reserve_pct" ? policy.reserve_meta.freeze_reserve_pct : reserveEntryFor(policy.reserve_meta, attributeTo)), policy.policy_mtime)}`,
         };
       }
     }
