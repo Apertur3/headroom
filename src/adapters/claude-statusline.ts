@@ -3,7 +3,7 @@ import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { headroomHome } from "../paths.js";
 import { assertSafeReadableDirectory, exceedsJsonDepth, readBoundedRegularFile, safeError } from "../security.js";
-import type { Observation, ProviderAccount } from "../types.js";
+import { isAccountEnabled, type Observation, type ProviderAccount } from "../types.js";
 
 export const STATUSLINE_SOURCE = "native:claude-statusline";
 
@@ -193,12 +193,13 @@ export function snapshotFromStatuslinePayload(payload: unknown, profile: string,
  * convenience source, not the source of truth, and most configured
  * principals don't use it), but a directory that exists and fails the trust
  * checks below is skipped with exactly one audit line to stderr instead of
- * being read at all -- it is never opened, symlinks and all. Every file
- * within a trusted directory is still read defensively (lstat'd, size-bound,
- * JSON-depth-bound): the directory being safe says nothing about a single
- * file dropped or replaced inside it after the fact.
+ * being read at all -- it is never opened, symlinks and all. The enabled
+ * account filename allowlist is resolved before any file is opened, so a
+ * parked profile's snapshot is never inspected. Each allowed file is still
+ * read defensively (lstat'd, size-bound, JSON-depth-bound): the directory
+ * being safe says nothing about a single file dropped or replaced inside it.
  */
-async function readSnapshotDirectory(dir: string, now: Date): Promise<Array<{ file: string; snapshot: StatuslineSnapshot }>> {
+async function readSnapshotDirectory(dir: string, now: Date, allowedFiles: ReadonlySet<string>): Promise<Array<{ file: string; snapshot: StatuslineSnapshot }>> {
   try { await assertSafeReadableDirectory(dir); }
   catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; // not configured, nothing to say
@@ -206,7 +207,7 @@ async function readSnapshotDirectory(dir: string, now: Date): Promise<Array<{ fi
     return [];
   }
   let entries: string[];
-  try { entries = (await readdir(dir)).filter((name) => name.endsWith(".json")).slice(0, MAX_SNAPSHOT_FILES_PER_DIR); }
+  try { entries = (await readdir(dir)).filter((name) => name.endsWith(".json") && allowedFiles.has(name)).slice(0, MAX_SNAPSHOT_FILES_PER_DIR); }
   catch { return []; }
   const results: Array<{ file: string; snapshot: StatuslineSnapshot }> = [];
   for (const name of entries) {
@@ -234,6 +235,20 @@ function matchAccount(snapshot: StatuslineSnapshot, accounts: ProviderAccount[])
   if (explicit) return explicit;
   if (snapshot.alias === "main") return accounts.find((account) => statuslineProfile(account.location) === "default");
   return accounts.find((account) => statuslineProfile(account.location) === snapshot.alias);
+}
+
+/** The only on-disk names a configured enabled Claude profile can own: the
+ * profile used by Headroom's snapshot writer plus each documented external
+ * collector alias convention. */
+function enabledSnapshotFiles(accounts: ProviderAccount[]): Set<string> {
+  const files = new Set<string>();
+  for (const account of accounts) {
+    const profile = statuslineProfile(account.location);
+    files.add(`${profile}.json`);
+    if (account.alias) files.add(`${account.alias}.json`);
+    if (profile === "default") files.add("main.json");
+  }
+  return files;
 }
 
 /** Never throws: readBucket above already refuses an out-of-range resets_at
@@ -316,10 +331,13 @@ export function observationsFromStatuslineSnapshot(snapshot: StatuslineSnapshot,
  * never win this comparison and permanently shadow a real reading.
  */
 export async function latestStatuslineSnapshot(dirs: string[], account: ProviderAccount, accounts: ProviderAccount[], now: Date = new Date()): Promise<StatuslineSnapshot | undefined> {
+  if (!isAccountEnabled(account)) return undefined;
+  const enabledAccounts = accounts.filter(isAccountEnabled);
+  const allowedFiles = enabledSnapshotFiles(enabledAccounts);
   let best: StatuslineSnapshot | undefined;
   for (const dir of dirs) {
-    for (const { snapshot } of await readSnapshotDirectory(dir, now)) {
-      if (matchAccount(snapshot, accounts)?.name !== account.name) continue;
+    for (const { snapshot } of await readSnapshotDirectory(dir, now, allowedFiles)) {
+      if (matchAccount(snapshot, enabledAccounts)?.name !== account.name) continue;
       if (!best || snapshot.observed_at > best.observed_at) best = snapshot;
     }
   }

@@ -113,13 +113,41 @@ async function startFakeUnresponsiveDaemon(root: string, holdMs: number): Promis
   track(child.pid, root);
   await new Promise<void>((resolve, reject) => {
     let out = "";
+    let err = "";
     const onData = (chunk: Buffer) => { out += chunk.toString("utf8"); if (out.includes("ready")) { child.stdout?.off("data", onData); resolve(); } };
     child.stdout?.on("data", onData);
+    child.stderr?.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
     child.once("error", reject);
-    child.once("exit", (code) => reject(new Error(`fake daemon exited early (code ${code})`)));
+    child.once("exit", (code) => reject(new Error(`fake daemon exited early (code ${code}): ${err.trim() || "no stderr"}`)));
     setTimeout(() => reject(new Error("fake daemon never became ready")), 5_000).unref();
   });
   return { pid: child.pid!, stop: () => { try { child.kill("SIGTERM"); } catch { /* already gone */ } } };
+}
+
+async function seedDisabledCache(root: string): Promise<void> {
+  await writeFile(join(root, "routing.toml"), ['local_preference = "prefer"', "[consumes]", 'review = ["codex-live:main"]', ""].join("\n"), { mode: 0o600 });
+  await writeFile(join(root, "accounts.toml"), [
+    "[[accounts]]", 'name = "codex-live"', 'vendor = "codex"', 'location = "/fixture/codex-live"', 'adapter = "native-ts"', "",
+    "[[accounts]]", 'name = "codex-parked"', "enabled = false", 'vendor = "codex"', 'location = "/fixture/codex-parked"', 'adapter = "native-ts"', "",
+    "[[accounts]]", 'name = "local-parked"', "enabled = false", 'kind = "local"', 'base_url = "http://pool.invalid"', 'adapter = "native"', "",
+  ].join("\n"), { mode: 0o600 });
+  const now = new Date();
+  const store = await HeadroomStore.open(root);
+  try {
+    for (const principal of ["codex-live", "codex-parked"]) {
+      store.insert({
+        principal_id: principal, meter_id: `${principal}:main`, window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" }, resets_at: new Date(now.getTime() + 3_600_000).toISOString(), observed_at: now.toISOString(), fetched_at: now.toISOString(),
+        source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      });
+    }
+    store.insert({
+      principal_id: "local-parked", meter_id: "local-parked:capacity", window: { kind: "state", minutes: null, enforcement: "soft" },
+      quantity: { used: 0, limit: null, remaining: null, unit: "requests" }, resets_at: null, observed_at: now.toISOString(), fetched_at: now.toISOString(),
+      source: "fixture", truth: "estimated", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+      metadata: { state: "UP", model_ids: [], running: 0, waiting: 0, cost_model: "marginal" },
+    });
+  } finally { store.close(); }
 }
 
 describe("cached read-only fallback against a genuinely unresponsive daemon", () => {
@@ -284,6 +312,25 @@ describe("cached read-only fallback against a genuinely unresponsive daemon", ()
       fake.stop();
     }
   }, 20_000);
+
+  it.skipIf(process.platform === "win32")("cached `can` excludes a disabled local pool", async () => {
+    const root = await tempRoot("cache-can-disabled-local");
+    await seedDisabledCache(root);
+    const fake = await startFakeUnresponsiveDaemon(root, 5_000);
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      expect(await runCli(["can", "review", "--owner", "tester", "--json"])).toBe(0);
+      const payload = JSON.parse(logSpy.mock.calls.map((call) => String(call[0])).join("\n")) as { meter: string; served_from?: string; daemon?: string };
+      expect(payload).toMatchObject({ meter: "codex-live:main", served_from: "cache", daemon: "unresponsive" });
+      expect(payload.meter).not.toBe("local-parked:capacity");
+    } finally {
+      logSpy.mockRestore();
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+      fake.stop();
+    }
+  }, 20_000);
 });
 
 describe("MCP cached read-only fallback against a genuinely unresponsive daemon", () => {
@@ -360,6 +407,28 @@ describe("MCP cached read-only fallback against a genuinely unresponsive daemon"
     try {
       const reply = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_can", arguments: { action_class: "review", owner: "tester", lease: true, expect_percent: 5 } } })) as { error?: { message: string } };
       expect(reply.error?.message).toMatch(/did not respond within 2s/);
+    } finally {
+      if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
+      fake.stop();
+    }
+  }, 20_000);
+
+  it.skipIf(process.platform === "win32")("cached `quota_can` excludes a disabled local pool and `quota_rate` refuses a disabled meter", async () => {
+    const root = await tempRoot("mcp-cache-disabled");
+    await seedDisabledCache(root);
+    const fake = await startFakeUnresponsiveDaemon(root, 5_000);
+    const previousHome = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    try {
+      const canReply = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_can", arguments: { action_class: "review", owner: "tester" } } })) as { result: { structuredContent: { source: string; daemon: string; decision: { meter: string } } } };
+      expect(canReply.result.structuredContent).toMatchObject({ source: "cache", daemon: "unresponsive", decision: { meter: "codex-live:main" } });
+      expect(canReply.result.structuredContent.decision.meter).not.toBe("local-parked:capacity");
+
+      const rateReply = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "quota_rate", arguments: { meter: "codex-parked:main" } } })) as { result: { structuredContent: { source: string; daemon: string; lines: Array<{ meter: string; reason?: string }> } } };
+      expect(rateReply.result.structuredContent).toMatchObject({
+        source: "cache", daemon: "unresponsive",
+        lines: [expect.objectContaining({ meter: "codex-parked:main", reason: expect.stringContaining("disabled") })],
+      });
     } finally {
       if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
       fake.stop();

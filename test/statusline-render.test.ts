@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
-import { COMPACT_MAX_WIDTH, DAEMON_BUDGET_MS, daemonRows, parseRenderOptions, renderStatusline, type StatuslineContext } from "../src/statusline-render.js";
+import { COMPACT_MAX_WIDTH, DAEMON_BUDGET_MS, daemonRows, parseRenderOptions, renderStatusline, statuslineContext, type StatuslineContext } from "../src/statusline-render.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
@@ -101,6 +101,24 @@ async function seedHome(root: string, now: Date): Promise<{ home: string; payloa
 function plain(text: string): string { return text.replace(/\u001b\[[0-9;]*m/g, ""); }
 
 describe("headroom statusline --render", () => {
+  it("filters parked observations and leases from the store fallback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hr-statusline-disabled-fallback-")); temporary.push(root);
+    const home = join(root, ".headroom");
+    const now = new Date();
+    const store = await HeadroomStore.open(home);
+    try {
+      store.insert(percentRow("claude-parked", "all", 300, 10, new Date(now.getTime() + HOUR), now));
+      store.startLease("test", "claude-parked:all", 5, HOUR, null, now);
+    } finally { store.close(); }
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/parked-profile"', 'adapter = "native-ts"', ''].join("\n"));
+    await withHeadroomHome(home, async () => {
+      const context = await statuslineContext("parked-profile", now);
+      expect(context.source).toBe("store");
+      expect(context.observations).toEqual([]);
+      expect(context.leases).toEqual([]);
+    });
+  });
+
   it("combines the session's own payload numbers with Headroom's other principals, in one compact line under the width budget", async () => {
     const root = await mkdtemp(join(tmpdir(), "hr-compact-")); temporary.push(root);
     const now = new Date();

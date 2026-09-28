@@ -351,8 +351,10 @@ reserve floor), projects other owners' open leases and the meter's recent 60-min
 end, and refuses if the requested work would cross that cap. `--duration <minutes>` (or a routing
 class's configured duration) defines that horizon, never beyond the reset. `fill` keeps its existing
 5-point safety margin and meter reserve while making its lane offer. Unlike the pro-rata basis, an
-explicit `fill` request is never silently skipped: it applies with no `--owner` given and inside the
-final 45 minutes before reset too (that is exactly when a burst against the cap matters most), and it
+explicit `fill` request is never silently skipped: it applies with no `--owner` given, inside the
+final 45 minutes before reset, and under `pacing = "none"` too (`pacing` only ever governs the
+pro-rata line and burst check above, which belong to the default pro-rata basis -- the opt-in fill
+basis runs its own projection either way, exactly the same under both pacing settings), and it
 fails closed -- UNKNOWN on `gate`, an `error` on `fill` -- rather than quietly falling back to full
 capacity, whenever the window has no finite future reset to project to or its last 60 minutes carry
 no burn history to project from (a real, measured zero burn is not the same fact as an absent one,
@@ -408,10 +410,14 @@ that a banked reset would restore").
 
 `headroom policy set reserve <meter> <percent> --reason "<text>" [--until <ISO|+7d>] [--unless
 banked_reset_available]`, `headroom policy clear reserve <meter>`, and `headroom policy set
-freeze_reserve_pct <n> [--reason ...] [--until ...]` edit policy.toml safely: atomic write, 0600
-mode, a `policy.toml.bak-<timestamp>` backup written first, every other key and comment preserved,
-and a before/after line printed. `headroom policy show` prints every reserve's effective percent,
-metadata, and whether it is currently expired or suspended.
+freeze_reserve_pct <n> [--reason ...] [--until ...]` edit policy.toml safely: an exclusive lock
+(shared with `headroom notify configure`'s own policy.toml edit, so the two can never interleave
+either) serializes concurrent writers, so two invocations can never have one's edit silently erased
+by the other's; atomic write (0600 mode on POSIX; Windows has no equivalent permission bit); a
+`policy.toml.bak-<timestamp>` backup written first (a collision-proof name even when two backups
+land in the same millisecond); every other key and comment preserved; and a before/after line
+printed. `headroom policy show` prints every reserve's effective percent, metadata, and whether it
+is currently expired or suspended.
 
 ## Spend ledger
 

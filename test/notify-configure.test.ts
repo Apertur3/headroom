@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configureNotifications, notifyTable, pickNotifications, rewriteNotifyTable } from "../src/notify-configure.js";
 import { NOTIFY_EVENT_NAMES, parseNotifyConfig, resolveNotifyEvents, wantsEvent } from "../src/notify.js";
+import { policyLockPath, withExclusiveLock } from "../src/security.js";
 import type { HeadroomEvent } from "../src/types.js";
 
 const temporary: string[] = [];
@@ -134,5 +135,41 @@ describe("scripted picker", () => {
     expect(await readFile(path, "utf8")).toBe("# concurrent edit\n");
     await expect(pickNotifications(config(), script(["ntfy", "bad topic", "", "", "n", "none"]), () => undefined)).rejects.toThrow(/ntfy topic/);
     expect(notifyTable(config())).not.toContain("notify_scheduled_short");
+  });
+
+  it("commits through the same shared policy lock as headroom policy set/clear -- it cannot finish while that lock is held elsewhere", async () => {
+    const root = await home();
+    await writeFile(join(root, "policy.toml"), "freeze_reserve_pct = 10\n[notify]\nchannels = []\n");
+    let releaseHold!: () => void;
+    let holding!: () => void;
+    const holdingPromise = new Promise<void>((resolve) => { holding = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { releaseHold = resolve; });
+    // Take the exact lock headroom policy set/clear takes -- not a stand-in
+    // -- and confirm configureNotifications' own commit is blocked by it.
+    const holder = withExclusiveLock(policyLockPath(root), async () => {
+      holding();
+      await releasePromise;
+    });
+    await holdingPromise; // the shared lock is now held by someone else entirely
+
+    const answers = script(["ntfy", "fixture", "", "", "n", "none", "n"]);
+    const configuring = configureNotifications([], { home: root, ask: answers, print: () => undefined });
+
+    // Proven with a race against a generous timer, not a fixed sleep before
+    // asserting state: a correct implementation can never resolve
+    // `configuring` while the lock is held, so the timer always wins
+    // regardless of machine speed; only a real bypass of the shared lock
+    // would change the outcome.
+    const timeout = Symbol("timeout");
+    const outcome = await Promise.race([configuring.then(() => "resolved"), new Promise((resolve) => setTimeout(() => resolve(timeout), 150))]);
+    expect(outcome).toBe(timeout);
+
+    releaseHold();
+    await holder;
+    expect(await configuring).toBe(0);
+
+    const written = await readFile(join(root, "policy.toml"), "utf8");
+    expect(parseNotifyConfig(written)?.channels).toEqual(["ntfy"]);
+    expect(written).toContain("freeze_reserve_pct = 10"); // the rest of the file survived untouched
   });
 });

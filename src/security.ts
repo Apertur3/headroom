@@ -1,6 +1,7 @@
-import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { assertSafeAncestry } from "./paths.js";
 
 /** Redact values that may identify an account or authorize a provider request. */
@@ -222,12 +223,15 @@ export function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
 /**
  * Writes `data` into `path` atomically and never through a link: a uniquely
  * named temporary file is created (exclusively, so it cannot itself already
- * be a link) in the same directory with the requested mode, then renamed
+ * be a link) in the same directory with the requested `mode`, then renamed
  * into place. `rename()` replaces whatever directory entry currently sits at
  * `path` -- including a symlink -- without ever dereferencing it, but an
  * existing symlink at `path` is refused outright rather than silently
  * replaced, since a link there is itself a sign the destination is not what
- * Headroom last wrote.
+ * Headroom last wrote. The atomic-replace guarantee holds on every platform;
+ * `mode`'s POSIX permission bits are meaningless on Windows (`fs.open`
+ * accepts the argument there but the resulting file has no such bits to
+ * set), which has no directly equivalent per-file ACL this project sets.
  */
 export async function writeFileAtomic(path: string, data: string, mode: number): Promise<void> {
   try {
@@ -243,4 +247,303 @@ export async function writeFileAtomic(path: string, data: string, mode: number):
   finally { await handle.close(); }
   try { await rename(temporaryPath, path); }
   catch (error) { await unlink(temporaryPath).catch(() => {}); throw error; }
+}
+
+/**
+ * Creates a file exclusively (O_EXCL via the "wx" open flag), and on a name
+ * collision retries under `<path>-1`, `<path>-2`, ... until one succeeds,
+ * returning whichever path was actually written. Two callers that both
+ * derive the same nominal name from a millisecond-resolution timestamp (two
+ * `policy set` backups taken in the same millisecond, say) each get their
+ * own file this way instead of the second silently replacing the first
+ * through a plain writeFile.
+ */
+export async function writeExclusiveFile(path: string, data: string, mode: number): Promise<string> {
+  for (let attempt = 0; ; attempt += 1) {
+    const candidate = attempt === 0 ? path : `${path}-${attempt}`;
+    let handle;
+    try { handle = await open(candidate, "wx", mode); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+    // A failure past this point still exclusively created `candidate` --
+    // clean it up before rethrowing, or a half-written file would linger
+    // and permanently claim this name for every future caller.
+    try {
+      await handle.writeFile(data, "utf8");
+    } catch (error) {
+      await handle.close().catch(() => {});
+      await unlink(candidate).catch(() => {});
+      throw error;
+    }
+    try {
+      await handle.close();
+    } catch (error) {
+      await unlink(candidate).catch(() => {});
+      throw error;
+    }
+    return candidate;
+  }
+}
+
+const LOCK_HARD_BOUND_MS = 10 * 60_000;
+const LOCK_RETRY_MS = 50;
+const LOCK_TIMEOUT_MS = 5_000;
+
+export interface ExclusiveLockOptions {
+  /** Reclaim floor for when the owner's liveness cannot be determined (a
+   * dead pid, or a missing/unreadable owner file): a lock directory older
+   * than this many ms is reclaimed regardless. A lock whose owner is
+   * confirmed alive is never reclaimed before this either, no matter how
+   * long `fn` runs -- there is no heartbeat here on purpose (see
+   * withExclusiveLock's own doc comment for why one is unnecessary and, as
+   * a previous version of this file proved, actively unsafe). */
+  hardBoundMs?: number;
+  retryMs?: number;
+  timeoutMs?: number;
+  /** Test seam: the clock `isReclaimable` judges a lock directory's age
+   * against `hardBoundMs` with. Production always reads the real wall
+   * clock (`Date.now`); a test can advance it instantly, with no real
+   * waiting, to prove the hard-bound path without a 10-minute sleep. */
+  now?: () => number;
+  /** Test seam: the liveness probe run on a recorded owner pid. Production
+   * always calls the real `process.kill(pid, 0)`, which throws `ESRCH` for
+   * a pid that no longer exists and `EPERM` for one that exists under
+   * another user (both distinguishable from a live, callable pid, which
+   * throws nothing). */
+  kill?: (pid: number, signal: 0) => void;
+}
+
+interface LockOwner { token: string; pid: number; created_at: string; }
+
+function lockErrorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+/** A random id (never just the pid, which a crashed-and-restarted process
+ * could reuse) identifying the one call that currently holds a given lock
+ * directory. Read back before every reclaim decision and before release, so
+ * one holder's lock is never mistaken for, reclaimed as, or released in
+ * place of, another's. */
+function newLockToken(): string {
+  return `${process.pid}:${randomBytes(8).toString("hex")}`;
+}
+
+function ownerFilePath(lockDir: string): string {
+  return join(lockDir, "owner");
+}
+
+/** Reads back a lock directory's owner metadata. Any failure to find, read,
+ * or parse it (missing, truncated by a crash, corrupted) is reported as
+ * "no owner known" rather than thrown -- `isReclaimable` and
+ * `releaseLockDirectory` both treat that the same as "cannot be reasoned
+ * about", never as an error that should itself block a caller. */
+async function readLockOwner(lockDir: string): Promise<LockOwner | undefined> {
+  let text: string;
+  try { text = await readFile(ownerFilePath(lockDir), "utf8"); }
+  catch { return undefined; }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object" && typeof (parsed as LockOwner).token === "string" && typeof (parsed as LockOwner).pid === "number") return parsed as LockOwner;
+  } catch { /* malformed content: treated the same as missing, below */ }
+  return undefined;
+}
+
+/**
+ * Creates the lock directory (`mkdir`, atomic on every platform -- unlike
+ * exclusive file creation, there is no separate O_EXCL flag to get right,
+ * and Windows supports it identically) and writes its owner file. If the
+ * owner-file write fails, removes the directory this call just created --
+ * a lock left behind by a failed write would otherwise wedge every future
+ * caller for the full hard bound with no live owner to blame it on.
+ */
+async function acquireLockDirectory(lockDir: string, token: string): Promise<void> {
+  await mkdir(lockDir); // EEXIST: already locked. ENOENT: the parent (Headroom's home) is missing -- a caller error, propagated as-is.
+  try {
+    await writeFile(ownerFilePath(lockDir), JSON.stringify({ token, pid: process.pid, created_at: new Date().toISOString() }), { mode: 0o600 });
+  } catch (error) {
+    await rm(lockDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * A lock directory may be reclaimed only when its recorded owner process is
+ * confirmed dead (`kill(pid, 0)` throws `ESRCH`), or the directory itself is
+ * older than `hardBoundMs` -- never merely because `fn()` has been running
+ * a while: a live owner is never reclaimed before the bound, however long
+ * it holds the lock. A missing or unreadable owner file carries no liveness
+ * signal at all, so it counts as fresh (never stolen early) until
+ * `hardBoundMs` on age alone.
+ */
+async function isReclaimable(lockDir: string, hardBoundMs: number, now: () => number, kill: (pid: number, signal: 0) => void): Promise<boolean> {
+  let info;
+  try { info = await stat(lockDir); }
+  catch (error: unknown) { if (lockErrorCode(error) === "ENOENT") return false; throw error; } // nothing there to reclaim; the caller just retries the create
+  const ageMs = now() - info.mtimeMs;
+  if (ageMs > hardBoundMs) return true;
+  const owner = await readLockOwner(lockDir);
+  if (!owner) return false; // no liveness signal available -- fresh until the hard bound
+  try { kill(owner.pid, 0); return false; } // no throw: the pid exists and is ours to signal -- alive
+  catch (killError: unknown) { return lockErrorCode(killError) === "ESRCH"; } // ESRCH: confirmed dead. EPERM (exists, owned by someone else) or anything else: treated as alive, never reclaimed early.
+}
+
+/**
+ * Atomically claims a stale lock directory for deletion: `rename()` on a
+ * given source path succeeds for at most one racing reclaimer -- everyone
+ * else gets `ENOENT` once the first rename has already moved it -- so at
+ * most one waiter ever deletes a given stale lock, never a fresh
+ * replacement a moment later (another waiter's own successful reclaim, or
+ * the true owner's release once it actually finishes).
+ */
+async function reclaimLockDirectory(lockDir: string): Promise<void> {
+  const tombstone = `${lockDir}.tombstone-${randomBytes(4).toString("hex")}`;
+  try { await rename(lockDir, tombstone); }
+  catch (error: unknown) {
+    if (lockErrorCode(error) === "ENOENT") return; // someone else's reclaim (or the real owner's own release) already won this
+    throw error;
+  }
+  await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+}
+
+/**
+ * Releases a lock directory this call still owns: reads the owner file back
+ * and only removes it (and the directory) when the token matches.
+ *
+ * This is a plain read-then-act, not an atomic compare-and-delete -- and
+ * that is deliberate, not an oversight. The invariant that makes it safe:
+ * `isReclaimable` refuses to reclaim a lock with a confirmed-live owner
+ * before `hardBoundMs` (10 minutes) has passed, full stop, regardless of
+ * how long `fn` runs. Every real writer this lock guards (a `policy.toml`
+ * or `accounts.toml` edit) holds it for milliseconds -- read, modify,
+ * write, release. For a token mismatch to occur here, this call's own
+ * process would have to go unresponsive for the entire `hardBoundMs`
+ * window while still holding the lock, which is many orders of magnitude
+ * longer than any edit this guards ever takes. So a successor's token can
+ * never actually be read back here in practice, and the read-then-act
+ * window between `readLockOwner` and the removal below is not a real race
+ * to close -- there is nothing running fast enough on the other side of it
+ * to land in that window before this call's own removal completes. The
+ * check exists as a documented invariant guard against a bug elsewhere
+ * (`isReclaimable` wrongly reclaiming a live owner), not as protection
+ * against a plausible ordinary race. A release failure is reported
+ * (`console.error`), never thrown, so a cleanup problem can never cost
+ * `fn()`'s own already-computed result.
+ */
+async function releaseLockDirectory(lockDir: string, token: string): Promise<void> {
+  const owner = await readLockOwner(lockDir);
+  if (!owner || owner.token !== token) return; // not ours to remove: already gone, or (should never happen within hardBoundMs) reclaimed by someone else
+  try {
+    await unlink(ownerFilePath(lockDir));
+    await rm(lockDir, { recursive: true, force: true });
+  } catch (error: unknown) {
+    console.error(`headroom: failed to release lock ${lockDir}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * Serializes concurrent writers of the same file (every `policy.toml`
+ * writer -- `headroom policy set/clear`, `notify configure`'s
+ * reread-compare-write -- shares one lock via `withPolicyLock` below)
+ * through an exclusive lock directory next to it: `fn`'s own
+ * read-modify-write critical section runs to completion, and the lock is
+ * removed, before the next waiting caller's `mkdir` can ever succeed -- so
+ * a second writer never reads the same pre-edit source a first writer
+ * already replaced, and the first writer's edit is never silently erased
+ * by the second's rename.
+ *
+ * Deliberately no heartbeat: a real policy edit holds the lock for
+ * milliseconds, so a lock is reclaimable only when its owner process is
+ * confirmed dead or the lock has sat past a long hard bound (10 minutes by
+ * default) -- see `isReclaimable`. An earlier version of this lock instead
+ * judged staleness by raw file age and refreshed it with a periodic
+ * heartbeat; because both the heartbeat refresh and release were
+ * read-then-act on a shared pathname with no ownership check tight enough
+ * to close the gap, an in-flight heartbeat could recreate or truncate a
+ * successor's lock, and release could unlink a lock a reclaimer had since
+ * taken over. Reclaiming by confirmed-dead-or-hard-bound instead of by age
+ * removes the need for a heartbeat entirely: nothing needs to be kept
+ * "fresh" for a lock that is only ever reclaimed once its owner is
+ * verifiably gone.
+ *
+ * The same invariant is what makes release's own token check (a plain
+ * read-then-act, not an atomic compare-and-delete) safe: a live owner is
+ * never reclaimed inside `hardBoundMs`, and every real edit this lock
+ * guards finishes in milliseconds -- many orders of magnitude under that
+ * bound -- so a release ever reading back a successor's token is not a
+ * plausible race to close, only a bug-in-`isReclaimable` guard. See
+ * `releaseLockDirectory`'s own doc comment for the full argument.
+ */
+export async function withExclusiveLock<T>(lockDir: string, fn: () => Promise<T>, options: ExclusiveLockOptions = {}): Promise<T> {
+  const hardBoundMs = options.hardBoundMs ?? LOCK_HARD_BOUND_MS;
+  const retryMs = options.retryMs ?? LOCK_RETRY_MS;
+  const timeoutMs = options.timeoutMs ?? LOCK_TIMEOUT_MS;
+  const now = options.now ?? Date.now;
+  const kill = options.kill ?? ((pid: number, signal: 0) => process.kill(pid, signal));
+  const token = newLockToken();
+  // Monotonic: immune to a concurrent wall-clock change (NTP step, DST),
+  // unlike Date.now(). Checked before every acquisition attempt, including
+  // right after a sleep, so a stuck reclaim (a denied delete, a busy
+  // directory) fails closed at timeoutMs instead of busy-looping past it.
+  const deadline = performance.now() + timeoutMs;
+
+  for (;;) {
+    if (performance.now() > deadline) throw new Error(`Timed out waiting for a lock: ${lockDir}`);
+    try {
+      await acquireLockDirectory(lockDir, token);
+      break;
+    } catch (error: unknown) {
+      if (lockErrorCode(error) !== "EEXIST") throw error;
+      if (performance.now() > deadline) throw new Error(`Timed out waiting for a lock: ${lockDir}`);
+      if (await isReclaimable(lockDir, hardBoundMs, now, kill)) { await reclaimLockDirectory(lockDir); continue; }
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error(`Timed out waiting for a lock: ${lockDir}`);
+      // Capped to whatever budget is actually left, never a full retryMs
+      // past the deadline.
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(retryMs, remaining))));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await releaseLockDirectory(lockDir, token);
+  }
+}
+
+/** The lock directory path every `policy.toml` writer shares -- see
+ * `withPolicyLock` below. */
+export function policyLockPath(home: string): string {
+  return join(home, "policy.lock");
+}
+
+/** The one lock every `policy.toml` writer (`headroom policy set/clear` in
+ * cli.ts, `notify configure`'s reread-compare-write in notify-configure.ts,
+ * and config seeding's exclusive create in config.ts) takes before touching
+ * the file, so no two of them can ever interleave a read and a write across
+ * each other, or a write across another's exclusive create. */
+export async function withPolicyLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  return withExclusiveLock(policyLockPath(home), fn);
+}
+
+/** The lock directory path every `accounts.toml` writer shares -- see
+ * `withAccountsLock` below. A separate lock from `policy.lock`: the two
+ * files are edited by disjoint sets of commands and have no read/write
+ * ordering to protect between them, so sharing one lock would only add
+ * needless contention. */
+export function accountsLockPath(home: string): string {
+  return join(home, "accounts.lock");
+}
+
+/** The one lock every `accounts.toml` writer (`headroom accounts
+ * enable/disable` and `headroom accounts discover`'s rediscovery, both in
+ * registry.ts) takes for its complete read-modify-write section, so a
+ * rediscovery can never read a principal's `enabled` flag before a
+ * concurrent `accounts disable` writes it and then overwrite that write
+ * with a fresh scan's default (re-enabling a principal an operator just
+ * parked). Same design as `withPolicyLock` above, just a different lock
+ * directory. */
+export async function withAccountsLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  return withExclusiveLock(accountsLockPath(home), fn);
 }
