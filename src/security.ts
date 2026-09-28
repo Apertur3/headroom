@@ -369,13 +369,27 @@ async function reclaimLockDirectory(lockDir: string): Promise<void> {
 
 /**
  * Releases a lock directory this call still owns: reads the owner file back
- * and only removes it (and the directory) when the token matches. Because a
- * live owner can never be reclaimed before `hardBoundMs`, and every real
- * `policy.toml` edit this guards holds the lock for milliseconds, release
- * ever seeing a successor's token here should not happen in practice -- this
- * check is a documented invariant guard, not a routine path, and a release
- * failure is reported (`console.error`), never thrown, so a cleanup problem
- * can never cost `fn()`'s own already-computed result.
+ * and only removes it (and the directory) when the token matches.
+ *
+ * This is a plain read-then-act, not an atomic compare-and-delete -- and
+ * that is deliberate, not an oversight. The invariant that makes it safe:
+ * `isReclaimable` refuses to reclaim a lock with a confirmed-live owner
+ * before `hardBoundMs` (10 minutes) has passed, full stop, regardless of
+ * how long `fn` runs. Every real writer this lock guards (a `policy.toml`
+ * or `accounts.toml` edit) holds it for milliseconds -- read, modify,
+ * write, release. For a token mismatch to occur here, this call's own
+ * process would have to go unresponsive for the entire `hardBoundMs`
+ * window while still holding the lock, which is many orders of magnitude
+ * longer than any edit this guards ever takes. So a successor's token can
+ * never actually be read back here in practice, and the read-then-act
+ * window between `readLockOwner` and the removal below is not a real race
+ * to close -- there is nothing running fast enough on the other side of it
+ * to land in that window before this call's own removal completes. The
+ * check exists as a documented invariant guard against a bug elsewhere
+ * (`isReclaimable` wrongly reclaiming a live owner), not as protection
+ * against a plausible ordinary race. A release failure is reported
+ * (`console.error`), never thrown, so a cleanup problem can never cost
+ * `fn()`'s own already-computed result.
  */
 async function releaseLockDirectory(lockDir: string, token: string): Promise<void> {
   const owner = await readLockOwner(lockDir);
@@ -412,6 +426,14 @@ async function releaseLockDirectory(lockDir: string, token: string): Promise<voi
  * removes the need for a heartbeat entirely: nothing needs to be kept
  * "fresh" for a lock that is only ever reclaimed once its owner is
  * verifiably gone.
+ *
+ * The same invariant is what makes release's own token check (a plain
+ * read-then-act, not an atomic compare-and-delete) safe: a live owner is
+ * never reclaimed inside `hardBoundMs`, and every real edit this lock
+ * guards finishes in milliseconds -- many orders of magnitude under that
+ * bound -- so a release ever reading back a successor's token is not a
+ * plausible race to close, only a bug-in-`isReclaimable` guard. See
+ * `releaseLockDirectory`'s own doc comment for the full argument.
  */
 export async function withExclusiveLock<T>(lockDir: string, fn: () => Promise<T>, options: ExclusiveLockOptions = {}): Promise<T> {
   const hardBoundMs = options.hardBoundMs ?? LOCK_HARD_BOUND_MS;
@@ -457,12 +479,31 @@ export function policyLockPath(home: string): string {
 }
 
 /** The one lock every `policy.toml` writer (`headroom policy set/clear` in
- * cli.ts, `notify configure`'s reread-compare-write in notify-configure.ts)
- * takes before touching the file, so no two of them can ever interleave a
- * read and a write across each other. Config seeding (`seedExampleConfig`
- * in config.ts) does not need this lock: it creates the file exclusively
- * (`wx`) instead, which sidesteps the read-compare-write race entirely for
- * a plain "create if absent" operation. */
+ * cli.ts, `notify configure`'s reread-compare-write in notify-configure.ts,
+ * and config seeding's exclusive create in config.ts) takes before touching
+ * the file, so no two of them can ever interleave a read and a write across
+ * each other, or a write across another's exclusive create. */
 export async function withPolicyLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
   return withExclusiveLock(policyLockPath(home), fn);
+}
+
+/** The lock directory path every `accounts.toml` writer shares -- see
+ * `withAccountsLock` below. A separate lock from `policy.lock`: the two
+ * files are edited by disjoint sets of commands and have no read/write
+ * ordering to protect between them, so sharing one lock would only add
+ * needless contention. */
+export function accountsLockPath(home: string): string {
+  return join(home, "accounts.lock");
+}
+
+/** The one lock every `accounts.toml` writer (`headroom accounts
+ * enable/disable` and `headroom accounts discover`'s rediscovery, both in
+ * registry.ts) takes for its complete read-modify-write section, so a
+ * rediscovery can never read a principal's `enabled` flag before a
+ * concurrent `accounts disable` writes it and then overwrite that write
+ * with a fresh scan's default (re-enabling a principal an operator just
+ * parked). Same design as `withPolicyLock` above, just a different lock
+ * directory. */
+export async function withAccountsLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  return withExclusiveLock(accountsLockPath(home), fn);
 }

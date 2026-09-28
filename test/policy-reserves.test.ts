@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { main } from "../src/cli.js";
 import { fillFor, gateFor, planFor } from "../src/orchestrator-reads.js";
 import { defaultPolicy, parsePolicy, reserveFor } from "../src/policy.js";
 import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry } from "../src/policy-configure.js";
+import { policyLockPath } from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 
@@ -431,8 +432,11 @@ describe("headroom policy CLI: concurrent-safe edits", () => {
     const parsed = parsePolicy(written);
     expect(parsed.reserve["codex-main:main"]).toBe(30);
     expect(parsed.reserve["claude-main:all"]).toBe(20);
-    // No lock file left behind once both writers finish.
-    await expect(readFile(join(home, "policy.toml.lock"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    // No lock directory left behind once both writers finish -- checked at
+    // the real production path (policyLockPath), not a filename this test
+    // guessed at: a stale assertion against the wrong path would pass
+    // trivially even if the real lock were left behind.
+    await expect(stat(policyLockPath(home))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("gives two backups that land in the same millisecond their own distinct files", async () => {

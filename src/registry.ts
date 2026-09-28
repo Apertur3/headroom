@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
 import { assertSafeAncestry, expandHome, headroomHome, vendorHome } from "./paths.js";
-import { readBoundedRegularFile, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, withAccountsLock, writeFileAtomic } from "./security.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { kimiCliCredentialPath, kimiTokenPath } from "./adapters/kimi.js";
 
@@ -78,34 +78,42 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
   // writable-without-sticky-bit) ancestor before ever touching the file that
   // names every principal's credential location.
   await assertSafeAncestry(home);
-  // Discovery updates locations and adapters, but an existing account is the
-  // operator's configuration. In particular, rediscovery must not wake a
-  // deliberately parked principal.
-  const existing = await readAccountsOrEmpty();
-  // Only the operator's `enabled` flag survives a rediscovery for a name it
-  // already knew -- everything else (location, adapter, etc.) comes from the
-  // fresh scan, so a moved config dir or a changed adapter actually takes
-  // effect instead of being frozen at whatever discovery first saw. A
-  // provider account discovery no longer finds (credential removed, config
-  // dir gone) is dropped, matching docs/vendors.md's "rerunning discovery
-  // replaces the account file" -- it must stop being polled forever. Local
-  // accounts (`kind: "local"`) are never produced by discovery at all and
-  // are preserved untouched.
-  const priorEnabled = new Map(existing.map((account) => [account.name, account.enabled]));
-  const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
-  const localAccounts = existing.filter(isLocalAccount);
-  const merged = [...discovered, ...localAccounts];
-  // Atomic (temp file + rename) on every platform, and 0600 on POSIX (mode
-  // bits are meaningless on Windows, which has no equivalent here -- see
-  // writeFileAtomic's own doc comment): a plain writeFile's `mode` option
-  // only applies the first time the path is created -- an existing
-  // accounts.toml left permissive by an older Headroom, or by an operator's
-  // own editor, would otherwise stay permissive forever, and a write
-  // interrupted mid-truncate could leave a corrupt file. writeFileAtomic
-  // instead builds the new file with the right mode from the start and
-  // rename()s it into place, refusing outright if accounts.toml is itself a
-  // symlink.
-  await writeFileAtomic(accountsPath(), accountsToml(merged), 0o600);
+  // The complete read-modify-write runs under the shared accounts.toml lock
+  // (see setAccountEnabled's own comment for the race this closes): without
+  // it, a rediscovery here could read a principal's `enabled` flag before a
+  // concurrent `accounts disable` writes it, then overwrite that write with
+  // this scan's own default -- silently re-enabling a principal an operator
+  // just parked.
+  await withAccountsLock(home, async () => {
+    // Discovery updates locations and adapters, but an existing account is
+    // the operator's configuration. In particular, rediscovery must not
+    // wake a deliberately parked principal.
+    const existing = await readAccountsOrEmpty();
+    // Only the operator's `enabled` flag survives a rediscovery for a name it
+    // already knew -- everything else (location, adapter, etc.) comes from the
+    // fresh scan, so a moved config dir or a changed adapter actually takes
+    // effect instead of being frozen at whatever discovery first saw. A
+    // provider account discovery no longer finds (credential removed, config
+    // dir gone) is dropped, matching docs/vendors.md's "rerunning discovery
+    // replaces the account file" -- it must stop being polled forever. Local
+    // accounts (`kind: "local"`) are never produced by discovery at all and
+    // are preserved untouched.
+    const priorEnabled = new Map(existing.map((account) => [account.name, account.enabled]));
+    const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
+    const localAccounts = existing.filter(isLocalAccount);
+    const merged = [...discovered, ...localAccounts];
+    // Atomic (temp file + rename) on every platform, and 0600 on POSIX (mode
+    // bits are meaningless on Windows, which has no equivalent here -- see
+    // writeFileAtomic's own doc comment): a plain writeFile's `mode` option
+    // only applies the first time the path is created -- an existing
+    // accounts.toml left permissive by an older Headroom, or by an operator's
+    // own editor, would otherwise stay permissive forever, and a write
+    // interrupted mid-truncate could leave a corrupt file. writeFileAtomic
+    // instead builds the new file with the right mode from the start and
+    // rename()s it into place, refusing outright if accounts.toml is itself a
+    // symlink.
+    await writeFileAtomic(accountsPath(), accountsToml(merged), 0o600);
+  });
 }
 
 export async function readAccounts(): Promise<Account[]> {
@@ -162,41 +170,53 @@ function validate(value: Record<string, string>): Account {
 
 /** Changes only one entry's enabled line. This avoids a serialize/parse round
  * trip that would erase an operator's comments, layout, and unknown future
- * TOML keys just to park one principal. */
+ * TOML keys just to park one principal.
+ *
+ * The complete read-modify-write runs under the shared accounts.toml lock
+ * (withAccountsLock, security.js -- same design as policy.toml's own lock,
+ * a separate lock directory since the two files have no ordering to protect
+ * between them): setAccountEnabled and a concurrent rediscovery
+ * (writeDiscoveredAccounts) are two independent read-modify-write paths on
+ * the same file, and without a shared lock, a rediscovery's own read could
+ * land before this call's write and its later write then overwrite it --
+ * silently re-enabling a principal an operator just disabled. */
 export async function setAccountEnabled(name: string, enabled: boolean): Promise<void> {
   const path = accountsPath();
-  await assertSafeAncestry(headroomHome());
-  // Same no-follow, bounded read as readAccounts() above -- setAccountEnabled
-  // has its own direct read (it edits raw lines rather than the parsed
-  // form), so it needs the same guard before it, not just writeFileAtomic's
-  // symlink refusal on the write that follows.
-  const text = await readBoundedRegularFile(path);
-  const lines = text.split(/(?<=\n)/);
-  const bare = (line: string): string => line.replace(/\r?\n$/, "");
-  const starts = lines.map((line, index) => /^\s*\[\[accounts\]\]\s*(?:#.*)?$/.test(bare(line)) ? index : -1).filter((index) => index >= 0);
-  let start = -1, end = lines.length, nameLine = -1;
-  for (let index = 0; index < starts.length; index += 1) {
-    const candidateStart = starts[index];
-    const candidateEnd = starts[index + 1] ?? lines.length;
-    const found = lines.slice(candidateStart + 1, candidateEnd).findIndex((line) => {
-      const match = /^\s*name\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(bare(line));
-      return match !== null && JSON.parse(match[1]) === name;
-    });
-    if (found >= 0) { start = candidateStart; end = candidateEnd; nameLine = candidateStart + 1 + found; break; }
-  }
-  if (start < 0) throw new Error(`Unknown account: ${name}`);
-  const enabledLine = lines.slice(start + 1, end).findIndex((line) => /^\s*enabled\s*=\s*(?:true|false)\s*(?:#.*)?$/.test(bare(line)));
-  if (enabledLine >= 0) {
-    const index = start + 1 + enabledLine;
-    lines[index] = lines[index].replace(/^(\s*)enabled\s*=\s*(?:true|false)(\s*(?:#.*)?)(\r?\n?)$/, `$1enabled = ${enabled}$2$3`);
-  } else {
-    const newline = lines[nameLine].endsWith("\r\n") ? "\r\n" : "\n";
-    if (!lines[nameLine].endsWith("\n")) lines[nameLine] += newline;
-    lines.splice(nameLine + 1, 0, `enabled = ${enabled}${newline}`);
-  }
-  // Atomic on every platform, 0600 on POSIX -- see writeDiscoveredAccounts'
-  // own comment: a plain writeFile here would leave an existing permissive
-  // mode untouched, could truncate the file on an interrupted write, and
-  // would follow a symlink at this path instead of refusing it.
-  await writeFileAtomic(path, lines.join(""), 0o600);
+  const home = headroomHome();
+  await assertSafeAncestry(home);
+  await withAccountsLock(home, async () => {
+    // Same no-follow, bounded read as readAccounts() above -- setAccountEnabled
+    // has its own direct read (it edits raw lines rather than the parsed
+    // form), so it needs the same guard before it, not just writeFileAtomic's
+    // symlink refusal on the write that follows.
+    const text = await readBoundedRegularFile(path);
+    const lines = text.split(/(?<=\n)/);
+    const bare = (line: string): string => line.replace(/\r?\n$/, "");
+    const starts = lines.map((line, index) => /^\s*\[\[accounts\]\]\s*(?:#.*)?$/.test(bare(line)) ? index : -1).filter((index) => index >= 0);
+    let start = -1, end = lines.length, nameLine = -1;
+    for (let index = 0; index < starts.length; index += 1) {
+      const candidateStart = starts[index];
+      const candidateEnd = starts[index + 1] ?? lines.length;
+      const found = lines.slice(candidateStart + 1, candidateEnd).findIndex((line) => {
+        const match = /^\s*name\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(bare(line));
+        return match !== null && JSON.parse(match[1]) === name;
+      });
+      if (found >= 0) { start = candidateStart; end = candidateEnd; nameLine = candidateStart + 1 + found; break; }
+    }
+    if (start < 0) throw new Error(`Unknown account: ${name}`);
+    const enabledLine = lines.slice(start + 1, end).findIndex((line) => /^\s*enabled\s*=\s*(?:true|false)\s*(?:#.*)?$/.test(bare(line)));
+    if (enabledLine >= 0) {
+      const index = start + 1 + enabledLine;
+      lines[index] = lines[index].replace(/^(\s*)enabled\s*=\s*(?:true|false)(\s*(?:#.*)?)(\r?\n?)$/, `$1enabled = ${enabled}$2$3`);
+    } else {
+      const newline = lines[nameLine].endsWith("\r\n") ? "\r\n" : "\n";
+      if (!lines[nameLine].endsWith("\n")) lines[nameLine] += newline;
+      lines.splice(nameLine + 1, 0, `enabled = ${enabled}${newline}`);
+    }
+    // Atomic on every platform, 0600 on POSIX -- see writeDiscoveredAccounts'
+    // own comment: a plain writeFile here would leave an existing permissive
+    // mode untouched, could truncate the file on an interrupted write, and
+    // would follow a symlink at this path instead of refusing it.
+    await writeFileAtomic(path, lines.join(""), 0o600);
+  });
 }

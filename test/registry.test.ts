@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { accountsPath, accountsToml, discoverAccounts, readAccounts, setAccountEnabled, writeDiscoveredAccounts } from "../src/registry.js";
+import { accountsLockPath, withExclusiveLock } from "../src/security.js";
 
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof import("node:fs/promises")>();
@@ -195,6 +196,91 @@ describe("accounts.toml writes: atomic, 0600, symlink-safe", () => {
       expect(await readFile(accountsPath(), "utf8")).toBe(source);
       const entries = await readdir(root);
       expect(entries).toEqual(["accounts.toml"]); // the temp file was cleaned up, not left behind
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+});
+
+describe("accounts.toml writes: setAccountEnabled and rediscovery share one lock", () => {
+  let root = "";
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
+
+  const source = ['[[accounts]]', 'name = "claude-main"', 'vendor = "claude"', 'location = "~/.claude"', 'adapter = "native-ts"', '', '[[accounts]]', 'name = "claude-2"', 'vendor = "claude"', 'location = "~/.claude2"', 'adapter = "native-ts"', ''].join("\n");
+
+  /** Proves `signal` has NOT resolved within `marginMs` -- safe by
+   * construction: a correct implementation can never resolve `signal`
+   * early, so the timer always wins regardless of machine speed, and only
+   * a real bypass of the lock changes the outcome. */
+  async function expectStillPending(signal: Promise<unknown>, marginMs = 150): Promise<void> {
+    const timeout = Symbol("timeout");
+    const outcome = await Promise.race([signal, new Promise((resolve) => setTimeout(() => resolve(timeout), marginMs))]);
+    expect(outcome).toBe(timeout);
+  }
+
+  it("setAccountEnabled cannot complete while the shared accounts.lock is held elsewhere", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-accountslock-setenabled-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      let holding!: () => void;
+      let releaseHold!: () => void;
+      const holdingPromise = new Promise<void>((resolve) => { holding = resolve; });
+      const releasePromise = new Promise<void>((resolve) => { releaseHold = resolve; });
+      const holder = withExclusiveLock(accountsLockPath(root), async () => { holding(); await releasePromise; });
+      await holdingPromise;
+
+      const disabling = setAccountEnabled("claude-2", false);
+      await expectStillPending(disabling);
+
+      releaseHold();
+      await holder;
+      await disabling;
+
+      expect(await readAccounts()).toContainEqual(expect.objectContaining({ name: "claude-2", enabled: false }));
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it("a rediscovery cannot complete while the shared accounts.lock is held elsewhere", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-accountslock-rediscover-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      let holding!: () => void;
+      let releaseHold!: () => void;
+      const holdingPromise = new Promise<void>((resolve) => { holding = resolve; });
+      const releasePromise = new Promise<void>((resolve) => { releaseHold = resolve; });
+      const holder = withExclusiveLock(accountsLockPath(root), async () => { holding(); await releasePromise; });
+      await holdingPromise;
+
+      const rediscovering = writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "~/.claude", adapter: "native-ts" }, { name: "claude-2", vendor: "claude", location: "~/.claude2", adapter: "native-ts" }]);
+      await expectStillPending(rediscovering);
+
+      releaseHold();
+      await holder;
+      await rediscovering;
+
+      expect(await readAccounts()).toEqual(expect.arrayContaining([expect.objectContaining({ name: "claude-main" }), expect.objectContaining({ name: "claude-2" })]));
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it("a disable and a concurrent rediscovery never race: the disable always survives regardless of which acquires the shared lock first", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-accountslock-race-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      // Genuinely concurrent, real calls -- whichever wins the shared lock
+      // first runs its own complete read-modify-write to completion before
+      // the other's read can even start, so neither ever computes its
+      // update from a snapshot the other is about to make stale. Before
+      // the fix, these were two independent read-modify-write paths: a
+      // rediscovery that read before this disable's write landed, then
+      // wrote after, would silently re-enable claude-2.
+      await Promise.all([
+        setAccountEnabled("claude-2", false),
+        writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "~/.claude", adapter: "native-ts" }, { name: "claude-2", vendor: "claude", location: "~/.claude2", adapter: "native-ts" }]),
+      ]);
+      expect(await readAccounts()).toContainEqual(expect.objectContaining({ name: "claude-2", enabled: false }));
+      // No lock directory left behind once both writers finish.
+      await expect(stat(accountsLockPath(root))).rejects.toMatchObject({ code: "ENOENT" });
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 });

@@ -1,9 +1,14 @@
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseRouting, seedExampleConfig } from "../src/config.js";
 import { defaultAntigravityKeepalive, parsePolicy } from "../src/policy.js";
+
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
 
 describe("policy defaults", () => {
   it("keeps Antigravity alive when the key is absent on macOS and Linux", () => {
@@ -29,7 +34,12 @@ describe("policy defaults", () => {
 
 describe("seedExampleConfig", () => {
   const temporary: string[] = [];
-  afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+  afterEach(async () => {
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const mocked = await import("node:fs/promises");
+    vi.mocked(mocked.open).mockReset().mockImplementation(actual.open);
+    await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  });
 
   it("copies policy.toml and routing.toml from examples/ into a fresh home, naming the seeded action classes", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-seed-"));
@@ -98,5 +108,42 @@ describe("seedExampleConfig", () => {
     expect(policyText).toContain("freeze_reserve_pct"); // fully intact example content, never interleaved or truncated
     const routingSeeders = [messagesA, messagesB].filter((messages) => messages.some((line) => line.includes("routing.toml")));
     expect(routingSeeders).toHaveLength(1);
+  });
+
+  it("never deletes a concurrent policy set's already-landed write when the seed's own write fails after its exclusive create", async () => {
+    const home = await mkdtemp(join(tmpdir(), "headroom-seed-race-"));
+    temporary.push(home);
+    const policyTarget = join(home, "policy.toml");
+    const concurrentContent = '[reserve]\n"codex-main:main" = 30\n';
+
+    const mocked = await import("node:fs/promises");
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    // Simulates the exact race this guards against: the seed's
+    // `open(path, "wx")` has already succeeded (this call's `open` mock
+    // only fires for that one exclusive create), and in the narrow window
+    // before its own writeFile reports failure, a concurrent `headroom
+    // policy set`'s writeFileAtomic finishes and rename()s its own
+    // completed file over this exact path -- rename() does not care what
+    // was there before. The seed's write is made to fail right after.
+    vi.mocked(mocked.open).mockImplementationOnce(async (...args: Parameters<typeof actual.open>) => {
+      const handle = await actual.open(...args);
+      return Object.assign(Object.create(Object.getPrototypeOf(handle) as object), handle, {
+        writeFile: async () => {
+          const concurrentTemp = `${policyTarget}.concurrent-tmp`;
+          await actual.writeFile(concurrentTemp, concurrentContent, { mode: 0o600 });
+          await actual.rename(concurrentTemp, policyTarget);
+          throw new Error("simulated seed write failure");
+        },
+      }) as typeof handle;
+    });
+
+    await expect(seedExampleConfig(home)).rejects.toThrow("simulated seed write failure");
+
+    // The concurrent writer's file must survive byte-for-byte: cleanup only
+    // ever removes a file it can prove (same inode as the one it opened)
+    // is still its own empty, failed attempt -- never whatever now sits at
+    // the path. The pre-fix version compared nothing and unconditionally
+    // unlinked `path`, which would have destroyed this reserve here.
+    expect(await readFile(policyTarget, "utf8")).toBe(concurrentContent);
   });
 });

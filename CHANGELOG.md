@@ -25,10 +25,17 @@ All notable changes to this project are documented here. The format follows
   past a 10-minute hard bound -- never merely because an edit (always a few milliseconds in practice)
   is still running -- and is only ever released by the call that still owns it. Seeding a fresh
   `policy.toml`/`routing.toml` from `examples/` on first `accounts discover` is now a single
-  exclusive-create instead of a separate check-then-write, so it can no longer overwrite a reserve a
-  concurrent `policy set` just added. Timestamped `.bak-` backups taken in the same millisecond no
-  longer collide either; a colliding name gets a counter suffix instead of overwriting the earlier
-  backup.
+  exclusive-create under the same shared lock instead of a separate check-then-write, so it can no
+  longer overwrite a reserve a concurrent `policy set` just added; if the seed's own write still fails
+  after that exclusive create, cleanup now proves (by comparing the open file handle's own inode
+  against whatever currently sits at the path) that the file it is about to delete is still the one it
+  created, rather than unconditionally deleting whatever is there. Timestamped `.bak-` backups taken
+  in the same millisecond no longer collide either; a colliding name gets a counter suffix instead of
+  overwriting the earlier backup.
+- `headroom accounts enable`/`disable` and rediscovery are two independent read-modify-write paths on
+  `accounts.toml`; without serialization, a rediscovery reading before a concurrent `disable`'s write
+  landed, then writing after, could silently re-enable a principal an operator just parked. Both now
+  share one exclusive lock (the same design as `policy.toml`'s, a separate lock directory).
 
 ## [0.2.0] - 2026-09-28
 
