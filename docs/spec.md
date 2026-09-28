@@ -43,6 +43,18 @@ CLI and MCP clients re-enrich an unmarked status array from an older daemon usin
 policy and local store before they show it or make a threshold decision, so compatibility with a
 running daemon cannot serve an expired stored-fresh row as capacity.
 
+## Host guard
+
+Quota is not the only reason a local dispatch can be a bad idea: `headroom run` also refuses to
+launch its child process onto a host that cannot take it (see docs/concepts.md's "Host guard"
+section for the full measurement/threshold reference and the 2026-09-27 PTY-leak incident that
+motivated it). `policy.toml`'s `[host_guard]`: `mode = "refuse"` (default) `| "warn" | "off"`,
+`warn_load_ratio` (2), `refuse_load_ratio` (3), `warn_pty_percent` (50), `refuse_pty_percent` (75).
+`headroom run --json` exits `2` when host pressure refuses the launch (`host.state: "refuse"` and
+`mode: "refuse"`), before the quota gate or any lease -- see docs/json-contract.md's `run` entry.
+`can`/`gate` (CLI and MCP) carry the same reading additively and never refuse over it; only `run`
+does.
+
 ## Architecture
 
 ```

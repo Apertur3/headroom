@@ -28,6 +28,15 @@ import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
 import type { HeadroomEvent, KnownModel, Observation } from "../src/types.js";
 
+// Host pressure is a live reading of whatever machine runs the suite, and
+// its measurements are null where a probe does not exist (Windows has no
+// load average or PTY table). Pin one fully populated reading so the shape
+// snapshot compares the contract, not the runner.
+vi.mock("../src/host-health.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/host-health.js")>()),
+  checkHostHealth: async () => ({ state: "ok", reasons: [], load_ratio: 0.5, pty_used: 10, pty_max: 511, orphans: 0 }),
+}));
+
 const FIXTURE_DIR = new URL("./fixtures/json-contract/", import.meta.url);
 
 // ---- shape extraction --------------------------------------------------
