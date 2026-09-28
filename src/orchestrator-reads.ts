@@ -204,9 +204,8 @@ export interface PlanAdvice {
 
 export type PlanSuccess = { meter: string } & PlanResult & {
   banked: BankedPlan; target?: PlanTarget; advice: PlanAdvice;
-  /** Every reserve capping this meter, tightest first, as one line (spec
-   * .claude/lanes/specs/reserves.md item 3) -- empty string when none
-   * applies. See policy.ts's formatReserveCeiling. */
+  /** Every reserve capping this meter, tightest first, as one line --
+   * empty string when none applies. See policy.ts's formatReserveCeiling. */
   reserve_ceiling: string;
 };
 type PlanCore = PlanSuccess | { meter: string; error: string };

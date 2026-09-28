@@ -6,8 +6,7 @@ import type { Lease, Observation, PaceState } from "./types.js";
  * `[freeze_reserve]`, under the synthetic key `"freeze_reserve_pct"`) entry:
  * a reserve percent plus the metadata that answers "who set this, why, and
  * until when" -- the exact context missing from the plain numeric form that
- * made two silently contradicting reserves take an hour to notice (see
- * .claude/lanes/specs/reserves.md). `until` is an expiry instant: once
+ * made two silently contradicting reserves take an hour to notice. `until` is an expiry instant: once
  * passed, the entry's contribution to `Policy.reserve` resolves to 0 (see
  * parsePolicy) though this record is kept so `policy show`/a refusal can
  * still say it existed and lapsed. `unless: "banked_reset_available"` -- per
