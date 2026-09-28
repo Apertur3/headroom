@@ -1,11 +1,12 @@
-import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { budgetPlanLeases, parseBudgetPlan } from "../src/budget-plan.js";
-import { assertSessionId, readInbox, sendInboxMessage, sessionDirectory, MAX_INBOX_MESSAGE_BYTES } from "../src/inbox.js";
+import { assertSessionId, readInbox, sendInboxMessage, sendInboxMessageAt, sessionDirectory, MAX_INBOX_MESSAGE_BYTES } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
+import * as securityModule from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 
 const temporary: string[] = [];
@@ -112,6 +113,271 @@ describe("inbox send and read", () => {
     await expect(sendInboxMessage({ to: "session-b", kind: "note", text: "", home: path })).rejects.toThrow(/empty/);
     await expect(sendInboxMessage({ to: "session-b", kind: "shout" as "note", text: "x", home: path })).rejects.toThrow(/kind must be one of/);
     await expect(sendInboxMessage({ to: "session-b", kind: "note", text: "x".repeat(MAX_INBOX_MESSAGE_BYTES + 1), home: path })).rejects.toThrow(/over the 65536 byte cap/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendInboxMessageAt: the idempotent-by-identity counterpart src/heartbeat.ts's
+// fireDueTimers uses. Its predecessor derived the filename from a hash of the
+// timer's own name/at (~1000 distinct values per owner per second) and shared
+// that filename space with ordinary hand-offs sent via `headroom inbox send`
+// -- two unrelated messages could land on the exact same path, and the old
+// "a file already exists here" check alone would then treat the SECOND
+// message's delivery as already done without ever writing it. `delivery_id`
+// (a random, per-registration identity, both in the filename and in the
+// envelope's own `delivery_id` field) removes the collision risk and lets
+// this verify identity by content, not merely by path, before ever treating
+// an existing file as a match.
+// ---------------------------------------------------------------------------
+
+describe("sendInboxMessageAt", () => {
+  it("writes the envelope with a delivery_id field, named <epoch-ms>-<delivery_id>-<kind>.json", async () => {
+    const path = await home();
+    const sent = await sendInboxMessageAt({ to: "session-c", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 123456789012345, home: path, now: new Date(1_757_000_000_000) });
+    expect(sent.delivered).toBe(true);
+    // The real send time stays the documented <epoch-ms> field (see the
+    // "order and a --since cursor" test below for why this matters); the
+    // delivery id is a separate, appended component.
+    expect(sent.file).toBe("1757000000000-123456789012345-handoff.json");
+    const envelope = JSON.parse(await readFile(sent.path, "utf8")) as Record<string, unknown>;
+    expect(envelope).toMatchObject({ version: 1, kind: "handoff", to: "session-c", from: "headroom-timer", at: "2025-09-04T15:33:20.000Z", delivery_id: 123456789012345, body: { timer: "wake", action: "check" } });
+  });
+
+  it("is idempotent: a retry with the same delivery_id but a different send time skips the write and reports delivered: false", async () => {
+    const path = await home();
+    const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 42, home: path };
+    const first = await sendInboxMessageAt({ ...options, now: new Date(1000) });
+    expect(first.delivered).toBe(true);
+    // A retry's own send time necessarily differs from the original
+    // attempt's -- this is exactly what a directory scan by identity (not
+    // a single expected path) has to tolerate.
+    const second = await sendInboxMessageAt({ ...options, now: new Date(99_000) });
+    expect(second.delivered).toBe(false);
+    expect(second.path).toBe(first.path);
+    // Exactly one file, one message -- never a duplicate.
+    const messages = await readdir(join(path, "inbox", "session-c"));
+    expect(messages).toHaveLength(1);
+  });
+
+  it("still recognizes an already-read message (renamed .read) as delivered, not as free to overwrite", async () => {
+    const path = await home();
+    const options = { to: "session-c", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 7, home: path, now: new Date(1000) };
+    await sendInboxMessageAt(options);
+    await readInbox({ session: "session-c", home: path }); // marks it read (renamed with .read)
+    const retried = await sendInboxMessageAt({ ...options, now: new Date(50_000) });
+    expect(retried.delivered).toBe(false);
+    const messages = await readdir(join(path, "inbox", "session-c"));
+    expect(messages).toEqual(["1000-7-handoff.json.read"]);
+  });
+
+  it("recognizes a matching delivery that a reader renames to .read between the directory scan and read", async () => {
+    const path = await home();
+    const options = { to: "session-race", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 8, home: path };
+    const original = await sendInboxMessageAt({ ...options, now: new Date(1_000) });
+    const readSpy = vi.spyOn(securityModule, "readBoundedRegularFile").mockImplementationOnce(async (readPath) => {
+      await rename(readPath, `${readPath}.read`);
+      const missing = new Error("renamed by reader") as NodeJS.ErrnoException;
+      missing.code = "ENOENT";
+      throw missing;
+    });
+    try {
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry).toMatchObject({ path: `${original.path}.read`, file: `${original.file}.read`, delivered: false });
+      expect(await readdir(join(path, "inbox", "session-race"))).toEqual([`${original.file}.read`]);
+    } finally { readSpy.mockRestore(); }
+  });
+
+  // The structural fix this filename shape closes: an ordinary hand-off's
+  // name (`<epoch-ms>-<kind>.json`) and a timer delivery's
+  // (`<epoch-ms>-<delivery_id>-<kind>.json`) can never coincide -- one has a
+  // middle numeric component, the other never does -- so the two message
+  // classes no longer share a filename space at all, in either direction.
+  it("an ordinary hand-off and a timer delivery never interfere, even sent in the same millisecond to the same recipient", async () => {
+    const path = await home();
+    await sendInboxMessage({ to: "session-d", kind: "handoff", text: '{"note":"from a human"}', from: "a-human", home: path, now: new Date(9_000) });
+    await sendInboxMessageAt({ to: "session-d", kind: "handoff", text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 999, home: path, now: new Date(9_000) });
+    const result = await readInbox({ session: "session-d", home: path });
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.map((item) => item.from).sort()).toEqual(["a-human", "headroom-timer"]);
+  });
+
+  // Why this filename shape: the delivery id used to sit in
+  // the documented <epoch-ms> field itself, so at_epoch, oldest-first
+  // ordering and --since all read a random value instead of a real
+  // timestamp for a timer delivery. Mixing ordinary and timer messages
+  // proves both now sort and filter correctly by real send time.
+  it("orders ordinary and timer messages by real send time, and --since filters both correctly, despite the delivery id embedded in the filename", async () => {
+    const path = await home();
+    // A delivery_id far larger than any of these timestamps -- if it ever
+    // leaked into the ordering/filter key, "second" would sort first and
+    // --since would wrongly include or exclude entries.
+    await sendInboxMessageAt({ to: "session-e", kind: "handoff", text: '{"timer":"a","at":"2026-01-01T00:00:00.000Z","action":"first"}', delivery_id: 999_999_999_999, home: path, now: new Date(1_000) });
+    await sendInboxMessage({ to: "session-e", kind: "note", text: "second", home: path, now: new Date(2_000) });
+    await sendInboxMessageAt({ to: "session-e", kind: "handoff", text: '{"timer":"b","at":"2026-01-01T00:00:00.000Z","action":"third"}', delivery_id: 1, home: path, now: new Date(3_000) });
+
+    const all = await readInbox({ session: "session-e", home: path, markRead: false });
+    expect(all.messages.map((item) => item.at_epoch)).toEqual([1_000, 2_000, 3_000]);
+    expect(all.messages.map((item) => (item.kind === "note" ? item.body : (item.body as { action: string }).action))).toEqual(["first", "second", "third"]);
+
+    const since = await readInbox({ session: "session-e", home: path, since: 2_000, markRead: false });
+    expect(since.messages.map((item) => item.at_epoch)).toEqual([2_000, 3_000]);
+  });
+
+  // the check-then-write race a timed-out (but not actually
+  // dead) delivery leaves open -- a retry starting while the original send
+  // is merely slow, not cancelled, must join it rather than racing its own
+  // independent check against it, and must recognize the original's file
+  // (however it eventually lands, read or unread) as this same delivery.
+  it("a retry for a delivery id already in flight joins the original attempt instead of writing a second file", async () => {
+    const path = await home();
+    let releaseOriginal: () => void;
+    const gate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode) => {
+      await gate; // held open until this test explicitly releases it
+      return realWriteFileAtomic(writePath, data, mode);
+    });
+    try {
+      const options = { to: "session-f", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 55, home: path, now: new Date(1_000) };
+      // Started but not awaited: the original attempt's own write is held
+      // open by the gate -- exactly like fireDueTimers's delivery timeout
+      // abandoning a wait on a send that is slow, not dead.
+      const original = sendInboxMessageAt(options);
+      // The retry starts while the original is still in flight (a stale
+      // claim reclaimed and retried before the original's own write
+      // landed). It must join the SAME promise, not perform its own
+      // directory scan (which would see nothing yet and start a second,
+      // independent write under a different <epoch-ms>).
+      const retry = sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      releaseOriginal!();
+      const [originalResult, retryResult] = await Promise.all([original, retry]);
+      expect(originalResult.delivered).toBe(true);
+      expect(retryResult).toEqual(originalResult); // the exact same outcome, not a second write
+      const messages = await readdir(join(path, "inbox", "session-f"));
+      expect(messages).toHaveLength(1);
+    } finally { writeSpy.mockRestore(); }
+  });
+
+  it("a retry that starts only after the original attempt's write has already landed and been read still recognizes it as delivered", async () => {
+    const path = await home();
+    const options = { to: "session-g", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 66, home: path };
+    const original = await sendInboxMessageAt({ ...options, now: new Date(1_000) });
+    expect(original.delivered).toBe(true);
+    // The recipient reads (and so renames to .read) the message before any
+    // retry ever starts -- the sequence a fully-completed-but-unconfirmed
+    // original delivery, followed by a later stale-claim retry, produces.
+    await readInbox({ session: "session-g", home: path });
+    const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+    expect(retry.delivered).toBe(false);
+    const messages = await readdir(join(path, "inbox", "session-g"));
+    expect(messages).toEqual(["1000-66-handoff.json.read"]); // never a second, fresh, unread copy
+  });
+
+  it("releases a never-settling in-flight delivery after its delivery timeout so a stale retry can write it", async () => {
+    const path = await home();
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    let writes = 0;
+    let firstWriteStarted: () => void;
+    const firstWrite = new Promise<void>((resolve) => { firstWriteStarted = resolve; });
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode) => {
+      writes += 1;
+      if (writes === 1) {
+        firstWriteStarted!();
+        await new Promise<void>(() => { /* genuinely never settles */ });
+        return;
+      }
+      return realWriteFileAtomic(writePath, data, mode);
+    });
+    try {
+      const options = { to: "session-timeout", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 67, home: path, inFlightTimeoutMs: 20 };
+      void sendInboxMessageAt({ ...options, now: new Date(1_000) });
+      await firstWrite;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry.delivered).toBe(true);
+      expect(writes).toBe(2);
+      expect(await readdir(join(path, "inbox", "session-timeout"))).toEqual(["2000-67-handoff.json"]);
+    } finally { writeSpy.mockRestore(); }
+  });
+
+  it("does not let a timed-out original write after its retry has already delivered", async () => {
+    const path = await home();
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    let writes = 0;
+    let releaseOriginal: () => void;
+    const originalGate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    let originalWriteStarted: () => void;
+    const originalWriteStartedPromise = new Promise<void>((resolve) => { originalWriteStarted = resolve; });
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode, beforeCommit) => {
+      writes += 1;
+      if (writes === 1) {
+        originalWriteStarted!();
+        await originalGate;
+      }
+      return realWriteFileAtomic(writePath, data, mode, beforeCommit);
+    });
+    try {
+      const options = { to: "session-superseded", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 68, home: path, inFlightTimeoutMs: 20 };
+      const original = sendInboxMessageAt({ ...options, now: new Date(1_000) });
+      await originalWriteStartedPromise;
+      // The original has started the atomic writer but has not committed.
+      // Once its in-flight entry expires, a retry writes the durable message.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry.delivered).toBe(true);
+
+      releaseOriginal!();
+      await expect(original).resolves.toMatchObject({ delivered: false, path: retry.path, file: retry.file });
+      expect(await readdir(join(path, "inbox", "session-superseded"))).toEqual(["2000-68-handoff.json"]);
+    } finally {
+      releaseOriginal!();
+      writeSpy.mockRestore();
+    }
+  });
+
+  it("rejects a negative or non-integer delivery_id", async () => {
+    const path = await home();
+    await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: -1, home: path })).rejects.toThrow(/delivery_id/);
+    await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: 1.5, home: path })).rejects.toThrow(/delivery_id/);
+  });
+
+  // findExistingDelivery used to trust a name match alone. A
+  // corrupt file, or a genuine collision with some unrelated message that
+  // happens to carry the same kind and delivery id in its own filename,
+  // must never be mistaken for this exact delivery already landing --
+  // reporting delivered: false for a delivery that never actually happened
+  // would let fireDueTimers mark a timer fired without its action ever
+  // reaching its owner.
+  it("throws rather than silently treating a name-matching file as delivered when its own envelope disagrees", async () => {
+    const path = await home();
+    const directory = await sessionDirectory("session-h", path);
+    // Written directly, bypassing the API entirely -- exactly what a
+    // corrupt write or a colliding delivery id from an unrelated message
+    // would leave behind: right name, wrong content.
+    await writeFile(join(directory, "5000-321-handoff.json"), JSON.stringify({ version: 1, kind: "handoff", to: "someone-else", from: "a-human", at: "2026-01-01T00:00:00.000Z", delivery_id: 321, body: "unrelated" }));
+    const options = { to: "session-h", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 321, home: path, now: new Date(5_000) };
+    await expect(sendInboxMessageAt(options)).rejects.toThrow(/matches delivery 321 by name but not by envelope content/);
+    // Never treated as delivered, and never overwritten either -- the
+    // corrupt/colliding file is left exactly as found for a human to
+    // investigate, not silently replaced.
+    const messages = await readdir(directory);
+    expect(messages).toEqual(["5000-321-handoff.json"]);
+  });
+
+  it("rejects a name-matching delivery when its version, sender, or timer action differs", async () => {
+    const path = await home();
+    const directory = await sessionDirectory("session-envelope", path);
+    const expectedBody = { timer: "wake", at: "2026-09-28T12:00:00.000Z", action: "check" };
+    const mismatches: Array<[number, Record<string, unknown>]> = [
+      [322, { version: 2 }],
+      [323, { from: "other-sender" }],
+      [324, { body: { ...expectedBody, action: "different action" } }],
+    ];
+    for (const [deliveryId, mismatch] of mismatches) {
+      await writeFile(join(directory, `5000-${deliveryId}-handoff.json`), JSON.stringify({ version: 1, kind: "handoff", to: "session-envelope", from: "headroom-timer", at: "2026-01-01T00:00:00.000Z", delivery_id: deliveryId, body: expectedBody, ...mismatch }));
+      await expect(sendInboxMessageAt({ to: "session-envelope", kind: "handoff", text: JSON.stringify(expectedBody), from: "headroom-timer", delivery_id: deliveryId, home: path, now: new Date(5_000) })).rejects.toThrow(/matches delivery/);
+    }
   });
 });
 

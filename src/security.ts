@@ -144,6 +144,46 @@ export async function assertSafeReadableDirectory(dir: string): Promise<void> {
  * quoted in the security review. */
 export const SAFE_READ_MAX_BYTES = 64 * 1024;
 
+/** The character-class rule inbox.ts's own `assertSessionId` applies to a
+ * session id (one path segment, no separators, no drive letters, no percent
+ * escapes), hosted here rather than in inbox.ts so a module with no
+ * business reading a session's messages -- store.ts's timer owner
+ * validation, since a timer's owner is always an inbox delivery target --
+ * can enforce the identical rule without importing inbox.ts, which itself
+ * imports from store.ts (a cycle). */
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** `.` and `..` satisfy SESSION_ID_PATTERN's character class but are
+ * directory references, not names -- refused by every session-id validator
+ * that shares this rule (see SESSION_ID_PATTERN's own doc comment). */
+export function isReservedSessionId(value: string): boolean { return value === "." || value === ".."; }
+
+/** The exact on-disk shape of one inbox message, shared by inbox.ts's own
+ * writers (`sendInboxMessage`/`sendInboxMessageAt`) and store.ts's
+ * `setTimer`, which must reject an action too large to ever be delivered
+ * *before* storing it. Both sides call this one function so the size check
+ * validates the actual serialized FILE inbox.ts will write -- pretty-print
+ * whitespace, the envelope wrapper, and all -- never just the inner body:
+ * a body that fits under the cap can still produce a file that does not,
+ * since `readBoundedRegularFile` (what every inbox reader uses) enforces
+ * the same cap against the whole file, not the body alone. Hosted here
+ * (not in inbox.ts) so store.ts can call it without importing inbox.ts,
+ * which itself imports from store.ts (a cycle) -- see SESSION_ID_PATTERN's
+ * own doc comment for the identical reasoning. */
+export function serializeInboxEnvelope(input: { kind: string; to: string; from: string | null; at: string; deliveryId?: number; body: unknown }): string {
+  const envelope: Record<string, unknown> = { version: 1, kind: input.kind, to: input.to, from: input.from, at: input.at };
+  if (input.deliveryId !== undefined) envelope.delivery_id = input.deliveryId;
+  envelope.body = input.body;
+  return `${JSON.stringify(envelope, null, 2)}\n`;
+}
+
+/** The `kind`/`from` a due timer's inbox delivery always uses -- shared
+ * between src/heartbeat.ts's fireDueTimers (the real send) and store.ts's
+ * setTimer (the pre-write size check via serializeInboxEnvelope above), so
+ * the two can never drift apart and silently make that check inexact. */
+export const TIMER_DELIVERY_KIND = "handoff";
+export const TIMER_DELIVERY_FROM = "headroom-timer";
+
 /** Reads `path` only after an lstat proves it is a regular file, not a
  * symlink, FIFO, or device -- and refuses it outright if it is already
  * larger than `maxBytes`, before ever opening a descriptor. A second check on
@@ -192,8 +232,12 @@ export function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
  * `mode`'s POSIX permission bits are meaningless on Windows (`fs.open`
  * accepts the argument there but the resulting file has no such bits to
  * set), which has no directly equivalent per-file ACL this project sets.
+ * `beforeCommit`, when supplied, runs after the temporary file is durable but
+ * immediately before its rename. Returning false abandons that temporary
+ * file without replacing the destination; callers that coordinate a later
+ * identity check can therefore avoid committing a stale result.
  */
-export async function writeFileAtomic(path: string, data: string, mode: number): Promise<void> {
+export async function writeFileAtomic(path: string, data: string, mode: number, beforeCommit?: () => boolean | Promise<boolean>): Promise<boolean> {
   try {
     const existing = await lstat(path);
     if (existing.isSymbolicLink()) throw new Error(`Refusing to write through symlinked destination: ${path}`);
@@ -205,7 +249,14 @@ export async function writeFileAtomic(path: string, data: string, mode: number):
   const handle = await open(temporaryPath, "wx", mode);
   try { await handle.writeFile(data, "utf8"); }
   finally { await handle.close(); }
-  try { await rename(temporaryPath, path); }
+  try {
+    if (beforeCommit && !(await beforeCommit())) {
+      await unlink(temporaryPath).catch(() => {});
+      return false;
+    }
+    await rename(temporaryPath, path);
+    return true;
+  }
   catch (error) { await unlink(temporaryPath).catch(() => {}); throw error; }
 }
 

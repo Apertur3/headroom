@@ -469,9 +469,16 @@ second reservation mechanism:
 
 Orchestrators sharing an account also need to leave each other notes, which the meters cannot
 carry. Each session has a directory `<HEADROOM_HOME>/inbox/<session-id>/` holding one file per
-message, named `<epoch-ms>-<kind>.json` for a kind of `budget`, `note`, or `handoff`. The file is
-a small envelope: `version`, `kind`, `to`, `from` (null when the sender did not name itself), `at`,
-and `body` -- the sender's payload, parsed when it was JSON and kept as text otherwise.
+message, named `<epoch-ms>-<kind>.json` for an ordinary hand-off (a kind of `budget`, `note`, or
+`handoff`) sent by `headroom inbox send` or the equivalent MCP path. A due timer's own delivery (see
+Heartbeats and timers, below) is named `<epoch-ms>-<delivery_id>-<kind>.json` instead -- the same
+real send time in the same leading position, plus the timer's own persisted `delivery_id` as a
+second, separate filename component, so a crash-and-retry can recognize an already-delivered timer
+message by that id rather than by guessing its exact filename. The two shapes never collide: only a
+timer delivery's filename has that middle numeric component at all. The file itself is a small
+envelope: `version`, `kind`, `to`, `from` (null when the sender did not name itself), `at`, `body` --
+the sender's payload, parsed when it was JSON and kept as text otherwise -- and, for a timer
+delivery only, the same `delivery_id` carried in its own filename.
 
 `headroom inbox send --to <session-id> --kind <kind> (--file <path> | --text <text>)` writes one,
 atomically and 0600, capped at 64 KiB. `headroom inbox --session <id> [--since <epoch-ms>]` prints
@@ -487,25 +494,40 @@ An orchestrator session can crash and take every in-session timer and watcher do
 unnoticed for however long nobody happens to look. The daemon is the one process that survives
 that crash, so it can hold both an orchestrator's heartbeat and its named wake-ups instead.
 
+Both are checked by a daemon-owned maintenance pass that runs on its own schedule, independent of
+any vendor poll: it reschedules itself around the next real deadline (the soonest pending timer's
+`at`, or the soonest still-live heartbeat's own lapse instant), somewhere between about one and
+sixty seconds out, so a heartbeat or timer registered with zero accounts configured -- or a due
+timer that would otherwise wait out a full poll interval -- is still noticed promptly. `headroom
+timer set`/`headroom heartbeat` refuse or warn, rather than silently succeed, when no daemon is
+running to ever act on the row they just wrote.
+
 `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` records or
 refreshes a promise to beat at least that often, keyed by `owner` (the same identity namespace as
 a lease owner or an inbox session), with an optional resume sentence -- what a human or a fresh
-session should do to pick the work back up. The daemon checks every registered heartbeat on each
-poll; one gone overdue by more than 2x its own interval gets `lapsed_since` set and exactly one
-`heartbeat_lapsed` event (never repeated while that lapse stays open), which the notifier delivers
-through the ordinary ledger dedupe and quiet hours -- see `docs/notifications.md`. A later beat
-closes the lapse immediately and may send one short `heartbeat_restored`. `--stop` deregisters a
-heartbeat without announcing a restore; `heartbeat list [--json]` shows every registered one.
+session should do to pick the work back up. The maintenance pass above checks every registered
+heartbeat; one gone overdue by more than 2x its own interval gets `lapsed_since` set and exactly
+one `heartbeat_lapsed` event (never repeated while that lapse stays open), which the notifier
+delivers through the ordinary ledger dedupe and quiet hours -- see `docs/notifications.md`. A later
+beat closes the lapse immediately and may send one short `heartbeat_restored`. `--stop` deregisters
+a heartbeat without announcing a restore; `heartbeat list [--json]` shows every registered one.
 
 `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
-[--if-missed notify|drop]` registers a named wake-up. When it comes due, the daemon delivers it
-exactly once as one inbox entry to its owner (see Inbox, above) -- **Headroom only ever delivers
-the action text; it never executes it.** `--if-missed notify` (the default) additionally raises
+[--if-missed notify|drop]` registers a named wake-up. When it comes due, the maintenance pass
+claims it, delivers it as one inbox entry to its owner (see Inbox, above), and only then marks it
+fired -- **Headroom only ever delivers the action text; it never executes it.** That claim is
+recoverable: a crash (or the daemon restarting) between claiming a timer and confirming its
+delivery leaves it claimed, not lost -- the claim goes stale and is retried, and a fresh daemon
+process reclaims every outstanding claim unconditionally on startup, with delivery itself
+idempotent by timer identity so a retried delivery is never sent twice. A timer whose delivery
+keeps failing for any other reason (a malformed owner, a filesystem error) is retried a bounded
+number of times before being marked permanently failed, with the reason logged, rather than
+retried on every maintenance pass forever. `--if-missed notify` (the default) additionally raises
 one `timer_missed` event if the owner's heartbeat is currently lapsed at that moment, since a
 crashed session will never read its own inbox; `--if-missed drop` still delivers the inbox entry
 but never notifies. `timer list [--owner <name>] [--json]` shows pending timers (never fired,
-never cleared); `timer clear --owner <name> --name <id>` clears one. `status`'s own `due_timers`
-field is the subset of pending timers already at or past their own `at`.
+never cleared, never given up on); `timer clear --owner <name> --name <id>` clears one. `status`'s
+own `due_timers` field is the subset of pending timers already at or past their own `at`.
 
 ## Events
 
