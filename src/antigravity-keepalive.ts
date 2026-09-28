@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSyn
 import { lstat, open, readdir, readFile, rmdir, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
-import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processSignature, type ExecFile } from "./process-tree.js";
+import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processArgs, processSignature, type ExecFile } from "./process-tree.js";
 
 type Spawn = (command: string, args: string[], options: { stdio: "ignore"; env: NodeJS.ProcessEnv; detached?: boolean }) => ChildProcess;
 
@@ -529,6 +529,14 @@ export function resolveAgyBinary(registryPath?: string, home = homedir(), path =
   return candidates.find((candidate) => existsSync(candidate)) ?? "agy";
 }
 
+/** True when a `ps` args line runs `binary`: as the command itself, or as a
+ * script's path after its interpreter. Matched as a whole argument, so a
+ * binary path that is a prefix or substring of another argument never counts;
+ * a path with spaces still matches because ps joins arguments with one space. */
+function argsRunBinary(args: string, binary: string): boolean {
+  return args === binary || args.startsWith(`${binary} `) || args.endsWith(` ${binary}`) || args.includes(` ${binary} `);
+}
+
 /** Owns only the `script` PTY it starts, so daemon shutdown cannot kill a user-launched agy. */
 export class AgyKeepaliveSupervisor {
   private child: ChildProcess | undefined;
@@ -915,15 +923,37 @@ export class AgyKeepaliveSupervisor {
     if (detailed.kind === "invalid") return false;
     try {
       // Signal only on positive agreement: the state learned this same pid as
-      // a descendant of this launch's own script. Without that, defer to the
-      // full reconciliation, which never signals unverifiable evidence.
+      // a descendant of this launch's own script, or, when script exited
+      // before recordState() got that far, ps identifies the pid as this
+      // launch's agy. Without either, defer to the full reconciliation, which
+      // never signals unverifiable evidence.
       const state = await readKeepaliveState(location.statePath);
-      if (state?.agyPid === undefined || state.agyPid !== detailed.pid) {
-        return (await reconcileEvidence(location)).unverified.length === 0;
-      }
+      const agrees = state?.agyPid !== undefined
+        ? state.agyPid === detailed.pid
+        : await this.isThisLaunchAgy(detailed.pid, location.pidPath, state?.launchedAt);
+      if (!agrees) return (await reconcileEvidence(location)).unverified.length === 0;
     } catch { return false; }
     killProcessGroup(detailed.pid, { groupOnly: true });
     return waitUntilGroupGone(detailed.pid);
+  }
+
+  /** The wrapper's pid is this launch's agy when it still runs this
+   * supervisor's binary and started between this launch and the pid file's
+   * write, compared in whole seconds because lstart has that resolution. The
+   * genuine wrapper writes the file after it starts, so its start second is
+   * never later than the file's; a pid recycled after agy died starts later,
+   * and anything else runs a different command.
+   * Without ps this says no, and reconcileEvidence's ps-free tier decides. */
+  private async isThisLaunchAgy(pid: number, pidPath: string, launchedAt: string | undefined): Promise<boolean> {
+    const launchedAtMs = launchedAt ? Date.parse(launchedAt) : NaN;
+    const entry = await readAgyPidFile(pidPath);
+    if (!Number.isFinite(launchedAtMs) || !entry || entry.pid !== pid) return false;
+    const [signature, args] = await Promise.all([processSignature(pid), processArgs(pid)]);
+    if (!signature || !args || !argsRunBinary(args, this.binary)) return false;
+    const startedMs = Date.parse(signature.startedAt);
+    return Number.isFinite(startedMs)
+      && startedMs >= Math.floor(launchedAtMs / 1000) * 1000 - 1000
+      && startedMs <= Math.floor(entry.mtimeMs / 1000) * 1000;
   }
 
   private forgetLaunchDirectory(): void {

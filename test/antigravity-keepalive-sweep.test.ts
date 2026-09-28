@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -293,6 +293,73 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leav
       await supervisor.stop(); // script is already gone: nothing proves the pid, so nothing is signalled
 
       expect(alive(strangerPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  /** Starts a launch, waits until its state has learned agy, then rolls the
+   * state back to the provisional record it holds before recordState()
+   * finishes: the window in which script can exit on a slow host. */
+  async function launchWithEarlyState(root: string, infoFile: string, fakeAgy: string) {
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, restartDelay: () => 60_000,
+    });
+    supervisor.start();
+    const scriptPid = track(supervisor.pid, root) as number;
+    const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+    const statePath = launchStatePath(root, supervisor);
+    await vi.waitFor(async () => { expect(JSON.parse(await readFile(statePath, "utf8")).agyPid).toBe(agyPid); }, { timeout: 5_000, interval: 20 });
+    const { agyPid: _pid, agyCommand: _command, agyStartedAt: _startedAt, ...early } = JSON.parse(await readFile(statePath, "utf8"));
+    await writeFile(statePath, JSON.stringify(early));
+    return { supervisor, scriptPid, agyPid };
+  }
+
+  it("reaps agy when script exits before the state has learned agy's pid, identifying it by ps", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-early-exit-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { supervisor, scriptPid, agyPid } = await launchWithEarlyState(root, infoFile, fakeAgy);
+    try {
+      process.kill(scriptPid, "SIGKILL");
+      await waitUntilDead(agyPid);
+      expect(groupKillCalls).toContainEqual({ pid: agyPid, options: { groupOnly: true } });
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("never signals a pid-file pid that runs a different command, even before the state has learned agy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-early-stranger-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
+    const strangerPid = track(stranger.pid, root) as number;
+    const { supervisor, scriptPid } = await launchWithEarlyState(root, infoFile, fakeAgy);
+    try {
+      await writeFile(launchPidPath(root, supervisor), String(strangerPid));
+      process.kill(scriptPid, "SIGKILL");
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(groupKillCalls.map((call) => call.pid)).not.toContain(strangerPid);
+      expect(alive(strangerPid)).toBe(true);
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("never signals a pid-file pid that runs agy but started after the pid file was written (a recycled pid)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-early-recycled-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const { supervisor, scriptPid } = await launchWithEarlyState(root, infoFile, fakeAgy);
+    try {
+      const pidPath = launchPidPath(root, supervisor);
+      const writtenAtMs = (await stat(pidPath)).mtimeMs;
+      // Start the look-alike in a later whole second than the pid file's write.
+      const nextSecond = Math.floor(writtenAtMs / 1000) * 1000 + 1000;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, nextSecond - Date.now()) + 100));
+      const recycled = spawn(fakeAgy, [], { stdio: "ignore", detached: true });
+      const recycledPid = track(recycled.pid, root) as number;
+      await writeFile(pidPath, String(recycledPid));
+      await utimes(pidPath, new Date(writtenAtMs), new Date(writtenAtMs));
+      process.kill(scriptPid, "SIGKILL");
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(groupKillCalls.map((call) => call.pid)).not.toContain(recycledPid);
+      expect(alive(recycledPid)).toBe(true);
     } finally { await supervisor.stop(); }
   }, 15_000);
 });

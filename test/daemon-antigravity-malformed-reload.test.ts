@@ -127,6 +127,34 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a malformed confi
   }, 15_000);
 });
 
+describe("HeadroomDaemon: a malformed policy.toml never stops or crashes poll scheduling", () => {
+  it("re-arms a principal's timer, without a rejection, when its schedule or its scheduled poll cannot read policy.toml", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-schedule-malformed-")); temporary.push(root);
+    await writeFile(join(root, "accounts.toml"), "", { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemonFor(root, path, async () => ({ observations: [], failures: [] }));
+    try {
+      const internal = daemon as unknown as {
+        schedulers: Map<string, ReturnType<typeof setTimeout>>;
+        schedulePrincipal(principal: string): Promise<void>;
+        runScheduledPoll(principal: string): Promise<void>;
+      };
+      await daemon.start();
+      await writeFile(join(root, "policy.toml"), 'pacing = "not-a-real-pacing-value"\n', { mode: 0o600 });
+      const { rejections } = await withUnhandledRejectionCapture(async () => {
+        await internal.schedulePrincipal("all");
+        await internal.runScheduledPoll("all");
+      });
+      expect(rejections).toEqual([]);
+      expect(internal.schedulers.has("all")).toBe(true);
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
+});
+
 async function HeadroomDaemonFor(root: string, path: string, poller: () => Promise<{ observations: never[]; failures: never[] }>) {
   const { HeadroomDaemon } = await import("../src/daemon.js");
   return HeadroomDaemon.create({ home: root, path, poller });

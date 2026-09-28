@@ -56,6 +56,9 @@ const RPC_ABSOLUTE_DEADLINE_MS = 10_000;
  * hot loop. */
 const MAINTENANCE_MAX_DELAY_MS = 60_000;
 const MAINTENANCE_MIN_DELAY_MS = 1_000;
+/** How soon a principal whose poll schedule could not be computed (a
+ * malformed accounts.toml or policy.toml) tries again. */
+const SCHEDULE_RETRY_DELAY_MS = 60_000;
 /** How long stop() waits for an in-flight maintenance/notifier pass to
  * finish before closing the store regardless -- generous relative to a
  * local inbox write (normally well under a second) while still bounding
@@ -1425,19 +1428,31 @@ export class HeadroomDaemon {
     catch { this.schedulePrincipal("all"); }
   }
 
+  /** Never rejects: every caller is detached, and an unhandled rejection
+   * ends the daemon. A malformed accounts.toml or policy.toml keeps the
+   * principal on a retry timer, so polling resumes once the file is fixed. */
   private async schedulePrincipal(principal: string): Promise<void> {
-    if (principal !== "all") {
-      const account = (await this.currentAccounts()).find((item) => item.name === principal);
-      if (!account || !isAccountEnabled(account)) { this.schedulers.delete(principal); return; }
+    let delay = SCHEDULE_RETRY_DELAY_MS;
+    try {
+      if (principal !== "all") {
+        const account = (await this.currentAccounts()).find((item) => item.name === principal);
+        if (!account || !isAccountEnabled(account)) { this.schedulers.delete(principal); return; }
+      }
+      const policy = await readPolicy();
+      const minutes = policy.principal_intervals[principal] ?? policy.poll_interval_minutes;
+      delay = Math.max(1_000, minutes * 60_000 * (0.8 + Math.random() * 0.4));
+    } catch (error) {
+      void appendDaemonLog(`poll scheduling for ${principal} failed, retrying: ${safeError(error)}`, this.home);
     }
-    const policy = await readPolicy();
-    const minutes = policy.principal_intervals[principal] ?? policy.poll_interval_minutes;
-    const delay = Math.max(1_000, minutes * 60_000 * (0.8 + Math.random() * 0.4));
-    const timer = setTimeout(async () => {
-      try { await this.poll(principal === "all" ? undefined : principal, false); }
-      finally { this.schedulers.delete(principal); void this.schedulePrincipal(principal); }
-    }, delay);
+    if (this.stopping) return;
+    const timer = setTimeout(() => { void this.runScheduledPoll(principal); }, delay);
     timer.unref(); this.schedulers.set(principal, timer);
+  }
+
+  private async runScheduledPoll(principal: string): Promise<void> {
+    try { await this.poll(principal === "all" ? undefined : principal, false); }
+    catch (error) { void appendDaemonLog(`scheduled poll for ${principal} failed: ${safeError(error)}`, this.home); }
+    finally { this.schedulers.delete(principal); void this.schedulePrincipal(principal); }
   }
 
   private installReloadHandlers(): void {

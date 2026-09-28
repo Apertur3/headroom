@@ -215,3 +215,14 @@ export async function processSignature(pid: number, execImpl: ExecFile = execFil
   const [command, startedAt] = await Promise.all([field("comm"), field("lstart")]);
   return command && startedAt ? { command, startedAt } : undefined;
 }
+
+/** One process's full argument line from `ps`, never truncated to a
+ * terminal width (`-ww`, accepted by both BSD and procps ps). Undefined when
+ * the process is gone or `ps` cannot be run. */
+export async function processArgs(pid: number, execImpl: ExecFile = execFileAsync): Promise<string | undefined> {
+  try {
+    const { stdout } = await execImpl("ps", ["-ww", "-o", "args=", "-p", String(pid)]);
+    const value = stdout.split("\n")[0]?.trim();
+    return value ? value : undefined;
+  } catch { return undefined; }
+}
