@@ -67,7 +67,7 @@ describe("plan downgrade protection", () => {
     const db = await store();
     const calls: string[] = [];
     try {
-      vi.useFakeTimers();
+      vi.useFakeTimers({ toFake: ["Date"] }); // only the clock: real waits in the delivery path must still resolve
       vi.setSystemTime(new Date("2026-09-09T15:12:00Z")); // 17:12 in the shared Europe/Amsterdam test zone.
       await deliverNotifications(db, notifications(calls));
       db.insert(reading("prolite", "2026-09-09T15:12:00Z"));
@@ -96,7 +96,7 @@ describe("plan downgrade protection", () => {
     const db = await store();
     const calls: string[] = [];
     try {
-      vi.useFakeTimers();
+      vi.useFakeTimers({ toFake: ["Date"] }); // only the clock: real waits in the delivery path must still resolve
       vi.setSystemTime(new Date("2026-09-09T22:12:00Z")); // 00:12 in Europe/Amsterdam, inside 23:00-07:00.
       await deliverNotifications(db, notifications(calls));
       db.insert(reading("prolite", "2026-09-09T22:12:00Z"));
