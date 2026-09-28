@@ -20,6 +20,7 @@
  */
 import { lstat, readdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { isReservedSessionId, readBoundedRegularFile, safeOutputDirectory, serializeInboxEnvelope, writeFileAtomic, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
 import { safeHeadroomDirectory } from "./store.js";
 
@@ -158,7 +159,15 @@ export interface SendAtOptions extends SendOptions {
    * possibly delivered, but never confirmed durable) is never delivered
    * twice. */
   delivery_id: number;
+  /** Matches the caller's delivery wait bound. A send that is still pending
+   * after this interval no longer monopolizes this process's in-flight slot:
+   * a later stale-claim retry may make a fresh idempotent attempt. */
+  inFlightTimeoutMs?: number;
 }
+
+/** The default matches heartbeat.ts's normal per-delivery timeout. The
+ * caller passes its configured delivery timeout when it differs. */
+const DEFAULT_IN_FLIGHT_TIMER_DELIVERY_TIMEOUT_MS = 10_000;
 
 /*
  * A timer delivery's filename is `<epoch-ms>-<delivery_id>-<kind>.json` --
@@ -188,14 +197,16 @@ export interface SendAtOptions extends SendOptions {
  * happened, and (via fireDueTimers's confirmTimerDelivered) let a timer be
  * marked fired without its action ever reaching its owner. The envelope's
  * own `delivery_id` field is the one place that identity is written under
- * the writer's control (serializeInboxEnvelope), so it -- and the `kind` and
- * `to` fields alongside it -- has to agree with what this scan is actually
- * looking for before the file is trusted. A file this scan cannot read back
- * at all (gone since the directory listing, or genuinely corrupt) is
- * skipped, not thrown on: it is not proof of anything either way, and the
- * caller's own write attempt will simply proceed past it. A file that DOES
- * parse but disagrees on identity is the one case worth failing loud on. */
-async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number, to: string): Promise<{ path: string; file: string } | undefined> {
+ * the writer's control (serializeInboxEnvelope), so it -- together with the
+ * envelope version, sender, recipient, kind, and exact expected body -- has
+ * to agree with what this scan is actually looking for before the file is
+ * trusted. If an unread file disappears while this scan reads it, its `.read`
+ * counterpart is checked once: a reader may have renamed it in precisely that
+ * interval, and that completed delivery must not be re-sent as fresh unread
+ * mail. A file this scan cannot read back at all is skipped, not thrown on:
+ * it is not proof of anything either way. A file that DOES parse but
+ * disagrees on identity is the one case worth failing loud on. */
+async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number, to: string, from: string | null, body: unknown): Promise<{ path: string; file: string } | undefined> {
   let entries: string[];
   try { entries = await readdir(directory); }
   catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
@@ -203,15 +214,25 @@ async function findExistingDelivery(directory: string, kind: InboxKind, delivery
     const bare = entry.endsWith(READ_SUFFIX) ? entry.slice(0, -READ_SUFFIX.length) : entry;
     const parsed = parseMessageName(bare);
     if (!parsed || parsed.kind !== kind || parsed.deliveryId !== deliveryId) continue;
-    const path = join(directory, entry);
+    let path = join(directory, entry);
+    let file = entry;
     let raw: string;
     try { raw = await readBoundedRegularFile(path); }
-    catch { continue; } // gone or unreadable since the directory listing above; not proof of anything
+    catch (error: unknown) {
+      // A reader can rename an unread message to `.read` after readdir() but
+      // before this read. Treat that counterpart as the same durable delivery
+      // rather than treating ENOENT as permission to write it again.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || entry.endsWith(READ_SUFFIX)) continue;
+      path = `${path}${READ_SUFFIX}`;
+      file = `${entry}${READ_SUFFIX}`;
+      try { raw = await readBoundedRegularFile(path); }
+      catch { continue; }
+    }
     let envelope: unknown;
     try { envelope = JSON.parse(raw); } catch { continue; } // not a name match worth trusting either
     const record = envelope && typeof envelope === "object" && !Array.isArray(envelope) ? envelope as Record<string, unknown> : {};
-    if (record.delivery_id === deliveryId && record.kind === kind && record.to === to) return { path, file: entry };
-    throw new Error(`inbox file ${entry} matches delivery ${deliveryId} by name but not by envelope content`);
+    if (record.version === 1 && record.delivery_id === deliveryId && record.kind === kind && record.to === to && record.from === from && isDeepStrictEqual(record.body, body)) return { path, file };
+    throw new Error(`inbox file ${file} matches delivery ${deliveryId} by name but not by envelope content`);
   }
   return undefined;
 }
@@ -229,8 +250,9 @@ async function findExistingDelivery(directory: string, kind: InboxKind, delivery
  * or the first's file could be read and renamed to `.read` in the gap
  * between the second's own check and its write, making the delivery
  * reappear as a second, fresh, unread message. Cleared once the attempt
- * itself settles (success or failure), independent of whether any
- * particular caller is still awaiting it. */
+ * itself settles (success or failure), or at the caller's delivery timeout:
+ * a truly never-settling attempt must not prevent every future stale-claim
+ * retry from making a fresh, idempotent attempt. */
 const inFlightTimerDeliveries = new Map<string, Promise<{ path: string; file: string; session: string; delivered: boolean }>>();
 
 /**
@@ -246,22 +268,33 @@ const inFlightTimerDeliveries = new Map<string, Promise<{ path: string; file: st
 export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path: string; file: string; session: string; delivered: boolean }> {
   const { session, from } = validateSendOptions(options);
   if (!Number.isInteger(options.delivery_id) || options.delivery_id < 0) throw new Error("delivery_id must be a non-negative integer");
+  const inFlightTimeoutMs = options.inFlightTimeoutMs ?? DEFAULT_IN_FLIGHT_TIMER_DELIVERY_TIMEOUT_MS;
+  if (!Number.isFinite(inFlightTimeoutMs) || inFlightTimeoutMs <= 0) throw new Error("inFlightTimeoutMs must be greater than 0");
   const key = `${options.home ?? ""}\u0000${session}\u0000${options.kind}\u0000${options.delivery_id}`;
   const inFlight = inFlightTimerDeliveries.get(key);
   if (inFlight) return inFlight;
   const attempt = (async (): Promise<{ path: string; file: string; session: string; delivered: boolean }> => {
     const now = options.now ?? new Date();
     const directory = await sessionDirectory(session, options.home);
-    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id, session);
+    const body = parseBody(options.text);
+    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body);
     if (existing) return { path: existing.path, file: existing.file, session, delivered: false };
     const file = `${now.getTime()}-${options.delivery_id}-${options.kind}.json`;
     const path = join(directory, file);
-    await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body: parseBody(options.text) }), 0o600);
+    await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body }), 0o600);
     return { path, file, session, delivered: true };
   })();
   inFlightTimerDeliveries.set(key, attempt);
+  const expiry = setTimeout(() => {
+    // Do not let an older, timed-out attempt erase a newer retry's entry.
+    if (inFlightTimerDeliveries.get(key) === attempt) inFlightTimerDeliveries.delete(key);
+  }, inFlightTimeoutMs);
+  expiry.unref?.();
   try { return await attempt; }
-  finally { inFlightTimerDeliveries.delete(key); }
+  finally {
+    clearTimeout(expiry);
+    if (inFlightTimerDeliveries.get(key) === attempt) inFlightTimerDeliveries.delete(key);
+  }
 }
 
 function parseBody(text: string): unknown {

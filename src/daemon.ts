@@ -330,17 +330,18 @@ export class HeadroomDaemon {
     if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
     this.maintenanceTimer = undefined;
     await this.keepalive?.stop();
-    await new Promise<void>((resolve) => this.server ? this.server.close(() => resolve()) : resolve());
-    // Drain whatever maintenance/notifier work is still in flight before the
-    // store closes out from under it: a timer delivery caught mid-write here
-    // is exactly the "stop during an in-flight delivery" case store.ts's
-    // recoverable claim (claimTimer/confirmTimerDelivered/
-    // releaseTimerClaim) exists to make safe -- without this drain, that
-    // in-flight call's own confirm/release could otherwise run against an
-    // already-closed SQLite handle. Bounded so a genuinely stuck filesystem
-    // call cannot hang shutdown forever.
+    // Keep the listener bound while this drains. A new daemon treats binding
+    // that listener as proof it may reclaim delivery claims, so closing it
+    // first would let a replacement resend while this process still writes.
+    // handleLine serves health as { state: "stopping" } and rejects every
+    // other method during this interval, so it cannot start new store work.
     await this.drainBackgroundWork();
     this.store.close();
+    const server = this.server;
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (this.server === server) this.server = undefined;
+    }
     if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }
   }
 
@@ -565,6 +566,7 @@ export class HeadroomDaemon {
       if (!expected || !safeTimingEqual(received, expected)) return reject(-32001, "Unauthorized pipe client");
       authenticatedThisCall = true;
     }
+    if (this.stopping && request.method !== "health") return finish(rpcError(request.id, -32000, "Headroom daemon is stopping"));
     try {
       let result: unknown;
       switch (request.method) {
@@ -873,6 +875,7 @@ export class HeadroomDaemon {
           result = await fillFor(this.store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent: planShare, actionClass, durationMinutes: typeof params.duration_minutes === "number" ? params.duration_minutes : routing?.costs[actionClass ?? ""]?.duration_minutes, pacing: policy.pacing, allowance: typeof params.allowance === "string" ? params.allowance : policy.allowance, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: typeof params.need === "string" ? params.need : undefined }); break;
         }
         case "health": result = {
+          state: this.stopping ? "stopping" : "running",
           socket: this.path,
           in_flight: this.inFlight.size,
           backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })),

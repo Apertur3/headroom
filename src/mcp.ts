@@ -16,7 +16,7 @@ import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
-import { isEnvelopable, normalizeDaemonTimers, withContract } from "./json-contract.js";
+import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract } from "./json-contract.js";
 import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
 import { HeadroomStore } from "./store.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Heartbeat, type Timer } from "./types.js";
@@ -918,7 +918,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       // unwrapAdditiveRpc. Any OTHER error (a genuine handler failure, most
       // commonly -32000) still propagates as a real MCP tool error instead
       // of being silently swallowed to "no heartbeats/timers registered".
-      const heartbeats = decodeAdditiveRpcReply(await call("heartbeats", {})) as Heartbeat[];
+      const heartbeats = validateDaemonHeartbeats(decodeAdditiveRpcReply(await call("heartbeats", {}))) as unknown as Heartbeat[];
       // normalizeDaemonTimers defaults attempts/failed_at for a row from a
       // still-running daemon whose own JSON-RPC reply predates those two
       // fields (see docs/json-contract.md's `timer list` entry).

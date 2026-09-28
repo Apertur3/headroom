@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -170,6 +170,23 @@ describe("sendInboxMessageAt", () => {
     expect(messages).toEqual(["1000-7-handoff.json.read"]);
   });
 
+  it("recognizes a matching delivery that a reader renames to .read between the directory scan and read", async () => {
+    const path = await home();
+    const options = { to: "session-race", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 8, home: path };
+    const original = await sendInboxMessageAt({ ...options, now: new Date(1_000) });
+    const readSpy = vi.spyOn(securityModule, "readBoundedRegularFile").mockImplementationOnce(async (readPath) => {
+      await rename(readPath, `${readPath}.read`);
+      const missing = new Error("renamed by reader") as NodeJS.ErrnoException;
+      missing.code = "ENOENT";
+      throw missing;
+    });
+    try {
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry).toMatchObject({ path: `${original.path}.read`, file: `${original.file}.read`, delivered: false });
+      expect(await readdir(join(path, "inbox", "session-race"))).toEqual([`${original.file}.read`]);
+    } finally { readSpy.mockRestore(); }
+  });
+
   // The structural fix this filename shape closes: an ordinary hand-off's
   // name (`<epoch-ms>-<kind>.json`) and a timer delivery's
   // (`<epoch-ms>-<delivery_id>-<kind>.json`) can never coincide -- one has a
@@ -256,6 +273,34 @@ describe("sendInboxMessageAt", () => {
     expect(messages).toEqual(["1000-66-handoff.json.read"]); // never a second, fresh, unread copy
   });
 
+  it("releases a never-settling in-flight delivery after its delivery timeout so a stale retry can write it", async () => {
+    const path = await home();
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    let writes = 0;
+    let firstWriteStarted: () => void;
+    const firstWrite = new Promise<void>((resolve) => { firstWriteStarted = resolve; });
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode) => {
+      writes += 1;
+      if (writes === 1) {
+        firstWriteStarted!();
+        await new Promise<void>(() => { /* genuinely never settles */ });
+        return;
+      }
+      return realWriteFileAtomic(writePath, data, mode);
+    });
+    try {
+      const options = { to: "session-timeout", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 67, home: path, inFlightTimeoutMs: 20 };
+      void sendInboxMessageAt({ ...options, now: new Date(1_000) });
+      await firstWrite;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry.delivered).toBe(true);
+      expect(writes).toBe(2);
+      expect(await readdir(join(path, "inbox", "session-timeout"))).toEqual(["2000-67-handoff.json"]);
+    } finally { writeSpy.mockRestore(); }
+  });
+
   it("rejects a negative or non-integer delivery_id", async () => {
     const path = await home();
     await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: -1, home: path })).rejects.toThrow(/delivery_id/);
@@ -283,6 +328,21 @@ describe("sendInboxMessageAt", () => {
     // investigate, not silently replaced.
     const messages = await readdir(directory);
     expect(messages).toEqual(["5000-321-handoff.json"]);
+  });
+
+  it("rejects a name-matching delivery when its version, sender, or timer action differs", async () => {
+    const path = await home();
+    const directory = await sessionDirectory("session-envelope", path);
+    const expectedBody = { timer: "wake", at: "2026-09-28T12:00:00.000Z", action: "check" };
+    const mismatches: Array<[number, Record<string, unknown>]> = [
+      [322, { version: 2 }],
+      [323, { from: "other-sender" }],
+      [324, { body: { ...expectedBody, action: "different action" } }],
+    ];
+    for (const [deliveryId, mismatch] of mismatches) {
+      await writeFile(join(directory, `5000-${deliveryId}-handoff.json`), JSON.stringify({ version: 1, kind: "handoff", to: "session-envelope", from: "headroom-timer", at: "2026-01-01T00:00:00.000Z", delivery_id: deliveryId, body: expectedBody, ...mismatch }));
+      await expect(sendInboxMessageAt({ to: "session-envelope", kind: "handoff", text: JSON.stringify(expectedBody), from: "headroom-timer", delivery_id: deliveryId, home: path, now: new Date(5_000) })).rejects.toThrow(/matches delivery/);
+    }
   });
 });
 

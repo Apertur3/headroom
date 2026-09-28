@@ -19,8 +19,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
+import * as daemonModule from "../src/daemon.js";
+import { normalizeDaemonTimer } from "../src/json-contract.js";
 import { handleMcp } from "../src/mcp.js";
 
 const temporary: string[] = [];
@@ -36,14 +38,12 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
  * as opposed to the compatibility gap this file otherwise covers. Every
  * other unknown method still answers a plain -32601, unaffected.
  *
- * `additiveResult`, when given, replaces the *result* (a genuine success,
- * never an error envelope) `heartbeats`/`timer_list` answer with instead of
- * the default `-32601` error -- used to simulate a daemon old enough to
- * predate a field on the Timer shape (but not the RPC itself), or one whose
- * reply is a malformed non-array value. Mutually exclusive with
- * `additiveError`: passing both is a test-writing mistake, not a scenario
- * being modeled. */
-function startLegacyDaemon(path: string, additiveError: { code: number; message: string } = { code: -32601, message: "Method not found" }, additiveResult?: unknown): Promise<Server> {
+ * `additiveResults`, when given, supplies each additive method's own genuine
+ * success result instead of the default `-32601` error. Keeping the two
+ * results independent matters: a Timer row is never a valid Heartbeat row.
+ * It is used to simulate a daemon old enough to predate a Timer field (but
+ * not the RPC itself), or a malformed success reply. */
+function startLegacyDaemon(path: string, additiveError: { code: number; message: string } = { code: -32601, message: "Method not found" }, additiveResults?: Partial<Record<"heartbeats" | "timer_list", unknown>>): Promise<Server> {
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
     let buffer = "";
@@ -58,7 +58,7 @@ function startLegacyDaemon(path: string, additiveError: { code: number; message:
         const reply = known.includes(request.method)
           ? { jsonrpc: "2.0", id: request.id, result: request.method === "status" ? [] : request.method === "reset_seen" || request.method === "free_reset_used" ? {} : [] }
           : request.method === "heartbeats" || request.method === "timer_list"
-            ? (additiveResult !== undefined ? { jsonrpc: "2.0", id: request.id, result: additiveResult } : { jsonrpc: "2.0", id: request.id, error: additiveError })
+            ? (additiveResults && Object.hasOwn(additiveResults, request.method) ? { jsonrpc: "2.0", id: request.id, result: additiveResults[request.method] } : { jsonrpc: "2.0", id: request.id, error: additiveError })
             : { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } };
         socket.write(`${JSON.stringify(reply)}\n`);
       }
@@ -158,7 +158,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     let server: Server;
     // A malformed (non-array) success value, not a JSON-RPC error at all --
     // only -32601 (the documented compatibility gap) may become "none".
-    try { server = await startLegacyDaemon(path, undefined, { unexpected: "shape" }); }
+    try { server = await startLegacyDaemon(path, undefined, { heartbeats: { unexpected: "shape" } }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI non-array test: sandbox forbids listen(2)\n"); return; }
       throw error;
@@ -187,6 +187,37 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(reply.error?.message).toContain("not an array");
   });
 
+  it("`headroom status --json` rejects a malformed heartbeat member instead of emitting it in the contract", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-bad-heartbeat-")); temporary.push(root);
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = root;
+    const request = vi.spyOn(daemonModule, "daemonRequest").mockImplementation(async (_path, method) => ({
+      status: "available" as const,
+      result: method === "heartbeats" ? [{ owner: "orch-malformed" }]
+        : method === "status" || method === "leases" || method === "plan_downgrades" || method === "timer_list" ? []
+          : {},
+    }));
+    try {
+      await expect(main(["--json"])).rejects.toThrow('Daemon heartbeat row is missing required field "started_at"');
+    } finally {
+      request.mockRestore();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  });
+
+  it("MCP quota_status rejects a malformed heartbeat member instead of emitting it in the contract", async () => {
+    const reply = await handleMcp(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}',
+      async (method) => {
+        if (method === "status" || method === "plan_downgrades" || method === "timer_list") return [];
+        if (method === "heartbeats") return [{ owner: "orch-malformed" }];
+        return undefined;
+      },
+    ) as { error?: { message: string }; result?: unknown };
+    expect(reply.result).toBeUndefined();
+    expect(reply.error?.message).toContain('missing required field "started_at"');
+  });
+
   // a timer row from a daemon that predates the attempts/
   // failed_at fields (still-running, still answers `timer_list`, just an
   // older Timer shape) must read the same way an older on-disk schema's row
@@ -198,7 +229,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-oldtimer-")); temporary.push(root);
     const path = join(root, "headroom.sock");
     let server: Server;
-    try { server = await startLegacyDaemon(path, undefined, [timerRowMissingDeliveryFields]); }
+    try { server = await startLegacyDaemon(path, undefined, { heartbeats: [], timer_list: [timerRowMissingDeliveryFields] }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI old-timer-shape test: sandbox forbids listen(2)\n"); return; }
       throw error;
@@ -224,7 +255,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-oldtimer-list-")); temporary.push(root);
     const path = join(root, "headroom.sock");
     let server: Server;
-    try { server = await startLegacyDaemon(path, undefined, [timerRowMissingDeliveryFields]); }
+    try { server = await startLegacyDaemon(path, undefined, { timer_list: [timerRowMissingDeliveryFields] }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list old-shape test: sandbox forbids listen(2)\n"); return; }
       throw error;
@@ -254,7 +285,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-timerlist-nonarray-")); temporary.push(root);
     const path = join(root, "headroom.sock");
     let server: Server;
-    try { server = await startLegacyDaemon(path, undefined, { unexpected: "shape" }); }
+    try { server = await startLegacyDaemon(path, undefined, { timer_list: { unexpected: "shape" } }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list non-array test: sandbox forbids listen(2)\n"); return; }
       throw error;
@@ -292,11 +323,17 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
   // row reaches from a daemon reply.
   const timerRowMalformed = { name: "wake", at: "2020-01-01T00:00:00.000Z", action: "check the deploy", if_missed: "notify", created_at: "2019-12-31T23:00:00.000Z", fired_at: null, cleared_at: null }; // missing owner
 
+  it("defaults additive timer fields only when absent, not when a present value is malformed", () => {
+    for (const [field, value] of [["attempts", "bad"], ["failed_at", 123]] as const) {
+      expect(() => normalizeDaemonTimer({ ...timerRowMissingDeliveryFields, [field]: value })).toThrow(`invalid "${field}"`);
+    }
+  });
+
   it("`headroom status --json` throws on a malformed timer_list member, instead of normalizing it into a contract-invalid due_timer", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-malformed-member-")); temporary.push(root);
     const path = join(root, "headroom.sock");
     let server: Server;
-    try { server = await startLegacyDaemon(path, undefined, [timerRowMalformed]); }
+    try { server = await startLegacyDaemon(path, undefined, { heartbeats: [], timer_list: [timerRowMalformed] }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI malformed-member test: sandbox forbids listen(2)\n"); return; }
       throw error;
@@ -315,7 +352,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     const root = await mkdtemp(join(tmpdir(), "headroom-legacy-daemon-cli-timerlist-malformed-member-")); temporary.push(root);
     const path = join(root, "headroom.sock");
     let server: Server;
-    try { server = await startLegacyDaemon(path, undefined, [timerRowMalformed]); }
+    try { server = await startLegacyDaemon(path, undefined, { timer_list: [timerRowMalformed] }); }
     catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code === "EPERM") { process.stderr.write("SKIP legacy-daemon CLI timer-list malformed-member test: sandbox forbids listen(2)\n"); return; }
       throw error;

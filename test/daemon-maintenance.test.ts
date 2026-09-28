@@ -29,6 +29,7 @@ import * as inboxModule from "../src/inbox.js";
 import { readInbox } from "../src/inbox.js";
 import { tailDaemonLog } from "../src/logs.js";
 import { HeadroomStore } from "../src/store.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -102,6 +103,30 @@ describe("daemon-owned maintenance scheduler", () => {
     await waitFor(() => internal.maintenanceTimer !== undefined);
     await daemon.stop();
     expect(internal.maintenanceTimer).toBeUndefined();
+  });
+
+  it("keeps health responsive as stopping until in-flight delivery drains before releasing its listener", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-stop-health-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-stop-health"), poller: async () => ({ observations: [], failures: [] }) });
+    let releaseDelivery: () => void;
+    const delivery = new Promise<number>((resolve) => { releaseDelivery = () => resolve(0); });
+    let listenerClosed = false;
+    const internal = daemon as unknown as {
+      timerFiringInFlight?: Promise<number>;
+      server?: { close(callback: () => void): void };
+    };
+    internal.timerFiringInFlight = delivery;
+    internal.server = { close(callback) { listenerClosed = true; callback(); } };
+
+    const stopping = daemon.stop();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const health = await authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"health"}');
+    expect(health.result).toMatchObject({ state: "stopping" });
+    expect(listenerClosed).toBe(false);
+
+    releaseDelivery!();
+    await stopping;
+    expect(listenerClosed).toBe(true);
   });
 
   // Unlike the first test above (whose timer is already due the instant the

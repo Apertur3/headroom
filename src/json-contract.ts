@@ -37,6 +37,8 @@ export const JSON_CONTRACT_DOC_PATH = "docs/json-contract.md";
  * it happened. */
 const REQUIRED_STRING_TIMER_FIELDS = ["owner", "name", "at", "action", "created_at"] as const;
 const NULLABLE_STRING_TIMER_FIELDS = ["fired_at", "cleared_at"] as const;
+const REQUIRED_STRING_HEARTBEAT_FIELDS = ["owner", "started_at", "last_beat_at", "updated_at"] as const;
+const NULLABLE_STRING_HEARTBEAT_FIELDS = ["resume_sentence", "lapsed_since"] as const;
 
 /** Normalizes one timer row from a daemon JSON-RPC reply to the current
  * additive shape: `attempts`/`failed_at` default to `0`/`null` when a still-
@@ -66,7 +68,11 @@ export function normalizeDaemonTimer(row: unknown): TimerLike {
   for (const field of NULLABLE_STRING_TIMER_FIELDS) {
     if (record[field] !== null && typeof record[field] !== "string") throw new Error(`Daemon timer row has an invalid "${field}"`);
   }
-  return { ...record, attempts: typeof record.attempts === "number" ? record.attempts : 0, failed_at: typeof record.failed_at === "string" ? record.failed_at : null } as TimerLike;
+  const hasAttempts = Object.hasOwn(record, "attempts");
+  if (hasAttempts && typeof record.attempts !== "number") throw new Error('Daemon timer row has an invalid "attempts"');
+  const hasFailedAt = Object.hasOwn(record, "failed_at");
+  if (hasFailedAt && record.failed_at !== null && typeof record.failed_at !== "string") throw new Error('Daemon timer row has an invalid "failed_at"');
+  return { ...record, attempts: hasAttempts ? record.attempts : 0, failed_at: hasFailedAt ? record.failed_at : null } as TimerLike;
 }
 
 /** `normalizeDaemonTimer`, applied across a whole `timer list`/`due_timers`
@@ -86,12 +92,37 @@ export function normalizeDaemonTimers(rows: unknown): TimerLike[] {
   return rows.map(normalizeDaemonTimer);
 }
 
+/** Validates a heartbeat row before a daemon-sourced list reaches a versioned
+ * JSON result. Unlike Timer's two additive compatibility fields, every
+ * Heartbeat field is part of its original shape and must be present. */
+export function validateDaemonHeartbeat(row: unknown): HeartbeatLike {
+  const record = row && typeof row === "object" && !Array.isArray(row) ? row as Record<string, unknown> : undefined;
+  if (!record) throw new Error("Daemon heartbeat row was not an object");
+  for (const field of REQUIRED_STRING_HEARTBEAT_FIELDS) {
+    if (typeof record[field] !== "string") throw new Error(`Daemon heartbeat row is missing required field "${field}"`);
+  }
+  if (typeof record.interval_ms !== "number" || !Number.isFinite(record.interval_ms)) throw new Error('Daemon heartbeat row has an invalid "interval_ms"');
+  for (const field of NULLABLE_STRING_HEARTBEAT_FIELDS) {
+    if (record[field] !== null && typeof record[field] !== "string") throw new Error(`Daemon heartbeat row has an invalid "${field}"`);
+  }
+  return record;
+}
+
+/** Structural validation for every member of a daemon-sourced heartbeat
+ * list. The array check remains here as defense in depth for callers that
+ * did not use their additive-RPC decoder first. */
+export function validateDaemonHeartbeats(rows: unknown): HeartbeatLike[] {
+  if (!Array.isArray(rows)) throw new Error("Daemon reply was not an array");
+  return rows.map(validateDaemonHeartbeat);
+}
+
 /** A structural stand-in for `types.ts`'s `Timer`: `normalizeDaemonTimer`
  * only ever adds/defaults two fields onto whatever object it was given, so
  * it cannot itself prove the daemon reply carried every other required
  * field -- callers already trust that reply enough to cast it, same as
  * before this normalizer existed. */
 type TimerLike = Record<string, unknown>;
+type HeartbeatLike = Record<string, unknown>;
 
 /** True for a plain JSON object eligible for the contract envelope: not an
  * array, not null. Used at the single points that assemble a CLI `--json`

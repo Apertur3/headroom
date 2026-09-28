@@ -123,7 +123,7 @@ export async function fireDueTimers(store: HeadroomStore, home: string, now = ne
       to: claimed.owner, kind: TIMER_DELIVERY_KIND, from: TIMER_DELIVERY_FROM,
       text: JSON.stringify({ timer: claimed.name, at: claimed.at, action: claimed.action }),
       delivery_id: claimed.delivery_id,
-      home, now: sendAt,
+      home, now: sendAt, inFlightTimeoutMs: deliveryTimeoutMs,
     });
     // A late settlement from an abandoned (timed-out) attempt is expected,
     // not a defect: by the time it happens this loop has already moved on,

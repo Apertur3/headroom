@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Timer delivery retries now verify the complete persisted inbox envelope, including its version,
+  sender, and exact timer body, and recognize a message renamed to `.read` during that check.
+  A never-settling write no longer keeps its in-process delivery slot forever: after the delivery
+  timeout a later stale-claim retry can start a new idempotent attempt. Daemon shutdown now keeps
+  its listener healthy in a `stopping` state until background delivery drains and the store closes,
+  so a replacement daemon cannot reclaim a timer while the previous one is still writing.
+- Daemon-sourced heartbeat rows are now structurally validated before CLI or MCP JSON output, and
+  malformed present `attempts` or `failed_at` timer fields are rejected rather than defaulted.
 - Heartbeat lapse checks, timer firing, and the notifier pass now run on a daemon-owned maintenance
   timer independent of account polling: with zero enabled accounts they previously never ran at all,
   and even with accounts enabled a due timer could wait a full poll interval (4-6 minutes at the

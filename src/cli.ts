@@ -45,7 +45,7 @@ import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
-import { isEnvelopable, normalizeDaemonTimers, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
+import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
@@ -508,7 +508,7 @@ async function heartbeat(argv: string[]): Promise<number> {
     const asJson = argv.includes("--json");
     const request = await requestDaemon("heartbeats");
     if (request !== undefined) {
-      const items = unwrapRpc(request) as Heartbeat[];
+      const items = validateDaemonHeartbeats(unwrapRpc(request)) as unknown as Heartbeat[];
       if (asJson) { console.log(JSON.stringify(withContract({ heartbeats: items }))); return 0; }
       printHeartbeats(items);
       return 0;
@@ -1659,7 +1659,7 @@ export async function observe(argv: string[]): Promise<number> {
     // protocol error `unwrapAdditiveRpc` now throws on, never silently
     // folded into "no heartbeats/timers registered" alongside it.
     const heartbeatsRequest = await requestDaemon("heartbeats");
-    heartbeats = heartbeatsRequest === undefined ? [] : unwrapAdditiveRpc(heartbeatsRequest) as Heartbeat[];
+    heartbeats = heartbeatsRequest === undefined ? [] : validateDaemonHeartbeats(unwrapAdditiveRpc(heartbeatsRequest)) as unknown as Heartbeat[];
     const timersRequest = await requestDaemon("timer_list");
     const unwrappedTimers = timersRequest === undefined ? [] : unwrapAdditiveRpc(timersRequest);
     const pendingTimers = normalizeDaemonTimers(unwrappedTimers) as unknown as Timer[];
