@@ -271,6 +271,67 @@ describe("headroom gate", () => {
     } finally { restore(); }
     expect(logs).toContain(`claude-main:all  UNKNOWN (${claudeGrantNeededReason("claude-main")})`);
   });
+
+  it("threads the fill allowance through direct gate/fill reads, lets policy select it, and lets a call override policy", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "policy.toml"), 'allowance = "fill"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    // Two same-used samples inside the 60-minute lookback: a real, measured
+    // zero burn (history exists) rather than a lone sample's null (no
+    // history to derive a rate from at all) -- the fill projection now
+    // refuses on the latter, so every "fill" scenario here needs the former.
+    store.insert(fiveHour(1, -3 * 60_000, 4.5 * HOUR));
+    store.insert(fiveHour(1, 0, 4.5 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["gate", "--need", "5h:50", "--meter", "claude-main:all", "--owner", "x", "--json"])).toBe(0);
+        expect(await main(["gate", "--need", "5h:50", "--meter", "claude-main:all", "--owner", "x", "--allowance", "pro_rata"])).toBe(2);
+        expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x", "--allowance", "fill", "--json"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(JSON.parse(logs[0])).toMatchObject({ allowance_basis: "fill", projected_percent: 1, cap_percent: 90 });
+    expect(JSON.parse(logs[2])).toMatchObject({ allowance_basis: "fill", lanes: { lanes: Math.floor((100 - 1 - 5) / 2) } });
+  });
+
+  it("passes --allowance fill into run's atomic gate", async () => {
+    const home = await seededHome();
+    const store = await HeadroomStore.open(home);
+    // Same zero-burn seeding as the test above -- a lone sample would leave
+    // burn null and the fill projection would now refuse it outright.
+    store.insert(fiveHour(1, -3 * 60_000, 4.5 * HOUR));
+    store.insert(fiveHour(1, 0, 4.5 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["run", "--meter", "claude-main:all", "--need", "5h:50", "--owner", "x", "--allowance", "fill", "--json", "--", process.execPath, "-e", "process.exit(0)"])).toBe(0);
+      });
+    } finally { restore(); }
+    expect(JSON.parse(logs[0])).toMatchObject({ gate: { allowed: true, allowance_basis: "fill" } });
+  });
+
+  it("uses an action class's routing duration as the fill projection horizon", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "routing.toml"), '[cost.review]\npercent = 4\nduration_minutes = 60\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(0, -3 * 60_000, 2 * HOUR));
+    store.insert(fiveHour(1, 0, 2 * HOUR)); // 20 pts/h over three minutes
+    store.close();
+    await withHeadroomHome(home, async () => {
+      expect(await main(["gate", "--need", "5h:60", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill"])).toBe(2);
+      expect(await main(["gate", "--need", "5h:60", "--meter", "claude-main:all", "--owner", "x", "--class", "review", "--allowance", "fill"])).toBe(0);
+    });
+  });
+
+  it("rejects an invalid policy allowance before it can make a gate decision", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "policy.toml"), 'allowance = "unsafe"\n', { mode: 0o600 });
+    await withHeadroomHome(home, async () => {
+      await expect(main(["gate", "--need", "5h:1", "--meter", "claude-main:all", "--owner", "x"])).rejects.toThrow("Invalid Headroom policy");
+    });
+  });
 });
 
 describe("headroom wait", () => {
