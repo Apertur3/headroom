@@ -523,3 +523,39 @@ The rule for changing the schema in the future: append a new migration with the 
 number. Never edit an existing migration's body, even to fix a mistake in it -- a database that
 already ran it has exactly that shape on disk, and a silently changed migration would stop
 describing what such a database actually has. Fix a mistake with a follow-up migration instead.
+
+## Daemon, direct, and cache reads
+
+A CLI or MCP read normally goes to the daemon: it holds the freshest picture and answers over its
+local socket (or named pipe on Windows). Every one of those calls checks `health` first, separately
+from the read itself, because a live daemon may need to poll before it can answer -- that must never
+be mistaken for no daemon at all. Three outcomes follow from that:
+
+- **Daemon answered.** The common case: the daemon's own in-memory/on-disk picture, fresh as of its
+  last poll.
+- **No daemon (`direct`).** No socket at all. The caller polls the vendor itself, on the spot, and
+  writes the result to the store before answering -- this is the only path that both reads and
+  writes in the same call. Marked `source: "direct"` (or, on the CLI, a stderr line) so a caller
+  never mistakes it for the daemon's own cadence.
+- **Daemon unresponsive, served from cache.** A socket exists, but `health` did not answer within its
+  2s budget even after one retry -- a poll cycle's own synchronous store write occasionally still
+  runs long enough under host load to miss that window (see the P0 fix note in this project's
+  changelog). Rather than fail the call outright, five read-only surfaces (`status`/`quota_status`,
+  `history`, `events`/`quota_events`, `rate`/`quota_rate`, and `can`/`quota_can` without a lease) open
+  the store **read-only** (`HeadroomStore.openReadOnly()`, which never migrates or writes) and serve
+  whatever is already there. Freshness and pace are still computed against the current clock, exactly
+  like every other read, so a row that is actually stale still serves stale -- being cached never
+  means being treated as fresher than it is. Marked `served_from: "cache"` plus `daemon:
+  "unresponsive"` (additive JSON fields, or a stderr line on the CLI's bare-array outputs) so a caller
+  can always tell this apart from a live daemon answer.
+
+Every write or dispatch path -- `lease start`, `gate` (with or without `--plan`), `can --lease`,
+`run` -- takes none of this: an unresponsive daemon there is reported as an error, exactly as before
+this fallback existed. Racing a write against the daemon's own connection is the one thing this
+project will not do to make a read more available; see requestDaemon's own doc comment in
+`src/cli.ts` for why.
+
+A `--json` invocation that fails for any reason -- daemon unresponsive on a write path, a usage
+error, anything else `main()` throws -- always prints a `{"error": "<message>"}` object to stdout,
+in addition to the human message on stderr, so a script or agent reading stdout alone can never
+mistake "no answer at all" for "a reading with nothing in it."

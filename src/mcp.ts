@@ -219,6 +219,29 @@ export async function directStatus(dependencies: DirectStatusDependencies = {}):
   } finally { store.close(); }
 }
 
+/**
+ * The read-only cached counterpart of `directStatus`: used only when a
+ * daemon socket exists but would not answer `health` even after one retry
+ * (see `daemonCallReadThrough`). Never polls a vendor and never writes --
+ * `HeadroomStore.openReadOnly()` could not anyway -- it only serves whatever
+ * is already stored, with freshness/pace computed against the current clock
+ * exactly like every other status path, so a stale row still serves stale.
+ * `source: "cache"` and `daemon: "unresponsive"` mark it apart from both a
+ * live daemon answer (no `source` at all) and the no-daemon `"direct"` read.
+ */
+async function cacheStatus(dependencies: DirectStatusDependencies = {}): Promise<DirectResult> {
+  const store = await HeadroomStore.openReadOnly();
+  try {
+    const policy = await readPolicy();
+    const now = dependencies.now?.() ?? new Date();
+    return {
+      source: "cache", daemon: "unresponsive",
+      observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, now), now),
+      failures: [], plan_downgraded: store.planDowngrades()[0] ?? null,
+    };
+  } finally { store.close(); }
+}
+
 async function directCan(action: string, allowUnknown: boolean, owner: string | undefined, expectOverride: number | null, leaseFlag: boolean): Promise<DirectResult> {
   if (!owner?.trim()) throw new Error("owner is required");
   const routing = await readRouting();
@@ -284,6 +307,48 @@ function remainingForDecision(store: HeadroomStore, decision: CanDecision): numb
   return deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
 }
 
+/** The read-only counterpart of `directCanDecision`: `dispatchBlockForMeter`
+ * and `leases()` each self-heal with a write (clearing an expired exhausted
+ * report, marking an expired lease ended) that a read-only connection cannot
+ * make. `dispatchBlockForMeterReadOnly`/`leasesReadOnly` return the same
+ * verdict without it -- see their own doc comments in store.ts. */
+function directCanDecisionReadOnly(store: HeadroomStore, meters: string[], localMeters: string[], localPreference: "fallback" | "prefer" | "never", policy: Awaited<ReturnType<typeof readPolicy>>, allowUnknown: boolean, owner: string, now: Date): CanDecision {
+  const blocked = meters.map((meter) => store.dispatchBlockForMeterReadOnly(meter, now) ?? store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+  if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+  const allMeters = [...new Set([...meters, ...localMeters])];
+  const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+  const burn = store.burnRateFor([...rows.values()].flat(), now);
+  const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+  return canRouteWithLeases(meters, localMeters, enriched, localPreference, policy, allowUnknown, store.leasesReadOnly(undefined, true, now), owner, now);
+}
+
+/**
+ * `quota_can` without `lease: true`, served from the store's stored rows when
+ * the daemon exists but would not answer health even after one retry. Never
+ * polls a local account and never admits/starts a lease -- `lease: true`
+ * never reaches this function at all (see the `atomicCanLease` guard in
+ * handleMcp), so a dispatch decision that can reserve capacity stays exactly
+ * as fail-closed as it is today.
+ */
+async function cacheCan(action: string, allowUnknown: boolean, owner: string | undefined, expectOverride: number | null): Promise<DirectResult> {
+  if (!owner?.trim()) throw new Error("owner is required");
+  const routing = await readRouting();
+  if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
+  const meters = routing.consumes[action];
+  if (!meters) throw new Error(`Unknown action class: ${action || "(missing)"}`);
+  const [policy, accounts, store] = await Promise.all([readPolicy(), readAccounts(), HeadroomStore.openReadOnly()]);
+  try {
+    const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+    if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
+    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const now = new Date();
+    const decision = directCanDecisionReadOnly(store, meters, localMeters, routing.local_preference, policy, allowUnknown, owner, now);
+    const learned = store.learnedCost(action)[0];
+    const cost = buildCostEstimate(action, expectOverride, learned, remainingForDecision(store, decision));
+    return { source: "cache", daemon: "unresponsive", decision, cost, leased_id: null };
+  } finally { store.close(); }
+}
+
 async function directEvents(since: unknown): Promise<DirectResult> {
   const value = typeof since === "string" ? since : new Date(Date.now() - 86_400_000).toISOString();
   const store = await HeadroomStore.open();
@@ -292,6 +357,13 @@ async function directEvents(since: unknown): Promise<DirectResult> {
     store.audit("mcp", "events", null, "ok");
     return { source: "direct", events };
   } finally { store.close(); }
+}
+
+async function cacheEvents(since: unknown): Promise<DirectResult> {
+  const value = typeof since === "string" ? since : new Date(Date.now() - 86_400_000).toISOString();
+  const store = await HeadroomStore.openReadOnly();
+  try { return { source: "cache", daemon: "unresponsive", events: store.events(value) }; }
+  finally { store.close(); }
 }
 
 async function directLeaseStart(arguments_: Record<string, unknown>): Promise<DirectResult> {
@@ -344,6 +416,14 @@ async function directRate(meter: unknown, minutes: unknown, owner: unknown, need
     const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
     store.audit("mcp", "rate", typeof meter === "string" ? meter : null, "ok");
     return { source: "direct", lines };
+  } finally { store.close(); }
+}
+
+async function cacheRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+  const store = await HeadroomStore.openReadOnly();
+  try {
+    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
+    return { source: "cache", daemon: "unresponsive", lines };
   } finally { store.close(); }
 }
 
@@ -489,11 +569,44 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   return directEvents(arguments_.since);
 }
 
+/**
+ * The read-only cached counterpart of `directResult`, dispatched only for
+ * the tool methods `daemonCallReadThrough` found a daemon unresponsive on
+ * (see its own doc comment): `status`, `events`, `rate`, and `can` without a
+ * lease. Every other method never reaches here -- `handleMcp` only takes
+ * this branch when `servedFromCache` is set, which only that eligibility
+ * check ever sets.
+ */
+async function cacheResult(method: string, arguments_: Record<string, unknown>): Promise<DirectResult> {
+  if (method === "status") return cacheStatus();
+  if (method === "can") return cacheCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true, typeof arguments_.owner === "string" ? arguments_.owner : undefined, typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null);
+  if (method === "rate") return cacheRate(arguments_.meter, arguments_.minutes, arguments_.owner, arguments_.need);
+  return cacheEvents(arguments_.since);
+}
+
 async function daemonCall(method: string, params: Record<string, unknown>): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
+}
+
+/**
+ * The read-only counterpart of `daemonCall`, used only for the tool methods
+ * eligible for a cached fallback: `status`, `events`, `rate`, and `can`
+ * without a lease (see handleMcp's own `cacheEligible` check -- `lease: true`
+ * never reaches this function). Retries the health check once before
+ * reporting the daemon unresponsive, exactly like the CLI's
+ * `requestDaemonReadThrough` (src/cli.ts) -- a poll's own synchronous write
+ * (store.ts's `insertPoll`) can occasionally still run past a single 2s
+ * budget under host load, and a second attempt often lands once it has
+ * finished.
+ */
+async function daemonCallReadThrough(method: string, params: Record<string, unknown>): Promise<{ kind: "available"; result: unknown } | { kind: "absent" } | { kind: "cache" }> {
+  const request = await daemonRequest(socketPath(), method, params, 2_000, 30_000, undefined, 2);
+  if (request.status === "available") return { kind: "available", result: request.result };
+  if (request.status === "unresponsive") return { kind: "cache" };
+  return { kind: "absent" };
 }
 
 /**
@@ -601,8 +714,26 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // (see routeFor's own doc comment: an infrequent, deliberate call, not a
     // hot path worth a daemon RPC case) -- both skip the daemon `call` step
     // every other tool takes.
-    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" ? undefined : await call(daemonMethod, params_);
-    const resolved = result === undefined ? await fallback(method, arguments_) : result;
+    const noDaemonStep = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox";
+    // Only a plain read can still answer usefully from stored rows when the
+    // daemon exists but would not answer health even after one retry: never
+    // a write, and never `can` with `lease: true` (a dispatch decision that
+    // could reserve capacity stays exactly as fail-closed as it is today).
+    // `call` is swapped out in tests, so this only ever engages against the
+    // real daemon transport, not a test double standing in for it.
+    const cacheEligible = !noDaemonStep && call === daemonCall
+      && (method === "status" || method === "events" || method === "rate" || (method === "can" && !atomicCanLease));
+    let result: unknown;
+    let servedFromCache = false;
+    if (noDaemonStep) result = undefined;
+    else if (cacheEligible) {
+      const outcome = await daemonCallReadThrough(daemonMethod, params_);
+      if (outcome.kind === "available") result = outcome.result;
+      else if (outcome.kind === "cache") servedFromCache = true;
+    } else {
+      result = await call(daemonMethod, params_);
+    }
+    const resolved = servedFromCache ? await cacheResult(method, arguments_) : result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or
     // from the direct fallback (already bundled with its own cost/leased_id):
