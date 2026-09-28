@@ -22,6 +22,7 @@
   "notices": [
     "unknown (empty array in the fixture data)"
   ],
+  "reserve_ceiling": "string",
   "resets_in_seconds": "number",
   "source": "string",
   "used_5h_percent": "number",

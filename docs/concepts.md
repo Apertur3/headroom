@@ -355,6 +355,42 @@ Example: a burst of parallel lanes that jumps a 5h window from 1% to 23% in ten 
 burst check (well over twice a modest plan rate) even though 23% used is nowhere near the freeze
 reserve -- `gate` refuses with `burst: 48 pts/h over the last 10 min, plan 4 pts/h; hold until 17:45`.
 
+### Dated, expiring reserves
+
+A `[reserve]` entry may carry metadata instead of a bare number, in a sibling table named after the
+meter: `[reserve."codex-main:main"]` with `percent = 30`, `reason = "..."`, `set_at` (ISO, stamped
+automatically by `headroom policy set`), `until` (ISO, optional expiry), and `unless =
+"banked_reset_available"` (optional). The plain bare form (`"codex-main:main" = 30` inside `[reserve]`)
+keeps working exactly as before -- both forms resolve into the same effective floor, and a meter
+with both defined uses whichever was written last. An entry whose `until` has passed no longer
+applies, at all, from that exact instant; `unless = "banked_reset_available"` additionally suspends
+it (also to no floor at all) for the duration that its principal's `:credits` meter carries a
+current, still-usable banked reset (a live manual `headroom credits set` entry, or a fresh, unheld
+vendor-confirmed one) -- once that reset lapses or is spent, the reserve resumes enforcing. Neither
+condition ever *drops* the entry: `headroom policy show` still reports it, marked expired or
+suspended, so an operator can see why a floor that used to bind no longer does.
+
+`freeze_reserve_pct` can carry the same reason/set_at/until metadata too, in its own `[freeze_reserve]`
+table -- its `until` is informational only (shown by `policy show`/a refusal), since silently
+reverting the FREEZE pace threshold to a default the moment a note expires would be a worse surprise
+than the contradiction this feature exists to fix.
+
+Every refusal a reserve or `freeze_reserve_pct` causes (`gate`, `can`, `fill`'s ceiling line, `plan`'s
+ceiling line, `route`) names the policy key, its value, and its reason and `set_at` date when the
+entry has them -- falling back to policy.toml's own last-modified date otherwise, so a refusal never
+reads as a bare unexplained number again. `headroom plan`/`headroom fill` also print a one-line
+ceiling showing every reserve capping the meter, tightest first (`usable to 70%: [reserve]
+codex-main:main = 30 (stop new Codex builds at 70% used, set 2026-09-23); then to 90%:
+freeze_reserve_pct = 10`), with a note when a banked reset is on file ("the reserves block 30 points
+that a banked reset would restore").
+
+`headroom policy set reserve <meter> <percent> --reason "<text>" [--until <ISO|+7d>] [--unless
+banked_reset_available]`, `headroom policy clear reserve <meter>`, and `headroom policy set
+freeze_reserve_pct <n> [--reason ...] [--until ...]` edit policy.toml safely: atomic write, 0600
+mode, a `policy.toml.bak-<timestamp>` backup written first, every other key and comment preserved,
+and a before/after line printed. `headroom policy show` prints every reserve's effective percent,
+metadata, and whether it is currently expired or suspended.
+
 ## Spend ledger
 
 A lease says what an orchestrator *expects* to spend. The spend ledger says what the meter
