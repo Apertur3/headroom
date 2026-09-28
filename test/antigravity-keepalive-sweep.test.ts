@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgyKeepaliveSupervisor, keepaliveStateFilePath, sweepPreviousKeepalive } from "../src/antigravity-keepalive.js";
+import { AgyKeepaliveSupervisor, InvalidKeepaliveEvidenceError, keepaliveStateFilePath, sweepPreviousKeepalive } from "../src/antigravity-keepalive.js";
 import { killTree, processSignature } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
@@ -72,6 +72,31 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
       await supervisor.stop();
 
       await expect(readFile(keepaliveStateFilePath(root), "utf8")).rejects.toThrow();
+    } finally { await supervisor.stop(); }
+  }, 15_000);
+
+  it("treats a missing agy pid file as unconfirmed, not as proof no agy exists, even though the real agy dies via killTree's own ps walk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-missingpid-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, killGraceMs: 100 });
+    try {
+      supervisor.start();
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      track(supervisor.pid, root);
+      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+      // Simulate the pid file becoming unreadable right before stop() -- it
+      // must not read this as "there is no agy to worry about".
+      await rm(`${keepaliveStateFilePath(root)}.agy-pid`, { force: true });
+
+      await supervisor.stop();
+
+      // killTree still reaches agy for real, through its own ps-based walk
+      // of script's tree -- entirely independent of the pid file -- but
+      // stop() itself never proved that on its own terms, so it must not
+      // have cleared its evidence on the strength of merely finding nothing.
+      await waitUntilDead(agyPid);
+      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
     } finally { await supervisor.stop(); }
   }, 15_000);
 });
@@ -358,8 +383,8 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive", () => {
   });
 });
 
-describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2 -- unrecoverable orphans when ps is denied or state was never fully recorded", () => {
-  it("(a) reaps an agy left behind by a daemon that died before recordState() ever ran, entirely without ps", async () => {
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: recovering an agy left behind by a daemon that never finished recording it", () => {
+  it("reaps, and confirms dead, an agy left behind by a daemon that died before recordState() ever ran, entirely without ps", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-provisional-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -369,7 +394,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2
     try {
       await withoutPs(root, async () => {
         crashed.start();
-        track(crashed.pid, root);
+        const scriptPid = track(crashed.pid, root) as number;
         const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
         await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
         // Without `ps`, recordState() can never get past its first ps call --
@@ -382,25 +407,23 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2
 
         // A brand new daemon's startup sweep, still without ps -- the only
         // thing distinguishing this from the old (broken) behaviour: it must
-        // not just shrug and let launch() delete the evidence.
+        // not just shrug and let launch() delete the evidence. For a fresh,
+        // internally-consistent fixture like this one, the ps-free tier must
+        // actually reap agy outright -- not merely tolerate leaving it
+        // unverified, which would let a broken tier still pass this test.
         const result = await sweepPreviousKeepalive(root);
 
-        // Either outcome closes the leak: ps-free evidence (process group
-        // still alive + pid-file mtime matching the recorded launch time) was
-        // strong enough here to reap it outright ...
-        if (result.swept.includes(agyPid)) {
-          await waitUntilDead(agyPid);
-        } else {
-          // ... or, at minimum, it was never silently discarded: it must be
-          // reported so a fresh keepalive refuses to launch on top of it.
-          expect(result.unverified).toContain(agyPid);
-          expect(alive(agyPid)).toBe(true);
-        }
+        expect(result.swept).toEqual([agyPid]);
+        // scriptPid itself is a SEPARATE candidate with no ps-free evidence
+        // of its own (only agy's pid file exists) -- it is correctly, not
+        // spuriously, `unverified` here; this is not the tier under test.
+        expect(result.unverified).toEqual([scriptPid]);
+        await waitUntilDead(agyPid);
       });
     } finally { await crashed.stop(); }
   }, 15_000);
 
-  it("(b) repeated crash/restart cycles across daemon starts never leave more than one agy alive at once", async () => {
+  it("never lets repeated crash/restart cycles across daemon starts leave more than one agy alive at once", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-repeated-crash-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -434,7 +457,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2
     } finally { for (const pid of agyPids) if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
   }, 30_000);
 
-  it("(c) a stale .agy-pid file naming an unrelated live process is never signalled", async () => {
+  it("never signals a stale .agy-pid file naming an unrelated live process", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-stranger-")); temporary.push(root);
     const stranger = spawn(await writeMortalShim(join(root, "stranger")), [], { stdio: "ignore", detached: true });
     const strangerPid = track(stranger.pid, root) as number;
@@ -452,8 +475,8 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: finding 2
   }, 10_000);
 });
 
-describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review round 2 -- mtime bound, kill-failure handling, confirm-before-cleanup, launch generation", () => {
-  it("(1) never verifies a .agy-pid file whose mtime is long AFTER the recorded launch time (no upper bound regression)", async () => {
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: ps-free identity evidence is bounded in both directions", () => {
+  it("never verifies a .agy-pid file whose mtime is long AFTER the recorded launch time (no upper bound regression)", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-futuremtime-")); temporary.push(root);
     // A real, live, detached (so its own process-group leader) process
     // stands in for "the pid the .agy-pid file names, still alive" -- the
@@ -485,7 +508,38 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review ro
     expect(alive(strayPid)).toBe(true);
   }, 10_000);
 
-  it("(2) a signalling failure (kill throwing) does not reject the whole sweep -- the pid is reported unverified, never trusted as swept", async () => {
+  it("never verifies old-but-internally-consistent evidence -- a detached stranger that happens to reuse the recorded pid is never signalled", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-staleevidence-")); temporary.push(root);
+    // A REAL, live, detached (its own process-group leader) process stands
+    // in for a completely unrelated process the OS has since recycled this
+    // exact pid to. The recorded evidence is internally self-consistent --
+    // the pid file's mtime matches launchedAt exactly -- which is the one
+    // thing the mtime-bound check above verifies; an age bound is what has
+    // to reject this in spite of that, since that consistency alone never
+    // expires and would otherwise still pass it however long ago the
+    // original launch happened.
+    const stranger = spawn(await writeMortalShim(join(root, "old-stranger")), [], { stdio: "ignore", detached: true });
+    const strangerPid = track(stranger.pid, root) as number;
+    const oldLaunchedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2 hours ago
+    await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+      scriptPid: strangerPid + 100000, scriptCommand: "", scriptStartedAt: "",
+      launchedAt: oldLaunchedAt, recordedAt: oldLaunchedAt, verified: false,
+    }), { mode: 0o600 });
+    const pidFilePath = `${keepaliveStateFilePath(root)}.agy-pid`;
+    await writeFile(pidFilePath, String(strangerPid), { mode: 0o600 });
+    const oldTime = new Date(Date.parse(oldLaunchedAt));
+    await utimes(pidFilePath, oldTime, oldTime); // mtime matches launchedAt exactly
+
+    const result = await sweepPreviousKeepalive(root);
+
+    expect(result.swept).not.toContain(strangerPid);
+    expect(result.unverified).toContain(strangerPid); // alive, but the evidence is too old to trust
+    expect(alive(strangerPid)).toBe(true);
+  }, 10_000);
+});
+
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: a kill that fails or cannot be confirmed is never trusted as reaped", () => {
+  it("a signalling failure (kill throwing) does not reject the whole sweep -- the pid is reported unverified, never trusted as swept", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-killthrows-")); temporary.push(root);
     const infoFile = join(root, "pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -513,7 +567,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review ro
     } finally { if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
   }, 15_000);
 
-  it("(3) keeps the evidence files and reports unverified when a signalled pid cannot be confirmed dead", async () => {
+  it("keeps the evidence files and reports unverified when a signalled pid cannot be confirmed dead", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-unconfirmed-")); temporary.push(root);
     const infoFile = join(root, "pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -545,8 +599,10 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review ro
       await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
     } finally { if (alive(pid)) await killTree(pid, { graceMs: 100 }); }
   }, 15_000);
+});
 
-  it("(4) recordState() never overwrites a newer launch's record with a stale (superseded-generation) one", async () => {
+describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: a superseded launch's write never overwrites a newer one", () => {
+  it("recordState() never overwrites a newer launch's record with a stale (superseded-generation) one", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-generation-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
@@ -554,7 +610,7 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review ro
     const internal = supervisor as unknown as {
       launchGeneration: number;
       child: unknown;
-      recordState(child: unknown, generation: number): Promise<void>;
+      recordState(child: unknown, generation: number, launchId: string): Promise<void>;
     };
     try {
       supervisor.start();
@@ -579,11 +635,94 @@ describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: review ro
       // Directly invoke recordState() again, standing in for that OLD
       // launch's own (delayed) call finally resolving after a newer launch
       // has already taken over -- exactly the race this generation check
-      // exists to close.
-      await internal.recordState(internal.child, staleGeneration);
+      // exists to close. The launchId passed here is irrelevant: the
+      // generation mismatch alone must already refuse the write.
+      await internal.recordState(internal.child, staleGeneration, "stale-launch-id");
 
       // The stale call must never have overwritten anything.
       await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBe(goodState);
     } finally { await supervisor.stop(); }
+  }, 15_000);
+});
+
+describe.skipIf(process.platform === "win32")("sweepPreviousKeepalive: evidence that cannot be read is never treated as evidence that nothing is there", () => {
+  it("rejects (does not silently report a clean sweep) when the state file exists but is not valid JSON", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-corrupt-state-")); temporary.push(root);
+    await writeFile(keepaliveStateFilePath(root), "{ this is not json", { mode: 0o600 });
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
+
+  it("rejects when the state file exists but does not match the recorded shape", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-wrongshape-")); temporary.push(root);
+    await writeFile(keepaliveStateFilePath(root), JSON.stringify({ hello: "world" }), { mode: 0o600 });
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
+
+  it("rejects when the .agy-pid file exists but does not contain a plain pid", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-badpidfile-")); temporary.push(root);
+    await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, "not-a-pid\n", { mode: 0o600 });
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
+
+  it("rejects when the .agy-pid file is a symlink rather than a plain regular file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-symlinkpidfile-")); temporary.push(root);
+    const elsewhere = join(root, "elsewhere");
+    await writeFile(elsewhere, "123", { mode: 0o600 });
+    await symlink(elsewhere, `${keepaliveStateFilePath(root)}.agy-pid`);
+
+    await expect(sweepPreviousKeepalive(root)).rejects.toBeInstanceOf(InvalidKeepaliveEvidenceError);
+  });
+
+  it("still returns a clean, empty sweep when nothing is there at all (ENOENT stays absent, not invalid)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-sweep-genuinely-empty-")); temporary.push(root);
+
+    await expect(sweepPreviousKeepalive(root)).resolves.toEqual({ swept: [], unverified: [] });
+  });
+});
+
+describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): never acts on evidence a different launch has since claimed", () => {
+  it("neither signals nor clears state once a newer (different) launch's own launchId has replaced this one's in the shared files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-crossinstance-")); temporary.push(root);
+    const infoFileA = join(root, "agy-a.txt");
+    const fakeAgyA = await writeFakeAgy(root, infoFileA);
+    const supervisorA = new AgyKeepaliveSupervisor({ binary: fakeAgyA, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100, killGraceMs: 100 });
+    try {
+      supervisorA.start();
+      const scriptPidA = track(supervisorA.pid, root) as number;
+      const agyPidA = track(Number(await waitForFile(infoFileA)), root) as number;
+      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+
+      // A second, real, live, detached process stands in for a NEWER
+      // launch's own agy -- as if a genuinely different AgyKeepaliveSupervisor
+      // instance, sharing the same `home`, had since started and overwritten
+      // both shared files with its own launchId. In production this exact
+      // interleaving is what the daemon's own serialization (awaiting a
+      // pending stop before ever constructing a new supervisor) prevents;
+      // this test proves the persisted-launchId check holds on its own,
+      // independent of that serialization.
+      const newerAgy = spawn(await writeMortalShim(join(root, "newer-agy")), [], { stdio: "ignore", detached: true });
+      const newerAgyPid = track(newerAgy.pid, root) as number;
+      await writeFile(`${keepaliveStateFilePath(root)}.agy-pid`, String(newerAgyPid), { mode: 0o600 });
+      await writeFile(keepaliveStateFilePath(root), JSON.stringify({
+        scriptPid: newerAgyPid + 100000, scriptCommand: "", scriptStartedAt: "",
+        launchedAt: new Date().toISOString(), recordedAt: new Date().toISOString(),
+        verified: false, launchId: "a-completely-different-launch-id",
+      }), { mode: 0o600 });
+
+      await supervisorA.stop();
+
+      // supervisorA's OWN script+agy are still killed for real, through
+      // killTree's ps walk of ITS OWN scriptPid -- unaffected by any of
+      // this, and not what this test is about.
+      await waitUntilDead(scriptPidA);
+      await waitUntilDead(agyPidA);
+      // The substituted "newer launch"'s process is never touched, and its
+      // evidence survives exactly as written.
+      expect(alive(newerAgyPid)).toBe(true);
+      await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toContain("a-completely-different-launch-id");
+    } finally { await supervisorA.stop(); }
   }, 15_000);
 });

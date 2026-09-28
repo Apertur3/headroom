@@ -37,8 +37,16 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
   }
 }
 
-describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): review round 2 (3) -- confirm before clearing evidence", () => {
-  it("does not clear the recorded state when the confirmation check keeps reporting the target alive after signalling", async () => {
+async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
+  const start = Date.now();
+  while (alive(pid)) {
+    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirming a kill worked before trusting or acting on it", () => {
+  it("stop() does not clear the recorded state when the confirmation check keeps reporting the target alive after signalling", async () => {
     const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-stop-unconfirmed-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
@@ -58,5 +66,45 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop(): re
     // confirm that, so it must not have discarded the evidence.
     expect(alive(agyPid)).toBe(false);
     await expect(readFile(keepaliveStateFilePath(root), "utf8")).resolves.toBeTruthy();
+  }, 15_000);
+
+  it("the unexpected-exit path retries reaping, rather than scheduling a restart, when it cannot confirm the kill worked", async () => {
+    const { spawn: realSpawn } = await import("node:child_process");
+    const { AgyKeepaliveSupervisor, keepaliveStateFilePath } = await import("../src/antigravity-keepalive.js");
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-exit-unconfirmed-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    let spawnCount = 0;
+    const spyingSpawn = ((command: string, args: string[], options: Parameters<typeof realSpawn>[2]) => {
+      spawnCount += 1;
+      return realSpawn(command, args, options);
+    }) as never;
+    const supervisor = new AgyKeepaliveSupervisor({
+      binary: fakeAgy, home: root, pidDiscoveryIntervalMs: 20, pidDiscoveryAttempts: 100,
+      spawn: spyingSpawn, restartDelay: () => 0, // would restart almost instantly if this path let it
+    });
+    try {
+      supervisor.start();
+      const scriptPid = track(supervisor.pid, root) as number;
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      await waitForFile(`${keepaliveStateFilePath(root)}.agy-pid`);
+      expect(spawnCount).toBe(1);
+
+      process.kill(scriptPid, "SIGKILL"); // triggers the unexpected-exit path
+
+      // Long enough for at least one full confirm-timeout window (the
+      // mocked isProcessGroupAlive never lets it succeed) plus margin: if
+      // this path were, incorrectly, scheduling a restart before confirming
+      // anything, a second spawn would show up almost immediately.
+      await new Promise((resolve) => setTimeout(resolve, 1_300));
+
+      expect(spawnCount).toBe(1); // no restart while the kill remains unconfirmed
+      // The evidence a kill was attempted at all is what a later sweep needs
+      // -- and it survives, exactly because no restart ran ahead of it.
+      await expect(readFile(`${keepaliveStateFilePath(root)}.agy-pid`, "utf8")).resolves.toBeTruthy();
+      // The real agy did in fact die for real (SIGKILL cannot be blocked) --
+      // only the mocked confirmation lied about it.
+      await waitUntilDead(agyPid);
+    } finally { await supervisor.stop(); }
   }, 15_000);
 });

@@ -189,6 +189,16 @@ export class HeadroomDaemon {
    * that reads identically to "nothing to worry about" while actually
    * meaning "we never checked". */
   private keepaliveSwept = false;
+  /** Set whenever a keepalive is stopped OUTSIDE of the daemon's own stop()
+   * (currently: currentAccounts() dropping it once no enabled Antigravity
+   * account is left) without waiting for that stop() to finish. Firing
+   * `stop()` and moving on -- the previous behavior -- let a quick
+   * disable-then-re-enable start a brand new AgyKeepaliveSupervisor on the
+   * SAME home/state-file paths while the old one's stop() was still reading
+   * or writing them: the old stop() could then kill the NEW agy or delete
+   * its state. maybeStartKeepalive() awaits this before ever constructing a
+   * new supervisor, so the two can never be in flight at once. */
+  private keepaliveStopPending: Promise<void> | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
   /** Guards against a second timer-firing pass starting while a slow one
@@ -260,6 +270,10 @@ export class HeadroomDaemon {
   /** Start the owned agy PTY once an Antigravity poll needs it. */
   private async maybeStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     if (this.keepalive?.running) return;
+    // Never construct a new supervisor while an old one's stop() might still
+    // be reading or writing the same shared home/state-file paths -- see
+    // keepaliveStopPending's own doc comment.
+    if (this.keepaliveStopPending) await this.keepaliveStopPending;
     if (!this.keepaliveSwept) await this.sweepStaleKeepalive(); // retry: a transient sweep failure must not permanently block every later cycle
     if (!this.keepaliveSwept) {
       void appendDaemonLog("antigravity keepalive: deferring a new launch -- the startup sweep has not completed cleanly yet", this.home);
@@ -1038,7 +1052,13 @@ export class HeadroomDaemon {
     if (this.keepalive?.running && !accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
       const keepalive = this.keepalive;
       this.keepalive = undefined;
-      void keepalive.stop().catch((error: unknown) => appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home));
+      // Tracked (not fired-and-forgotten): maybeStartKeepalive() awaits this
+      // before ever constructing a replacement supervisor, so a quick
+      // disable-then-re-enable can never start a new one while this stop()
+      // is still reading or writing the shared home/state-file paths.
+      this.keepaliveStopPending = keepalive.stop()
+        .catch((error: unknown) => { void appendDaemonLog(`antigravity keepalive stop (disabled): ${safeError(error)}`, this.home); })
+        .finally(() => { this.keepaliveStopPending = undefined; });
     }
     return this.accounts;
   }

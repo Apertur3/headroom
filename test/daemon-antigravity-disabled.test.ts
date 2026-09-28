@@ -89,4 +89,57 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
   }, 15_000);
+
+  it("maybeStartKeepalive() waits for a still-in-flight keepalive stop before constructing a new supervisor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-stopgate-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    const path = testSocketPath(root, "headroom");
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      try { await daemon.start(); }
+      catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") { await daemon.stop(); expect((error as NodeJS.ErrnoException).code).toBe("EPERM"); return; }
+        throw error;
+      }
+      const internal = daemon as unknown as {
+        keepalive: { running: boolean; stop(): Promise<void> } | undefined;
+        keepaliveStopPending: Promise<void> | undefined;
+        maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
+      };
+      // daemon.start() already launched a real keepalive from accounts.toml
+      // (enabled from the start): stop it for real first, so `this.keepalive`
+      // is genuinely undefined/not-running going into the actual assertion
+      // below -- otherwise maybeStartKeepalive()'s very first guard
+      // (`this.keepalive?.running`) would return before ever reaching the
+      // keepaliveStopPending check this test exists to exercise.
+      const firstAgyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      await internal.keepalive?.stop();
+      await waitUntilDead(firstAgyPid);
+      await rm(infoFile, { force: true });
+
+      // Stands in for a previous keepalive's stop() still in flight -- see
+      // currentAccounts()'s disable branch, which assigns exactly this kind
+      // of promise without waiting for it itself. A quick disable-then-
+      // re-enable must not let a new supervisor start while that stop()
+      // might still be reading or writing the same shared home/state-file
+      // paths (see keepaliveStopPending's own doc comment).
+      const stopStartedAt = Date.now();
+      internal.keepaliveStopPending = new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+      const accounts = [{ name: "antigravity", enabled: true, vendor: "antigravity", location: "agy", adapter: "native-ts", agy_path: fakeAgy }];
+      await internal.maybeStartKeepalive(accounts, { antigravity_keepalive: true });
+
+      // Must have waited out the pending stop, not raced past it.
+      expect(Date.now() - stopStartedAt).toBeGreaterThanOrEqual(280);
+      expect(internal.keepalive?.running).toBe(true);
+      const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
+      expect(alive(agyPid)).toBe(true);
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 15_000);
 });
