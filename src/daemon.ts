@@ -865,8 +865,17 @@ async function hasListener(path: string, timeoutMs = 1000): Promise<boolean> {
 /**
  * Probe health separately from a potentially slow request. A live daemon may
  * need to poll before answering `status`; that must not look like no daemon.
+ *
+ * `healthAttempts` (default 1, unchanged for every existing caller) lets a
+ * read-only caller that can serve a clearly-flagged cached answer ask for one
+ * retry before giving up on the daemon: a poll cycle's own synchronous write
+ * (see store.ts's `insertPoll`) can occasionally still run past a single 2s
+ * health budget under host load, and a second attempt often lands once it has
+ * finished. A write/dispatch caller must keep passing the default: retrying
+ * here only ever delays discovering "unresponsive", it never changes a
+ * fail-closed answer into anything less strict.
  */
-export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000, signal?: AbortSignal): Promise<
+export async function daemonRequest(path: string, method: string, params: Json = {}, healthTimeoutMs = 2_000, requestTimeoutMs = 30_000, signal?: AbortSignal, healthAttempts = 1): Promise<
   | { status: "available"; result: unknown }
   | { status: "absent" }
   | { status: "unresponsive" }
@@ -876,7 +885,11 @@ export async function daemonRequest(path: string, method: string, params: Json =
   // reply -- health included -- whose transcript proof does not check out
   // comes back as `undefined`, indistinguishable here from no daemon
   // answering at all. There is nothing left for daemonRequest to double-check.
-  const health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
+  let health: unknown;
+  for (let attempt = 0; attempt < Math.max(1, healthAttempts); attempt += 1) {
+    health = await rpc(path, "health", {}, healthTimeoutMs, Math.min(healthTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
+    if (health !== undefined || signal?.aborted) break;
+  }
   if (signal?.aborted) return { status: "absent" };
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
   const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
