@@ -227,14 +227,67 @@ export class HeadroomDaemon {
    * timer; cleared in stop() so a pending tick never fires (or reschedules)
    * after shutdown. */
   private maintenanceTimer: NodeJS.Timeout | undefined;
+  /** Every whole maintenance pass, including time spent awaiting configuration
+   * before it starts a timer or notifier child promise. stop() must drain
+   * these too: otherwise a pass can resume from that configuration read only
+   * after the store has closed. */
+  private readonly maintenancePassesInFlight = new Set<Promise<unknown>>();
+  /** A request accepted before stop() flips `stopping` may still be awaiting
+   * configuration or a poll. Keep its complete handler promise so shutdown
+   * does not close SQLite while that handler can later resume. */
+  private readonly rpcHandlersInFlight = new Set<Promise<unknown>>();
   /** Every currently-running background notifier pass (runMaintenancePass's
    * own, and poll()'s vendor-triggered one), tracked so stop() can drain
    * them before closing the store out from under a write still in flight --
    * see stop()'s own comment for why this matters together with
    * timerFiringInFlight. */
   private readonly notifyInFlight = new Set<Promise<unknown>>();
+  /** `HeadroomStore` has no public open-state probe. Keep the daemon-owned
+   * state here, and expose only guarded proxies to asynchronous work so every
+   * store method call (including one made by a helper after its own await)
+   * checks shutdown state before reaching SQLite. */
+  private storeOpen = true;
+  private readonly guardedStore: HeadroomStore;
+  /** Timer delivery and notification promises were already part of shutdown's
+   * drain contract before this change. They may finish their durable store
+   * update while the listener is in `stopping`; this proxy still refuses every
+   * method once close begins, but does not cancel work stop() is awaiting. */
+  private readonly drainingStore: HeadroomStore;
 
-  private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits, private readonly deliveryTimeoutMs: number = DELIVERY_TIMEOUT_MS) { this.keepalive = keepalive; }
+  private constructor(private readonly rawStore: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits, private readonly deliveryTimeoutMs: number = DELIVERY_TIMEOUT_MS) {
+    this.keepalive = keepalive;
+    const guarded = (assertUsable: () => void): HeadroomStore => new Proxy(rawStore, {
+      get: (target, property) => {
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? (...args: unknown[]) => {
+          assertUsable();
+          return value.apply(target, args);
+        } : value;
+      },
+    });
+    this.guardedStore = guarded(() => this.assertStoreUsable());
+    this.drainingStore = guarded(() => this.assertStoreOpen());
+  }
+
+  private canUseStore(): boolean { return !this.stopping && this.storeOpen; }
+
+  private assertStoreOpen(): void {
+    if (!this.storeOpen) throw new Error("Headroom store is closed");
+  }
+
+  private assertStoreUsable(): void {
+    if (!this.canUseStore()) throw new Error("Headroom daemon is stopping");
+  }
+
+  private get store(): HeadroomStore {
+    this.assertStoreUsable();
+    return this.guardedStore;
+  }
+
+  private get storeWhileDraining(): HeadroomStore {
+    this.assertStoreOpen();
+    return this.drainingStore;
+  }
 
   static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor; connectionLimits?: Partial<ConnectionLimits>; deliveryTimeoutMs?: number } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
@@ -335,8 +388,12 @@ export class HeadroomDaemon {
     // first would let a replacement resend while this process still writes.
     // handleLine serves health as { state: "stopping" } and rejects every
     // other method during this interval, so it cannot start new store work.
+    // Requests and maintenance passes accepted just before that state change
+    // are tracked below and either finish while the store is open or observe
+    // the stopping guard when one of their awaits resumes.
     await this.drainBackgroundWork();
-    this.store.close();
+    this.storeOpen = false;
+    this.rawStore.close();
     const server = this.server;
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -345,13 +402,18 @@ export class HeadroomDaemon {
     if (process.platform !== "win32") try { await unlink(this.path); } catch { /* already gone */ }
   }
 
-  /** Awaits every currently in-flight maintenance/notifier promise
-   * (timerFiringInFlight, notifyInFlight), capped at STOP_DRAIN_TIMEOUT_MS.
-   * Both are already wrapped with their own `.catch()` at the point they are
-   * created, so neither ever rejects here -- this only ever waits, never
-   * throws. */
+  /** Awaits every current maintenance child, complete maintenance pass, and
+   * accepted RPC handler, capped at STOP_DRAIN_TIMEOUT_MS. The sets are
+   * populated before any of their asynchronous work can yield; after
+   * `stopping` is set no new non-health request or maintenance tick can add
+   * store work. Both background children are already caught at creation, and
+   * boundedWait uses allSettled for the rest, so this only ever waits. */
   private async drainBackgroundWork(): Promise<void> {
-    const pending: Promise<unknown>[] = [...this.notifyInFlight];
+    const pending: Promise<unknown>[] = [
+      ...this.maintenancePassesInFlight,
+      ...this.rpcHandlersInFlight,
+      ...this.notifyInFlight,
+    ];
     if (this.timerFiringInFlight) pending.push(this.timerFiringInFlight);
     if (!pending.length) return;
     await boundedWait(pending, STOP_DRAIN_TIMEOUT_MS);
@@ -503,7 +565,18 @@ export class HeadroomDaemon {
     });
   }
 
-  private async handleLine(line: string, nonce?: string): Promise<HandledLine> {
+  /** Tracks the complete lifetime of a request, rather than only its socket
+   * write or a child poll. This also covers direct test calls through
+   * authedHandleLine(), which intentionally exercise the same private RPC
+   * entry point as the transport. */
+  private handleLine(line: string, nonce?: string): Promise<HandledLine> {
+    const handler = this.handleLineInner(line, nonce);
+    const tracked = handler.finally(() => { this.rpcHandlersInFlight.delete(tracked); });
+    this.rpcHandlersInFlight.add(tracked);
+    return tracked;
+  }
+
+  private async handleLineInner(line: string, nonce?: string): Promise<HandledLine> {
     // Hashed unconditionally, from the exact bytes received, before any
     // parsing: this becomes part of the win32 transcript proof below (see
     // pipeServerProof's own comment), binding the *request* into the
@@ -557,7 +630,7 @@ export class HeadroomDaemon {
     // A rejected request is still audited before it returns: a caller
     // learning nothing about capacity does not mean the daemon saw nothing.
     const reject = (code: number, message: string, subject: string | null = null): HandledLine => {
-      this.store.audit(caller, request.method as string, subject, "rejected");
+      if (this.canUseStore()) this.store.audit(caller, request.method as string, subject, "rejected");
       return finish(rpcError(request.id, code, message));
     };
     if (process.platform === "win32" && request.method !== "health") {
@@ -897,11 +970,14 @@ export class HeadroomDaemon {
         : request.method === "heartbeat_beat" || request.method === "heartbeat_stop" ? (typeof params.owner === "string" ? params.owner : "?")
         : request.method === "timer_set" || request.method === "timer_clear" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.name === "string" ? params.name : "?"}`
         : typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null;
-      this.store.audit(caller, request.method, auditSubject, "ok");
+      // health remains available during shutdown so callers can distinguish
+      // a draining daemon from a dead socket; its informational audit must
+      // not turn that otherwise store-free reply into a closed-store access.
+      if (this.canUseStore()) this.store.audit(caller, request.method, auditSubject, "ok");
       return finish(rpcResult(request.id, result));
     } catch (error) {
-      this.store.audit(caller, request.method, null, "error");
-      const message = safeError(error);
+      if (this.canUseStore()) this.store.audit(caller, request.method, null, "error");
+      const message = this.stopping || !this.storeOpen ? "Headroom daemon is stopping" : safeError(error);
       // The client only ever sees the JSON-RPC error's message; without a
       // matching daemon-log line, a genuine handler exception (as opposed to
       // a domain-level "no" answer) leaves no local trail to diagnose from.
@@ -909,7 +985,7 @@ export class HeadroomDaemon {
       // calls) so the log line is guaranteed to land before the error reply
       // does -- an operator reading the log right after seeing the error
       // must never race an unflushed write.
-      await appendDaemonLog(`${request.method} failed: ${message}`, this.home);
+      if (this.canUseStore()) await appendDaemonLog(`${request.method} failed: ${message}`, this.home);
       return finish(rpcError(request.id, -32000, message));
     }
   }
@@ -936,7 +1012,17 @@ export class HeadroomDaemon {
    * recorded unconditionally either way (`claimDaemonInterval(..., 0)` never
    * refuses), so a poll()-triggered call arriving soon after a scheduler
    * tick still correctly treats the work as already done. */
-  private async runMaintenancePass(now: Date, respectThrottle = true): Promise<void> {
+  /** Tracks the complete pass, including configuration reads that happen
+   * before its existing timer/notifier child promises are created. */
+  private runMaintenancePass(now: Date, respectThrottle = true): Promise<void> {
+    const pass = this.runMaintenancePassInner(now, respectThrottle);
+    const tracked = pass.finally(() => { this.maintenancePassesInFlight.delete(tracked); });
+    this.maintenancePassesInFlight.add(tracked);
+    return tracked;
+  }
+
+  private async runMaintenancePassInner(now: Date, respectThrottle = true): Promise<void> {
+    if (!this.canUseStore()) return;
     if (respectThrottle) { if (!this.store.claimDaemonInterval("heartbeat_timer_check", now, 15_000)) return; }
     else this.store.claimDaemonInterval("heartbeat_timer_check", now, 0);
     // Same ordering rule as poll() below (and the same reasoning): this must
@@ -954,8 +1040,12 @@ export class HeadroomDaemon {
     // must never take heartbeat checks and timer firing down with it -- caught
     // and logged on its own, same as checkHeartbeatLapses's own guard just
     // below, rather than left to propagate and abort the rest of this pass.
-    try { if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents(); }
+    try { if ((await readNotifyConfig(this.home))?.channels.length && this.canUseStore()) this.store.initializeNotificationEvents(); }
     catch (error) { void appendDaemonLog(`notification config read failed: ${safeError(error)}`, this.home); }
+    // The config read above is the common shutdown race: do not start any
+    // later store work when stop() began while it was pending. The guarded
+    // store additionally protects helper calls across their own awaits.
+    if (!this.canUseStore()) return;
     // Never let a defect here (or an unexpected throw from store access)
     // abort the vendor poll this call is about to make: this whole block
     // is best-effort background bookkeeping, not something a caller
@@ -975,7 +1065,7 @@ export class HeadroomDaemon {
       // reusing it for every timestamp would let a --since cursor hide a
       // timer this same pass genuinely delivers later, in real time, than
       // some other message written while it was still busy).
-      this.timerFiringInFlight = fireDueTimers(this.store, this.home, now, undefined, undefined, this.deliveryTimeoutMs, () => new Date())
+      this.timerFiringInFlight = fireDueTimers(this.storeWhileDraining, this.home, now, undefined, undefined, this.deliveryTimeoutMs, () => new Date())
         .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
         .finally(() => { this.timerFiringInFlight = undefined; });
     }
@@ -984,7 +1074,7 @@ export class HeadroomDaemon {
     // executes (see the early-return branches just below this call site in
     // poll()), which a heartbeat_lapsed or timer_missed event must never
     // have to wait on.
-    this.trackNotify(deliverNotifications(this.store, { home: this.home })
+    this.trackNotify(deliverNotifications(this.storeWhileDraining, { home: this.home })
       .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home)));
   }
 
@@ -1110,7 +1200,7 @@ export class HeadroomDaemon {
       // channel must never delay a poll, and the ledger inside carries its
       // own retries. Tracked in notifyInFlight so stop() still drains it
       // before closing the store (see stop()'s own comment).
-      this.trackNotify(deliverNotifications(this.store, { home: this.home })
+      this.trackNotify(deliverNotifications(this.storeWhileDraining, { home: this.home })
         .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home)));
       // Model-catalog reads are throttled to at most once per hour per
       // principal on their own (see MODEL_CHECK_INTERVAL_MS), independent of

@@ -249,11 +249,13 @@ async function findExistingDelivery(directory: string, kind: InboxKind, delivery
  * because the first attempt's write has not landed yet) and both write --
  * or the first's file could be read and renamed to `.read` in the gap
  * between the second's own check and its write, making the delivery
- * reappear as a second, fresh, unread message. Cleared once the attempt
- * itself settles (success or failure), or at the caller's delivery timeout:
- * a truly never-settling attempt must not prevent every future stale-claim
- * retry from making a fresh, idempotent attempt. */
-const inFlightTimerDeliveries = new Map<string, Promise<{ path: string; file: string; session: string; delivered: boolean }>>();
+ * reappear as a second, fresh, unread message. Each entry carries an
+ * attempt token as well as its promise: expiry deliberately removes a slow
+ * attempt from this map so a retry can proceed, but the slow attempt must
+ * then recognize that it was superseded just before it writes. */
+type TimerDeliveryResult = { path: string; file: string; session: string; delivered: boolean };
+interface InFlightTimerDelivery { token: symbol; promise: Promise<TimerDeliveryResult>; }
+const inFlightTimerDeliveries = new Map<string, InFlightTimerDelivery>();
 
 /**
  * The idempotent-by-identity counterpart of `sendInboxMessage`. Calling
@@ -265,15 +267,16 @@ const inFlightTimerDeliveries = new Map<string, Promise<{ path: string; file: st
  * path a retry would otherwise have to guess) is recognized instead of
  * re-sent.
  */
-export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path: string; file: string; session: string; delivered: boolean }> {
+export async function sendInboxMessageAt(options: SendAtOptions): Promise<TimerDeliveryResult> {
   const { session, from } = validateSendOptions(options);
   if (!Number.isInteger(options.delivery_id) || options.delivery_id < 0) throw new Error("delivery_id must be a non-negative integer");
   const inFlightTimeoutMs = options.inFlightTimeoutMs ?? DEFAULT_IN_FLIGHT_TIMER_DELIVERY_TIMEOUT_MS;
   if (!Number.isFinite(inFlightTimeoutMs) || inFlightTimeoutMs <= 0) throw new Error("inFlightTimeoutMs must be greater than 0");
   const key = `${options.home ?? ""}\u0000${session}\u0000${options.kind}\u0000${options.delivery_id}`;
   const inFlight = inFlightTimerDeliveries.get(key);
-  if (inFlight) return inFlight;
-  const attempt = (async (): Promise<{ path: string; file: string; session: string; delivered: boolean }> => {
+  if (inFlight) return inFlight.promise;
+  const token = Symbol("timer-delivery-attempt");
+  const attempt = (async (): Promise<TimerDeliveryResult> => {
     const now = options.now ?? new Date();
     const directory = await sessionDirectory(session, options.home);
     const body = parseBody(options.text);
@@ -281,19 +284,36 @@ export async function sendInboxMessageAt(options: SendAtOptions): Promise<{ path
     if (existing) return { path: existing.path, file: existing.file, session, delivered: false };
     const file = `${now.getTime()}-${options.delivery_id}-${options.kind}.json`;
     const path = join(directory, file);
-    await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body }), 0o600);
-    return { path, file, session, delivered: true };
+    // The delivery timeout may have removed this attempt's in-flight entry
+    // while its initial scan was slow. The check belongs at the atomic
+    // writer's commit boundary, not merely before it opens its temporary
+    // file: otherwise an old writer already awaiting filesystem I/O could
+    // still rename its file after a retry lands. A retry that took over is
+    // the sole writer, and a retry that has already landed (including as
+    // `.read`) is authoritative.
+    const committed = await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body }), 0o600, async () => {
+      const current = inFlightTimerDeliveries.get(key);
+      if (!current || current.token !== token) return false;
+      return (await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body)) === undefined;
+    });
+    if (committed) return { path, file, session, delivered: true };
+    const landed = await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body);
+    if (landed) return { path: landed.path, file: landed.file, session, delivered: false };
+    const successor = inFlightTimerDeliveries.get(key);
+    if (successor && successor.token !== token) return successor.promise;
+    throw new Error("timer delivery attempt was superseded before write");
   })();
-  inFlightTimerDeliveries.set(key, attempt);
+  const entry = { token, promise: attempt };
+  inFlightTimerDeliveries.set(key, entry);
   const expiry = setTimeout(() => {
     // Do not let an older, timed-out attempt erase a newer retry's entry.
-    if (inFlightTimerDeliveries.get(key) === attempt) inFlightTimerDeliveries.delete(key);
+    if (inFlightTimerDeliveries.get(key)?.token === token) inFlightTimerDeliveries.delete(key);
   }, inFlightTimeoutMs);
   expiry.unref?.();
   try { return await attempt; }
   finally {
     clearTimeout(expiry);
-    if (inFlightTimerDeliveries.get(key) === attempt) inFlightTimerDeliveries.delete(key);
+    if (inFlightTimerDeliveries.get(key)?.token === token) inFlightTimerDeliveries.delete(key);
   }
 }
 

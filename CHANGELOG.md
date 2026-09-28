@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Daemon shutdown now drains complete maintenance passes and already accepted RPC handlers, not
+  only their timer-delivery and notification children. Work resuming after configuration I/O is
+  guarded from the closed store and returns a clean stopping error instead of touching SQLite.
+- A timer-delivery attempt that outlives its in-flight timeout now carries an attempt token and
+  rechecks both that token and durable unread/`.read` delivery evidence immediately before writing.
+  A retry that has taken over is now the sole writer, so a late original attempt cannot create a
+  second inbox file.
 - Timer delivery retries now verify the complete persisted inbox envelope, including its version,
   sender, and exact timer body, and recognize a message renamed to `.read` during that check.
   A never-settling write no longer keeps its in-process delivery slot forever: after the delivery

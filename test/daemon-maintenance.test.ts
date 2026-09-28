@@ -25,9 +25,12 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
+import * as configModule from "../src/config.js";
 import * as inboxModule from "../src/inbox.js";
 import { readInbox } from "../src/inbox.js";
 import { tailDaemonLog } from "../src/logs.js";
+import * as notifyModule from "../src/notify.js";
+import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
@@ -127,6 +130,71 @@ describe("daemon-owned maintenance scheduler", () => {
     releaseDelivery!();
     await stopping;
     expect(listenerClosed).toBe(true);
+  });
+
+  it("stop() drains a maintenance pass paused on configuration before its later store work can resume", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-stop-config-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-stop-config"), poller: async () => ({ observations: [], failures: [] }) });
+    const internal = daemon as unknown as { runMaintenancePass(now: Date, respectThrottle?: boolean): Promise<void> };
+    let releaseConfig: () => void;
+    const configGate = new Promise<void>((resolve) => { releaseConfig = resolve; });
+    let configStarted: () => void;
+    const configReadStarted = new Promise<void>((resolve) => { configStarted = resolve; });
+    const notifyConfig = vi.spyOn(notifyModule, "readNotifyConfig").mockImplementation(async () => {
+      configStarted!();
+      await configGate;
+      return undefined;
+    });
+    let stopPromise: Promise<void> | undefined;
+    const pass = internal.runMaintenancePass(new Date(), false);
+    try {
+      await configReadStarted;
+      let stopped = false;
+      stopPromise = daemon.stop().then(() => { stopped = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stopped).toBe(false);
+
+      releaseConfig!();
+      await expect(pass).resolves.toBeUndefined();
+      await stopPromise;
+    } finally {
+      releaseConfig!();
+      await pass.catch(() => { /* cleanup after a failed assertion */ });
+      await (stopPromise ?? daemon.stop()).catch(() => { /* already stopped */ });
+      notifyConfig.mockRestore();
+    }
+  });
+
+  it("stop() drains an accepted RPC paused on configuration and returns its stopping error cleanly", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-maintenance-stop-rpc-")); temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "maintenance-stop-rpc"), poller: async () => ({ observations: [], failures: [] }) });
+    let releasePolicy: () => void;
+    const policyGate = new Promise<void>((resolve) => { releasePolicy = resolve; });
+    let policyStarted: () => void;
+    const policyReadStarted = new Promise<void>((resolve) => { policyStarted = resolve; });
+    const policy = vi.spyOn(configModule, "readPolicy").mockImplementation(async () => {
+      policyStarted!();
+      await policyGate;
+      return defaultPolicy;
+    });
+    let stopPromise: Promise<void> | undefined;
+    const rpc = authedHandleLine(daemon, '{"jsonrpc":"2.0","id":1,"method":"dashboard"}');
+    try {
+      await policyReadStarted;
+      let stopped = false;
+      stopPromise = daemon.stop().then(() => { stopped = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stopped).toBe(false);
+
+      releasePolicy!();
+      await expect(rpc).resolves.toMatchObject({ error: { code: -32000, message: "Headroom daemon is stopping" } });
+      await stopPromise;
+    } finally {
+      releasePolicy!();
+      await rpc.catch(() => { /* cleanup after a failed assertion */ });
+      await (stopPromise ?? daemon.stop()).catch(() => { /* already stopped */ });
+      policy.mockRestore();
+    }
   });
 
   // Unlike the first test above (whose timer is already due the instant the

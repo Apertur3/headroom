@@ -301,6 +301,41 @@ describe("sendInboxMessageAt", () => {
     } finally { writeSpy.mockRestore(); }
   });
 
+  it("does not let a timed-out original write after its retry has already delivered", async () => {
+    const path = await home();
+    const realWriteFileAtomic = securityModule.writeFileAtomic;
+    let writes = 0;
+    let releaseOriginal: () => void;
+    const originalGate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    let originalWriteStarted: () => void;
+    const originalWriteStartedPromise = new Promise<void>((resolve) => { originalWriteStarted = resolve; });
+    const writeSpy = vi.spyOn(securityModule, "writeFileAtomic").mockImplementation(async (writePath, data, mode, beforeCommit) => {
+      writes += 1;
+      if (writes === 1) {
+        originalWriteStarted!();
+        await originalGate;
+      }
+      return realWriteFileAtomic(writePath, data, mode, beforeCommit);
+    });
+    try {
+      const options = { to: "session-superseded", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 68, home: path, inFlightTimeoutMs: 20 };
+      const original = sendInboxMessageAt({ ...options, now: new Date(1_000) });
+      await originalWriteStartedPromise;
+      // The original has started the atomic writer but has not committed.
+      // Once its in-flight entry expires, a retry writes the durable message.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      expect(retry.delivered).toBe(true);
+
+      releaseOriginal!();
+      await expect(original).resolves.toMatchObject({ delivered: false, path: retry.path, file: retry.file });
+      expect(await readdir(join(path, "inbox", "session-superseded"))).toEqual(["2000-68-handoff.json"]);
+    } finally {
+      releaseOriginal!();
+      writeSpy.mockRestore();
+    }
+  });
+
   it("rejects a negative or non-integer delivery_id", async () => {
     const path = await home();
     await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: -1, home: path })).rejects.toThrow(/delivery_id/);

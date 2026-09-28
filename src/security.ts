@@ -232,8 +232,12 @@ export function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
  * `mode`'s POSIX permission bits are meaningless on Windows (`fs.open`
  * accepts the argument there but the resulting file has no such bits to
  * set), which has no directly equivalent per-file ACL this project sets.
+ * `beforeCommit`, when supplied, runs after the temporary file is durable but
+ * immediately before its rename. Returning false abandons that temporary
+ * file without replacing the destination; callers that coordinate a later
+ * identity check can therefore avoid committing a stale result.
  */
-export async function writeFileAtomic(path: string, data: string, mode: number): Promise<void> {
+export async function writeFileAtomic(path: string, data: string, mode: number, beforeCommit?: () => boolean | Promise<boolean>): Promise<boolean> {
   try {
     const existing = await lstat(path);
     if (existing.isSymbolicLink()) throw new Error(`Refusing to write through symlinked destination: ${path}`);
@@ -245,7 +249,14 @@ export async function writeFileAtomic(path: string, data: string, mode: number):
   const handle = await open(temporaryPath, "wx", mode);
   try { await handle.writeFile(data, "utf8"); }
   finally { await handle.close(); }
-  try { await rename(temporaryPath, path); }
+  try {
+    if (beforeCommit && !(await beforeCommit())) {
+      await unlink(temporaryPath).catch(() => {});
+      return false;
+    }
+    await rename(temporaryPath, path);
+    return true;
+  }
   catch (error) { await unlink(temporaryPath).catch(() => {}); throw error; }
 }
 
