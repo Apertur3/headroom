@@ -11,6 +11,18 @@ all -- `quota_wait` because it never blocks (it just reports the reset time), `q
 it's a deliberate, occasional call, not a hot path worth a daemon round trip, and
 `quota_usage_paste` because it is a rare, human-triggered write.
 
+Four read-only tools -- `quota_status`, `quota_events`, `quota_rate`, and `quota_can` without
+`lease: true` -- have a third path beyond "daemon answered" and "no daemon, read directly": a daemon
+socket that exists but does not answer `health` even after one retry (a poll cycle's own write can
+occasionally still run past the 2s budget under host load). Rather than fail the call outright, these
+serve the store's own last-written rows, opened read-only (no poll, no write), with freshness and
+pace still computed against the current clock -- a stale reading still serves stale. The result
+carries `"source": "cache"` and `"daemon": "unresponsive"` so a caller can tell this apart from both a
+live daemon answer (no `source` field at all) and the no-daemon `"source": "direct"` read. Every write
+or dispatch tool (`quota_lease_start`, `quota_gate`, `quota_can` with `lease: true`, and every other
+tool not in that list of four) keeps failing closed exactly as before: a daemon that will not answer
+health is reported as an error, never silently served from cache.
+
 Every tool call is validated against its own declared schema before any dispatch, to the daemon or
 to the direct fallback: an argument of the wrong type, a number outside the bounds noted below (the
 same bounds the CLI's own flags enforce), or a name the tool never declared is refused with a JSON-
@@ -53,7 +65,9 @@ about.
 ```
 
 `structuredContent` is always an object with `observations` and `plan_downgraded`. A direct read
-also has `source: "direct"` and `failures`.
+also has `source: "direct"` and `failures`. A cached read (see above) has `source: "cache"`,
+`daemon: "unresponsive"`, `failures: []`, and no `status_enriched_at` gap to fill in -- it is already
+enriched against the current clock before it is returned.
 
 An MCP server newer than its daemon recognizes an older status array by its missing
 `status_enriched_at` fields and re-enriches it with the current policy and local store before it

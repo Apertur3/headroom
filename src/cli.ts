@@ -57,13 +57,48 @@ function since(value: string | undefined): string {
 }
 
 /** Only fall back to SQLite when no daemon socket exists. A socket which cannot
- * answer health is an operational problem, not permission to race its writer. */
+ * answer health is an operational problem, not permission to race its writer.
+ * Every write/dispatch path (lease start, gate with a lease, `can --lease`,
+ * `run`, and every other command not listed in requestDaemonReadThrough's own
+ * doc comment) keeps calling this, unchanged. */
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
 }
+
+/** The three ways a read-only command's daemon request can come back:
+ * answered live, no daemon at all (the existing no-daemon direct-read
+ * fallback still applies), or a daemon that exists but would not answer
+ * health even after one retry -- servable from the store's own last-written
+ * rows, read-only, no poll, no write. */
+type DaemonReadOutcome = { kind: "available"; result: unknown } | { kind: "absent" } | { kind: "cache" };
+
+/**
+ * The read-only counterpart of `requestDaemon`, for exactly the commands
+ * that can still answer usefully from stored rows when a live daemon is slow:
+ * `status` (including bare `headroom`), `history`, `events`, `rate`, and
+ * `can` without `--lease`. Retries the health check once (a poll's own
+ * synchronous write occasionally still runs past a single 2s budget under
+ * host load -- see store.ts's `insertPoll`) before treating the daemon as
+ * unresponsive; only then does the caller open `HeadroomStore.openReadOnly()`
+ * and serve whatever is already stored, clearly flagged. Every write or
+ * dispatch path (lease start, gate with a lease, `can --lease`, `run`) must
+ * keep calling `requestDaemon` instead: this never changes what a fail-closed
+ * caller decides, only what a read-only caller may still answer from.
+ */
+async function requestDaemonReadThrough(method: string, params: Record<string, unknown> = {}): Promise<DaemonReadOutcome> {
+  const request = await daemonRequest(socketPath(), method, params, 2_000, 30_000, undefined, 2);
+  if (request.status === "available") return { kind: "available", result: request.result };
+  if (request.status === "unresponsive") return { kind: "cache" };
+  return { kind: "absent" };
+}
+
+/** Mirrors `directReadNotice()`'s stderr-only convention: a script reading
+ * only stdout never has to special-case this, and a human at a terminal
+ * still sees it regardless of --json or the human-table view. */
+function cacheReadNotice(): void { process.stderr.write("(served from cache; daemon busy, not a fresh read)\n"); }
 
 export interface ThresholdWindow {
   meter_id: string;
@@ -91,12 +126,19 @@ async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: headroom history <meter> [--since 24h]");
   const at = argv.indexOf("--since");
-  const request = await requestDaemon("history", { meter, since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { console.log(JSON.stringify(unwrapRpc(request))); return 0; }
+  const sinceValue = since(at >= 0 ? argv[at + 1] : undefined);
+  const outcome = await requestDaemonReadThrough("history", { meter, since: sinceValue });
+  if (outcome.kind === "available") { console.log(JSON.stringify(unwrapRpc(outcome.result))); return 0; }
+  if (outcome.kind === "cache") {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try { console.log(JSON.stringify(store.history(meter, sinceValue))); return 0; }
+    finally { store.close(); }
+  }
   directReadNotice();
   const store = await HeadroomStore.open();
   try {
-    const items = store.history(meter, since(at >= 0 ? argv[at + 1] : undefined));
+    const items = store.history(meter, sinceValue);
     store.audit("cli", "history", meter, "ok");
     console.log(JSON.stringify(items));
     return 0;
@@ -106,12 +148,19 @@ async function history(argv: string[]): Promise<number> {
 async function events(argv: string[]): Promise<number> {
   const at = argv.indexOf("--since");
   const table = argv.includes("--table");
-  const request = await requestDaemon("events", { since: since(at >= 0 ? argv[at + 1] : undefined) });
-  if (request !== undefined) { printEventsOutput(unwrapRpc(request) as HeadroomEvent[], table); return 0; }
+  const sinceValue = since(at >= 0 ? argv[at + 1] : undefined);
+  const outcome = await requestDaemonReadThrough("events", { since: sinceValue });
+  if (outcome.kind === "available") { printEventsOutput(unwrapRpc(outcome.result) as HeadroomEvent[], table); return 0; }
+  if (outcome.kind === "cache") {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try { printEventsOutput(store.events(sinceValue), table); return 0; }
+    finally { store.close(); }
+  }
   directReadNotice();
   const store = await HeadroomStore.open();
   try {
-    const items = store.events(since(at >= 0 ? argv[at + 1] : undefined));
+    const items = store.events(sinceValue);
     store.audit("cli", "events", null, "ok");
     printEventsOutput(items, table);
     return 0;
@@ -206,11 +255,41 @@ async function can(argv: string[]): Promise<number> {
   const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
   if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
 
-  const request = await requestDaemon("can", { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner });
-  let decision: CanDecision;
-  if (request !== undefined) {
-    decision = unwrapRpc(request) as CanDecision;
+  const daemonParams = { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner };
+  // `--lease` is a dispatch path (it can reserve capacity) and must stay
+  // fail-closed exactly as before: only a plain advisory `can` (no --lease)
+  // is eligible for the read-only cached fallback below.
+  let request: unknown;
+  let decision!: CanDecision;
+  let servedFromCache = false;
+  if (leaseFlag) {
+    request = await requestDaemon("can", daemonParams);
+    if (request !== undefined) decision = unwrapRpc(request) as CanDecision;
   } else {
+    const outcome = await requestDaemonReadThrough("can", daemonParams);
+    if (outcome.kind === "available") { request = outcome.result; decision = unwrapRpc(outcome.result) as CanDecision; }
+    else if (outcome.kind === "cache") {
+      servedFromCache = true;
+      cacheReadNotice();
+      const readStore = await HeadroomStore.openReadOnly();
+      try {
+        const policy = await readPolicy();
+        const localAccounts = accounts.filter(isLocalAccount);
+        const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
+        const allMeters = [...new Set([...meters, ...localMeters])];
+        const now = new Date();
+        const blocked = meters.map((item) => readStore.dispatchBlockForMeterReadOnly(item, now) ?? readStore.dispatchBlockForPrincipal(item.split(":")[0])).find(Boolean);
+        if (blocked) decision = { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+        else {
+          const rows = new Map(allMeters.map((meter) => [meter, readStore.latestPerWindow(meter)]));
+          const burn = readStore.burnRateFor([...rows.values()].flat(), now);
+          const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+          decision = canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, policy, argv.includes("--allow-unknown"), readStore.leasesReadOnly(undefined, true, now), owner, now);
+        }
+      } finally { readStore.close(); }
+    }
+  }
+  if (decision === undefined) {
     directReadNotice();
     const [policy, directStore] = await Promise.all([readPolicy(), HeadroomStore.open()]);
     try {
@@ -289,7 +368,7 @@ async function can(argv: string[]): Promise<number> {
     leasedId = payload.leases[0]?.id;
   }
 
-  printCan(decision, cost, leasedId, argv.includes("--json"));
+  printCan(decision, cost, leasedId, argv.includes("--json"), servedFromCache);
   return decision.allowed ? 0 : 2;
 }
 
@@ -514,10 +593,15 @@ async function rate(argv: string[]): Promise<number> {
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
-  const request = await requestDaemon("rate", { meter, minutes, owner, need });
+  const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
   let lines: RateLine[];
-  if (request !== undefined) { lines = unwrapRpc(request) as RateLine[]; }
-  else {
+  if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
+  else if (outcome.kind === "cache") {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
+    finally { store.close(); }
+  } else {
     directReadNotice();
     const store = await HeadroomStore.open();
     try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
@@ -1123,14 +1207,21 @@ export async function observe(argv: string[]): Promise<number> {
   // whatever the daemon last cached. A no-daemon direct read already polls
   // fresh on every call, so this is a no-op there.
   if (argv.includes("--refresh") || option(argv, "--ttl") === "0") {
-    const refreshed = await requestDaemon("refresh", { principal });
-    if (refreshed !== undefined) {
-      const outcome = unwrapRpc(refreshed) as { rate_limited?: true } | Observation[];
-      if (outcome && !Array.isArray(outcome) && outcome.rate_limited) process.stderr.write("(refresh throttled by the daemon's own poll interval or vendor backoff; showing the latest cached reading)\n");
-    }
+    // Best-effort: a daemon too slow to force a fresh probe right now must
+    // not fail the whole status read, which may still be servable from
+    // cache below -- exactly the outcome this whole call would otherwise
+    // hide behind a thrown "unresponsive" error.
+    try {
+      const refreshed = await requestDaemon("refresh", { principal });
+      if (refreshed !== undefined) {
+        const refreshOutcome = unwrapRpc(refreshed) as { rate_limited?: true } | Observation[];
+        if (refreshOutcome && !Array.isArray(refreshOutcome) && refreshOutcome.rate_limited) process.stderr.write("(refresh throttled by the daemon's own poll interval or vendor backoff; showing the latest cached reading)\n");
+      }
+    } catch { /* handled below: the plain status request right after this retries health once. */ }
   }
-  const request = await requestDaemon("status");
-  const daemonObservations = request === undefined ? undefined : unwrapRpc(request) as Observation[];
+  const outcome = await requestDaemonReadThrough("status");
+  const daemonObservations = outcome.kind === "available" ? unwrapRpc(outcome.result) as Observation[] : undefined;
+  const servedFromCache = outcome.kind === "cache";
   const policy = await readPolicy();
   let observations: Observation[];
   let failures: string[];
@@ -1140,13 +1231,30 @@ export async function observe(argv: string[]): Promise<number> {
   let planDowngraded: PlanDowngrade[] = [];
   let directCatalogAccounts: ProviderAccount[] | undefined;
   let directCatalogHome: string | undefined;
-  const direct = daemonObservations === undefined;
+  const direct = outcome.kind === "absent";
   if (daemonObservations) {
     const daemonRows = daemonObservations.filter((item) => !principal || item.principal_id === principal);
     observations = await normalizeUnmarkedDaemonStatus(daemonRows, policy.staleness_minutes);
     failures = [];
     const leaseRequest = await requestDaemon("leases");
     leases = leaseRequest === undefined ? [] : unwrapRpc(leaseRequest) as Lease[];
+  } else if (servedFromCache) {
+    cacheReadNotice();
+    const store = await HeadroomStore.openReadOnly();
+    try {
+      const rawObservations = store.latestPerWindow().filter((item) => !principal || item.principal_id === principal);
+      const now = new Date();
+      // Freshness/pace are computed against the CURRENT clock here, exactly
+      // like every other status path: a stored row served stale here stays
+      // stale, never a falsely fresh capacity reading just because it came
+      // from the cache instead of a live poll.
+      observations = withStatusInfo(rawObservations, store.burnRateFor(rawObservations, now), store.lastKnownFor(rawObservations, now), policy.staleness_minutes, now);
+      failures = [];
+      resetSeen = store.resetSeenFor(observations);
+      freeResetUsed = store.freeResetUsedFor(observations);
+      leases = store.leasesReadOnly(undefined, true, now);
+      planDowngraded = store.planDowngrades(new Set(observations.map((item) => item.principal_id)));
+    } finally { store.close(); }
   } else {
     const store = await HeadroomStore.open();
     try {
@@ -1170,7 +1278,7 @@ export async function observe(argv: string[]): Promise<number> {
       store.audit("cli", "observe", principal ?? null, failures.length ? "partial" : "ok");
     } finally { store.close(); }
   }
-  if (!direct) {
+  if (outcome.kind === "available") {
     const windows = observations.map((item) => ({ meter_id: item.meter_id, minutes: item.window?.minutes, resets_at: item.resets_at }));
     const resetEvents = unwrapRpc(await requestDaemon("reset_seen", { windows })) as Record<string, string>;
     resetSeen = new Map(Object.entries(resetEvents));
@@ -1184,20 +1292,14 @@ export async function observe(argv: string[]): Promise<number> {
   if (direct && (view.form !== "grouped" || argv.includes("--json"))) directReadNotice();
   const thresholdRows = threshold === undefined ? undefined : thresholdReport(observations, threshold);
   const leaseMap = new Map<string, Lease[]>(); for (const item of leases) leaseMap.set(item.meter_id, [...(leaseMap.get(item.meter_id) ?? []), item]);
-  // Additive surfaces (see .claude/lanes/specs/heartbeat.md item 4): every
-  // registered heartbeat lease, and every pending timer already at or past
-  // its own `at` -- a daemon-side notion ("due"), recomputed here
-  // client-side from the same `timer_list` a no-daemon fallback would read.
-  let heartbeats: Heartbeat[];
-  let dueTimers: Timer[];
-  if (direct) {
-    const store = await HeadroomStore.open();
-    try { heartbeats = store.heartbeats(); dueTimers = store.timers().filter((item) => Date.parse(item.at) <= Date.now()); }
-    finally { store.close(); }
-  } else {
-    // An older daemon (or, in tests, a mocked one) may not answer these two
-    // methods with an array at all -- treated the same as "none", never a
-    // crash, matching how `leases`/`plan_downgrades` are read just above.
+  // Additive surfaces: every registered heartbeat lease, and every pending
+  // timer already at or past its own `at` -- recomputed client-side from the
+  // same timer list a no-daemon read would use.
+  let heartbeats: Heartbeat[] = [];
+  let dueTimers: Timer[] = [];
+  if (outcome.kind === "available") {
+    // An older daemon may not answer these two methods with an array at all --
+    // treated the same as "none", never a crash, like `leases` above.
     const heartbeatsRequest = await requestDaemon("heartbeats");
     const unwrappedHeartbeats = heartbeatsRequest === undefined ? [] : unwrapRpc(heartbeatsRequest);
     heartbeats = Array.isArray(unwrappedHeartbeats) ? unwrappedHeartbeats as Heartbeat[] : [];
@@ -1205,12 +1307,22 @@ export async function observe(argv: string[]): Promise<number> {
     const unwrappedTimers = timersRequest === undefined ? [] : unwrapRpc(timersRequest);
     const pendingTimers = Array.isArray(unwrappedTimers) ? unwrappedTimers as Timer[] : [];
     dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
+  } else {
+    // No daemon (direct) or an unresponsive one (cache): read the store
+    // directly -- read-only in the cache case, never racing the live writer.
+    // A store from before these tables existed reads as "none".
+    try {
+      const store = direct ? await HeadroomStore.open() : await HeadroomStore.openReadOnly();
+      try { heartbeats = store.heartbeats(); dueTimers = store.timers().filter((item) => Date.parse(item.at) <= Date.now()); }
+      finally { store.close(); }
+    } catch { heartbeats = []; dueTimers = []; }
   }
   if (argv.includes("--json")) {
     const lapsed = withCreditsLapsed(observations);
-    console.log(JSON.stringify(withContract(thresholdRows === undefined
-      ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers }
-      : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) } })));
+    // Additive only, present only over the cached fallback -- see printCan's
+    // identical convention for `can --json`.
+    const cacheFields = servedFromCache ? { served_from: "cache" as const, daemon: "unresponsive" as const } : {};
+    console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, ...cacheFields } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) }, ...cacheFields })));
   }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
@@ -1292,8 +1404,16 @@ function dedupeStateReason(state: string, reason: string): string {
   return match ? match[1] : reason;
 }
 
-function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean): void {
-  if (asJson) { console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null }))); return; }
+function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | undefined, asJson: boolean, servedFromCache = false): void {
+  if (asJson) {
+    // Additive only: absent unless this decision came from the read-only
+    // cached fallback (a live daemon that would not answer health even after
+    // one retry), so an existing caller matching on this object's shape sees
+    // no change at all on the ordinary path.
+    const cacheFields = servedFromCache ? { served_from: "cache" as const, daemon: "unresponsive" as const } : {};
+    console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null, ...cacheFields })));
+    return;
+  }
   console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
   for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
   if (cost.expected_percent !== null) {
@@ -1864,9 +1984,36 @@ export function isAccountsMissingError(error: unknown): boolean {
   return sameMissingFile(errno.path, accountsPath());
 }
 
+/**
+ * Runs `main()` the way the real CLI entry point below does, catching
+ * whatever it throws and turning that into an exit code instead of a
+ * rejection. `main()` itself keeps its existing throw-on-error contract
+ * unchanged (every `await expect(main(...)).rejects.toThrow(...)` test
+ * depends on that); this wrapper is what the entry point -- and a test that
+ * wants the entry point's own error handling, not `main()`'s raw throw --
+ * should call instead.
+ *
+ * A `--json` caller (an agent reading stdout, most of all) must never see
+ * empty stdout on a failed read: with no JSON printed here, a thrown error
+ * used to leave stdout completely empty (only the stderr line below), so "no
+ * answer at all" and "an empty but valid reading" were indistinguishable
+ * from stdout alone. This still prints the same stderr line for a human at
+ * a terminal; the JSON object on stdout is additional, not a replacement.
+ */
+export async function runCli(argv: string[]): Promise<number> {
+  const printJsonError = (message: string): void => { if (argv.includes("--json")) console.log(JSON.stringify({ error: message })); };
+  try {
+    return await main(argv);
+  } catch (error) {
+    if (isAccountsMissingError(error)) {
+      const message = "No accounts configured yet. Run: headroom accounts discover";
+      printJsonError(message); console.error(message); return 1;
+    }
+    const message = safeError(error);
+    printJsonError(message); console.error(`headroom error: ${message}`); return 1;
+  }
+}
+
 if (isMainModule(import.meta.url, process.argv[1])) {
-  main(process.argv.slice(2)).then((code) => { process.exitCode = code; }).catch((error) => {
-    if (isAccountsMissingError(error)) { console.error("No accounts configured yet. Run: headroom accounts discover"); process.exitCode = 1; return; }
-    console.error(`headroom error: ${safeError(error)}`); process.exitCode = 1;
-  });
+  runCli(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }
