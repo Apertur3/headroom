@@ -170,7 +170,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired" | "heartbeat_lapsed" | "heartbeat_restored" | "timer_missed";
 
 /** One vendor model id known to Headroom for a principal, as read from that
  * vendor's own local model catalog (never fabricated, never inferred from
@@ -274,5 +274,45 @@ export interface HeadroomEvent {
    * Headroom can already see a meter of its own for this id (`shares_pool:
    * false`) or a current generic meter (`shares_pool: true`). Undefined
    * means no current fresh official meter establishes either relationship. */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean } | null;
+  /** On `heartbeat_lapsed`/`heartbeat_restored`: the owner whose heartbeat
+   * lapsed or resumed, its configured interval, its last beat before the
+   * lapse (or the beat that closed it), and, on a lapse, the resume sentence
+   * that owner registered -- what a human or a fresh session should do to
+   * pick the work back up. On `timer_missed`: the owner and timer name whose
+   * due wake-up fired while that owner's heartbeat was lapsed, and the
+   * action text Headroom delivered (never executed). */
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean; owner?: string; interval_ms?: number; last_beat_at?: string; resume_sentence?: string | null; timer_name?: string; action?: string } | null;
+}
+
+/** One orchestrator heartbeat lease: an owner's promise to beat at least
+ * every `interval_ms`, so the daemon -- the one process that survives a
+ * crashed session -- can notice when it stops and say what a fresh session
+ * should do about it. `lapsed_since` is non-null exactly while the daemon
+ * currently considers this heartbeat overdue by more than 2x its interval. */
+export interface Heartbeat {
+  owner: string;
+  interval_ms: number;
+  resume_sentence: string | null;
+  started_at: string;
+  last_beat_at: string;
+  lapsed_since: string | null;
+  updated_at: string;
+}
+
+/** One named wake-up: `at` is when it is due, `action` the text Headroom only
+ * ever delivers (as one inbox entry to `owner`), never executes. `if_missed`
+ * controls whether a due timer whose owner's heartbeat is currently lapsed
+ * also raises a `timer_missed` notification, in addition to the inbox entry
+ * every due timer always gets. `fired_at`/`cleared_at` are set once, never
+ * cleared, so a timer's history stays inspectable after it fires or is
+ * cleared. */
+export interface Timer {
+  owner: string;
+  name: string;
+  at: string;
+  action: string;
+  if_missed: "notify" | "drop";
+  created_at: string;
+  fired_at: string | null;
+  cleared_at: string | null;
 }

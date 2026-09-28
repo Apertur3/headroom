@@ -17,6 +17,7 @@ import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "./orchestrat
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
 import { checkModelAvailability } from "./model-catalog.js";
+import { fireDueTimers } from "./heartbeat.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
@@ -176,6 +177,13 @@ export class HeadroomDaemon {
   private keepalive: AgyKeepaliveSupervisor | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
+  /** Guards against a second timer-firing pass starting while a slow one
+   * (an inbox write that outlasts the 15s poll throttle below) is still
+   * running: see poll()'s own throttled block. `store.claimTimer`'s
+   * per-timer atomicity already makes two genuinely overlapping passes safe
+   * on their own, but this avoids the wasted duplicate `dueTimers()` scan
+   * and log noise a second pass would otherwise produce. */
+  private timerFiringInFlight: Promise<number> | undefined;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
 
@@ -573,6 +581,41 @@ export class HeadroomDaemon {
           break;
         }
         case "leases": result = this.store.leases(undefined, true); break;
+        case "heartbeat_beat": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const intervalMs = typeof params.interval_ms === "number" ? params.interval_ms : Number.NaN;
+          if (!owner.trim()) return reject(-32602, "owner is required");
+          if (!Number.isFinite(intervalMs) || intervalMs <= 0) return reject(-32602, "interval_ms must be positive", owner);
+          const resumeSentence = params.resume_sentence === null ? null : typeof params.resume_sentence === "string" ? params.resume_sentence : undefined;
+          result = this.store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date()); break;
+        }
+        case "heartbeat_stop": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          if (!owner.trim()) return reject(-32602, "owner is required");
+          result = { stopped: this.store.heartbeatStop(owner) }; break;
+        }
+        case "heartbeats": result = this.store.heartbeats(); break;
+        case "timer_set": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const timerName = typeof params.name === "string" ? params.name : "";
+          const at = typeof params.at === "string" ? params.at : "";
+          const action = typeof params.action === "string" ? params.action : "";
+          const ifMissed = params.if_missed === "drop" ? "drop" : "notify";
+          if (!owner.trim() || !timerName.trim()) return reject(-32602, "owner and name are required");
+          if (!action.trim()) return reject(-32602, "action is required", `${owner}:${timerName}`);
+          if (!Number.isFinite(Date.parse(at))) return reject(-32602, "at must be a valid ISO instant", `${owner}:${timerName}`);
+          result = this.store.setTimer(owner, timerName, at, action, ifMissed, new Date()); break;
+        }
+        case "timer_list": {
+          const owner = typeof params.owner === "string" && params.owner.trim() ? params.owner.trim() : undefined;
+          result = this.store.timers(owner); break;
+        }
+        case "timer_clear": {
+          const owner = typeof params.owner === "string" ? params.owner : "";
+          const timerName = typeof params.name === "string" ? params.name : "";
+          if (!owner.trim() || !timerName.trim()) return reject(-32602, "owner and name are required");
+          result = { cleared: this.store.clearTimer(owner, timerName) }; break;
+        }
         case "refresh": {
           const principal = typeof params.principal === "string" ? params.principal : undefined;
           result = await this.poll(principal, true); break;
@@ -683,6 +726,8 @@ export class HeadroomDaemon {
       // request, see callerFrom) does not identify which lease was touched.
       const auditSubject = request.method === "lease_start" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.meter_id === "string" ? params.meter_id : "?"}`
         : request.method === "lease_end" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.id === "string" ? params.id : "?"}`
+        : request.method === "heartbeat_beat" || request.method === "heartbeat_stop" ? (typeof params.owner === "string" ? params.owner : "?")
+        : request.method === "timer_set" || request.method === "timer_clear" ? `${typeof params.owner === "string" ? params.owner : "?"}:${typeof params.name === "string" ? params.name : "?"}`
         : typeof params.principal === "string" ? params.principal : typeof params.meter === "string" ? params.meter : null;
       this.store.audit(caller, request.method, auditSubject, "ok");
       return finish(rpcResult(request.id, result));
@@ -704,6 +749,37 @@ export class HeadroomDaemon {
   private async poll(principal: string | undefined, forced: boolean): Promise<PollResult | { rate_limited: true }> {
     const key = principal ?? "all";
     const now = Date.now();
+    // Heartbeat lapse detection and due-timer firing are independent of any
+    // vendor poll -- an owner may register a heartbeat with zero accounts
+    // configured at all -- so they run here, at the top of every poll() call
+    // (itself reached on every scheduled tick and every capacity-checking
+    // RPC), throttled to at most once every 15s so a burst of RPCs from a
+    // busy orchestrator does not turn this into a hot loop. A dedicated
+    // notification pass follows immediately: the vendor-poll notify pass
+    // below only runs once the poller itself actually executes (see the
+    // early-return branches just below this), which a heartbeat_lapsed or
+    // timer_missed event must never have to wait on.
+    if (this.store.claimDaemonInterval("heartbeat_timer_check", new Date(now), 15_000)) {
+      // Never let a defect here (or an unexpected throw from store access)
+      // abort the vendor poll this call is about to make: this whole block
+      // is best-effort background bookkeeping, not something a caller
+      // waiting on capacity should ever fail behind.
+      try { this.store.checkHeartbeatLapses(new Date(now)); }
+      catch (error) { void appendDaemonLog(`heartbeat lapse check failed: ${safeError(error)}`, this.home); }
+      // Single-flight: a slow inbox write can outlast this 15s throttle, and
+      // starting a second pass while the first is still running would let
+      // both see the same due timer as a candidate. store.claimTimer's own
+      // per-timer atomicity already makes that safe (only one claim can
+      // succeed), but skipping the second pass entirely avoids the wasted
+      // work and duplicate log lines it would otherwise produce.
+      if (!this.timerFiringInFlight) {
+        this.timerFiringInFlight = fireDueTimers(this.store, this.home, new Date(now))
+          .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
+          .finally(() => { this.timerFiringInFlight = undefined; });
+      }
+      void deliverNotifications(this.store, { home: this.home })
+        .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
+    }
     const policy = await readPolicy(); // mtime/reload safe: no cached config survives a request or SIGHUP.
     // Settings can enable notifications without restarting the daemon. Take
     // the history boundary before this poll creates its first eligible event.

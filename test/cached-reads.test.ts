@@ -113,6 +113,10 @@ describe("cached read-only fallback against a genuinely unresponsive daemon", ()
       expect(payload.daemon).toBe("unresponsive");
       expect(payload.observations).toEqual([]);
       expect(payload.leases).toEqual([]);
+      // CLI/MCP parity (see mcp.ts's cacheStatus): the cache path carries
+      // these two additive fields exactly like the daemon and direct paths.
+      expect(payload.heartbeats).toEqual([]);
+      expect(payload.due_timers).toEqual([]);
       // A one-line human-readable note lands on stderr regardless of --json,
       // the same convention the existing no-daemon direct-read notice uses.
       const stderrLines = errSpy.mock.calls.map((call) => String(call[0])).join("");
@@ -196,6 +200,10 @@ describe("MCP cached read-only fallback against a genuinely unresponsive daemon"
       expect(content.source).toBe("cache");
       expect(content.daemon).toBe("unresponsive");
       expect(content.observations).toEqual([]);
+      // CLI/MCP parity: quota_status's cache path carries these two
+      // additive fields exactly like `headroom status --json` does.
+      expect(content.heartbeats).toEqual([]);
+      expect(content.due_timers).toEqual([]);
     } finally {
       if (previousHome === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previousHome;
       fake.stop();

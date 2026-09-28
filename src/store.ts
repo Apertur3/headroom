@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
-import type { EventKind, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, HeadroomEvent } from "./types.js";
+import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, paceDecision } from "./policy.js";
@@ -236,6 +236,14 @@ export interface CreditBalance {
 
 function leaseFromRow(row: Row): Lease {
   return { id: String(row.id), owner: String(row.owner), meter_id: String(row.meter_id), expected_percent: number(row.expected_percent), note: displayLeaseNote(string(row.note)), action_class: string(row.action_class), started_at: String(row.started_at), expires_at: String(row.expires_at), ended_at: string(row.ended_at), ended_reason: string(row.ended_reason), spent_percent: Number(row.spent_percent ?? 0) };
+}
+
+function heartbeatFromRow(row: Row): Heartbeat {
+  return { owner: String(row.owner), interval_ms: Number(row.interval_ms), resume_sentence: string(row.resume_sentence), started_at: String(row.started_at), last_beat_at: String(row.last_beat_at), lapsed_since: string(row.lapsed_since), updated_at: String(row.updated_at) };
+}
+
+function timerFromRow(row: Row): Timer {
+  return { owner: String(row.owner), name: String(row.name), at: String(row.at), action: String(row.action), if_missed: row.if_missed === "drop" ? "drop" : "notify", created_at: String(row.created_at), fired_at: string(row.fired_at), cleared_at: string(row.cleared_at) };
 }
 
 const ATOMIC_LEASE_GROUP_PREFIX = "headroom:atomic:";
@@ -2132,6 +2140,184 @@ export class HeadroomStore {
     const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL AND l.expires_at > ?" : ""].filter(Boolean).join(" AND ");
     const params = [...(meterId ? [meterId] : []), ...(activeOnly ? [now.toISOString()] : [])];
     return this.prepared(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...params).map(leaseFromRow);
+  }
+
+  /* -----------------------------------------------------------------------
+   * Orchestrator heartbeats and named wake-ups (timers). See migrations.ts's
+   * ADD_HEARTBEATS_AND_TIMERS for the schema and the reasoning: the daemon is
+   * the one process that survives a crashed orchestrator session, so it
+   * holds both.
+   * -------------------------------------------------------------------- */
+
+  private addHeartbeatEvent(kind: Extract<EventKind, "heartbeat_lapsed" | "heartbeat_restored">, heartbeat: Heartbeat, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: heartbeat.owner, interval_ms: heartbeat.interval_ms, last_beat_at: heartbeat.last_beat_at, ...(kind === "heartbeat_lapsed" ? { resume_sentence: heartbeat.resume_sentence } : {}) };
+    // Deterministic on (kind, owner, the beat instant the lapse/restore is
+    // about): a lapse and the restore that later closes it always get
+    // different last_beat_at values (a beat updates last_beat_at before the
+    // lapse marker is ever read again), so this stays idempotent under
+    // INSERT OR IGNORE the same way addModelEvent's ids do, without ever
+    // colliding a lapse with the restore that follows it.
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`${kind}:${heartbeat.owner}:${heartbeat.last_beat_at}`, kind, "vendor_reported", 1, "[]", at, null, null, null, heartbeat.owner, null, JSON.stringify(metadata));
+  }
+
+  private heartbeatRow(owner: string): Heartbeat | undefined {
+    const row = this.db.prepare("SELECT * FROM heartbeats WHERE owner = ?").get(owner);
+    return row ? heartbeatFromRow(row) : undefined;
+  }
+
+  /**
+   * Records or refreshes one owner's heartbeat lease. `resumeSentence`
+   * `undefined` keeps whatever was registered before (a plain re-beat need
+   * not repeat it); `null` clears it explicitly. A beat that finds this
+   * heartbeat currently lapsed closes the lapse immediately -- rather than
+   * waiting for the next poll's checkHeartbeatLapses to notice -- and emits
+   * exactly one `heartbeat_restored` event for it.
+   */
+  heartbeatBeat(owner: string, intervalMs: number, resumeSentence: string | null | undefined, now = new Date()): Heartbeat {
+    const trimmed = owner.trim();
+    if (!trimmed) throw new Error("owner is required");
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("interval must be positive");
+    const at = now.toISOString();
+    const existing = this.heartbeatRow(trimmed);
+    if (existing?.lapsed_since) this.addHeartbeatEvent("heartbeat_restored", existing, at);
+    const resume = resumeSentence === undefined ? existing?.resume_sentence ?? null : resumeSentence;
+    this.db.prepare(`INSERT INTO heartbeats (owner,interval_ms,resume_sentence,started_at,last_beat_at,lapsed_since,updated_at) VALUES (?,?,?,?,?,NULL,?)
+      ON CONFLICT(owner) DO UPDATE SET interval_ms = excluded.interval_ms, resume_sentence = excluded.resume_sentence, last_beat_at = excluded.last_beat_at, lapsed_since = NULL, updated_at = excluded.updated_at`)
+      .run(trimmed, Math.round(intervalMs), resume, existing?.started_at ?? at, at, at);
+    return this.heartbeatRow(trimmed)!;
+  }
+
+  /** Deregisters a heartbeat lease. Returns false when there was none --
+   * an idempotent stop is not an error. Does not itself emit
+   * `heartbeat_restored`: a deliberate stop is not a recovery worth a
+   * notification, and a lapsed heartbeat that is simply stopped should stay
+   * silent rather than announce a restore that never happened. */
+  heartbeatStop(owner: string): boolean {
+    const trimmed = owner.trim();
+    if (!trimmed) throw new Error("owner is required");
+    if (!this.heartbeatRow(trimmed)) return false;
+    this.db.prepare("DELETE FROM heartbeats WHERE owner = ?").run(trimmed);
+    return true;
+  }
+
+  /** Every registered heartbeat, most recently updated first. */
+  heartbeats(): Heartbeat[] {
+    return this.db.prepare("SELECT * FROM heartbeats ORDER BY updated_at DESC").all().map(heartbeatFromRow);
+  }
+
+  /**
+   * The daemon's per-poll pass: every heartbeat not already marked lapsed
+   * whose last beat is now overdue by more than 2x its own interval gets
+   * `lapsed_since` set to `now` and exactly one `heartbeat_lapsed` event --
+   * INSERT OR IGNORE on addHeartbeatEvent's deterministic id means a poll
+   * that somehow runs twice for the same lapse still produces only one.
+   * Never called from a beat/stop path, only from the daemon's own poll
+   * loop, so a heartbeat never lapses because a caller happened to invoke
+   * this at an unusual moment.
+   */
+  checkHeartbeatLapses(now = new Date()): void {
+    const at = now.toISOString();
+    for (const row of this.db.prepare("SELECT * FROM heartbeats WHERE lapsed_since IS NULL").all()) {
+      const heartbeat = heartbeatFromRow(row);
+      const elapsedMs = now.getTime() - Date.parse(heartbeat.last_beat_at);
+      if (!Number.isFinite(elapsedMs) || elapsedMs <= heartbeat.interval_ms * 2) continue;
+      this.db.prepare("UPDATE heartbeats SET lapsed_since = ?, updated_at = ? WHERE owner = ? AND lapsed_since IS NULL").run(at, at, heartbeat.owner);
+      this.addHeartbeatEvent("heartbeat_lapsed", heartbeat, at);
+    }
+  }
+
+  /** True while `owner` has a registered heartbeat currently considered
+   * lapsed. An owner with no heartbeat at all is never "lapsed" -- that is
+   * simply an orchestrator that never opted in, not a missed one. */
+  heartbeatLapsed(owner: string): boolean {
+    return this.heartbeatRow(owner.trim())?.lapsed_since != null;
+  }
+
+  private addTimerMissedEvent(timer: Timer, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: timer.owner, timer_name: timer.name, action: timer.action };
+    // meter_id and principal_id are both null, same as addHeartbeatEvent
+    // above: the owner is an orchestrator identity, not a vendor account or
+    // meter, so it belongs only in `reason`/metadata, never in the column a
+    // reader would otherwise read as "this event is about that principal".
+    this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(`timer_missed:${timer.owner}:${timer.name}:${timer.at}`, "timer_missed", "vendor_reported", 1, "[]", at, null, null, null, timer.owner, null, JSON.stringify(metadata));
+  }
+
+  /** Registers (or replaces, by the same owner+name) one named wake-up. A
+   * timer already fired or cleared under this owner+name is simply replaced
+   * by the new one, same as re-registering any other schedule. */
+  setTimer(owner: string, name: string, at: string, action: string, ifMissed: "notify" | "drop", now = new Date()): Timer {
+    const trimmedOwner = owner.trim();
+    const trimmedName = name.trim();
+    if (!trimmedOwner || !trimmedName) throw new Error("owner and name are required");
+    if (!action.trim()) throw new Error("action is required");
+    if (!Number.isFinite(Date.parse(at))) throw new Error("at must be a valid ISO instant");
+    const createdAt = now.toISOString();
+    this.db.prepare(`INSERT INTO timers (owner,name,at,action,if_missed,created_at,fired_at,cleared_at) VALUES (?,?,?,?,?,?,NULL,NULL)
+      ON CONFLICT(owner,name) DO UPDATE SET at = excluded.at, action = excluded.action, if_missed = excluded.if_missed, created_at = excluded.created_at, fired_at = NULL, cleared_at = NULL`)
+      .run(trimmedOwner, trimmedName, new Date(at).toISOString(), action, ifMissed, createdAt);
+    return timerFromRow(this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(trimmedOwner, trimmedName)!);
+  }
+
+  /** Pending timers (never fired, never cleared) for one owner, or every
+   * owner's when omitted, soonest due first. */
+  timers(owner?: string): Timer[] {
+    const filter = owner ? "WHERE owner = ? AND fired_at IS NULL AND cleared_at IS NULL" : "WHERE fired_at IS NULL AND cleared_at IS NULL";
+    return this.db.prepare(`SELECT * FROM timers ${filter} ORDER BY at ASC`).all(...(owner ? [owner] : [])).map(timerFromRow);
+  }
+
+  /** Pending timers at or past `now`, oldest due first -- the daemon's own
+   * per-poll firing query. */
+  dueTimers(now = new Date()): Timer[] {
+    return this.db.prepare("SELECT * FROM timers WHERE fired_at IS NULL AND cleared_at IS NULL AND at <= ? ORDER BY at ASC").all(now.toISOString()).map(timerFromRow);
+  }
+
+  /**
+   * Claims one due timer for delivery, before src/heartbeat.ts's
+   * fireDueTimers ever attempts the actual inbox write (filesystem I/O this
+   * synchronous store cannot do itself): the `WHERE fired_at IS NULL` guard
+   * on the UPDATE means this is the single atomic point that decides which
+   * of two overlapping firing passes (a slow inbox write outlasting the
+   * daemon's own poll throttle) gets to deliver a given timer -- the loser's
+   * claim affects zero rows and gets `undefined` back, never a duplicate
+   * delivery. Also raises one `timer_missed` event when `if_missed` is
+   * `notify` and this owner's heartbeat is currently lapsed, so a wake-up
+   * that fired while nobody was watching still reaches a human channel, not
+   * only the inbox its crashed session will never read -- `addTimerMissedEvent`'s
+   * own deterministic id keeps this idempotent even if the claim is later
+   * released (`unclaimTimer`) and re-claimed on a retry.
+   * Returns the claimed row (with its own new `fired_at`), or `undefined`
+   * when nothing matched -- already claimed by a concurrent pass, already
+   * cleared, or gone.
+   */
+  claimTimer(owner: string, name: string, now = new Date()): Timer | undefined {
+    const at = now.toISOString();
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL").get(owner, name);
+    if (!row) return undefined;
+    this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL").run(at, owner, name);
+    const timer = { ...timerFromRow(row), fired_at: at };
+    if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, at);
+    return timer;
+  }
+
+  /** Releases a claim a delivery attempt could not honor (the inbox write
+   * failed), so a later firing pass sees this timer as pending again. Only
+   * releases the exact claim it was given (`fired_at` must still equal
+   * `claimedFiredAt`): a timer independently cleared, or reclaimed by a
+   * different pass in between, is never clobbered by a stale release. */
+  unclaimTimer(owner: string, name: string, claimedFiredAt: string): void {
+    this.db.prepare("UPDATE timers SET fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ?").run(owner, name, claimedFiredAt);
+  }
+
+  /** Idempotent: clearing an already-cleared or already-fired timer is not
+   * an error, it simply has nothing left to do. Returns false when no row
+   * matched owner+name at all. */
+  clearTimer(owner: string, name: string, now = new Date()): boolean {
+    const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ?").get(owner, name);
+    if (!row) return false;
+    this.db.prepare("UPDATE timers SET cleared_at = ? WHERE owner = ? AND name = ? AND cleared_at IS NULL").run(now.toISOString(), owner, name);
+    return true;
   }
 
   private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {

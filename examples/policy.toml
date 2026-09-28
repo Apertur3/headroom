@@ -48,6 +48,18 @@ update_check = true
 # reason = "burn the week to 100%, then press a banked reset"
 # set_at = "2026-09-27T08:00:00Z"
 
+# Host guard: `headroom run` refuses to launch its child process onto a host
+# that cannot take it (see docs/concepts.md's "Host guard" section). `can` and
+# `gate` carry the same reading additively and never refuse over it.
+# [host_guard]
+# mode = "refuse" # "warn" only logs and still launches; "off" disables the guard entirely
+# warn_load_ratio = 2 # os.loadavg()[0] / cpu count
+# refuse_load_ratio = 3
+# warn_pty_percent = 50 # in-use / configured pseudo-terminals, POSIX only
+# refuse_pty_percent = 75
+# Orphaned agy/script processes (see doctor's own dedicated check) always
+# only warn, never refuse, however many are found -- not configurable here.
+
 # --- Notifications (off unless you uncomment [notify] and name a channel) ---
 # Delivered by the daemon after each poll, once per event, over the channels
 # below. Credentials are never written here: the Telegram bot token and the

@@ -1,9 +1,9 @@
 # MCP and agents
 
 Headroom's MCP server is a small stdio JSON-RPC 2.0 server (`headroom mcp`), with no external MCP
-SDK dependency. It exposes sixteen tools, defined in `src/mcp.ts`: status, action checks, events,
-three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, and pasted
-`/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
+SDK dependency. It exposes seventeen tools, defined in `src/mcp.ts`: status, action checks, events,
+three lease operations, cost, rate, spend, inbox, plan, gate, wait, fill, route, heartbeats, and
+pasted `/usage` ingestion. Every tool but `quota_wait`, `quota_route`, `quota_inbox`, and `quota_usage_paste` tries the daemon
 first, over its local socket or named pipe, and falls back to
 a direct poll (marked `"source": "direct"` in the result) if no daemon is running. `quota_wait`,
 `quota_route`, `quota_inbox`, and `quota_usage_paste` always read directly, since none has a daemon RPC case at
@@ -111,7 +111,8 @@ expected or learned percent, same as `can --lease`).
         "iqr_high": 5.0,
         "max_more_before_reset": 23
       },
-      "leased_id": null
+      "leased_id": null,
+      "host": { "state": "ok", "reasons": [], "load_ratio": 0.4, "pty_used": 3, "pty_max": 512, "orphans": 0 }
     }
   }
 }
@@ -120,7 +121,9 @@ expected or learned percent, same as `can --lease`).
 `owner` is required. It's how Headroom excludes your own open leases from the reservation check,
 so calling `quota_can` doesn't get blocked by a lease you started yourself. `cost` is always
 present (its fields are `null` with no learned or given expectation yet); `leased_id` is the new
-lease's id when `lease: true` was passed and the call was allowed, otherwise `null`.
+lease's id when `lease: true` was passed and the call was allowed, otherwise `null`. `host` is a
+fresh, additive read of local host pressure (see docs/concepts.md's "Host guard" section) --
+`quota_can` never refuses over it; only `headroom run`, which launches locally, does.
 
 ### `quota_events`
 
@@ -247,6 +250,50 @@ No arguments. Lists active and recently ended leases with their estimated spend.
 }
 ```
 
+## Heartbeat tool
+
+### `quota_heartbeat`
+
+Arguments: `owner` (string, optional; defaults to `<client name>#<session id>` from the MCP
+session, same as `quota_lease_start`), `interval_ms` (number, required unless `stop: true`, > 0),
+`resume_sentence` (string, optional -- what a human or a fresh session should do to pick this
+session's work back up; omitted on a plain re-beat to keep whatever was registered before),
+`stop` (boolean, optional -- deregisters instead of beating; `interval_ms`/`resume_sentence` are
+then ignored). Tries the daemon first like every lease tool; there is no CLI equivalent for a
+one-shot beat other than `headroom heartbeat --owner <name> --every <duration>` itself.
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"quota_heartbeat","arguments":{"owner":"triage-bot","interval_ms":300000,"resume_sentence":"rerun the deploy"}}}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "result": {
+    "content": [{ "type": "text", "text": "{...}" }],
+    "structuredContent": {
+      "source": "daemon",
+      "heartbeat": {
+        "owner": "triage-bot",
+        "interval_ms": 300000,
+        "resume_sentence": "rerun the deploy",
+        "started_at": "2026-09-28T12:00:00.000Z",
+        "last_beat_at": "2026-09-28T12:00:00.000Z",
+        "lapsed_since": null,
+        "updated_at": "2026-09-28T12:00:00.000Z"
+      }
+    }
+  }
+}
+```
+
+The daemon checks every registered heartbeat on each poll; one gone overdue by more than 2x its
+own interval gets one `heartbeat_lapsed` notification (never repeated for the same open lapse),
+delivered the same way every other event is -- see `docs/notifications.md`. A later beat closes
+the lapse and may send one short `heartbeat_restored`. Named wake-ups (`headroom timer`) have no
+MCP tool of their own; they are CLI-only.
+
 ## Pacing and routing tools
 
 Every one of these takes a `meter` id (for example `codex-main:main`) unless noted, and answers
@@ -282,7 +329,9 @@ the current window (and, with `plan`, the plan line); under even pacing a 5h nee
 against the pro-rata share of the window that has elapsed, and a burst is refused with a reason.
 Fails UNKNOWN, naming the meter, if a window the request actually consumes is stale, failed, or
 older than `staleness_minutes`, or if `meter` resolves to several meters and one of them has never
-produced a windowed reading at all. CLI: `headroom gate` (exit 2 when it does not fit).
+produced a windowed reading at all. Also carries an additive `host` object (same shape and meaning
+as `quota_can`'s, above) -- a fresh read of local host pressure that never affects `fits`/`allowed`
+here either. CLI: `headroom gate` (exit 2 when it does not fit).
 
 ### `quota_wait`
 
@@ -391,6 +440,8 @@ For agents that call a shell instead of MCP, such as Codex or Antigravity CLI se
 | `quota_spend` | `headroom spend [--meter <meter_id>] [--owner <name>] [--since 24h] [--json]` |
 | `quota_inbox` | `headroom inbox --session <session-id> [--since <epoch-ms>] [--json]` (send: `headroom inbox send --to <session-id> --kind <budget\|note\|handoff> (--file <path> \| --text <text>)`) |
 | `quota_usage_paste` | `headroom usage --paste [--principal <id>] [--json]` (or `--clipboard`) |
+| `quota_heartbeat` | `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` (stop: `--stop`; list: `heartbeat list [--json]`) |
+| (none -- CLI only) | `headroom timer set --owner <name> --name <id> --at <ISO\|+duration> --action "<text>" [--if-missed notify\|drop]` (list: `timer list [--owner <name>] [--json]`; clear: `timer clear --owner <name> --name <id>`) |
 
 `headroom can` exits 0 for yes and 2 for no, in addition to printing a line, so a script can check
 the exit code without parsing `--json`. `headroom lease end` exits 1 if `--owner` doesn't match

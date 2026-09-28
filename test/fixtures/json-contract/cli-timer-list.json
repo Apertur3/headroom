@@ -1,0 +1,16 @@
+{
+  "contract": "string",
+  "generated_at": "string",
+  "timers": [
+    {
+      "action": "string",
+      "at": "string",
+      "cleared_at": "null",
+      "created_at": "string",
+      "fired_at": "null",
+      "if_missed": "string",
+      "name": "string",
+      "owner": "string"
+    }
+  ]
+}
