@@ -38,7 +38,7 @@ import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAG
 import { parseTimerAt } from "./heartbeat.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, reserveSuspendedFor, routeFor, withSuspendedReserves, type RateLine, type RouteResult } from "./orchestrator-reads.js";
-import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "./registry.js";
+import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccountsOrEmpty, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
@@ -47,7 +47,7 @@ import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
-import { isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
+import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";
 import { headroomVersion } from "./version.js";
 
@@ -127,6 +127,9 @@ export { formatMeters };
 async function history(argv: string[]): Promise<number> {
   const meter = argv[0];
   if (!meter) throw new Error("Usage: headroom history <meter> [--since 24h]");
+  // Unlike can/gate/plan/fill, history cannot create capacity -- it is a
+  // read of what was already stored. A disabled principal's history remains
+  // readable (docs/vendors.md), so there is no disabled guard here.
   const at = argv.indexOf("--since");
   const sinceValue = since(at >= 0 ? argv[at + 1] : undefined);
   const outcome = await requestDaemonReadThrough("history", { meter, since: sinceValue });
@@ -256,6 +259,17 @@ async function can(argv: string[]): Promise<number> {
   const accounts = await readAccounts();
   const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
   if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
+  const disabledMeter = meters.find((meter) => disabledPrincipalForMeter(accounts, meter) !== undefined);
+  if (disabledMeter) {
+    const reason = disabledPrincipalReason(disabledPrincipalForMeter(accounts, disabledMeter)!);
+    // The deciding meter is the one actually disabled, not whichever meter
+    // happens to be first in the action class, and every requested meter is
+    // reported (not just one) so a caller can see which one blocked it.
+    const decision: CanDecision = { allowed: false, meter: disabledMeter, state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
+    const host = await checkHostHealth(await readHostGuardPolicy());
+    printCan(decision, buildCostEstimate(action, expectOverride, undefined, null), undefined, host, argv.includes("--json"));
+    return 2;
+  }
 
   const daemonParams = { action_class: action, allow_unknown: argv.includes("--allow-unknown"), owner };
   // `--lease` is a dispatch path (it can reserve capacity) and must stay
@@ -295,7 +309,7 @@ async function can(argv: string[]): Promise<number> {
     directReadNotice();
     const [policy, directStore] = await Promise.all([readPolicy(), HeadroomStore.open()]);
     try {
-      const localAccounts = accounts.filter(isLocalAccount);
+      const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
       // With no daemon, `can` is also a direct read: refresh local state rather
       // than deciding a routing preference from an old queue-depth sample.
       directStore.insertAll(await Promise.all(localAccounts.map(observeLocal)));
@@ -334,7 +348,7 @@ async function can(argv: string[]): Promise<number> {
       // now; only this recomputation decides whether a lease is created.
       const admissionNow = new Date();
       const admitted = store.admitAndStartLeases(() => {
-        const localAccounts = accounts.filter(isLocalAccount);
+        const localAccounts = accounts.filter(isLocalAccount).filter(isAccountEnabled);
         const localMeters = localAccounts.map((account) => `${account.name}:capacity`);
         const allMeters = [...new Set([...meters, ...localMeters])];
         const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
@@ -346,7 +360,7 @@ async function can(argv: string[]): Promise<number> {
           : canRouteWithLeases(meters, localMeters, enriched, routing.local_preference, canPolicy, argv.includes("--allow-unknown"), store.leases(undefined, true, admissionNow), owner, admissionNow, true);
         return admitCanCost(store, raw, localMeters.includes(raw.meter) ? [raw.meter] : meters, canPolicy, cost.expected_percent, admissionNow);
       }, owner, (admittedDecision) => {
-        const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+        const localMeters = accounts.filter(isLocalAccount).filter(isAccountEnabled).map((account) => `${account.name}:capacity`);
         return localMeters.includes(admittedDecision.meter) ? [admittedDecision.meter] : meters;
       }, cost.expected_percent, ttl(option(argv, "--ttl")), `can:${action}`, admissionNow, action);
       decision = admitted.decision;
@@ -387,6 +401,28 @@ function ttl(value: string | undefined, flag = "--ttl"): number {
 
 function option(argv: string[], name: string): string | undefined { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
 
+// Registry reads for the disabled-principal check use readAccountsOrEmpty(),
+// never a blanket swallowing .catch(): a missing accounts.toml (before the
+// first `accounts discover`) is a normal, well-defined "no accounts
+// configured" state, but a malformed or otherwise unreadable file must still
+// fail closed (propagate, which every caller below either lets reach
+// runCli's own error handling or folds into its own existing failure shape)
+// rather than silently reporting "nothing disabled" and risking admission of
+// a parked principal's stored capacity.
+async function disabledMeterReason(meter: string): Promise<string | undefined> {
+  const principal = disabledPrincipalForMeter(await readAccountsOrEmpty(), meter);
+  return principal ? disabledPrincipalReason(principal) : undefined;
+}
+
+/** Like disabledMeterReason, but for an action class's resolved list of
+ * meters: names which specific meter is disabled (never just meters[0]),
+ * since a decision built from this must report the actual deciding meter. */
+async function disabledMeterInList(meters: string[]): Promise<{ meter: string; reason: string } | undefined> {
+  const accounts = await readAccountsOrEmpty();
+  const meter = meters.find((item) => disabledPrincipalForMeter(accounts, item) !== undefined);
+  return meter ? { meter, reason: disabledPrincipalReason(disabledPrincipalForMeter(accounts, meter)!) } : undefined;
+}
+
 function printLeases(items: Lease[]): void {
   for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
 }
@@ -397,6 +433,12 @@ async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
     const owner = option(argv, "--owner"); const meter = option(argv, "--meter"); const expect = option(argv, "--expect"); const note = option(argv, "--note"); const actionClass = option(argv, "--class");
     if (!owner || !meter) throw new Error("Usage: headroom lease start --owner <name> --meter <meter_id> [--expect <percent>] [--ttl 30m] [--note ...] [--class <action-class>]");
+    // A write, not a read with its own "UNKNOWN" convention: refusing it the
+    // same way any other daemon-side lease_start rejection already would
+    // (an Error that runCli turns into the ordinary exit-1 failure shape)
+    // keeps this one refusal from inventing a second, undocumented shape.
+    const disabled = await disabledMeterReason(meter);
+    if (disabled) throw new Error(disabled);
     const expected = expect === undefined ? null : Number(expect);
     if (expected !== null && (!Number.isFinite(expected) || expected < 0 || expected > 100)) throw new Error("--expect must be 0 through 100");
     const params = { owner, meter_id: meter, expected_percent: expected, ttl_ms: ttl(option(argv, "--ttl")), note: note ?? null, action_class: actionClass ?? null };
@@ -599,19 +641,28 @@ async function rate(argv: string[]): Promise<number> {
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
   const asJson = argv.includes("--json");
-  const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
+  const disabled = meter ? await disabledMeterReason(meter) : undefined;
   let lines: RateLine[];
-  if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
-  else if (outcome.kind === "cache") {
-    cacheReadNotice();
-    const store = await HeadroomStore.openReadOnly();
-    try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
-    finally { store.close(); }
+  if (disabled) {
+    // Same synthetic-line shape rateLines() already uses for any other
+    // meter it cannot read at all (meterUnknownReason) -- a bare RateLine[]
+    // array, exit 0 -- rather than a one-off object/exit-code just for this
+    // refusal.
+    lines = [{ meter: meter!, window_minutes: null, used_percent: null, burn_percent_per_hour: null, empty_in_seconds: null, resets_at: null, reason: disabled }];
   } else {
-    directReadNotice();
-    const store = await HeadroomStore.open();
-    try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
-    finally { store.close(); }
+    const outcome = await requestDaemonReadThrough("rate", { meter, minutes, owner, need });
+    if (outcome.kind === "available") { lines = unwrapRpc(outcome.result) as RateLine[]; }
+    else if (outcome.kind === "cache") {
+      cacheReadNotice();
+      const store = await HeadroomStore.openReadOnly();
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); }
+      finally { store.close(); }
+    } else {
+      directReadNotice();
+      const store = await HeadroomStore.open();
+      try { lines = rateLines(store, meter, minutes, new Date(), owner, need); store.audit("cli", "rate", meter ?? null, "ok"); }
+      finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(lines)); return 0; }
   if (!lines.length) { console.log(meter ? `no readings for ${meter}` : "no readings"); return 0; }
@@ -958,6 +1009,17 @@ async function run(argv: string[]): Promise<number> {
       if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
     }
     if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
+    const disabled = await disabledMeterInList(Array.isArray(target) ? target : [target]);
+    if (disabled) {
+      // Same CanDecision shape `run --json`'s "quota gate refuses" outcome
+      // already documents (docs/json-contract.md), including `host` -- not a
+      // one-off object that drops it.
+      const targetMeters = Array.isArray(target) ? target : [target];
+      const decision: CanDecision = { allowed: false, meter: disabled.meter, state: "UNKNOWN", reason: disabled.reason, meters: targetMeters.map((item) => ({ meter: item, state: "UNKNOWN", reason: disabled.reason })) };
+      if (flags.includes("--json")) console.log(JSON.stringify(withContract({ host, gate: decision, lease_id: null })));
+      else console.log(`${targetMeters.join(", ")}  UNKNOWN (${disabled.reason})`);
+      return 2;
+    }
     const now = new Date();
     // Gate and reservation are one admission. A previous implementation
     // checked first and inserted the lease later, so two CLI processes could
@@ -1138,17 +1200,25 @@ async function plan(argv: string[]): Promise<number> {
   const targetPoints = targetValue === undefined ? undefined : Number(targetValue);
   if (targetPoints !== undefined && (!Number.isFinite(targetPoints) || targetPoints < 0)) throw new Error("--target must be a non-negative number");
   const asJson = argv.includes("--json");
+  const disabled = await disabledMeterReason(meter);
   const need = option(argv, "--need");
   if (need) parseGateNeed(`${need}:0`);
-  const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need, target_points: targetPoints });
   let result: Awaited<ReturnType<typeof planFor>>;
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
-    const store = await HeadroomStore.open();
-    try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints, policy.reserve_meta, policy.policy_mtime); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+  if (disabled) {
+    // plan's own documented failure shape (docs/json-contract.md): `{ meter,
+    // error, notices }`, always exit 0 -- the same data state a meter with
+    // no weekly window at all already reports, not a one-off object/exit 2.
+    result = { meter, error: disabled, notices: [] };
+  } else {
+    const request = await requestDaemon("plan", { meter, reserve_percent: reserveValue === undefined ? undefined : Number(reserveValue), need, target_points: targetPoints });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const reserve = reserveValue === undefined ? policy.freeze_reserve_pct : Number(reserveValue);
+      const store = await HeadroomStore.open();
+      try { result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, need, targetPoints, policy.reserve_meta, policy.policy_mtime); store.audit("cli", "plan", meter, "ok"); } finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // planFor's only error path is an unreadable/never-seen meter (no weekly
@@ -1201,15 +1271,23 @@ async function gate(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
+  const disabled = target ? await disabledMeterInList(Array.isArray(target) ? target : [target]) : undefined;
   const options = { owner, planSharePercent, actionClass };
-  const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
   let result: Awaited<ReturnType<typeof gateFor>>;
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const store = await HeadroomStore.open();
-    try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+  if (disabled) {
+    // gate's own documented refusal shape (docs/json-contract.md): `{
+    // allowed, reason, meters_checked, unknown, notices }` -- exit 2, same
+    // as any other refusal below, not a one-off object/field set.
+    result = { allowed: false, reason: disabled.reason, unknown: true, meters_checked: Array.isArray(target) ? target : target ? [target] : [], notices: [] };
+  } else {
+    const request = await requestDaemon("gate", { needs, meter: target, plan: usePlan, owner, plan_share_percent: planSharePercent, action_class: actionClass });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const store = await HeadroomStore.open();
+      try { result = gateFor(store, needs, target, policy.freeze_reserve_pct, usePlan, new Date(), { ...options, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime }); store.audit("cli", "gate", meter ?? (Array.isArray(target) ? target.join(",") : null), result.allowed ? "yes" : "no"); } finally { store.close(); }
+    }
   }
   if (asJson) {
     const host = await checkHostHealth(await readHostGuardPolicy());
@@ -1231,6 +1309,11 @@ async function wait(argv: string[]): Promise<number> {
   const meter = option(argv, "--meter");
   if (!meter || !argv.includes("--until-reset")) throw new Error("Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]");
   const maxValue = option(argv, "--max");
+  const disabled = await disabledMeterReason(meter);
+  // wait has no --json and no data state of its own beyond the "resets_at
+  // unknown" line below; render disabled the exact same way, exit 0 like
+  // any other unknown reading rather than a distinct exit 2.
+  if (disabled) { console.log(`${meter}  UNKNOWN (${disabled})`); return 0; }
   const maxMs = maxValue === undefined ? null : ttl(maxValue, "--max");
   // Set whenever a poll finds no windowed reading for this meter at all: the
   // meter's own latest reason (e.g. a pending Keychain grant), so the final
@@ -1241,7 +1324,7 @@ async function wait(argv: string[]): Promise<number> {
   const getResetsAt = async (): Promise<string | null> => {
     const request = await requestDaemon("status");
     let observations: Observation[];
-    if (request !== undefined) { observations = unwrapRpc(request) as Observation[]; }
+    if (request !== undefined) { observations = statusObservations(unwrapRpc(request)); }
     else {
       const store = await HeadroomStore.open();
       try { observations = store.latestPerWindow(meter); } finally { store.close(); }
@@ -1275,16 +1358,24 @@ async function fill(argv: string[]): Promise<number> {
   const planSharePercent = planShareValue === undefined ? undefined : Number(planShareValue);
   if (planSharePercent !== undefined && (!Number.isFinite(planSharePercent) || planSharePercent < 0)) throw new Error("--plan-share must be a non-negative percent");
   const asJson = argv.includes("--json");
+  const disabled = await disabledMeterReason(meter);
   const need = option(argv, "--need"); if (need) parseGateNeed(`${need}:0`);
-  const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
   let result: Awaited<ReturnType<typeof fillFor>>;
-  if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
-  else {
-    directReadNotice();
-    const policy = await readPolicy();
-    const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
-    const store = await HeadroomStore.open();
-    try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+  if (disabled) {
+    // fill's own documented failure shape (docs/json-contract.md): `{
+    // meter, error, notices }`, exit 0 -- the same data state a meter with
+    // no enforced window at all already reports, not a one-off object/exit 2.
+    result = { meter, error: disabled, notices: [] };
+  } else {
+    const request = await requestDaemon("fill", { meter, lane_cost_percent: laneCost, weekly_reserve_percent: weeklyReserveValue === undefined ? undefined : Number(weeklyReserveValue), owner, plan_share_percent: planSharePercent, need });
+    if (request !== undefined) { result = unwrapRpc(request) as typeof result; }
+    else {
+      directReadNotice();
+      const policy = await readPolicy();
+      const weeklyReserve = weeklyReserveValue === undefined ? policy.freeze_reserve_pct : Number(weeklyReserveValue);
+      const store = await HeadroomStore.open();
+      try { result = await fillFor(store, meter, laneCost, weeklyReserve, new Date(), { owner, planSharePercent, pacing: policy.pacing, staleness_minutes: policy.staleness_minutes, reserves: policy.reserve, reserveMeta: policy.reserve_meta, policyMtime: policy.policy_mtime, needWindow: need }); store.audit("cli", "fill", meter, "ok"); } finally { store.close(); }
+    }
   }
   if (asJson) { console.log(JSON.stringify(withContract(result))); return 0; }
   // fillFor's only error path is an unreadable/never-seen meter (no enforced
@@ -1349,6 +1440,7 @@ async function printModelShare(principal: string | undefined, asJson: boolean): 
   const accounts = await readAccounts();
   const account = accounts.find((item) => item.name === principal);
   if (!account || isLocalAccount(account) || account.vendor !== "claude") throw new Error(`--models requires a configured Claude principal (got ${principal})`);
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   const now = new Date();
   // Best effort: prefer the stored <principal>:all 5h window's own resets_at
   // (whatever the vendor last reported) as the window boundary; fall back to
@@ -1397,6 +1489,8 @@ export async function observe(argv: string[]): Promise<number> {
   const principalIndex = argv.indexOf("--principal");
   const principal = principalIndex >= 0 ? argv[principalIndex + 1] : undefined;
   if (argv.includes("--models")) return printModelShare(principal, argv.includes("--json"));
+  const configuredAccounts = await readAccountsOrEmpty();
+  const disabledPrincipals = configuredAccounts.filter((account) => !isAccountEnabled(account) && (!principal || account.name === principal)).map((account) => account.name);
   // --ttl 0 is a synonym for --refresh: both force a fresh probe through the
   // daemon's own `refresh` method (still gated by the grant marker and the
   // daemon's own vendor backoff, same as any other poll) instead of serving
@@ -1416,7 +1510,7 @@ export async function observe(argv: string[]): Promise<number> {
     } catch { /* handled below: the plain status request right after this retries health once. */ }
   }
   const outcome = await requestDaemonReadThrough("status");
-  const daemonObservations = outcome.kind === "available" ? unwrapRpc(outcome.result) as Observation[] : undefined;
+  const daemonObservations = outcome.kind === "available" ? statusObservations(unwrapRpc(outcome.result)) : undefined;
   const servedFromCache = outcome.kind === "cache";
   const policy = await readPolicy();
   let observations: Observation[];
@@ -1482,6 +1576,9 @@ export async function observe(argv: string[]): Promise<number> {
     freeResetUsed = new Map(Object.entries(freeResetEvents));
     planDowngraded = unwrapRpc(await requestDaemon("plan_downgrades")) as PlanDowngrade[];
   }
+  // Store rows intentionally outlive a configuration change for audit and
+  // history, but current status must not revive a parked principal.
+  observations = observations.filter((item) => !disabledPrincipals.includes(item.principal_id));
   const view = { ...statusViewOptions(argv, process.stdout.isTTY === true, process.env, process.stdout.columns), direct };
   // The grouped view's own footer already says where the numbers came from, so
   // the stderr notice would only repeat it on the one form that carries both.
@@ -1518,13 +1615,13 @@ export async function observe(argv: string[]): Promise<number> {
     // Additive only, present only over the cached fallback -- see printCan's
     // identical convention for `can --json`.
     const cacheFields = servedFromCache ? { served_from: "cache" as const, daemon: "unresponsive" as const } : {};
-    console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, ...cacheFields } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) }, ...cacheFields })));
+    console.log(JSON.stringify(withContract(thresholdRows === undefined ? { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, heartbeats, due_timers: dueTimers, ...cacheFields } : { observations: lapsed, leases, plan_downgraded: planDowngraded[0] ?? null, disabled_principals: disabledPrincipals, heartbeats, due_timers: dueTimers, threshold: { percent: threshold, windows: thresholdRows, any_crossed: thresholdRows.some((item) => item.crossed), any_blocking: thresholdRows.some((item) => item.blocking) }, ...cacheFields })));
   }
   else {
     // accounts.toml names each principal's vendor; a missing or unreadable
     // registry only costs the header its vendor word, never the reading.
-    const vendors = new Map((await readAccounts().catch(() => [])).map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
-    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded }, view)) console.log(line);
+    const vendors = new Map(configuredAccounts.map((account) => [account.name, isLocalAccount(account) ? "local" : account.vendor]));
+    for (const line of renderStatus({ observations, policy, resetSeen, freeResetUsed, leases: leaseMap, vendors, planDowngraded, disabled_principals: disabledPrincipals }, view)) console.log(line);
     for (const failure of failures) console.log(failure);
     // The dense/agent form is what a script or an orchestrator shell reads
     // (see status-view.ts's own doc comment); a lapsed heartbeat or a due
@@ -1556,6 +1653,7 @@ async function responseShape(argv: string[]): Promise<number> {
   if (argv.length !== 3 || argv[0] !== "--principal" || !argv[1] || argv[2] !== "--shape") throw new Error("Usage: headroom --principal <id> --shape");
   const account = (await readAccounts()).find((item) => item.name === argv[1]);
   if (!account || isLocalAccount(account) || account.adapter !== "native-ts") throw new Error("--shape requires a native TypeScript Claude or Codex principal");
+  if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   if (account.vendor === "gemini") throw new Error(GEMINI_RETIRED_REASON);
   if (account.vendor === "antigravity") throw new Error("Antigravity uses agy local quota summaries; inspect headroom doctor and headroom --principal <id> --json instead");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
@@ -1579,6 +1677,12 @@ function unwrapRpc(value: unknown): unknown {
     throw new Error(typeof error?.message === "string" ? error.message : "Daemon request failed");
   }
   return value;
+}
+
+function statusObservations(value: unknown): Observation[] {
+  if (Array.isArray(value)) return value as Observation[]; // pre-#73 daemon
+  if (value && typeof value === "object" && Array.isArray((value as { observations?: unknown }).observations)) return (value as { observations: Observation[] }).observations;
+  throw new Error("Daemon status response is invalid");
 }
 
 /**
@@ -1765,7 +1869,13 @@ async function usagePaste(argv: string[]): Promise<number> {
   }
   const fromClipboard = argv.includes("--clipboard");
   if (fromClipboard === argv.includes("--paste")) throw new Error(USAGE_PASTE_HELP);
-  const principal = resolveClaudePrincipal(await readAccounts(), option(argv, "--principal"));
+  const accounts = await readAccounts();
+  const principal = resolveClaudePrincipal(accounts, option(argv, "--principal"));
+  const disabled = disabledPrincipalForMeter(accounts, `${principal}:all`);
+  // A write, not a read with its own "UNKNOWN" convention: refuse it the
+  // same way any other usage_paste rejection would (an ordinary thrown
+  // Error, exit 1) rather than inventing a one-off object/exit 2.
+  if (disabled) throw new Error(disabledPrincipalReason(disabled));
   const text = fromClipboard ? await readClipboardText() : await readStdinText();
   const now = new Date();
   const panel = parseUsagePanel(text, now);
@@ -1805,6 +1915,14 @@ async function logs(argv: string[]): Promise<number> {
   return 0;
 }
 
+async function accounts(argv: string[]): Promise<number> {
+  const action = argv[0];
+  if ((action !== "enable" && action !== "disable") || !argv[1] || argv.length !== 2) throw new Error("Usage: headroom accounts <discover|enable|disable> [<name>]");
+  await setAccountEnabled(argv[1], action === "enable");
+  console.log(`${argv[1]} ${action}d`);
+  return 0;
+}
+
 /** The message for a config dir Claude Code was never logged into: distinct
  * from a Keychain access denial, since there is nothing to grant yet. */
 export function noKeychainItemMessage(directory: string): string {
@@ -1839,7 +1957,7 @@ export async function keychain(argv: string[]): Promise<number> {
   // README, or from a stored marker, learns that there is nothing to answer.
   if (process.platform === "darwin") console.log("Checking that the Claude credential is readable. No Keychain dialog is involved: the probe reads it through /usr/bin/security, which the item already admits.");
   const requested = option(parsed, "--principal");
-  const accounts = (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item) && item.vendor === "claude");
+  const accounts = (await readAccounts()).filter((item): item is ProviderAccount => isAccountEnabled(item) && !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
   if (!targets.length) throw new Error(requested ? `No Claude principal named ${requested}; run headroom accounts discover` : "No Claude principal found; run headroom accounts discover");
   const store = await HeadroomStore.open();
@@ -1931,7 +2049,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["wait", "Block until a meter's window resets, or --max elapses"],
   ["fill", "How many more lanes (and which action classes) fit before a window's unspent points are lost at reset"],
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
-  ["accounts discover", "Scan for Claude/Codex/Antigravity accounts and write accounts.toml"],
+  ["accounts discover|enable|disable", "Scan for accounts, or park/re-enable one configured principal"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config (--bundle [path] writes a redacted report for a GitHub issue)"],
   ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
   ["keychain grant", "macOS: check that the Claude credential is readable (no dialog)"],
@@ -1990,7 +2108,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   wait: "Usage: headroom wait --meter <meter_id> --until-reset [--max 6h]",
   fill: "Usage: headroom fill --meter <meter_id> --until-reset [--lane-cost <percent>] [--weekly-reserve <percent>] [--plan-share <N>] --owner <name> [--json]",
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
-  accounts: "Usage: headroom accounts discover",
+  accounts: "Usage: headroom accounts <discover|enable|disable> [<name>]",
   doctor: "Usage: headroom doctor [--bundle [path]]",
   setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]",
@@ -2081,13 +2199,15 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (argv[0] === "engine" && argv[1] === "status") { const [upstream, native] = await Promise.all([engineStatus(), nativeEnginePath()]); console.log(`native ${native ? "present" : "absent"} ${native ?? "~/.headroom/engine/native/headroom-engine (or engine/.build/release/headroom-engine)"}`); console.log(`upstream ${upstream.tag} ${upstream.present ? "present" : "absent"} ${upstream.path}`); return native || upstream.present ? 0 : 1; }
   if (argv[0] === "accounts" && argv[1] === "discover") {
-    const accounts = await discoverAccounts();
+    const discovered = await discoverAccounts();
+    await writeDiscoveredAccounts(discovered);
+    const accounts = await readAccounts();
     console.log(accountsToml(accounts));
-    await writeDiscoveredAccounts(accounts);
     console.log(`Wrote ${accountsPath()} (${accounts.length} account${accounts.length === 1 ? "" : "s"}). Next: headroom doctor`);
     for (const line of await seedExampleConfig()) console.log(line);
     return 0;
   }
+  if (argv[0] === "accounts") return accounts(argv.slice(1));
   if (argv[0] === "doctor") return doctor(argv.slice(1));
   // `headroom` has always rendered status, and the help text documents the
   // explicit spelling too. Dispatch it before observe() so `status` is never

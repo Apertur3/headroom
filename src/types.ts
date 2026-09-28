@@ -29,6 +29,8 @@ export interface Reading {
 
 export interface ProviderAccount {
   name: string;
+  /** Absent is enabled. Disabled principals stay configured but are never read. */
+  enabled?: boolean;
   vendor: "codex" | "claude" | "antigravity" | "gemini" | "grok" | "kimi";
   location: string;
   /** `native-ts` is credential-local TypeScript; `engine` is the optional Swift engine. */
@@ -45,6 +47,8 @@ export interface ProviderAccount {
 /** A local pool is a probed OpenAI-compatible capacity source. */
 export interface LocalAccount {
   name: string;
+  /** Absent is enabled. Disabled local pools are never probed. */
+  enabled?: boolean;
   kind: "local";
   base_url: string;
   wake?: string;
@@ -55,6 +59,21 @@ export type Account = ProviderAccount | LocalAccount;
 
 export function isLocalAccount(account: Account): account is LocalAccount {
   return "kind" in account && account.kind === "local";
+}
+
+/** Keep the opt-out representation compact in accounts.toml: only false is
+ * written, so every account created before this setting remains enabled. */
+export function isAccountEnabled(account: Account): boolean { return account.enabled !== false; }
+
+/** A meter is always namespaced by its configured principal. Keep the
+ * disabled explanation identical across CLI, daemon, and MCP decision paths. */
+export function disabledPrincipalForMeter(accounts: Account[], meterId: string): string | undefined {
+  const principal = meterId.split(":", 1)[0];
+  return accounts.find((account) => account.name === principal && !isAccountEnabled(account))?.name;
+}
+
+export function disabledPrincipalReason(principal: string): string {
+  return `principal ${principal} is disabled (enabled = false in accounts.toml)`;
 }
 
 /** v0.2 observation emitted by headroom-engine and normalized from the fallback engine. */

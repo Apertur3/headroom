@@ -102,6 +102,10 @@ doctor`) and, the first time, seeds `~/.headroom/policy.toml` and `routing.toml`
 `headroom can <class>` works immediately with the example action classes (`claude-fable`, `codex-build`,
 `gemini-bulk`) -- edit `routing.toml` to match your accounts.
 
+Keep an optional second profile that is deliberately logged out without polling it: add
+`enabled = false` to its `[[accounts]]` block, or run `headroom accounts disable <name>`.
+It remains configured and can be restored with `headroom accounts enable <name>`.
+
 Register the MCP server in each Claude Code profile:
 
 ```sh

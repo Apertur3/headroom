@@ -18,7 +18,7 @@ import { CURRENT_SCHEMA_VERSION } from "./migrations.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 import { updateNoticeLine } from "./update.js";
-import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 import { headroomVersion } from "./version.js";
 import { safeError } from "./security.js";
 
@@ -274,7 +274,8 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
     let accounts: Account[] = [];
     try {
       accounts = await readAccounts();
-      output.push(check(accounts.length ? "OK" : "WARN", "principals", accounts.length ? `${accounts.length} configured (${accountsPath()})` : "no principals configured", accounts.length ? "no action needed" : "headroom accounts discover"));
+      const disabled = accounts.filter((account) => !isAccountEnabled(account)).length;
+      output.push(check(accounts.length ? "OK" : "WARN", "principals", accounts.length ? `${accounts.length} configured${disabled ? `, ${disabled} disabled` : ""} (${accountsPath()})` : "no principals configured", accounts.length ? "no action needed" : "headroom accounts discover"));
     } catch (error) {
       // A never-created accounts.toml (first run, before `accounts discover`)
       // has no configured principal to block reading -- WARN, matching the
@@ -288,12 +289,16 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
     // this home is running is recorded before the checks below report on it.
     let probePin: DoctorCheck | undefined;
     if (store) {
-      const claudeIds = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
+      const claudeIds = accounts.filter((account): account is ProviderAccount => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude").map((account) => account.name);
       await syncClaudeProbeState(store);
       probePin = await probePinCheck(store, claudeIds);
     }
     const grantsNeeded = store ? new Map(store.keychainGrantsNeeded().map((item) => [item.principal_id, item.reason])) : new Map<string, string>();
     for (const account of accounts) {
+      if (!isAccountEnabled(account)) {
+        output.push(check("INFO", `principal ${account.name}`, "disabled in accounts.toml, not polled", "headroom accounts enable " + account.name));
+        continue;
+      }
       output.push(await credentialCheck(account, grantsNeeded, store));
       const grant = keychainGrantCheck(account, grantsNeeded);
       if (grant) output.push(grant);
@@ -325,7 +330,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     ? check(verifiedNative ? "OK" : "INFO", "engine native hash", verifiedNative ? `verified (${native})` : `development binary (${native}) is not release-pinned`, verifiedNative ? "no action needed" : "install the published macOS package for a verified reader")
     : check(nativeFailure ? "FAIL" : "INFO", "engine native hash", nativeFailure ?? "no native reader for this installation", "reinstall headroomd on macOS"));
 
-  if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
+  if (accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
     output.push(native
       ? check("OK", "Antigravity local reader", "native reader available; Gemini CLI is not required", "no action needed")
       : check("FAIL", "Antigravity local reader", nativeFailure ?? (process.platform === "darwin" ? "packaged native reader missing" : "packaged Antigravity reader is macOS-only"), process.platform === "darwin" ? "reinstall headroomd" : "use Antigravity with Headroom on macOS"));
@@ -338,7 +343,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
     output.push(check("OK", "daemon health", "responding", "no action needed"));
     const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
-    const antigravity = accounts.find((account) => !isLocalAccount(account) && account.vendor === "antigravity");
+    const antigravity = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
     const keepalive = health.keepalive;
     if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
     else if (!keepaliveEnabled) output.push(check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
@@ -361,7 +366,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     const level: DoctorLevel = daemon.status === "absent" ? "WARN" : "FAIL";
     output.push(check(level, "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
     output.push(check(level, "daemon health", daemon.status === "absent" ? "not available" : "present but unresponsive", "headroom install-service"));
-    if (accounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) output.push(keepaliveEnabled
+    if (accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) output.push(keepaliveEnabled
       ? check("WARN", "Antigravity keepalive", "cannot inspect agy without a healthy daemon", "headroom install-service")
       : check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
   }
@@ -410,7 +415,7 @@ async function mcpRegisteredFor(location: string): Promise<boolean> {
  * all) when there is no configured Claude principal to report on.
  */
 export async function mcpRegistrationCheck(accounts: Account[]): Promise<DoctorCheck | undefined> {
-  const claudeAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude");
+  const claudeAccounts = accounts.filter((account): account is ProviderAccount => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude");
   if (!claudeAccounts.length) return undefined;
   const registered: string[] = [];
   const unregistered: string[] = [];

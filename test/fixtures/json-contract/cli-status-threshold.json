@@ -1,5 +1,8 @@
 {
   "contract": "string",
+  "disabled_principals": [
+    "unknown (empty array in the fixture data)"
+  ],
   "due_timers": [
     "unknown (empty array in the fixture data)"
   ],

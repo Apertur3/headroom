@@ -17,7 +17,7 @@ import {
 import { withPaceInfo } from "./pace.js";
 import { creditSource, creditsLapsed, isCurrentBankedResetObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 import type { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
+import { disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type PaceState, type StoredObservation } from "./types.js";
 
 /** The enforced, fresh, percent-quantity window with the highest used% for a
  * meter -- an approximation of "the window that decided this", good enough
@@ -771,6 +771,10 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
   // came from, rather than guessing from `meters` again.
   const decidingMeterByPrincipal = new Map<string, string | undefined>();
   const candidates: RouteCandidate[] = principals.map((principal) => {
+    const account = accounts.find((item) => item.name === principal);
+    // `--allow-unknown` is a diagnostic escape hatch for a read failure, not
+    // permission to spend an account the operator deliberately parked.
+    if (account && !isAccountEnabled(account)) return { principal, state: "UNKNOWN", reason: disabledPrincipalReason(principal), remaining_percent: null, reserve_percent: 0, window_minutes: null };
     const principalMeters = meters.filter((meter) => meter.startsWith(`${principal}:`));
     const observationMap = new Map(principalMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
     const rows = [...observationMap.values()].flat();

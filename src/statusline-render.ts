@@ -23,7 +23,7 @@ import { defaultPolicy, paceDecision, reserveFor, type Policy } from "./policy.j
 import { readAccounts } from "./registry.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, type ResetsIn } from "./resets.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount, type Lease, type Observation, type PaceState } from "./types.js";
+import { isAccountEnabled, isLocalAccount, type Lease, type Observation, type PaceState } from "./types.js";
 import { formatStatuslineBar, statuslineMeterName, statuslineProfile, type StatuslineSnapshot } from "./adapters/claude-statusline.js";
 
 export type StatuslineStyle = "compact" | "full";
@@ -309,8 +309,13 @@ export async function daemonRows(path: string, budgetMs = DAEMON_BUDGET_MS, requ
   });
   const work = (async () => {
     const [status, leases] = await Promise.all([request(path, "status", {}, budgetMs), request(path, "leases", {}, budgetMs)]);
-    if (!Array.isArray(status)) return undefined;
-    return { observations: status as Observation[], leases: Array.isArray(leases) ? leases as Lease[] : [] };
+    const observations = Array.isArray(status)
+      ? status as Observation[]
+      : status && typeof status === "object" && Array.isArray((status as { observations?: unknown }).observations)
+        ? (status as { observations: Observation[] }).observations
+        : undefined;
+    if (!observations) return undefined;
+    return { observations, leases: Array.isArray(leases) ? leases as Lease[] : [] };
   })();
   return Promise.race([work, deadline]).catch(() => undefined);
 }
@@ -321,7 +326,7 @@ export async function daemonRows(path: string, budgetMs = DAEMON_BUDGET_MS, requ
 export async function sessionPrincipal(profile: string): Promise<string | undefined> {
   try {
     const accounts = await readAccounts();
-    const match = accounts.find((account) => !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile);
+    const match = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile);
     return match?.name;
   } catch { return undefined; }
 }

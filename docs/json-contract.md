@@ -135,10 +135,17 @@ differ from the `0`/`1` pair above, they are called out below.
 
 CLI: `{ contract, generated_at, observations: Observation[], leases: Lease[],
 plan_downgraded: { principal, from, to, since, acknowledged } | null,
-heartbeats: Heartbeat[], due_timers: Timer[], threshold?: {...} }`.
-`heartbeats` is every registered orchestrator heartbeat (see `heartbeat list`
-below); `due_timers` is every pending `Timer` (see `timer list` below) already
-at or past its own `at`.
+disabled_principals: string[], heartbeats: Heartbeat[], due_timers: Timer[],
+threshold?: {...} }`. `disabled_principals` is always present (empty when
+none): its principals are configured with `enabled = false`, so their stored
+observations are omitted rather than reported as current capacity. MCP
+`quota_status` carries the same additive field. The daemon JSON-RPC `status`
+result stays the `Observation[]` array it has always been -- the 1.x contract
+forbids turning it into an object -- so `disabled_principals` is derived by
+the CLI and MCP layers from the registry, not returned by the daemon method
+itself. `heartbeats` is every registered orchestrator heartbeat (see
+`heartbeat list` below); `due_timers` is every pending `Timer` (see `timer
+list` below) already at or past its own `at`.
 `threshold` is present only with `--threshold N`:
 `{ percent: number, windows: ThresholdWindow[], any_crossed: boolean,
 any_blocking: boolean }`, where each `ThresholdWindow` is `{ meter_id: string,

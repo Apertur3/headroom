@@ -322,7 +322,12 @@ async function idsFromDaemonOrElse(field: "meter_id" | "principal_id", fallback:
   // Windows this is also what turns an aborted pipe probe into a clean exit.
   if (signal.aborted) return [];
   if (request.status === "available" && !isRpcError(request.result)) {
-    return [...new Set((request.result as Record<string, unknown>[]).map((item) => String(item[field])))];
+    const rows = Array.isArray(request.result)
+      ? request.result as Record<string, unknown>[]
+      : request.result && typeof request.result === "object" && Array.isArray((request.result as { observations?: unknown }).observations)
+        ? (request.result as { observations: Record<string, unknown>[] }).observations
+        : [];
+    return [...new Set(rows.map((item) => String(item[field])))];
   }
   if (signal.aborted) return [];
   return fallback(signal);
