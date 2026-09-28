@@ -18,7 +18,7 @@ import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount } from "./types.js";
+import { isLocalAccount, type Heartbeat, type Timer } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
@@ -170,6 +170,16 @@ function withStatus(store: HeadroomStore, observations: ReturnType<HeadroomStore
   return withStatusInfo(observations, store.burnRateFor(observations, now), store.lastKnownFor(observations, now), stalenessMinutes, now);
 }
 
+/** `quota_status`'s additive `heartbeats`/`due_timers` fields (see
+ * src/cli.ts's own `observe()`, which this mirrors): every registered
+ * heartbeat, and every pending timer already at or past its own `at`. Both
+ * `store.heartbeats()` and `store.timers()` are plain reads, so this is safe
+ * to call on a read-only-opened store (the cache path) as well as a normal
+ * one (the direct path). */
+function heartbeatFields(store: HeadroomStore, now: Date): { heartbeats: Heartbeat[]; due_timers: Timer[] } {
+  return { heartbeats: store.heartbeats(), due_timers: store.timers().filter((item) => Date.parse(item.at) <= now.getTime()) };
+}
+
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
@@ -194,10 +204,10 @@ export async function directStatus(dependencies: DirectStatusDependencies = {}):
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withCreditsLapsed(withStatus(store, cached, policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, cached, policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
@@ -215,7 +225,7 @@ export async function directStatus(dependencies: DirectStatusDependencies = {}):
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
     store.setDirectPollBackoff({ lastPollAt: responseNow, until: protectedFailure ? responseNow + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, responseAt) };
   } finally { store.close(); }
 }
 
@@ -238,6 +248,7 @@ async function cacheStatus(dependencies: DirectStatusDependencies = {}): Promise
       source: "cache", daemon: "unresponsive",
       observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, now), now),
       failures: [], plan_downgraded: store.planDowngrades()[0] ?? null,
+      ...heartbeatFields(store, now),
     };
   } finally { store.close(); }
 }
@@ -777,7 +788,17 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       const policy = await readPolicy();
       const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);
       const downgrade = await call("plan_downgrades", {});
-      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+      // Same additive fields as the direct/cache paths (heartbeatFields,
+      // above), read here from the daemon instead of a local store. An older
+      // daemon that does not yet answer these two methods reads as "none",
+      // never a crash -- same defensive Array.isArray guard as src/cli.ts's
+      // own observe().
+      const heartbeatsReply = await call("heartbeats", {});
+      const heartbeats = Array.isArray(heartbeatsReply) ? heartbeatsReply as Heartbeat[] : [];
+      const timersReply = await call("timer_list", {});
+      const pendingTimers = Array.isArray(timersReply) ? timersReply as Timer[] : [];
+      const dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
+      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null, heartbeats, due_timers: dueTimers };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself

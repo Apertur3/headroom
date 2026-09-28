@@ -435,9 +435,9 @@ function printHeartbeats(items: Heartbeat[]): void {
 /**
  * `headroom heartbeat`: an orchestrator's promise to beat at least every
  * `--every`, recorded in the daemon's own store -- the one process that
- * survives a crashed session (see .claude/INCIDENT-2026-09-27-pty-leak.md).
- * The daemon's own poll loop is what notices a lapse; this command only
- * ever records/refreshes/stops the promise or lists it.
+ * survives a crashed session. The daemon's own poll loop is what notices a
+ * lapse; this command only ever records/refreshes/stops the promise or
+ * lists it.
  */
 async function heartbeat(argv: string[]): Promise<number> {
   if (argv[0] === "list") {

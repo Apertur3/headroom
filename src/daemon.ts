@@ -177,6 +177,13 @@ export class HeadroomDaemon {
   private keepalive: AgyKeepaliveSupervisor | undefined;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
+  /** Guards against a second timer-firing pass starting while a slow one
+   * (an inbox write that outlasts the 15s poll throttle below) is still
+   * running: see poll()'s own throttled block. `store.claimTimer`'s
+   * per-timer atomicity already makes two genuinely overlapping passes safe
+   * on their own, but this avoids the wasted duplicate `dueTimers()` scan
+   * and log noise a second pass would otherwise produce. */
+  private timerFiringInFlight: Promise<number> | undefined;
 
   private constructor(private readonly store: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits) { this.keepalive = keepalive; }
 
@@ -753,9 +760,23 @@ export class HeadroomDaemon {
     // early-return branches just below this), which a heartbeat_lapsed or
     // timer_missed event must never have to wait on.
     if (this.store.claimDaemonInterval("heartbeat_timer_check", new Date(now), 15_000)) {
-      this.store.checkHeartbeatLapses(new Date(now));
-      void fireDueTimers(this.store, this.home, new Date(now))
-        .catch((error: unknown) => appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home));
+      // Never let a defect here (or an unexpected throw from store access)
+      // abort the vendor poll this call is about to make: this whole block
+      // is best-effort background bookkeeping, not something a caller
+      // waiting on capacity should ever fail behind.
+      try { this.store.checkHeartbeatLapses(new Date(now)); }
+      catch (error) { void appendDaemonLog(`heartbeat lapse check failed: ${safeError(error)}`, this.home); }
+      // Single-flight: a slow inbox write can outlast this 15s throttle, and
+      // starting a second pass while the first is still running would let
+      // both see the same due timer as a candidate. store.claimTimer's own
+      // per-timer atomicity already makes that safe (only one claim can
+      // succeed), but skipping the second pass entirely avoids the wasted
+      // work and duplicate log lines it would otherwise produce.
+      if (!this.timerFiringInFlight) {
+        this.timerFiringInFlight = fireDueTimers(this.store, this.home, new Date(now))
+          .catch((error: unknown) => { void appendDaemonLog(`timer firing pass failed: ${safeError(error)}`, this.home); return 0; })
+          .finally(() => { this.timerFiringInFlight = undefined; });
+      }
       void deliverNotifications(this.store, { home: this.home })
         .catch((error: unknown) => appendDaemonLog(`notify pass failed: ${safeError(error)}`, this.home));
     }

@@ -439,6 +439,12 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
       const now = new Date();
       store.insert(fiveHour(30, 0, 4 * 3_600_000, now));
       store.insert(weekly(40, now));
+      // One lapsed heartbeat and one due timer, so the fixture captures
+      // their real object shape rather than an "empty array" placeholder --
+      // same seeding as the CLI "status" test above.
+      store.heartbeatBeat("cadence", 60_000, "resume: rerun the deploy", new Date(now.getTime() - 3 * 60_000));
+      store.checkHeartbeatLapses(now);
+      store.setTimer("cadence", "check-pr", now.toISOString(), "check PR CI status", "notify", new Date(now.getTime() - 60_000));
     } finally { store.close(); }
     const result = await withHeadroomHome(home, () => call("quota_status", {}));
     await compareToFixture("mcp-quota_status", result);

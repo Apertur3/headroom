@@ -2236,8 +2236,12 @@ export class HeadroomStore {
 
   private addTimerMissedEvent(timer: Timer, at: string): void {
     const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: timer.owner, timer_name: timer.name, action: timer.action };
+    // meter_id and principal_id are both null, same as addHeartbeatEvent
+    // above: the owner is an orchestrator identity, not a vendor account or
+    // meter, so it belongs only in `reason`/metadata, never in the column a
+    // reader would otherwise read as "this event is about that principal".
     this.db.prepare("INSERT OR IGNORE INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason,last_seen_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(`timer_missed:${timer.owner}:${timer.name}:${timer.at}`, "timer_missed", "vendor_reported", 1, "[]", at, null, null, timer.owner, timer.name, null, JSON.stringify(metadata));
+      .run(`timer_missed:${timer.owner}:${timer.name}:${timer.at}`, "timer_missed", "vendor_reported", 1, "[]", at, null, null, null, timer.owner, null, JSON.stringify(metadata));
   }
 
   /** Registers (or replaces, by the same owner+name) one named wake-up. A
@@ -2270,22 +2274,40 @@ export class HeadroomStore {
   }
 
   /**
-   * Marks one due timer delivered. Always records the inbox delivery having
-   * happened (the caller -- src/heartbeat.ts's fireDueTimers -- writes the
-   * actual inbox message itself, since that is filesystem I/O this
-   * synchronous store cannot do); additionally raises one `timer_missed`
-   * event when `if_missed` is `notify` and this owner's heartbeat is
-   * currently lapsed, so a wake-up that fired while nobody was watching
-   * still reaches a human channel, not only the inbox its crashed session
-   * will never read.
+   * Claims one due timer for delivery, before src/heartbeat.ts's
+   * fireDueTimers ever attempts the actual inbox write (filesystem I/O this
+   * synchronous store cannot do itself): the `WHERE fired_at IS NULL` guard
+   * on the UPDATE means this is the single atomic point that decides which
+   * of two overlapping firing passes (a slow inbox write outlasting the
+   * daemon's own poll throttle) gets to deliver a given timer -- the loser's
+   * claim affects zero rows and gets `undefined` back, never a duplicate
+   * delivery. Also raises one `timer_missed` event when `if_missed` is
+   * `notify` and this owner's heartbeat is currently lapsed, so a wake-up
+   * that fired while nobody was watching still reaches a human channel, not
+   * only the inbox its crashed session will never read -- `addTimerMissedEvent`'s
+   * own deterministic id keeps this idempotent even if the claim is later
+   * released (`unclaimTimer`) and re-claimed on a retry.
+   * Returns the claimed row (with its own new `fired_at`), or `undefined`
+   * when nothing matched -- already claimed by a concurrent pass, already
+   * cleared, or gone.
    */
-  markTimerFired(owner: string, name: string, now = new Date()): void {
+  claimTimer(owner: string, name: string, now = new Date()): Timer | undefined {
     const at = now.toISOString();
     const row = this.db.prepare("SELECT * FROM timers WHERE owner = ? AND name = ? AND fired_at IS NULL AND cleared_at IS NULL").get(owner, name);
-    if (!row) return;
-    const timer = timerFromRow(row);
+    if (!row) return undefined;
     this.db.prepare("UPDATE timers SET fired_at = ? WHERE owner = ? AND name = ? AND fired_at IS NULL").run(at, owner, name);
+    const timer = { ...timerFromRow(row), fired_at: at };
     if (timer.if_missed === "notify" && this.heartbeatLapsed(owner)) this.addTimerMissedEvent(timer, at);
+    return timer;
+  }
+
+  /** Releases a claim a delivery attempt could not honor (the inbox write
+   * failed), so a later firing pass sees this timer as pending again. Only
+   * releases the exact claim it was given (`fired_at` must still equal
+   * `claimedFiredAt`): a timer independently cleared, or reclaimed by a
+   * different pass in between, is never clobbered by a stale release. */
+  unclaimTimer(owner: string, name: string, claimedFiredAt: string): void {
+    this.db.prepare("UPDATE timers SET fired_at = NULL WHERE owner = ? AND name = ? AND fired_at = ?").run(owner, name, claimedFiredAt);
   }
 
   /** Idempotent: clearing an already-cleared or already-fired timer is not

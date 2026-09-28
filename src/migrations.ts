@@ -151,10 +151,10 @@ const ADD_KNOWN_MODELS: Migration = {
 
 /**
  * `heartbeats` and `timers` back the orchestrator heartbeat / named wake-up
- * feature (issue: the P0 on 2026-09-27 -- see .claude/INCIDENT-2026-09-27-pty-leak.md
- * -- where a crashed orchestrator session took every in-session timer and
- * watcher with it, and nothing noticed for 45 minutes). Both live in the
- * daemon-owned store, the one process that survives a session crash.
+ * feature: a crashed orchestrator session takes every in-session timer and
+ * watcher down with it, and that can go unnoticed for as long as nobody
+ * happens to look. Both live in the daemon-owned store, the one process
+ * that survives a session crash.
  *
  * `heartbeats` is one row per owner (an orchestrator identity, the same
  * namespace as a lease owner or an inbox session): `interval_ms` is what the

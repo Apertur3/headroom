@@ -8,6 +8,7 @@ import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 import * as config from "../src/config.js";
 import { daemonRequest, rpc, socketPath, HeadroomDaemon } from "../src/daemon.js";
+import * as logs from "../src/logs.js";
 import { tailDaemonLog } from "../src/logs.js";
 import { directStatus, handleMcp, serveMcp } from "../src/mcp.js";
 import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
@@ -925,5 +926,29 @@ describe("heartbeat and timer RPCs", () => {
       const listAfterStop = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 10, method: "heartbeats" }));
       expect(listAfterStop.result).toEqual([]);
     } finally { await daemon.stop(); }
+  });
+
+  it("a checkHeartbeatLapses failure is logged but never aborts the vendor poll", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-heartbeat-check-throws-")); temporary.push(root);
+    let polls = 0;
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "heartbeat-throws"), poller: async () => { polls += 1; return { observations: [fixture()], failures: [] }; } });
+    const internal = daemon as unknown as { store: HeadroomStore };
+    const broken = vi.spyOn(internal.store, "checkHeartbeatLapses").mockImplementation(() => { throw new Error("simulated lapse-check failure"); });
+    const logged = vi.spyOn(logs, "appendDaemonLog");
+    try {
+      const status = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status" }));
+      // The vendor poll still ran and its reply is a normal, error-free one --
+      // a defect in the best-effort heartbeat bookkeeping never surfaces as
+      // a failed status call.
+      expect(status.error).toBeUndefined();
+      expect(Array.isArray(status.result)).toBe(true);
+      expect(polls).toBe(1);
+      expect(broken).toHaveBeenCalled();
+      expect(logged.mock.calls.some(([message]) => String(message).includes("heartbeat lapse check failed"))).toBe(true);
+    } finally {
+      broken.mockRestore();
+      logged.mockRestore();
+      await daemon.stop();
+    }
   });
 });

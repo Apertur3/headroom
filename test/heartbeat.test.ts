@@ -1,5 +1,5 @@
 /**
- * Orchestrator heartbeat leases and named wake-ups (.claude/lanes/specs/heartbeat.md).
+ * Orchestrator heartbeat leases and named wake-ups.
  * Covers store.ts's heartbeat/timer persistence and lapse/fire bookkeeping,
  * src/heartbeat.ts's inbox delivery, and the notifier picking up
  * heartbeat_lapsed/heartbeat_restored/timer_missed the same way it already
@@ -10,11 +10,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { HeadroomDaemon } from "../src/daemon.js";
 import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
-import { readInbox } from "../src/inbox.js";
+import { readInbox, sendInboxMessage } from "../src/inbox.js";
 import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
 import { HeadroomStore } from "../src/store.js";
+import { authedHandleLine } from "./helpers/daemon-rpc.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -227,6 +229,63 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
+  it("two overlapping passes with a slow inbox sender never deliver the same timer twice", async () => {
+    const { store, home } = await openStore("headroom-firedue-overlap-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-overlap", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+
+      let releaseFirst: () => void;
+      const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const sent: string[] = [];
+      const slowSend: typeof sendInboxMessage = async (options) => {
+        sent.push(options.to);
+        await gate; // held open until the test explicitly releases it
+        return sendInboxMessage(options);
+      };
+
+      // Started but not awaited: this pass claims the timer synchronously
+      // (store.claimTimer runs before the first await inside slowSend) and
+      // then blocks on the gate, exactly like a slow inbox write outlasting
+      // the daemon's own 15s poll throttle.
+      const firstPass = fireDueTimers(store, home, at, undefined, slowSend);
+      // A second, independent pass starts while the first is still stuck in
+      // its slow send. Its own dueTimers() scan must no longer see the
+      // timer at all -- claimTimer already marked it fired_at the instant
+      // the first pass claimed it -- so this resolves immediately without
+      // ever touching slowSend.
+      const secondPass = await fireDueTimers(store, home, at, undefined, slowSend);
+      expect(secondPass).toBe(0);
+      expect(sent).toEqual(["orch-overlap"]); // only the first pass ever called send
+
+      releaseFirst!();
+      expect(await firstPass).toBe(1);
+
+      const inbox = await readInbox({ session: "orch-overlap", home, markRead: false });
+      expect(inbox.messages).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  it("un-claims a timer whose inbox delivery fails, so a later pass can retry and succeed", async () => {
+    const { store, home } = await openStore("headroom-firedue-retry-");
+    try {
+      const at = new Date("2026-09-28T12:05:00.000Z");
+      store.setTimer("orch-retry", "wake", at.toISOString(), "check the deploy", "notify", new Date("2026-09-28T12:00:00.000Z"));
+
+      const failingSend: typeof sendInboxMessage = async () => { throw new Error("simulated inbox write failure"); };
+      const failedPass = await fireDueTimers(store, home, at, undefined, failingSend);
+      expect(failedPass).toBe(0);
+      // Un-claimed: the timer is pending again, not lost.
+      expect(store.timers("orch-retry")).toHaveLength(1);
+      expect((await readInbox({ session: "orch-retry", home, markRead: false })).messages).toHaveLength(0);
+
+      const retryPass = await fireDueTimers(store, home, new Date(at.getTime() + 60_000));
+      expect(retryPass).toBe(1);
+      expect(store.timers("orch-retry")).toHaveLength(0);
+      expect((await readInbox({ session: "orch-retry", home, markRead: false })).messages).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
   it("still delivers the inbox entry with --if-missed drop, but raises no timer_missed event even while the owner's heartbeat is lapsed", async () => {
     const { store, home } = await openStore("headroom-firedue-drop-");
     try {
@@ -268,6 +327,10 @@ describe("fireDueTimers", () => {
       await fireDueTimers(store, home, lapsedAt);
       const missed = store.events(start.toISOString()).filter((event) => event.kind === "timer_missed");
       expect(missed).toHaveLength(1);
+      // The owner is an orchestrator identity, not a vendor account: it
+      // belongs in metadata/reason only, never in principal_id -- same
+      // convention as heartbeat_lapsed/heartbeat_restored.
+      expect(missed[0].principal_id).toBeNull();
       expect(missed[0].metadata).toMatchObject({ owner: "orch-i", timer_name: "missed-check", action: "check while unattended" });
     } finally { store.close(); }
   });
@@ -412,5 +475,58 @@ describe("quota_heartbeat", () => {
       const store = await HeadroomStore.open(home);
       try { expect(store.heartbeats()).toHaveLength(1); } finally { store.close(); }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI/MCP parity: quota_status must carry heartbeats/due_timers exactly like
+// `headroom status --json` does, over every path -- daemon, direct, and
+// cache (the cache path is exercised in test/cached-reads.test.ts's own
+// "quota_status is served from the read-only cache, flagged" test).
+// ---------------------------------------------------------------------------
+
+describe("quota_status daemon-path parity", () => {
+  it("carries heartbeats and due_timers from a real (in-process) daemon's own store, via the heartbeats/timer_list RPCs quota_status now calls", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-mcp-status-parity-"));
+    temporary.push(root);
+    const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
+    try {
+      const internal = daemon as unknown as { store: HeadroomStore };
+      const now = new Date("2026-09-28T12:00:00.000Z");
+      internal.store.heartbeatBeat("cadence", 60_000, "resume: rerun the deploy", new Date(now.getTime() - 3 * 60_000));
+      internal.store.checkHeartbeatLapses(now);
+      // mcp.ts's own due-timer filter (unlike the store methods above) uses
+      // the real wall clock, since it runs inside production dispatch code
+      // with no injected test clock -- the timer's `at` must therefore be
+      // safely in the past relative to real now, not merely before the
+      // fixture's own fixed `now`.
+      internal.store.setTimer("cadence", "check-pr", "2020-01-01T00:00:00.000Z", "check PR CI status", "notify", new Date(now.getTime() - 60_000));
+      // The "status" RPC's own poll() call fires any currently-due timer as
+      // a real side effect (see daemon.ts's own throttled block) -- correct
+      // production behavior, but it would otherwise consume this test's
+      // timer before quota_status ever gets to read it back as "due".
+      // Pre-claiming the same throttle key is exactly what a status call a
+      // few seconds earlier would already have done, and isolates the
+      // wiring this test is actually about: that quota_status's `due_timers`
+      // reads from the same store this timer was seeded into.
+      internal.store.claimDaemonInterval("heartbeat_timer_check", new Date(), 15_000);
+
+      // A stand-in for daemonCall that dispatches to this same in-process
+      // daemon's private handleLine() (authedHandleLine, the project's own
+      // helper for exactly this) instead of dialing a real socket -- the
+      // point here is exercising handleMcp's own daemon-array-normalization
+      // path (mcp.ts's `method === "status" && Array.isArray(finalResult)`
+      // branch, which now also calls "heartbeats"/"timer_list"), not the
+      // socket transport itself.
+      const call = async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+        const reply = await authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
+        if (reply.error) throw new Error(reply.error.message);
+        return reply.result;
+      };
+      const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_status","arguments":{}}}', call);
+      const structured = (response as { result: { structuredContent: Record<string, unknown> } }).result.structuredContent;
+      expect(structured.heartbeats).toEqual([expect.objectContaining({ owner: "cadence", resume_sentence: "resume: rerun the deploy", lapsed_since: expect.any(String) })]);
+      expect(structured.due_timers).toEqual([expect.objectContaining({ owner: "cadence", name: "check-pr", action: "check PR CI status" })]);
+    } finally { await daemon.stop(); }
   });
 });

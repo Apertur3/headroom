@@ -206,11 +206,14 @@ direct alike.
 
 MCP `quota_status`: `{ contract, generated_at, source?: "direct" | "cache",
 daemon?: "unresponsive", observations: Observation[], plan_downgraded: {
-principal, from, to, since, acknowledged } | null, failures?: string[] }`.
-Direct reads carry `source: "direct"` and `failures`; a cached read (daemon
-present but unresponsive after one retry) carries `source: "cache"`,
-`daemon: "unresponsive"`, and `failures: []`; daemon reads omit `source` and
-`daemon` entirely. There is no `--threshold` equivalent.
+principal, from, to, since, acknowledged } | null, heartbeats: Heartbeat[],
+due_timers: Timer[], failures?: string[] }`. `heartbeats`/`due_timers` are
+the same additive fields as the CLI's own `status` (above), present over
+every path -- daemon, direct, and cache -- for CLI/MCP parity. Direct reads
+carry `source: "direct"` and `failures`; a cached read (daemon present but
+unresponsive after one retry) carries `source: "cache"`, `daemon:
+"unresponsive"`, and `failures: []`; daemon reads omit `source` and `daemon`
+entirely. There is no `--threshold` equivalent.
 
 ### `can` (`headroom can <class> --owner X --json`, MCP `quota_can`)
 
