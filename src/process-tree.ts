@@ -112,6 +112,41 @@ function trySignal(pid: number, signal: NodeJS.Signals): void {
   try { process.kill(pid, signal); } catch { /* already exited, or never ours to signal */ }
 }
 
+/** ps-free liveness probe for a process GROUP (not just the bare pid): true
+ * iff a signal-0 send to `-pid` succeeds, fails with EPERM (exists, just not
+ * ours to signal -- still alive), or fails with anything else that is NOT
+ * ESRCH; false ONLY on ESRCH (kernel-confirmed: no such process group).
+ * Fails closed on purpose -- every caller treats `true` as "leave it alone"
+ * and `false` as "confirmed gone, safe to act" (reap, restart, clear
+ * evidence), so an unexpected errno (EINVAL, a sandboxed/virtualized kill(2)
+ * behaving unusually, anything not in POSIX's documented set for kill(2))
+ * must never be read as proof of death -- only ESRCH is that proof. Uses no
+ * `ps` at all, so it is the one identity signal that still works when `ps`
+ * is denied or absent. Checking the GROUP specifically (not the bare pid) is
+ * deliberately more specific than a plain liveness check: a pid the OS
+ * recycled to an ordinary, non-leader process would essentially never also
+ * happen to be a session/group leader of that exact id, whereas an agy
+ * process (see antigravity-keepalive.ts) always is one. It is still not a
+ * full identity proof -- see sweepPreviousKeepalive()'s use of it alongside
+ * a launch-time/mtime cross-check for what that combination does and does
+ * not verify. */
+export function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+/** SIGKILL a pid and, on POSIX, the process group it may lead (a PTY session
+ * leader like agy always is one -- see antigravity-keepalive.ts). Uses no
+ * `ps` or process listing at all, unlike killTree()'s SIGKILL escalation
+ * (which re-lists via `ps` to decide who survived a SIGTERM and, if `ps`
+ * cannot answer, silently skips escalating at all): this is the one kill
+ * primitive that still reliably reaps a SIGTERM-ignoring process when `ps` is
+ * denied or unavailable. Errors mean the target is already gone. */
+export function killProcessGroup(pid: number, options: { groupOnly?: boolean } = {}): void {
+  for (const target of options.groupOnly ? [-pid] : [-pid, pid]) { try { process.kill(target, "SIGKILL"); } catch { /* already gone */ } }
+}
+
 /** Signal both `pid` itself and, on POSIX, the process group it may be the
  * leader of (negative pid). A pid that never became its own group leader
  * (the common case for an ordinary child) just makes the group signal a
@@ -179,4 +214,30 @@ export async function processSignature(pid: number, execImpl: ExecFile = execFil
   };
   const [command, startedAt] = await Promise.all([field("comm"), field("lstart")]);
   return command && startedAt ? { command, startedAt } : undefined;
+}
+
+/** How long one process has been running, in whole seconds, from `ps`'s
+ * `etime` (`[[dd-]hh:]mm:ss`, the same on BSD and procps). Unlike `lstart`,
+ * this is measured on one clock: procps derives `lstart` from the boot time,
+ * kept in whole seconds, so it can read up to a second early against the
+ * wall clock. Undefined when the process is gone or `ps` cannot be run. */
+export async function processElapsedSeconds(pid: number, execImpl: ExecFile = execFileAsync): Promise<number | undefined> {
+  let raw: string | undefined;
+  try { raw = (await execImpl("ps", ["-o", "etime=", "-p", String(pid)])).stdout.split("\n")[0]?.trim(); }
+  catch { return undefined; }
+  const match = raw?.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!match) return undefined;
+  const [, days, hours, minutes, seconds] = match;
+  return ((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds);
+}
+
+/** One process's full argument line from `ps`, never truncated to a
+ * terminal width (`-ww`, accepted by both BSD and procps ps). Undefined when
+ * the process is gone or `ps` cannot be run. */
+export async function processArgs(pid: number, execImpl: ExecFile = execFileAsync): Promise<string | undefined> {
+  try {
+    const { stdout } = await execImpl("ps", ["-ww", "-o", "args=", "-p", String(pid)]);
+    const value = stdout.split("\n")[0]?.trim();
+    return value ? value : undefined;
+  } catch { return undefined; }
 }
