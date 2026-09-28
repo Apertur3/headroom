@@ -1637,12 +1637,24 @@ export class HeadroomStore {
    * like it displaces another fresh one, since the tie-break is fetched_at
    * DESC either way.
    */
+  /** Whether this meter has ever reported a window at least `minutes` long.
+   * latestPerWindow() drops a window whose newest poll failed, so a caller
+   * that must fail closed on a missing window uses this to tell "failed
+   * right now" apart from "this meter has no such window". */
+  hasReportedWindow(meterId: string, minutes: number): boolean {
+    return this.prepared("SELECT 1 FROM observations WHERE meter_id = ? AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) >= ? LIMIT 1")
+      .get(meterId, minutes) !== undefined;
+  }
+
   latestPerWindow(meterId?: string): StoredObservation[] {
     const filter = meterId === undefined
       ? "WHERE COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0"
       : "WHERE meter_id = ? AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0";
+    // Ranks ids only and joins the winners' full rows back: sorting every
+    // observation's JSON columns through the window function made this the
+    // daemon's slowest synchronous read, long enough to stall health replies.
     return this.prepared(`WITH ranked AS (
-      SELECT *, ROW_NUMBER() OVER (
+      SELECT id, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
         -- A later manual entry supersedes an earlier one, including a clear.
         -- A cleared/expired manual fact does not hide a newer failed poll:
@@ -1669,8 +1681,8 @@ export class HeadroomStore {
                       THEN 0 ELSE 1 END), fetched_at DESC, id DESC
       ) AS row_number
       FROM observations ${filter}
-    ) SELECT current.* FROM ranked AS current
-      WHERE current.row_number = 1
+    ) SELECT current.* FROM ranked JOIN observations AS current ON current.id = ranked.id
+      WHERE ranked.row_number = 1
         AND NOT EXISTS (
           SELECT 1 FROM observations AS retired
           WHERE retired.meter_id = current.meter_id

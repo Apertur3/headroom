@@ -2000,7 +2000,7 @@ async function daemon(): Promise<number> {
   await instance.start();
   await appendDaemonLog(`daemon started; listening on ${socketPath()}`);
   await new Promise<void>((resolve) => {
-    const stop = () => { void instance.stop().then(() => appendDaemonLog("daemon stopped")).finally(resolve); };
+    const stop = () => { void instance.stop().then(() => appendDaemonLog("daemon stopped"), (error: unknown) => appendDaemonLog(`daemon stop failed: ${safeError(error)}`)).finally(resolve); };
     process.once("SIGINT", stop); process.once("SIGTERM", stop);
   });
   return 0;
