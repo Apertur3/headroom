@@ -20,7 +20,7 @@ import { readPolicy } from "./config.js";
 import { rpc, socketPath } from "./daemon.js";
 import { withEffectiveFreshness, withStatusInfo } from "./pace.js";
 import { defaultPolicy, paceDecision, reserveFor, type Policy } from "./policy.js";
-import { readAccounts } from "./registry.js";
+import { readAccountsOrEmpty } from "./registry.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, type ResetsIn } from "./resets.js";
 import { HeadroomStore } from "./store.js";
 import { isAccountEnabled, isLocalAccount, type Lease, type Observation, type PaceState } from "./types.js";
@@ -324,11 +324,9 @@ export async function daemonRows(path: string, budgetMs = DAEMON_BUDGET_MS, requ
  * Undefined when the file is missing or names no account for this profile;
  * the line then simply has no session-scoped half to attribute. */
 export async function sessionPrincipal(profile: string): Promise<string | undefined> {
-  try {
-    const accounts = await readAccounts();
-    const match = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile);
-    return match?.name;
-  } catch { return undefined; }
+  const accounts = await readAccountsOrEmpty();
+  const match = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile);
+  return match?.name;
 }
 
 /**
@@ -340,18 +338,24 @@ export async function sessionPrincipal(profile: string): Promise<string | undefi
  */
 export async function statuslineContext(profile: string, now = new Date(), budgetMs = DAEMON_BUDGET_MS): Promise<StatuslineContext> {
   const policy = await readPolicy().catch(() => defaultPolicy);
-  const principal = await sessionPrincipal(profile);
+  const accounts = await readAccountsOrEmpty();
+  const disabledPrincipalIds = new Set(accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name));
+  const principal = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile)?.name;
+  const current = <T extends { principal_id?: string; meter_id?: string }>(items: T[]): T[] => items.filter((item) => {
+    const principalId = item.principal_id ?? item.meter_id?.split(":", 1)[0];
+    return !principalId || !disabledPrincipalIds.has(principalId);
+  });
   try {
     const fromDaemon = await daemonRows(socketPath(), budgetMs);
-    if (fromDaemon) return { ...fromDaemon, policy, ...(principal ? { principal } : {}), source: "daemon" };
+    if (fromDaemon) return { observations: current(fromDaemon.observations), leases: current(fromDaemon.leases), policy, ...(principal ? { principal } : {}), source: "daemon" };
   } catch { /* the store fallback below is the answer to any daemon trouble */ }
   try {
     const store = await HeadroomStore.open();
     try {
-      const rows = store.latestPerWindow();
+      const rows = current(store.latestPerWindow());
       return {
         observations: withStatusInfo(rows, store.burnRateFor(rows, now), store.lastKnownFor(rows, now), policy.staleness_minutes, now),
-        leases: store.leases(undefined, true, now),
+        leases: current(store.leases(undefined, true, now)),
         policy, ...(principal ? { principal } : {}), source: "store",
       };
     } finally { store.close(); }

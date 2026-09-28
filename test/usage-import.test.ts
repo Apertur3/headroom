@@ -73,6 +73,19 @@ describe("headroom usage import", () => {
     });
   });
 
+  it("refuses a disabled principal before opening its transcript or creating usage.db", async () => {
+    const { root, home } = await setupHome("usage-import-disabled-");
+    // This path is deliberately absent: a disabled refusal rather than an
+    // input-file error proves the importer did not inspect it.
+    const transcript = join(root, "never-opened.jsonl");
+    await writeFile(join(home, "accounts.toml"), ['[[accounts]]', 'name = "claude-parked"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/claude-parked"', 'adapter = "native-ts"', ''].join("\n"), { mode: 0o600 });
+    await withHeadroomHome(home, async () => {
+      await expect(main(["usage", "import", "--source", "fixture-source", "--principal", "claude-parked", "--path", transcript]))
+        .rejects.toThrow("principal claude-parked is disabled");
+      await expect(lstat(join(home, "usage.db"))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
   it("prints --json output with a version and generated_at, no raw path", async () => {
     const { root, home } = await setupHome("usage-import-json-");
     const transcript = join(root, "transcript.jsonl");
