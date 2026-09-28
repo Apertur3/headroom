@@ -322,9 +322,18 @@ export interface Heartbeat {
  * ever delivers (as one inbox entry to `owner`), never executes. `if_missed`
  * controls whether a due timer whose owner's heartbeat is currently lapsed
  * also raises a `timer_missed` notification, in addition to the inbox entry
- * every due timer always gets. `fired_at`/`cleared_at` are set once, never
- * cleared, so a timer's history stays inspectable after it fires or is
- * cleared. */
+ * every due timer always gets. `fired_at`/`cleared_at`/`failed_at` are set
+ * once, never cleared, so a timer's history stays inspectable after it
+ * fires, is cleared, or is given up on. `attempts` counts delivery attempts
+ * that *completed* and failed (a thrown error) -- one that timed out with
+ * delivery still unknown (see src/heartbeat.ts's fireDueTimers) is never
+ * counted, since it may yet succeed unobserved; it recovers once its claim
+ * simply goes stale, retried under the same `attempts` count rather than
+ * bumping it for an outcome that was never actually determined. Once
+ * `attempts` reaches MAX_TIMER_DELIVERY_ATTEMPTS (store.ts), `failed_at` is
+ * set instead of releasing the claim for another retry, so a permanently-
+ * undeliverable timer (an invalid owner, an oversized action) does not get
+ * retried on every maintenance pass forever. */
 export interface Timer {
   owner: string;
   name: string;
@@ -334,4 +343,6 @@ export interface Timer {
   created_at: string;
   fired_at: string | null;
   cleared_at: string | null;
+  attempts: number;
+  failed_at: string | null;
 }

@@ -20,14 +20,17 @@
  */
 import { lstat, readdir, rename } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { readBoundedRegularFile, safeOutputDirectory, writeFileAtomic, SAFE_READ_MAX_BYTES } from "./security.js";
+import { isDeepStrictEqual } from "node:util";
+import { isReservedSessionId, readBoundedRegularFile, safeOutputDirectory, serializeInboxEnvelope, writeFileAtomic, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN } from "./security.js";
 import { safeHeadroomDirectory } from "./store.js";
 
 export const INBOX_KINDS = ["budget", "note", "handoff"] as const;
 export type InboxKind = (typeof INBOX_KINDS)[number];
 
-/** One path segment, no separators, no drive letters, no percent escapes. */
-export const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/** Re-exported from security.js, which now hosts the pattern so store.ts's
+ * timer owner validation can share it without importing this module (see
+ * security.ts's own doc comment on SESSION_ID_PATTERN for why). */
+export { SESSION_ID_PATTERN };
 
 /** Bytes accepted for one message body, matching security.ts's own bound. */
 export const MAX_INBOX_MESSAGE_BYTES = SAFE_READ_MAX_BYTES;
@@ -68,7 +71,7 @@ export function isInboxKind(value: string): value is InboxKind {
 export function assertSessionId(value: string): string {
   const session = value.trim();
   if (!SESSION_ID_PATTERN.test(session)) throw new Error("session id must be 1 to 64 characters of A-Z a-z 0-9 . _ -");
-  if (session === "." || session === "..") throw new Error("session id must not be a directory reference");
+  if (isReservedSessionId(session)) throw new Error("session id must not be a directory reference");
   return session;
 }
 
@@ -119,33 +122,218 @@ export interface SendOptions {
   now?: Date;
 }
 
-/** Writes one message atomically, 0600, into the recipient's inbox. */
-export async function sendInboxMessage(options: SendOptions): Promise<{ path: string; file: string; session: string }> {
+function validateSendOptions(options: Pick<SendOptions, "to" | "kind" | "text" | "from">): { session: string; from: string | null } {
   const session = assertSessionId(options.to);
   const from = options.from ? assertSessionId(options.from) : null;
   if (!isInboxKind(options.kind)) throw new Error(`kind must be one of ${INBOX_KINDS.join(", ")}`);
   const bytes = Buffer.byteLength(options.text, "utf8");
   if (!bytes) throw new Error("message body is empty");
   if (bytes > MAX_INBOX_MESSAGE_BYTES) throw new Error(`message body is ${bytes} bytes, over the ${MAX_INBOX_MESSAGE_BYTES} byte cap`);
+  return { session, from };
+}
+
+/** Writes one message atomically, 0600, into the recipient's inbox. */
+export async function sendInboxMessage(options: SendOptions): Promise<{ path: string; file: string; session: string }> {
+  const { session, from } = validateSendOptions(options);
   const now = options.now ?? new Date();
   const directory = await sessionDirectory(session, options.home);
   const { path, file } = await freeMessagePath(directory, options.kind, now.getTime());
-  const envelope = { version: 1, kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) };
-  await writeFileAtomic(path, `${JSON.stringify(envelope, null, 2)}\n`, 0o600);
+  await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), body: parseBody(options.text) }), 0o600);
   return { path, file, session };
+}
+
+export interface SendAtOptions extends SendOptions {
+  /** A unique identity for this exact delivery, generated once by store.ts's
+   * `setTimer` and persisted on the timer row (never derived here, and never
+   * shared with any other timer or ordinary handoff) -- in place of
+   * `sendInboxMessage`'s own "now.getTime(), advance on collision"
+   * numbering, which both collides across distinct messages that happen to
+   * land in the same window and cannot be idempotent (it is different on
+   * every call). Appended as its own filename component (see
+   * `parseMessageName` below) and carried in the envelope's own
+   * `delivery_id` field, so a retried delivery -- which necessarily runs at
+   * a different wall-clock instant than the original attempt, and so gets a
+   * different leading `<epoch-ms>` -- can still be recognized as the same
+   * delivery by identity, not by path. Used by src/heartbeat.ts's
+   * fireDueTimers so a timer retried after a crash or a timeout (claimed,
+   * possibly delivered, but never confirmed durable) is never delivered
+   * twice. */
+  delivery_id: number;
+  /** Matches the caller's delivery wait bound. A send that is still pending
+   * after this interval no longer monopolizes this process's in-flight slot:
+   * a later stale-claim retry may make a fresh idempotent attempt. */
+  inFlightTimeoutMs?: number;
+}
+
+/** The default matches heartbeat.ts's normal per-delivery timeout. The
+ * caller passes its configured delivery timeout when it differs. */
+const DEFAULT_IN_FLIGHT_TIMER_DELIVERY_TIMEOUT_MS = 10_000;
+
+/*
+ * A timer delivery's filename is `<epoch-ms>-<delivery_id>-<kind>.json` --
+ * keeping the real timestamp (the delivery attempt's own send time) in the
+ * documented `<epoch-ms>` position, so `at_epoch`, oldest-first ordering and
+ * `--since` all keep working exactly like an ordinary hand-off's
+ * `<epoch-ms>-<kind>.json`. The delivery id is a second, separate
+ * component, appended rather than substituted -- it never collides with an
+ * ordinary hand-off's filename shape (which has no middle numeric component
+ * at all), and it is what idempotency is keyed on, not the timestamp, since
+ * a retry's own send time differs from the original attempt's. See
+ * `parseMessageName`'s own regex for both shapes.
+ */
+
+/** Every file already on disk (unread, or read and renamed with
+ * READ_SUFFIX) for this exact `kind`/`deliveryId`, regardless of the
+ * `<epoch-ms>` a previous attempt happened to send it under -- a directory
+ * scan, not a single-path check, precisely because a retry's own send time
+ * (and so its own filename) legitimately differs from the original
+ * attempt's. At most one is expected under normal operation; the first
+ * found is treated as authoritative -- but only once its own envelope
+ * confirms it: the filename is what THIS scan searches by, never what it
+ * trusts. A corrupt file, or a genuine collision with some unrelated
+ * message that happens to carry a matching kind and delivery id in its own
+ * name, must never be mistaken for this exact delivery already landing --
+ * that would report `delivered: false` for a delivery that never actually
+ * happened, and (via fireDueTimers's confirmTimerDelivered) let a timer be
+ * marked fired without its action ever reaching its owner. The envelope's
+ * own `delivery_id` field is the one place that identity is written under
+ * the writer's control (serializeInboxEnvelope), so it -- together with the
+ * envelope version, sender, recipient, kind, and exact expected body -- has
+ * to agree with what this scan is actually looking for before the file is
+ * trusted. If an unread file disappears while this scan reads it, its `.read`
+ * counterpart is checked once: a reader may have renamed it in precisely that
+ * interval, and that completed delivery must not be re-sent as fresh unread
+ * mail. A file this scan cannot read back at all is skipped, not thrown on:
+ * it is not proof of anything either way. A file that DOES parse but
+ * disagrees on identity is the one case worth failing loud on. */
+async function findExistingDelivery(directory: string, kind: InboxKind, deliveryId: number, to: string, from: string | null, body: unknown): Promise<{ path: string; file: string } | undefined> {
+  let entries: string[];
+  try { entries = await readdir(directory); }
+  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  for (const entry of entries) {
+    const bare = entry.endsWith(READ_SUFFIX) ? entry.slice(0, -READ_SUFFIX.length) : entry;
+    const parsed = parseMessageName(bare);
+    if (!parsed || parsed.kind !== kind || parsed.deliveryId !== deliveryId) continue;
+    let path = join(directory, entry);
+    let file = entry;
+    let raw: string;
+    try { raw = await readBoundedRegularFile(path); }
+    catch (error: unknown) {
+      // A reader can rename an unread message to `.read` after readdir() but
+      // before this read. Treat that counterpart as the same durable delivery
+      // rather than treating ENOENT as permission to write it again.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || entry.endsWith(READ_SUFFIX)) continue;
+      path = `${path}${READ_SUFFIX}`;
+      file = `${entry}${READ_SUFFIX}`;
+      try { raw = await readBoundedRegularFile(path); }
+      catch { continue; }
+    }
+    let envelope: unknown;
+    try { envelope = JSON.parse(raw); } catch { continue; } // not a name match worth trusting either
+    const record = envelope && typeof envelope === "object" && !Array.isArray(envelope) ? envelope as Record<string, unknown> : {};
+    if (record.version === 1 && record.delivery_id === deliveryId && record.kind === kind && record.to === to && record.from === from && isDeepStrictEqual(record.body, body)) return { path, file };
+    throw new Error(`inbox file ${file} matches delivery ${deliveryId} by name but not by envelope content`);
+  }
+  return undefined;
+}
+
+/** Every currently in-flight `sendInboxMessageAt` call, keyed by exactly
+ * what identifies one delivery (home/session/kind/delivery_id). A second
+ * call for the same key -- a genuinely concurrent retry, or a crash-
+ * recovery retry that starts while the original attempt (its own send
+ * merely slow, not actually dead -- fireDueTimers's own delivery timeout
+ * only stops AWAITING it, it does not cancel it) is still running -- joins
+ * the SAME promise instead of racing its own independent
+ * check-then-write against it. Without this, two overlapping attempts
+ * could both see "no file yet" (`findExistingDelivery` finding nothing
+ * because the first attempt's write has not landed yet) and both write --
+ * or the first's file could be read and renamed to `.read` in the gap
+ * between the second's own check and its write, making the delivery
+ * reappear as a second, fresh, unread message. Each entry carries an
+ * attempt token as well as its promise: expiry deliberately removes a slow
+ * attempt from this map so a retry can proceed, but the slow attempt must
+ * then recognize that it was superseded just before it writes. */
+type TimerDeliveryResult = { path: string; file: string; session: string; delivered: boolean };
+interface InFlightTimerDelivery { token: symbol; promise: Promise<TimerDeliveryResult>; }
+const inFlightTimerDeliveries = new Map<string, InFlightTimerDelivery>();
+
+/**
+ * The idempotent-by-identity counterpart of `sendInboxMessage`. Calling
+ * this twice for the same `to`/`kind`/`delivery_id` -- whether truly
+ * concurrent, or a later crash/timeout-recovery retry -- is safe: see
+ * `inFlightTimerDeliveries`'s own doc comment for how a still-running
+ * attempt is joined rather than duplicated, and `findExistingDelivery`'s
+ * for how an already-completed one (found by identity, not by the exact
+ * path a retry would otherwise have to guess) is recognized instead of
+ * re-sent.
+ */
+export async function sendInboxMessageAt(options: SendAtOptions): Promise<TimerDeliveryResult> {
+  const { session, from } = validateSendOptions(options);
+  if (!Number.isInteger(options.delivery_id) || options.delivery_id < 0) throw new Error("delivery_id must be a non-negative integer");
+  const inFlightTimeoutMs = options.inFlightTimeoutMs ?? DEFAULT_IN_FLIGHT_TIMER_DELIVERY_TIMEOUT_MS;
+  if (!Number.isFinite(inFlightTimeoutMs) || inFlightTimeoutMs <= 0) throw new Error("inFlightTimeoutMs must be greater than 0");
+  const key = `${options.home ?? ""}\u0000${session}\u0000${options.kind}\u0000${options.delivery_id}`;
+  const inFlight = inFlightTimerDeliveries.get(key);
+  if (inFlight) return inFlight.promise;
+  const token = Symbol("timer-delivery-attempt");
+  const attempt = (async (): Promise<TimerDeliveryResult> => {
+    const now = options.now ?? new Date();
+    const directory = await sessionDirectory(session, options.home);
+    const body = parseBody(options.text);
+    const existing = await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body);
+    if (existing) return { path: existing.path, file: existing.file, session, delivered: false };
+    const file = `${now.getTime()}-${options.delivery_id}-${options.kind}.json`;
+    const path = join(directory, file);
+    // The delivery timeout may have removed this attempt's in-flight entry
+    // while its initial scan was slow. The check belongs at the atomic
+    // writer's commit boundary, not merely before it opens its temporary
+    // file: otherwise an old writer already awaiting filesystem I/O could
+    // still rename its file after a retry lands. A retry that took over is
+    // the sole writer, and a retry that has already landed (including as
+    // `.read`) is authoritative.
+    const committed = await writeFileAtomic(path, serializeInboxEnvelope({ kind: options.kind, to: session, from, at: now.toISOString(), deliveryId: options.delivery_id, body }), 0o600, async () => {
+      const current = inFlightTimerDeliveries.get(key);
+      if (!current || current.token !== token) return false;
+      return (await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body)) === undefined;
+    });
+    if (committed) return { path, file, session, delivered: true };
+    const landed = await findExistingDelivery(directory, options.kind, options.delivery_id, session, from, body);
+    if (landed) return { path: landed.path, file: landed.file, session, delivered: false };
+    const successor = inFlightTimerDeliveries.get(key);
+    if (successor && successor.token !== token) return successor.promise;
+    throw new Error("timer delivery attempt was superseded before write");
+  })();
+  const entry = { token, promise: attempt };
+  inFlightTimerDeliveries.set(key, entry);
+  const expiry = setTimeout(() => {
+    // Do not let an older, timed-out attempt erase a newer retry's entry.
+    if (inFlightTimerDeliveries.get(key)?.token === token) inFlightTimerDeliveries.delete(key);
+  }, inFlightTimeoutMs);
+  expiry.unref?.();
+  try { return await attempt; }
+  finally {
+    clearTimeout(expiry);
+    if (inFlightTimerDeliveries.get(key)?.token === token) inFlightTimerDeliveries.delete(key);
+  }
 }
 
 function parseBody(text: string): unknown {
   try { return JSON.parse(text) as unknown; } catch { return text; }
 }
 
-/** `<epoch>-<kind>.json` for a known kind, or undefined for any other name --
- * a stray file in the directory is skipped, never guessed at. */
-function parseMessageName(file: string): { epoch: number; kind: InboxKind } | undefined {
-  const match = /^(\d{1,15})-([a-z]+)\.json$/.exec(file);
-  if (!match || !isInboxKind(match[2])) return undefined;
+/** `<epoch-ms>-<kind>.json` (an ordinary hand-off) or
+ * `<epoch-ms>-<delivery_id>-<kind>.json` (a timer delivery) for a known
+ * kind, or undefined for any other name --
+ * a stray file in the directory is skipped, never guessed at. `[a-z]+`
+ * never matches a digit, so the two shapes are never ambiguous: the
+ * (optional) middle numeric group only ever consumes a genuine
+ * `-<digits>-` run immediately before the kind. */
+function parseMessageName(file: string): { epoch: number; deliveryId: number | null; kind: InboxKind } | undefined {
+  const match = /^(\d{1,15})-(?:(\d{1,19})-)?([a-z]+)\.json$/.exec(file);
+  if (!match || !isInboxKind(match[3])) return undefined;
   const epoch = Number(match[1]);
-  return Number.isFinite(epoch) ? { epoch, kind: match[2] } : undefined;
+  const deliveryId = match[2] === undefined ? null : Number(match[2]);
+  return Number.isFinite(epoch) && (deliveryId === null || Number.isFinite(deliveryId)) ? { epoch, deliveryId, kind: match[3] } : undefined;
 }
 
 export interface ReadOptions {

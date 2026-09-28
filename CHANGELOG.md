@@ -7,6 +7,69 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Daemon shutdown now drains complete maintenance passes and already accepted RPC handlers, not
+  only their timer-delivery and notification children. Work resuming after configuration I/O is
+  guarded from the closed store and returns a clean stopping error instead of touching SQLite.
+- A timer-delivery attempt that outlives its in-flight timeout now carries an attempt token and
+  rechecks both that token and durable unread/`.read` delivery evidence immediately before writing.
+  A retry that has taken over is now the sole writer, so a late original attempt cannot create a
+  second inbox file.
+- Timer delivery retries now verify the complete persisted inbox envelope, including its version,
+  sender, and exact timer body, and recognize a message renamed to `.read` during that check.
+  A never-settling write no longer keeps its in-process delivery slot forever: after the delivery
+  timeout a later stale-claim retry can start a new idempotent attempt. Daemon shutdown now keeps
+  its listener healthy in a `stopping` state until background delivery drains and the store closes,
+  so a replacement daemon cannot reclaim a timer while the previous one is still writing.
+- Daemon-sourced heartbeat rows are now structurally validated before CLI or MCP JSON output, and
+  malformed present `attempts` or `failed_at` timer fields are rejected rather than defaulted.
+- Heartbeat lapse checks, timer firing, and the notifier pass now run on a daemon-owned maintenance
+  timer independent of account polling: with zero enabled accounts they previously never ran at all,
+  and even with accounts enabled a due timer could wait a full poll interval (4-6 minutes at the
+  default cadence). The new timer runs immediately on daemon start and reschedules itself around the
+  next real deadline (the soonest pending timer or heartbeat lapse instant), capped at 60s and never
+  below 1s, and is cleared on daemon stop. `headroom timer set` and `headroom heartbeat` now print an
+  explicit warning when writing directly with no daemon running, since nothing will deliver or watch
+  that row until one starts.
+- A 0.2.0 CLI or MCP client talking to a still-running 0.1.7 daemon no longer fails `status`/
+  `quota_status` outright: the additive `heartbeats`/`timer_list` RPCs an older daemon has never
+  heard of now answer with an empty list on a JSON-RPC `-32601 Method not found`, instead of
+  throwing and taking the whole status read down with them. Every other RPC error still propagates
+  unchanged.
+- MCP's cached (read-only) status path no longer fails with "no such table" when a database was
+  last written by a pre-0.2.0 daemon and has never since been opened for a write: `heartbeats()`/
+  `timers()` now schema-check before querying and read as "none registered" on an older schema,
+  matching the CLI's own cached fallback.
+- A timer with an invalid owner id or an action too large to ever fit in one inbox message was
+  previously stored successfully and then retried on every single maintenance pass forever, since
+  inbox delivery could never succeed. `headroom timer set` (CLI, MCP RPC, and the direct fallback)
+  now validates the owner against the inbox's own session-id rule and rejects an oversized action
+  before the timer is ever stored. A timer whose delivery keeps failing for any other reason is now
+  retried a bounded number of times before being marked permanently failed (with a logged reason)
+  instead of retried forever.
+- A timer's delivery claim is now crash-safe: the daemon used to mark a claimed timer's inbox
+  delivery as done before the write that actually delivers it, so a crash (or the daemon's own
+  shutdown) between the two left it excluded forever with no message, retry, or failure record.
+  The claim is now confirmed only after the inbox message is known durable, a stale claim is
+  offered back up for another attempt, and a fresh daemon process reclaims every outstanding claim
+  on start; delivery itself is idempotent by a unique per-timer identity, so a retried delivery is
+  never sent twice, even to the exact same path an unrelated hand-off message happens to occupy.
+  Re-setting a timer while its previous registration's delivery is still in flight now also clears
+  that old claim, so the old delivery can never mark the replacement as fired. `headroom stop`
+  drains any in-flight delivery before closing its database, and a single delivery that never
+  settles at all is now bounded by a timeout rather than stalling every other timer and heartbeat
+  check queued behind it.
+- The size check on a timer's action now validates the fully serialized inbox file (envelope,
+  pretty-print whitespace, and all), not just the inner action text -- a body that fit under the
+  cap could previously still produce a file the inbox reader's own size cap silently refused to
+  read, confirming the timer as delivered without it ever being readable.
+- A malformed or otherwise unreadable notification config introduced after the daemon has already
+  started (a `policy.toml` edit with no restart) no longer disables heartbeat checks and timer
+  firing entirely; that failure is now isolated and logged on its own.
+- `heartbeats`/`timer_list` replies that are not an array and not the documented `-32601`
+  compatibility case (a malformed or unexpected daemon reply) are now treated as a protocol error
+  on both the CLI and MCP paths, instead of being silently read as "none registered". A timer row
+  from a daemon whose own reply predates the `attempts`/`failed_at` fields is now normalized to
+  the documented shape at every protocol boundary, not only when reading the local store directly.
 - The explicit `fill` allowance for `gate`, `run`, and `fill --allowance fill` was silently skipped
   whenever policy pacing was `"none"`, letting a caller over-dispatch past the reserve-derived cap
   with no burn projection at all. `fill` now runs independently of pacing; pacing still restricts
