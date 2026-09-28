@@ -60,7 +60,7 @@ describe("classifyHostHealth", () => {
   it("orphans alone always warn, never refuse, at any count above zero", () => {
     const one = classifyHostHealth({ ...allUnknown, orphans: 1 });
     expect(one.state).toBe("warn");
-    expect(one.reasons[0]).toContain("orphaned agy/script");
+    expect(one.reasons[0]).toContain("orphaned agy");
     const many = classifyHostHealth({ ...allUnknown, orphans: 500 });
     expect(many.state).toBe("warn"); // not "refuse", however large
   });
@@ -148,10 +148,10 @@ describe("checkHostHealth (injected probes -- no real load, no real PTYs)", () =
     expect(health.pty_used).toBeNull();
   });
 
-  it("counts orphaned agy AND script processes via the shared process-tree predicate, ignoring live ones and unrelated commands", async () => {
+  it("counts orphaned agy processes via the shared process-tree predicate, ignoring live ones, a user's own orphaned `script` session, and unrelated commands", async () => {
     const processes: ProcessEntry[] = [
       { pid: 100, ppid: 1, rssKb: 1000, command: "/Users/test/.local/bin/agy" }, // orphaned
-      { pid: 101, ppid: 1, rssKb: 500, command: "/usr/bin/script" }, // orphaned
+      { pid: 101, ppid: 1, rssKb: 500, command: "/usr/bin/script" }, // a user's own script session: not the leak shape
       { pid: 102, ppid: 555, rssKb: 500, command: "/usr/bin/script" }, // still has a live parent
       { pid: 103, ppid: 1, rssKb: 500, command: "/usr/bin/something-else" }, // orphaned, but not the leak shape
     ];
@@ -160,18 +160,18 @@ describe("checkHostHealth (injected probes -- no real load, no real PTYs)", () =
       readFileImpl: (async () => { throw new Error("no /proc here"); }) as never,
       listProcessesImpl: async () => processes,
     });
-    expect(health.orphans).toBe(2);
+    expect(health.orphans).toBe(1);
     expect(health.state).toBe("warn");
   });
 
-  it("reports 0 orphans (not unknown) when ps itself fails, matching listProcesses' own empty-on-failure contract", async () => {
+  it("reports orphans as unknown (never 0) when ps itself fails, since listProcesses reports a failure as an empty list", async () => {
     const health = await checkHostHealth(defaultHostGuardPolicy, {
       platform: "linux", loadavg: () => [0, 0, 0], cpuCount: () => 4,
       readFileImpl: (async () => { throw new Error("no /proc here"); }) as never,
       listProcessesImpl: async () => [], // listProcesses() itself never throws; a failed `ps` surfaces as []
     });
-    expect(health.orphans).toBe(0);
-    expect(health.state).toBe("ok");
+    expect(health.orphans).toBeNull(); // unknown, never a reassuring 0
+    expect(health.reasons.join(" ")).not.toContain("orphaned");
   });
 });
 

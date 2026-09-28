@@ -260,7 +260,7 @@ run`'s local launch on host pressure the same way, from one cheap, never-throwin
 |---|---|---|
 | `load_ratio` | `os.loadavg()[0] / os.cpus().length` | win32 (`os.loadavg()` always reports zeros there) |
 | `pty_used` / `pty_max` | In-use / configured pseudo-terminals (macOS: `sysctl kern.tty.ptmx_max` and `/dev/ttys*`; Linux: `/proc/sys/kernel/pty/{max,nr}`) | Not POSIX, or the probe itself failed |
-| `orphans` | Processes with ppid 1 whose command is the leaked `agy`/`script` shape (the same pattern `doctor`'s antigravity-orphan check uses -- see `isOrphanedAgentProcess` in `process-tree.ts`) | win32 (no PTY tree to walk there) |
+| `orphans` | Processes with ppid 1 whose command is the leaked `agy` shape (the same pattern `doctor`'s antigravity-orphan check uses -- see `isOrphanedAgentProcess` in `process-tree.ts`) | win32 (no PTY tree to walk there) |
 
 Every probe carries its own short timeout and never throws; a probe that fails or does not apply
 on this platform reports `null` ("unknown") rather than a number, and unknown measurements never

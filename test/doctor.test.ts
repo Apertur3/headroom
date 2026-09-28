@@ -70,11 +70,9 @@ describe.skipIf(process.platform === "win32")("doctor: orphaned antigravity keep
     expect(result.level).toBe("OK");
   });
 
-  it("also counts an orphaned bare `script` PTY wrapper, sharing the same predicate host-health.ts uses", async () => {
+  it("never counts a user's own orphaned `script` session as a leaked agy", async () => {
     const result = await antigravityOrphanCheck(async () => [{ pid: 77, ppid: 1, rssKb: 2_000, command: "/usr/bin/script" }]);
-    expect(result.level).toBe("WARN");
-    expect(result.detail).toContain("1 orphaned agy process(es)");
-    expect(result.fix).toContain("77");
+    expect(result.level).toBe("OK");
   });
 });
 
@@ -96,7 +94,7 @@ describe("doctor: host pressure check", () => {
   });
 
   it("reports WARN for a warn reading", async () => {
-    const result = await hostPressureCheck(async () => health({ state: "warn", reasons: ["1 orphaned agy/script process(es) found"] }), defaultHostGuardPolicy);
+    const result = await hostPressureCheck(async () => health({ state: "warn", reasons: ["1 orphaned agy process(es) found"] }), defaultHostGuardPolicy);
     expect(result.level).toBe("WARN");
     expect(result.detail).toContain("warn");
   });

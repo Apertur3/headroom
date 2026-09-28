@@ -101,8 +101,8 @@ needs the JSON meaning.
   reasons: string[], load_ratio: number | null, pty_used: number | null,
   pty_max: number | null, orphans: number | null }`. One read of local host
   pressure (`src/host-health.ts`; see docs/concepts.md's "Host guard" section
-  and `.claude/INCIDENT-2026-09-27-pty-leak.md` for why it exists): CPU
-  load-per-core, pseudo-terminal usage, and leaked `agy`/`script` orphans. Any
+  for why it exists): CPU load-per-core, pseudo-terminal usage, and orphaned
+  `agy` processes. Any
   measurement is `null` ("unknown") when its probe is unsupported on this
   platform or itself failed -- never treated as pressure. Carried, purely
   additively, on `can` and `gate` (CLI and MCP) so an orchestrator sharing this

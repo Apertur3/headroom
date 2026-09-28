@@ -14,8 +14,8 @@ const execFileAsync: ExecFile = promisify(execFile);
  * timeout) reports its own measurement as `null` ("unknown"), and `state`
  * itself is never worse than "unknown" when every measurement is null. See
  * `classifyHostHealth` for the threshold logic and docs/concepts.md for what
- * each field means and why it exists (the 2026-09-27 PTY-leak incident:
- * .claude/INCIDENT-2026-09-27-pty-leak.md).
+ * each field means and why it exists (leaked PTY-holding processes once
+ * exhausted a developer machine's pseudo-terminals).
  */
 export interface HostHealth {
   state: "ok" | "warn" | "refuse" | "unknown";
@@ -31,7 +31,7 @@ export interface HostHealth {
   pty_used: number | null;
   /** The platform's configured pseudo-terminal ceiling (POSIX only). */
   pty_max: number | null;
-  /** Count of processes with ppid 1 whose command is the leaked `agy`/`script`
+  /** Count of processes with ppid 1 whose command is the leaked `agy`
    * shape (see `isOrphanedAgentProcess`). `null` on win32 (no PTY tree there
    * to walk); otherwise always a number -- `listProcesses()` itself never
    * throws, so this is 0 rather than unknown when `ps` cannot be read. */
@@ -109,9 +109,13 @@ export function parseHostGuardPolicy(text: string): HostGuardPolicy {
 
 export async function readHostGuardPolicy(home = headroomHome()): Promise<HostGuardPolicy> {
   let text: string;
+  // Never throws: callers read this after other work (a `can --lease`
+  // reservation, say), and a broken policy file must not abort them. An
+  // unreadable or invalid file falls back to the documented defaults.
   try { text = await readFile(join(home, "policy.toml"), "utf8"); }
-  catch (error: unknown) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultHostGuardPolicy; throw error; }
-  return parseHostGuardPolicy(text);
+  catch { return defaultHostGuardPolicy; }
+  try { return parseHostGuardPolicy(text); }
+  catch { return defaultHostGuardPolicy; }
 }
 
 export type HostMeasurements = Omit<HostHealth, "state" | "reasons">;
@@ -140,7 +144,7 @@ export function classifyHostHealth(measurements: HostMeasurements, policy: HostG
   }
   // Orphans alone warn, never refuse: a user's own stray agy is not proof
   // the host is dying (see the spec's own rationale for this asymmetry).
-  if (orphans !== null && orphans > 0) { warn = true; reasons.push(`${orphans} orphaned agy/script process(es) found (orphans alone never refuse)`); }
+  if (orphans !== null && orphans > 0) { warn = true; reasons.push(`${orphans} orphaned agy process(es) found (orphans alone never refuse)`); }
   if (refuse) return { state: "refuse", reasons };
   if (warn) return { state: "warn", reasons };
   if (load_ratio === null && pty_used === null && orphans === null) return { state: "unknown", reasons: ["no host pressure measurements available on this platform"] };
@@ -163,7 +167,7 @@ function loadRatio(loadavg: () => number[], cpuCount: () => number, platform: No
 async function ptyUsage(platform: NodeJS.Platform, exec: ExecFile, readdirImpl: typeof readdir, readFileImpl: typeof readFile): Promise<{ used: number | null; max: number | null }> {
   try {
     if (platform === "darwin") {
-      const max = await exec("sysctl", ["-n", "kern.tty.ptmx_max"], { timeout: 1000 })
+      const max = await exec("sysctl", ["-n", "kern.tty.ptmx_max"], { timeout: 1000, killSignal: "SIGKILL" })
         .then(({ stdout }) => { const value = Number(stdout.trim()); return Number.isFinite(value) && value > 0 ? value : null; })
         .catch(() => null);
       const used = await readdirImpl("/dev")
@@ -185,7 +189,9 @@ async function ptyUsage(platform: NodeJS.Platform, exec: ExecFile, readdirImpl: 
 
 async function orphanCount(platform: NodeJS.Platform, list: (execImpl?: ExecFile) => Promise<ProcessEntry[]>, execImpl: ExecFile | undefined): Promise<number | null> {
   if (platform === "win32") return null; // no script/agy PTY tree there (see isOrphanedAgentProcess)
-  try { return (await list(execImpl)).filter(isOrphanedAgentProcess).length; }
+  // listProcesses() reports a failed `ps` as an empty list; that must read
+  // as unknown here, not as zero orphans.
+  try { const processes = await list(execImpl); return processes.length ? processes.filter(isOrphanedAgentProcess).length : null; }
   catch { return null; }
 }
 
