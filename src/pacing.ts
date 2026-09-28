@@ -9,6 +9,9 @@ import { fiveHourPercentToWeeklyPercent } from "./calibration.js";
 export interface PlanResult {
   weekly_remaining_percent: number;
   reserve_percent: number;
+  /** The weekly capacity left after the protected reserve. This is the
+   * existing planner budget, named explicitly for queued-work comparisons. */
+  usable_now_percent: number;
   hours_per_window: number;
   /** Whole 5h windows left before the weekly reset, rounded up so a partial
    * window still gets its own share instead of inflating the last one. */
@@ -25,7 +28,7 @@ export function computePlan(weeklyUsedPercent: number, weeklyResetsAt: string, h
   const budget = Math.max(0, weeklyRemaining - reservePercent);
   const remainingWindows = Math.max(1, Math.ceil(hoursUntilReset / hoursPer5hWindow));
   return {
-    weekly_remaining_percent: weeklyRemaining, reserve_percent: reservePercent, hours_per_window: hoursPer5hWindow,
+    weekly_remaining_percent: weeklyRemaining, reserve_percent: reservePercent, usable_now_percent: budget, hours_per_window: hoursPer5hWindow,
     remaining_5h_windows: remainingWindows, points_per_5h_window: budget / remainingWindows,
     plan_line_percent_per_hour: hoursUntilReset > 0 ? budget / hoursUntilReset : 0,
   };

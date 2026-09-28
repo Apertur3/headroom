@@ -29,6 +29,8 @@ describe("phone notification text", () => {
       source_recovered: eventText(event("source_recovered", { principal_id: "antigravity", meter_id: "antigravity:main" })),
       pace_projection_conserve: eventText(event("pace_projection_conserve", { reason: "burning 24%/h, empty in 48m, reset in 3h 12m" }), [{ ...observation, window: { kind: "rolling", minutes: 300, enforcement: "hard" } }]),
       model_new: eventText(event("model_new", { reason: "Opus 5" })),
+      model_available: eventText(event("model_available", { reason: "claude-opus-5-5", metadata: { model_id: "claude-opus-5-5", model_name: "Opus 5.5", shares_pool: true } })),
+      model_retired: eventText(event("model_retired", { reason: "claude-opus-4-6", metadata: { model_id: "claude-opus-4-6", model_name: "Opus 4.6" } })),
       grant_lapsed: eventText(event("grant_lapsed")),
       lease_started: eventText(event("lease_started")),
       lease_ended: eventText(event("lease_ended")),
@@ -53,9 +55,13 @@ describe("phone notification text", () => {
         "lease_started": "▶️ Lease started
       Claude main has a new work reservation.
       Its reserved capacity is accounted for while the lease runs.",
+        "model_available": "🆕 Claude: Opus 5.5 now available on Claude main (shares the main pool)",
         "model_new": "🆕 New model bucket seen
-      Claude main now reports \"Opus 5\" as its own meter.
+      Claude main now reports "Opus 5" as its own meter.
       Check its allowance before routing work to it.",
+        "model_retired": "🗑️ Model retired
+      Claude no longer lists "Opus 4.6" on Claude main.
+      It is no longer available to route work to.",
         "pace_projection_conserve": "🐢 Projected stall
       Claude main 5h burns 24%/h and would hit 100% in 48m, reset in 3h 12m.
       Slow down to make this window last.",
@@ -84,6 +90,12 @@ describe("phone notification text", () => {
     expect(eventText(event("reset_seen", { metadata: { window_minutes: 10_080 } }), [observation])).toBe("🗓️ Weekly reset\nClaude main weekly is at 0% again (reset 03:24).\nCapacity is available again in this window.");
     expect(eventText(event("reset_seen", { metadata: { window_minutes: 300 } }), [observation])).toBe("🗓️ Scheduled reset\nClaude main 5h is at 0% again (reset 03:24).\nCapacity is available again in this window.");
     expect(thresholdText({ ...observation, principal_id: "codex", meter_id: "codex:main", fetched_at: new Date(2026, 8, 8, 10, 8).toISOString(), resets_at: new Date(2026, 8, 10, 15, 8).toISOString(), quantity: { used: 90.3, remaining: 9.7, limit: 100, unit: "percent" } }, 90)).toBe("🔥 Threshold\nCodex weekly crossed 90% (now 90%); resets Sep 10 15:08, in 2d 5h.\nCONSERVE until then.");
+  });
+
+  it("labels an unknown model-meter relationship without implying capacity", () => {
+    expect(eventText(event("model_available", {
+      reason: "claude-fable-5", metadata: { model_id: "claude-fable-5", model_name: "Fable 5" },
+    }))).toContain("no dedicated meter observed");
   });
 
   it("does not invent a percentage for old events without evidence or leak multiline markup", () => {

@@ -46,7 +46,11 @@ Example: an observation for `claude-main:fable` at 82% used, `resets_at` next Sa
 ## Freshness and UNKNOWN
 
 Every observation is `fresh`, `stale`, `failed`, or `not_enforced`. `fresh` is a good, recent
-vendor read. `stale` means the last good read is older than the staleness threshold (15 minutes by
+vendor read. Freshness is evaluated again whenever a percent-quota row is served: a row stored as
+`fresh` whose `fetched_at` has crossed `staleness_minutes`, or cannot be parsed, is served as
+`stale`, with `last accepted reading <age> ago` at the front of its reason (followed by any stored
+explanation). Local-pool state and count observations have their own policy states and are not
+aged by this rule. This presentation rule does not rewrite the historical row. `stale` means the last good read is older than the staleness threshold (15 minutes by
 default). `failed` means the last attempt errored, timed out, exceeded Headroom's own bounds on
 the response, or -- for a vendor-reported idle window that looks like a placeholder -- contradicted
 a real-usage reading Headroom already trusted for that same window within the last two hours (a
@@ -68,7 +72,7 @@ that might no longer be true.
 Example: a Codex account with no 5-hour window in the vendor's response and no recent session log
 shows `5h n/a`, not `5h 0%`.
 
-A window that is `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
+A window that is served `stale` or `failed` still carries `last_known`: the newest `fresh` reading of that
 exact meter and window from the last 7 days, with the age of that reading, so a person or a
 fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the word itself --
 `headroom` prints it as `UNKNOWN (reason; last 41% at 00:05, 65m ago)`, and it rides along on
@@ -76,6 +80,47 @@ fail-closed orchestrator can see the trend behind an UNKNOWN instead of just the
 age_seconds }` (`null` when nothing fresh exists in that window within 7 days). It is informational
 only: `can`, `gate`, and `route` keep treating UNKNOWN as no capacity no matter what `last_known`
 says.
+
+Reset countdowns are also evaluated when served. A reset within 60 seconds of now still reads
+`0m`, matching the store's same-window tolerance. Once it is older, human output says `overdue
+<age>` instead of an imminent `0m`. JSON retains its contract-1.0 values
+`resets_in_seconds: 0` and `resets_in: "0m"`, then adds `reset_overdue: true`
+and `reset_overdue_seconds` (the age in seconds). Agents check `reset_overdue`,
+not the compatibility countdown, to distinguish an overdue schedule from an unknown one.
+
+Status enrichment carries `status_enriched_at` with the freshness, pace,
+reset, and `last_known` fields it was served with at that instant. That
+marker records when enrichment last ran; it is never a license to skip
+re-running it. Every renderer (the dashboard, the browser report, the
+statusline, a cached CLI payload) re-evaluates freshness and pace against
+its own current serving clock on every render, whether or not a row already
+carries `status_enriched_at`. A row served fresh minutes or hours ago that
+has since aged past `staleness_minutes` is re-served UNKNOWN, not left
+fresh forever on the strength of an old marker. A renderer re-staling a row
+this way has no store-backed lookup to attach a fresh `last_known` reading
+to it, so it serves `last_known: null` instead -- an UNKNOWN reading with no
+last-known figure, never a `fresh` one claiming capacity nobody
+re-confirmed.
+
+When a newer CLI or MCP server reaches an older daemon whose status rows do
+not yet carry that marker, it re-enriches those rows from the current policy
+and a read-only, non-migrating store lookup before rendering, serializing,
+or checking a threshold: this path must never run schema migrations against
+a database an older daemon may still be running against. If that lookup is
+unavailable (the file does not exist yet, or predates something the lookup
+needs), enrichment still happens locally, without history: no burn rate, no
+real `last_known`. Either way an aged stored-fresh row still becomes UNKNOWN;
+daemon version skew never makes it capacity.
+
+A vendor-window hold (`metadata.vendor_window_held` or
+`vendor_inconsistent` -- see "Vendor-window consistency" below) is served
+UNKNOWN immediately, at any age, the same way: a reading frozen at its last
+confirmed baseline while a new identity awaits confirmation is not capacity
+just because it hasn't yet aged past `staleness_minutes`. This applies
+uniformly everywhere a pace decision or freshness gate is made -- `status`,
+`gate`, `fill`, `plan`, `route`, `can`, and the CLI's `--threshold` report --
+since they all resolve through the same shared `paceDecision`/`freshnessGate`
+functions.
 
 ## Pace states
 
@@ -183,6 +228,10 @@ if the account's overall `all` meter has room.
 Example: `claude-fable = ["claude-main:all", "claude-main:fable"]` means a `claude-fable` action
 needs both meters to allow it.
 
+An informational `count` meter is never a meter an action can consume: placing one in a consumes
+entry makes `can`, `route`, and `gate` refuse, even with `--allow-unknown`. It can describe reset
+credits, prepaid money, or another vendor count; none of those is dispatch capacity.
+
 ## Leases
 
 A lease reserves a slice of a meter for one orchestrator before it fans out work, so a second
@@ -198,6 +247,44 @@ different orchestrator has already spoken for.
 Example: `headroom lease start --owner triage-bot --meter codex-main:main --expect 15 --ttl 30m`
 reserves 15 points of `codex-main:main` for 30 minutes.
 
+## Host guard
+
+Quota is not the only thing that can make dispatching more local work a bad idea: on 2026-09-27 a
+developer machine running several agent lanes was taken down by leaked processes -- about 290
+orphaned PTY-holding processes, kernel at 96% system CPU, load around 180 on 16 cores -- while
+every quota read and every dispatch kept going, because nothing was watching the host itself.
+Headroom already gates dispatch on quota; the host guard (`src/host-health.ts`) gates `headroom
+run`'s local launch on host pressure the same way, from one cheap, never-throwing read:
+
+| Measurement | What it is | Unknown when |
+|---|---|---|
+| `load_ratio` | `os.loadavg()[0] / os.cpus().length` | win32 (`os.loadavg()` always reports zeros there) |
+| `pty_used` / `pty_max` | In-use / configured pseudo-terminals (macOS: `sysctl kern.tty.ptmx_max` and `/dev/ttys*`; Linux: `/proc/sys/kernel/pty/{max,nr}`) | Not POSIX, or the probe itself failed |
+| `orphans` | Processes with ppid 1 whose command is the leaked `agy` shape (the same pattern `doctor`'s antigravity-orphan check uses -- see `isOrphanedAgentProcess` in `process-tree.ts`) | win32 (no PTY tree to walk there) |
+
+Every probe carries its own short timeout and never throws; a probe that fails or does not apply
+on this platform reports `null` ("unknown") rather than a number, and unknown measurements never
+contribute to a warn or refuse verdict -- exactly the same fail-closed-but-never-blocking rule the
+rest of Headroom applies to a stale quota reading, just inverted (here, "unknown" means "don't
+act," not "don't trust").
+
+`[host_guard]` in `policy.toml` sets `mode = "refuse"` (default) `| "warn" | "off"` and the
+thresholds: `warn_load_ratio` (default 2), `refuse_load_ratio` (default 3), `warn_pty_percent`
+(default 50), `refuse_pty_percent` (default 75). Orphans alone only ever warn, never refuse, at
+any count above zero -- a user's own stray `agy` left over from a normal Antigravity session is not
+proof the host is dying, and `doctor` already has a dedicated check (and a kill command) for that
+specific leak.
+
+`headroom run` is the only surface that actually refuses: it checks host pressure before it even
+opens the store, so a refusal can never leak a lease, and it refuses (exit 2) only when the reading
+is `state: "refuse"` **and** `host_guard.mode = "refuse"`. A `"warn"` reading -- or a `"refuse"`
+reading under `mode: "warn"` -- prints one stderr line and still launches; `mode: "off"` disables
+the guard outright (no message, no refusal). `headroom can`, `quota_can`, `headroom gate`, and
+`quota_gate` (which can gate remote-account work, not just this machine) carry the same reading as
+an additive `host` object in their JSON so an orchestrator can see local pressure alongside its
+quota decision, but never refuse over it themselves. `headroom doctor` reports it too, as a "host
+pressure" check, so it is visible without dispatching anything at all.
+
 ## Plan line, gate and fill
 
 `headroom plan --meter M --reserve N` splits the weekly window's remaining percent (after the
@@ -210,6 +297,30 @@ resolving to several meters, every one of them must have a usable reading -- a m
 genuinely consumes but that has never produced a windowed reading fails the whole gate UNKNOWN by
 name, rather than being silently skipped while a different, populated meter in the same class
 answers on its own.
+
+### Banked resets
+
+Codex reports banked reset credits and their earliest expiry as a `<principal>:credits` count;
+Claude's usage endpoint does not expose them. A count becomes a banked reset for planning only when
+it is an operator's manual entry or has the vendor's explicit `free_resets_available` marker.
+Prepaid or on-demand balances remain informational counts, never reset capacity. Vendor-marked
+reset counts must also be fresh and not held or inconsistent; a manual entry remains usable until it
+is cleared, superseded, or expires. When a human says a Claude banked reset exists,
+record it with `headroom credits set --principal claude-main --available 1 --expires 2026-10-05`
+(and `headroom credits clear --principal claude-main` after it is gone). The entry is an auditable,
+estimated manual observation, and a later vendor-reported Codex reading naturally supersedes a
+manual one. `headroom plan --meter claude-main:all --until reset --target <points>` reports the
+weekly budget left above reserve, the value of each banked reset (`100 - reserve`), and whether the
+target fits now or after a number of resets. It advises using one now only when none would otherwise
+survive to the scheduled reset, or when a blocked target is more than 24 hours from that reset;
+otherwise it says to wait, or that no target is blocked. A lapsed credit always remains in history,
+and shows in status as expired until superseded there by a newer reading for the same meter -- even
+a failed vendor poll, which a live (unlapsed, uncleared) manual entry would otherwise outrank; either
+way, a lapsed credit contributes zero to planning. Headroom never fires a reset: that remains a
+human action in the vendor UI. A date-only `--expires` value is midnight UTC on that calendar day,
+and credit status renders that same UTC calendar day in every timezone. At a 100% reserve each
+reset is worth zero, so a target that does not already fit has `resets_needed: null` and the advice
+never recommends using a credit.
 
 `policy.toml`'s `pacing` (`"even"`, the default, or `"none"`) controls two extra checks scoped to a
 5h `--need` and one owner. The pro-rata line is that owner's planned share of the window (from
@@ -299,15 +410,41 @@ sends. A session id is one path segment of `[A-Za-z0-9._-]{1,64}` and nothing el
 tree lives inside the verified Headroom home at 0700, and a file Headroom did not write is skipped
 rather than guessed at.
 
+## Heartbeats and timers
+
+An orchestrator session can crash and take every in-session timer and watcher down with it,
+unnoticed for however long nobody happens to look. The daemon is the one process that survives
+that crash, so it can hold both an orchestrator's heartbeat and its named wake-ups instead.
+
+`headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` records or
+refreshes a promise to beat at least that often, keyed by `owner` (the same identity namespace as
+a lease owner or an inbox session), with an optional resume sentence -- what a human or a fresh
+session should do to pick the work back up. The daemon checks every registered heartbeat on each
+poll; one gone overdue by more than 2x its own interval gets `lapsed_since` set and exactly one
+`heartbeat_lapsed` event (never repeated while that lapse stays open), which the notifier delivers
+through the ordinary ledger dedupe and quiet hours -- see `docs/notifications.md`. A later beat
+closes the lapse immediately and may send one short `heartbeat_restored`. `--stop` deregisters a
+heartbeat without announcing a restore; `heartbeat list [--json]` shows every registered one.
+
+`headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"
+[--if-missed notify|drop]` registers a named wake-up. When it comes due, the daemon delivers it
+exactly once as one inbox entry to its owner (see Inbox, above) -- **Headroom only ever delivers
+the action text; it never executes it.** `--if-missed notify` (the default) additionally raises
+one `timer_missed` event if the owner's heartbeat is currently lapsed at that moment, since a
+crashed session will never read its own inbox; `--if-missed drop` still delivers the inbox entry
+but never notifies. `timer list [--owner <name>] [--json]` shows pending timers (never fired,
+never cleared); `timer clear --owner <name> --name <id>` clears one. `status`'s own `due_timers`
+field is the subset of pending timers already at or past their own `at`.
+
 ## Events
 
 An event is a separate, append-only record of something that happened to a principal or meter: a
 reset was seen, a free reset was granted or used, a plan changed, a source started failing or
-recovered, a lease started or ended. Each event carries its origin, `vendor_reported` when the
-vendor said so directly or `inferred` when Headroom deduced it (for example, from a large drop in
-usage between polls), a confidence score, and the observation ids that back it up. Events are
-never folded into observations; a percentage and the fact that explains it are two different kinds
-of record.
+recovered, a lease started or ended, a heartbeat lapsed or was restored, a timer fired while its
+owner was unattended. Each event carries its origin, `vendor_reported` when the vendor said so
+directly or `inferred` when Headroom deduced it (for example, from a large drop in usage between
+polls), a confidence score, and the observation ids that back it up. Events are never folded into
+observations; a percentage and the fact that explains it are two different kinds of record.
 
 Example: `codex-main` shows `reset seen 14:00 (inferred, 62%)` when usage drops sharply without a
 vendor-confirmed reset timestamp yet.
@@ -363,6 +500,14 @@ reset event is recorded, and status keeps the earlier reading with a holding
 note. A `vendor_inconsistent` notification is emitted at most once per meter
 per six hours. Flagged rows never contribute to burn-rate or pace calculations.
 
+Either flag (`vendor_window_held` or `vendor_inconsistent`) puts the reading's
+pace state at UNKNOWN immediately, the moment the poll that holds it lands --
+not only once it has also aged past `staleness_minutes`. This is enforced
+centrally in `paceDecision` and `freshnessGate`, so every caller that
+consumes them (`status`, `gate`, `fill`, `plan`, `route`, `can`, and the
+CLI's `--threshold` report) fails closed on a held reading from the start of
+the hold, never treating it as capacity while it waits to age out.
+
 ## Export
 
 `headroom export [--since 7d] [--until <iso>] [--meter M] [--principal P] [--kind
@@ -413,3 +558,39 @@ The rule for changing the schema in the future: append a new migration with the 
 number. Never edit an existing migration's body, even to fix a mistake in it -- a database that
 already ran it has exactly that shape on disk, and a silently changed migration would stop
 describing what such a database actually has. Fix a mistake with a follow-up migration instead.
+
+## Daemon, direct, and cache reads
+
+A CLI or MCP read normally goes to the daemon: it holds the freshest picture and answers over its
+local socket (or named pipe on Windows). Every one of those calls checks `health` first, separately
+from the read itself, because a live daemon may need to poll before it can answer -- that must never
+be mistaken for no daemon at all. Three outcomes follow from that:
+
+- **Daemon answered.** The common case: the daemon's own in-memory/on-disk picture, fresh as of its
+  last poll.
+- **No daemon (`direct`).** No socket at all. The caller polls the vendor itself, on the spot, and
+  writes the result to the store before answering -- this is the only path that both reads and
+  writes in the same call. Marked `source: "direct"` (or, on the CLI, a stderr line) so a caller
+  never mistakes it for the daemon's own cadence.
+- **Daemon unresponsive, served from cache.** A socket exists, but `health` did not answer within its
+  2s budget even after one retry -- a poll cycle's own synchronous store write occasionally still
+  runs long enough under host load to miss that window (see the P0 fix note in this project's
+  changelog). Rather than fail the call outright, five read-only surfaces (`status`/`quota_status`,
+  `history`, `events`/`quota_events`, `rate`/`quota_rate`, and `can`/`quota_can` without a lease) open
+  the store **read-only** (`HeadroomStore.openReadOnly()`, which never migrates or writes) and serve
+  whatever is already there. Freshness and pace are still computed against the current clock, exactly
+  like every other read, so a row that is actually stale still serves stale -- being cached never
+  means being treated as fresher than it is. Marked `served_from: "cache"` plus `daemon:
+  "unresponsive"` (additive JSON fields, or a stderr line on the CLI's bare-array outputs) so a caller
+  can always tell this apart from a live daemon answer.
+
+Every write or dispatch path -- `lease start`, `gate` (with or without `--plan`), `can --lease`,
+`run` -- takes none of this: an unresponsive daemon there is reported as an error, exactly as before
+this fallback existed. Racing a write against the daemon's own connection is the one thing this
+project will not do to make a read more available; see requestDaemon's own doc comment in
+`src/cli.ts` for why.
+
+A `--json` invocation that fails for any reason -- daemon unresponsive on a write path, a usage
+error, anything else `main()` throws -- always prints a `{"error": "<message>"}` object to stdout,
+in addition to the human message on stderr, so a script or agent reading stdout alone can never
+mistake "no answer at all" for "a reading with nothing in it."

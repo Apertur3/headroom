@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { emptyInSeconds, leastSquaresBurnPerHour, sustainablePercentPerHour, withLastKnown, withPaceInfo } from "../src/pace.js";
+import { effectiveFreshness, emptyInSeconds, leastSquaresBurnPerHour, sustainablePercentPerHour, withLastKnown, withPaceInfo, withStatusInfo } from "../src/pace.js";
 import type { LastKnownReading, Observation } from "../src/types.js";
 
 describe("least-squares burn rate", () => {
@@ -144,5 +144,82 @@ describe("withLastKnown", () => {
     const map = new Map([["claude-main:all:300", reading]]);
     const [failed] = withLastKnown([observation({ window: null, quantity: null, freshness: "failed" })], map);
     expect(failed.last_known).toBeNull();
+  });
+});
+
+describe("effectiveFreshness", () => {
+  function observation(overrides: Partial<Observation> = {}): Observation {
+    return {
+      principal_id: "codex-main", meter_id: "codex-main:spark", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
+      quantity: { used: 40, limit: 100, remaining: 60, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z",
+      observed_at: "2026-09-03T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z", source: "fixture", truth: "official", freshness: "fresh",
+      confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture", ...overrides,
+    };
+  }
+
+  const now = new Date("2026-09-03T12:00:00Z");
+
+  it("keeps a fresh row inside the policy staleness window unchanged", () => {
+    const row = observation({ fetched_at: "2026-09-03T11:46:00Z" });
+    expect(effectiveFreshness(row, 15, now)).toEqual({ freshness: "fresh", reason: undefined });
+  });
+
+  it("serves an old fresh row as stale and preserves its held-window explanation", () => {
+    const row = observation({
+      fetched_at: "2026-09-03T10:00:00Z", metadata: { vendor_window_held: true }, reason: "new window unconfirmed, holding",
+    });
+    expect(effectiveFreshness(row, 15, now)).toEqual({
+      freshness: "stale", reason: "last accepted reading 2h ago; new window unconfirmed, holding",
+    });
+  });
+
+  it("serves a held row (recent, well inside the staleness window) as stale immediately -- never capacity", () => {
+    // Inside stalenessMinutes there is no age story to tell yet, so the
+    // reason passes through unchanged; a renderer that wants held-specific
+    // wording (browser-report, dashboard, status-view) builds it straight
+    // from the metadata flags instead of this field.
+    const row = observation({
+      fetched_at: "2026-09-03T11:59:00Z", metadata: { vendor_window_held: true }, reason: "new window unconfirmed, holding",
+    });
+    expect(effectiveFreshness(row, 15, now)).toEqual({
+      freshness: "stale", reason: "new window unconfirmed, holding",
+    });
+  });
+
+  it("serves a vendor_inconsistent row as stale immediately too", () => {
+    const row = observation({ fetched_at: "2026-09-03T11:59:00Z", metadata: { vendor_inconsistent: true } });
+    expect(effectiveFreshness(row, 15, now).freshness).toBe("stale");
+  });
+
+  it("passes through stored stale, failed and not_enforced rows", () => {
+    for (const freshness of ["stale", "failed", "not_enforced"] as const) {
+      const row = observation({ freshness, reason: `${freshness} reason`, fetched_at: "2026-08-01T12:00:00Z" });
+      expect(effectiveFreshness(row, 1, now)).toEqual({ freshness, reason: `${freshness} reason` });
+    }
+  });
+
+  it("matches policy's non-age-gated state and count rows", () => {
+    const old = "2026-08-01T12:00:00Z";
+    const state = observation({ window: { kind: "state", minutes: null, enforcement: "hard" }, fetched_at: old, metadata: { state: "UP" } });
+    const count = observation({ window: { kind: "count", minutes: null, enforcement: "soft" }, fetched_at: old });
+    expect(effectiveFreshness(state, 1, now)).toEqual({ freshness: "fresh", reason: undefined });
+    expect(effectiveFreshness(count, 1, now)).toEqual({ freshness: "fresh", reason: undefined });
+  });
+
+  it("serves an invalid fetched_at as stale rather than fresh", () => {
+    expect(effectiveFreshness(observation({ fetched_at: "not a timestamp" }), 15, now)).toEqual({ freshness: "stale", reason: "invalid fetch time" });
+  });
+
+  it("uses the supplied staleness_minutes and attaches last_known after a fresh row ages out", () => {
+    const row = observation({ fetched_at: "2026-09-03T11:50:00Z" });
+    expect(effectiveFreshness(row, 15, now).freshness).toBe("fresh");
+    const known: LastKnownReading = { used_percent: 39, resets_at: row.resets_at, observed_at: "2026-09-03T11:49:00Z", age_seconds: 660 };
+    const [served] = withStatusInfo([row], new Map(), new Map([["codex-main:spark:10080", known]]), 5, now);
+    expect(served).toMatchObject({ freshness: "stale", last_known: known });
+  });
+
+  it("marks the complete response enrichment instant", () => {
+    const [served] = withStatusInfo([observation()], new Map(), new Map(), 15, now);
+    expect(served.status_enriched_at).toBe(now.toISOString());
   });
 });

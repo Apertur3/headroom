@@ -1,8 +1,9 @@
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { gatherDashboard, type DashboardModel } from "./dashboard.js";
+import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
-import { formatResetsIn, resetsIn } from "./resets.js";
+import { formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { redact, writeFileAtomic } from "./security.js";
 import { formatReset, label, planDowngradeLine } from "./status-view.js";
 import { type HeadroomEvent, type Lease, type Observation, type PaceState } from "./types.js";
@@ -54,7 +55,7 @@ export function sanitizeFailureReason(reason: string | null | undefined): string
   if (!reason) return "Reading unavailable; run headroom doctor";
   const clean = redact(reason);
   if (/grant|keychain|credential/i.test(clean)) return "Credential access required";
-  if (/stale/i.test(clean)) return "Reading is stale";
+  if (/stale|last accepted reading/i.test(clean)) return "Reading is stale";
   if (/unresponsive|timeout|hang/i.test(clean)) return "Provider request timed out";
   if (/401|403|unauthorized|forbidden/i.test(clean)) return "Authentication failed";
   if (/429|rate limit/i.test(clean)) return "Rate limit backoff";
@@ -104,6 +105,10 @@ export interface ProcessedWindow {
   used_percent: number | null;
   remaining_percent: number | null;
   resets_at: string | null;
+  resets_in_seconds?: number | null;
+  resets_in?: string | null;
+  reset_overdue?: true;
+  reset_overdue_seconds?: number;
   observed_at: string;
   fetched_at: string;
   burn_rate: number | null;
@@ -359,6 +364,10 @@ export function processWindow(row: Observation, model: DashboardModel, now: Date
     used_percent,
     remaining_percent,
     resets_at: row.resets_at,
+    resets_in_seconds: row.resets_in_seconds,
+    resets_in: row.resets_in,
+    reset_overdue: row.reset_overdue,
+    reset_overdue_seconds: row.reset_overdue_seconds,
     observed_at: row.observed_at,
     fetched_at: row.fetched_at,
     burn_rate: row.burn_percent_per_hour ?? null,
@@ -697,20 +706,25 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
     const isHeld = Boolean(pw.metadata?.vendor_window_held || pw.metadata?.vendor_inconsistent);
     const tag = isHeld ? "HELD" : "UNKNOWN";
     const reason = sanitizeFailureReason(pw.raw_reason ?? pw.decision_reason);
+    const reset = pw.resets_at ? servedResetsIn(pw, now) : undefined;
+    const overdueText = reset ? formatOverdueReset(reset) : undefined;
     return `
       <div class="cell-block">
         <div class="cell-status-row">
           <span class="badge unknown">${escapeHtml(tag)}</span>
           <span class="cell-reason muted" title="${escapeHtml(reason)}">${escapeHtml(reason)}</span>
         </div>
+        ${overdueText ? `<div class="reset-time muted mono">↻ ${escapeHtml(overdueText)}</div>` : ""}
       </div>
     `;
   }
 
   const usedVal = pw.used_percent !== null ? pw.used_percent : 0;
   const remVal = pw.remaining_percent !== null ? pw.remaining_percent : 100;
-  const secondsToReset = pw.resets_at ? resetsIn(pw.resets_at, now).resets_in_seconds : null;
-  const displayReset = secondsToReset !== null ? formatResetsIn(secondsToReset) : "?";
+  const reset = pw.resets_at ? servedResetsIn(pw, now) : undefined;
+  const displayReset = reset?.resets_in ?? "?";
+  const overdueText = reset ? formatOverdueReset(reset) : undefined;
+  const resetText = overdueText ? `↻ ${overdueText}` : `resets in ${displayReset}`;
 
   // Color bar by usage level
   const barClass = usedVal > 90 ? "danger" : usedVal > 70 ? "warning" : "healthy";
@@ -723,7 +737,7 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
       <div class="cell-numbers">
         <span class="pct mono"><strong>${formatHumanPercent(usedVal)}%</strong> used</span>
         <span class="rem-pct muted mono">(${formatHumanPercent(remVal)}% rem)</span>
-        <span class="reset-time muted mono">resets in ${escapeHtml(displayReset)}</span>
+        <span class="reset-time muted mono">${escapeHtml(resetText)}</span>
       </div>
     </div>
   `;
@@ -732,7 +746,8 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
 /** Pure renderer that converts a DashboardModel to a standalone HTML snapshot. */
 export function renderBrowserReport(model: DashboardModel, options: BrowserReportOptions = {}): string {
   const now = options.generatedAt ?? model.now ?? new Date();
-  const observations = model.observations ?? [];
+  const observations = withEffectiveFreshness(model.observations ?? [], model.policy.staleness_minutes, now);
+  model = { ...model, observations };
   const processedWindows = observations.map((row) => processWindow(row, model, now));
 
   // Determine latest observation / fetch timestamps safely
@@ -1704,8 +1719,8 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
           const isSelected = pw.meter_id === defaultSelection.meter_id && (pw.window_minutes === defaultSelection.window_minutes || (defaultSelection.window_minutes === null && pw.window_minutes === null));
           const safeMeterKey = pw.meter_id.replace(/[^a-zA-Z0-9_-]/g, "_");
           const panelId = `panel-${safeMeterKey}-${pw.window_minutes ?? "custom"}`;
-          const secondsToReset = pw.resets_at ? resetsIn(pw.resets_at, now).resets_in_seconds : null;
-          const displayReset = secondsToReset !== null ? formatResetsIn(secondsToReset) : "?";
+          const reset = pw.resets_at ? servedResetsIn(pw, now) : undefined;
+          const displayReset = reset && formatOverdueReset(reset) ? formatOverdueReset(reset)! : reset?.resets_in ?? "?";
 
           return `
           <div class="chart-panel" id="${panelId}" style="display: ${isSelected ? "block" : "none"};">

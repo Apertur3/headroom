@@ -5,18 +5,21 @@ import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN } from "./co
 import { readPolicy, readRouting } from "./config.js";
 import { observeLocal } from "./engine/local.js";
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision } from "./policy.js";
-import { withLastKnown, withPaceInfo } from "./pace.js";
+import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
 import { buildCostEstimate } from "./cost.js";
 import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
-import { resetsIn, withResetsIn } from "./resets.js";
+import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
+import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, withContract } from "./json-contract.js";
+import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
 import { HeadroomStore } from "./store.js";
-import { isLocalAccount } from "./types.js";
+import { isLocalAccount, type Heartbeat, type Timer } from "./types.js";
 
 type Request = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: Record<string, unknown> };
 
@@ -34,12 +37,13 @@ const tools: ToolDefinition[] = [
   { name: "quota_rate", description: "Burn in percent per hour over the last N minutes. need selects a vendor-reported window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, minutes: { type: "number", exclusiveMinimum: 0 }, owner: { type: "string" }, need: { type: "string" } } } },
   { name: "quota_spend", description: "Per-owner attributed spend on shared meters: how much of each window's actual movement the spend ledger books to each lease owner, with a confidence. The owner `unattributed` is movement that happened while no lease was open. since is an ISO timestamp, defaulting to 24 hours ago.", inputSchema: { type: "object", properties: { meter: { type: "string" }, owner: { type: "string" }, since: { type: "string" } } } },
   { name: "quota_inbox", description: "Read this session's hand-off messages from <HEADROOM_HOME>/inbox/<session>/, oldest first, marking each read. Read-only: sending a message is `headroom inbox send`, never this tool.", inputSchema: { type: "object", properties: { session: { type: "string" }, since: { type: "number", minimum: 0 } }, required: ["session"] } },
-  { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" } }, required: ["meter"] } },
+  { name: "quota_plan", description: "Points available per remaining vendor-reported window before reset, including advisory banked-reset guidance. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, need: { type: "string" }, target_points: { type: "number", minimum: 0 } }, required: ["meter"] } },
   { name: "quota_gate", description: "Pre-dispatch check for vendor-reported windows. needs accepts 5h, wk, 30d, or an exact <n>m, <n>h, or <n>d duration.", inputSchema: { type: "object", properties: { needs: { type: "array", items: { type: "string", pattern: "^(5h|wk|30d|[1-9][0-9]*[mhd]):[0-9]+(\\.[0-9]+)?$" } }, meter: { type: "string" }, plan: { type: "boolean" }, reserve_percent: { type: "number", minimum: 0, maximum: 100 }, cap_percent: { type: "number", minimum: 0, maximum: 100 }, duration_minutes: { type: "number", exclusiveMinimum: 0 }, allowance: { type: "string", enum: ["pro_rata", "fill"] }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" } }, required: ["needs"] } },
   { name: "quota_wait", description: "Returns immediately (never blocks) with the meter's reset time and a suggested sleep, for a caller that polls itself.", inputSchema: { type: "object", properties: { meter: { type: "string" } }, required: ["meter"] } },
   { name: "quota_fill", description: "How many more lanes fit before a vendor-reported window resets. need selects that window.", inputSchema: { type: "object", properties: { meter: { type: "string" }, lane_cost_percent: { type: "number", exclusiveMinimum: 0 }, weekly_reserve_percent: { type: "number", minimum: 0, maximum: 100 }, duration_minutes: { type: "number", exclusiveMinimum: 0 }, allowance: { type: "string", enum: ["pro_rata", "fill"] }, owner: { type: "string" }, plan_share_percent: { type: "number", minimum: 0 }, action_class: { type: "string" }, need: { type: "string" } }, required: ["meter"] } },
   { name: "quota_usage_paste", description: "Turn the text of Claude Code's /usage panel into observations, for a meter Headroom cannot poll (a denied probe, or a model-scoped weekly bar the account-wide window hides). text is the pasted panel; principal names the Claude principal and is required when more than one is configured. Stores the readings the same way a poll does, so status, gate, can, rate and route see them immediately.", inputSchema: { type: "object", properties: { principal: { type: "string" }, text: { type: "string" } }, required: ["text"] } },
   { name: "quota_route", description: "Among the principals routing.toml's [consumes] entry for this action class allows, picks the one with the most remaining headroom on its own tightest window and returns its launch environment (e.g. CLAUDE_CONFIG_DIR for a second Claude profile). Every candidate's own state and reason is reported too, not just the winner.", inputSchema: { type: "object", properties: { action_class: { type: "string" }, owner: { type: "string" }, allow_unknown: { type: "boolean" } }, required: ["action_class", "owner"] } },
+  { name: "quota_heartbeat", description: "Record or refresh this orchestrator's heartbeat lease with the daemon -- the one process that survives a crashed session -- so a lapse past 2x interval_ms is noticed and, once configured, notified. owner defaults to this MCP session's client name and session id, same as quota_lease_start. resume_sentence is what a human or a fresh session should do to pick this session's work back up; omit it on a plain re-beat to keep whatever was registered before. Pass stop: true to deregister instead of beating (interval_ms and resume_sentence are ignored then).", inputSchema: { type: "object", properties: { owner: { type: "string" }, interval_ms: { type: "number", exclusiveMinimum: 0 }, resume_sentence: { type: "string" }, stop: { type: "boolean" } } } },
 ];
 
 /**
@@ -162,23 +166,37 @@ export function serveMcp(): void {
 
 type DirectResult = Record<string, unknown>;
 
-/** Attaches burn/empty-in/sustainable-pace fields, and (for a failed or
- * stale observation) last_known, to every observation of a fresh store
- * read -- from one shared burn computation and one shared last-known
- * lookup. */
-function withPace(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, now: Date): ReturnType<HeadroomStore["latestPerWindow"]> {
-  const paced = withPaceInfo(observations, store.burnRateFor(observations, now), now);
-  return withLastKnown(paced, store.lastKnownFor(observations, now)) as ReturnType<HeadroomStore["latestPerWindow"]>;
+/** The direct-MCP equivalent of daemon status: one shared served shape keeps
+ * freshness, pace, last-known and reset countdowns on the same clock. */
+function withStatus(store: HeadroomStore, observations: ReturnType<HeadroomStore["latestPerWindow"]>, stalenessMinutes: number, now: Date) {
+  return withStatusInfo(observations, store.burnRateFor(observations, now), store.lastKnownFor(observations, now), stalenessMinutes, now);
+}
+
+/** `quota_status`'s additive `heartbeats`/`due_timers` fields (see
+ * src/cli.ts's own `observe()`, which this mirrors): every registered
+ * heartbeat, and every pending timer already at or past its own `at`. Both
+ * `store.heartbeats()` and `store.timers()` are plain reads, so this is safe
+ * to call on a read-only-opened store (the cache path) as well as a normal
+ * one (the direct path). */
+function heartbeatFields(store: HeadroomStore, now: Date): { heartbeats: Heartbeat[]; due_timers: Timer[] } {
+  return { heartbeats: store.heartbeats(), due_timers: store.timers().filter((item) => Date.parse(item.at) <= now.getTime()) };
 }
 
 /** Exported only for tests: the MCP client that skips the daemon and reads
  * straight from the collector must gate the Claude probe exactly like the
  * CLI's no-daemon fallback does. */
-export async function directStatus(): Promise<DirectResult> {
+export interface DirectStatusDependencies {
+  /** Test seam: production uses the wall clock and real collector. */
+  now?: () => Date;
+  poll?: typeof pollAccounts;
+}
+
+export async function directStatus(dependencies: DirectStatusDependencies = {}): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try {
     const policy = await readPolicy();
-    const now = Date.now();
+    const requestedAt = dependencies.now?.() ?? new Date();
+    const now = requestedAt.getTime();
     // Without a daemon scheduler, a direct MCP status call has no in-process
     // rate limit of its own; share one persisted in the database instead, so
     // repeated tool calls (or several MCP client processes reading the same
@@ -188,24 +206,52 @@ export async function directStatus(): Promise<DirectResult> {
     if (backoff.until > now) {
       store.audit("mcp", "status", null, "rate_limited");
       const cached = withBackoffReasons(store.latestPerWindow(), () => backoff.until, now);
-      return { source: "direct", observations: withResetsIn(withPace(store, cached, new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, cached, policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     if (now - backoff.lastPollAt < policy.poll_interval_minutes * 60_000) {
-      return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null };
+      return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, requestedAt), requestedAt), failures: [], plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, requestedAt) };
     }
     // Same gating as the CLI's no-daemon fallback (src/cli.ts observe()):
     // without this, an MCP client polling directly (no daemon running) would
     // spawn the Claude probe on every call regardless of a keychain_grants
     // marker, popping a fresh dialog instead of respecting it.
     await syncClaudeProbeState(store);
-    const polled = await pollAccounts(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    const polled = await (dependencies.poll ?? pollAccounts)(undefined, { claudeGrant: claudeGrantGate(store), noDaemon: true });
+    // Polling is asynchronous. Everything sent to the caller must use the
+    // response clock, not the clock captured before a slow vendor call.
+    const responseAt = dependencies.now?.() ?? new Date();
+    const responseNow = responseAt.getTime();
     store.insertPoll(polled.observations);
     for (const [principalId, outcome] of Object.entries(polled.claudeProbeOutcomes ?? {})) store.audit("mcp", "claude_probe", principalId, outcome);
     store.audit("mcp", "status", null, polled.failures.length ? "partial" : "ok");
     const protectedFailure = polled.failures.some((failure) => PROTECTED_STATUS_PATTERN.test(failure));
     const failures = protectedFailure ? backoff.failures + 1 : 0;
-    store.setDirectPollBackoff({ lastPollAt: now, until: protectedFailure ? now + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
-    return { source: "direct", observations: withResetsIn(withPace(store, store.latestPerWindow(), new Date(now))), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null };
+    store.setDirectPollBackoff({ lastPollAt: responseNow, until: protectedFailure ? responseNow + Math.min(3_600_000, 60_000 * 2 ** backoff.failures) : 0, failures });
+    return { source: "direct", observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, responseAt), responseAt), failures: polled.failures, plan_downgraded: store.planDowngrades()[0] ?? null, ...heartbeatFields(store, responseAt) };
+  } finally { store.close(); }
+}
+
+/**
+ * The read-only cached counterpart of `directStatus`: used only when a
+ * daemon socket exists but would not answer `health` even after one retry
+ * (see `daemonCallReadThrough`). Never polls a vendor and never writes --
+ * `HeadroomStore.openReadOnly()` could not anyway -- it only serves whatever
+ * is already stored, with freshness/pace computed against the current clock
+ * exactly like every other status path, so a stale row still serves stale.
+ * `source: "cache"` and `daemon: "unresponsive"` mark it apart from both a
+ * live daemon answer (no `source` at all) and the no-daemon `"direct"` read.
+ */
+async function cacheStatus(dependencies: DirectStatusDependencies = {}): Promise<DirectResult> {
+  const store = await HeadroomStore.openReadOnly();
+  try {
+    const policy = await readPolicy();
+    const now = dependencies.now?.() ?? new Date();
+    return {
+      source: "cache", daemon: "unresponsive",
+      observations: withCreditsLapsed(withStatus(store, store.latestPerWindow(), policy.staleness_minutes, now), now),
+      failures: [], plan_downgraded: store.planDowngrades()[0] ?? null,
+      ...heartbeatFields(store, now),
+    };
   } finally { store.close(); }
 }
 
@@ -274,6 +320,48 @@ function remainingForDecision(store: HeadroomStore, decision: CanDecision): numb
   return deciding?.quantity?.unit === "percent" ? deciding.quantity.remaining ?? (deciding.quantity.limit !== null ? deciding.quantity.limit - deciding.quantity.used : null) : null;
 }
 
+/** The read-only counterpart of `directCanDecision`: `dispatchBlockForMeter`
+ * and `leases()` each self-heal with a write (clearing an expired exhausted
+ * report, marking an expired lease ended) that a read-only connection cannot
+ * make. `dispatchBlockForMeterReadOnly`/`leasesReadOnly` return the same
+ * verdict without it -- see their own doc comments in store.ts. */
+function directCanDecisionReadOnly(store: HeadroomStore, meters: string[], localMeters: string[], localPreference: "fallback" | "prefer" | "never", policy: Awaited<ReturnType<typeof readPolicy>>, allowUnknown: boolean, owner: string, now: Date): CanDecision {
+  const blocked = meters.map((meter) => store.dispatchBlockForMeterReadOnly(meter, now) ?? store.dispatchBlockForPrincipal(meter.split(":")[0])).find(Boolean);
+  if (blocked) return { allowed: false, meter: meters[0], state: "FREEZE", reason: blocked, meters: [{ meter: meters[0], state: "FREEZE", reason: blocked }] };
+  const allMeters = [...new Set([...meters, ...localMeters])];
+  const rows = new Map(allMeters.map((meter) => [meter, store.latestPerWindow(meter)]));
+  const burn = store.burnRateFor([...rows.values()].flat(), now);
+  const enriched = new Map([...rows].map(([meter, list]) => [meter, withPaceInfo(list, burn, now)]));
+  return canRouteWithLeases(meters, localMeters, enriched, localPreference, policy, allowUnknown, store.leasesReadOnly(undefined, true, now), owner, now);
+}
+
+/**
+ * `quota_can` without `lease: true`, served from the store's stored rows when
+ * the daemon exists but would not answer health even after one retry. Never
+ * polls a local account and never admits/starts a lease -- `lease: true`
+ * never reaches this function at all (see the `atomicCanLease` guard in
+ * handleMcp), so a dispatch decision that can reserve capacity stays exactly
+ * as fail-closed as it is today.
+ */
+async function cacheCan(action: string, allowUnknown: boolean, owner: string | undefined, expectOverride: number | null): Promise<DirectResult> {
+  if (!owner?.trim()) throw new Error("owner is required");
+  const routing = await readRouting();
+  if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
+  const meters = routing.consumes[action];
+  if (!meters) throw new Error(`Unknown action class: ${action || "(missing)"}`);
+  const [policy, accounts, store] = await Promise.all([readPolicy(), readAccounts(), HeadroomStore.openReadOnly()]);
+  try {
+    const unknownMeters = unknownMeterPrincipals(meters, new Set(accounts.map((item) => item.name)));
+    if (unknownMeters.length) throw new Error(`Routing action class ${action} names unknown meter(s): ${unknownMeters.join(", ")}`);
+    const localMeters = accounts.filter(isLocalAccount).map((account) => `${account.name}:capacity`);
+    const now = new Date();
+    const decision = directCanDecisionReadOnly(store, meters, localMeters, routing.local_preference, policy, allowUnknown, owner, now);
+    const learned = store.learnedCost(action)[0];
+    const cost = buildCostEstimate(action, expectOverride, learned, remainingForDecision(store, decision));
+    return { source: "cache", daemon: "unresponsive", decision, cost, leased_id: null };
+  } finally { store.close(); }
+}
+
 async function directEvents(since: unknown): Promise<DirectResult> {
   const value = typeof since === "string" ? since : new Date(Date.now() - 86_400_000).toISOString();
   const store = await HeadroomStore.open();
@@ -282,6 +370,13 @@ async function directEvents(since: unknown): Promise<DirectResult> {
     store.audit("mcp", "events", null, "ok");
     return { source: "direct", events };
   } finally { store.close(); }
+}
+
+async function cacheEvents(since: unknown): Promise<DirectResult> {
+  const value = typeof since === "string" ? since : new Date(Date.now() - 86_400_000).toISOString();
+  const store = await HeadroomStore.openReadOnly();
+  try { return { source: "cache", daemon: "unresponsive", events: store.events(value) }; }
+  finally { store.close(); }
 }
 
 async function directLeaseStart(arguments_: Record<string, unknown>): Promise<DirectResult> {
@@ -314,6 +409,30 @@ async function directLeaseEnd(arguments_: Record<string, unknown>): Promise<Dire
   finally { store.close(); }
 }
 
+/**
+ * `quota_heartbeat`: the MCP twin of `headroom heartbeat`. `stop: true`
+ * deregisters instead of beating; interval_ms and resume_sentence are then
+ * ignored, matching the CLI's own `--stop` (which also takes no `--every`).
+ */
+async function directHeartbeat(arguments_: Record<string, unknown>): Promise<DirectResult> {
+  const owner = String(arguments_.owner ?? "");
+  if (!owner.trim()) throw new Error("owner is required");
+  const store = await HeadroomStore.open();
+  try {
+    if (arguments_.stop === true) {
+      const stopped = store.heartbeatStop(owner);
+      store.audit("mcp", "heartbeat_stop", owner, "ok");
+      return { source: "direct", stopped };
+    }
+    const intervalMs = typeof arguments_.interval_ms === "number" ? arguments_.interval_ms : Number.NaN;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new Error("interval_ms must be positive");
+    const resumeSentence = arguments_.resume_sentence === null ? null : typeof arguments_.resume_sentence === "string" ? arguments_.resume_sentence : undefined;
+    const heartbeat = store.heartbeatBeat(owner, intervalMs, resumeSentence, new Date());
+    store.audit("mcp", "heartbeat_beat", owner, "ok");
+    return { source: "direct", heartbeat };
+  } finally { store.close(); }
+}
+
 async function directLeases(): Promise<DirectResult> {
   const store = await HeadroomStore.open();
   try { return { source: "direct", leases: store.leases(undefined, true) }; } finally { store.close(); }
@@ -334,6 +453,14 @@ async function directRate(meter: unknown, minutes: unknown, owner: unknown, need
     const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
     store.audit("mcp", "rate", typeof meter === "string" ? meter : null, "ok");
     return { source: "direct", lines };
+  } finally { store.close(); }
+}
+
+async function cacheRate(meter: unknown, minutes: unknown, owner: unknown, need: unknown): Promise<DirectResult> {
+  const store = await HeadroomStore.openReadOnly();
+  try {
+    const lines = rateLines(store, typeof meter === "string" ? meter : undefined, typeof minutes === "number" && minutes > 0 ? minutes : 30, new Date(), typeof owner === "string" && owner.trim() ? owner.trim() : undefined, typeof need === "string" ? need : undefined);
+    return { source: "cache", daemon: "unresponsive", lines };
   } finally { store.close(); }
 }
 
@@ -365,12 +492,12 @@ async function directInbox(session: unknown, since: unknown): Promise<DirectResu
   return { source: "direct", ...result };
 }
 
-async function directPlan(meter: unknown, reservePercent: unknown, need: unknown): Promise<DirectResult> {
+async function directPlan(meter: unknown, reservePercent: unknown, need: unknown, targetPoints: unknown): Promise<DirectResult> {
   if (typeof meter !== "string" || !meter) throw new Error("meter is required");
   const policy = await readPolicy();
   const reserve = typeof reservePercent === "number" ? reservePercent : policy.freeze_reserve_pct;
   const store = await HeadroomStore.open();
-  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
+  try { const result = planFor(store, meter, reserve, new Date(), policy.staleness_minutes, policy.reserve, typeof need === "string" ? need : undefined, typeof targetPoints === "number" ? targetPoints : undefined); store.audit("mcp", "plan", meter, "ok"); return { source: "direct", ...result }; } finally { store.close(); }
 }
 
 /**
@@ -459,7 +586,7 @@ async function directWait(meter: unknown): Promise<DirectResult> {
     const rows = store.latestPerWindow(meter).filter((item) => item.window?.kind !== "state" && item.window?.kind !== "count" && item.window?.minutes);
     const shortest = [...rows].sort((a, b) => (a.window?.minutes ?? Number.MAX_SAFE_INTEGER) - (b.window?.minutes ?? Number.MAX_SAFE_INTEGER))[0];
     const resetsAt = shortest?.resets_at ?? null;
-    const { resets_in_seconds } = resetsIn(resetsAt);
+    const resets_in_seconds = resetSecondsRemaining(resetsAt);
     store.audit("mcp", "wait", meter, "ok");
     return { source: "direct", meter, resets_at: resetsAt, resets_in_seconds, suggested_sleep_seconds: resets_in_seconds === null ? null : Math.max(0, Math.min(resets_in_seconds, 3600)) };
   } finally { store.close(); }
@@ -469,13 +596,14 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   if (method === "status") return directStatus();
   if (method === "can") return directCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true, typeof arguments_.owner === "string" ? arguments_.owner : undefined, typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, arguments_.lease === true);
   if (method === "lease_start") return directLeaseStart(arguments_);
+  if (method === "heartbeat") return directHeartbeat(arguments_);
   if (method === "lease_end") return directLeaseEnd(arguments_);
   if (method === "leases") return directLeases();
   if (method === "cost") return directCost(arguments_.action_class);
   if (method === "rate") return directRate(arguments_.meter, arguments_.minutes, arguments_.owner, arguments_.need);
   if (method === "spend") return directSpend(arguments_.meter, arguments_.owner, arguments_.since);
   if (method === "inbox") return directInbox(arguments_.session, arguments_.since);
-  if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need);
+  if (method === "plan") return directPlan(arguments_.meter, arguments_.reserve_percent, arguments_.need, arguments_.target_points);
   if (method === "gate") return directGate(arguments_.needs, arguments_.meter, arguments_.plan, arguments_.reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.action_class, arguments_.allowance, arguments_.cap_percent, arguments_.duration_minutes);
   if (method === "wait") return directWait(arguments_.meter);
   if (method === "fill") return directFill(arguments_.meter, arguments_.lane_cost_percent, arguments_.weekly_reserve_percent, arguments_.owner, arguments_.plan_share_percent, arguments_.need, arguments_.action_class, arguments_.allowance, arguments_.duration_minutes);
@@ -484,11 +612,44 @@ async function directResult(method: string, arguments_: Record<string, unknown>)
   return directEvents(arguments_.since);
 }
 
+/**
+ * The read-only cached counterpart of `directResult`, dispatched only for
+ * the tool methods `daemonCallReadThrough` found a daemon unresponsive on
+ * (see its own doc comment): `status`, `events`, `rate`, and `can` without a
+ * lease. Every other method never reaches here -- `handleMcp` only takes
+ * this branch when `servedFromCache` is set, which only that eligibility
+ * check ever sets.
+ */
+async function cacheResult(method: string, arguments_: Record<string, unknown>): Promise<DirectResult> {
+  if (method === "status") return cacheStatus();
+  if (method === "can") return cacheCan(typeof arguments_.action_class === "string" ? arguments_.action_class : "", arguments_.allow_unknown === true, typeof arguments_.owner === "string" ? arguments_.owner : undefined, typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null);
+  if (method === "rate") return cacheRate(arguments_.meter, arguments_.minutes, arguments_.owner, arguments_.need);
+  return cacheEvents(arguments_.since);
+}
+
 async function daemonCall(method: string, params: Record<string, unknown>): Promise<unknown | undefined> {
   const request = await daemonRequest(socketPath(), method, params);
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
+}
+
+/**
+ * The read-only counterpart of `daemonCall`, used only for the tool methods
+ * eligible for a cached fallback: `status`, `events`, `rate`, and `can`
+ * without a lease (see handleMcp's own `cacheEligible` check -- `lease: true`
+ * never reaches this function). Retries the health check once before
+ * reporting the daemon unresponsive, exactly like the CLI's
+ * `requestDaemonReadThrough` (src/cli.ts) -- a poll's own synchronous write
+ * (store.ts's `insertPoll`) can occasionally still run past a single 2s
+ * budget under host load, and a second attempt often lands once it has
+ * finished.
+ */
+async function daemonCallReadThrough(method: string, params: Record<string, unknown>): Promise<{ kind: "available"; result: unknown } | { kind: "absent" } | { kind: "cache" }> {
+  const request = await daemonRequest(socketPath(), method, params, 2_000, 30_000, undefined, 2);
+  if (request.status === "available") return { kind: "available", result: request.result };
+  if (request.status === "unresponsive") return { kind: "cache" };
+  return { kind: "absent" };
 }
 
 /**
@@ -551,7 +712,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
   const methodByTool: Record<string, string> = {
     quota_status: "status", quota_can: "can", quota_events: "events", quota_lease_start: "lease_start", quota_lease_end: "lease_end", quota_leases: "leases",
     quota_cost: "cost", quota_rate: "rate", quota_plan: "plan", quota_gate: "gate", quota_wait: "wait", quota_fill: "fill", quota_route: "route",
-    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox",
+    quota_usage_paste: "usage_paste", quota_spend: "spend", quota_inbox: "inbox", quota_heartbeat: "heartbeat",
   };
   const method = typeof name === "string" ? methodByTool[name] : undefined;
   if (!method) return failure(request.id, -32602, "Unknown tool");
@@ -565,7 +726,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     const reason = typeof rawArguments.reason === "string" ? rawArguments.reason.trim() : "";
     if (rawArguments.confirm_force !== true || !reason) return failure(request.id, -32602, "force requires confirm_force: true and a non-empty reason string, both of which are audited");
   }
-  const arguments_ = method === "lease_start" ? { ...rawArguments, owner: deriveLeaseOwner(rawArguments.owner) } : rawArguments;
+  const arguments_ = method === "lease_start" || method === "heartbeat" ? { ...rawArguments, owner: deriveLeaseOwner(rawArguments.owner) } : rawArguments;
   // Every tool handler is wrapped: a thrown error (invalid owner, unknown
   // action class, a daemon socket error, ...) must become a JSON-RPC error
   // response, never an uncaught rejection out of this stdio loop.
@@ -582,13 +743,15 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
       : method === "cost" ? { action_class: arguments_.action_class }
       : method === "rate" ? { meter: arguments_.meter, minutes: arguments_.minutes, owner: arguments_.owner, need: arguments_.need }
       : method === "spend" ? { meter: arguments_.meter, owner: arguments_.owner, since: arguments_.since }
-      : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need }
+      : method === "plan" ? { meter: arguments_.meter, reserve_percent: arguments_.reserve_percent, need: arguments_.need, target_points: arguments_.target_points }
       : method === "gate" ? { meter: arguments_.meter, plan: arguments_.plan, reserve_percent: arguments_.reserve_percent, cap_percent: arguments_.cap_percent, duration_minutes: arguments_.duration_minutes, allowance: arguments_.allowance, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, needs: Array.isArray(arguments_.needs) ? arguments_.needs.filter((item): item is string => typeof item === "string").map((item) => parseGateNeed(item)) : [] }
       : method === "fill" ? { meter: arguments_.meter, lane_cost_percent: arguments_.lane_cost_percent, weekly_reserve_percent: arguments_.weekly_reserve_percent, duration_minutes: arguments_.duration_minutes, allowance: arguments_.allowance, owner: arguments_.owner, plan_share_percent: arguments_.plan_share_percent, action_class: arguments_.action_class, need: arguments_.need }
       : method === "route" ? { action_class: arguments_.action_class, owner: arguments_.owner, allow_unknown: arguments_.allow_unknown === true }
       : method === "usage_paste" ? { principal: arguments_.principal, text: arguments_.text }
+      : method === "heartbeat" ? (arguments_.stop === true ? { owner: arguments_.owner } : { owner: arguments_.owner, interval_ms: arguments_.interval_ms, resume_sentence: arguments_.resume_sentence })
       : {};
-    const daemonMethod = atomicCanLease && requestedCost?.expected_percent !== null
+    const daemonMethod = method === "heartbeat" ? (arguments_.stop === true ? "heartbeat_stop" : "heartbeat_beat")
+      : atomicCanLease && requestedCost?.expected_percent !== null
       ? "can_lease"
       : method;
     if (daemonMethod === "can_lease") Object.assign(params_, { expected_percent: requestedCost!.expected_percent });
@@ -596,16 +759,63 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     // (see routeFor's own doc comment: an infrequent, deliberate call, not a
     // hot path worth a daemon RPC case) -- both skip the daemon `call` step
     // every other tool takes.
-    const result = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox" ? undefined : await call(daemonMethod, params_);
-    const resolved = result === undefined ? await fallback(method, arguments_) : result;
+    const noDaemonStep = method === "wait" || method === "route" || method === "usage_paste" || method === "inbox";
+    // Only a plain read can still answer usefully from stored rows when the
+    // daemon exists but would not answer health even after one retry: never
+    // a write, and never `can` with `lease: true` (a dispatch decision that
+    // could reserve capacity stays exactly as fail-closed as it is today).
+    // `call` is swapped out in tests, so this only ever engages against the
+    // real daemon transport, not a test double standing in for it.
+    const cacheEligible = !noDaemonStep && call === daemonCall
+      && (method === "status" || method === "events" || method === "rate" || (method === "can" && !atomicCanLease));
+    let result: unknown;
+    let servedFromCache = false;
+    if (noDaemonStep) result = undefined;
+    else if (cacheEligible) {
+      const outcome = await daemonCallReadThrough(daemonMethod, params_);
+      if (outcome.kind === "available") result = outcome.result;
+      else if (outcome.kind === "cache") servedFromCache = true;
+    } else {
+      result = await call(daemonMethod, params_);
+    }
+    const resolved = servedFromCache ? await cacheResult(method, arguments_) : result === undefined ? await fallback(method, arguments_) : result;
     // The learned-cost/max-more/optional-lease report is the same regardless
     // of whether the decision came from the daemon (a raw CanDecision) or
     // from the direct fallback (already bundled with its own cost/leased_id):
     // a daemon-sourced decision still gets this annotation added here.
-    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost) : normalizeDaemonResult(method, resolved, arguments_);
+    let finalResult = method === "can" && result !== undefined ? await annotateDaemonCan(resolved, typeof arguments_.action_class === "string" ? arguments_.action_class : "", typeof arguments_.expect_percent === "number" ? arguments_.expect_percent : null, requestedCost)
+      // A daemon-sourced heartbeat reply is the bare Heartbeat/{stopped}
+      // object the "heartbeat_beat"/"heartbeat_stop" RPC returns; the direct
+      // fallback (directHeartbeat, above) already returns the named,
+      // source-tagged shape below, so only the daemon path needs wrapping
+      // here.
+      : method === "heartbeat" && result !== undefined ? { source: "daemon", ...(daemonMethod === "heartbeat_stop" ? { stopped: (resolved as { stopped: boolean }).stopped } : { heartbeat: resolved }) }
+      : normalizeDaemonResult(method, resolved, arguments_);
     if (method === "status" && Array.isArray(finalResult)) {
+      const policy = await readPolicy();
+      const observations = await normalizeUnmarkedDaemonStatus(finalResult, policy.staleness_minutes);
       const downgrade = await call("plan_downgrades", {});
-      finalResult = { observations: finalResult, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null };
+      // Same additive fields as the direct/cache paths (heartbeatFields,
+      // above), read here from the daemon instead of a local store. An older
+      // daemon that does not yet answer these two methods reads as "none",
+      // never a crash -- same defensive Array.isArray guard as src/cli.ts's
+      // own observe().
+      const heartbeatsReply = await call("heartbeats", {});
+      const heartbeats = Array.isArray(heartbeatsReply) ? heartbeatsReply as Heartbeat[] : [];
+      const timersReply = await call("timer_list", {});
+      const pendingTimers = Array.isArray(timersReply) ? timersReply as Timer[] : [];
+      const dueTimers = pendingTimers.filter((item) => Date.parse(item.at) <= Date.now());
+      finalResult = { observations, plan_downgraded: Array.isArray(downgrade) ? downgrade[0] ?? null : null, heartbeats, due_timers: dueTimers };
+    }
+    // `can` and `gate` additionally carry the same host-pressure reading
+    // `headroom can`/`gate --json` and `doctor` report (src/host-health.ts):
+    // an orchestrator sharing this machine sees local pressure alongside the
+    // quota decision, whether that decision itself came from the daemon or a
+    // direct read. Purely additive and never a refusal here -- only `headroom
+    // run`, which launches locally, refuses on host pressure.
+    if ((method === "can" || method === "gate") && isEnvelopable(finalResult)) {
+      const hostGuardPolicy = await readHostGuardPolicy();
+      finalResult = { ...finalResult, host: await checkHostHealth(hostGuardPolicy) };
     }
     // The contract envelope fits object results. Array-shaped daemon reads
     // have already been normalized above, since MCP structuredContent itself
