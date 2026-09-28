@@ -1,8 +1,8 @@
 import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
-import { DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS, dashboardSnapshot, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
-import { readAccountsOrEmpty } from "./registry.js";
+import { DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS, dashboardSnapshot, noticeShown, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
+import { readAccounts } from "./registry.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
@@ -56,28 +56,35 @@ export function filterDashboardPrincipals(snapshot: DashboardSnapshot, principal
     observations,
     events: snapshot.events.filter((event) => !event.principal_id || principals.has(event.principal_id)),
     leases: snapshot.leases.filter((lease) => observations.some((row) => row.meter_id === lease.meter_id)),
+    planDowngraded: (snapshot.planDowngraded ?? []).filter((downgrade) => principals.has(downgrade.principal)),
+    notices: snapshot.notices.filter((notice) => noticeShown(notice, principals)),
   };
 }
 
-export interface DashboardRegistry { accounts: Account[]; error?: string }
+export interface DashboardRegistry { accounts: Account[]; present: boolean; error?: string }
 
-/** The registry the dashboard filters by. A missing accounts.toml is an
- * empty registry; any other read failure is kept as an error, because which
- * principals are disabled cannot be known then. */
+/** The registry the dashboard filters by. A missing accounts.toml means no
+ * registry yet; an existing one, even empty, is a registry; any other read
+ * failure is kept as an error, because which principals are disabled cannot
+ * be known then. */
 export async function readDashboardRegistry(): Promise<DashboardRegistry> {
-  try { return { accounts: await readAccountsOrEmpty() }; }
-  catch (error: unknown) { return { accounts: [], error: safeError(error) }; }
+  try { return { accounts: await readAccounts(), present: true }; }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { accounts: [], present: false };
+    return { accounts: [], present: true, error: safeError(error) };
+  }
 }
 
 /** Shows only enabled principals, including none when every account is
- * disabled, and none at all when the registry cannot be read. The store is
- * shown as is only when there is no registry yet. */
+ * disabled or the file lists none, and none at all when the registry cannot
+ * be read. The store is shown as is only when there is no accounts.toml. */
 export function applyDashboardRegistry(snapshot: DashboardSnapshot, registry: DashboardRegistry): DashboardSnapshot {
   if (registry.error) {
+    // An unreadable registry cannot attribute any notice, so none is kept.
     const hidden = filterDashboardPrincipals(snapshot, new Set());
-    return { ...hidden, notices: [...hidden.notices, `accounts.toml could not be read (${registry.error}); no principal is shown until it is fixed`] };
+    return { ...hidden, notices: [`accounts.toml could not be read (${registry.error}); no principal is shown until it is fixed`] };
   }
-  if (!registry.accounts.length) return snapshot;
+  if (!registry.present) return snapshot;
   const disabled = registry.accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
   const filtered = filterDashboardPrincipals(snapshot, new Set(registry.accounts.filter(isAccountEnabled).map((account) => account.name)));
   return disabled.length ? { ...filtered, notices: [...filtered.notices, `disabled principals: ${disabled.join(", ")} (enabled = false in accounts.toml)`] } : filtered;

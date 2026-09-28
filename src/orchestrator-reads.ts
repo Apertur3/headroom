@@ -478,10 +478,16 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
       }
       // The plan line reads the weekly window too, so it gets the same
       // freshness gate as a requested need; a stale weekly reading would
-      // otherwise loosen the plan line from outdated usage.
-      if (usePlan && minutes === 300 && long) {
-        const weekly = freshnessGate(long, staleMinutes, now);
-        if (!weekly.ok) return { allowed: false, reason: `wk ${weekly.reason} for ${id} (read by the plan line)`, meters_checked: checked, unknown: true };
+      // otherwise loosen the plan line from outdated usage. A meter that has
+      // reported a weekly window but has no usable one now (its newest poll
+      // failed, or the row lacks usage or a reset) is unknown, not planless.
+      if (usePlan && minutes === 300 && long?.freshness !== "not_enforced") {
+        const unknownWeekly = (reason: string) => ({ allowed: false, reason: `wk ${reason} for ${id} (read by the plan line)`, meters_checked: checked, unknown: true as const });
+        if (long) {
+          const weekly = freshnessGate(long, staleMinutes, now);
+          if (!weekly.ok) return unknownWeekly(weekly.reason);
+          if (!long.resets_at || long.quantity?.used === undefined) return unknownWeekly("usage or reset unknown");
+        } else if (store.hasReportedWindow(id, LONG_WINDOW_THRESHOLD_MINUTES)) return unknownWeekly("usage unknown");
       }
       if (usePlan && minutes === 300 && long?.resets_at && long.quantity?.used !== undefined) {
         const plan = computePlan(Math.min(100, long.quantity.used + reservedPercent), long.resets_at, row.window!.minutes! / 60, reserve, now);

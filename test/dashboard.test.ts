@@ -357,22 +357,33 @@ describe("dashboard registry filtering fails closed", () => {
   const disabledAccount = { name: "account-a", enabled: false, vendor: "claude", location: "/fixture/.claude", adapter: "native-ts" } as Account;
 
   it("shows no principal when every account is disabled, and names them", () => {
-    const shown = applyDashboardRegistry(fixedModel(), { accounts: [disabledAccount] });
+    const shown = applyDashboardRegistry(fixedModel(), { accounts: [disabledAccount], present: true });
     expect(shown.observations).toEqual([]);
     expect(shown.notices).toContainEqual(expect.stringContaining("disabled principals: account-a"));
   });
 
   it("shows no principal when accounts.toml cannot be read, and says so", () => {
-    const shown = applyDashboardRegistry(fixedModel(), { accounts: [], error: "Invalid account entry in accounts.toml" });
+    const shown = applyDashboardRegistry(fixedModel(), { accounts: [], present: true, error: "Invalid account entry in accounts.toml" });
     expect(shown.observations).toEqual([]);
     expect(shown.notices).toContainEqual(expect.stringContaining("accounts.toml could not be read"));
   });
 
-  it("shows the store as is when there is no registry yet", () => {
-    expect(applyDashboardRegistry(fixedModel(), { accounts: [] }).observations).toHaveLength(fixedModel().observations.length);
+  it("shows the store as is only when there is no accounts.toml at all", () => {
+    expect(applyDashboardRegistry(fixedModel(), { accounts: [], present: false }).observations).toHaveLength(fixedModel().observations.length);
+    expect(applyDashboardRegistry(fixedModel(), { accounts: [], present: true }).observations).toEqual([]);
   });
 
-  it("the cached report hides every principal behind a malformed or all-disabled accounts.toml", async () => {
+  it("hides plan downgrades and reset notices of principals that are not shown", () => {
+    const snapshot = { ...fixedModel(), planDowngraded: [{ principal: "account-a", from: "Max", to: "Pro", since: "2026-09-08T11:00:00Z", acknowledged: false }], notices: ["unscheduled reset on account-a:all; capacity appeared, re-plan", "an unattributed notice"] };
+    const shown = applyDashboardRegistry(snapshot, { accounts: [disabledAccount], present: true });
+    expect(shown.planDowngraded).toEqual([]);
+    expect(shown.notices).not.toContainEqual(expect.stringContaining("account-a:all"));
+    const unreadable = applyDashboardRegistry(snapshot, { accounts: [], present: true, error: "unreadable" });
+    expect(unreadable.planDowngraded).toEqual([]);
+    expect(unreadable.notices).toEqual([expect.stringContaining("accounts.toml could not be read")]);
+  });
+
+  it("the cached report hides every principal behind a malformed, empty or all-disabled accounts.toml", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-dashboard-registry-"));
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     try {
@@ -385,6 +396,8 @@ describe("dashboard registry filtering fails closed", () => {
       const unreadable = await gatherCachedDashboard(root, timeouts);
       expect(unreadable.observations).toEqual([]);
       expect(unreadable.notices).toContainEqual(expect.stringContaining("accounts.toml could not be read"));
+      await writeFile(join(root, "accounts.toml"), "", { mode: 0o600 });
+      expect((await gatherCachedDashboard(root, timeouts)).observations).toEqual([]);
       await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "account-a"', "enabled = false", 'vendor = "claude"', 'location = "/fixture/.claude"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
       expect((await gatherCachedDashboard(root, timeouts)).observations).toEqual([]);
     } finally {
@@ -858,7 +871,7 @@ describe("dashboard graph gathering", () => {
     const model = graphModel(); store.insertAll(model.history!["account-a:all"]);
     const request = vi.spyOn(daemon, "daemonRequest").mockResolvedValue({ status: "available", result: { result: model } });
     vi.spyOn(config, "readPolicy").mockResolvedValue(model.policy);
-    vi.spyOn(registry, "readAccountsOrEmpty").mockResolvedValue([
+    vi.spyOn(registry, "readAccounts").mockResolvedValue([
       { name: "account-a", vendor: "claude", location: "/fixture/.claude", adapter: "native-ts" },
       { name: "account-b", enabled: false, vendor: "claude", location: "/fixture/.claude2", adapter: "native-ts" },
     ]);

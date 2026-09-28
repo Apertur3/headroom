@@ -1,6 +1,6 @@
 import { readPolicy } from "./config.js";
 import { withStatusInfo } from "./pace.js";
-import { readAccountsOrEmpty } from "./registry.js";
+import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import type { PlanDowngrade } from "./store.js";
@@ -90,6 +90,13 @@ export async function dashboardSnapshot(reader: DashboardReader): Promise<{ snap
   return { snapshot: await reader.fallback(), direct: true };
 }
 
+/** A notice names the meter it concerns ("unscheduled reset on <meter>;
+ * ..."); one about a principal that is not shown is hidden with it. */
+export function noticeShown(notice: string, principals: ReadonlySet<string>): boolean {
+  const meter = /^unscheduled reset on ([^;\s]+);/.exec(notice)?.[1];
+  return meter === undefined || principals.has(meter.split(":", 1)[0]!);
+}
+
 export interface DashboardRequestTimeouts {
   healthTimeoutMs?: number;
   requestTimeoutMs?: number;
@@ -112,20 +119,27 @@ export async function gatherDashboard(home?: string, timeouts: DashboardRequestT
         } finally { store.close(); }
       },
     }),
-    // A missing accounts.toml is an empty registry; any other read failure
-    // hides every principal, since which ones are disabled cannot be known.
-    policyPromise, readAccountsOrEmpty().then((accounts): { accounts: Account[]; error?: string } => ({ accounts }), (error: unknown) => ({ accounts: [], error: safeError(error) })), headroomVersion(),
+    // A missing accounts.toml means no registry yet; an existing one, even
+    // empty, is a registry; any other read failure hides every principal,
+    // since which ones are disabled cannot be known.
+    policyPromise, readAccounts().then(
+      (accounts): { accounts: Account[]; present: boolean; error?: string } => ({ accounts, present: true }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT" ? { accounts: [], present: false } : { accounts: [], present: true, error: safeError(error) },
+    ), headroomVersion(),
   ]);
   const accounts = registry.accounts;
   const disabled = accounts.filter((account) => !isAccountEnabled(account)).map((account) => account.name);
   const enabled = new Set(accounts.filter(isAccountEnabled).map((account) => account.name));
-  // Filtered whenever a registry exists, even one whose accounts are all
-  // disabled; the store is shown as is only when there is no registry yet.
-  const filtered = accounts.length || registry.error ? {
+  // Filtered whenever accounts.toml exists, even with every account disabled
+  // or none listed; the store is shown as is only when there is no file.
+  const filtered = registry.present ? {
     ...snapshot,
     observations: snapshot.observations.filter((row) => enabled.has(row.principal_id)),
     events: snapshot.events.filter((event) => !event.principal_id || enabled.has(event.principal_id)),
     leases: snapshot.leases.filter((lease) => enabled.has(lease.meter_id.split(":", 1)[0])),
+    planDowngraded: (snapshot.planDowngraded ?? []).filter((downgrade) => enabled.has(downgrade.principal)),
+    // An unreadable registry cannot attribute any notice, so none is kept.
+    notices: registry.error ? [] : snapshot.notices.filter((notice) => noticeShown(notice, enabled)),
   } : snapshot;
   const notices = [
     ...filtered.notices,

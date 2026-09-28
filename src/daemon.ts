@@ -731,6 +731,13 @@ export class HeadroomDaemon {
     });
   }
 
+  /** A request's audit row is best-effort: when the store cannot write it (a
+   * full or read-only disk), the request is still answered with its own
+   * result or error, never turned into a different error or a dropped reply. */
+  private auditQuietly(caller: string, method: string, subject: string | null, outcome: string): void {
+    try { if (this.canUseStore()) this.store.audit(caller, method, subject, outcome); } catch { /* answer regardless */ }
+  }
+
   /** Tracks the complete lifetime of a request, rather than only its socket
    * write or a child poll. This also covers direct test calls through
    * authedHandleLine(), which intentionally exercise the same private RPC
@@ -796,7 +803,7 @@ export class HeadroomDaemon {
     // A rejected request is still audited before it returns: a caller
     // learning nothing about capacity does not mean the daemon saw nothing.
     const reject = (code: number, message: string, subject: string | null = null): HandledLine => {
-      if (this.canUseStore()) this.store.audit(caller, request.method as string, subject, "rejected");
+      this.auditQuietly(caller, request.method as string, subject, "rejected");
       return finish(rpcError(request.id, code, message));
     };
     if (process.platform === "win32" && request.method !== "health") {
@@ -931,7 +938,7 @@ export class HeadroomDaemon {
           result = this.store.endLease(params.id, params.owner, params.force === true);
           if (params.force === true && (result as { owner: string }).owner !== params.owner) {
             const reason = typeof params.reason === "string" && params.reason.trim() ? params.reason.trim().slice(0, 200) : "(no reason given)";
-            this.store.audit(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}:${params.id} reason=${reason}`, "ok");
+            this.auditQuietly(caller, "lease_force_end", `${params.owner}->${(result as { owner: string }).owner}:${params.id} reason=${reason}`, "ok");
           }
           break;
         }
@@ -1139,15 +1146,10 @@ export class HeadroomDaemon {
       // health remains available during shutdown so callers can distinguish
       // a draining daemon from a dead socket; its informational audit must
       // not turn that otherwise store-free reply into a closed-store access.
-      // Best-effort, like the error path's: a read that succeeded is still
-      // answered when the audit row cannot be written (a full disk), and a
-      // mutation on such a disk has already failed on its own write.
-      try { if (this.canUseStore()) this.store.audit(caller, request.method, auditSubject, "ok"); } catch { /* answer regardless */ }
+      this.auditQuietly(caller, request.method, auditSubject, "ok");
       return finish(rpcResult(request.id, result));
     } catch (error) {
-      // A store that cannot write (a full or read-only disk) must not turn
-      // the error reply itself into a rejection.
-      try { if (this.canUseStore()) this.store.audit(caller, request.method, null, "error"); } catch { /* reply regardless */ }
+      this.auditQuietly(caller, request.method, null, "error");
       const message = this.stopping || !this.storeOpen ? "Headroom daemon is stopping" : safeError(error);
       // The client only ever sees the JSON-RPC error's message; without a
       // matching daemon-log line, a genuine handler exception (as opposed to

@@ -149,15 +149,22 @@ All notable changes to this project are documented here. The format follows
   ends a running daemon. Poll scheduling re-reads both files from detached calls and rejected when
   either failed to parse; it now logs the error and retries every 60 seconds until the file is fixed.
 - A full or read-only disk no longer ends the daemon. Writing the daemon log and a request's audit
-  row are now best-effort: a request is still answered when its audit row cannot be written, and a
-  lost log line is dropped instead of surfacing as an unhandled rejection.
+  row are now best-effort: a request is still answered with its own result, error or rejection code
+  when its audit row cannot be written, and a lost log line is dropped instead of surfacing as an
+  unhandled rejection.
 - `gate --plan` now applies the freshness gate to the weekly window the plan line reads, not only to
-  the windows a request names. A stale, failed or held weekly reading refuses as unknown instead of
-  loosening the plan line from outdated usage.
-- The dashboard (terminal and cached report) never shows a disabled principal: a registry whose
-  accounts are all disabled shows none, and an unreadable `accounts.toml` shows none with a notice,
-  since which principals are disabled cannot be known. Previously both cases showed every principal
-  the store retained.
+  the windows a request names. A stale, failed or held weekly reading, or one without usage or a
+  reset, refuses as unknown instead of loosening or silently skipping the plan line; a meter that has
+  never reported a weekly window still has no plan line to apply.
+- The daemon no longer stalls for seconds at a time on a large history. The notifier's latest-reading
+  query sorted every stored observation, JSON columns included, and ran twice per pass; it now ranks
+  ids only and runs once per pass. On a store of about 80,000 observations a pass went from 2-3
+  seconds to well under one, so `health` answers within its 2-second timeout again.
+- The dashboard (terminal and cached report) never shows a disabled principal: an `accounts.toml`
+  whose accounts are all disabled, or that lists none, shows none, and an unreadable one shows none
+  with a notice, since which principals are disabled cannot be known. Plan-downgrade entries and
+  reset notices are filtered the same way. Previously these cases showed every principal the store
+  retained.
 - A daemon poll cycle's own synchronous SQLite writes could occasionally stall a concurrent `health`
   reply well past its 2s budget under host load (reproduced: back-to-back `headroom status --json`
   calls, one out of twelve taking 5.1s, lining up with a poll cycle). Root cause: `insert()` prepares

@@ -23,7 +23,7 @@ describe("a disk that cannot be written never ends the daemon", () => {
     await expect(appendDaemonLog("line", join(notADirectory, "home"))).resolves.toBeUndefined();
   });
 
-  it("answers an RPC, success or error, when its audit row cannot be written", async () => {
+  it("answers an RPC, success, error or rejection, with its own reply when its audit row cannot be written", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-daemon-audit-unwritable-")); temporary.push(home);
     await writeFile(join(home, "accounts.toml"), "", { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
@@ -33,9 +33,12 @@ describe("a disk that cannot be written never ends the daemon", () => {
     try {
       store.audit = () => { throw new Error("database or disk is full"); };
       await expect(authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "leases", params: {} }))).resolves.toMatchObject({ result: [] });
-      const expires = new Date(Date.now() + 86_400_000).toISOString();
-      await expect(authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 2, method: "credits_set", params: { principal: "nobody", available: 1, expires } })))
+      // A handler exception still gets its error reply.
+      await expect(authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 2, method: "lease_end", params: { id: "no-such-lease", owner: "nobody" } })))
         .resolves.toMatchObject({ error: { code: -32000 } });
+      // A validation rejection keeps its own code and message.
+      await expect(authedHandleLine(daemon, JSON.stringify({ jsonrpc: "2.0", id: 3, method: "history", params: {} })))
+        .resolves.toMatchObject({ error: { code: -32602, message: "meter is required" } });
     } finally {
       store.audit = audit;
       await daemon.stop();
