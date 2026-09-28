@@ -640,6 +640,83 @@ describe("gateFor/fillFor: explicit fill allowance basis", () => {
   });
 });
 
+describe("gateFor/fillFor: explicit fill allowance is independent of pacing (review finding 3)", () => {
+  const meter = "claude-main:all";
+  const now = new Date("2026-09-03T12:00:00Z");
+  const resetsAt = "2026-09-03T16:30:00Z"; // 4.5h left
+
+  function seedZeroBurn(store: HeadroomStore, used: number): void {
+    store.insert(fiveHour(used, new Date(now.getTime() - 3 * 60_000).toISOString(), resetsAt, meter));
+    store.insert(fiveHour(used, now.toISOString(), resetsAt, meter));
+  }
+
+  /** 100 pts/h over the last 3 minutes (0% -> 5%): the plain reserve-ceiling
+   * check the main need loop always runs (regardless of pacing) only ever
+   * sees the raw 5% currently used, so a small request against it still
+   * passes under pacing "none" -- only the fill projection (which also
+   * carries this burn to the lane's end) diverges from it. */
+  function seedBurn(store: HeadroomStore): void {
+    store.insert(fiveHour(0, new Date(now.getTime() - 3 * 60_000).toISOString(), resetsAt, meter));
+    store.insert(fiveHour(5, now.toISOString(), resetsAt, meter));
+  }
+
+  it("still projects and can refuse a 5h fill request under pacing \"none\" -- the pre-fix bug let it silently fall through to \"fits\"", async () => {
+    const store = await open();
+    try {
+      seedBurn(store);
+      // Plain (pro-rata-basis) pacing "none" runs no smoothing at all: a
+      // 5-point request against the raw 5% used passes the ordinary reserve
+      // ceiling check on its own, with no burn projection in sight.
+      const plain = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "none" });
+      expect(plain.allowed).toBe(true);
+      // The explicit fill basis must still run its own projection (5% used,
+      // 100 pts/h over the last 3 minutes, projected to the 4.5h lane end)
+      // and refuse the very same request once that projection crosses the
+      // 90% reserve-derived cap -- pacing "none" only ever disables the
+      // pro-rata/burst smoothing below, never this opt-in allowance.
+      const fillGate = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "none", allowance: "fill" });
+      expect(fillGate).toMatchObject({ allowed: false, allowance_basis: "fill", projected_percent: 100, cap_percent: 90 });
+    } finally { store.close(); }
+  });
+
+  it("applies with no owner given under pacing \"none\" too -- never gated on one, same as under even pacing", async () => {
+    const store = await open();
+    try {
+      seedBurn(store);
+      const result = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { pacing: "none", allowance: "fill" });
+      expect(result).toMatchObject({ allowed: false, allowance_basis: "fill" });
+    } finally { store.close(); }
+  });
+
+  it("fillFor also runs the fill projection (never \"full\") under pacing \"none\"", async () => {
+    const store = await open();
+    try {
+      seedZeroBurn(store, 50);
+      const proRata = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "none" });
+      if ("error" in proRata) throw new Error("expected a fill result");
+      expect(proRata.allowance_basis).toBe("full"); // the default allowance is unaffected by this fix
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "none", allowance: "fill" });
+      if ("error" in fill) throw new Error("expected a fill result");
+      expect(fill.allowance_basis).toBe("fill");
+      expect(fill.used_5h_percent).toBe(50);
+    } finally { store.close(); }
+  });
+
+  it("still fails closed as UNKNOWN under pacing \"none\" when the 60-minute burn cannot be computed", async () => {
+    const store = await open();
+    try {
+      // A single sample: leastSquaresBurnPerHour has nothing to fit a slope
+      // to, so burn is null -- never silently treated as a measured zero.
+      store.insert(fiveHour(1, now.toISOString(), resetsAt, meter));
+      const gate = gateFor(store, [{ window: "5h", points: 5 }], meter, 10, false, now, { owner: "orchestrator", pacing: "none", allowance: "fill" });
+      expect(gate).toMatchObject({ allowed: false, unknown: true });
+      expect(gate.reason).toContain("burn");
+      const fill = await fillFor(store, meter, 2, 10, now, { owner: "orchestrator", pacing: "none", allowance: "fill" });
+      expect("error" in fill).toBe(true);
+    } finally { store.close(); }
+  });
+});
+
 describe("gateFor/planFor/fillFor: unscheduled-reset notices (issue #20)", () => {
   it("carries one notice on gate, plan and fill for 24 hours after an unscheduled reset on a checked meter, then none", async () => {
     const store = await open();

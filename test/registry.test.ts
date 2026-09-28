@@ -1,8 +1,8 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { accountsPath, accountsToml, discoverAccounts, readAccounts, writeDiscoveredAccounts } from "../src/registry.js";
+import { accountsPath, accountsToml, discoverAccounts, readAccounts, setAccountEnabled, writeDiscoveredAccounts } from "../src/registry.js";
 
 describe("account discovery", () => {
   let root = "";
@@ -73,6 +73,65 @@ describe("disabled accounts", () => {
       expect(accounts.find((account) => account.name === "codex-main")).toBeUndefined();
       expect(accounts.find((account) => account.name === "claude-main")).toBeDefined();
       expect(accounts.find((account) => account.name === "local-vllm")).toMatchObject({ kind: "local", base_url: "http://localhost:8000" });
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+});
+
+describe("accounts.toml writes: atomic, 0600, symlink-safe", () => {
+  let root = "";
+  afterEach(async () => { if (root) { await chmod(root, 0o700).catch(() => {}); await rm(root, { recursive: true, force: true }); } });
+
+  const source = ['[[accounts]]', 'name = "claude-main"', 'vendor = "claude"', 'location = "~/.claude"', 'adapter = "native-ts"', ''].join("\n");
+
+  it.skipIf(process.platform === "win32")("corrects a pre-existing permissive mode instead of leaving it untouched", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-mode-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o644 }); // simulates an older Headroom's, or an operator's own, permissive file
+      expect((await stat(accountsPath())).mode & 0o777).toBe(0o644);
+      await setAccountEnabled("claude-main", false);
+      expect((await stat(accountsPath())).mode & 0o777).toBe(0o600);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a symlinked accounts.toml and never writes through it", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-symlink-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      const realTarget = join(root, "elsewhere.toml");
+      // Valid accounts.toml content (rather than an arbitrary fixture
+      // string): both setAccountEnabled's line-based lookup and
+      // writeDiscoveredAccounts's full readAccounts() parse must find and
+      // process the entry successfully before ever reaching the write --
+      // the refusal below has to come from the symlink check, not an
+      // unrelated read/parse failure.
+      const targetContent = source;
+      await writeFile(realTarget, targetContent);
+      await symlink(realTarget, accountsPath());
+      await expect(setAccountEnabled("claude-main", false)).rejects.toThrow(/symlink/);
+      // The link target's content must never have been written through.
+      expect(await readFile(realTarget, "utf8")).toBe(targetContent);
+      await expect(writeDiscoveredAccounts([{ name: "claude-main", vendor: "claude", location: "~/.claude", adapter: "native-ts" }])).rejects.toThrow(/symlink/);
+      expect(await readFile(realTarget, "utf8")).toBe(targetContent);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
+  it.skipIf(process.platform === "win32")("leaves the original file byte-for-byte intact when the write is interrupted before rename", async () => {
+    root = await mkdtemp(join(tmpdir(), "headroom-registry-interrupted-"));
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    try {
+      await writeFile(accountsPath(), source, { mode: 0o600 });
+      // Read-only, executable directory: setAccountEnabled can still read the
+      // existing file, but writeFileAtomic's temp file can no longer be
+      // created there, so the failure lands before anything about the
+      // original file's own content or mode is ever touched -- never mid
+      // truncate, since the atomic writer only ever replaces the file with
+      // rename() once a complete replacement already exists on disk.
+      await chmod(root, 0o500);
+      await expect(setAccountEnabled("claude-main", false)).rejects.toThrow();
+      await chmod(root, 0o700);
+      expect(await readFile(accountsPath(), "utf8")).toBe(source);
+      expect((await stat(accountsPath())).mode & 0o777).toBe(0o600);
     } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
   });
 });

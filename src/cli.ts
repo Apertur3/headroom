@@ -42,7 +42,7 @@ import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccount
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
-import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, writeFileAtomic } from "./security.js";
+import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withExclusiveLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
@@ -777,11 +777,27 @@ async function readPolicyTextOrEmpty(path: string): Promise<string> {
 /** Writes a timestamped `.bak-<iso>` copy of the CURRENT on-disk policy.toml
  * before any `policy set/clear` write -- skipped only when the file did not
  * exist yet (nothing to back up). Mirrors notify-configure.ts's own
- * atomic-write/0600 pattern, plus the backup this editor additionally makes. */
+ * atomic-write/0600 pattern, plus the backup this editor additionally makes.
+ * The name is only a starting point: two backups whose ISO stamp collides at
+ * millisecond resolution (two `policy set` calls landing in the same
+ * millisecond) each still get their own file -- writeExclusiveFile appends a
+ * counter suffix on a collision instead of one silently replacing the
+ * other's backup. */
 async function backupPolicyFile(home: string, original: string): Promise<void> {
   if (!original) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  await writeFileAtomic(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
+  await writeExclusiveFile(join(home, `policy.toml.bak-${stamp}`), original, 0o600);
+}
+
+/** Serializes every `policy set`/`policy clear` writer through one lock file:
+ * without it, two concurrent CLI invocations can both read the same
+ * on-disk policy.toml, compute two different updates from it, and have the
+ * second writer's rename silently erase the first writer's edit -- neither
+ * ever saw the other's change. `fn` must contain the whole read-modify-write
+ * (readPolicyTextOrEmpty through writeFileAtomic): the lock only protects
+ * what runs inside it. */
+async function withPolicyLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  return withExclusiveLock(join(home, "policy.toml.lock"), fn);
 }
 
 interface PolicyReserveRow {
@@ -849,16 +865,18 @@ async function policySetReserve(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
-  const updated = upsertReserveEntry(original, meter, entry);
-  parsePolicy(updated); // validate before ever writing it
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
-  const after = describeReserveEntry(entry);
+  const { before, after } = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+    const updated = upsertReserveEntry(original, meter, entry);
+    parsePolicy(updated); // validate before ever writing it
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return { before: beforeLine, after: describeReserveEntry(entry) };
+  });
   if (asJson) console.log(JSON.stringify(withContract({ meter, before, after })));
   else console.log(`${meter}: ${before} -> ${after}`);
   return 0;
@@ -871,15 +889,18 @@ async function policyClearReserve(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
-  const updated = clearReserveEntry(original, meter);
-  parsePolicy(updated);
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
+  const before = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta[meter] ?? (meter in beforePolicy.reserve ? { percent: beforePolicy.reserve[meter] } : undefined));
+    const updated = clearReserveEntry(original, meter);
+    parsePolicy(updated);
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return beforeLine;
+  });
   if (asJson) console.log(JSON.stringify(withContract({ meter, before, after: "cleared" })));
   else console.log(`${meter}: ${before} -> cleared`);
   return 0;
@@ -900,16 +921,18 @@ async function policySetFreeze(argv: string[]): Promise<number> {
   const home = headroomHome();
   const path = join(home, "policy.toml");
   await assertSafeAncestry(home);
-  const original = await readPolicyTextOrEmpty(path);
-  const beforePolicy = parsePolicy(original);
-  const before = describeReserveEntry(beforePolicy.reserve_meta.freeze_reserve_pct ?? { percent: beforePolicy.freeze_reserve_pct });
-  const updated = setFreezeReservePct(original, percent, meta);
-  const afterPolicy = parsePolicy(updated);
-
   await safeOutputDirectory(home);
-  await backupPolicyFile(home, original);
-  await writeFileAtomic(path, updated, 0o600);
-  const after = describeReserveEntry(afterPolicy.reserve_meta.freeze_reserve_pct ?? { percent: afterPolicy.freeze_reserve_pct });
+  const { before, after } = await withPolicyLock(home, async () => {
+    const original = await readPolicyTextOrEmpty(path);
+    const beforePolicy = parsePolicy(original);
+    const beforeLine = describeReserveEntry(beforePolicy.reserve_meta.freeze_reserve_pct ?? { percent: beforePolicy.freeze_reserve_pct });
+    const updated = setFreezeReservePct(original, percent, meta);
+    const afterPolicy = parsePolicy(updated);
+
+    await backupPolicyFile(home, original);
+    await writeFileAtomic(path, updated, 0o600);
+    return { before: beforeLine, after: describeReserveEntry(afterPolicy.reserve_meta.freeze_reserve_pct ?? { percent: afterPolicy.freeze_reserve_pct }) };
+  });
   if (asJson) console.log(JSON.stringify(withContract({ key: "freeze_reserve_pct", before, after })));
   else console.log(`freeze_reserve_pct: ${before} -> ${after}`);
   return 0;

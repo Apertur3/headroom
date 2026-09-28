@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The explicit `fill` allowance for `gate`, `run`, and `fill --allowance fill` was silently skipped
+  whenever policy pacing was `"none"`, letting a caller over-dispatch past the reserve-derived cap
+  with no burn projection at all. `fill` now runs independently of pacing; pacing still restricts
+  only the pro-rata line and burst check it was always meant to.
+- `accounts.toml` enable/disable and rediscovery writes are now atomic (temp file + rename) and
+  always end up `0600`, matching the pattern already used for `policy.toml`: a plain `writeFile`'s
+  mode only applied the first time the file was created, so a pre-existing permissive file stayed
+  permissive, and an interrupted write could truncate it. The write also refuses outright if
+  `accounts.toml` is a symlink instead of following it.
+- `headroom policy set`/`clear` writers are now serialized through an exclusive lock file, so two
+  concurrent invocations editing `policy.toml` can no longer have the second writer's rename
+  silently erase the first writer's edit. Timestamped `.bak-` backups taken in the same millisecond
+  no longer collide either; a colliding name gets a counter suffix instead of overwriting the
+  earlier backup.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

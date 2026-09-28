@@ -204,3 +204,77 @@ export async function writeFileAtomic(path: string, data: string, mode: number):
   try { await rename(temporaryPath, path); }
   catch (error) { await unlink(temporaryPath).catch(() => {}); throw error; }
 }
+
+/**
+ * Creates a file exclusively (O_EXCL via the "wx" open flag), and on a name
+ * collision retries under `<path>-1`, `<path>-2`, ... until one succeeds,
+ * returning whichever path was actually written. Two callers that both
+ * derive the same nominal name from a millisecond-resolution timestamp (two
+ * `policy set` backups taken in the same millisecond, say) each get their
+ * own file this way instead of the second silently replacing the first
+ * through a plain writeFile.
+ */
+export async function writeExclusiveFile(path: string, data: string, mode: number): Promise<string> {
+  for (let attempt = 0; ; attempt += 1) {
+    const candidate = attempt === 0 ? path : `${path}-${attempt}`;
+    let handle;
+    try { handle = await open(candidate, "wx", mode); }
+    catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+    try { await handle.writeFile(data, "utf8"); }
+    finally { await handle.close(); }
+    return candidate;
+  }
+}
+
+const LOCK_STALE_MS = 30_000;
+const LOCK_RETRY_MS = 50;
+const LOCK_TIMEOUT_MS = 5_000;
+
+export interface ExclusiveLockOptions {
+  /** A lock file older than this is assumed abandoned by a writer that
+   * crashed mid-edit (never one merely slow -- see LOCK_TIMEOUT_MS for the
+   * per-call wait) and is reclaimed rather than wedging every future edit
+   * forever. */
+  staleMs?: number;
+  retryMs?: number;
+  timeoutMs?: number;
+}
+
+/**
+ * Serializes concurrent writers of the same file (two `headroom policy`
+ * invocations editing policy.toml, say) through an exclusive lock file next
+ * to it: `fn`'s own read-modify-write critical section runs to completion,
+ * and the lock file is removed, before the next waiting caller's `open(...,
+ * "wx")` can ever succeed -- so a second writer never reads the same
+ * pre-edit source a first writer already replaced, and the first writer's
+ * edit is never silently erased by the second's rename.
+ */
+export async function withExclusiveLock<T>(lockPath: string, fn: () => Promise<T>, options: ExclusiveLockOptions = {}): Promise<T> {
+  const staleMs = options.staleMs ?? LOCK_STALE_MS;
+  const retryMs = options.retryMs ?? LOCK_RETRY_MS;
+  const deadline = Date.now() + (options.timeoutMs ?? LOCK_TIMEOUT_MS);
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try { await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8"); }
+      finally { await handle.close(); }
+      break;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const info = await lstat(lockPath);
+        if (Date.now() - info.mtimeMs > staleMs) { await unlink(lockPath).catch(() => {}); continue; }
+      } catch (statError: unknown) {
+        if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue; // released between our open() and lstat()
+        throw statError;
+      }
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for a lock: ${lockPath}`);
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
+    }
+  }
+  try { return await fn(); }
+  finally { await unlink(lockPath).catch(() => {}); }
+}

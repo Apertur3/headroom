@@ -2,7 +2,8 @@ import { constants, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount } from "./types.js";
-import { expandHome, headroomHome, vendorHome } from "./paths.js";
+import { assertSafeAncestry, expandHome, headroomHome, vendorHome } from "./paths.js";
+import { writeFileAtomic } from "./security.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { kimiCliCredentialPath, kimiTokenPath } from "./adapters/kimi.js";
 
@@ -70,7 +71,13 @@ export async function discoverAccounts(home = homedir(), environment = process.e
 }
 
 export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void> {
-  await fs.mkdir(headroomHome(), { recursive: true, mode: 0o700 });
+  const home = headroomHome();
+  await fs.mkdir(home, { recursive: true, mode: 0o700 });
+  // Same trust boundary as policy.toml's own editor (cli.ts's policySet*):
+  // refuse a home directory reached through an unsafe (foreign-owned, or
+  // writable-without-sticky-bit) ancestor before ever touching the file that
+  // names every principal's credential location.
+  await assertSafeAncestry(home);
   // Discovery updates locations and adapters, but an existing account is the
   // operator's configuration. In particular, rediscovery must not wake a
   // deliberately parked principal.
@@ -88,8 +95,15 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
   const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
   const localAccounts = existing.filter(isLocalAccount);
   const merged = [...discovered, ...localAccounts];
-  await fs.writeFile(accountsPath(), accountsToml(merged), { mode: 0o600 });
-  await fs.chmod(accountsPath(), 0o600);
+  // Atomic (temp file + rename) and always 0600: a plain writeFile's `mode`
+  // option only applies the first time the path is created -- an existing
+  // accounts.toml left permissive by an older Headroom, or by an operator's
+  // own editor, would otherwise stay permissive forever, and a write
+  // interrupted mid-truncate could leave a corrupt file. writeFileAtomic
+  // instead builds the new file with the right mode from the start and
+  // rename()s it into place, refusing outright if accounts.toml is itself a
+  // symlink.
+  await writeFileAtomic(accountsPath(), accountsToml(merged), 0o600);
 }
 
 export async function readAccounts(): Promise<Account[]> {
@@ -144,6 +158,7 @@ function validate(value: Record<string, string>): Account {
  * TOML keys just to park one principal. */
 export async function setAccountEnabled(name: string, enabled: boolean): Promise<void> {
   const path = accountsPath();
+  await assertSafeAncestry(headroomHome());
   const text = await fs.readFile(path, "utf8");
   const lines = text.split(/(?<=\n)/);
   const bare = (line: string): string => line.replace(/\r?\n$/, "");
@@ -168,5 +183,9 @@ export async function setAccountEnabled(name: string, enabled: boolean): Promise
     if (!lines[nameLine].endsWith("\n")) lines[nameLine] += newline;
     lines.splice(nameLine + 1, 0, `enabled = ${enabled}${newline}`);
   }
-  await fs.writeFile(path, lines.join(""), { mode: 0o600 });
+  // Atomic (temp file + rename) and always 0600 -- see writeDiscoveredAccounts'
+  // own comment: a plain writeFile here would leave an existing permissive
+  // mode untouched, could truncate the file on an interrupted write, and
+  // would follow a symlink at this path instead of refusing it.
+  await writeFileAtomic(path, lines.join(""), 0o600);
 }

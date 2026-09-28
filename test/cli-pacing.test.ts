@@ -332,6 +332,47 @@ describe("headroom gate", () => {
       await expect(main(["gate", "--need", "5h:1", "--meter", "claude-main:all", "--owner", "x"])).rejects.toThrow("Invalid Headroom policy");
     });
   });
+
+  it("still evaluates --allowance fill under policy pacing \"none\" for gate, fill and run (review finding 3)", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    // 100 pts/h over the last 3 minutes (0% -> 5%): a 5-point request against
+    // the raw 5% used would clear the ordinary reserve ceiling check on its
+    // own (independent of pacing/allowance), so only the fill projection
+    // (which also carries this burn to the 4.5h lane end, well past the 90%
+    // reserve-derived cap) can be what refuses it. Before the fix, pacing
+    // "none" skipped that projection entirely and every one of these calls
+    // fell through to "fits"/"full" regardless.
+    store.insert(fiveHour(0, -3 * 60_000, 4.5 * HOUR));
+    store.insert(fiveHour(5, 0, 4.5 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        // --json always exits 0 on gate (the refusal is in the JSON body,
+        // not the exit code) -- run's --json still exits 2 on a refusal.
+        expect(await main(["gate", "--need", "5h:5", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill", "--json"])).toBe(0);
+        expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x", "--allowance", "fill", "--json"])).toBe(0);
+        expect(await main(["run", "--meter", "claude-main:all", "--need", "5h:5", "--owner", "x", "--allowance", "fill", "--json", "--", process.execPath, "-e", "process.exit(0)"])).toBe(2);
+      });
+    } finally { restore(); }
+    expect(JSON.parse(logs[0])).toMatchObject({ allowed: false, allowance_basis: "fill", projected_percent: 100, cap_percent: 90 });
+    expect(JSON.parse(logs[1])).toMatchObject({ allowance_basis: "fill", used_5h_percent: 5 });
+    expect(JSON.parse(logs[2])).toMatchObject({ gate: { allowed: false, allowance_basis: "fill" } });
+  });
+
+  it("fails closed as UNKNOWN under pacing \"none\" when the fill projection's burn cannot be computed", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(1, 0, 4.5 * HOUR)); // a lone sample: no burn history to project from
+    store.close();
+    await withHeadroomHome(home, async () => {
+      expect(await main(["gate", "--need", "5h:5", "--meter", "claude-main:all", "--owner", "x", "--allowance", "fill"])).toBe(2);
+      expect(await main(["fill", "--meter", "claude-main:all", "--until-reset", "--lane-cost", "2", "--owner", "x", "--allowance", "fill"])).toBe(0); // fill CLI reports the error line and still exits 0
+    });
+  });
 });
 
 describe("headroom wait", () => {
