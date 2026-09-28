@@ -184,7 +184,7 @@ describe("sendInboxMessageAt", () => {
     expect(result.messages.map((item) => item.from).sort()).toEqual(["a-human", "headroom-timer"]);
   });
 
-  // The blocker this filename shape closes: the delivery id used to sit in
+  // Why this filename shape: the delivery id used to sit in
   // the documented <epoch-ms> field itself, so at_epoch, oldest-first
   // ordering and --since all read a random value instead of a real
   // timestamp for a timer delivery. Mixing ordinary and timer messages
@@ -206,7 +206,7 @@ describe("sendInboxMessageAt", () => {
     expect(since.messages.map((item) => item.at_epoch)).toEqual([2_000, 3_000]);
   });
 
-  // should-fix: the check-then-write race a timed-out (but not actually
+  // the check-then-write race a timed-out (but not actually
   // dead) delivery leaves open -- a retry starting while the original send
   // is merely slow, not cancelled, must join it rather than racing its own
   // independent check against it, and must recognize the original's file
@@ -262,7 +262,7 @@ describe("sendInboxMessageAt", () => {
     await expect(sendInboxMessageAt({ to: "session-c", kind: "handoff", text: "{}", delivery_id: 1.5, home: path })).rejects.toThrow(/delivery_id/);
   });
 
-  // should-fix: findExistingDelivery used to trust a name match alone. A
+  // findExistingDelivery used to trust a name match alone. A
   // corrupt file, or a genuine collision with some unrelated message that
   // happens to carry the same kind and delivery id in its own filename,
   // must never be mistaken for this exact delivery already landing --

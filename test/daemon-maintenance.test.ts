@@ -8,7 +8,7 @@
  * real deadline (src/store.ts's nextMaintenanceDeadline) regardless of
  * whether the vendor poller is ever invoked.
  *
- * This file also covers the blocker fix for the daemon's own lifecycle: a
+ * This file also covers the daemon's own lifecycle: a
  * claimed timer's delivery is confirmed durable only after the inbox write
  * lands (never before), and stop() drains any in-flight maintenance/notifier
  * work before it closes the store -- see src/store.ts's claimTimer/
@@ -210,7 +210,7 @@ describe("daemon-owned maintenance scheduler", () => {
     } finally { await daemon.stop(); }
   });
 
-  // Blocker fix: stop() must drain an in-flight delivery before it closes
+  // stop() must drain an in-flight delivery before it closes
   // the store, rather than racing it -- otherwise the pending
   // confirmTimerDelivered/releaseTimerClaim call this in-flight send is
   // about to make would run against an already-closed SQLite handle.
@@ -262,7 +262,7 @@ describe("daemon-owned maintenance scheduler", () => {
     }
   });
 
-  // should-fix: a delivery that never settles at all (not merely a slow
+  // a delivery that never settles at all (not merely a slow
   // one) must never stall the scheduler out of processing every OTHER due
   // timer or heartbeat behind it -- proven here by a second, distinct timer
   // becoming due shortly after the first one's delivery hangs, and still
@@ -301,7 +301,7 @@ describe("daemon-owned maintenance scheduler", () => {
     }
   });
 
-  // Blocker fix, end to end: a crashed process (never reaches
+  // End to end: a crashed process (never reaches
   // confirmTimerDelivered, never even reaches store.close()'s own cleanup --
   // simulated here by claiming the timer and then closing the store
   // directly, skipping the daemon's own graceful stop()) leaves a claimed

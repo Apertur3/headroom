@@ -333,7 +333,7 @@ describe("releaseTimerClaim bounded retry", () => {
 
 // ---------------------------------------------------------------------------
 // store.ts: the recoverable claim itself -- claimTimer/confirmTimerDelivered/
-// reclaimStaleTimerClaims. Covers the blocker fix: claimTimer no longer sets
+// reclaimStaleTimerClaims. Covers this: claimTimer no longer sets
 // the terminal fired_at, so a crash between claim and delivery leaves a
 // recoverable claim, never a silently-lost timer.
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ describe("recoverable timer claim (claimTimer/confirmTimerDelivered/reclaimStale
     } finally { store.close(); }
   });
 
-  // Blocker fix: replacing a timer (the same owner+name re-set while an OLD
+  // replacing a timer (the same owner+name re-set while an OLD
   // delivery for the PREVIOUS registration is still in flight) used to leave
   // claimed_at/claim_token untouched, so that old, now-orphaned delivery's
   // eventual confirmTimerDelivered call would match the NEW row's guard
@@ -633,7 +633,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // Blocker fix: dueTimers() takes one snapshot at the top of a pass, but
+  // dueTimers() takes one snapshot at the top of a pass, but
   // claimTimer() used to require only that the row still be pending, never
   // that it still be the SAME registration due at THAT snapshot -- awaiting
   // an earlier timer's delivery in the same pass is a real window in which
@@ -785,7 +785,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // Blocker fix: every claim/send/confirm in a pass used to share the same
+  // every claim/send/confirm in a pass used to share the same
   // frozen `now` the pass started with. A pass with a slow earlier delivery
   // can genuinely take real, unbounded time to reach a later timer -- long
   // enough for an ordinary hand-off to land, in real time, before that later
@@ -894,7 +894,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // should-fix: a `send` that never settles at all (a stuck filesystem, not
+  // a `send` that never settles at all (a stuck filesystem, not
   // merely a slow one) used to leave fireDueTimers -- and every other due
   // timer queued behind it in the same pass, and the daemon's own
   // maintenance scheduler, which awaits this whole pass before it can
@@ -933,7 +933,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // should-fix: fireDueTimers's own timeout/failure logging used to be an
+  // fireDueTimers's own timeout/failure logging used to be an
   // unprotected `await log(...)`. A `log` that rejects (a broken custom
   // logger, a full disk under appendDaemonLog) must never abort this pass --
   // the timer it was about to log about has already been claimed and
@@ -959,7 +959,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // should-fix, continued: a `log` that never settles at all (a stuck
+  // a `log` that never settles at all (a stuck
   // filesystem under appendDaemonLog, not merely a slow one) must not hang
   // this pass -- and so the daemon's own maintenance scheduler, which
   // awaits it -- forever either. Proven with a short logTimeoutMs rather
@@ -984,7 +984,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // should-fix: `attempts` (docs/json-contract.md's `timer list` entry,
+  // `attempts` (docs/json-contract.md's `timer list` entry,
   // types.ts's own Timer comment) counts delivery attempts that completed
   // and failed, never one that merely timed out with the outcome unknown --
   // more consecutive timeouts than MAX_TIMER_DELIVERY_ATTEMPTS must never
@@ -1012,7 +1012,7 @@ describe("fireDueTimers", () => {
     } finally { store.close(); }
   });
 
-  // Blocker fix: claimTimer used to write the terminal fired_at before the
+  // claimTimer used to write the terminal fired_at before the
   // async inbox write, so a crash (or the daemon's own stop() closing
   // SQLite) between claim and delivery left the timer excluded forever with
   // no message, retry, or failure marker. These two tests simulate that

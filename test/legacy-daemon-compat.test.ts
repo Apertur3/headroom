@@ -187,7 +187,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(reply.error?.message).toContain("not an array");
   });
 
-  // should-fix: a timer row from a daemon that predates the attempts/
+  // a timer row from a daemon that predates the attempts/
   // failed_at fields (still-running, still answers `timer_list`, just an
   // older Timer shape) must read the same way an older on-disk schema's row
   // already does (store.ts's own timerFromRow default) at every protocol
@@ -246,7 +246,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(parsed.timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
   });
 
-  // should-fix: a malformed (non-array) SUCCESS reply to `timer_list` must
+  // a malformed (non-array) SUCCESS reply to `timer_list` must
   // fail loud, the same way it already does on the `status` path -- never
   // silently normalized into an empty list, which would hide a real daemon
   // defect behind "no pending timers".
@@ -283,7 +283,7 @@ describe.skipIf(process.platform === "win32")("0.2.0 client against a simulated 
     expect(reply.result.structuredContent.due_timers).toEqual([expect.objectContaining({ owner: "orch-oldshape", attempts: 0, failed_at: null })]);
   });
 
-  // should-fix: normalizeDaemonTimer used to default attempts/failed_at onto
+  // normalizeDaemonTimer used to default attempts/failed_at onto
   // ANY object, missing pre-additive fields included -- silently producing a
   // contract-invalid Timer (an `owner` of `undefined`) instead of surfacing
   // the malformed reply. Only the two genuinely additive fields may be
