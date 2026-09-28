@@ -336,7 +336,7 @@ describe("headroom policy CLI", () => {
     const { stat } = await import("node:fs/promises");
     // Windows has no POSIX permission bits (it reports 0666 whatever was asked).
     if (process.platform !== "win32") expect((await stat(join(home, "policy.toml"))).mode & 0o777).toBe(0o600);
-    expect((await stat(join(home, backups[0]))).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") expect((await stat(join(home, backups[0]))).mode & 0o777).toBe(0o600);
   });
 
   it("rejects a missing --reason, an out-of-range percent, and a bad --unless value without writing anything", async () => {
