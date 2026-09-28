@@ -425,6 +425,12 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
 
   const verified: Array<{ pid: number; tier: "ps" | "ps-free" }> = [];
   const unverified = new Set<number>();
+  // The ps-free tier exists for hosts where the process table cannot be read.
+  // Where it can, a pid without a recorded ps signature is never signalled on
+  // pid-file evidence alone: a recycled pid can pass a freshness and
+  // group-alive check, and killing a stranger is worse than an orphan that is
+  // reported and blocks the next launch.
+  const psAvailable = (await processSignature(process.pid, options.execImpl)) !== undefined;
   for (const [pid, recorded] of candidates) {
     if (recorded.command && recorded.startedAt) {
       const live = await processSignature(pid, options.execImpl);
@@ -435,7 +441,7 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
         continue;
       }
     }
-    if (pidFileEntry && pidFileEntry.pid === pid && state?.launchedAt) {
+    if (!psAvailable && pidFileEntry && pidFileEntry.pid === pid && state?.launchedAt) {
       const launchedAtMs = Date.parse(state.launchedAt);
       if (isLaunchEvidenceFresh(launchedAtMs)
         && Math.abs(pidFileEntry.mtimeMs - launchedAtMs) <= AGY_PID_FILE_MTIME_TOLERANCE_MS
@@ -908,8 +914,13 @@ export class AgyKeepaliveSupervisor {
     if (!location || detailed.kind === "absent") return true;
     if (detailed.kind === "invalid") return false;
     try {
+      // Signal only on positive agreement: the state learned this same pid as
+      // a descendant of this launch's own script. Without that, defer to the
+      // full reconciliation, which never signals unverifiable evidence.
       const state = await readKeepaliveState(location.statePath);
-      if (state?.agyPid !== undefined && state.agyPid !== detailed.pid) return false;
+      if (state?.agyPid === undefined || state.agyPid !== detailed.pid) {
+        return (await reconcileEvidence(location)).unverified.length === 0;
+      }
     } catch { return false; }
     killProcessGroup(detailed.pid, { groupOnly: true });
     return waitUntilGroupGone(detailed.pid);
