@@ -123,6 +123,20 @@ already respect. Leave anything another session must act on in its inbox (`headr
 --to <session> --kind handoff --text ...`) and read your own with `headroom inbox --session <self>`
 before planning the next window; reading marks a message read, so a hand-off is acted on once.
 
+## Host guard
+
+`can` and `gate` (CLI and MCP) carry an additive `host` object -- `{ state: "ok" | "warn" |
+"refuse" | "unknown", reasons, load_ratio, pty_used, pty_max, orphans }` -- alongside the quota
+decision: local CPU load, pseudo-terminal usage and leaked-process count on the machine you're
+about to fan out onto. Neither `can` nor `gate` ever refuses over it themselves; read `host.state`
+before dispatching more LOCAL work anyway (spawning several agent lanes onto an already-overloaded
+host is exactly how this repo's own P0 incident started -- see docs/concepts.md's "Host guard"
+section). Only `headroom run`, which actually launches a child process, refuses on its own
+(`state: "refuse"`, exit 2) when `policy.toml`'s `host_guard.mode = "refuse"` (the default);
+`"warn"` or `"off"` still launches. `host.state: "unknown"` (a probe unsupported on this platform,
+or one that failed) is never a reason to hold back -- treat it like any other unknown: no signal
+either way, not a red flag.
+
 ## Heartbeats and named wake-ups
 
 A crashed orchestrator session takes every in-session timer and watcher down with it, unnoticed
@@ -161,5 +175,6 @@ human should also be told if you are not there to read it.
 ## Habits
 
 - Check `headroom` before any fan-out of more than two agents and after any 429 or limit error.
+- Read `can`/`gate`'s `host.state` before fanning out more LOCAL work, not just the quota decision.
 - Do not poll in a loop; one read per decision. Headroom's daemon does the sampling.
 - When the user fires a free reset, `headroom events` shows it; refresh your plan then.
