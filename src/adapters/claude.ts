@@ -102,11 +102,25 @@ export function isClaudeProbeDenialReason(reason: string | null | undefined): bo
  * stream is the secret itself. */
 const SECURITY_TOOL_FAILED_PATTERN = /HEADROOM_PROBE_SECURITY_TOOL_FAILED(?:\s+(\S+))?/;
 
+/** `security` exits with the low byte of the OSStatus it hit, and 36 is errSecInteractionNotAllowed
+ * (-25308): the login keychain is locked or the session has no window server to unlock it with.
+ * That is the ordinary state of an ssh login, where the item exists and the daemon (a launchd
+ * agent) can still read it, so it gets its own wording and fix instead of a bare exit number. */
+export const KEYCHAIN_LOCKED_EXIT_STATUS = 36;
+export const CLAUDE_KEYCHAIN_INACCESSIBLE_PREFIX = "the login keychain is not accessible from this session";
+export const CLAUDE_KEYCHAIN_INACCESSIBLE_REASON = `${CLAUDE_KEYCHAIN_INACCESSIBLE_PREFIX} (security exit 36, common over ssh); the background service can still read it (headroom install-service), or unlock it here with: security unlock-keychain`;
+
+/** True for the reason claudeSecurityToolFailureReason() gives an exit-36 read. */
+export function isClaudeKeychainInaccessibleReason(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && reason.startsWith(CLAUDE_KEYCHAIN_INACCESSIBLE_PREFIX);
+}
+
 /** The single wording for a failed `security` read, built from the marker's
  * suffix alone. An absent item is not this: it keeps HEADROOM_PROBE_NO_CREDENTIALS
  * and the "log in" fix it has always had. */
 export function claudeSecurityToolFailureReason(detail: string | undefined): string {
   const status = /^exit=(-?\d+)$/.exec(detail ?? "");
+  if (status && Number(status[1]) === KEYCHAIN_LOCKED_EXIT_STATUS) return CLAUDE_KEYCHAIN_INACCESSIBLE_REASON;
   if (status) return `the macOS security tool could not read the credential (exit ${status[1]})`;
   if (detail === "timeout") return "the macOS security tool did not answer within 10s";
   return "the macOS security tool could not be run";

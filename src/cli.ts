@@ -43,7 +43,7 @@ import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js"
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
-import { installService, uninstallService } from "./service.js";
+import { describeServiceStart, installAndStartService, installService, uninstallService } from "./service.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
@@ -247,7 +247,7 @@ async function can(argv: string[]): Promise<number> {
   if (!action) throw new Error("Usage: headroom can <action-class> --owner <name> [--allow-unknown] [--expect <percent>] [--lease] [--ttl 30m] [--json]");
   const ownerAt = argv.indexOf("--owner");
   const owner = ownerAt >= 0 ? argv[ownerAt + 1] : undefined;
-  if (!owner) throw new Error("--owner is required");
+  if (!owner) throw new Error(`--owner is required, e.g. headroom can ${action} --owner <your-agent-name>`);
   const expectValue = option(argv, "--expect");
   const expectOverride = expectValue === undefined ? null : Number(expectValue);
   if (expectOverride !== null && (!Number.isFinite(expectOverride) || expectOverride < 0 || expectOverride > 100)) throw new Error("--expect must be 0 through 100");
@@ -2212,7 +2212,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   doctor: "Usage: headroom doctor [--bundle [path]]",
   setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]",
-  "install-service": "Usage: headroom install-service [--dry-run]",
+  "install-service": "Usage: headroom install-service [--dry-run] [--no-start]",
   "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
   uninstall: "Usage: headroom uninstall [--home] [--yes] [--dry-run]",
   daemon: "Usage: headroom daemon",
@@ -2320,8 +2320,18 @@ export async function main(argv: string[]): Promise<number> {
   if (argv[0] === "keychain") return keychain(argv.slice(1));
   if (argv[0] === "mcp") { serveMcp(); return await new Promise<number>(() => undefined); }
   if (argv[0] === "install-service") {
-    if (argv.length > 2 || (argv[1] && argv[1] !== "--dry-run")) throw new Error("Usage: headroom install-service [--dry-run]");
-    const result = await installService(process.argv[1], process.platform, undefined, process.execPath, argv[1] === "--dry-run");
+    const flags = argv.slice(1);
+    if (flags.some((flag) => flag !== "--dry-run" && flag !== "--no-start")) throw new Error("Usage: headroom install-service [--dry-run] [--no-start]");
+    const dryRun = flags.includes("--dry-run");
+    // By default the service is also loaded and started; --no-start (and --dry-run) keep the
+    // write-only behaviour and print the command to load it by hand.
+    if (!dryRun && !flags.includes("--no-start")) {
+      const started = await installAndStartService();
+      describeServiceStart(started).forEach((line) => console.log(line));
+      console.log(`The service will run: ${started.install?.runtime ?? process.execPath} ${started.install?.script ?? process.argv[1]} daemon`);
+      return 0;
+    }
+    const result = await installService(process.argv[1], process.platform, undefined, process.execPath, dryRun);
     console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`);
     // Names the exact executable and script the service will run, so a
     // maintainer installing from a repo checkout (rather than a global npm

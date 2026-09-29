@@ -18,7 +18,7 @@ first one that fails, showing its output:
    the background service install in one pass -- it answers yes to each of those on its own and
    shows its output.
 2. Register the MCP server in the agent that will use it, for example
-   `claude mcp add headroom -- headroom mcp`, and confirm with a `quota_status` call.
+   `claude mcp add --scope user headroom -- headroom mcp`, and confirm with a `quota_status` call.
 3. `headroom doctor` once more; every non-OK line names the next command.
 4. Show `headroom --json` or `headroom --agent` once and explain the pace state on each row.
 
