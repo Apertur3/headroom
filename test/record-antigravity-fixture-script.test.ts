@@ -98,6 +98,7 @@ describe("record-antigravity-fixture.sh", () => {
     expect(existsSync(join(root, "BUILD_RAN"))).toBe(false);
   });
 
+  // The recorder is bash-only (darwin engine); the tests that spawn /bin/bash are skipped on Windows, where it does not exist.
   const readPid = (file: string): number => Number(readFileSync(file, "utf8").trim());
 
   // The stub writes its pid, then replaces itself with a sleep that has a hard
@@ -119,7 +120,7 @@ describe("record-antigravity-fixture.sh", () => {
     return { engine, wrapper, exited, pid, stop };
   }
 
-  it("execs the engine: the wrapper pid is the engine pid, so no child exists", async () => {
+  it.skipIf(process.platform === "win32")("execs the engine: the wrapper pid is the engine pid, so no child exists", async () => {
     const run = start();
     try {
       expect(await waitFor(() => run.pid() !== undefined)).toBe(true);
@@ -129,7 +130,7 @@ describe("record-antigravity-fixture.sh", () => {
     }
   }, 30_000);
 
-  it("passes the principals JSON on stdin, with no secrets or arguments in it", async () => {
+  it.skipIf(process.platform === "win32")("passes the principals JSON on stdin, with no secrets or arguments in it", async () => {
     const run = start();
     try {
       expect(await waitFor(() => existsSync(`${run.engine}.stdin`) && readFileSync(`${run.engine}.stdin`, "utf8").includes("antigravity"))).toBe(true);
@@ -141,7 +142,7 @@ describe("record-antigravity-fixture.sh", () => {
     }
   }, 30_000);
 
-  it("leaves no survivors when the wrapper is terminated", async () => {
+  it.skipIf(process.platform === "win32")("leaves no survivors when the wrapper is terminated", async () => {
     const run = start();
     try {
       expect(await waitFor(() => run.pid() !== undefined)).toBe(true);
