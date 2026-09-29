@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `setup` now registers the MCP server at user scope (`claude mcp add --scope user headroom -- headroom mcp`), so the tools exist in every directory; `doctor` warns about a local-scope-only entry and names its directory, and `uninstall` removes user-scope and local-scope entries.
+- The README and docs now use `headroom mcp`, the same command `setup`, `doctor` and `uninstall` use, instead of `npx headroomd mcp`.
+- `install-service` (and `setup`) now load and start the service and confirm the daemon answers; `--no-start` keeps the write-only behaviour, and a refused load (for example over ssh) prints the reason and the manual command.
+- A Claude credential read that fails with `security` exit 36 now explains that the login keychain is not accessible from this session, and `doctor` no longer reports that credential as OK.
+- `headroom can` without `--owner` now shows an example, and the README example includes it.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added
