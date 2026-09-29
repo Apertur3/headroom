@@ -68,14 +68,14 @@ final class AntigravityRecordTests: XCTestCase {
     func testQuotaSummaryExtractionKeepsDisabledAndNilFraction() throws {
         let summary = AntigravityQuotaSummary(description: nil, groups: [
             AntigravityQuotaSummaryGroup(displayName: "Gemini Models", description: nil, buckets: [
-                AntigravityQuotaSummaryBucket(bucketId: "g5", displayName: "5 hour", remainingFraction: nil, resetDescription: nil, disabled: true),
-                AntigravityQuotaSummaryBucket(bucketId: "gw", displayName: "Weekly", remainingFraction: 0, resetTime: reset, resetDescription: nil, disabled: false),
+                AntigravityQuotaSummaryBucket(bucketId: "gemini-5h", displayName: "5 hour", remainingFraction: nil, resetDescription: nil, disabled: true),
+                AntigravityQuotaSummaryBucket(bucketId: "gemini-weekly", displayName: "Weekly", remainingFraction: 0, resetTime: reset, resetDescription: nil, disabled: false),
             ]),
         ])
         let status = AntigravityStatusSnapshot(quotaSummary: summary, accountEmail: "person@example.com", accountPlan: "Some Plan")
         let record = AntigravityRecorder.principalRecord(index: 0, input: AntigravityRecorder.input(from: status))
         XCTAssertEqual(record.payload_kind, "quota_summary")
-        XCTAssertEqual(record.buckets.map(\.bucket_id), ["g5", "gw"])
+        XCTAssertEqual(record.buckets.map(\.bucket_id), ["gemini-5h", "gemini-weekly"])
         XCTAssertEqual(record.buckets.map(\.usage_known), [false, true])
         XCTAssertEqual(record.buckets[0].disabled, true)
         XCTAssertNil(record.buckets[0].remaining_fraction)
@@ -107,14 +107,13 @@ final class AntigravityRecordTests: XCTestCase {
         "Name Surname wrote this", "0123456789abcdef0123456789abcdef", "QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu",
     ]
 
+    private let semanticHostile = ["Alice Smith", "project-42", "--profile work", "x9Kd82LmQ4zA"]
+
     func testHostileStringsNeverReachTheFile() throws {
         var buckets: [AntigravityRecordInput.Bucket] = []
         var models: [AntigravityRecordInput.Model] = []
-        // A plain-words name matches the label charset by design (real labels
-        // are words), so it is only fed to free-text description fields, which
-        // are dropped outright.
-        for h in hostile {
-            let label = h.hasPrefix("Name Surname") ? "Weekly" : h
+        for h in hostile + semanticHostile {
+            let label = h
             buckets.append(.init(group: label, bucketID: label, displayName: label, remainingFraction: 0.5, resetTime: reset, resetDescription: h, disabled: false))
             models.append(.init(label: label, modelID: label, remainingFraction: 0.5, resetTime: reset, resetDescription: h))
         }
@@ -123,9 +122,13 @@ final class AntigravityRecordTests: XCTestCase {
         let file = AntigravityRecordFile(schema: 1, recorded_at: "x", engine_version: "x", probe_version: "x",
                                          principals: [AntigravityRecorder.principalRecord(index: 0, input: input)] + failed)
         let text = String(decoding: try AntigravityRecorder.encode(file), as: UTF8.self)
-        for h in hostile {
+        for h in hostile + semanticHostile {
             XCTAssertFalse(text.contains(h), h)
         }
+        for fragment in ["Alice", "Smith", "project-42", "--profile", "x9Kd82"] {
+            XCTAssertFalse(text.contains(fragment), fragment)
+        }
+        XCTAssertTrue(text.contains("bucket-1") && text.contains("group-1") && text.contains("model-1"))
         for fragment in ["csrf", "session=", "example.com", "123e4567", "eyJ", "Surname", "0123456789abcdef", "QWxhZGRpbjpv"] {
             XCTAssertFalse(text.contains(fragment), fragment)
         }
@@ -133,10 +136,16 @@ final class AntigravityRecordTests: XCTestCase {
         XCTAssertTrue(text.contains("\"error\" : \"api_error\""))
     }
 
-    func testBenignLabelsAndStructuredResetSurvive() {
-        XCTAssertEqual(AntigravityRecorder.label("Claude and GPT models"), "Claude and GPT models")
-        XCTAssertEqual(AntigravityRecorder.label("Gemini 3 Pro (High)"), "Gemini 3 Pro (High)")
-        XCTAssertEqual(AntigravityRecorder.identifier("gemini-weekly"), "gemini-weekly")
+    func testKnownIdsSurviveAndEverythingElseIsPositional() {
+        for id in ["gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly"] {
+            XCTAssertEqual(AntigravityRecorder.bucketName(id, placeholder: "bucket-9"), id)
+        }
+        XCTAssertEqual(AntigravityRecorder.bucketName("Claude and GPT models", placeholder: "group-2"), "group-2")
+        XCTAssertEqual(AntigravityRecorder.bucketName("Weekly", placeholder: "bucket-3"), "bucket-3")
+        XCTAssertEqual(AntigravityRecorder.modelName("gemini-3.7-flash", placeholder: "model-1"), "gemini-3.7-flash")
+        XCTAssertEqual(AntigravityRecorder.modelName("claude-sonnet-4", placeholder: "model-1"), "claude-sonnet-4")
+        XCTAssertEqual(AntigravityRecorder.modelName("Gemini 3 Pro (High)", placeholder: "model-2"), "model-2")
+        XCTAssertEqual(AntigravityRecorder.modelName("project-42", placeholder: "model-3"), "model-3")
         XCTAssertEqual(AntigravityRecorder.structuredReset("Resets in 2d 3h"), "Resets in 2d 3h")
         XCTAssertNil(AntigravityRecorder.structuredReset("Resets in 2d for user@example.com"))
     }

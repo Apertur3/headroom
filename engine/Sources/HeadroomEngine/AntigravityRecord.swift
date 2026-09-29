@@ -179,21 +179,21 @@ enum AntigravityRecorder {
             payload_kind: kind,
             source: input.isLocal ? "local" : "remote",
             account: redactedMarker,
-            buckets: input.buckets.map { bucket in
+            buckets: input.buckets.enumerated().map { position, bucket in
                 AntigravityRecordBucket(
-                    group: label(bucket.group),
-                    bucket_id: identifier(bucket.bucketID),
-                    name: label(bucket.displayName),
+                    group: bucketName(bucket.group, placeholder: "group-\(position + 1)"),
+                    bucket_id: bucketName(bucket.bucketID, placeholder: "bucket-\(position + 1)"),
+                    name: bucketName(bucket.displayName, placeholder: "bucket-\(position + 1)"),
                     disabled: bucket.disabled,
                     remaining_fraction: bucket.remainingFraction,
                     usage_known: !bucket.disabled && bucket.remainingFraction != nil,
                     reset_time: HeadroomEngine.iso(bucket.resetTime),
                     reset_description: structuredReset(bucket.resetDescription))
             },
-            model_quotas: input.models.map { model in
+            model_quotas: input.models.enumerated().map { position, model in
                 AntigravityRecordModelQuota(
-                    label: label(model.label),
-                    model_id: identifier(model.modelID),
+                    label: modelName(model.label, placeholder: "model-\(position + 1)"),
+                    model_id: modelName(model.modelID, placeholder: "model-\(position + 1)"),
                     remaining_fraction: model.remainingFraction,
                     reset_time: HeadroomEngine.iso(model.resetTime),
                     reset_description: structuredReset(model.resetDescription))
@@ -223,18 +223,28 @@ enum AntigravityRecorder {
             || matches(value, #"(?i)eyJ|sk-|bearer|token|cookie|csrf|secret|password|session"#)
     }
 
-    /// Display names (group, bucket, model label): strict charset and length,
-    /// no token or id shapes, else "redacted".
-    static func label(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard matches(trimmed, #"^[A-Za-z0-9 ._()/+-]{1,64}$"#), !looksLikeToken(trimmed) else { return redactedMarker }
-        return trimmed
+    /// The bucket ids Antigravity is known to send (CodexBar probe and the
+    /// Headroom adapter). The fixture only needs structure, so a bucket or
+    /// group value is kept only when it equals one of these exactly.
+    static let knownBucketIDs: Set<String> = ["gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly", "cg-5h", "cg-weekly"]
+
+    /// Known model-family prefixes (the families the probe recognises).
+    static let knownModelPrefixes = ["gemini-", "claude-", "gpt-"]
+
+    /// Bucket or group value: kept only if a known bucket id, else the
+    /// positional placeholder. Human-readable names never survive.
+    static func bucketName(_ value: String, placeholder: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return knownBucketIDs.contains(trimmed) ? trimmed : placeholder
     }
 
-    /// Bucket and model ids: same rule, no spaces.
-    static func identifier(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard matches(trimmed, #"^[A-Za-z0-9._/-]{1,64}$"#), !looksLikeToken(trimmed) else { return redactedMarker }
+    /// Model id or label: kept only if it is a known-family model id (or a
+    /// known bucket id) with no token shape, else the positional placeholder.
+    static func modelName(_ value: String, placeholder: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if knownBucketIDs.contains(trimmed) { return trimmed }
+        guard knownModelPrefixes.contains(where: { trimmed.hasPrefix($0) }),
+              matches(trimmed, #"^[a-z0-9][a-z0-9.-]{1,47}$"#), !looksLikeToken(trimmed) else { return placeholder }
         return trimmed
     }
 

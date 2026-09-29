@@ -71,27 +71,33 @@ umask 077
 
 # Run the engine in its own process group (set -m) and forward INT/TERM/HUP to
 # that group, then wait for it, so nothing from this run outlives the wrapper.
-set -m
-"$engine" observe --principals "$principals" --record "$out" &
-engine_pid=$!
+# The traps are installed BEFORE the child starts: a signal in between would
+# otherwise kill the wrapper and orphan the engine.
+engine_pid=""
 got_signal=0
 forward() {
   got_signal=1
-  kill -TERM -- "-$engine_pid" 2>/dev/null || true
+  if [[ -n "$engine_pid" ]]; then kill -TERM -- "-$engine_pid" 2>/dev/null || true; fi
 }
 trap forward INT TERM HUP
+set -m
+"$engine" observe --principals "$principals" --record "$out" &
+engine_pid=$!
+# A signal that landed before the pid was known is honoured now.
+if (( got_signal == 1 )); then kill -TERM -- "-$engine_pid" 2>/dev/null || true; fi
 status=0
 wait "$engine_pid" || status=$?
-grace=0
-while kill -0 "$engine_pid" 2>/dev/null; do
-  # `wait` returns early when a trapped signal arrives; keep reaping.
-  wait "$engine_pid" 2>/dev/null || status=$?
-  if (( got_signal == 1 )); then
-    grace=$((grace + 1))
-    if (( grace > 50 )); then kill -KILL -- "-$engine_pid" 2>/dev/null || true; fi
+if (( got_signal == 1 )); then
+  # `wait` returned because of the signal. Give the group 5 s (50 x 0.1 s) to
+  # exit on TERM, poll without blocking, then SIGKILL whatever is left.
+  tries=0
+  while kill -0 -- "-$engine_pid" 2>/dev/null && (( tries < 50 )); do
     sleep 0.1
-  fi
-done
+    tries=$((tries + 1))
+  done
+  if kill -0 -- "-$engine_pid" 2>/dev/null; then kill -KILL -- "-$engine_pid" 2>/dev/null || true; fi
+  wait "$engine_pid" 2>/dev/null || true
+fi
 trap - INT TERM HUP
 set +m
 if (( got_signal == 1 )); then
