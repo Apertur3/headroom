@@ -208,4 +208,13 @@ final class AntigravityRecordTests: XCTestCase {
         XCTAssertEqual(observations.filter { $0.freshness == "fresh" }.map(\.meter_id).sorted(), ["p:claude-gpt", "p:claude-gpt", "p:gemini"])
         XCTAssertEqual(observations.filter { $0.freshness == "failed" }.count, 0)
     }
+
+    /// Bash 5.1+ delivers a short here-string as a pipe; the record input must accept it.
+    func testRecordInputReadsPrincipalsFromAPipe() throws {
+        let pipe = Pipe()
+        let json = Data(#"[{"id":"antigravity","vendor":"antigravity","location":"agy"}]"#.utf8)
+        pipe.fileHandleForWriting.write(json)
+        try pipe.fileHandleForWriting.close()
+        XCTAssertEqual(try HeadroomEngine.readRecordInput("/dev/stdin", standardInput: pipe.fileHandleForReading), json)
+    }
 }
