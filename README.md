@@ -99,7 +99,7 @@ setup, and `headroom completion <bash|zsh|fish|pwsh>` prints a shell completion 
 
 `accounts discover` prints what it wrote (`Wrote ~/.headroom/accounts.toml (4 accounts). Next: headroom
 doctor`) and, the first time, seeds `~/.headroom/policy.toml` and `routing.toml` from `examples/` so
-`headroom can <class>` works immediately with the example action classes (`claude-fable`, `codex-build`,
+`headroom can <class> --owner <your-agent-name>` works immediately with the example action classes (`claude-fable`, `codex-build`,
 `gemini-bulk`) -- edit `routing.toml` to match your accounts.
 
 Keep an optional second profile that is deliberately logged out without polling it: add
@@ -109,8 +109,8 @@ It remains configured and can be restored with `headroom accounts enable <name>`
 Register the MCP server in each Claude Code profile:
 
 ```sh
-claude mcp add headroom -- npx headroomd mcp
-CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
+claude mcp add --scope user headroom -- headroom mcp
+CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add --scope user headroom -- headroom mcp
 ```
 
 Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your skills directory.

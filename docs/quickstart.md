@@ -91,7 +91,7 @@ started) the checks end with an ordered punch list:
 ```
 Next steps:
 1. headroom install-service
-2. claude mcp add headroom -- npx headroomd mcp
+2. claude mcp add --scope user headroom -- headroom mcp
 ```
 
 Run `headroom --help` any time for the full command list, or `headroom <command> --help` for one
@@ -356,7 +356,10 @@ headroom install-service
 ```
 
 This writes a service definition (a launchd agent on macOS, a systemd user unit on Linux, a Task
-Scheduler XML on Windows) and prints the command to load it. Run that printed command:
+Scheduler XML on Windows), loads it, and waits a few seconds for the daemon to answer. Running it
+again with nothing changed says "already installed and running". Pass `--no-start` to only write
+the file. If the service manager refuses (launchd has no GUI session to load into over ssh), the
+file is still written and the exact command to run yourself is printed:
 
 ```sh
 # macOS
@@ -377,16 +380,16 @@ log rotation (`logrotate`, `newsyslog`) if a process crash ever needs to be boun
 ## 7. Register the MCP server
 
 ```sh
-claude mcp add headroom -- npx headroomd mcp
+claude mcp add --scope user headroom -- headroom mcp
 ```
 
-(swap `npx headroomd` for `node /path/to/headroom/dist/cli.js` if you're working from a source
+(swap `headroom` for `node /path/to/headroom/dist/cli.js` if you're working from a source
 checkout instead of the published package, same as step 1)
 
 For every extra Claude Code profile, point at its config directory:
 
 ```sh
-CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add headroom -- npx headroomd mcp
+CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add --scope user headroom -- headroom mcp
 ```
 
 This registers Headroom's MCP server (stdio; all sixteen `quota_*` tools) for that Claude Code

@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -21,6 +21,7 @@ import { updateNoticeLine } from "./update.js";
 import { isAccountEnabled, isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 import { headroomVersion } from "./version.js";
 import { safeError } from "./security.js";
+import { MCP_ADD_COMMAND } from "./mcp-registration.js";
 
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
 export interface DoctorCheck { level: DoctorLevel; check: string; detail: string; fix: string; }
@@ -42,7 +43,7 @@ export async function doctorFileStatus(path: string): Promise<FileStatus> {
   } catch (error: unknown) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe"; }
 }
 
-async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
+export async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} credential`, "local adapter has no credential", "no action needed");
   if (account.vendor === "claude" && process.platform === "darwin") {
     // A principal already marked grant-needed must never touch the Keychain
@@ -67,6 +68,12 @@ async function credentialCheck(account: Account, grantsNeeded: Map<string, strin
     const lastObservation = store?.latest(`${account.name}:all`);
     if (lastObservation?.freshness === "failed" && isClaudeLoggedOutReason(lastObservation.reason)) {
       return check("FAIL", `principal ${account.name} credential`, lastObservation.reason ?? "Claude Code is logged out", claudeLoggedOutFix(account.location));
+    }
+    // The same reasoning for a live read that came back "keychain not accessible from this
+    // session" (exit 36, the ssh case): metadata below still succeeds there, so without this
+    // doctor would call a credential OK that `headroom` itself just failed to read.
+    if (lastObservation?.freshness === "failed" && isClaudeKeychainInaccessibleReason(lastObservation.reason)) {
+      return check("WARN", `principal ${account.name} credential`, lastObservation.reason ?? CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, "run headroom from a normal Terminal session, install the service (headroom install-service), or run: security unlock-keychain");
     }
     // The same Apple-signed tool the probe reads the credential through, and
     // the reason this line can call it readable: the item's access list
@@ -398,16 +405,30 @@ export function claudeConfigJsonPath(location: string, home = homedir()): string
   return directory === resolve(home, ".claude") ? join(home, ".claude.json") : join(directory, ".claude.json");
 }
 
-async function mcpRegisteredFor(location: string): Promise<boolean> {
+/** Where a profile's `.claude.json` holds a `headroom` MCP entry. User scope is the top-level
+ * `mcpServers` (visible from every directory); local scope, the `claude mcp add` default, is
+ * `projects[<directory>].mcpServers` (visible only when Claude Code starts in that directory).
+ * Project scope lives in a repo's `.mcp.json` and cannot be discovered from here. */
+export interface McpRegistration { user: boolean; localDirectories: string[] }
+
+function hasHeadroomServer(value: unknown): boolean {
+  const servers = (value as { mcpServers?: unknown } | null | undefined)?.mcpServers;
+  return typeof servers === "object" && servers !== null && "headroom" in servers;
+}
+
+export async function mcpRegistrationFor(location: string): Promise<McpRegistration> {
   try {
-    const parsed = JSON.parse(await readFile(claudeConfigJsonPath(location), "utf8")) as { mcpServers?: Record<string, unknown> };
-    return typeof parsed.mcpServers === "object" && parsed.mcpServers !== null && "headroom" in parsed.mcpServers;
-  } catch { return false; }
+    const parsed = JSON.parse(await readFile(claudeConfigJsonPath(location), "utf8")) as { projects?: unknown };
+    const projects = typeof parsed.projects === "object" && parsed.projects !== null ? parsed.projects as Record<string, unknown> : {};
+    return { user: hasHeadroomServer(parsed), localDirectories: Object.keys(projects).filter((directory) => hasHeadroomServer(projects[directory])) };
+  } catch { return { user: false, localDirectories: [] }; }
 }
 
 /**
  * One line naming which configured Claude profiles have Headroom's MCP
- * server registered (`claude mcp add headroom -- ...`) and which don't, read
+ * server registered for every directory (user scope), which only have it
+ * bound to one directory (local scope, so the tools are missing everywhere
+ * else) and which have none, read
  * straight from each profile's own `.claude.json` -- never assumed from
  * whether the current process happens to be running under the MCP server
  * itself, since a session started before an install or a rename would not
@@ -419,10 +440,19 @@ export async function mcpRegistrationCheck(accounts: Account[]): Promise<DoctorC
   if (!claudeAccounts.length) return undefined;
   const registered: string[] = [];
   const unregistered: string[] = [];
-  for (const account of claudeAccounts) (await mcpRegisteredFor(account.location) ? registered : unregistered).push(account.name);
-  const detail = `registered for ${registered.length ? registered.join(", ") : "none"}${unregistered.length ? `; not registered for ${unregistered.join(", ")}` : ""}`;
-  const fix = unregistered.length ? "claude mcp add headroom -- npx headroomd mcp (CLAUDE_CONFIG_DIR=<dir> for a non-default profile)" : "no action needed";
-  return check(unregistered.length ? "INFO" : "OK", "mcp registration", detail, fix);
+  const localOnly: string[] = [];
+  const boundTo = new Set<string>();
+  for (const account of claudeAccounts) {
+    const found = await mcpRegistrationFor(account.location);
+    if (found.user) registered.push(account.name);
+    else if (found.localDirectories.length) { localOnly.push(account.name); found.localDirectories.forEach((directory) => boundTo.add(directory)); }
+    else unregistered.push(account.name);
+  }
+  const parts = [`registered for ${registered.length ? registered.join(", ") : "none"}`];
+  if (localOnly.length) parts.push(`only bound to ${[...boundTo].join(", ")} (local scope) for ${localOnly.join(", ")}`);
+  if (unregistered.length) parts.push(`not registered for ${unregistered.join(", ")}`);
+  const fix = localOnly.length || unregistered.length ? `${MCP_ADD_COMMAND} (CLAUDE_CONFIG_DIR=<dir> for a non-default profile)` : "no action needed";
+  return check(localOnly.length ? "WARN" : unregistered.length ? "INFO" : "OK", "mcp registration", parts.join("; "), fix);
 }
 
 /**
@@ -449,7 +479,7 @@ export async function isFreshInstall(checks: DoctorCheck[], home = headroomHome(
  * has nothing to grant, since the probe reads the Claude credential through
  * the Apple security tool the Keychain item already admits. */
 export function nextSteps(_platform: NodeJS.Platform = process.platform): string[] {
-  return ["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"];
+  return ["headroom install-service", MCP_ADD_COMMAND];
 }
 
 export async function doctor(argv: string[] = []): Promise<number> {

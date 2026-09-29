@@ -107,6 +107,24 @@ describe("headroom setup: empty-answer confirmation defaults to No", () => {
   });
 });
 
+describe("headroom setup --yes: service step", () => {
+  it("loads and starts the service through the injected runner, never the real service manager", async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), "headroom-setup-userhome-"));
+    const headroomHome = await mkdtemp(join(tmpdir(), "headroom-setup-home-"));
+    temporary.push(fakeHome, headroomHome);
+    const calls: string[] = [];
+    const runner = async (command: string, args: string[]) => { calls.push([command, ...args].join(" ")); return { code: 0, output: "" }; };
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      logs = (await captureLog(() => runSetup(["--yes", "--skip-mcp"], { serviceStart: { runner, probe: async () => calls.length > 0, sleep: async () => undefined, intervalMs: 1, waitMs: 2, uid: 501 } }))).logs;
+    });
+    // Only the platform's own service manager was named, and only through the injected runner.
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => /^(launchctl|systemctl|schtasks) /.test(call))).toBe(true);
+    expect(logs.join("\n")).toContain("service loaded; the daemon is answering");
+  });
+});
+
 describe("headroom setup --yes", () => {
   it("never asks about Keychain access, and never prints a grant command, for a principal an older build would have sent to one", async () => {
     const fakeHome = await mkdtemp(join(tmpdir(), "headroom-setup-userhome-"));
@@ -119,14 +137,17 @@ describe("headroom setup --yes", () => {
     // own ~/.claude login.
     await mkdir(join(fakeHome, ".claude-setup-test"), { recursive: true });
     const claudeOnPath = vi.fn(async () => false);
+    // The real final check runs doctor and observe, whose native probe reads /usr/bin/security by absolute path.
+    const finalCheck = vi.fn(async () => undefined);
     let code = -1;
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { claudeOnPath }));
+      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { claudeOnPath, finalCheck }));
       code = captured.result;
       logs = captured.logs;
     });
     expect(code).toBe(0);
+    expect(finalCheck).toHaveBeenCalledTimes(1);
     const output = logs.join("\n");
     expect(output).not.toContain("headroom keychain grant");
     expect(output).not.toContain("Keychain access granted");
@@ -155,7 +176,7 @@ describe("headroom setup --skip-service --skip-mcp", () => {
     // skipped -- distinct from --dry-run, which still describes them.
     expect(output).not.toContain("com.headroom.daemon.plist");
     expect(output).not.toContain("would offer to run this now");
-    expect(output).not.toContain("claude mcp add headroom -- headroom mcp");
+    expect(output).not.toContain("claude mcp add --scope user headroom -- headroom mcp");
     expect(await fileExists(join(headroomHome, "Library", "LaunchAgents", "com.headroom.daemon.plist"))).toBe(false);
   });
 });

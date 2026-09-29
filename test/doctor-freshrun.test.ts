@@ -26,7 +26,7 @@ describe("nextSteps", () => {
     // macOS included: the probe reads the Claude credential through the Apple
     // security tool the Keychain item already admits, so a first run has
     // nothing to grant.
-    const steps = ["headroom install-service", "claude mcp add headroom -- npx headroomd mcp"];
+    const steps = ["headroom install-service", "claude mcp add --scope user headroom -- headroom mcp"];
     expect(nextSteps("darwin")).toEqual(steps);
     expect(nextSteps("linux")).toEqual(steps);
     expect(nextSteps("win32")).toEqual(steps);
@@ -61,7 +61,7 @@ describe("doctor first-run mode", () => {
     } finally { spy.mockRestore(); }
     expect(lines).toContain("Next steps:");
     expect(lines.some((line) => line.includes("headroom install-service"))).toBe(true);
-    expect(lines.some((line) => line.includes("claude mcp add headroom"))).toBe(true);
+    expect(lines.some((line) => line.includes("claude mcp add --scope user headroom"))).toBe(true);
 
     const seasoned = await mkdtemp(join(tmpdir(), "headroom-doctor-noprint-")); temporary.push(seasoned);
     const home = join(seasoned, ".headroom");
