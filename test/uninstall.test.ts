@@ -396,6 +396,24 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     expect(logs.join("\n")).toContain("env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user headroom");
   });
 
+  it("prints a PowerShell retry command on win32 and keeps env -u on POSIX", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
+    const run = async (platform: NodeJS.Platform) => {
+      let logs: string[] = [];
+      await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+        logs = (await captureLog(() => runUninstall(["--dry-run"], { ...noOverrides, platform }))).logs;
+      });
+      return logs.join("\n");
+    };
+    const win = await run("win32");
+    expect(win).toContain("Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue; claude mcp remove --scope user headroom");
+    expect(win).not.toContain("env -u");
+    const posix = await run("linux");
+    expect(posix).toContain("env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user headroom");
+    expect(posix).not.toContain("Remove-Item");
+  });
+
   it("quotes the directory in the printed mkdir command for a path with a space", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const gone = join(fakeHome, "deleted worktree");

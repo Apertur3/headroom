@@ -86,10 +86,10 @@ async function serviceManagerHasService(platform: NodeJS.Platform, uid: number, 
   const ok = async (command: string, args: string[]) => (await runner(command, args)).code === 0;
   if (platform === "darwin") return ok("launchctl", ["print", `gui/${uid}/${SERVICE_LABEL}`]);
   if (platform === "win32") {
-    // /Query succeeds for a disabled or idle task too, so read its state; output that does not parse (a localized Windows) fails closed.
-    const { code, output } = await runner("schtasks", ["/Query", "/TN", WINDOWS_TASK, "/FO", "LIST", "/V"]);
-    const field = (name: string) => new RegExp(`^\\s*${name}:\\s*(.+?)\\s*$`, "im").exec(output)?.[1];
-    return code === 0 && field("Status")?.toLowerCase() === "running" && field("Scheduled Task State")?.toLowerCase() === "enabled";
+    // Get-ScheduledTask's State is an enum name (Running, Ready, Disabled, Queued, Unknown) whatever the Windows language, unlike schtasks' localized text.
+    // Only Running counts as running and enabled; Ready (enabled, idle), Disabled, anything else, or a failed query fails closed.
+    const { code, output } = await runner("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-ScheduledTask -TaskName '${WINDOWS_TASK}').State`]);
+    return code === 0 && output.trim().toLowerCase() === "running";
   }
   return (await ok("systemctl", ["--user", "is-active", "headroom.service"])) && (await ok("systemctl", ["--user", "is-enabled", "headroom.service"]));
 }

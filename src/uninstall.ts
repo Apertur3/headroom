@@ -24,6 +24,8 @@ export interface UninstallOverrides {
   runClaudeMcpRemove?: (env: NodeJS.ProcessEnv, scope: "user" | "local", cwd?: string) => Promise<number>;
   /** Runs the platform's own stop/unload command for the installed service; overridden in tests so launchd, systemd and Task Scheduler are never touched. */
   runServiceStop?: (command: string) => Promise<number>;
+  /** The platform whose shell the printed retry commands are written for; overridden in tests. */
+  platform?: NodeJS.Platform;
 }
 
 interface UninstallOptions {
@@ -77,8 +79,14 @@ async function defaultRunServiceStop(command: string): Promise<number> {
 
 function shellQuote(value: string): string { return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`; }
 
-function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "local", cwd?: string): string {
+function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "local", cwd?: string, platform: NodeJS.Platform = process.platform): string {
   const command = `claude mcp remove --scope ${scope} headroom`;
+  if (platform === "win32") {
+    // PowerShell: `env -u` and `(cd .. && ..)` do not exist there. The default profile must not inherit a CLAUDE_CONFIG_DIR either.
+    const psQuote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    const profile = env.CLAUDE_CONFIG_DIR ? `$env:CLAUDE_CONFIG_DIR = ${psQuote(env.CLAUDE_CONFIG_DIR)}` : "Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue";
+    return `${cwd ? `Set-Location ${psQuote(cwd)}; ` : ""}${profile}; ${command}`;
+  }
   // The default profile must not inherit a CLAUDE_CONFIG_DIR from the shell the user pastes this into.
   const withProfile = env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${shellQuote(env.CLAUDE_CONFIG_DIR)} ${command}` : `env -u CLAUDE_CONFIG_DIR ${command}`;
   return cwd ? `(cd ${shellQuote(cwd)} && ${withProfile})` : withProfile;
@@ -152,7 +160,7 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
   let failed = false;
   for (const { account, scope, cwd } of registered) {
     const { env, profile } = removalEnvironment(account);
-    const display = claudeDisplayCommand(profile, scope, cwd);
+    const display = claudeDisplayCommand(profile, scope, cwd, overrides.platform);
     const label = cwd ? `${account.name} (${scope} scope, ${cwd})` : `${account.name} (${scope} scope)`;
     if (cwd && !(await directoryExists(cwd))) {
       // Claude Code looks a local entry up under the directory it runs in, so it cannot be removed without that directory.

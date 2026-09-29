@@ -144,9 +144,7 @@ describe("install-service loads and starts the service", () => {
     expect(steps[1]).toMatchObject({ optional: true, confirmStopped: true });
   });
 
-  const winQuery = (status: string, state: string) => `Folder: \\\nTaskName: \\Headroom Daemon\nStatus:                               ${status}\nScheduled Task State:                 ${state}\n`;
-
-  async function windowsReplace(query: string, endCode: number, endOutput: string, probe: () => Promise<boolean>, unchanged = true) {
+  async function windowsReplace(state: string, endCode: number, endOutput: string, probe: () => Promise<boolean>, unchanged = true) {
     const { home, env } = await fakeHome();
     const path = servicePath("win32", home, env); temporary.push(path); // win32 paths are backslash-joined, so on posix this is a stray file in the cwd
     await mkdir(dirname(path), { recursive: true });
@@ -154,7 +152,8 @@ describe("install-service loads and starts the service", () => {
     const calls: string[] = [];
     const runner: ServiceRunner = async (command, args) => {
       const line = [command, ...args].join(" "); calls.push(line);
-      if (args[0] === "/Query") return { code: 0, output: query };
+      if (command === "powershell") return { code: 0, output: `${state}\r\n` };
+      if (args[0] === "/Query") return { code: 0, output: "Status: Wird ausgeführt\nStatus des geplanten Tasks: Aktiviert" }; // German schtasks text, never parsed
       if (args[0] === "/End") return { code: endCode, output: endOutput };
       return { code: 0, output: "" };
     };
@@ -162,22 +161,23 @@ describe("install-service loads and starts the service", () => {
     return { result, calls };
   }
 
-  it("win32: a disabled or idle task is not 'already running' even though /Query succeeds and a daemon answers", async () => {
-    for (const query of [winQuery("Running", "Disabled"), winQuery("Ready", "Enabled"), "GARBAGE localized output"]) {
-      const { result, calls } = await windowsReplace(query, 0, "", async () => true);
+  it("win32: a disabled, idle, queued or unknown task is not 'already running' even though a daemon answers", async () => {
+    for (const state of ["Disabled", "Ready", "Queued", "Unknown", "GARBAGE"]) {
+      const { result, calls } = await windowsReplace(state, 0, "", async () => true);
       expect(result.state).not.toBe("already-running");
       expect(calls.some((call) => call.startsWith("schtasks /Create"))).toBe(true);
     }
   });
 
-  it("win32: an enabled, running task with an answering daemon is already running", async () => {
-    const { result, calls } = await windowsReplace(winQuery("Running", "Enabled"), 0, "", async () => true);
+  it("win32: a Running task with an answering daemon is already running, whatever language schtasks speaks", async () => {
+    const { result, calls } = await windowsReplace("Running", 0, "", async () => true);
     expect(result.state).toBe("already-running");
-    expect(calls).toEqual(["schtasks /Query /TN Headroom Daemon /FO LIST /V"]);
+    expect(calls).toEqual(["powershell -NoProfile -NonInteractive -Command (Get-ScheduledTask -TaskName 'Headroom Daemon').State"]);
+    expect(calls.some((call) => call.startsWith("schtasks"))).toBe(false);
   });
 
   it("win32: a failed /End other than 'not running' reports not-loaded and never runs the task", async () => {
-    const { result, calls } = await windowsReplace(winQuery("Ready", "Disabled"), 1, "ERROR: Access is denied.", async () => false);
+    const { result, calls } = await windowsReplace("Ready", 1, "ERROR: Access is denied.", async () => false);
     expect(result.state).toBe("not-loaded");
     expect(result.reason).toContain("Access is denied");
     expect(calls.some((call) => call.startsWith("schtasks /Run"))).toBe(false);
@@ -186,7 +186,7 @@ describe("install-service loads and starts the service", () => {
   it("win32: one failed health probe is not enough to call the old daemon stopped", async () => {
     const answers = [false, true, true, true, true, true, true, true, true, true, true, true];
     const probe = vi.fn(async () => answers.shift() ?? true);
-    const { result, calls } = await windowsReplace(winQuery("Ready", "Disabled"), 0, "", probe, false);
+    const { result, calls } = await windowsReplace("Ready", 0, "", probe, false);
     expect(result.state).toBe("not-loaded");
     expect(result.reason).toContain("did not stop the old daemon");
     expect(calls.some((call) => call.startsWith("schtasks /Run"))).toBe(false);
