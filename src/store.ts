@@ -8,7 +8,7 @@ import { decodeResetSeen, encodeResetSeen } from "./resets.js";
 import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
-import { defaultPolicy, paceDecision } from "./policy.js";
+import { defaultPolicy, isAcceptedLaneReading, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
@@ -206,6 +206,25 @@ async function legacyDatabasePath(directory: string): Promise<string | undefined
 
 function json(value: unknown): string | null { return value === undefined ? null : JSON.stringify(value); }
 function parseJson<T>(value: unknown, fallback: T): T { try { return typeof value === "string" ? JSON.parse(value) as T : fallback; } catch { return fallback; } }
+
+/** One meter lane as the stale-lane canary sees it. `meter_ids` lists every
+ * stored spelling that folds into the canonical `meter_id`. */
+export interface LaneRecord {
+  principal_id: string;
+  meter_id: string;
+  /** 0 for a meter that has only ever failed without a window. */
+  window_minutes: number;
+  last_accepted_at: string | null;
+  first_attempt_at: string;
+  meter_ids: string[];
+}
+
+/** Folds the legacy `<principal>:<principal>:<meter>` id an earlier engine
+ * emitted into the canonical `<principal>:<meter>`. */
+export function canonicalMeterId(principal: string, meterId: string): string {
+  const doubled = `${principal}:${principal}:`;
+  return meterId.startsWith(doubled) ? meterId.slice(principal.length + 1) : meterId;
+}
 
 export function canonicalWindow(window: Observation["window"] | undefined | null): Observation["window"] | null {
   if (!window) return null;
@@ -1734,28 +1753,89 @@ export class HeadroomStore {
   }
 
   /**
-   * Every windowed meter lane that has ever had an accepted reading, with the
-   * time of its newest fresh or not_enforced one. Manual and pasted rows are
-   * operator facts, not a lane the vendor is expected to keep answering, and a
-   * synthetic exhausted report is not a reading. A lane retired after its last
-   * accepted reading is no longer expected. Feeds the stale-lane canary.
+   * Every meter lane the store has ever attempted for a principal, with the
+   * newest accepted reading (null when it never had one) and its first
+   * recorded attempt. "Accepted" is exactly `isAcceptedLaneReading`, the same
+   * predicate status uses: held vendor readings, exhausted synthetics and
+   * unusable shapes do not count. Manual and pasted rows are operator facts,
+   * not a lane the vendor is expected to keep answering. Legacy
+   * `<principal>:<principal>:<meter>` ids fold into the canonical lane. A
+   * windowless failure only forms its own lane (window_minutes 0) when the
+   * meter has no windowed lane. A lane retired after its last accepted
+   * reading (or after its first attempt, if it never had one) is dropped.
+   * Feeds the stale-lane canary.
+   *
+   * Cost: one grouped scan of observations without JSON functions, plus one
+   * indexed (meter_id, fetched_at) walk per lane that stops at its first
+   * accepted row.
    */
-  laneLastAccepted(): Array<{ principal_id: string; meter_id: string; window_minutes: number; last_accepted_at: string }> {
-    const lanes = this.prepared(`SELECT principal_id, meter_id, CAST(json_extract(window_json, '$.minutes') AS INTEGER) AS window_minutes, MAX(fetched_at) AS last_accepted_at
-      FROM observations
-      WHERE freshness IN ('fresh', 'not_enforced') AND source NOT IN ('manual', 'paste')
-        AND json_extract(window_json, '$.minutes') IS NOT NULL
-        AND COALESCE(json_extract(metadata_json, '$.exhausted'), 0) = 0
-      GROUP BY principal_id, meter_id, window_minutes`).all() as Array<{ principal_id: string; meter_id: string; window_minutes: number; last_accepted_at: string }>;
-    const retired = new Map((this.prepared(`SELECT meter_id, CAST(json_extract(window_json, '$.minutes') AS INTEGER) AS window_minutes, MAX(fetched_at) AS at
-      FROM observations WHERE json_extract(metadata_json, '$.retired') = 1 AND json_extract(window_json, '$.minutes') IS NOT NULL
-      GROUP BY meter_id, window_minutes`).all() as Array<{ meter_id: string; window_minutes: number; at: string }>).map((row) => [`${row.meter_id}|${row.window_minutes}`, row.at]));
-    return lanes.filter((lane) => { const at = retired.get(`${lane.meter_id}|${lane.window_minutes}`); return at === undefined || at < lane.last_accepted_at; });
+  laneLastAccepted(): LaneRecord[] {
+    const groups = this.prepared(`SELECT principal_id, meter_id, window_json, MIN(fetched_at) AS first_at
+      FROM observations WHERE source NOT IN ('manual', 'paste')
+      GROUP BY principal_id, meter_id, window_json`).all() as Array<{ principal_id: string; meter_id: string; window_json: string | null; first_at: string }>;
+    const lanes = new Map<string, LaneRecord & { windowless: boolean }>();
+    for (const group of groups) {
+      let minutes: number | null = null;
+      if (group.window_json) { try { const parsed = Number((JSON.parse(group.window_json) as { minutes?: unknown }).minutes); if (Number.isFinite(parsed) && parsed > 0) minutes = Math.trunc(parsed); } catch { /* unreadable window: treat as windowless */ } }
+      const meter = canonicalMeterId(group.principal_id, group.meter_id);
+      const key = `${meter}|${minutes ?? 0}`;
+      const lane = lanes.get(key);
+      if (lane) {
+        if (!lane.meter_ids.includes(group.meter_id)) lane.meter_ids.push(group.meter_id);
+        if (group.first_at < lane.first_attempt_at) lane.first_attempt_at = group.first_at;
+      } else lanes.set(key, { principal_id: group.principal_id, meter_id: meter, window_minutes: minutes ?? 0, last_accepted_at: null, first_attempt_at: group.first_at, meter_ids: [group.meter_id], windowless: minutes === null });
+    }
+    const windowedMeters = new Set([...lanes.values()].filter((lane) => !lane.windowless).map((lane) => lane.meter_id));
+    const retired = new Map<string, string>();
+    for (const row of this.prepared(`SELECT principal_id, meter_id, CAST(json_extract(window_json, '$.minutes') AS INTEGER) AS window_minutes, MAX(fetched_at) AS at
+      FROM observations WHERE metadata_json LIKE '%retired%' AND json_extract(metadata_json, '$.retired') = 1 AND json_extract(window_json, '$.minutes') IS NOT NULL
+      GROUP BY principal_id, meter_id, window_minutes`).all() as Array<{ principal_id: string; meter_id: string; window_minutes: number; at: string }>) {
+      const key = `${canonicalMeterId(row.principal_id, row.meter_id)}|${row.window_minutes}`;
+      if (!retired.has(key) || retired.get(key)! < row.at) retired.set(key, row.at);
+    }
+    const result: LaneRecord[] = [];
+    for (const [key, lane] of lanes) {
+      if (lane.windowless && windowedMeters.has(lane.meter_id)) continue;
+      const { windowless: _windowless, ...record } = lane;
+      record.last_accepted_at = this.newestAcceptedAt(record);
+      const retiredAt = retired.get(key);
+      if (retiredAt !== undefined && retiredAt >= (record.last_accepted_at ?? record.first_attempt_at)) continue;
+      result.push(record);
+    }
+    return result;
   }
 
-  /** The reason on the newest failed poll of this meter after `since`, if any. */
-  laneLastFailureReason(meterId: string, since: string): string | undefined {
-    const row = this.prepared("SELECT reason FROM observations WHERE meter_id = ? AND freshness = 'failed' AND fetched_at > ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId, since) as { reason?: string | null } | undefined;
+  /** Walks the lane's windowed fresh/not_enforced rows newest first and
+   * returns the first one status would accept. Stops at that row, so a
+   * healthy lane costs one indexed page. */
+  private newestAcceptedAt(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">): string | null {
+    if (lane.window_minutes <= 0) return null;
+    const placeholders = lane.meter_ids.map(() => "?").join(",");
+    const statement = this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND freshness IN ('fresh', 'not_enforced') AND source NOT IN ('manual', 'paste')
+      AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ? AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
+      ORDER BY fetched_at DESC, id DESC LIMIT 50`);
+    let cursorAt = "￿"; let cursorId = Number.MAX_SAFE_INTEGER;
+    for (;;) {
+      const rows = statement.all(...lane.meter_ids, lane.window_minutes, cursorAt, cursorAt, cursorId) as Row[];
+      for (const row of rows) { const observation = observationFromRow(row); if (isAcceptedLaneReading(observation)) return observation.fetched_at; }
+      if (rows.length < 50) return null;
+      const last = rows[rows.length - 1]; cursorAt = String(last.fetched_at); cursorId = Number(last.id);
+    }
+  }
+
+  /** Every reading of one lane at or after `since`, newest first: the lane's
+   * own windowed rows plus its meter's windowless failures, which speak for
+   * the whole meter. Indexed by (meter_id, fetched_at). */
+  laneReadingsSince(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">, since: string): Observation[] {
+    const placeholders = lane.meter_ids.map(() => "?").join(",");
+    return (this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND fetched_at >= ? AND source NOT IN ('manual', 'paste')
+      AND (window_json IS NULL OR CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?) ORDER BY fetched_at DESC, id DESC`).all(...lane.meter_ids, since, lane.window_minutes) as Row[]).map(observationFromRow);
+  }
+
+  /** The reason on the newest failed poll of this lane's meter after `since`, if any. */
+  laneLastFailureReason(meterIds: string | string[], since: string): string | undefined {
+    const ids = Array.isArray(meterIds) ? meterIds : [meterIds];
+    const row = this.prepared(`SELECT reason FROM observations WHERE meter_id IN (${ids.map(() => "?").join(",")}) AND freshness = 'failed' AND fetched_at > ? ORDER BY fetched_at DESC, id DESC LIMIT 1`).get(...ids, since) as { reason?: string | null } | undefined;
     return row?.reason ?? undefined;
   }
 

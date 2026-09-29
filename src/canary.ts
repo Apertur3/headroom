@@ -13,10 +13,12 @@
  * same lanes on demand from the store, so no configuration can hide one.
  */
 import { readdir } from "node:fs/promises";
+import { join } from "node:path";
+import { isAcceptedLaneReading } from "./policy.js";
 import { formatResetsIn } from "./resets.js";
 import { inboxRoot, sendInboxMessage, SESSION_ID_PATTERN } from "./inbox.js";
 import { isAccountEnabled, isLocalAccount, type Account } from "./types.js";
-import type { HeadroomStore } from "./store.js";
+import type { HeadroomStore, LaneRecord } from "./store.js";
 
 export const CANARY_INBOX_SESSION = "headroom-canary";
 /** Minimum spacing between two alerts for one lane, across recoveries too. */
@@ -26,7 +28,11 @@ export const CANARY_RECOVERY_HOLD_MS = 30 * 60_000;
 /** Recovery needs a reading at most this fraction of the threshold old, so a
  * lane hovering around the threshold cannot flap between the two states. */
 const RECOVERY_AGE_FRACTION = 0.25;
-const MAX_INBOX_TARGETS = 50;
+/** Fan-out past this many sessions is logged, never truncated. */
+const INBOX_TARGET_LOG_THRESHOLD = 50;
+/** A session directory with a message newer than this still counts as active. */
+const INBOX_ACTIVE_MS = 24 * 3_600_000;
+const PRINCIPAL_SEEN_PREFIX = "canary:principal_seen:";
 
 export interface StaleLane {
   principal: string;
@@ -34,7 +40,10 @@ export interface StaleLane {
   window_minutes: number;
   /** "5h", "weekly", "90m" ... */
   label: string;
-  last_accepted_at: string;
+  /** Null when the lane has never had an accepted reading. */
+  last_accepted_at: string | null;
+  /** What the age counts from: the last accepted reading, else the first recorded attempt, else when the principal was first seen. */
+  since: string;
   age_seconds: number;
   last_error: string | null;
 }
@@ -49,6 +58,7 @@ export interface CanaryItem {
 }
 
 export function laneLabel(minutes: number): string {
+  if (minutes <= 0) return "any window";
   if (minutes === 10_080) return "weekly";
   if (minutes % 1440 === 0) return `${minutes / 1440}d`;
   if (minutes % 60 === 0) return `${minutes / 60}h`;
@@ -61,26 +71,48 @@ function expectedPrincipals(accounts: Account[]): Set<string> {
   return new Set(accounts.filter((account) => isAccountEnabled(account) && !isLocalAccount(account)).map((account) => account.name));
 }
 
-/** Pure read: every expected lane past the threshold right now. */
-export function findStaleLanes(store: HeadroomStore, accounts: Account[], staleAfterHours: number, now: Date): StaleLane[] {
+/**
+ * The lanes a healthy daemon owes readings for: every lane the store has an
+ * attempt for (accepted or not) on an enabled principal, plus a placeholder
+ * lane for an enabled principal the canary has seen but that has no recorded
+ * attempt at all. Pure read.
+ */
+export function expectedLanes(store: HeadroomStore, accounts: Account[]): LaneRecord[] {
   const principals = expectedPrincipals(accounts);
+  const lanes = store.laneLastAccepted().filter((lane) => principals.has(lane.principal_id));
+  const withLanes = new Set(lanes.map((lane) => lane.principal_id));
+  for (const principal of principals) {
+    if (withLanes.has(principal)) continue;
+    const seen = store.daemonState(`${PRINCIPAL_SEEN_PREFIX}${principal}`);
+    if (seen && Number.isFinite(Date.parse(seen))) lanes.push({ principal_id: principal, meter_id: principal, window_minutes: 0, last_accepted_at: null, first_attempt_at: seen, meter_ids: [principal] });
+  }
+  return lanes;
+}
+
+function staleFrom(store: HeadroomStore, lanes: LaneRecord[], staleAfterHours: number, now: Date): StaleLane[] {
   const limitMs = staleAfterHours * 3_600_000;
   const stale: StaleLane[] = [];
-  for (const lane of store.laneLastAccepted()) {
-    if (!principals.has(lane.principal_id)) continue;
-    const ageMs = now.getTime() - Date.parse(lane.last_accepted_at);
+  for (const lane of lanes) {
+    const since = lane.last_accepted_at ?? lane.first_attempt_at;
+    const ageMs = now.getTime() - Date.parse(since);
     if (!Number.isFinite(ageMs) || ageMs <= limitMs) continue;
     stale.push({
       principal: lane.principal_id, meter: lane.meter_id, window_minutes: lane.window_minutes, label: laneLabel(lane.window_minutes),
-      last_accepted_at: lane.last_accepted_at, age_seconds: Math.floor(ageMs / 1000),
-      last_error: store.laneLastFailureReason(lane.meter_id, lane.last_accepted_at) ?? null,
+      last_accepted_at: lane.last_accepted_at, since, age_seconds: Math.floor(ageMs / 1000),
+      last_error: store.laneLastFailureReason(lane.meter_ids, since) ?? null,
     });
   }
   return stale.sort((a, b) => b.age_seconds - a.age_seconds || a.meter.localeCompare(b.meter));
 }
 
+/** Pure read: every expected lane past the threshold right now. */
+export function findStaleLanes(store: HeadroomStore, accounts: Account[], staleAfterHours: number, now: Date): StaleLane[] {
+  return staleFrom(store, expectedLanes(store, accounts), staleAfterHours, now);
+}
+
 export function staleLaneText(lane: StaleLane): string {
-  return `STALE LANE ${lane.meter} ${lane.label}: no fresh reading for ${laneAgeText(lane.age_seconds)} (last ${lane.last_accepted_at}). Last error: ${lane.last_error ?? "none recorded"}. Run: headroom doctor`;
+  const last = lane.last_accepted_at ? `last ${lane.last_accepted_at}` : `never accepted, first seen ${lane.since}`;
+  return `STALE LANE ${lane.meter} ${lane.label}: no fresh reading for ${laneAgeText(lane.age_seconds)} (${last}). Last error: ${lane.last_error ?? "none recorded"}. Run: headroom doctor`;
 }
 
 interface LaneState {
@@ -100,23 +132,44 @@ function readState(store: HeadroomStore, key: string): LaneState {
   return { state: "ok" };
 }
 
-async function inboxTargets(home: string): Promise<string[]> {
+/** Whether a session inbox directory holds a message newer than the active
+ * window. Message names are `<epoch>-<kind>.json[.read]`, so this follows the
+ * injected clock rather than file mtimes. */
+async function inboxRecentlyActive(directory: string, now: Date): Promise<boolean> {
+  try {
+    for (const file of await readdir(directory)) {
+      const epoch = Number(/^(\d+)-/.exec(file)?.[1]);
+      if (Number.isFinite(epoch) && now.getTime() - epoch <= INBOX_ACTIVE_MS) return true;
+    }
+  } catch { /* unreadable directory: not active */ }
+  return false;
+}
+
+/** Always the canary session, plus every session that is actually in use: a
+ * live (not lapsed) heartbeat, or inbox traffic in the last 24 hours. The set
+ * is never truncated; a large set or skipped idle inboxes are logged. */
+async function inboxTargets(home: string, store: HeadroomStore, now: Date, log?: (message: string) => Promise<void>): Promise<string[]> {
   const targets = new Set([CANARY_INBOX_SESSION]);
+  for (const heartbeat of store.heartbeats()) if (!heartbeat.lapsed_since && SESSION_ID_PATTERN.test(heartbeat.owner)) targets.add(heartbeat.owner);
+  let skipped = 0;
   try {
     for (const entry of await readdir(inboxRoot(home), { withFileTypes: true })) {
-      if (targets.size >= MAX_INBOX_TARGETS) break;
-      if (entry.isDirectory() && SESSION_ID_PATTERN.test(entry.name) && entry.name !== "." && entry.name !== "..") targets.add(entry.name);
+      if (!entry.isDirectory() || !SESSION_ID_PATTERN.test(entry.name) || entry.name === "." || entry.name === ".." || targets.has(entry.name)) continue;
+      if (await inboxRecentlyActive(join(inboxRoot(home), entry.name), now)) targets.add(entry.name); else skipped += 1;
     }
   } catch { /* no inbox root yet */ }
+  if (log && (targets.size > INBOX_TARGET_LOG_THRESHOLD || skipped > 0)) {
+    await log(`stale-lane canary: inbox fan-out to ${targets.size} session(s)${targets.size > INBOX_TARGET_LOG_THRESHOLD ? ` (over ${INBOX_TARGET_LOG_THRESHOLD}; none dropped)` : ""}, ${skipped} idle inbox(es) skipped`).catch(() => undefined);
+  }
   return [...targets];
 }
 
-/** Writes the alert to the canary session (must succeed) and to every session
- * that already has an inbox (best effort), so whichever session an
- * orchestrator reads with `headroom inbox` / `quota_inbox` carries it. */
-async function writeInbox(home: string, item: CanaryItem, lane: { window_minutes: number; label: string }, now: Date, extra: Record<string, unknown>): Promise<void> {
+/** Writes the alert to the canary session (must succeed) and to every active
+ * session (best effort), so whichever session an orchestrator reads with
+ * `headroom inbox` / `quota_inbox` carries it. */
+async function writeInbox(store: HeadroomStore, home: string, item: CanaryItem, lane: { window_minutes: number; label: string }, now: Date, extra: Record<string, unknown>, log?: (message: string) => Promise<void>): Promise<void> {
   const body = JSON.stringify({ event: item.kind, meter: item.meter, principal: item.principal, window_minutes: lane.window_minutes, lane: lane.label, message: item.text, ...extra });
-  for (const session of await inboxTargets(home)) {
+  for (const session of await inboxTargets(home, store, now, log)) {
     try { await sendInboxMessage({ to: session, kind: "note", text: body, from: CANARY_INBOX_SESSION, home, now }); }
     catch (error: unknown) { if (session === CANARY_INBOX_SESSION) throw error; }
   }
@@ -129,6 +182,7 @@ export interface CanaryOptions {
   staleAfterHours: number;
   /** Minimum spacing between evaluations; the daemon calls this every pass. */
   minIntervalMs?: number;
+  log?: (message: string) => Promise<void>;
 }
 
 /**
@@ -145,9 +199,14 @@ export async function runLaneCanary(store: HeadroomStore, options: CanaryOptions
   if (Number.isFinite(previous) && now.getTime() >= previous && now.getTime() - previous < minInterval) return [];
   store.setDaemonState(evaluatedKey, now.toISOString());
 
-  const principals = expectedPrincipals(options.accounts);
-  const stale = new Map(findStaleLanes(store, options.accounts, staleAfterHours, now).map((lane) => [`${lane.meter}|${lane.window_minutes}`, lane]));
-  const known = store.laneLastAccepted().filter((lane) => principals.has(lane.principal_id));
+  // First sight of a principal anchors the age of a lane that has no attempt
+  // at all yet, so a freshly added principal gets the full threshold first.
+  for (const principal of expectedPrincipals(options.accounts)) {
+    const seenKey = `${PRINCIPAL_SEEN_PREFIX}${principal}`;
+    if (!store.daemonState(seenKey)) store.setDaemonState(seenKey, now.toISOString());
+  }
+  const known = expectedLanes(store, options.accounts);
+  const stale = new Map(staleFrom(store, known, staleAfterHours, now).map((lane) => [`${lane.meter}|${lane.window_minutes}`, lane]));
   const items: CanaryItem[] = [];
   const iso = now.toISOString();
 
@@ -163,7 +222,7 @@ export async function runLaneCanary(store: HeadroomStore, options: CanaryOptions
       if (due) {
         const item: CanaryItem = { id: `lane_stale:${key}:${iso}`, kind: "lane_stale", meter: lane.meter_id, principal: lane.principal_id, at: iso, text: staleLaneText(staleLane) };
         try {
-          await writeInbox(home, item, { window_minutes: lane.window_minutes, label }, now, { age_seconds: staleLane.age_seconds, last_accepted_at: staleLane.last_accepted_at, last_error: staleLane.last_error });
+          await writeInbox(store, home, item, { window_minutes: lane.window_minutes, label }, now, { age_seconds: staleLane.age_seconds, last_accepted_at: staleLane.last_accepted_at, since: staleLane.since, last_error: staleLane.last_error }, options.log);
           next.last_alert_at = iso; next.alerted = true;
           items.push(item);
         } catch { /* state still advances; the alert is retried on the next pass */ }
@@ -172,13 +231,21 @@ export async function runLaneCanary(store: HeadroomStore, options: CanaryOptions
       continue;
     }
     if (state.state !== "stale") continue;
+    const clear = (recoveringSince?: string): void => store.setDaemonState(stateKey, JSON.stringify({ ...state, recovering_since: recoveringSince }));
+    if (!lane.last_accepted_at) { clear(); continue; }
     const ageMs = now.getTime() - Date.parse(lane.last_accepted_at);
-    if (ageMs > staleAfterHours * 3_600_000 * RECOVERY_AGE_FRACTION) { store.setDaemonState(stateKey, JSON.stringify({ ...state, recovering_since: undefined })); continue; }
-    if (!state.recovering_since) { store.setDaemonState(stateKey, JSON.stringify({ ...state, recovering_since: iso })); continue; }
+    if (ageMs > staleAfterHours * 3_600_000 * RECOVERY_AGE_FRACTION) { clear(); continue; }
+    // Recovery is the lane's own readings, judged by the status predicate: the
+    // newest one must be accepted and so must every one inside the hold. Any
+    // failed or unaccepted reading restarts the hold.
+    const readings = store.laneReadingsSince(lane, state.recovering_since ?? lane.last_accepted_at);
+    if (!readings.length || !isAcceptedLaneReading(readings[0])) { clear(); continue; }
+    if (state.recovering_since && !readings.every(isAcceptedLaneReading)) { clear(iso); continue; }
+    if (!state.recovering_since) { clear(iso); continue; }
     if (now.getTime() - Date.parse(state.recovering_since) < CANARY_RECOVERY_HOLD_MS) continue;
     if (state.alerted) {
       const item: CanaryItem = { id: `lane_recovered:${key}:${iso}`, kind: "lane_recovered", meter: lane.meter_id, principal: lane.principal_id, at: iso, text: `LANE RECOVERED ${lane.meter_id} ${label}: fresh readings again (stale since ${state.stale_since ?? "unknown"}).` };
-      try { await writeInbox(home, item, { window_minutes: lane.window_minutes, label }, now, { stale_since: state.stale_since ?? null }); }
+      try { await writeInbox(store, home, item, { window_minutes: lane.window_minutes, label }, now, { stale_since: state.stale_since ?? null }, options.log); }
       catch { continue; }
       items.push(item);
     }

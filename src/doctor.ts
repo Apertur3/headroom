@@ -330,7 +330,7 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       try { hours = (await readPolicy()).canary_stale_after_hours; } catch { /* the policy check below reports the parse error */ }
       const now = new Date();
       for (const lane of findStaleLanes(store, accounts, hours, now)) {
-        output.push(check("FAIL", `lane ${lane.meter} ${lane.label}`, `no fresh reading for ${laneAgeText(lane.age_seconds)} (last ${lane.last_accepted_at}); last error: ${lane.last_error ?? "none recorded"}`, `headroom --refresh, then headroom logs --tail 50 (the stale-lane canary alerts every 24h until it recovers)`));
+        output.push(check("FAIL", `lane ${lane.meter} ${lane.label}`, `no fresh reading for ${laneAgeText(lane.age_seconds)} (${lane.last_accepted_at ? `last ${lane.last_accepted_at}` : `never accepted, first seen ${lane.since}`}); last error: ${lane.last_error ?? "none recorded"}`, `headroom --refresh, then headroom logs --tail 50 (the stale-lane canary alerts every 24h until it recovers)`));
       }
     }
     await doctorChecksTail(output, home, accounts, keepaliveEnabled);

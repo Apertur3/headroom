@@ -302,6 +302,20 @@ export function isHeldReading(observation: Observation): boolean {
   return Boolean(observation.metadata?.vendor_window_held || observation.metadata?.vendor_inconsistent);
 }
 
+/** True when status would count this stored windowed reading as a real answer
+ * from the vendor: fresh with a usable percent shape, or an explicit
+ * not_enforced, and neither held (isHeldReading) nor a synthetic exhausted
+ * report. Anything else renders UNKNOWN. Manual and pasted rows are operator
+ * facts, not vendor answers, and never count. The stale-lane canary shares
+ * this with status so the two cannot disagree. */
+export function isAcceptedLaneReading(observation: Observation): boolean {
+  if (observation.source === "manual" || observation.source === "paste") return false;
+  if (isHeldReading(observation) || observation.metadata?.exhausted || observation.metadata?.retired) return false;
+  if (observation.freshness === "not_enforced") return true;
+  if (observation.freshness !== "fresh") return false;
+  return Boolean(observation.quantity && observation.quantity.limit !== null && observation.window?.minutes);
+}
+
 /** Whole minutes since `fetchedAt`, clamped at 0; 0 when it cannot be
  * parsed at all, which only ever feeds held-window reason text below. */
 export function ageMinutesSince(fetchedAt: string, now: Date): number {

@@ -77,6 +77,7 @@ describe("stale-lane canary", () => {
   it("re-alerts after 24 hours while the lane stays stale, not before", async () => {
     const { store, home } = await setup();
     store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    seedHealthy(store, 0, 32);
     await deliverNotifications(store, options(home, at(7)));
     await deliverNotifications(store, options(home, at(20)));
     expect(await inbox(home)).toHaveLength(1);
@@ -204,5 +205,128 @@ describe("stale-lane canary", () => {
     expect(parsePolicy("").canary_stale_after_hours).toBe(6);
     expect(parsePolicy("[canary]\nstale_after_hours = 12\n").canary_stale_after_hours).toBe(12);
     expect(() => parsePolicy("[canary]\nstale_after_hours = 0\n")).toThrow();
+  });
+});
+
+describe("stale-lane canary review fixes", () => {
+  const events = async (home: string): Promise<string[]> => (await inbox(home)).map((message) => message.event);
+
+  it("alerts on a lane that never had an accepted reading, aged from its first attempt", async () => {
+    const { store, home } = await setup();
+    store.insert(failure("agy", "claude-gpt", at(1), "not logged in"));
+    store.insert(failure("agy", "claude-gpt", at(4), "not logged in"));
+    seedHealthy(store, 0, 9);
+    await deliverNotifications(store, options(home, at(6)));
+    expect(await events(home)).toEqual([]);
+    await deliverNotifications(store, options(home, at(8)));
+    const [alert] = (await readInbox({ session: "headroom-canary", home, markRead: false })).messages;
+    expect(alert.body).toMatchObject({ event: "lane_stale", meter: "agy:claude-gpt", last_accepted_at: null, since: at(1).toISOString(), last_error: "not logged in" });
+    expect(findStaleLanes(store, ACCOUNTS, 6, at(8))).toHaveLength(1);
+    store.close();
+  });
+
+  it("gives a principal with no attempts at all the full threshold from first sight, then alerts", async () => {
+    const { store, home } = await setup();
+    const accounts: Account[] = [...ACCOUNTS, { name: "kk", vendor: "kimi", location: "/tmp/kk", adapter: "native" }];
+    const opts = (now: Date): NotifyOptions => options(home, now, { canary: { accounts, staleAfterHours: 6, minIntervalMs: 0 } });
+    seedHealthy(store, 0, 9);
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    for (let hour = 1; hour <= 9; hour += 1) store.insert(lane("agy", "claude-gpt", 300, at(hour)));
+    await deliverNotifications(store, opts(at(0)));
+    await deliverNotifications(store, opts(at(5)));
+    expect(await events(home)).toEqual([]);
+    await deliverNotifications(store, opts(at(7)));
+    const [alert] = (await readInbox({ session: "headroom-canary", home, markRead: false })).messages;
+    expect(alert.body).toMatchObject({ event: "lane_stale", meter: "kk", principal: "kk", lane: "any window" });
+    store.close();
+  });
+
+  it("does not count held or inconsistent vendor readings as fresh", async () => {
+    const { store, home } = await setup();
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    for (let hour = 1; hour <= 8; hour += 1) store.insert(lane("agy", "claude-gpt", 300, at(hour), { metadata: hour % 2 ? { vendor_inconsistent: true } : { vendor_window_held: true } }));
+    seedHealthy(store, 0, 9);
+    await deliverNotifications(store, options(home, at(8)));
+    const [alert] = (await readInbox({ session: "headroom-canary", home, markRead: false })).messages;
+    expect(alert.body).toMatchObject({ event: "lane_stale", meter: "agy:claude-gpt", last_accepted_at: at(0).toISOString() });
+    store.close();
+  });
+
+  it("does not recover while the lane's newest reading is a failure", async () => {
+    const { store, home } = await setup();
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    seedHealthy(store, 0, 12);
+    await deliverNotifications(store, options(home, at(7)));
+    store.insert(lane("agy", "claude-gpt", 300, at(8)));
+    await deliverNotifications(store, options(home, at(8)));
+    store.insert(failure("agy", "claude-gpt", at(8.1), "engine down"));
+    await deliverNotifications(store, options(home, at(8.1)));
+    store.insert(failure("agy", "claude-gpt", at(8.6), "engine down"));
+    await deliverNotifications(store, options(home, at(8.6)));
+    expect(await events(home)).toEqual(["lane_stale"]);
+    store.close();
+  });
+
+  it("restarts the recovery hold when a failure landed between two passes", async () => {
+    const { store, home } = await setup();
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    seedHealthy(store, 0, 12);
+    await deliverNotifications(store, options(home, at(7)));
+    store.insert(lane("agy", "claude-gpt", 300, at(8)));
+    await deliverNotifications(store, options(home, at(8)));
+    store.insert(failure("agy", "claude-gpt", at(8.2), "blip"));
+    store.insert(lane("agy", "claude-gpt", 300, at(8.6)));
+    await deliverNotifications(store, options(home, at(8.6)));
+    expect(await events(home)).toEqual(["lane_stale"]);
+    store.insert(lane("agy", "claude-gpt", 300, at(9.2)));
+    await deliverNotifications(store, options(home, at(9.2)));
+    expect(await events(home)).toEqual(["lane_stale", "lane_recovered"]);
+    store.close();
+  });
+
+  it("treats a legacy doubled-principal meter id and its canonical form as one lane", async () => {
+    const { store, home } = await setup();
+    store.insert(lane("agy", "claude-gpt", 300, at(0), { meter_id: "agy:agy:claude-gpt" }));
+    for (let hour = 1; hour <= 30; hour += 1) store.insert(lane("agy", "claude-gpt", 300, at(hour)));
+    seedHealthy(store, 0, 30);
+    expect(store.laneLastAccepted().filter((item) => item.principal_id === "agy")).toHaveLength(1);
+    await deliverNotifications(store, options(home, at(30)));
+    expect(await events(home)).toEqual([]);
+    expect(findStaleLanes(store, ACCOUNTS, 6, at(30))).toEqual([]);
+    store.close();
+  });
+
+  async function staleAlertWithSessions(idle: string[], active: string[], heartbeat: string[]): Promise<{ home: string; logs: string[]; store: HeadroomStore }> {
+    const { store, home } = await setup();
+    const { sendInboxMessage } = await import("../src/inbox.js");
+    for (const session of idle) await sendInboxMessage({ to: session, kind: "note", text: "old", home, now: new Date(T0.getTime() - 3 * 24 * HOUR) });
+    for (const session of active) await sendInboxMessage({ to: session, kind: "note", text: "recent", home, now: at(6) });
+    for (const owner of heartbeat) store.heartbeatBeat(owner, 600_000, null, at(6));
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    seedHealthy(store, 0, 8);
+    const logs: string[] = [];
+    await deliverNotifications(store, options(home, at(7), { log: async (message) => { logs.push(message); } }));
+    return { home, logs, store };
+  }
+
+  const received = async (home: string, session: string): Promise<number> => (await readInbox({ session, home, markRead: false })).messages.filter((message) => (message.body as { event?: string }).event === "lane_stale").length;
+
+  it("writes to the canary and active sessions only, and logs the idle inboxes it skipped", async () => {
+    const idle = Array.from({ length: 60 }, (_, index) => `idle-${index}`);
+    const { home, logs, store } = await staleAlertWithSessions(idle, ["busy-1"], ["hb-1"]);
+    expect(await received(home, "headroom-canary")).toBe(1);
+    expect(await received(home, "busy-1")).toBe(1);
+    expect(await received(home, "hb-1")).toBe(1);
+    expect(await received(home, "idle-0")).toBe(0);
+    expect(logs.join("\n")).toMatch(/60 idle inbox\(es\) skipped/);
+    store.close();
+  });
+
+  it("never drops an active session when there are more than the log threshold", async () => {
+    const active = Array.from({ length: 55 }, (_, index) => `busy-${index}`);
+    const { home, logs, store } = await staleAlertWithSessions([], active, []);
+    for (const session of active) expect(await received(home, session)).toBe(1);
+    expect(logs.join("\n")).toMatch(/none dropped/);
+    store.close();
   });
 });

@@ -1010,7 +1010,7 @@ async function evaluateCanary(store: HeadroomStore, options: NotifyOptions, home
   try {
     const accounts = options.canary?.accounts ?? await readAccountsOrEmpty();
     const staleAfterHours = options.canary?.staleAfterHours ?? (await readPolicy().catch(() => undefined))?.canary_stale_after_hours ?? 6;
-    return await runLaneCanary(store, { home, now, accounts, staleAfterHours, minIntervalMs: options.canary?.minIntervalMs });
+    return await runLaneCanary(store, { home, now, accounts, staleAfterHours, minIntervalMs: options.canary?.minIntervalMs, log });
   } catch (error: unknown) {
     await log(`stale-lane canary failed: ${scrubSecrets(error, [])}`).catch(() => undefined);
     return [];
