@@ -11,7 +11,7 @@ import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
 import {
-  canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
+  blockedLaneReason, canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
   withOtherOwnerReservations, type CanDecision, type Policy, type ReserveEntry,
 } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
@@ -451,7 +451,13 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         const available = reported.map((item) => windowNeedLabel(item.window!.minutes!)).join(", ") || "none";
         return { allowed: false, reason: (need.window === "5h" || need.window === "wk") ? `${label} usage unknown` : `${label} usage unknown; vendor reports: ${available}`, meters_checked: checked, unknown: true };
       }
-      if (row.freshness === "not_enforced") { notEnforced.push(label); continue; }
+      if (row.freshness === "not_enforced") {
+        // A lane blocked by its exhausted weekly has nothing to spend: refuse
+        // it for this lane as a known "no", never as an unreadable window.
+        const blocked = blockedLaneReason(row);
+        if (blocked) return { allowed: false, reason: `${label} ${blocked} for ${id}`, meters_checked: checked };
+        notEnforced.push(label); continue;
+      }
       const freshness = freshnessGate(row, staleMinutes, now);
       if (!freshness.ok) return { allowed: false, reason: `${label} ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
       if (minutes === 300) fiveHourRow = row;

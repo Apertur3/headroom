@@ -68,7 +68,11 @@ needs the JSON meaning.
   response-time label does not rewrite history. `failed` is an errored,
   timed-out, or contradicted read. `not_enforced` means the vendor confirmed
   there is no cap at all on this window -- it never counts as UNKNOWN and
-  never blocks `can`/`gate`/`fill`.
+  never blocks `can`/`gate`/`fill`. One additive exception: a `not_enforced`
+  row with `metadata.lane_state: "blocked_by_weekly"` (an Antigravity 5h lane
+  whose weekly lane is exhausted) has no capacity, so `can`, `gate` and `plan`
+  refuse it for that lane (a plain refusal, never `unknown: true`); its
+  `reason` is `blocked: weekly exhausted until <reset>`.
 - **`truth`** -- `"official" | "estimated"`. `official` came straight from the
   vendor's own meter. `estimated` is Headroom's own inference (a local pool's
   session-log estimate, a vendor-reported idle window that might be a
@@ -174,6 +178,9 @@ credentials or prompt content). `metadata.vendor_inconsistent?: boolean` is
 then keeps showing the earlier window while Headroom waits for a second
 matching poll. `metadata.vendor_window_held?: boolean` marks that same
 frozen earlier reading while a new window identity awaits confirmation.
+`metadata.lane_state?: "blocked_by_weekly"` and `metadata.blocked_until?:
+string | null` (additive) mark an Antigravity lane that reports no usage
+because its weekly lane is exhausted; see `freshness` above.
 Either flag puts the pace state at UNKNOWN immediately -- at any age, not
 only once the reading has also aged past `staleness_minutes` -- everywhere a
 pace decision is made (`status`, `gate`, `fill`, `plan`, `route`, `can`, and

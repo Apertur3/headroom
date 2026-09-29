@@ -1385,7 +1385,8 @@ export class HeadroomDaemon {
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         if (disabled.has(principalId)) continue;
         this.antigravityLocal.set(principalId, read);
-        void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind})`, this.home);
+        const unsettled = Object.entries(read.lanes ?? {}).filter(([, state]) => state !== "fresh").map(([lane, state]) => `${lane} ${state}`);
+        void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind}${unsettled.length ? `; ${unsettled.join(", ")}` : ""})`, this.home);
       }
       if (this.schedulingStarted && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
         // maybeStartKeepalive() itself never rejects (see its own doc

@@ -8,12 +8,16 @@ import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statusline
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
 import { failedAntigravityObservations, noDaemonObservations } from "./adapters/antigravity.js";
+import {
+  antigravityLaneObservations, antigravityPayloadFromEngineRows, classifyAntigravityLanes, engineFreshRow, isSettledLane,
+  type AntigravityClassification, type AntigravityLaneState, type AntigravityPayloadKind, type EngineRead,
+} from "./antigravity-lanes.js";
 import { retiredGeminiObservations } from "./adapters/gemini.js";
 import { observeGrok } from "./adapters/grok.js";
 import { observeKimi } from "./adapters/kimi.js";
 import { observeLocal } from "./engine/local.js";
 import { readAccounts } from "./registry.js";
-import { safeError } from "./security.js";
+import { redact, safeError } from "./security.js";
 import { isAccountEnabled, isLocalAccount, type Observation, type ProviderAccount } from "./types.js";
 import type { AgyLoginState } from "./antigravity-keepalive.js";
 
@@ -56,8 +60,14 @@ export interface PollOptions {
 }
 
 export interface AntigravityLocalRead {
-  outcome: "fresh" | "failed" | "empty" | "error";
-  payload_kind: "quota_summary" | "placeholder" | "none" | "error";
+  /** `fresh`: every expected lane settled (fresh or blocked_by_weekly).
+   * `partial`: some lanes settled, others not. `failed`: none settled.
+   * `empty`: the engine returned no rows. `error`: the engine call threw. */
+  outcome: "fresh" | "partial" | "failed" | "empty" | "error";
+  /** What agy answered with (antigravity-lanes.ts), or `none` for no rows. */
+  payload_kind: AntigravityPayloadKind | "none";
+  /** Each expected lane's state, keyed "gemini 5h", "claude-gpt weekly", ... */
+  lanes?: Record<string, AntigravityLaneState>;
   at: string;
 }
 
@@ -103,36 +113,44 @@ export function withBackoffReasons<T extends Observation>(observations: T[], bac
   });
 }
 
-const ANTIGRAVITY_METERS = ["gemini", "claude-gpt"];
-const ANTIGRAVITY_WINDOWS = [300, 10_080];
+const LOCAL_ANTIGRAVITY_SOURCE = "local:antigravity:warm";
 
-function completeAntigravityRows(rows: Observation[], principal: string): boolean {
-  return selectAntigravitySource(rows, [], principal) === rows && rows.length > 0;
+interface ClassifiedLocalRead { rows: Observation[]; read: EngineRead; classification: AntigravityClassification }
+
+/** One principal's native-engine rows through the shared lane classifier
+ * (antigravity-lanes.ts): one row per expected lane, each in its own state,
+ * plus any per-model fallback rows the engine sent alongside. */
+function classifyLocalAntigravity(rows: Observation[], principal: string): ClassifiedLocalRead {
+  const read = antigravityPayloadFromEngineRows(rows, principal);
+  // The engine already redacts its error text; redact again at this boundary.
+  const payload = read.payload.kind === "error" ? { ...read.payload, error: redact(read.payload.error) } : read.payload;
+  return { rows: rows.filter((row) => row.principal_id === principal), read: { ...read, payload }, classification: classifyAntigravityLanes(payload) };
 }
 
-/** An incomplete warm read must not leave an omitted lane backed by cached
- * capacity. Keep any explicit whole-meter failure (which already covers all
- * lanes); otherwise add failed rows only for lanes the engine omitted. */
-function completeOrFailedAntigravityRows(account: ProviderAccount, rows: Observation[], now: string): Observation[] {
-  if (completeAntigravityRows(rows, account.name)
-    || rows.some((row) => row.freshness === "failed" && !row.window)) return rows;
-  const present = new Set(rows.filter((row) => row.window?.minutes !== undefined)
-    .map((row) => `${row.meter_id}:${row.window!.minutes}`));
-  const missing = failedAntigravityObservations(account, "agy quota summary not ready", now)
-    .filter((row) => !present.has(`${row.meter_id}:${row.window?.minutes}`))
-    .map((row) => ({ ...row, source: "local:antigravity:warm" }));
-  return [...rows, ...missing];
+function localLaneRows(classified: ClassifiedLocalRead, principal: string, now: string): Observation[] {
+  return [...antigravityLaneObservations(classified.classification, principal, { now, source: LOCAL_ANTIGRAVITY_SOURCE, adapterVersion: "0.1.0", freshRow: engineFreshRow(classified.read) }), ...classified.read.extra];
+}
+
+function localReadSummary(classified: ClassifiedLocalRead, at: string): AntigravityLocalRead {
+  const { classification } = classified;
+  const settled = classification.lanes.filter((lane) => isSettledLane(lane.state)).length;
+  const empty = classified.rows.length === 0;
+  return {
+    outcome: empty ? "empty" : classification.complete ? "fresh" : settled > 0 ? "partial" : "failed",
+    payload_kind: empty ? "none" : classification.payloadKind,
+    lanes: Object.fromEntries(classification.lanes.map((lane) => [`${lane.meter} ${lane.minutes === 300 ? "5h" : "weekly"}`, lane.state])),
+    at,
+  };
 }
 
 /** Called only once remote has already failed to answer: picks the
  * daemon-owned agy summary in preference to remote's own failed/estimated
- * rows, but only once agy's quota summary supplies every real lane -- a
- * partial warm read is worse than remote's own honest failure reason. */
+ * rows, but only once the shared lane classifier calls the local read
+ * complete -- a partial warm read is worse than remote's own honest failure
+ * reason. */
 export function selectAntigravitySource(local: Observation[], remote: Observation[], principal: string): Observation[] {
-  const expected = new Set(ANTIGRAVITY_METERS.flatMap((meter) => ANTIGRAVITY_WINDOWS.map((minutes) => `${principal}:${meter}:${minutes}`)));
-  const real = local.filter((row) => row.principal_id === principal && row.source === "local:antigravity:warm" && row.freshness === "fresh" && row.quantity !== null && row.window?.minutes !== null);
-  const available = new Set(real.map((row) => `${row.principal_id}:${row.meter_id.slice(principal.length + 1)}:${row.window?.minutes}`));
-  return [...expected].every((key) => available.has(key)) ? local : remote;
+  const own = local.filter((row) => row.principal_id === principal && row.source === LOCAL_ANTIGRAVITY_SOURCE);
+  return own.length && classifyLocalAntigravity(own, principal).classification.complete ? local : remote;
 }
 
 /** Explains, alongside remote's own failure reason, why the daemon-kept agy
@@ -240,7 +258,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // A one-shot CLI/MCP read requires a daemon for Antigravity. The Swift local
   // probe is called exclusively by the daemon after it has started `agy`.
   const antigravityAccounts = providerAccounts.filter((account) => account.vendor === "antigravity");
-  let localAntigravity = new Map<string, Observation[]>();
+  const localAntigravity = new Map<string, Observation[]>();
   const antigravityLocal: Record<string, AntigravityLocalRead> = {};
   const engineAccounts = providerAccounts.filter((account) => account.vendor !== "antigravity" && account.vendor !== "claude" && (account.adapter === "engine" || account.adapter === "native"));
   let nativeFailure: string | undefined;
@@ -261,11 +279,8 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
         return runNativeEngine(native, accounts, { timeoutMs });
       };
       const local = await readAntigravity(antigravityAccounts);
-      localAntigravity = new Map(antigravityAccounts.map((account) => [account.name, local.filter((row) => row.principal_id === account.name)]));
-      const incomplete = antigravityAccounts.filter((account) => {
-        const rows = localAntigravity.get(account.name) ?? [];
-        return !completeAntigravityRows(rows, account.name);
-      });
+      const classified = new Map(antigravityAccounts.map((account) => [account.name, classifyLocalAntigravity(local, account.name)]));
+      const incomplete = antigravityAccounts.filter((account) => !classified.get(account.name)!.classification.complete);
       // agy's local quota-summary endpoint routinely needs a moment past the
       // engine's own readiness wait to populate every lane, especially while
       // the machine is busy; a real outage stays incomplete on the retry too,
@@ -277,27 +292,27 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
         try {
           const retried = await readAntigravity(incomplete);
           for (const account of incomplete) {
-            const rows = retried.filter((row) => row.principal_id === account.name);
+            const again = classifyLocalAntigravity(retried, account.name);
             // A partial retry is not an authoritative replacement: it could
             // erase this attempt's whole-meter failure and expose cached
             // fresh capacity for a lane the retry did not answer. Only a
-            // complete quota summary wins; otherwise retain the first read.
-            if (completeAntigravityRows(rows, account.name)) localAntigravity.set(account.name, rows);
+            // complete classification wins; otherwise retain the first read.
+            if (again.classification.complete) classified.set(account.name, again);
           }
         } catch { /* keep the first attempt's rows; handled below as usual */ }
       }
+      const at = new Date().toISOString();
       for (const account of antigravityAccounts) {
-        let rows = localAntigravity.get(account.name) ?? [];
-        const complete = completeAntigravityRows(rows, account.name);
-        if (!complete) {
-          rows = completeOrFailedAntigravityRows(account, rows, new Date().toISOString());
-          localAntigravity.set(account.name, rows);
+        const read = classified.get(account.name)!;
+        antigravityLocal[account.name] = localReadSummary(read, at);
+        if (!read.rows.length) continue; // handled below with the reader's own reason
+        let rows = localLaneRows(read, account.name, at);
+        // The engine's own failure text stays. A known logged-out agy is the
+        // actionable part, so it is appended, never substituted.
+        if (!read.classification.complete && options.antigravityLoginState === "not_logged_in") {
+          rows = rows.map((row) => row.freshness === "failed" ? { ...row, reason: `${row.reason ?? "agy local quota read failed"}; agy not logged in (run: agy)` } : row);
         }
-        if (!complete && options.antigravityLoginState && options.antigravityLoginState !== "unknown") {
-          const reason = options.antigravityLoginState === "not_logged_in" ? "agy not logged in (run: agy)" : "agy logged in; quota summary not ready";
-          localAntigravity.set(account.name, rows.map((row) => row.freshness === "failed" ? { ...row, reason } : row));
-        }
-        antigravityLocal[account.name] = { outcome: complete ? "fresh" : rows.length ? "failed" : "empty", payload_kind: complete ? "quota_summary" : rows.length ? "placeholder" : "none", at: new Date().toISOString() };
+        localAntigravity.set(account.name, rows);
       }
     } catch (error) {
       failures.push(`native Antigravity local source failed: ${safeError(error)}`);
