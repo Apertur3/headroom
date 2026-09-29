@@ -63,6 +63,9 @@ struct HeadroomEngine {
         let arguments = CommandLine.arguments
         let principalFlag = arguments.firstIndex(of: "--principals")
         let shapeMode = arguments.contains("--shape")
+        if let recordFlag = arguments.firstIndex(of: "--record") {
+            await runRecord(arguments: arguments, principalFlag: principalFlag, recordFlag: recordFlag, shapeMode: shapeMode)
+        }
         guard (arguments.count == 4 || arguments.count == 5),
               arguments[1] == "observe",
               let principalFlag,
@@ -91,6 +94,34 @@ struct HeadroomEngine {
         await ProviderCLISessionLifecycle.shutdownPersistentSessions()
         emit(observations)
         exit(observations.contains { $0.freshness == "fresh" } ? 0 : 3)
+    }
+
+    /// `observe --principals <json> --record <out>`. Never returns.
+    static func runRecord(arguments: [String], principalFlag: Int?, recordFlag: Int, shapeMode: Bool) async -> Never {
+        guard arguments.count == 6, arguments[1] == "observe", !shapeMode,
+              let principalFlag, principalFlag + 1 < arguments.count,
+              recordFlag + 1 < arguments.count,
+              !arguments[recordFlag + 1].hasPrefix("--"), !arguments[principalFlag + 1].hasPrefix("--")
+        else {
+            FileHandle.standardError.write(Data("Usage: headroom-engine observe --principals <path-to-json> --record <out-json>\n".utf8))
+            exit(2)
+        }
+        let principals: [Principal]
+        do {
+            principals = try JSONDecoder().decode([Principal].self, from: try readRecordInput(arguments[principalFlag + 1]))
+        } catch {
+            FileHandle.standardError.write(Data("record: invalid principals input\n".utf8))
+            exit(3)
+        }
+        exit(await AntigravityRecorder.run(principals: principals, outputPath: arguments[recordFlag + 1]))
+    }
+
+    /// The recorder's wrapper hands the principals over on stdin. Bash 5.1+ turns a short
+    /// here-string into a pipe, and `Data(contentsOf:)` refuses anything but a regular
+    /// file, so stdin is read through the file handle instead.
+    static func readRecordInput(_ path: String, standardInput: FileHandle = .standardInput) throws -> Data {
+        if path == "-" || path == "/dev/stdin" { return standardInput.readDataToEndOfFile() }
+        return try Data(contentsOf: URL(fileURLWithPath: path))
     }
 
     static func emit<T: Encodable>(_ value: T) {
