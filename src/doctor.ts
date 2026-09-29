@@ -2,6 +2,7 @@ import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
+import { findStaleLanes, laneAgeText } from "./canary.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { grokAuthPath } from "./adapters/grok.js";
@@ -16,6 +17,7 @@ import { isOrphanedAgentProcess, listProcesses, type ProcessEntry } from "./proc
 import { checkHostHealth, defaultHostGuardPolicy, readHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "./host-health.js";
 import { CURRENT_SCHEMA_VERSION } from "./migrations.js";
 import { accountsPath, readAccounts } from "./registry.js";
+import { defaultPolicy } from "./policy.js";
 import { HeadroomStore } from "./store.js";
 import { updateNoticeLine } from "./update.js";
 import { isAccountEnabled, isLocalAccount, type Account, type ProviderAccount } from "./types.js";
@@ -319,6 +321,18 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
       }
     }
     if (probePin) output.push(probePin);
+    // FAIL, not WARN: a stale lane reads as UNKNOWN, so every gate/route/can
+    // decision fails closed on it. That is the same class as a missing
+    // credential or an unacknowledged plan downgrade, which are FAIL too, and
+    // it makes `doctor` exit non-zero for scripts.
+    if (store) {
+      let hours = defaultPolicy.canary_stale_after_hours;
+      try { hours = (await readPolicy()).canary_stale_after_hours; } catch { /* the policy check below reports the parse error */ }
+      const now = new Date();
+      for (const lane of findStaleLanes(store, accounts, hours, now)) {
+        output.push(check("FAIL", `lane ${lane.meter} ${lane.label}`, `no fresh reading for ${laneAgeText(lane.age_seconds)} (${lane.last_accepted_at ? `last ${lane.last_accepted_at}` : `never accepted, first seen ${lane.since}`}); last error: ${lane.last_error ?? "none recorded"}`, `headroom --refresh, then headroom logs --tail 50 (the stale-lane canary alerts every 24h until it recovers)`));
+      }
+    }
     await doctorChecksTail(output, home, accounts, keepaliveEnabled);
   } finally { store?.close(); }
   return output;

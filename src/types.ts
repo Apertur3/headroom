@@ -157,6 +157,11 @@ export interface Observation {
    * already-enriched row rather than aging it again without its store-backed
    * last-known context. */
   status_enriched_at?: string;
+  /** Computed, never persisted: true when this reading is served stale or
+   * failed, so its number (if any) must not be read as current.
+   * `stale_age_seconds` is the age of the last accepted reading, when known. */
+  stale?: true;
+  stale_age_seconds?: number;
   /** Computed, never persisted: the newest FRESH reading of this exact meter
    * and window from the last 7 days, attached only when this observation's
    * served freshness is `failed` or `stale` (see pace.ts's withLastKnown). A
