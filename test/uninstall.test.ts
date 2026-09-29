@@ -457,7 +457,9 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
     const output = logs.join("\n");
     expect(output).toContain("no longer exists");
-    expect(output).toContain(`mkdir -p ${gone}`);
-    expect(output).not.toContain(`(cd ${gone}`);
+    // A Windows temp path carries backslashes, which the POSIX form single-quotes.
+    const quoted = /^[A-Za-z0-9_@%+=:,./-]+$/.test(gone) ? gone : `'${gone.replaceAll("'", "'\\''")}'`;
+    expect(output).toContain(`mkdir -p ${quoted}`);
+    expect(output).not.toContain(`(cd ${quoted}`);
   });
 });
