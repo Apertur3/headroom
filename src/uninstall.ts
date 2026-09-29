@@ -85,7 +85,10 @@ function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "loca
     // PowerShell: `env -u` and `(cd .. && ..)` do not exist there. The default profile must not inherit a CLAUDE_CONFIG_DIR either.
     const psQuote = (value: string) => `'${value.replaceAll("'", "''")}'`;
     const profile = env.CLAUDE_CONFIG_DIR ? `$env:CLAUDE_CONFIG_DIR = ${psQuote(env.CLAUDE_CONFIG_DIR)}` : "Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue";
-    return `${cwd ? `Set-Location ${psQuote(cwd)}; ` : ""}${profile}; ${command}`;
+    // A `;` list keeps going after a failed Set-Location, which would remove the
+    // registration of whatever directory the user pasted this into; run the
+    // removal only once the bound directory was actually entered.
+    return cwd ? `if (Set-Location -LiteralPath ${psQuote(cwd)} -PassThru -ErrorAction SilentlyContinue) { ${profile}; ${command} }` : `${profile}; ${command}`;
   }
   // The default profile must not inherit a CLAUDE_CONFIG_DIR from the shell the user pastes this into.
   const withProfile = env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${shellQuote(env.CLAUDE_CONFIG_DIR)} ${command}` : `env -u CLAUDE_CONFIG_DIR ${command}`;

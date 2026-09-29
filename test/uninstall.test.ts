@@ -414,6 +414,21 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     expect(posix).not.toContain("Remove-Item");
   });
 
+  it("on win32 only runs a local-scope removal once Set-Location into the bound directory succeeded", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const bound = join(fakeHome, "proj");
+    await mkdir(bound, { recursive: true });
+    const config = { projects: { [bound]: { mcpServers: { headroom: { command: "headroom" } } } } };
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true, config });
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      logs = (await captureLog(() => runUninstall(["--dry-run"], { ...noOverrides, platform: "win32" }))).logs;
+    });
+    const output = logs.join("\n");
+    expect(output).toContain(`if (Set-Location -LiteralPath '${bound}' -PassThru -ErrorAction SilentlyContinue) { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue; claude mcp remove --scope local headroom }`);
+    expect(output).not.toContain(`Set-Location '${bound}';`);
+  });
+
   it("quotes the directory in the printed mkdir command for a path with a space", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const gone = join(fakeHome, "deleted worktree");
