@@ -146,6 +146,9 @@ final class AntigravityRecordTests: XCTestCase {
         XCTAssertEqual(AntigravityRecorder.modelName("claude-sonnet-4", placeholder: "model-1"), "claude-sonnet-4")
         XCTAssertEqual(AntigravityRecorder.modelName("Gemini 3 Pro (High)", placeholder: "model-2"), "model-2")
         XCTAssertEqual(AntigravityRecorder.modelName("project-42", placeholder: "model-3"), "model-3")
+        for unknown in ["gemini-project-42", "claude-alice-smith", "gpt-x9kd82lmq4za"] {
+            XCTAssertEqual(AntigravityRecorder.modelName(unknown, placeholder: "model-4"), "model-4")
+        }
         XCTAssertEqual(AntigravityRecorder.structuredReset("Resets in 2d 3h"), "Resets in 2d 3h")
         XCTAssertNil(AntigravityRecorder.structuredReset("Resets in 2d for user@example.com"))
     }

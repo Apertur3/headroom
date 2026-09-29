@@ -58,18 +58,30 @@ async function waitFor(check: () => boolean, ms = 10_000): Promise<boolean> {
 
 describe("record-antigravity-fixture.sh", () => {
   it("prints the engine command and stops before invoking it", async () => {
-    const { stdout } = await execFileAsync("bash", [script, "--dry-run", "gemini-weekly-exhausted"]);
-    expect(stdout).toMatch(/observe --principals <temp principals json> --record test\/fixtures\/antigravity\/\d{4}-\d{2}-\d{2}-gemini-weekly-exhausted\.json/);
+    const { stdout } = await execFileAsync("bash", [script, "--dry-run", "weekly-exhausted"]);
+    expect(stdout).toMatch(/observe --principals \/dev\/stdin --record test\/fixtures\/antigravity\/\d{4}-\d{2}-\d{2}-weekly-exhausted\.json/);
     expect(stdout).not.toMatch(/would run: bash scripts\/build/);
   });
 
-  it("rejects a label that is not kebab-case", async () => {
-    await expect(execFileAsync("bash", [script, "--dry-run", "../escape"])).rejects.toMatchObject({ code: 2 });
+  it("rejects a label outside the fixed list, lists the allowed ones and never echoes the argument", async () => {
+    for (const bad of ["../escape", "alice-smith", "sk-abc123", "Weekly-Exhausted"]) {
+      const result = await execFileAsync("bash", [script, "--dry-run", bad]).catch((e) => e);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("weekly-exhausted, all-fresh, availability-only, loading, other");
+      expect(result.stderr + result.stdout).not.toContain(bad);
+    }
+  });
+
+  it("accepts each allowed label", async () => {
+    for (const ok of ["weekly-exhausted", "all-fresh", "availability-only", "loading", "other"]) {
+      const { stdout } = await execFileAsync("bash", [script, "--dry-run", ok]);
+      expect(stdout).toContain(`-${ok}.json`);
+    }
   });
 
   it("stops with the build command when the engine is missing, and never builds", async () => {
     const root = fakeRepo();
-    const result = await execFileAsync("bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "x"]).catch((e) => e);
+    const result = await execFileAsync("bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "other"]).catch((e) => e);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("bash scripts/build-native-engine.sh");
     expect(existsSync(join(root, "BUILD_RAN"))).toBe(false);
@@ -80,7 +92,7 @@ describe("record-antigravity-fixture.sh", () => {
     const engine = join(root, "bin", "engine", "darwin", "headroom-engine");
     const past = new Date(Date.now() - 60_000);
     utimesSync(engine, past, past);
-    const result = await execFileAsync("bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "x"]).catch((e) => e);
+    const result = await execFileAsync("bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "other"]).catch((e) => e);
     expect(result.code).toBe(1);
     expect(result.stderr).toMatch(/older than the engine sources/);
     expect(existsSync(join(root, "BUILD_RAN"))).toBe(false);
@@ -88,72 +100,58 @@ describe("record-antigravity-fixture.sh", () => {
 
   const readPid = (file: string): number => Number(readFileSync(file, "utf8").trim());
 
-  /** Spawns the wrapper against a stub engine. Every process is tracked for the
-   * reaper and killed (group and all) in `stop`, which callers put in finally. */
-  function start(stub: string) {
+  // The stub writes its pid, then replaces itself with a sleep that has a hard
+  // 10 s deadline, so a runner crash cannot leave it running. exec keeps the pid.
+  const stub = '#!/bin/bash\necho $$ > "$0.pid"\ncat > "$0.stdin"\nexec sleep 10\n';
+
+  function start() {
     const root = fakeRepo(stub);
     const engine = join(root, "bin", "engine", "darwin", "headroom-engine");
-    const wrapper = spawn("/bin/bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "x"], { stdio: "ignore" });
+    const wrapper = spawn("/bin/bash", [join(root, "scripts", "record-antigravity-fixture.sh"), "other"], { stdio: ["pipe", "ignore", "ignore"] });
     track(wrapper.pid, root);
-    const exited = new Promise<number | null>((resolve) => wrapper.on("exit", (code) => resolve(code)));
-    const pids = (): number[] => [`${engine}.pid`, `${engine}.child`].filter((f) => existsSync(f)).map(readPid).filter((n) => Number.isInteger(n) && n > 1);
+    const exited = new Promise<number | null>((resolve) => wrapper.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : null))));
+    const pid = (): number | undefined => (existsSync(`${engine}.pid`) && readFileSync(`${engine}.pid`, "utf8").trim() !== "" ? readPid(`${engine}.pid`) : undefined);
     const stop = () => {
-      for (const pid of pids()) {
-        try { process.kill(-pid, "SIGKILL"); } catch { /* not a group leader */ }
-        try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
-      }
+      const p = pid();
+      if (p) try { process.kill(p, "SIGKILL"); } catch { /* gone */ }
       if (wrapper.pid) try { process.kill(wrapper.pid, "SIGKILL"); } catch { /* gone */ }
     };
-    return { root, engine, wrapper, exited, pids, stop };
+    return { engine, wrapper, exited, pid, stop };
   }
 
-  // /bin/bash is bash 3.2 on macOS, the oldest shell the script must support.
-  const term = '#!/bin/bash\necho $$ > "$0.pid"\nsleep 30 &\necho $! > "$0.child"\nwait\n';
-
-  it("leaves no engine process behind when the wrapper is terminated", async () => {
-    const run = start(term);
+  it("execs the engine: the wrapper pid is the engine pid, so no child exists", async () => {
+    const run = start();
     try {
-      expect(await waitFor(() => existsSync(`${run.engine}.child`) && readFileSync(`${run.engine}.child`, "utf8").trim() !== "")).toBe(true);
-      const [enginePid, childPid] = [readPid(`${run.engine}.pid`), readPid(`${run.engine}.child`)];
-      expect(alive(enginePid) && alive(childPid)).toBe(true);
-      run.wrapper.kill("SIGTERM");
-      expect(await run.exited).toBe(130);
-      expect(await waitFor(() => !alive(enginePid) && !alive(childPid), 5_000)).toBe(true);
+      expect(await waitFor(() => run.pid() !== undefined)).toBe(true);
+      expect(run.pid()).toBe(run.wrapper.pid);
     } finally {
       run.stop();
     }
   }, 30_000);
 
-  it("escalates to SIGKILL when the engine ignores TERM, within the grace period", async () => {
-    const run = start('#!/bin/bash\ntrap "" TERM\necho $$ > "$0.pid"\nwhile :; do sleep 1; done\n');
+  it("passes the principals JSON on stdin, with no secrets or arguments in it", async () => {
+    const run = start();
     try {
-      expect(await waitFor(() => existsSync(`${run.engine}.pid`) && readFileSync(`${run.engine}.pid`, "utf8").trim() !== "")).toBe(true);
-      const enginePid = readPid(`${run.engine}.pid`);
-      const began = Date.now();
-      run.wrapper.kill("SIGTERM");
-      expect(await run.exited).toBe(130);
-      expect(Date.now() - began).toBeLessThan(9_000);
-      expect(await waitFor(() => !alive(enginePid), 3_000)).toBe(true);
+      expect(await waitFor(() => existsSync(`${run.engine}.stdin`) && readFileSync(`${run.engine}.stdin`, "utf8").includes("antigravity"))).toBe(true);
+      const parsed = JSON.parse(readFileSync(`${run.engine}.stdin`, "utf8"));
+      expect(parsed).toHaveLength(1);
+      expect(Object.keys(parsed[0]).sort()).toEqual(["id", "location", "vendor"]);
     } finally {
       run.stop();
     }
   }, 30_000);
 
-  it("leaves no survivors when the wrapper is killed the moment the engine starts", async () => {
-    for (let round = 0; round < 8; round++) {
-      const run = start(term);
-      try {
-        // Signal as early as the wrapper has started the engine, inside the window
-        // that used to precede trap installation.
-        expect(await waitFor(() => existsSync(`${run.engine}.pid`) && readFileSync(`${run.engine}.pid`, "utf8").trim() !== "")).toBe(true);
-        run.wrapper.kill("SIGTERM");
-        await run.exited;
-        await waitFor(() => existsSync(`${run.engine}.child`), 1_000);
-        const pids = run.pids();
-        expect(await waitFor(() => pids.every((pid) => !alive(pid)), 5_000)).toBe(true);
-      } finally {
-        run.stop();
-      }
+  it("leaves no survivors when the wrapper is terminated", async () => {
+    const run = start();
+    try {
+      expect(await waitFor(() => run.pid() !== undefined)).toBe(true);
+      const pid = run.pid() as number;
+      expect(alive(pid)).toBe(true);
+      run.wrapper.kill("SIGTERM");
+      await run.exited;
+      expect(await waitFor(() => !alive(pid), 5_000)).toBe(true);
+    } finally {
+      run.stop();
     }
-  }, 60_000);
+  }, 30_000);
 });

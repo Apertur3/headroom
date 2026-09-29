@@ -5,7 +5,7 @@
 # keeps only allowlisted quota fields (identity is written as "redacted").
 #
 # Usage: scripts/record-antigravity-fixture.sh [--dry-run] <label>
-#   <label>     short kebab-case name, e.g. gemini-weekly-exhausted
+#   <label>     one of: weekly-exhausted, all-fresh, availability-only, loading, other
 #   --dry-run   print the exact engine command and stop before invoking it
 #
 # Output: test/fixtures/antigravity/<YYYY-MM-DD>-<label>.json (mode 0600).
@@ -28,7 +28,10 @@ for arg in "$@"; do
     *) [[ -z "$label" ]] || { usage; exit 2; }; label="$arg" ;;
   esac
 done
-[[ "$label" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || { usage; echo "label must be kebab-case (a-z, 0-9, -)" >&2; exit 2; }
+case "$label" in
+  weekly-exhausted|all-fresh|availability-only|loading|other) ;;
+  *) usage; echo "label must be one of: weekly-exhausted, all-fresh, availability-only, loading, other" >&2; exit 2 ;;
+esac
 
 engine="bin/engine/darwin/headroom-engine"
 out_dir="test/fixtures/antigravity"
@@ -39,14 +42,11 @@ out="$out_dir/$(date -u +%F)-$label.json"
 location="agy"
 [[ -d "$HOME/.gemini/antigravity-cli" ]] && location="$HOME/.gemini/antigravity-cli"
 
-principals="$(mktemp "${TMPDIR:-/tmp}/headroom-record-principals.XXXXXX")"
-chmod 600 "$principals"
-trap 'rm -f "$principals"' EXIT
-printf '[{"id":"antigravity","vendor":"antigravity","location":"%s"}]\n' "$location" > "$principals"
+json="[{\"id\":\"antigravity\",\"vendor\":\"antigravity\",\"location\":\"$location\"}]"
 
 if (( dry_run == 1 )); then
   echo "would check: $engine exists and is newer than engine sources (never builds)"
-  echo "would run: $engine observe --principals <temp principals json> --record $out"
+  echo "would run: $engine observe --principals /dev/stdin --record $out"
   exit 0
 fi
 
@@ -69,41 +69,6 @@ fi
 mkdir -p "$out_dir"
 umask 077
 
-# Run the engine in its own process group (set -m) and forward INT/TERM/HUP to
-# that group, then wait for it, so nothing from this run outlives the wrapper.
-# The traps are installed BEFORE the child starts: a signal in between would
-# otherwise kill the wrapper and orphan the engine.
-engine_pid=""
-got_signal=0
-forward() {
-  got_signal=1
-  if [[ -n "$engine_pid" ]]; then kill -TERM -- "-$engine_pid" 2>/dev/null || true; fi
-}
-trap forward INT TERM HUP
-set -m
-"$engine" observe --principals "$principals" --record "$out" &
-engine_pid=$!
-# A signal that landed before the pid was known is honoured now.
-if (( got_signal == 1 )); then kill -TERM -- "-$engine_pid" 2>/dev/null || true; fi
-status=0
-wait "$engine_pid" || status=$?
-if (( got_signal == 1 )); then
-  # `wait` returned because of the signal. Give the group 5 s (50 x 0.1 s) to
-  # exit on TERM, poll without blocking, then SIGKILL whatever is left.
-  tries=0
-  while kill -0 -- "-$engine_pid" 2>/dev/null && (( tries < 50 )); do
-    sleep 0.1
-    tries=$((tries + 1))
-  done
-  if kill -0 -- "-$engine_pid" 2>/dev/null; then kill -KILL -- "-$engine_pid" 2>/dev/null || true; fi
-  wait "$engine_pid" 2>/dev/null || true
-fi
-trap - INT TERM HUP
-set +m
-if (( got_signal == 1 )); then
-  echo "interrupted; engine stopped" >&2
-  exit 130
-fi
-(( status == 0 )) || { echo "engine exited with status $status" >&2; exit "$status"; }
-echo "wrote $out (mode $(stat -f %Lp "$out" 2>/dev/null || stat -c %a "$out"))"
-echo "review it, then run scripts/privacy-sweep.sh before committing"
+# exec: this process becomes the engine (principals JSON on stdin), so there is
+# no child, no trap and nothing that can outlive a signal.
+exec "$engine" observe --principals /dev/stdin --record "$out" <<<"$json"

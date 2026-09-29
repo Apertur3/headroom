@@ -213,23 +213,22 @@ enum AntigravityRecorder {
         value.range(of: pattern, options: .regularExpression) != nil
     }
 
-    /// True for anything shaped like a secret or an id: long hex, UUID, JWT,
-    /// long base64/alnum runs, `sk-` keys, long digit runs.
-    private static func looksLikeToken(_ value: String) -> Bool {
-        matches(value, #"[0-9A-Fa-f]{16,}"#)
-            || matches(value, #"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#)
-            || matches(value, #"[A-Za-z0-9+/_-]{20,}"#)
-            || matches(value, #"[0-9]{9,}"#)
-            || matches(value, #"(?i)eyJ|sk-|bearer|token|cookie|csrf|secret|password|session"#)
-    }
-
     /// The bucket ids Antigravity is known to send (CodexBar probe and the
     /// Headroom adapter). The fixture only needs structure, so a bucket or
     /// group value is kept only when it equals one of these exactly.
     static let knownBucketIDs: Set<String> = ["gemini-5h", "gemini-weekly", "3p-5h", "3p-weekly", "cg-5h", "cg-weekly"]
 
-    /// Known model-family prefixes (the families the probe recognises).
-    static let knownModelPrefixes = ["gemini-", "claude-", "gpt-"]
+    /// Exact model ids seen in the CodexBar Antigravity probe and its fixtures.
+    /// Same rule as the bucket ids: anything not in this set becomes `model-N`.
+    static let knownModelIDs: Set<String> = [
+        "claude-gpt", "claude-sonnet", "claude-sonnet-4", "claude-thinking",
+        "claude-opus-4-6", "claude-opus-4-6-thinking", "claude-opus-4.6-thinking",
+        "gemini-2-5-flash", "gemini-2-5-flash-image", "gemini-2-5-flash-lite", "gemini-2-5-pro",
+        "gemini-3-1-pro-low", "gemini-3-flash-agent",
+        "gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3.5-flash-mid", "gemini-3.5-flash-high",
+        "gemini-3.6-flash", "gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high",
+        "gemini-3.7-flash",
+    ]
 
     /// Bucket or group value: kept only if a known bucket id, else the
     /// positional placeholder. Human-readable names never survive.
@@ -238,14 +237,11 @@ enum AntigravityRecorder {
         return knownBucketIDs.contains(trimmed) ? trimmed : placeholder
     }
 
-    /// Model id or label: kept only if it is a known-family model id (or a
-    /// known bucket id) with no token shape, else the positional placeholder.
+    /// Model id or label: kept only when exactly a known model or bucket id,
+    /// else the positional placeholder.
     static func modelName(_ value: String, placeholder: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if knownBucketIDs.contains(trimmed) { return trimmed }
-        guard knownModelPrefixes.contains(where: { trimmed.hasPrefix($0) }),
-              matches(trimmed, #"^[a-z0-9][a-z0-9.-]{1,47}$"#), !looksLikeToken(trimmed) else { return placeholder }
-        return trimmed
+        return knownModelIDs.contains(trimmed) || knownBucketIDs.contains(trimmed) ? trimmed : placeholder
     }
 
     /// Reset descriptions are kept only in the pure "Resets in 2d 3h" shape.
