@@ -137,14 +137,17 @@ describe("headroom setup --yes", () => {
     // own ~/.claude login.
     await mkdir(join(fakeHome, ".claude-setup-test"), { recursive: true });
     const claudeOnPath = vi.fn(async () => false);
+    // The real final check runs doctor and observe, whose native probe reads /usr/bin/security by absolute path.
+    const finalCheck = vi.fn(async () => undefined);
     let code = -1;
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { claudeOnPath }));
+      const captured = await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { claudeOnPath, finalCheck }));
       code = captured.result;
       logs = captured.logs;
     });
     expect(code).toBe(0);
+    expect(finalCheck).toHaveBeenCalledTimes(1);
     const output = logs.join("\n");
     expect(output).not.toContain("headroom keychain grant");
     expect(output).not.toContain("Keychain access granted");

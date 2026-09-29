@@ -21,6 +21,8 @@ export interface SetupOverrides {
   runClaudeMcpAdd?: () => Promise<number>;
   /** Service-manager and daemon-probe stand-ins for the service step; overridden in tests so launchctl, systemctl and schtasks are never run. */
   serviceStart?: ServiceStartOptions;
+  /** Replaces the final doctor + observe; overridden in tests so no real Keychain, vendor or native probe is ever queried. */
+  finalCheck?: () => Promise<void>;
 }
 
 interface SetupOptions {
@@ -198,7 +200,7 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
   return true;
 }
 
-async function stepFinalCheck(options: SetupOptions): Promise<boolean> {
+async function stepFinalCheck(options: SetupOptions, overrides: SetupOverrides): Promise<boolean> {
   console.log("Step 5: final check");
   if (options.planOnly) {
     // observe() (with no daemon running, the common case for a first-time
@@ -208,7 +210,7 @@ async function stepFinalCheck(options: SetupOptions): Promise<boolean> {
     console.log("Pace legend: HARVEST = spend it before it expires, NORMAL = proceed, CONSERVE = slow down, FREEZE = do not spawn, UNKNOWN = treat as no capacity.");
     return true;
   }
-  try { await doctor(); await observe([]); }
+  try { if (overrides.finalCheck) await overrides.finalCheck(); else { await doctor(); await observe([]); } }
   catch (error) {
     console.error(isAccountsMissingError(error) ? "  No accounts configured yet. Run: headroom accounts discover" : `  failed: ${safeError(error)}`);
   }
@@ -242,7 +244,7 @@ export async function runSetup(argv: string[], overrides: SetupOverrides = {}): 
       () => stepInstallService(options, overrides),
       () => stepNotifications(options, overrides).catch((error: unknown) => surviveStepError(options, error)),
       () => stepMcp(options, overrides),
-      () => stepFinalCheck(options),
+      () => stepFinalCheck(options, overrides),
     ]) {
       console.log("");
       if (!(await step())) return 1;

@@ -77,7 +77,16 @@ async function defaultServiceRunner(command: string, args: string[]): Promise<{ 
 async function defaultDaemonProbe(): Promise<boolean> {
   // Loaded lazily: daemon.ts is the whole daemon, and only this one check needs it.
   const { daemonRequest, socketPath } = await import("./daemon.js");
-  return (await daemonRequest(socketPath(), "health", {}, 500)).status === "available";
+  return (await daemonRequest(socketPath(), "health", {}, 500, 500)).status === "available";
+}
+
+/** True when the service manager itself has the service loaded (and, on systemd, running and enabled),
+ * which a foreground `headroom daemon` answering health says nothing about. */
+async function serviceManagerHasService(platform: NodeJS.Platform, uid: number, runner: ServiceRunner): Promise<boolean> {
+  const ok = async (command: string, args: string[]) => (await runner(command, args)).code === 0;
+  if (platform === "darwin") return ok("launchctl", ["print", `gui/${uid}/${SERVICE_LABEL}`]);
+  if (platform === "win32") return ok("schtasks", ["/Query", "/TN", WINDOWS_TASK]);
+  return (await ok("systemctl", ["--user", "is-active", "headroom.service"])) && (await ok("systemctl", ["--user", "is-enabled", "headroom.service"]));
 }
 
 export interface ServiceStartOptions {
@@ -109,8 +118,9 @@ const WINDOWS_TASK = "Headroom Daemon";
 
 /** The service manager's own commands, in run order, to load (or reload) the service and start it.
  * `optional` steps may fail without meaning anything: launchctl bootout on a service that was never
- * loaded, and systemctl restart when the unit was only just enabled. */
-export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: number, replacing: boolean): { command: string; args: string[]; optional?: boolean }[] {
+ * loaded, and schtasks /End on a task that is not running. `confirmStopped` steps must leave the daemon
+ * no longer answering before the next step runs. */
+export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: number, replacing: boolean): { command: string; args: string[]; optional?: boolean; confirmStopped?: boolean }[] {
   if (platform === "darwin") return [
     // A rewritten plist only takes effect once the old job is gone, so unload first; on a first install this fails harmlessly.
     { command: "launchctl", args: ["bootout", `gui/${uid}/${SERVICE_LABEL}`], optional: true },
@@ -118,13 +128,15 @@ export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: n
   ];
   if (platform === "win32") return [
     { command: "schtasks", args: ["/Create", "/TN", WINDOWS_TASK, "/XML", path, "/F"] },
+    // The task XML says IgnoreNew, so /Run is a no-op while the old process lives: end it first.
+    ...(replacing ? [{ command: "schtasks", args: ["/End", "/TN", WINDOWS_TASK], optional: true, confirmStopped: true }] : []),
     { command: "schtasks", args: ["/Run", "/TN", WINDOWS_TASK] },
   ];
   return [
     { command: "systemctl", args: ["--user", "daemon-reload"] },
     { command: "systemctl", args: ["--user", "enable", "--now", "headroom.service"] },
     // `enable --now` leaves an already-running unit on its old definition.
-    ...(replacing ? [{ command: "systemctl", args: ["--user", "restart", "headroom.service"], optional: true }] : []),
+    ...(replacing ? [{ command: "systemctl", args: ["--user", "restart", "headroom.service"] }] : []),
   ];
 }
 
@@ -143,17 +155,24 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
   const previous = await readFile(path, "utf8").catch(() => undefined);
   const contents = serviceContents(script, platform, runtime, username, home, env);
   const manual = (await installService(script, platform, home, runtime, true, env, username)).command;
-  if (previous === contents && await probe()) return { state: "already-running", manual };
-  const install = await installService(script, platform, home, runtime, false, env, username);
   const runner = options.runner ?? defaultServiceRunner;
   const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : 0);
+  if (previous === contents && await serviceManagerHasService(platform, uid, runner) && await probe()) return { state: "already-running", manual };
+  const install = await installService(script, platform, home, runtime, false, env, username);
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const interval = options.intervalMs ?? 500;
   for (const step of serviceLoadSteps(platform, path, uid, previous !== undefined)) {
     const { code, output } = await runner(step.command, step.args);
     if (code !== 0 && !step.optional) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} exited ${code}${output ? `: ${output}` : ""}`, install, manual };
+    if (step.confirmStopped) {
+      let stopped = !(await probe());
+      for (let attempt = 0; !stopped && attempt < 10; attempt += 1) { await sleep(interval); stopped = !(await probe()); }
+      if (!stopped) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} did not stop the old daemon${output ? `: ${output}` : ""}`, install, manual };
+    }
   }
-  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const interval = options.intervalMs ?? 500;
-  for (let waited = 0; waited <= (options.waitMs ?? 10_000); waited += interval) {
+  const waitMs = options.waitMs ?? 10_000;
+  const deadline = Date.now() + waitMs;
+  for (let waited = 0; waited <= waitMs && Date.now() <= deadline; waited += interval) {
     if (await probe()) return { state: "started", install, manual };
     await sleep(interval);
   }

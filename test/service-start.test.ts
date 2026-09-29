@@ -87,7 +87,8 @@ describe("install-service loads and starts the service", () => {
     const { runner, calls } = recorder();
     const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => true });
     expect(result.state).toBe("already-running");
-    expect(calls).toEqual([]);
+    // Only the service manager's own read-only state query; nothing is rewritten or reloaded.
+    expect(calls).toEqual(["launchctl print gui/501/com.headroom.daemon"]);
     expect(describeServiceStart(result)).toEqual(["already installed and running"]);
   });
 
@@ -99,6 +100,57 @@ describe("install-service loads and starts the service", () => {
     const { runner, calls } = recorder();
     let answering = false;
     await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => { const was = answering; answering = calls.length > 0; return was; } });
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("reloads when the plist is unchanged and a daemon answers, but the service manager does not have the service (--no-start, then a foreground daemon)", async () => {
+    const { home, env } = await fakeHome();
+    const path = servicePath("darwin", home, env);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, serviceContents(script, "darwin", runtime, "tester", home, env));
+    const { runner, calls } = recorder((line) => line.startsWith("launchctl print") ? 113 : 0);
+    const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => true });
+    expect(result.state).toBe("started");
+    expect(calls).toEqual(["launchctl print gui/501/com.headroom.daemon", "launchctl bootout gui/501/com.headroom.daemon", `launchctl bootstrap gui/501 ${path}`]);
+  });
+
+  it("linux: asks systemd whether the unit is active and enabled before calling it already running", async () => {
+    const { home, env } = await fakeHome();
+    const path = servicePath("linux", home, env);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, serviceContents(script, "linux", runtime, "tester", home, env));
+    const { runner, calls } = recorder((line) => line.includes("is-enabled") ? 1 : 0);
+    const result = await installAndStartService(script, "linux", home, runtime, env, "tester", { ...fast, runner, probe: async () => true });
+    expect(result.state).toBe("started");
+    expect(calls.slice(0, 2)).toEqual(["systemctl --user is-active headroom.service", "systemctl --user is-enabled headroom.service"]);
+    expect(calls).toContain("systemctl --user enable --now headroom.service");
+  });
+
+  it("linux: a refused restart of a replaced unit is reported as not started, with the command's output", async () => {
+    const { home, env } = await fakeHome();
+    const path = servicePath("linux", home, env);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, "[Service]\nold\n");
+    const { runner } = recorder((line) => line.includes(" restart ") ? 1 : 0);
+    const result = await installAndStartService(script, "linux", home, runtime, env, "tester", { ...fast, runner, probe: async () => true });
+    expect(result.state).toBe("not-loaded");
+    expect(result.reason).toContain("restart headroom.service exited 1");
+    expect(result.reason).toContain("Bootstrap failed");
+  });
+
+  it("win32: replacing a task ends the old one and waits for the old daemon to stop before /Run", () => {
+    const steps = serviceLoadSteps("win32", "C:\\h\\headroom-daemon.xml", 0, true);
+    expect(steps.map((step) => step.args[0])).toEqual(["/Create", "/End", "/Run"]);
+    expect(steps[1]).toMatchObject({ optional: true, confirmStopped: true });
+  });
+
+  it("bounds the whole health wait by wall-clock time even when each probe is slow", async () => {
+    const { home, env } = await fakeHome();
+    const { runner } = recorder();
+    const started = Date.now();
+    const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { runner, sleep: async () => undefined, intervalMs: 1, waitMs: 60, uid: 501, probe: async () => { await new Promise((resolve) => setTimeout(resolve, 30)); return false; } });
+    expect(result.state).toBe("unconfirmed");
+    // Without a deadline: 61 probes x 30 ms of real time.
+    expect(Date.now() - started).toBeLessThan(600);
   });
 });

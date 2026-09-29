@@ -1,6 +1,6 @@
 import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsToml } from "../src/registry.js";
@@ -217,6 +217,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("finds an entry a plain `claude mcp add` left at local scope and removes it with --scope local from the directory it is bound to", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const bound = join(fakeHome, "some-project");
+    await mkdir(bound, { recursive: true });
     // Two project entries: one with headroom next to an unrelated server, one with only an unrelated server.
     const config = { projects: {
       [bound]: { mcpServers: { headroom: { command: "headroom", args: ["mcp"] }, other: { command: "other" } } },
@@ -236,6 +237,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("removes both a user-scope and a local-scope entry when a profile has both", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const bound = join(fakeHome, "some-project");
+    await mkdir(bound, { recursive: true });
     const config = { mcpServers: { headroom: { command: "headroom" } }, projects: { [bound]: { mcpServers: { headroom: { command: "headroom" } } } } };
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true, config });
     const runClaudeMcpRemove = vi.fn(async () => 0);
@@ -352,5 +354,52 @@ describe("headroom uninstall dispatch", () => {
     expect(code).toBe(0);
     expect(logs.join("\n")).toContain("Headroom uninstall (dry run; nothing will change)");
     expect(await readdir(headroomHome)).toEqual([]);
+  });
+});
+
+describe("headroom uninstall: removal environment and vanished directories", () => {
+  it("passes an absolute CLAUDE_CONFIG_DIR even when the profile location is relative", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const bound = join(fakeHome, "proj");
+    await mkdir(bound, { recursive: true });
+    const config = { projects: { [bound]: { mcpServers: { headroom: { command: "headroom" } } } } };
+    const account = await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
+    // Rewrite accounts.toml with a location relative to the current directory.
+    const relativeLocation = relative(process.cwd(), account.location);
+    await writeFile(join(headroomHome, "accounts.toml"), accountsToml([{ ...account, location: relativeLocation }]), { mode: 0o600 });
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
+    });
+    expect(runClaudeMcpRemove).toHaveBeenCalledTimes(1);
+    expect(runClaudeMcpRemove.mock.calls[0][0].CLAUDE_CONFIG_DIR).toBe(account.location);
+  });
+
+  it("does not let an inherited CLAUDE_CONFIG_DIR redirect the default profile's removal", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "", CLAUDE_CONFIG_DIR: "/somewhere/else" }, async () => {
+      await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
+    });
+    expect(runClaudeMcpRemove).toHaveBeenCalledTimes(1);
+    expect(runClaudeMcpRemove.mock.calls[0][0].CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
+  it("does not spawn for a local-scope entry whose directory is gone, and says how to remove it", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const gone = join(fakeHome, "deleted-worktree");
+    const config = { projects: { [gone]: { mcpServers: { headroom: { command: "headroom" } } } } };
+    await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
+    const runClaudeMcpRemove = vi.fn(async () => 0);
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;
+    });
+    expect(runClaudeMcpRemove).not.toHaveBeenCalled();
+    const output = logs.join("\n");
+    expect(output).toContain("no longer exists");
+    expect(output).toContain(`mkdir -p ${gone}`);
+    expect(output).not.toContain(`(cd ${gone}`);
   });
 });

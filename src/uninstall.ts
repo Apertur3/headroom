@@ -1,10 +1,11 @@
 import { exec, execFile, spawn } from "node:child_process";
-import { lstat, rm } from "node:fs/promises";
+import { lstat, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { isAccountsMissingError } from "./cli.js";
-import { mcpRegistrationFor } from "./doctor.js";
+import { claudeConfigJsonPath, mcpRegistrationFor } from "./doctor.js";
 import { launchEnvironment } from "./orchestrator-reads.js";
 import { headroomHome } from "./paths.js";
 import { readAccounts } from "./registry.js";
@@ -30,6 +31,22 @@ interface UninstallOptions {
   yes: boolean;
   dryRun: boolean;
   rl: Interface | undefined;
+}
+
+/** The profile's environment for the spawned `claude`: CLAUDE_CONFIG_DIR made absolute (a local-scope
+ * removal runs from another cwd, where a relative path would name a different profile), and for the
+ * default profile any CLAUDE_CONFIG_DIR inherited from the caller cleared so it cannot redirect the
+ * removal to another profile's config. */
+function removalEnvironment(account: ProviderAccount): { env: NodeJS.ProcessEnv; profile: Record<string, string> } {
+  const launch = launchEnvironment(account);
+  const profile: Record<string, string> = launch.CLAUDE_CONFIG_DIR ? { CLAUDE_CONFIG_DIR: resolve(launch.CLAUDE_CONFIG_DIR) } : {};
+  const env = { ...process.env, ...profile };
+  if (!profile.CLAUDE_CONFIG_DIR) delete env.CLAUDE_CONFIG_DIR;
+  return { env, profile };
+}
+
+async function directoryExists(path: string): Promise<boolean> {
+  try { return (await stat(path)).isDirectory(); } catch { return false; }
 }
 
 async function defaultClaudeOnPath(): Promise<boolean> {
@@ -131,9 +148,14 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
   const runClaudeMcpRemove = overrides.runClaudeMcpRemove ?? defaultRunClaudeMcpRemove;
   let failed = false;
   for (const { account, scope, cwd } of registered) {
-    const env = { ...process.env, ...launchEnvironment(account) };
-    const display = claudeDisplayCommand(launchEnvironment(account), scope, cwd);
+    const { env, profile } = removalEnvironment(account);
+    const display = claudeDisplayCommand(profile, scope, cwd);
     const label = cwd ? `${account.name} (${scope} scope, ${cwd})` : `${account.name} (${scope} scope)`;
+    if (cwd && !(await directoryExists(cwd))) {
+      // Claude Code looks a local entry up under the directory it runs in, so it cannot be removed without that directory.
+      console.log(`  ${label}: ${cwd} no longer exists, so \`claude mcp remove\` cannot run there. The entry is inert while the directory is gone. To remove it, recreate the directory (mkdir -p ${cwd}) and run headroom uninstall again, or delete projects["${cwd}"].mcpServers.headroom yourself in ${claudeConfigJsonPath(account.location)}`);
+      continue;
+    }
     if (options.dryRun) { console.log(`  (dry run) would run for ${label}: ${display}`); continue; }
     if (!onPath) { console.log(`  \`claude\` was not found on PATH; run this yourself for ${label}: ${display}`); continue; }
     try {
