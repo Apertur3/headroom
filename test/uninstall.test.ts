@@ -39,6 +39,9 @@ const noOverrides: UninstallOverrides = {};
 // These tests assert the POSIX form of the printed commands; on a Windows runner the
 // default platform would print the PowerShell form (covered by its own tests).
 const posix: UninstallOverrides = { platform: "linux" };
+// The POSIX form single-quotes a path with characters outside the shell-safe set,
+// such as the backslashes of a Windows runner's temp directory.
+const posixQuote = (value: string): string => /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 
 async function makeTempHomes(): Promise<{ fakeHome: string; headroomHome: string }> {
   const fakeHome = await mkdtemp(join(tmpdir(), "headroom-uninstall-userhome-"));
@@ -135,7 +138,7 @@ describe("headroom uninstall --dry-run", () => {
       logs = captured.logs;
     });
     const output = logs.join("\n");
-    expect(output).toContain(`(dry run) would run for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${account.location} claude mcp remove --scope user headroom`);
+    expect(output).toContain(`(dry run) would run for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${posixQuote(account.location)} claude mcp remove --scope user headroom`);
   });
 
   it("never deletes the home directory, even with --home", async () => {
@@ -284,7 +287,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
       logs = captured.logs;
     });
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
-    expect(logs.join("\n")).toContain(`run this yourself for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${account.location} claude mcp remove --scope user headroom`);
+    expect(logs.join("\n")).toContain(`run this yourself for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${posixQuote(account.location)} claude mcp remove --scope user headroom`);
   });
 
   it("exits 1 when `claude mcp remove` itself fails", async () => {
@@ -457,8 +460,7 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
     const output = logs.join("\n");
     expect(output).toContain("no longer exists");
-    // A Windows temp path carries backslashes, which the POSIX form single-quotes.
-    const quoted = /^[A-Za-z0-9_@%+=:,./-]+$/.test(gone) ? gone : `'${gone.replaceAll("'", "'\\''")}'`;
+    const quoted = posixQuote(gone);
     expect(output).toContain(`mkdir -p ${quoted}`);
     expect(output).not.toContain(`(cd ${quoted}`);
   });
