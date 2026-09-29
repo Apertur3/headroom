@@ -1,6 +1,8 @@
+import { vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { HostGuardPolicy, HostHealthDeps } from "../src/host-health.js";
 
 // Every test worker starts with HOME and HEADROOM_HOME pointing at fresh
 // temporary directories, so no test can read or write the developer's real
@@ -15,3 +17,20 @@ delete process.env.CLAUDE_CONFIG_DIR;
 // Rendered clocks and day ticks appear in snapshot tests; pin the zone so a
 // runner in UTC and a developer in Europe agree on every frame.
 process.env.TZ = "Europe/Amsterdam";
+
+// Host pressure is a property of the machine running the suite, not of the
+// code under test: a loaded CI runner (load ratio 8+ on macOS) made `run`
+// refuse and `doctor` report FAIL in tests that are not about the host guard.
+// Every call without injected probes therefore sees an idle host. Tests of
+// the guard itself inject their own probes, or mock this module themselves.
+vi.mock("../src/host-health.js", async (original) => {
+  const actual = await original<typeof import("../src/host-health.js")>();
+  const idleHost: HostHealthDeps = {
+    platform: "linux",
+    loadavg: () => [0, 0, 0],
+    cpuCount: () => 1,
+    readFileImpl: (async () => { throw new Error("no PTY probe in tests"); }) as never,
+    listProcessesImpl: async () => [],
+  };
+  return { ...actual, checkHostHealth: (policy?: HostGuardPolicy, deps?: HostHealthDeps) => actual.checkHostHealth(policy, deps ?? idleHost) };
+});
