@@ -166,6 +166,12 @@ function paceSegment(observation: Observation): string {
   return ` burn ${formatRatePercent(burn)}, ok ${sustainableText}`;
 }
 
+/** " STALE 6h": the explicit not-current marker, with the age of the last accepted reading. */
+function staleTag(observation: Observation): string {
+  if (!observation.stale) return "";
+  return observation.stale_age_seconds === undefined ? " STALE" : ` STALE ${formatResetsIn(Math.max(60, observation.stale_age_seconds))}`;
+}
+
 function vendorWindowNote(observation: Observation): string {
   if (observation.metadata?.vendor_inconsistent) return "vendor readings inconsistent, holding";
   if (observation.metadata?.vendor_window_held) return "new window unconfirmed, holding";
@@ -200,7 +206,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
     // A windowless row's borrowed reading names its source window first
     // ("last wk 41% at ...") the same way the compact form does.
     const known = observation.last_known ? `; last ${lastKnownWindowPrefix(observation.last_known)}${Math.round(observation.last_known.used_percent)}% at ${formatClockTime(new Date(observation.last_known.observed_at))}, ${lastKnownAge(observation.last_known)} ago` : "";
-    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${overdue}${inconsistent}${evidence}`;
+    return `${label(observation)} UNKNOWN (${observation.reason ?? reason}${known})${staleTag(observation)}${overdue}${inconsistent}${evidence}`;
   }
   const seconds = resetInfo.resets_in_seconds;
   const countdown = seconds === null ? "" : ` (in ${formatResetsIn(seconds)})`;
@@ -552,7 +558,7 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
         // its last known reading (if any survived the 7-day lookback) takes
         // that column instead -- a trend beside the "-" used cell, not a
         // substitute for it.
-        const known = decision.state === "UNKNOWN" && observation.last_known ? lastKnownCompact(observation.last_known) : "";
+        const known = decision.state === "UNKNOWN" ? (observation.last_known ? lastKnownCompact(observation.last_known) : observation.stale ? `STALE${observation.stale_age_seconds === undefined ? "" : ` ${formatResetsIn(Math.max(60, observation.stale_age_seconds))}`}` : "") : "";
         rows.push({
           meter: index === 0 ? shortMeter(observation) : "",
           ...(isCredits(observation) ? { text: creditsCell(observation, now) } : {}),

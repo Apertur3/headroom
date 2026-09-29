@@ -202,6 +202,12 @@ function wrap(text: string, width: number): string[] {
   if (remaining) lines.push(remaining);
   return lines;
 }
+/** " (STALE 6h)": the explicit not-current marker beside an old number. */
+function staleNote(row: Observation): string {
+  if (!row.stale) return "";
+  return row.stale_age_seconds === undefined ? " (STALE)" : ` (STALE ${formatResetsIn(Math.max(60, row.stale_age_seconds))})`;
+}
+
 function clock(date: string | Date): string {
   const value = new Date(date);
   return Number.isFinite(value.getTime()) ? new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(value) : "?";
@@ -432,7 +438,7 @@ function windowLines(row: Observation, model: DashboardModel, view: DashboardVie
     const known = row.last_known ?? (row.quantity?.unit === "percent" ? { used_percent: row.quantity.used, observed_at: row.observed_at, window_minutes: undefined } : null);
     const knownWindow = known?.window_minutes !== undefined ? `${label({ ...row, window: { kind: "fixed", minutes: known.window_minutes, enforcement: "hard" } })} ` : "";
     const diag = (sharedReason || !view.verbose) ? "" : `${explainUnknown(row.reason ?? decision.reason).text} `;
-    lines.push(...wrap(`    ${diag}last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}`, view.width));
+    lines.push(...wrap(`    ${diag}last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}${staleNote(row)}`, view.width));
   }
   if (view.verbose) {
     const rate = (value: number | null | undefined): string => value == null ? "?" : formatRatePercent(value);
@@ -574,7 +580,7 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
       for (const u of unknownRows) {
         const known = u.last_known ?? (u.quantity?.unit === "percent" ? { used_percent: u.quantity.used, observed_at: u.observed_at, window_minutes: undefined } : null);
         const knownWindow = known?.window_minutes !== undefined ? `${labelForMinutes(known.window_minutes)} ` : "";
-        lines.push(...wrap(`    last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}`, view.width));
+        lines.push(...wrap(`    last ${known ? `${knownWindow}${Math.round(known.used_percent)}% at ${clock(known.observed_at)}` : "reading unavailable"}${staleNote(u)}`, view.width));
       }
     }
   }

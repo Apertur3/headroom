@@ -1733,6 +1733,32 @@ export class HeadroomStore {
       });
   }
 
+  /**
+   * Every windowed meter lane that has ever had an accepted reading, with the
+   * time of its newest fresh or not_enforced one. Manual and pasted rows are
+   * operator facts, not a lane the vendor is expected to keep answering, and a
+   * synthetic exhausted report is not a reading. A lane retired after its last
+   * accepted reading is no longer expected. Feeds the stale-lane canary.
+   */
+  laneLastAccepted(): Array<{ principal_id: string; meter_id: string; window_minutes: number; last_accepted_at: string }> {
+    const lanes = this.prepared(`SELECT principal_id, meter_id, CAST(json_extract(window_json, '$.minutes') AS INTEGER) AS window_minutes, MAX(fetched_at) AS last_accepted_at
+      FROM observations
+      WHERE freshness IN ('fresh', 'not_enforced') AND source NOT IN ('manual', 'paste')
+        AND json_extract(window_json, '$.minutes') IS NOT NULL
+        AND COALESCE(json_extract(metadata_json, '$.exhausted'), 0) = 0
+      GROUP BY principal_id, meter_id, window_minutes`).all() as Array<{ principal_id: string; meter_id: string; window_minutes: number; last_accepted_at: string }>;
+    const retired = new Map((this.prepared(`SELECT meter_id, CAST(json_extract(window_json, '$.minutes') AS INTEGER) AS window_minutes, MAX(fetched_at) AS at
+      FROM observations WHERE json_extract(metadata_json, '$.retired') = 1 AND json_extract(window_json, '$.minutes') IS NOT NULL
+      GROUP BY meter_id, window_minutes`).all() as Array<{ meter_id: string; window_minutes: number; at: string }>).map((row) => [`${row.meter_id}|${row.window_minutes}`, row.at]));
+    return lanes.filter((lane) => { const at = retired.get(`${lane.meter_id}|${lane.window_minutes}`); return at === undefined || at < lane.last_accepted_at; });
+  }
+
+  /** The reason on the newest failed poll of this meter after `since`, if any. */
+  laneLastFailureReason(meterId: string, since: string): string | undefined {
+    const row = this.prepared("SELECT reason FROM observations WHERE meter_id = ? AND freshness = 'failed' AND fetched_at > ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId, since) as { reason?: string | null } | undefined;
+    return row?.reason ?? undefined;
+  }
+
   /** Compatibility helper for callers that explicitly need one newest row. */
   latest(meterId: string): StoredObservation | undefined {
     const row = this.prepared("SELECT * FROM observations WHERE meter_id = ? ORDER BY fetched_at DESC, id DESC LIMIT 1").get(meterId);

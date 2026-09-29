@@ -2,12 +2,15 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { runLaneCanary, type CanaryItem } from "./canary.js";
+import { readPolicy } from "./config.js";
 import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
+import { readAccountsOrEmpty } from "./registry.js";
 import { HeadroomStore } from "./store.js";
-import type { EventKind, HeadroomEvent, NotifyDelivery, Observation, StoredObservation } from "./types.js";
+import type { Account, EventKind, HeadroomEvent, NotifyDelivery, Observation, StoredObservation } from "./types.js";
 
 /** Telegram rejects a message body over 4096 characters. 3800 leaves room for
  * the batch header a combined quiet-hours message adds. */
@@ -439,6 +442,8 @@ export interface NotifyOptions {
   run?: CommandRunner;
   platform?: NodeJS.Platform;
   log?: (message: string) => Promise<void>;
+  /** Test seams for the stale-lane canary; production reads accounts.toml and policy.toml. */
+  canary?: { accounts?: Account[]; staleAfterHours?: number; minIntervalMs?: number };
 }
 
 /**
@@ -935,7 +940,8 @@ function sourceHealthItemForChannel(store: HeadroomStore, channel: ChannelName, 
 }
 
 function bypassesQuietHours(item: NotifyItem): boolean {
-  return item.kind === "plan_changed" && item.text.startsWith("🚨 PLAN DOWNGRADED:")
+  return item.kind === "lane_stale"
+    || item.kind === "plan_changed" && item.text.startsWith("🚨 PLAN DOWNGRADED:")
     || item.kind === "plan_changed" && item.text.startsWith("📈 plan restored")
     || item.kind === "plan_downgrade_reminder"
     || item.kind === "free_reset_used" && item.text === "🚨 A reset credit was just spent on the free plan";
@@ -1000,17 +1006,36 @@ export function deliverNotifications(store: HeadroomStore, options: NotifyOption
  * batch would go out twice. */
 const running = new Map<string, Promise<NotifyRun>>();
 
+async function evaluateCanary(store: HeadroomStore, options: NotifyOptions, home: string, now: Date, log: (message: string) => Promise<void>): Promise<CanaryItem[]> {
+  try {
+    const accounts = options.canary?.accounts ?? await readAccountsOrEmpty();
+    const staleAfterHours = options.canary?.staleAfterHours ?? (await readPolicy().catch(() => undefined))?.canary_stale_after_hours ?? 6;
+    return await runLaneCanary(store, { home, now, accounts, staleAfterHours, minIntervalMs: options.canary?.minIntervalMs });
+  } catch (error: unknown) {
+    await log(`stale-lane canary failed: ${scrubSecrets(error, [])}`).catch(() => undefined);
+    return [];
+  }
+}
+
 async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promise<NotifyRun> {
   const now = options.now ?? new Date();
   const home = options.home ?? headroomHome();
+  const log = options.log ?? ((message: string) => appendDaemonLog(message, home));
+  // The stale-lane canary runs before, and independently of, the notify
+  // config: it writes the inbox whether or not any channel exists or works.
+  const canaryItems = await evaluateCanary(store, options, home, now, log);
   const config = options.config ?? await readNotifyConfig(home);
   if (!config || !config.channels.length) return { configured: false, queued: 0, sent: 0, quiet: false, channels: [] };
-  const log = options.log ?? ((message: string) => appendDaemonLog(message, home));
   const channels = await prepareChannelsInternal(config, options);
   for (const channel of channels) if (!channel.ready) await logDisabledOnce(store, log, channel);
   const ready = channels.filter((channel) => channel.ready);
   const status = channels.map(({ channel, ready: isReady, detail }) => ({ channel, ready: isReady, detail }));
   if (!ready.length) return { configured: true, queued: 0, sent: 0, quiet: false, channels: status };
+  // Straight into the ledger: canary items skip wantsEvent, the events_off
+  // switches and the source-health gate by construction.
+  for (const channel of ready) for (const item of canaryItems) {
+    if (!store.notifyDelivery(item.id, channel.channel)) store.notifyEnqueue(item.id, channel.channel, encodeItem({ ...item, delivery_identity: `${item.kind}:${item.meter}` }), now.toISOString());
+  }
   const queued = store.enqueueNotificationEvents((events) => {
     const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now)];
     // Source-health hysteresis runs every pass, not just when this poll

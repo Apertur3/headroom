@@ -287,3 +287,7 @@ preset and breaks through quiet hours once, with one reminder after 24 hours if 
 is still unacknowledged. Dispatches stay refused until `headroom ack plan <principal>`
 confirms an intended downgrade, or until the vendor reports the paid plan again.
 A reset credit spent while the plan is free is also delivered immediately.
+
+## Stale-lane canary
+
+Independent of the event list above. A meter lane that has had neither a fresh reading nor an explicit `not_enforced` reading for longer than `stale_after_hours` (policy.toml `[canary]`, default 6) raises `lane_stale`, repeated at most once per 24 hours while it stays stale, and one `lane_recovered` once it has been fresh again for 30 minutes. `events_on`/`events_off` and quiet hours do not apply: the alert is always written to the inbox (session `headroom-canary` and every session that already has an inbox, read with `headroom inbox` or `quota_inbox`), is sent to every channel that works, and is listed by `headroom doctor` (FAIL) whether or not any channel is configured.

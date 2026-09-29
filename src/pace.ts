@@ -199,5 +199,16 @@ export function withStatusInfo(
 ): Array<Observation & BurnInfo & { sustainable_percent_per_hour: number | null; last_known: LastKnownReading | null } & ResetsIn> {
   const served = withEffectiveFreshness(observations, stalenessMinutes, now);
   return withResetsIn(withLastKnown(withPaceInfo(served, burn, now), lastKnown), now)
-    .map((item) => ({ ...item, status_enriched_at: now.toISOString() }));
+    .map((item) => ({ ...item, ...staleMark(item, now), status_enriched_at: now.toISOString() }));
+}
+
+/** The explicit "this is not current" marker: any windowed reading served
+ * stale or failed carries `stale: true` and, when known, how old its last
+ * accepted reading is. Absent on a fresh or not_enforced row. */
+function staleMark(item: Observation & { last_known?: LastKnownReading | null }, now: Date): { stale?: true; stale_age_seconds?: number } {
+  if (item.freshness !== "stale" && item.freshness !== "failed") return {};
+  if (item.window?.kind === "state" || item.window?.kind === "count") return {};
+  const own = item.freshness === "stale" ? (now.getTime() - Date.parse(item.fetched_at)) / 1000 : Number.NaN;
+  const age = item.last_known?.age_seconds ?? own;
+  return { stale: true, ...(Number.isFinite(age) ? { stale_age_seconds: Math.max(0, Math.floor(age)) } : {}) };
 }
