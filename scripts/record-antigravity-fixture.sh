@@ -10,6 +10,7 @@
 #
 # Output: test/fixtures/antigravity/<YYYY-MM-DD>-<label>.json (mode 0600).
 # Run this only while agy is up (the engine does not start a competing agy).
+# The engine binary must already be built (bash scripts/build-native-engine.sh).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,15 +45,59 @@ trap 'rm -f "$principals"' EXIT
 printf '[{"id":"antigravity","vendor":"antigravity","location":"%s"}]\n' "$location" > "$principals"
 
 if (( dry_run == 1 )); then
-  echo "would run: bash scripts/build-native-engine.sh"
+  echo "would check: $engine exists and is newer than engine sources (never builds)"
   echo "would run: $engine observe --principals <temp principals json> --record $out"
   exit 0
 fi
 
 [[ ! -e "$out" ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
-bash scripts/build-native-engine.sh
+
+# This script never builds: a build writes trees, logs and digests well beyond
+# the fixture. Stop and print the command instead.
+stale=""
+if [[ ! -x "$engine" ]]; then
+  stale="missing"
+elif [[ -n "$(find engine/Sources/HeadroomEngine engine/Package.swift engine/Package.resolved scripts/build-native-engine.sh -type f -newer "$engine" -print -quit 2>/dev/null)" ]]; then
+  stale="older than the engine sources"
+fi
+if [[ -n "$stale" ]]; then
+  echo "$engine is $stale. Build it first, then re-run:" >&2
+  echo "  bash scripts/build-native-engine.sh" >&2
+  exit 1
+fi
+
 mkdir -p "$out_dir"
 umask 077
-"$engine" observe --principals "$principals" --record "$out"
+
+# Run the engine in its own process group (set -m) and forward INT/TERM/HUP to
+# that group, then wait for it, so nothing from this run outlives the wrapper.
+set -m
+"$engine" observe --principals "$principals" --record "$out" &
+engine_pid=$!
+got_signal=0
+forward() {
+  got_signal=1
+  kill -TERM -- "-$engine_pid" 2>/dev/null || true
+}
+trap forward INT TERM HUP
+status=0
+wait "$engine_pid" || status=$?
+grace=0
+while kill -0 "$engine_pid" 2>/dev/null; do
+  # `wait` returns early when a trapped signal arrives; keep reaping.
+  wait "$engine_pid" 2>/dev/null || status=$?
+  if (( got_signal == 1 )); then
+    grace=$((grace + 1))
+    if (( grace > 50 )); then kill -KILL -- "-$engine_pid" 2>/dev/null || true; fi
+    sleep 0.1
+  fi
+done
+trap - INT TERM HUP
+set +m
+if (( got_signal == 1 )); then
+  echo "interrupted; engine stopped" >&2
+  exit 130
+fi
+(( status == 0 )) || { echo "engine exited with status $status" >&2; exit "$status"; }
 echo "wrote $out (mode $(stat -f %Lp "$out" 2>/dev/null || stat -c %a "$out"))"
 echo "review it, then run scripts/privacy-sweep.sh before committing"

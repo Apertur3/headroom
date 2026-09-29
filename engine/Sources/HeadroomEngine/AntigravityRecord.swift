@@ -8,8 +8,10 @@ import Foundation
 /// is built from an allowlist of value types (`AntigravityRecordFile` and its
 /// members). Anything not modelled there, including account e-mail, plan
 /// names, user/project/installation IDs and the principal's own id, cannot
-/// reach the file. Free-text fields go through `HeadroomEngine.redact` and a
-/// length cap as a second guard.
+/// reach the file. String CONTENTS are constrained too: the file carries no
+/// vendor or error free text. Labels and ids survive only when they match a
+/// strict pattern (else "redacted"), descriptions are dropped unless purely
+/// structured, and errors are a fixed code enum.
 struct AntigravityRecordFile: Codable, Equatable {
     var schema: Int
     var recorded_at: String
@@ -26,13 +28,15 @@ struct AntigravityRecordPrincipal: Codable, Equatable {
     /// local | remote
     var source: String?
     var account: String
-    var summary_description: String?
     var buckets: [AntigravityRecordBucket]
     var model_quotas: [AntigravityRecordModelQuota]
+    /// A fixed `AntigravityRecordError` code, never vendor text.
     var error: String?
+    /// Schema drift found while reading the snapshot, e.g. "missing field: groups".
+    var extraction_errors: [String]
 
     enum CodingKeys: String, CodingKey {
-        case principal, vendor, payload_kind, source, account, summary_description, buckets, model_quotas, error
+        case principal, vendor, payload_kind, source, account, buckets, model_quotas, error, extraction_errors
     }
 
     func encode(to encoder: Encoder) throws {
@@ -42,10 +46,39 @@ struct AntigravityRecordPrincipal: Codable, Equatable {
         try c.encode(payload_kind, forKey: .payload_kind)
         try c.encode(source, forKey: .source)
         try c.encode(account, forKey: .account)
-        try c.encode(summary_description, forKey: .summary_description)
         try c.encode(buckets, forKey: .buckets)
         try c.encode(model_quotas, forKey: .model_quotas)
         try c.encode(error, forKey: .error)
+        try c.encode(extraction_errors, forKey: .extraction_errors)
+    }
+}
+
+/// Fixed error vocabulary. Nothing from a thrown error's message is recorded.
+enum AntigravityRecordError: String {
+    case notRunning = "not_running"
+    case missingCSRFToken = "missing_csrf_token"
+    case portDetectionFailed = "port_detection_failed"
+    case apiError = "api_error"
+    case parseFailed = "parse_failed"
+    case timedOut = "timed_out"
+    case authenticationRequired = "authentication_required"
+    case accountMismatch = "account_mismatch"
+    case noStatus = "no_status"
+    case vendorNotRecorded = "vendor_not_recorded"
+    case other
+
+    static func code(for error: Error) -> AntigravityRecordError {
+        guard let probe = error as? AntigravityStatusProbeError else { return .other }
+        switch probe {
+        case .notRunning: return .notRunning
+        case .missingCSRFToken: return .missingCSRFToken
+        case .portDetectionFailed: return .portDetectionFailed
+        case .apiError: return .apiError
+        case .parseFailed: return .parseFailed
+        case .timedOut: return .timedOut
+        case .authenticationRequired: return .authenticationRequired
+        case .accountMismatch: return .accountMismatch
+        }
     }
 }
 
@@ -119,10 +152,10 @@ struct AntigravityRecordInput {
         var resetDescription: String?
     }
     var isQuotaSummary: Bool
-    var summaryDescription: String?
     var isLocal: Bool
     var buckets: [Bucket]
     var models: [Model]
+    var extractionErrors: [String] = []
 }
 
 enum AntigravityRecorder {
@@ -146,72 +179,152 @@ enum AntigravityRecorder {
             payload_kind: kind,
             source: input.isLocal ? "local" : "remote",
             account: redactedMarker,
-            summary_description: input.summaryDescription.map(text),
             buckets: input.buckets.map { bucket in
                 AntigravityRecordBucket(
-                    group: text(bucket.group),
-                    bucket_id: text(bucket.bucketID),
-                    name: text(bucket.displayName),
+                    group: label(bucket.group),
+                    bucket_id: identifier(bucket.bucketID),
+                    name: label(bucket.displayName),
                     disabled: bucket.disabled,
                     remaining_fraction: bucket.remainingFraction,
                     usage_known: !bucket.disabled && bucket.remainingFraction != nil,
                     reset_time: HeadroomEngine.iso(bucket.resetTime),
-                    reset_description: bucket.resetDescription.map(text))
+                    reset_description: structuredReset(bucket.resetDescription))
             },
             model_quotas: input.models.map { model in
                 AntigravityRecordModelQuota(
-                    label: text(model.label),
-                    model_id: text(model.modelID),
+                    label: label(model.label),
+                    model_id: identifier(model.modelID),
                     remaining_fraction: model.remainingFraction,
                     reset_time: HeadroomEngine.iso(model.resetTime),
-                    reset_description: model.resetDescription.map(text))
+                    reset_description: structuredReset(model.resetDescription))
             },
-            error: nil)
+            error: nil,
+            extraction_errors: input.extractionErrors)
     }
 
-    static func failedRecord(index: Int, vendor: String, message: String) -> AntigravityRecordPrincipal {
+    static func failedRecord(index: Int, vendor: String, code: AntigravityRecordError) -> AntigravityRecordPrincipal {
         AntigravityRecordPrincipal(
             principal: "principal-\(index)", vendor: vendor, payload_kind: "none", source: nil,
-            account: redactedMarker, summary_description: nil, buckets: [], model_quotas: [],
-            error: text(message))
+            account: redactedMarker, buckets: [], model_quotas: [],
+            error: code.rawValue, extraction_errors: [])
     }
 
-    static func text(_ value: String) -> String {
-        HeadroomEngine.redact(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    private static func matches(_ value: String, _ pattern: String) -> Bool {
+        value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// True for anything shaped like a secret or an id: long hex, UUID, JWT,
+    /// long base64/alnum runs, `sk-` keys, long digit runs.
+    private static func looksLikeToken(_ value: String) -> Bool {
+        matches(value, #"[0-9A-Fa-f]{16,}"#)
+            || matches(value, #"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"#)
+            || matches(value, #"[A-Za-z0-9+/_-]{20,}"#)
+            || matches(value, #"[0-9]{9,}"#)
+            || matches(value, #"(?i)eyJ|sk-|bearer|token|cookie|csrf|secret|password|session"#)
+    }
+
+    /// Display names (group, bucket, model label): strict charset and length,
+    /// no token or id shapes, else "redacted".
+    static func label(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard matches(trimmed, #"^[A-Za-z0-9 ._()/+-]{1,64}$"#), !looksLikeToken(trimmed) else { return redactedMarker }
+        return trimmed
+    }
+
+    /// Bucket and model ids: same rule, no spaces.
+    static func identifier(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard matches(trimmed, #"^[A-Za-z0-9._/-]{1,64}$"#), !looksLikeToken(trimmed) else { return redactedMarker }
+        return trimmed
+    }
+
+    /// Reset descriptions are kept only in the pure "Resets in 2d 3h" shape.
+    /// Anything else is vendor free text and is dropped (null).
+    static func structuredReset(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        return matches(trimmed, #"^[Rr]esets in( [0-9]{1,4} ?(d|h|m|s|days?|hours?|hrs?|minutes?|mins?|seconds?|secs?))+$"#) ? trimmed : nil
     }
 
     /// Reads the probe snapshot. `quotaSummary` is internal to CodexBarCore, so
     /// it is reached by reflection and only its allowlisted scalar members are
     /// copied out (never the whole object, and never the account fields).
+    /// Reflection is fragile against upstream drift, so every expected member
+    /// must be present with the expected type; each miss is reported in
+    /// `extractionErrors` instead of defaulting to a plausible value.
     static func input(from status: AntigravityStatusSnapshot) -> AntigravityRecordInput {
-        var buckets: [AntigravityRecordInput.Bucket] = []
-        var description: String?
-        var isSummary = false
-        if let summary = child(status, "quotaSummary"), let unwrapped = unwrap(summary) {
-            isSummary = true
-            description = child(unwrapped, "description").flatMap(unwrap) as? String
-            for group in (child(unwrapped, "groups").flatMap(unwrap) as? [Any]) ?? [] {
-                let groupName = (child(group, "displayName").flatMap(unwrap) as? String) ?? ""
-                for bucket in (child(group, "buckets").flatMap(unwrap) as? [Any]) ?? [] {
-                    buckets.append(.init(
-                        group: groupName,
-                        bucketID: (child(bucket, "bucketId").flatMap(unwrap) as? String) ?? "",
-                        displayName: (child(bucket, "displayName").flatMap(unwrap) as? String) ?? "",
-                        remainingFraction: child(bucket, "remainingFraction").flatMap(unwrap) as? Double,
-                        resetTime: child(bucket, "resetTime").flatMap(unwrap) as? Date,
-                        resetDescription: child(bucket, "resetDescription").flatMap(unwrap) as? String,
-                        disabled: (child(bucket, "disabled").flatMap(unwrap) as? Bool) ?? false))
-                }
-            }
-        }
         let models = status.modelQuotas.map {
             AntigravityRecordInput.Model(label: $0.label, modelID: $0.modelId, remainingFraction: $0.remainingFraction, resetTime: $0.resetTime, resetDescription: $0.resetDescription)
         }
-        return AntigravityRecordInput(isQuotaSummary: isSummary, summaryDescription: description, isLocal: status.source == .local, buckets: buckets, models: models)
+        var result = extractSummary(from: status)
+        result.models = models
+        result.isLocal = status.source == .local
+        return result
     }
 
-    private static func child(_ value: Any, _ label: String) -> Any? {
-        Mirror(reflecting: value).children.first { $0.label == label }?.value
+    /// Reflection half of `input(from:)`, split out so tests can hand it a
+    /// deliberately mismatched mirror type.
+    static func extractSummary(from host: Any) -> AntigravityRecordInput {
+        var out = AntigravityRecordInput(isQuotaSummary: false, isLocal: false, buckets: [], models: [])
+        var errors: [String] = []
+        guard let summary = member(host, "quotaSummary", &errors) else {
+            out.extractionErrors = errors
+            return out
+        }
+        guard let unwrapped = unwrap(summary) else { return out } // present and nil: not a quota summary
+        out.isQuotaSummary = true
+        _ = member(unwrapped, "description", &errors)
+        var groupList: [Any] = []
+        if let raw = member(unwrapped, "groups", &errors).flatMap(unwrap) {
+            if let list = raw as? [Any] { groupList = list } else { errors.append("wrong type: groups") }
+        }
+        for group in groupList {
+            let groupName = string(group, "displayName", &errors) ?? ""
+            var bucketList: [Any] = []
+            if let raw = member(group, "buckets", &errors).flatMap(unwrap) {
+                if let list = raw as? [Any] { bucketList = list } else { errors.append("wrong type: buckets") }
+            }
+            for bucket in bucketList {
+                out.buckets.append(.init(
+                    group: groupName,
+                    bucketID: string(bucket, "bucketId", &errors) ?? "",
+                    displayName: string(bucket, "displayName", &errors) ?? "",
+                    remainingFraction: optional(bucket, "remainingFraction", Double.self, &errors),
+                    resetTime: optional(bucket, "resetTime", Date.self, &errors),
+                    resetDescription: optional(bucket, "resetDescription", String.self, &errors),
+                    // A missing `disabled` is drift, never "enabled": fail closed to true.
+                    disabled: required(bucket, "disabled", Bool.self, &errors) ?? true))
+            }
+        }
+        var seen = Set<String>()
+        out.extractionErrors = errors.filter { seen.insert($0).inserted }
+        return out
+    }
+
+    /// The stored property's value (possibly an Optional wrapper), or nil with
+    /// an error recorded when the member does not exist.
+    private static func member(_ value: Any, _ label: String, _ errors: inout [String]) -> Any? {
+        guard let found = Mirror(reflecting: value).children.first(where: { $0.label == label }) else {
+            errors.append("missing field: \(label)")
+            return nil
+        }
+        return found.value
+    }
+
+    private static func required<T>(_ value: Any, _ label: String, _ type: T.Type, _ errors: inout [String]) -> T? {
+        guard let raw = member(value, label, &errors) else { return nil }
+        guard let typed = unwrap(raw) as? T else { errors.append("wrong type: \(label)"); return nil }
+        return typed
+    }
+
+    private static func string(_ value: Any, _ label: String, _ errors: inout [String]) -> String? {
+        required(value, label, String.self, &errors)
+    }
+
+    /// Member must exist; a nil value is legitimate, a non-nil wrong type is not.
+    private static func optional<T>(_ value: Any, _ label: String, _ type: T.Type, _ errors: inout [String]) -> T? {
+        guard let raw = member(value, label, &errors), let inner = unwrap(raw) else { return nil }
+        guard let typed = inner as? T else { errors.append("wrong type: \(label)"); return nil }
+        return typed
     }
 
     private static func unwrap(_ value: Any) -> Any? {
@@ -226,18 +339,19 @@ enum AntigravityRecorder {
         return try encoder.encode(file) + Data("\n".utf8)
     }
 
-    /// Creates the file with mode 0600 from the first byte (never widened then
-    /// narrowed) and re-asserts the mode in case the file already existed.
+    /// Creates the file with mode 0600 from the first byte. O_EXCL (and no
+    /// O_TRUNC) means an existing file is never touched, even with concurrent
+    /// writers or a direct engine call.
     static func write(_ data: Data, to path: String) throws {
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, fileMode)
-        guard fd >= 0 else { throw RecordError.cannotWrite }
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, fileMode)
+        guard fd >= 0 else { throw errno == EEXIST ? RecordError.exists : RecordError.cannotWrite }
         defer { close(fd) }
         guard fchmod(fd, fileMode) == 0 else { throw RecordError.cannotWrite }
         let written = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, data.count) }
         guard written == data.count else { throw RecordError.cannotWrite }
     }
 
-    enum RecordError: Error { case cannotWrite }
+    enum RecordError: Error { case cannotWrite, exists }
 
     /// Runs the engine's normal wait/probe path for one principal and returns
     /// the record. The fetch closure keeps the last parsed status alongside the
@@ -254,10 +368,10 @@ enum AntigravityRecorder {
                     box.set(status)
                     return fetch
                 })
-            guard let status = box.get() else { return failedRecord(index: index, vendor: "antigravity", message: "no status returned") }
+            guard let status = box.get() else { return failedRecord(index: index, vendor: "antigravity", code: .noStatus) }
             return principalRecord(index: index, input: input(from: status))
         } catch {
-            return failedRecord(index: index, vendor: "antigravity", message: error.localizedDescription)
+            return failedRecord(index: index, vendor: "antigravity", code: .code(for: error))
         }
     }
 
@@ -270,10 +384,17 @@ enum AntigravityRecorder {
             if principal.vendor == "antigravity" {
                 records.append(await record(index: index))
             } else {
-                records.append(failedRecord(index: index, vendor: principal.vendor == "codex" ? "codex" : "unknown", message: "vendor not recorded"))
+                records.append(failedRecord(index: index, vendor: principal.vendor == "codex" ? "codex" : "unknown", code: .vendorNotRecorded))
             }
         }
-        await ProviderCLISessionLifecycle.shutdownPersistentSessions()
+        // Deliberately no `ProviderCLISessionLifecycle.shutdownPersistentSessions()`
+        // here. Record mode only calls `AntigravityStatusProbe.fetch()`, which
+        // on macOS reads the process table via sysctl and talks to the already
+        // running language server over localhost. It launches no agy session
+        // (that is `AgyBootstrap`, used only by `observe`), so there is nothing
+        // of ours to shut down, and the shutdown would create CodexBar's
+        // `~/.codexbar/antigravity/agy-session.lock`, rewrite session records
+        // and kill sessions owned by other tools.
         let file = AntigravityRecordFile(
             schema: 1,
             recorded_at: HeadroomEngine.iso(Date())!,
@@ -282,9 +403,17 @@ enum AntigravityRecorder {
             principals: records)
         do {
             try write(try encode(file), to: outputPath)
+        } catch RecordError.exists {
+            FileHandle.standardError.write(Data("record: output file already exists; refusing to overwrite\n".utf8))
+            return 4
         } catch {
             FileHandle.standardError.write(Data("record: could not write output file\n".utf8))
             return 4
+        }
+        let drifted = records.filter { !$0.extraction_errors.isEmpty }.count
+        if drifted > 0 {
+            FileHandle.standardError.write(Data("record: schema drift in \(drifted) principal(s); see extraction_errors in the output; do not use it as a fixture\n".utf8))
+            return 5
         }
         let usable = records.filter { $0.vendor == "antigravity" && $0.error == nil }.count
         FileHandle.standardOutput.write(Data("recorded \(usable) antigravity principal(s)\n".utf8))

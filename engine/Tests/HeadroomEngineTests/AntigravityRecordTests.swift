@@ -10,7 +10,6 @@ final class AntigravityRecordTests: XCTestCase {
     private func syntheticInput() -> AntigravityRecordInput {
         AntigravityRecordInput(
             isQuotaSummary: true,
-            summaryDescription: "Quota for user@example.com",
             isLocal: true,
             buckets: [
                 .init(group: "Gemini Models", bucketID: "gemini-5h", displayName: "5 hour", remainingFraction: nil, resetTime: nil, resetDescription: nil, disabled: true),
@@ -39,7 +38,6 @@ final class AntigravityRecordTests: XCTestCase {
             schema: 1, recorded_at: "2026-09-30T00:00:00Z", engine_version: "0.1.0", probe_version: "v0.56.4",
             principals: [AntigravityRecorder.principalRecord(index: 0, input: syntheticInput())])
         let text = String(decoding: try AntigravityRecorder.encode(file), as: UTF8.self)
-        XCTAssertFalse(text.contains("user@example.com"))
         XCTAssertTrue(text.contains("\"account\" : \"redacted\""))
         XCTAssertTrue(text.contains("\"principal\" : \"principal-0\""))
         XCTAssertTrue(text.contains("\"remaining_fraction\" : null"))
@@ -85,14 +83,94 @@ final class AntigravityRecordTests: XCTestCase {
         XCTAssertNotNil(record.buckets[1].reset_time)
     }
 
-    func testFileIsWrittenWithMode0600() throws {
+    func testFileIsCreatedWithMode0600() throws {
         let path = NSTemporaryDirectory() + "headroom-record-\(UUID().uuidString).json"
         defer { try? FileManager.default.removeItem(atPath: path) }
-        // Pre-existing wide file must be narrowed.
-        FileManager.default.createFile(atPath: path, contents: Data(), attributes: [.posixPermissions: 0o644])
         try AntigravityRecorder.write(Data("{}\n".utf8), to: path)
         let mode = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o600)
+    }
+
+    func testExistingFileIsNeverOverwritten() throws {
+        let path = NSTemporaryDirectory() + "headroom-record-\(UUID().uuidString).json"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        try Data("keep me".utf8).write(to: URL(fileURLWithPath: path))
+        XCTAssertThrowsError(try AntigravityRecorder.write(Data("{}\n".utf8), to: path)) { error in
+            XCTAssertEqual(error as? AntigravityRecorder.RecordError, .exists)
+        }
+        XCTAssertEqual(try String(contentsOfFile: path, encoding: .utf8), "keep me")
+    }
+
+    private let hostile = [
+        "csrf_token=abc123def456", "Cookie: session=abcdef", "someone@example.com",
+        "123e4567-e89b-12d3-a456-426614174000", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+        "Name Surname wrote this", "0123456789abcdef0123456789abcdef", "QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu",
+    ]
+
+    func testHostileStringsNeverReachTheFile() throws {
+        var buckets: [AntigravityRecordInput.Bucket] = []
+        var models: [AntigravityRecordInput.Model] = []
+        // A plain-words name matches the label charset by design (real labels
+        // are words), so it is only fed to free-text description fields, which
+        // are dropped outright.
+        for h in hostile {
+            let label = h.hasPrefix("Name Surname") ? "Weekly" : h
+            buckets.append(.init(group: label, bucketID: label, displayName: label, remainingFraction: 0.5, resetTime: reset, resetDescription: h, disabled: false))
+            models.append(.init(label: label, modelID: label, remainingFraction: 0.5, resetTime: reset, resetDescription: h))
+        }
+        let input = AntigravityRecordInput(isQuotaSummary: true, isLocal: true, buckets: buckets, models: models)
+        let failed = hostile.map { AntigravityRecorder.failedRecord(index: 1, vendor: "antigravity", code: AntigravityRecordError.code(for: AntigravityStatusProbeError.apiError($0))) }
+        let file = AntigravityRecordFile(schema: 1, recorded_at: "x", engine_version: "x", probe_version: "x",
+                                         principals: [AntigravityRecorder.principalRecord(index: 0, input: input)] + failed)
+        let text = String(decoding: try AntigravityRecorder.encode(file), as: UTF8.self)
+        for h in hostile {
+            XCTAssertFalse(text.contains(h), h)
+        }
+        for fragment in ["csrf", "session=", "example.com", "123e4567", "eyJ", "Surname", "0123456789abcdef", "QWxhZGRpbjpv"] {
+            XCTAssertFalse(text.contains(fragment), fragment)
+        }
+        XCTAssertTrue(text.contains("redacted"))
+        XCTAssertTrue(text.contains("\"error\" : \"api_error\""))
+    }
+
+    func testBenignLabelsAndStructuredResetSurvive() {
+        XCTAssertEqual(AntigravityRecorder.label("Claude and GPT models"), "Claude and GPT models")
+        XCTAssertEqual(AntigravityRecorder.label("Gemini 3 Pro (High)"), "Gemini 3 Pro (High)")
+        XCTAssertEqual(AntigravityRecorder.identifier("gemini-weekly"), "gemini-weekly")
+        XCTAssertEqual(AntigravityRecorder.structuredReset("Resets in 2d 3h"), "Resets in 2d 3h")
+        XCTAssertNil(AntigravityRecorder.structuredReset("Resets in 2d for user@example.com"))
+    }
+
+    func testErrorsMapToFixedCodes() {
+        XCTAssertEqual(AntigravityRecordError.code(for: AntigravityStatusProbeError.timedOut), .timedOut)
+        XCTAssertEqual(AntigravityRecordError.code(for: AntigravityStatusProbeError.accountMismatch(expected: "user@example.com", found: "other@example.com")), .accountMismatch)
+        XCTAssertEqual(AntigravityRecordError.code(for: NSError(domain: "csrf_token=zzz", code: 1)), .other)
+    }
+
+    // Schema drift: mirror types that look like the upstream ones but renamed a field.
+    private struct DriftBucket { var bucketId = "b"; var displayName = "n"; var remainingFraction: Double? = 0.5; var resetTime: Date? = nil; var resetDescription: String? = nil; var isDisabled = false }
+    private struct DriftGroup { var displayName = "g"; var buckets = [DriftBucket()] }
+    private struct DriftSummary { var description: String? = nil; var groupList = [DriftGroup()] }
+    private struct DriftHost { var quotaSummary: DriftSummary? = DriftSummary() }
+    private struct DriftGroup2 { var displayName = "g"; var buckets = [DriftBucket()] }
+    private struct DriftSummary2 { var description: String? = nil; var groups = [DriftGroup2()] }
+    private struct DriftHost2 { var quotaSummary: DriftSummary2? = DriftSummary2() }
+    private struct DriftHost3 { var quota: Int = 0 }
+
+    func testSchemaDriftIsReportedNotDefaulted() {
+        let renamedGroups = AntigravityRecorder.extractSummary(from: DriftHost())
+        XCTAssertEqual(renamedGroups.extractionErrors, ["missing field: groups"])
+        XCTAssertTrue(renamedGroups.buckets.isEmpty)
+
+        let renamedDisabled = AntigravityRecorder.extractSummary(from: DriftHost2())
+        XCTAssertTrue(renamedDisabled.extractionErrors.contains("missing field: disabled"))
+        XCTAssertEqual(renamedDisabled.buckets.first?.disabled, true, "missing disabled must never default to enabled")
+
+        let renamedSummary = AntigravityRecorder.extractSummary(from: DriftHost3())
+        XCTAssertEqual(renamedSummary.extractionErrors, ["missing field: quotaSummary"])
+
+        let record = AntigravityRecorder.principalRecord(index: 0, input: renamedGroups)
+        XCTAssertEqual(record.extraction_errors, ["missing field: groups"])
     }
 
     /// Golden check: the record path must not change what `observe` and
