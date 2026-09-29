@@ -68,11 +68,10 @@ needs the JSON meaning.
   response-time label does not rewrite history. `failed` is an errored,
   timed-out, or contradicted read. `not_enforced` means the vendor confirmed
   there is no cap at all on this window -- it never counts as UNKNOWN and
-  never blocks `can`/`gate`/`fill`. One additive exception: a `not_enforced`
-  row with `metadata.lane_state: "blocked_by_weekly"` (an Antigravity 5h lane
-  whose weekly lane is exhausted) has no capacity, so `can`, `gate` and `plan`
-  refuse it for that lane (a plain refusal, never `unknown: true`); its
-  `reason` is `blocked: weekly exhausted until <reset>`.
+  never blocks `can`/`gate`/`fill`. An Antigravity 5h lane blocked by its
+  exhausted weekly lane is never `not_enforced`: it is `failed` (the
+  fail-closed value, no quantity) with the additive `metadata.lane_state:
+  "blocked_by_weekly"` and `reason` `blocked: weekly exhausted until <reset>`.
 - **`truth`** -- `"official" | "estimated"`. `official` came straight from the
   vendor's own meter. `estimated` is Headroom's own inference (a local pool's
   session-log estimate, a vendor-reported idle window that might be a

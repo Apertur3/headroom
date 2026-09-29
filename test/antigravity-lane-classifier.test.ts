@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { observeAntigravity, observationsFromAntigravityQuota, antigravityPayloadFromQuota } from "../src/adapters/antigravity.js";
-import { antigravityPayloadFromEngineRows, classifyAntigravityLanes, type AntigravityLaneState } from "../src/antigravity-lanes.js";
+import { antigravityLaneObservations, antigravityPayloadFromEngineRows, classifyAntigravityLanes, type AntigravityLaneState } from "../src/antigravity-lanes.js";
 import { findStaleLanes } from "../src/canary.js";
 import { pollAccounts } from "../src/collector.js";
 import { nativeEnginePath, runNativeEngine } from "../src/engine/native/run.js";
@@ -63,7 +63,7 @@ function expectLaneRows(rows: Observation[], expected: Expected): void {
     const row = laneRow(rows, lane);
     expect(row, lane).toBeDefined();
     if (state === "fresh") expect(row, lane).toMatchObject({ freshness: "fresh", quantity: { unit: "percent" } });
-    else if (state === "blocked_by_weekly") expect(row, lane).toMatchObject({ freshness: "not_enforced", quantity: null, metadata: { lane_state: "blocked_by_weekly" } });
+    else if (state === "blocked_by_weekly") expect(row, lane).toMatchObject({ freshness: "failed", quantity: null, metadata: { lane_state: "blocked_by_weekly" } });
     else if (state === "missing" && lane.endsWith("5h")) expect(row, lane).toMatchObject({ freshness: "not_enforced", quantity: null, reason: "vendor sent no 5h bucket in this response" });
     else expect(row, lane).toMatchObject({ freshness: "failed", quantity: null });
   }
@@ -118,7 +118,7 @@ describe("09-29 weekly exhausted (recorded live fixture)", () => {
     expect(laneRow(rows, "gemini 5h")?.quantity).toBeNull();
   });
 
-  it("status reads not enforced with the honest reason, the canary accepts it, and gates fail closed for that lane only", async () => {
+  it("status names the block instead of a generic UNKNOWN, the canary accepts it, and gates fail closed for that lane only", async () => {
     const record = await principalFrom("2026-09-29-weekly-exhausted.json");
     const { rows } = await localPoll(record);
     const root = await mkdtemp(join(tmpdir(), "headroom-agy-blocked-"));
@@ -132,10 +132,10 @@ describe("09-29 weekly exhausted (recorded live fixture)", () => {
       }
       const now = new Date(Date.parse(NOW) + 7 * 3_600_000 + 60_000);
       const gemini5h = store.latestPerWindow(`${PRINCIPAL}:gemini`).find((row) => row.window?.minutes === 300)!;
-      expect(gemini5h).toMatchObject({ freshness: "not_enforced", metadata: { lane_state: "blocked_by_weekly" } });
+      expect(gemini5h).toMatchObject({ freshness: "failed", metadata: { lane_state: "blocked_by_weekly" } });
 
-      expect(paceDecision(gemini5h, defaultPolicy, now)).toEqual({ state: "NOT_ENFORCED", reason: "blocked: weekly exhausted until 2026-09-30T20:21:49Z" });
-      expect(formatMeters([gemini5h], defaultPolicy, new Map(), new Map(), new Map(), now).join("\n")).toContain("5h n/a (blocked: weekly exhausted until 2026-09-30T20:21:49Z)");
+      expect(paceDecision(gemini5h, defaultPolicy, now)).toEqual({ state: "UNKNOWN", reason: "blocked: weekly exhausted until 2026-09-30T20:21:49Z" });
+      expect(formatMeters([gemini5h], defaultPolicy, new Map(), new Map(), new Map(), now).join("\n")).toContain("5h blocked until 2026-09-30T20:21:49Z (weekly exhausted)");
 
       expect(isAcceptedLaneReading(gemini5h)).toBe(true);
       const accounts: Account[] = [ACCOUNT];
@@ -253,5 +253,51 @@ describe("09-23 to 09-28 whole-meter engine error (synthetic)", () => {
     const record = await principalFrom("2026-09-25-whole-meter-error.synthetic.json");
     const { rows } = await localPoll(record, "not_logged_in");
     expect(rows.every((row) => row.reason === `${ENGINE_ERROR_TEXT.timed_out}; agy not logged in (run: agy)`)).toBe(true);
+  });
+});
+
+describe("partial read: gemini 5h absent, weekly without usage (review finding)", () => {
+  const HOUR = 3_600_000;
+  const bucket = (meter: "gemini" | "claude-gpt", minutes: 300 | 10_080, usage: boolean) => ({
+    meter, minutes, remaining: usage ? 0.9 : null, usageKnown: usage, disabled: null, resetsAt: usage ? "2026-10-01T00:00:00Z" : null,
+  });
+  const rowsAt = (hour: number, geminiWeeklyUsage: boolean): Observation[] => {
+    const at = new Date(Date.parse(NOW) + hour * HOUR).toISOString();
+    const payload = { kind: "quota_summary" as const, buckets: [bucket("gemini", 10_080, geminiWeeklyUsage), bucket("claude-gpt", 300, true), bucket("claude-gpt", 10_080, true)] };
+    return antigravityLaneObservations(classifyAntigravityLanes(payload), PRINCIPAL, { now: at, source: "test" });
+  };
+
+  const retiredWeeklies = (store: HeadroomStore, meter: string) =>
+    store.history(meter, "1970-01-01T00:00:00Z").filter((row) => row.window?.minutes === 10_080 && row.metadata?.retired);
+
+  it("keeps the failed weekly lane, refuses can and gate, and lets the canary see it go stale", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-partial-"));
+    temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      for (let hour = 0; hour <= 7; hour += 1) store.insertPoll(rowsAt(hour, false));
+      const now = new Date(Date.parse(NOW) + 7 * HOUR + 60_000);
+      const meter = `${PRINCIPAL}:gemini`;
+      expect(retiredWeeklies(store, meter)).toEqual([]);
+
+      const can = canConsume([meter], new Map([[meter, store.latestPerWindow(meter)]]), defaultPolicy, false, now);
+      expect(can.allowed).toBe(false);
+      expect(gateFor(store, [{ window: "5h", points: 1 }], meter, 0, true, now).allowed).toBe(false);
+      expect(gateFor(store, [{ window: "wk", points: 1 }], meter, 0, false, now).allowed).toBe(false);
+
+      expect(findStaleLanes(store, [ACCOUNT], 6, now).map((lane) => `${lane.meter}:${lane.window_minutes}`)).toContain(`${meter}:10080`);
+    } finally { store.close(); }
+  });
+
+  it("only retires a lane the poll never mentioned", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-retire-"));
+    temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const meter = `${PRINCIPAL}:gemini`;
+      store.insertPoll(rowsAt(0, true));
+      store.insertPoll(rowsAt(2, true).filter((row) => !(row.meter_id === meter && row.window?.minutes === 10_080)));
+      expect(retiredWeeklies(store, meter)).toHaveLength(1);
+    } finally { store.close(); }
   });
 });

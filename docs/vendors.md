@@ -270,9 +270,9 @@ by fetch time) and is skipped, not blocking, on `gate --need 5h:N` and `can`. A 
 with genuine usage is unaffected -- the vendor's own numbers always win when one is present.
 
 Once a group's weekly lane is exhausted, agy keeps sending that group's five-hour bucket but
-disabled, with no usable fraction. That lane reads `not_enforced` with the reason
-`blocked: weekly exhausted until <reset>` and `metadata.lane_state: "blocked_by_weekly"`: a real
-answer (the stale-lane canary accepts it, doctor does not call the source broken), with no
+disabled, with no usable fraction. That lane is stored `failed` (never `not_enforced`, which contract 1.0 defines as capless) with the reason
+`blocked: weekly exhausted until <reset>` and `metadata.lane_state: "blocked_by_weekly"`: a known
+state (status shows "blocked until <reset>", the stale-lane canary accepts it, doctor does not call the source broken), with no
 capacity (`gate --need 5h:N`, `can` and `plan` refuse it for that lane). The other lanes of the
 same read stay fresh. Both Antigravity paths (the daemon's local read and the remote
 `retrieveUserQuota` adapter) classify every lane with one shared classifier,

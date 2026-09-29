@@ -302,13 +302,13 @@ export function isHeldReading(observation: Observation): boolean {
   return Boolean(observation.metadata?.vendor_window_held || observation.metadata?.vendor_inconsistent);
 }
 
-/** The reason text for a `not_enforced` lane that is really blocked by its
+/** The reason text for a `failed` lane that is really blocked by its
  * exhausted weekly lane (antigravity-lanes.ts), undefined for any other
- * reading. Such a lane is an accepted vendor answer, so status shows it as
- * not enforced and the canary counts it, but it has no capacity: every
- * gate that would spend on it refuses, as a known "no" rather than UNKNOWN. */
+ * reading. It is stored `failed` so contract-1.0 consumers fail closed, but
+ * Headroom knows the state: the canary counts it as accepted, and every gate
+ * that would spend on it refuses as a known "no" rather than UNKNOWN. */
 export function blockedLaneReason(observation: Observation): string | undefined {
-  if (observation.freshness !== "not_enforced" || observation.metadata?.lane_state !== "blocked_by_weekly") return undefined;
+  if (observation.freshness !== "failed" || observation.metadata?.lane_state !== "blocked_by_weekly") return undefined;
   return observation.reason ?? "blocked: weekly exhausted";
 }
 
@@ -322,6 +322,7 @@ export function isAcceptedLaneReading(observation: Observation): boolean {
   if (observation.source === "manual" || observation.source === "paste") return false;
   if (isHeldReading(observation) || observation.metadata?.exhausted || observation.metadata?.retired) return false;
   if (observation.freshness === "not_enforced") return true;
+  if (blockedLaneReason(observation)) return true;
   if (observation.freshness !== "fresh") return false;
   return Boolean(observation.quantity && observation.quantity.limit !== null && observation.window?.minutes);
 }
@@ -377,7 +378,10 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   // not_enforced) so a frozen, unconfirmed baseline can never be treated as
   // capacity while it waits out its hold.
   if (isHeldReading(observation)) return { state: "UNKNOWN", reason: heldWindowReason(observation, ageMinutesSince(observation.fetched_at, now))! };
-  if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: blockedLaneReason(observation) ?? "not enforced" };
+  // A blocked lane is UNKNOWN by state (never capacity) but names why.
+  const blockedReason = blockedLaneReason(observation);
+  if (blockedReason) return { state: "UNKNOWN", reason: blockedReason };
+  if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   const parsedFetchedAt = new Date(observation.fetched_at).getTime();
   if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(observation, parsedFetchedAt, policy, now)}` };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };

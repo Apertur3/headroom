@@ -11,8 +11,9 @@
  * - `blocked_by_weekly`: the 5h bucket is disabled, carries no fraction, or is
  *   absent while the same group's weekly lane is exhausted. There is no usage
  *   to report and no capacity to spend until the weekly resets. Stored as
- *   `not_enforced` with the reason "blocked: weekly exhausted until <reset>"
- *   and `metadata.lane_state`, never as an invented number.
+ *   `failed` (the contract's fail-closed value; `not_enforced` would tell 1.0
+ *   consumers the lane is capless) with the reason "blocked: weekly exhausted
+ *   until <reset>" and `metadata.lane_state`, never as an invented number.
  * - `loading`: the bucket is reported without usage and nothing explains it
  *   (for a weekly lane: the engine's readiness wait never saw it populate).
  * - `missing`: the vendor sent no bucket for the lane. A 5h lane goes idle
@@ -165,11 +166,14 @@ export function antigravityLaneObservations(classification: AntigravityClassific
       const used = Math.round(Math.max(0, Math.min(100, (1 - (item.remaining as number)) * 100)) * 1_000_000) / 1_000_000;
       return { ...base, quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" as const }, resets_at: item.resetsAt, truth: "official" as const, freshness: "fresh" as const, confidence: 1 };
     }
-    if (item.state === "blocked_by_weekly" || (item.state === "missing" && item.minutes === 300)) {
-      return {
-        ...base, quantity: null, resets_at: null, truth: "official" as const, freshness: "not_enforced" as const, confidence: 1, reason: item.reason,
-        ...(item.state === "blocked_by_weekly" ? { metadata: { lane_state: "blocked_by_weekly" as const, blocked_until: item.blockedUntil } } : {}),
-      };
+    // A blocked lane is `failed`, the contract's fail-closed value: 1.0
+    // consumers read `not_enforced` as capless and would dispatch. The
+    // additive metadata lets Headroom's own readers name the state.
+    if (item.state === "blocked_by_weekly") {
+      return { ...base, quantity: null, resets_at: null, truth: "official" as const, freshness: "failed" as const, confidence: 1, reason: item.reason, metadata: { lane_state: "blocked_by_weekly" as const, blocked_until: item.blockedUntil } };
+    }
+    if (item.state === "missing" && item.minutes === 300) {
+      return { ...base, quantity: null, resets_at: null, truth: "official" as const, freshness: "not_enforced" as const, confidence: 1, reason: item.reason };
     }
     return { ...base, quantity: null, resets_at: null, truth: "estimated" as const, freshness: "failed" as const, confidence: 0, reason: item.reason };
   });
