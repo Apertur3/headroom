@@ -63,6 +63,9 @@ struct HeadroomEngine {
         let arguments = CommandLine.arguments
         let principalFlag = arguments.firstIndex(of: "--principals")
         let shapeMode = arguments.contains("--shape")
+        if let recordFlag = arguments.firstIndex(of: "--record") {
+            await runRecord(arguments: arguments, principalFlag: principalFlag, recordFlag: recordFlag, shapeMode: shapeMode)
+        }
         guard (arguments.count == 4 || arguments.count == 5),
               arguments[1] == "observe",
               let principalFlag,
@@ -91,6 +94,26 @@ struct HeadroomEngine {
         await ProviderCLISessionLifecycle.shutdownPersistentSessions()
         emit(observations)
         exit(observations.contains { $0.freshness == "fresh" } ? 0 : 3)
+    }
+
+    /// `observe --principals <json> --record <out>`. Never returns.
+    static func runRecord(arguments: [String], principalFlag: Int?, recordFlag: Int, shapeMode: Bool) async -> Never {
+        guard arguments.count == 6, arguments[1] == "observe", !shapeMode,
+              let principalFlag, principalFlag + 1 < arguments.count,
+              recordFlag + 1 < arguments.count,
+              !arguments[recordFlag + 1].hasPrefix("--"), !arguments[principalFlag + 1].hasPrefix("--")
+        else {
+            FileHandle.standardError.write(Data("Usage: headroom-engine observe --principals <path-to-json> --record <out-json>\n".utf8))
+            exit(2)
+        }
+        let principals: [Principal]
+        do {
+            principals = try JSONDecoder().decode([Principal].self, from: try Data(contentsOf: URL(fileURLWithPath: arguments[principalFlag + 1])))
+        } catch {
+            FileHandle.standardError.write(Data("record: invalid principals input\n".utf8))
+            exit(3)
+        }
+        exit(await AntigravityRecorder.run(principals: principals, outputPath: arguments[recordFlag + 1]))
     }
 
     static func emit<T: Encodable>(_ value: T) {
