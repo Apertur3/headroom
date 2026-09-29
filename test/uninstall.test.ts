@@ -36,6 +36,9 @@ async function captureLog<T>(run: () => Promise<T>): Promise<{ result: T; logs: 
  * Scheduler on this machine -- only `which`/`where claude` (a harmless PATH
  * read) is ever allowed to run for real, and only in the dry-run tests below. */
 const noOverrides: UninstallOverrides = {};
+// These tests assert the POSIX form of the printed commands; on a Windows runner the
+// default platform would print the PowerShell form (covered by its own tests).
+const posix: UninstallOverrides = { platform: "linux" };
 
 async function makeTempHomes(): Promise<{ fakeHome: string; headroomHome: string }> {
   const fakeHome = await mkdtemp(join(tmpdir(), "headroom-uninstall-userhome-"));
@@ -128,7 +131,7 @@ describe("headroom uninstall --dry-run", () => {
     const account = await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true });
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      const captured = await captureLog(() => runUninstall(["--dry-run"], noOverrides));
+      const captured = await captureLog(() => runUninstall(["--dry-run"], posix));
       logs = captured.logs;
     });
     const output = logs.join("\n");
@@ -277,7 +280,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
     const runClaudeMcpRemove = vi.fn(async () => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      const captured = await captureLog(() => runUninstall([], { claudeOnPath: async () => false, runClaudeMcpRemove }));
+      const captured = await captureLog(() => runUninstall([], { ...posix, claudeOnPath: async () => false, runClaudeMcpRemove }));
       logs = captured.logs;
     });
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
@@ -391,7 +394,7 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "", CLAUDE_CONFIG_DIR: "/somewhere/else" }, async () => {
-      logs = (await captureLog(() => runUninstall(["--dry-run"], noOverrides))).logs;
+      logs = (await captureLog(() => runUninstall(["--dry-run"], posix))).logs;
     });
     expect(logs.join("\n")).toContain("env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user headroom");
   });
@@ -449,7 +452,7 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     const runClaudeMcpRemove = vi.fn(async () => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;
+      logs = (await captureLog(() => runUninstall([], { ...posix, claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;
     });
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
     const output = logs.join("\n");
