@@ -85,7 +85,12 @@ async function defaultDaemonProbe(): Promise<boolean> {
 async function serviceManagerHasService(platform: NodeJS.Platform, uid: number, runner: ServiceRunner): Promise<boolean> {
   const ok = async (command: string, args: string[]) => (await runner(command, args)).code === 0;
   if (platform === "darwin") return ok("launchctl", ["print", `gui/${uid}/${SERVICE_LABEL}`]);
-  if (platform === "win32") return ok("schtasks", ["/Query", "/TN", WINDOWS_TASK]);
+  if (platform === "win32") {
+    // /Query succeeds for a disabled or idle task too, so read its state; output that does not parse (a localized Windows) fails closed.
+    const { code, output } = await runner("schtasks", ["/Query", "/TN", WINDOWS_TASK, "/FO", "LIST", "/V"]);
+    const field = (name: string) => new RegExp(`^\\s*${name}:\\s*(.+?)\\s*$`, "im").exec(output)?.[1];
+    return code === 0 && field("Status")?.toLowerCase() === "running" && field("Scheduled Task State")?.toLowerCase() === "enabled";
+  }
   return (await ok("systemctl", ["--user", "is-active", "headroom.service"])) && (await ok("systemctl", ["--user", "is-enabled", "headroom.service"]));
 }
 
@@ -96,6 +101,8 @@ export interface ServiceStartOptions {
   /** How long to wait for the daemon to answer after loading the service. */
   waitMs?: number;
   intervalMs?: number;
+  /** How long to wait for a replaced Windows task's old daemon to stop answering. */
+  stopWaitMs?: number;
   uid?: number;
   /** Test seam so the bounded wait does not really sleep. */
   sleep?: (ms: number) => Promise<void>;
@@ -115,6 +122,7 @@ export interface ServiceStartResult { state: ServiceStartState; reason?: string;
 
 const SERVICE_LABEL = "com.headroom.daemon";
 const WINDOWS_TASK = "Headroom Daemon";
+const STOP_CONFIRMATIONS = 3;
 
 /** The service manager's own commands, in run order, to load (or reload) the service and start it.
  * `optional` steps may fail without meaning anything: launchctl bootout on a service that was never
@@ -165,9 +173,16 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
     const { code, output } = await runner(step.command, step.args);
     if (code !== 0 && !step.optional) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} exited ${code}${output ? `: ${output}` : ""}`, install, manual };
     if (step.confirmStopped) {
-      let stopped = !(await probe());
-      for (let attempt = 0; !stopped && attempt < 10; attempt += 1) { await sleep(interval); stopped = !(await probe()); }
-      if (!stopped) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} did not stop the old daemon${output ? `: ${output}` : ""}`, install, manual };
+      // Only "the task was not running" is a harmless /End failure; anything else means the old daemon may still be up.
+      if (code !== 0 && !/not\s+(currently\s+)?running/i.test(output)) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} exited ${code}${output ? `: ${output}` : ""}`, install, manual };
+      // One failed probe can be a busy daemon, so require consecutive misses within a bounded deadline.
+      const stopDeadline = Date.now() + (options.stopWaitMs ?? 10_000);
+      let misses = 0;
+      while (misses < STOP_CONFIRMATIONS && Date.now() <= stopDeadline) {
+        misses = (await probe()) ? 0 : misses + 1;
+        if (misses < STOP_CONFIRMATIONS) await sleep(interval);
+      }
+      if (misses < STOP_CONFIRMATIONS) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} did not stop the old daemon${output ? `: ${output}` : ""}`, install, manual };
     }
   }
   const waitMs = options.waitMs ?? 10_000;

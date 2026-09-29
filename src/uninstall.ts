@@ -75,10 +75,13 @@ async function defaultRunServiceStop(command: string): Promise<number> {
   catch (error) { return typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1; }
 }
 
+function shellQuote(value: string): string { return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`; }
+
 function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "local", cwd?: string): string {
   const command = `claude mcp remove --scope ${scope} headroom`;
-  const withProfile = env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${env.CLAUDE_CONFIG_DIR} ${command}` : command;
-  return cwd ? `(cd ${cwd} && ${withProfile})` : withProfile;
+  // The default profile must not inherit a CLAUDE_CONFIG_DIR from the shell the user pastes this into.
+  const withProfile = env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${shellQuote(env.CLAUDE_CONFIG_DIR)} ${command}` : `env -u CLAUDE_CONFIG_DIR ${command}`;
+  return cwd ? `(cd ${shellQuote(cwd)} && ${withProfile})` : withProfile;
 }
 
 /**
@@ -153,7 +156,7 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
     const label = cwd ? `${account.name} (${scope} scope, ${cwd})` : `${account.name} (${scope} scope)`;
     if (cwd && !(await directoryExists(cwd))) {
       // Claude Code looks a local entry up under the directory it runs in, so it cannot be removed without that directory.
-      console.log(`  ${label}: ${cwd} no longer exists, so \`claude mcp remove\` cannot run there. The entry is inert while the directory is gone. To remove it, recreate the directory (mkdir -p ${cwd}) and run headroom uninstall again, or delete projects["${cwd}"].mcpServers.headroom yourself in ${claudeConfigJsonPath(account.location)}`);
+      console.log(`  ${label}: ${cwd} no longer exists, so \`claude mcp remove\` cannot run there. The entry is inert while the directory is gone. To remove it, recreate the directory (mkdir -p ${shellQuote(cwd)}) and run headroom uninstall again, or delete projects["${cwd}"].mcpServers.headroom yourself in ${claudeConfigJsonPath(account.location)}`);
       continue;
     }
     if (options.dryRun) { console.log(`  (dry run) would run for ${label}: ${display}`); continue; }

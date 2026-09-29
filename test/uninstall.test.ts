@@ -386,6 +386,28 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     expect(runClaudeMcpRemove.mock.calls[0][0].CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
+  it("prints a default-profile retry command that unsets an inherited CLAUDE_CONFIG_DIR", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "", CLAUDE_CONFIG_DIR: "/somewhere/else" }, async () => {
+      logs = (await captureLog(() => runUninstall(["--dry-run"], noOverrides))).logs;
+    });
+    expect(logs.join("\n")).toContain("env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user headroom");
+  });
+
+  it("quotes the directory in the printed mkdir command for a path with a space", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const gone = join(fakeHome, "deleted worktree");
+    const config = { projects: { [gone]: { mcpServers: { headroom: { command: "headroom" } } } } };
+    await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove: vi.fn(async () => 0) }))).logs;
+    });
+    expect(logs.join("\n")).toContain(`mkdir -p '${gone}'`);
+  });
+
   it("does not spawn for a local-scope entry whose directory is gone, and says how to remove it", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const gone = join(fakeHome, "deleted-worktree");
