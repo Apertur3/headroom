@@ -181,7 +181,7 @@ function parseCanonicalPid(raw: string): number | undefined {
  * have no ps signatures at all; current verified records have complete,
  * non-empty signatures. This prevents a malformed mixture from being
  * mistaken for the harmless provisional form. */
-async function readKeepaliveState(path: string): Promise<KeepaliveState | undefined> {
+export async function readKeepaliveState(path: string): Promise<KeepaliveState | undefined> {
   let info;
   try { info = await lstat(path); }
   catch (error) {
@@ -321,7 +321,7 @@ const KILL_CONFIRM_POLL_MS = 25;
 /** Polls isProcessGroupAlive until it reports false (confirmed gone) or
  * `timeoutMs` elapses. See KILL_CONFIRM_TIMEOUT_MS for why this exists at
  * all rather than trusting a kill call's return to mean "gone now". */
-async function waitUntilGroupGone(pid: number, timeoutMs = KILL_CONFIRM_TIMEOUT_MS): Promise<boolean> {
+export async function waitUntilGroupGone(pid: number, timeoutMs = KILL_CONFIRM_TIMEOUT_MS): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (isProcessGroupAlive(pid)) {
     if (Date.now() >= deadline) return false;
@@ -343,7 +343,7 @@ export interface SweepResult {
   unverified: number[];
 }
 
-interface EvidenceLocation {
+export interface EvidenceLocation {
   statePath: string;
   pidPath: string;
   /** Set for the private, per-launch layout. Legacy shared files have none. */
@@ -375,7 +375,7 @@ async function removeEvidence(location: EvidenceLocation): Promise<void> {
   }
 }
 
-async function launchEvidenceLocations(home: string, skipLaunchId?: string): Promise<EvidenceLocation[]> {
+export async function launchEvidenceLocations(home: string, skipLaunchId?: string): Promise<EvidenceLocation[]> {
   const root = keepaliveDirectoryPath(home);
   let rootInfo;
   try { rootInfo = await lstat(root); }

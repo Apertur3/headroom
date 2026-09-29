@@ -1,9 +1,7 @@
-import { execFile } from "node:child_process";
 import { chmod, lstat, mkdtemp, realpath, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { headroomHome, executablePath } from "../../paths.js";
 import { createHash } from "node:crypto";
 import { readPolicy } from "../../config.js";
@@ -11,8 +9,8 @@ import { outboundEnvironment, redact } from "../../security.js";
 import type { Observation, ProviderAccount } from "../../types.js";
 import { readEngineLock } from "../codexbar/install.js";
 import { normalizeObservations } from "../observation.js";
+import { runInGroup } from "../group-run.js";
 
-const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine");
 
@@ -72,8 +70,41 @@ export async function nativeEnginePath(): Promise<string | undefined> {
   return undefined;
 }
 
+interface EngineFlight { key: string; promise: Promise<Observation[]> }
+/** The one engine read that may run right now (see runNativeEngine). */
+let engineFlight: EngineFlight | undefined;
+
+/**
+ * At most ONE native engine read runs at a time, process-wide: the engine can
+ * start agy, and two overlapping reads doubled the agy trees on the host. A
+ * caller asking for the same accounts while one is in flight shares its
+ * result; a caller asking for different accounts waits its turn, and that wait
+ * counts against its own timeout.
+ */
 export async function runNativeEngine(enginePath: string, accounts: ProviderAccount[], options: { timeoutMs?: number } = {}): Promise<Observation[]> {
   const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? NATIVE_ENGINE_TIMEOUT_MS, NATIVE_ENGINE_TIMEOUT_MS));
+  const deadline = Date.now() + timeoutMs;
+  const key = `${enginePath}\0${JSON.stringify(accounts.map(({ name, vendor, location }) => [name, vendor, location]))}`;
+  for (;;) {
+    const current = engineFlight;
+    if (!current) break;
+    if (current.key === key) return current.promise;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("native engine busy with another read");
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); });
+    try { await Promise.race([current.promise.then(() => undefined, () => undefined), expired]); }
+    finally { clearTimeout(timer); }
+    if (engineFlight === current) { if (Date.now() >= deadline) throw new Error("native engine busy with another read"); }
+  }
+  const flight: EngineFlight = { key, promise: undefined as unknown as Promise<Observation[]> };
+  flight.promise = readNativeEngine(enginePath, accounts, Math.max(1, deadline - Date.now()))
+    .finally(() => { if (engineFlight === flight) engineFlight = undefined; });
+  engineFlight = flight;
+  return flight.promise;
+}
+
+async function readNativeEngine(enginePath: string, accounts: ProviderAccount[], timeoutMs: number): Promise<Observation[]> {
   const directory = await mkdtemp(join(tmpdir(), "headroom-principals-"));
   const principals = join(directory, "principals.json");
   try {
@@ -81,7 +112,7 @@ export async function runNativeEngine(enginePath: string, accounts: ProviderAcco
     await chmod(principals, 0o600);
     try {
       const { proxy } = await readPolicy();
-      const { stdout } = await execFileAsync(enginePath, ["observe", "--principals", principals], { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" }) });
+      const { stdout } = await runInGroup(enginePath, ["observe", "--principals", principals], { timeoutMs, maxBuffer: 2 * 1024 * 1024, env: outboundEnvironment(proxy, { PATH: process.env.PATH ?? "" }) });
       return parseObservations(stdout);
     } catch (error: unknown) {
       const result = error as { stdout?: string; stderr?: string; message?: string };

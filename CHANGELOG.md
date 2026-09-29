@@ -12,6 +12,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - Antigravity: a 5h lane agy disables while its weekly lane is exhausted no longer fails the whole read or logs "placeholder"; it is stored `failed` with `metadata.lane_state: "blocked_by_weekly"` and reads "blocked until <reset>", the other lanes stay fresh, gates refuse that lane, and failure reasons keep the engine's real error text. The local and remote paths now share one lane classifier. A poll that carries an explicit row for a lane in any state no longer retires that lane, so a partial read (5h absent, weekly without usage) stays refused and visible to the stale-lane canary.
+- The native engine now runs in its own process group. A timeout kills the whole group (TERM, then KILL after a short grace), and the daemon reaps live engine groups on stop and on process exit, so no engine, agy or language_server child outlives a read.
+- Native engine reads are single-flight across the whole daemon: at most one runs at a time, callers asking for the same accounts share its result, and others wait within their own timeout.
+- The daemon runs an age watchdog on each poll pass: a Headroom-started agy older than `agy_max_age_minutes` (policy.toml, default 10) is killed by group and reported in the daemon log and the `headroom-watchdog` inbox session. The daemon-owned keepalive is exempt, and processes are matched by recorded launch evidence, never by name.
+- The keepalive no longer starts while an Antigravity IDE language server or another agy is already reachable, and stops at the next check if one appears.
+- Removed the unused engine `AgyBootstrap`, which launched agy from the reader.
 
 ## [0.2.1] - 2026-09-29
 
