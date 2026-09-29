@@ -1,0 +1,26 @@
+{
+  "_comment" : "SYNTHETIC, not recorded. History row 09-04/05: the remote retrieveUserQuota path refused the agy token (free tier, HTTP 403), so no bucket came back at all. Same schema as an observe --record file; redacted by construction.",
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+
+      ],
+      "error" : "api_error",
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+
+      ],
+      "payload_kind" : "none",
+      "principal" : "principal-0",
+      "source" : "remote",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-04T09:12:00Z",
+  "schema" : 1
+}

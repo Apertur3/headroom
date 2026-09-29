@@ -1,0 +1,55 @@
+{
+  "_comment" : "SYNTHETIC, not recorded. History row 09-22 (issue #55): an idle gemini 5h lane with no bucket at all in an otherwise healthy answer. Same schema as an observe --record file; redacted by construction.",
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+        {
+          "bucket_id" : "gemini-weekly",
+          "disabled" : false,
+          "group" : "group-1",
+          "name" : "bucket-1",
+          "remaining_fraction" : 0.86,
+          "reset_description" : null,
+          "reset_time" : "2026-09-28T17:26:36Z",
+          "usage_known" : true
+        },
+        {
+          "bucket_id" : "3p-5h",
+          "disabled" : false,
+          "group" : "group-2",
+          "name" : "bucket-2",
+          "remaining_fraction" : 0.81,
+          "reset_description" : null,
+          "reset_time" : "2026-09-22T14:26:36Z",
+          "usage_known" : true
+        },
+        {
+          "bucket_id" : "3p-weekly",
+          "disabled" : false,
+          "group" : "group-3",
+          "name" : "bucket-3",
+          "remaining_fraction" : 0.58,
+          "reset_description" : null,
+          "reset_time" : "2026-09-28T17:26:36Z",
+          "usage_known" : true
+        }
+      ],
+      "error" : null,
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+
+      ],
+      "payload_kind" : "quota_summary",
+      "principal" : "principal-0",
+      "source" : "remote",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-22T10:26:36Z",
+  "schema" : 1
+}

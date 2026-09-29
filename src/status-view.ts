@@ -20,7 +20,7 @@
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { creditsLapsed } from "./credits.js";
 import { withEffectiveFreshness } from "./pace.js";
-import { paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
+import { blockedLaneReason, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
@@ -198,6 +198,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   const resetInfo = servedResetsIn(observation, now);
   const overdueText = formatOverdueReset(resetInfo);
   const overdue = overdueText ? ` ↻ ${overdueText}` : "";
+  if (blockedLaneReason(observation)) return `${label(observation)} blocked until ${blockedUntilText(observation)} (weekly exhausted)`;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the
@@ -246,6 +247,11 @@ export function formatMeters(observations: Observation[], policy: Policy, resetS
       return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id), now);
     }).join(" | ")}  (${freshnessWord(ordered)} ${age(ordered[0], now)})${leaseLabel}`;
   });
+}
+
+/** When a lane blocked by its exhausted weekly lane unblocks, as text. */
+function blockedUntilText(observation: Observation): string {
+  return observation.metadata?.blocked_until ?? "its weekly reset (time not reported)";
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +550,8 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
         const overdueText = formatOverdueReset(resetInfo);
         const overdue = overdueText ? `↻ ${overdueText}` : undefined;
         const countdown = !overdue && (seconds === null || decision.state === "UNKNOWN");
-        const unknown = decision.state === "UNKNOWN" ? explainUnknown(observation.reason ?? decision.reason) : undefined;
+        const blocked = blockedLaneReason(observation) !== undefined;
+        const unknown = decision.state === "UNKNOWN" && !blocked ? explainUnknown(observation.reason ?? decision.reason) : undefined;
         if (unknown) explanations.push(unknown);
         const rawResetSeen = resetSeen.get(windowKey(observation));
         const decodedResetSeen = rawResetSeen ? decodeResetSeen(rawResetSeen) : undefined;
@@ -565,9 +572,9 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
           window: label(observation),
           bar: isCredits(observation) ? undefined : barFor(observation, decision.state, ascii),
           used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),
-          reset: overdue ?? (countdown ? known : `resets in ${formatResetsIn(seconds as number)}`),
-          resetCoarse: overdue ?? (countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`),
-          state: isCredits(observation) ? "" : observation.metadata?.exhausted ? "FREEZE" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
+          reset: blocked ? `until ${blockedUntilText(observation)}` : overdue ?? (countdown ? known : `resets in ${formatResetsIn(seconds as number)}`),
+          resetCoarse: blocked ? `until ${blockedUntilText(observation)}` : overdue ?? (countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`),
+          state: isCredits(observation) ? "" : observation.metadata?.exhausted ? "FREEZE" : blocked ? "blocked" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
           detail: detailLine(observation, reserveFor(policy.reserve, observation.meter_id), resetSeen.get(windowKey(observation)), freeResetUsed.get(windowKey(observation)), now),
           unknown,
           // The lease belongs to the meter, not to one of its windows, so it

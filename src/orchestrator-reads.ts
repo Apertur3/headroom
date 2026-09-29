@@ -11,7 +11,7 @@ import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
 import {
-  canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
+  blockedLaneReason, canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
   withOtherOwnerReservations, type CanDecision, type Policy, type ReserveEntry,
 } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
@@ -47,7 +47,7 @@ function enforcedPercentWindows(store: HeadroomStore, meterId: string): StoredOb
  * cannot distinguish once the row is filtered out. */
 function knownPercentWindows(store: HeadroomStore, meterId: string): StoredObservation[] {
   return store.latestPerWindow(meterId)
-    .filter((row) => row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes && (row.quantity?.unit === "percent" || row.freshness === "not_enforced"))
+    .filter((row) => row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes && (row.quantity?.unit === "percent" || row.freshness === "not_enforced" || blockedLaneReason(row)))
     .sort((a, b) => (a.window!.minutes as number) - (b.window!.minutes as number));
 }
 
@@ -451,7 +451,21 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         const available = reported.map((item) => windowNeedLabel(item.window!.minutes!)).join(", ") || "none";
         return { allowed: false, reason: (need.window === "5h" || need.window === "wk") ? `${label} usage unknown` : `${label} usage unknown; vendor reports: ${available}`, meters_checked: checked, unknown: true };
       }
-      if (row.freshness === "not_enforced") { notEnforced.push(label); continue; }
+      // A lane blocked by its exhausted weekly has nothing to spend: refuse
+      // it for this lane as a known "no", never as an unreadable window.
+      const blocked = blockedLaneReason(row);
+      if (blocked) return { allowed: false, reason: `${label} ${blocked} for ${id}`, meters_checked: checked };
+      if (row.freshness === "not_enforced") {
+        // A capless 5h says nothing about the weekly the plan line reads: a
+        // weekly that has reported before but has no usable reading now (a
+        // partial read) must still fail the gate closed.
+        if (usePlan && minutes === 300 && long?.freshness !== "not_enforced") {
+          const weekly = long ? freshnessGate(long, staleMinutes, now) : undefined;
+          if (weekly && !weekly.ok) return { allowed: false, reason: `wk ${weekly.reason} for ${id} (read by the plan line)`, meters_checked: checked, unknown: true };
+          if (!long && store.hasReportedWindow(id, LONG_WINDOW_THRESHOLD_MINUTES)) return { allowed: false, reason: `wk usage unknown for ${id} (read by the plan line)`, meters_checked: checked, unknown: true };
+        }
+        notEnforced.push(label); continue;
+      }
       const freshness = freshnessGate(row, staleMinutes, now);
       if (!freshness.ok) return { allowed: false, reason: `${label} ${freshness.reason} for ${id}`, meters_checked: checked, unknown: true };
       if (minutes === 300) fiveHourRow = row;

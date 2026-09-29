@@ -9,6 +9,10 @@ import {
   type CodeAssistDependencies, type GoogleCredential, type ObjectValue,
 } from "./google-code-assist.js";
 import type { Observation, ProviderAccount } from "../types.js";
+import {
+  antigravityLaneObservations, classifyAntigravityLanes,
+  type AntigravityBucket, type AntigravityMeter, type AntigravityPayload, type AntigravityWindowMinutes,
+} from "../antigravity-lanes.js";
 
 /** The Gemini CLI OAuth read, token refresh, Code Assist calls and bundle scan
  * this adapter uses are shared verbatim with the Gemini CLI adapter; only the
@@ -23,21 +27,11 @@ const SOURCE = "remote:antigravity";
 const CODE_ASSIST_METADATA = { ideType: "ANTIGRAVITY", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" };
 /** The product token CodexBar's Antigravity fetcher sends; the Gemini CLI path sends none. */
 const USER_AGENT = "antigravity";
-const METERS = ["gemini", "claude-gpt"] as const;
-const WINDOWS = [
-  { name: "5h", minutes: 300, kind: "rolling" as const },
-  { name: "weekly", minutes: 10_080, kind: "fixed" as const },
-] as const;
 
-function base(account: ProviderAccount, meter: string, now: string): Omit<Observation, "window" | "quantity" | "resets_at" | "freshness" | "reason"> {
-  return { principal_id: account.name, meter_id: `${account.name}:${meter}`, observed_at: now, fetched_at: now, source: SOURCE, truth: "official", confidence: 1, adapter_version: "native-ts", upstream_schema_version: "v0.56.4" };
-}
-
+/** Every lane failed with one reason: the classifier's `error` state, so a
+ * whole-meter failure reads the same from the remote and the local path. */
 export function failedAntigravityObservations(account: ProviderAccount, reason: string, now: string): Observation[] {
-  return METERS.flatMap((meter) => WINDOWS.map((window) => ({
-    ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" as const }, quantity: null, resets_at: null,
-    freshness: "failed" as const, truth: "estimated" as const, confidence: 0, reason: redact(reason),
-  })));
+  return antigravityLaneObservations(classifyAntigravityLanes({ kind: "error", error: redact(reason) }), account.name, { now, source: SOURCE });
 }
 
 /**
@@ -52,7 +46,7 @@ export function noDaemonObservations(account: ProviderAccount, now = new Date())
   return failedAntigravityObservations(account, "no daemon; Antigravity needs the daemon-kept agy: run headroom install-service", now.toISOString());
 }
 
-interface QuotaBucket { meter?: typeof METERS[number]; minutes?: number; remaining?: number; resetsAt: string | null; }
+interface QuotaBucket { meter?: AntigravityMeter; minutes?: AntigravityWindowMinutes; remaining?: number; disabled?: boolean; resetsAt: string | null; }
 function bucketFrom(value: unknown): QuotaBucket | undefined {
   if (!object(value)) return undefined;
   const remainingObject = object(field(value, "remaining")) ? field(value, "remaining") as ObjectValue : undefined;
@@ -61,7 +55,8 @@ function bucketFrom(value: unknown): QuotaBucket | undefined {
   const meter = /gemini/.test(words) ? "gemini" : /claude|gpt/.test(words) ? "claude-gpt" : undefined;
   const explicitMinutes = number(field(value, "windowMinutes", "window_minutes", "minutes"));
   const minutes = explicitMinutes === 300 || explicitMinutes === 10_080 ? explicitMinutes : /weekly|week|7.?day/.test(words) ? 10_080 : /session|5.?hour|five.?hour/.test(words) ? 300 : undefined;
-  return { meter, minutes, remaining: remaining === undefined ? undefined : Math.max(0, Math.min(1, remaining)), resetsAt: reset(field(value, "resetTime", "reset_time", "resetsAt", "resets_at")) };
+  const disabled = field(value, "disabled");
+  return { meter, minutes, remaining: remaining === undefined ? undefined : Math.max(0, Math.min(1, remaining)), disabled: typeof disabled === "boolean" ? disabled : undefined, resetsAt: reset(field(value, "resetTime", "reset_time", "resetsAt", "resets_at")) };
 }
 
 function buckets(body: unknown): QuotaBucket[] {
@@ -72,53 +67,29 @@ function buckets(body: unknown): QuotaBucket[] {
   return [...direct, ...grouped].flatMap((bucket) => { const parsed = bucketFrom(bucket); return parsed ? [parsed] : []; });
 }
 
-/** Maps verified `retrieveUserQuota` bucket fractions. A response without remainingFraction is availability-only, never usage. */
-export function observationsFromAntigravityQuota(body: unknown, account: ProviderAccount, at = new Date()): Observation[] {
-  const now = at.toISOString();
-  const candidates = buckets(body);
-  const output: Observation[] = [];
-  for (const meter of METERS) for (const window of WINDOWS) {
-    const match = candidates.filter((candidate) => candidate.meter === meter && candidate.minutes === window.minutes && candidate.remaining !== undefined)
-      .sort((left, right) => (left.remaining ?? 1) - (right.remaining ?? 1))[0];
-    if (!match || match.remaining === undefined) {
-      // The rolling five-hour lane has no persistent state to report while
-      // genuinely unused, and retrieveUserQuota already proved this
-      // account's response is real (buckets() found at least one usable
-      // fraction somewhere, or observeAntigravity would already have failed
-      // the whole read above) -- but an absent bucket is still exactly
-      // that: absent. Earlier attempts here synthesized a 100%-remaining
-      // reading with a reset of fetch-time-plus-window-length, a number the
-      // vendor never actually sent; that is precisely the placeholder shape
-      // Headroom already treats with suspicion everywhere else (see
-      // detectPlaceholder), and inventing it for real was rejected (issue
-      // #55). So this reports the honest thing instead: `not_enforced`,
-      // with no quantity, no resets_at and no percentage -- "the vendor
-      // sent no bucket for this window in this response" -- the same
-      // vendor-confirmed-absence state claude-main:routines already uses
-      // for a scoped limit with nothing to show (see adapters/claude.ts's
-      // `scoped()`). Because `not_enforced` shares fresh's top rank in
-      // store.ts's latestPerWindow (and insertPoll treats it as present,
-      // not omitted), this reading replaces an old real fresh 5h reading
-      // the moment the window goes idle instead of freezing it in place
-      // until it ages into a misleading "stale Nm" -- the actual bug issue
-      // #55 reported. Status shows it as "5h n/a (...)", never 100% and
-      // never exhausted, and a `gate --need 5h:N` on it does not block
-      // (freshnessGate/paceDecision treat not_enforced as skip-worthy, not
-      // fail-closed). A fixed (weekly) window never gets this treatment --
-      // the vendor has never been observed to omit it while healthy, so its
-      // absence stays a genuine failed read.
-      if (window.kind === "rolling") {
-        output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" },
-          quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor sent no 5h bucket in this response" });
-        continue;
-      }
-      output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no quota bucket for this window" });
-      continue;
-    }
-    const used = Math.round(Math.max(0, Math.min(100, (1 - match.remaining) * 100)) * 1_000_000) / 1_000_000;
-    output.push({ ...base(account, meter, now), window: { kind: window.kind, minutes: window.minutes, enforcement: "hard" }, quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: match.resetsAt, freshness: "fresh" });
-  }
-  return normalizeObservations(output);
+/** The retrieveUserQuota body as a lane-classifier payload. A body without
+ * any fraction is availability only, never usage; a disabled bucket's
+ * fraction is never usage either. */
+export function antigravityPayloadFromQuota(body: unknown, availabilityReason = "quota endpoint returned availability only"): AntigravityPayload {
+  const parsed = buckets(body);
+  if (!parsed.some((bucket) => bucket.remaining !== undefined)) return { kind: "availability_only", reason: availabilityReason };
+  return {
+    kind: "quota_summary",
+    buckets: parsed.flatMap((bucket): AntigravityBucket[] => bucket.meter && bucket.minutes ? [{
+      meter: bucket.meter, minutes: bucket.minutes, remaining: bucket.remaining ?? null,
+      usageKnown: bucket.remaining !== undefined && bucket.disabled !== true, disabled: bucket.disabled ?? null, resetsAt: bucket.resetsAt,
+    }] : []),
+  };
+}
+
+/** Maps verified `retrieveUserQuota` buckets through the shared lane
+ * classifier (antigravity-lanes.ts), the same one the daemon's local read
+ * uses. A missing 5h bucket is an honest `not_enforced` gap (issue #55), never
+ * an invented 100%; a 5h bucket without usage behind an exhausted weekly is
+ * blocked; a missing weekly bucket is a failed read. */
+export function observationsFromAntigravityQuota(body: unknown, account: ProviderAccount, at = new Date(), availabilityReason?: string): Observation[] {
+  const classification = classifyAntigravityLanes(antigravityPayloadFromQuota(body, availabilityReason));
+  return normalizeObservations(antigravityLaneObservations(classification, account.name, { now: at.toISOString(), source: SOURCE }));
 }
 
 export async function observeAntigravity(account: ProviderAccount, dependencies: AntigravityDependencies = {}): Promise<Observation[]> {
@@ -135,11 +106,8 @@ export async function observeAntigravity(account: ProviderAccount, dependencies:
     const quota = await postUserQuota(fetcher, credentials.token, projectId, USER_AGENT);
     if (!quota.ok) throw await codeAssistHTTPError(quota);
     const body: unknown = await vendorJson(quota);
-    if (!buckets(body).some((bucket) => bucket.remaining !== undefined)) {
-      const tier = parsed.reasonCode ? `; tier ${parsed.tierId ?? parsed.tierName ?? "unknown"} (${parsed.reasonCode})` : "";
-      return failedAntigravityObservations(account, `quota endpoint returned availability only${tier}`, timestamp);
-    }
-    return observationsFromAntigravityQuota(body, account, now);
+    const tier = parsed.reasonCode ? `; tier ${parsed.tierId ?? parsed.tierName ?? "unknown"} (${parsed.reasonCode})` : "";
+    return observationsFromAntigravityQuota(body, account, now, redact(`quota endpoint returned availability only${tier}`));
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     if (message === "expired") return failedAntigravityObservations(account, "token expired; run: gemini", timestamp);

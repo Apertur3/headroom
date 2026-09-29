@@ -704,7 +704,7 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
 
   if (pw.is_unknown) {
     const isHeld = Boolean(pw.metadata?.vendor_window_held || pw.metadata?.vendor_inconsistent);
-    const tag = isHeld ? "HELD" : "UNKNOWN";
+    const tag = isHeld ? "HELD" : pw.metadata?.lane_state === "blocked_by_weekly" ? "BLOCKED" : "UNKNOWN";
     const reason = sanitizeFailureReason(pw.raw_reason ?? pw.decision_reason);
     const reset = pw.resets_at ? servedResetsIn(pw, now) : undefined;
     const overdueText = reset ? formatOverdueReset(reset) : undefined;

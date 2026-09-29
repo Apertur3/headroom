@@ -185,9 +185,10 @@ final class AntigravityRecordTests: XCTestCase {
         XCTAssertEqual(record.extraction_errors, ["missing field: groups"])
     }
 
-    /// Golden check: the record path must not change what `observe` and
-    /// `observe --shape` derive from the same usage snapshot.
-    func testObserveAndShapeOutputAreUnchangedForExhaustedWeekly() {
+    /// Golden check: the record path must not change `observe --shape`, and
+    /// `observe` now emits the usage-unknown bucket with its state instead of
+    /// dropping it.
+    func testObserveEmitsTheUnknownBucketAndShapeIsUnchangedForExhaustedWeekly() {
         let named = [
             NamedRateWindow(id: "antigravity-quota-summary-gemini-5h", title: "Gemini 5-hour", window: RateWindow(usedPercent: 0, windowMinutes: 300, resetsAt: nil, resetDescription: nil), usageKnown: false),
             NamedRateWindow(id: "antigravity-quota-summary-gemini-weekly", title: "Gemini weekly", window: RateWindow(usedPercent: 100, windowMinutes: 10_080, resetsAt: reset, resetDescription: nil)),
@@ -204,9 +205,14 @@ final class AntigravityRecordTests: XCTestCase {
             "$.windows[3]: title=Claude/GPT weekly, id=antigravity-quota-summary-cg-weekly, minutes=10080, resets_at=present",
         ])
         let observations = HeadroomEngine.antigravityWindows(Principal(id: "p", vendor: "antigravity", location: "agy"), usage: usage)
-        // The unknown gemini 5h bucket is still dropped by observe (unchanged behaviour).
         XCTAssertEqual(observations.filter { $0.freshness == "fresh" }.map(\.meter_id).sorted(), ["p:claude-gpt", "p:claude-gpt", "p:gemini"])
-        XCTAssertEqual(observations.filter { $0.freshness == "failed" }.count, 0)
+        // The unknown gemini 5h bucket is emitted, never dropped and never with
+        // CodexBarCore's placeholder percent.
+        let unknown = observations.filter { $0.freshness == "failed" }
+        XCTAssertEqual(unknown.map(\.meter_id), ["p:gemini"])
+        XCTAssertEqual(unknown.first?.window?.minutes, 300)
+        XCTAssertNil(unknown.first?.quantity)
+        XCTAssertEqual(unknown.first?.lane, LaneFacts(payload_kind: "quota_summary", bucket: "reported", usage_known: false, disabled: nil))
     }
 
     /// Bash 5.1+ delivers a short here-string as a pipe; the record input must accept it.
