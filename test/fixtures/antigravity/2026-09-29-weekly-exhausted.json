@@ -1,0 +1,64 @@
+{
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+        {
+          "bucket_id" : "gemini-weekly",
+          "disabled" : false,
+          "group" : "group-1",
+          "name" : "bucket-1",
+          "remaining_fraction" : 0,
+          "reset_description" : null,
+          "reset_time" : "2026-09-30T20:21:49Z",
+          "usage_known" : true
+        },
+        {
+          "bucket_id" : "gemini-5h",
+          "disabled" : true,
+          "group" : "group-2",
+          "name" : "bucket-2",
+          "remaining_fraction" : 1,
+          "reset_description" : null,
+          "reset_time" : "2026-09-30T00:07:00Z",
+          "usage_known" : false
+        },
+        {
+          "bucket_id" : "3p-weekly",
+          "disabled" : false,
+          "group" : "group-3",
+          "name" : "bucket-3",
+          "remaining_fraction" : 1,
+          "reset_description" : null,
+          "reset_time" : "2026-10-06T20:14:23Z",
+          "usage_known" : true
+        },
+        {
+          "bucket_id" : "3p-5h",
+          "disabled" : false,
+          "group" : "group-4",
+          "name" : "bucket-4",
+          "remaining_fraction" : 1,
+          "reset_description" : null,
+          "reset_time" : "2026-09-30T01:14:23Z",
+          "usage_known" : true
+        }
+      ],
+      "error" : null,
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+
+      ],
+      "payload_kind" : "quota_summary",
+      "principal" : "principal-0",
+      "source" : "local",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-29T20:14:23Z",
+  "schema" : 1
+}
