@@ -122,6 +122,18 @@ describe("keychain grant message for a config dir with no Claude login", () => {
   });
 });
 
+describe("headroom can without --owner", () => {
+  it("shows a one-line example instead of a bare error", async () => {
+    await expect(main(["can", "codex-build"])).rejects.toThrow("--owner is required, e.g. headroom can codex-build --owner <your-agent-name>");
+  });
+});
+
+describe("headroom install-service flags", () => {
+  it("rejects an unknown flag and lists --no-start in the usage", async () => {
+    await expect(main(["install-service", "--bogus"])).rejects.toThrow("Usage: headroom install-service [--dry-run] [--no-start]");
+  });
+});
+
 describe("headroom install-service --dry-run", () => {
   it("prints the full unit/plist/task text it would write, not just the path and load command", async () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-install-dryrun-"));

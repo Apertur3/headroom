@@ -1,10 +1,10 @@
 import { exec, execFile, spawn } from "node:child_process";
-import { lstat, readFile, rm } from "node:fs/promises";
+import { lstat, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface, type Interface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { isAccountsMissingError } from "./cli.js";
-import { claudeConfigJsonPath } from "./doctor.js";
+import { mcpRegistrationFor } from "./doctor.js";
 import { launchEnvironment } from "./orchestrator-reads.js";
 import { headroomHome } from "./paths.js";
 import { readAccounts } from "./registry.js";
@@ -19,8 +19,8 @@ const execFileAsync = promisify(execFile);
 export interface UninstallOverrides {
   /** Checks PATH for the `claude` command; overridden in tests to avoid depending on the machine. */
   claudeOnPath?: () => Promise<boolean>;
-  /** Runs `claude mcp remove headroom` for real; overridden in tests so no real Claude Code profile is ever touched. */
-  runClaudeMcpRemove?: (env: NodeJS.ProcessEnv) => Promise<number>;
+  /** Runs `claude mcp remove --scope <scope> headroom` for real; overridden in tests so no real Claude Code profile is ever touched. `cwd` is set for local scope only: Claude Code looks the entry up under the directory it runs in. */
+  runClaudeMcpRemove?: (env: NodeJS.ProcessEnv, scope: "user" | "local", cwd?: string) => Promise<number>;
   /** Runs the platform's own stop/unload command for the installed service; overridden in tests so launchd, systemd and Task Scheduler are never touched. */
   runServiceStop?: (command: string) => Promise<number>;
 }
@@ -39,9 +39,9 @@ async function defaultClaudeOnPath(): Promise<boolean> {
   } catch { return false; }
 }
 
-function defaultRunClaudeMcpRemove(env: NodeJS.ProcessEnv): Promise<number> {
+function defaultRunClaudeMcpRemove(env: NodeJS.ProcessEnv, scope: "user" | "local", cwd?: string): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn("claude", ["mcp", "remove", "headroom"], { stdio: "inherit", env });
+    const child = spawn("claude", ["mcp", "remove", "--scope", scope, "headroom"], { stdio: "inherit", env, cwd });
     child.on("error", () => resolve(1));
     child.on("close", (code) => resolve(code ?? 1));
   });
@@ -58,8 +58,10 @@ async function defaultRunServiceStop(command: string): Promise<number> {
   catch (error) { return typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1; }
 }
 
-function claudeDisplayCommand(env: Record<string, string>): string {
-  return env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${env.CLAUDE_CONFIG_DIR} claude mcp remove headroom` : "claude mcp remove headroom";
+function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "local", cwd?: string): string {
+  const command = `claude mcp remove --scope ${scope} headroom`;
+  const withProfile = env.CLAUDE_CONFIG_DIR ? `CLAUDE_CONFIG_DIR=${env.CLAUDE_CONFIG_DIR} ${command}` : command;
+  return cwd ? `(cd ${cwd} && ${withProfile})` : withProfile;
 }
 
 /**
@@ -98,7 +100,11 @@ async function stepService(options: UninstallOptions, overrides: UninstallOverri
  * Step 2: remove the MCP registration (`claude mcp add headroom -- ...`) for
  * every configured Claude profile that actually has one, read straight from
  * each profile's own `.claude.json` the same way `headroom doctor`'s mcp
- * registration check does.
+ * registration check does. A user-scope entry is removed with `--scope user`;
+ * an entry a plain `claude mcp add` left at local scope is removed with
+ * `--scope local` run from the directory it is bound to, which is where Claude
+ * Code looks it up. Only the `headroom` name is ever named, so unrelated MCP
+ * entries are never touched.
  */
 async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides): Promise<boolean> {
   console.log("Step 2: remove the Claude Code MCP registration");
@@ -111,12 +117,11 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
   }
   const claudeAccounts = accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && account.vendor === "claude");
   if (!claudeAccounts.length) { console.log("  no configured Claude profiles; nothing to remove"); return true; }
-  const registered: ProviderAccount[] = [];
+  const registered: { account: ProviderAccount; scope: "user" | "local"; cwd?: string }[] = [];
   for (const account of claudeAccounts) {
-    try {
-      const parsed = JSON.parse(await readFile(claudeConfigJsonPath(account.location), "utf8")) as { mcpServers?: Record<string, unknown> };
-      if (parsed.mcpServers && typeof parsed.mcpServers === "object" && "headroom" in parsed.mcpServers) registered.push(account);
-    } catch { /* no .claude.json for this profile, or unreadable: nothing registered to remove */ }
+    const found = await mcpRegistrationFor(account.location);
+    if (found.user) registered.push({ account, scope: "user" });
+    for (const cwd of found.localDirectories) registered.push({ account, scope: "local", cwd });
   }
   if (!registered.length) { console.log("  not registered for any configured Claude profile"); return true; }
   const claudeOnPath = overrides.claudeOnPath ?? defaultClaudeOnPath;
@@ -125,16 +130,17 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
   catch (error) { console.error(`  failed: ${safeError(error)}`); return false; }
   const runClaudeMcpRemove = overrides.runClaudeMcpRemove ?? defaultRunClaudeMcpRemove;
   let failed = false;
-  for (const account of registered) {
+  for (const { account, scope, cwd } of registered) {
     const env = { ...process.env, ...launchEnvironment(account) };
-    const display = claudeDisplayCommand(launchEnvironment(account));
-    if (options.dryRun) { console.log(`  (dry run) would run for ${account.name}: ${display}`); continue; }
-    if (!onPath) { console.log(`  \`claude\` was not found on PATH; run this yourself for ${account.name}: ${display}`); continue; }
+    const display = claudeDisplayCommand(launchEnvironment(account), scope, cwd);
+    const label = cwd ? `${account.name} (${scope} scope, ${cwd})` : `${account.name} (${scope} scope)`;
+    if (options.dryRun) { console.log(`  (dry run) would run for ${label}: ${display}`); continue; }
+    if (!onPath) { console.log(`  \`claude\` was not found on PATH; run this yourself for ${label}: ${display}`); continue; }
     try {
-      const code = await runClaudeMcpRemove(env);
-      console.log(code === 0 ? `  removed for ${account.name}` : `  claude mcp remove exited with code ${code} for ${account.name}`);
+      const code = await runClaudeMcpRemove(env, scope, cwd);
+      console.log(code === 0 ? `  removed for ${label}` : `  claude mcp remove exited with code ${code} for ${label}; run it yourself: ${display}`);
       if (code !== 0) failed = true;
-    } catch (error) { console.error(`  failed for ${account.name}: ${safeError(error)}`); failed = true; }
+    } catch (error) { console.error(`  failed for ${label}: ${safeError(error)}`); failed = true; }
   }
   return !failed;
 }

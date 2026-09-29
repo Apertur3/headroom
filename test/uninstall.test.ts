@@ -44,7 +44,7 @@ async function makeTempHomes(): Promise<{ fakeHome: string; headroomHome: string
   return { fakeHome, headroomHome };
 }
 
-async function writeClaudeAccount(fakeHome: string, headroomHome: string, options: { profileDirName?: string; registered: boolean }): Promise<ProviderAccount> {
+async function writeClaudeAccount(fakeHome: string, headroomHome: string, options: { profileDirName?: string; registered: boolean; /** Replaces the default user-scope config when set. */ config?: unknown }): Promise<ProviderAccount> {
   const location = options.profileDirName ? join(fakeHome, options.profileDirName) : join(fakeHome, ".claude");
   await mkdir(location, { recursive: true });
   const account: ProviderAccount = { name: options.profileDirName ? options.profileDirName.replace(/^\./, "") : "claude-main", vendor: "claude", location, adapter: "native-ts" };
@@ -56,7 +56,8 @@ async function writeClaudeAccount(fakeHome: string, headroomHome: string, option
   // claudeConfigJsonPath(): the default profile's .claude.json sits beside
   // ~/.claude, not inside it; a non-default profile's sits inside its own dir.
   const configJsonPath = options.profileDirName ? join(location, ".claude.json") : join(fakeHome, ".claude.json");
-  if (options.registered) await writeFile(configJsonPath, JSON.stringify({ mcpServers: { headroom: { command: "headroom", args: ["mcp"] } } }));
+  if (options.config !== undefined) await writeFile(configJsonPath, JSON.stringify(options.config));
+  else if (options.registered) await writeFile(configJsonPath, JSON.stringify({ mcpServers: { headroom: { command: "headroom", args: ["mcp"] } } }));
   return account;
 }
 
@@ -131,7 +132,7 @@ describe("headroom uninstall --dry-run", () => {
       logs = captured.logs;
     });
     const output = logs.join("\n");
-    expect(output).toContain(`(dry run) would run for ${account.name}: CLAUDE_CONFIG_DIR=${account.location} claude mcp remove headroom`);
+    expect(output).toContain(`(dry run) would run for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${account.location} claude mcp remove --scope user headroom`);
   });
 
   it("never deletes the home directory, even with --home", async () => {
@@ -203,6 +204,47 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
     expect(logs.join("\n")).toContain(`removed for ${account.name}`);
   });
 
+  it("removes a user-scope entry with --scope user and no directory", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
+    const runClaudeMcpRemove = vi.fn(async () => 0);
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
+    });
+    expect(runClaudeMcpRemove.mock.calls.map((call) => [call[1], call[2]])).toEqual([["user", undefined]]);
+  });
+
+  it("finds an entry a plain `claude mcp add` left at local scope and removes it with --scope local from the directory it is bound to", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const bound = join(fakeHome, "some-project");
+    // Two project entries: one with headroom next to an unrelated server, one with only an unrelated server.
+    const config = { projects: {
+      [bound]: { mcpServers: { headroom: { command: "headroom", args: ["mcp"] }, other: { command: "other" } } },
+      [join(fakeHome, "elsewhere")]: { mcpServers: { other: { command: "other" } } },
+    }, mcpServers: { other: { command: "other" } } };
+    await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
+    const runClaudeMcpRemove = vi.fn(async () => 0);
+    let logs: string[] = [];
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;
+    });
+    // Exactly one removal, for the one directory that holds a headroom entry; the unrelated servers are never named.
+    expect(runClaudeMcpRemove.mock.calls.map((call) => [call[1], call[2]])).toEqual([["local", bound]]);
+    expect(logs.join("\n")).toContain(`local scope, ${bound}`);
+  });
+
+  it("removes both a user-scope and a local-scope entry when a profile has both", async () => {
+    const { fakeHome, headroomHome } = await makeTempHomes();
+    const bound = join(fakeHome, "some-project");
+    const config = { mcpServers: { headroom: { command: "headroom" } }, projects: { [bound]: { mcpServers: { headroom: { command: "headroom" } } } } };
+    await writeClaudeAccount(fakeHome, headroomHome, { registered: true, config });
+    const runClaudeMcpRemove = vi.fn(async () => 0);
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
+    });
+    expect(runClaudeMcpRemove.mock.calls.map((call) => [call[1], call[2]])).toEqual([["user", undefined], ["local", bound]]);
+  });
+
   it("removes it for the default profile without setting CLAUDE_CONFIG_DIR", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
@@ -237,7 +279,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
       logs = captured.logs;
     });
     expect(runClaudeMcpRemove).not.toHaveBeenCalled();
-    expect(logs.join("\n")).toContain(`run this yourself for ${account.name}: CLAUDE_CONFIG_DIR=${account.location} claude mcp remove headroom`);
+    expect(logs.join("\n")).toContain(`run this yourself for ${account.name} (user scope): CLAUDE_CONFIG_DIR=${account.location} claude mcp remove --scope user headroom`);
   });
 
   it("exits 1 when `claude mcp remove` itself fails", async () => {

@@ -4,9 +4,10 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { configureNotifications, type Ask } from "./notify-configure.js";
 import { doctor } from "./doctor.js";
+import { CLAUDE_MCP_ADD_ARGS, MCP_ADD_COMMAND } from "./mcp-registration.js";
 import { isAccountsMissingError, observe } from "./cli.js";
 import { accountsPath, accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
-import { installService } from "./service.js";
+import { describeServiceStart, installAndStartService, installService, type ServiceStartOptions } from "./service.js";
 import { safeError } from "./security.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,6 +19,8 @@ export interface SetupOverrides {
   claudeOnPath?: () => Promise<boolean>;
   /** Runs `claude mcp add ...` for real; overridden in tests so `~/.claude.json` is never touched. */
   runClaudeMcpAdd?: () => Promise<number>;
+  /** Service-manager and daemon-probe stand-ins for the service step; overridden in tests so launchctl, systemctl and schtasks are never run. */
+  serviceStart?: ServiceStartOptions;
 }
 
 interface SetupOptions {
@@ -43,7 +46,7 @@ async function defaultClaudeOnPath(): Promise<boolean> {
 
 function defaultRunClaudeMcpAdd(): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn("claude", ["mcp", "add", "headroom", "--", "headroom", "mcp"], { stdio: "inherit" });
+    const child = spawn("claude", CLAUDE_MCP_ADD_ARGS, { stdio: "inherit" });
     child.on("error", () => resolve(1));
     child.on("close", (code) => resolve(code ?? 1));
   });
@@ -121,7 +124,7 @@ async function stepDoctor(options: SetupOptions): Promise<boolean> {
   return true;
 }
 
-async function stepInstallService(options: SetupOptions): Promise<boolean> {
+async function stepInstallService(options: SetupOptions, overrides: SetupOverrides): Promise<boolean> {
   console.log("Step 3: install the background service (launchd, systemd user unit, or Windows Task Scheduler)");
   if (options.skipService) {
     console.log("  skipped via --skip-service");
@@ -141,10 +144,9 @@ async function stepInstallService(options: SetupOptions): Promise<boolean> {
     return true;
   }
   try {
-    const result = await installService(process.argv[1], process.platform, undefined, process.execPath, false);
-    console.log(`  wrote ${result.path}`);
-    console.log(`  to load it: ${result.command}`);
-    console.log(`  the service will run: ${result.runtime} ${result.script} daemon`);
+    const started = await installAndStartService(process.argv[1], process.platform, undefined, process.execPath, process.env, undefined, overrides.serviceStart);
+    describeServiceStart(started).forEach((line) => console.log(`  ${line}`));
+    if (started.install) console.log(`  the service will run: ${started.install.runtime} ${started.install.script} daemon`);
   } catch (error) { return surviveStepError(options, error); }
   return true;
 }
@@ -171,7 +173,7 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
     console.log("  skipped via --skip-mcp");
     return true;
   }
-  console.log("  claude mcp add headroom -- headroom mcp");
+  console.log(`  ${MCP_ADD_COMMAND}`);
   const claudeOnPath = overrides.claudeOnPath ?? defaultClaudeOnPath;
   const runClaudeMcpAdd = overrides.runClaudeMcpAdd ?? defaultRunClaudeMcpAdd;
   let onPath: boolean;
@@ -237,7 +239,7 @@ export async function runSetup(argv: string[], overrides: SetupOverrides = {}): 
     for (const step of [
       () => stepDiscoverAccounts(options),
       () => stepDoctor(options),
-      () => stepInstallService(options),
+      () => stepInstallService(options, overrides),
       () => stepNotifications(options, overrides).catch((error: unknown) => surviveStepError(options, error)),
       () => stepMcp(options, overrides),
       () => stepFinalCheck(options),
