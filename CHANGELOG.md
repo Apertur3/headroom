@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Native engine `observe --principals <json> --record <out.json>` writes a redacted, allowlisted recording (mode 0600) of every Antigravity quota bucket the probe returned, before the usage-known filter, for regression fixtures; `scripts/record-antigravity-fixture.sh` wraps it. `observe` and `--shape` are unchanged.
+- Stale-lane canary: a meter lane with no fresh or `not_enforced` reading for `[canary] stale_after_hours` (default 6) raises `lane_stale` (again at most every 24h) and `lane_recovered` when it returns; both always go to the inbox, ignore `events_off`, reach every working notify channel, and show as a FAIL in `headroom doctor` and as `stale`/`stale_age_seconds` in status.
+
 ## [0.2.1] - 2026-09-29
 
 ### Fixed
@@ -14,10 +20,6 @@ All notable changes to this project are documented here. The format follows
 - `uninstall` resolves the profile path before removing a local-scope MCP entry, ignores an inherited `CLAUDE_CONFIG_DIR` for the default profile, and prints instructions instead of a failing command for a local-scope entry whose directory no longer exists.
 - A Claude credential read that fails with `security` exit 36 now explains that the login keychain is not accessible from this session, and `doctor` no longer reports that credential as OK.
 - `headroom can` without `--owner` now shows an example, and the README example includes it.
-
-### Added
-- Native engine `observe --principals <json> --record <out.json>` writes a redacted, allowlisted recording (mode 0600) of every Antigravity quota bucket the probe returned, before the usage-known filter, for regression fixtures; `scripts/record-antigravity-fixture.sh` wraps it. `observe` and `--shape` are unchanged.
-- Stale-lane canary: a meter lane with no fresh or `not_enforced` reading for `[canary] stale_after_hours` (default 6) raises `lane_stale` (again at most every 24h) and `lane_recovered` when it returns; both always go to the inbox, ignore `events_off`, reach every working notify channel, and show as a FAIL in `headroom doctor` and as `stale`/`stale_age_seconds` in status.
 
 ## [0.2.0] - 2026-09-28
 
