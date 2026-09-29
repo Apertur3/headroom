@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] - 2026-09-29
 
 ### Fixed
 - `setup` now registers the MCP server at user scope (`claude mcp add --scope user headroom -- headroom mcp`), so the tools exist in every directory; `doctor` warns about a local-scope-only entry and names its directory, and `uninstall` removes user-scope and local-scope entries.
