@@ -46,10 +46,9 @@ const COMPLETE_ANTIGRAVITY_ROWS: Observation[] = (["gemini", "claude-gpt"] as co
 
 /** Mirrors the Swift engine's catch-all `failed()` shape (see
  * HeadroomEngine.swift's `observe()`): a whole-meter, windowless failure pair
- * for both Antigravity meters -- the "placeholder" outcome collector.ts
- * classifies when the native engine returned something, but not a complete
- * warm summary. This is what agy's local server produces while its quota
- * summary is still warming or the machine is briefly busy. */
+ * for both Antigravity meters, which the shared lane classifier reads as the
+ * `error` state on every lane, keeping the engine's own text. This is what
+ * agy's local server produces while it is briefly unreachable or busy. */
 function transientFailurePair(): Observation[] {
   return (["gemini", "claude-gpt"] as const).map((meter) => ({
     principal_id: "antigravity", meter_id: `antigravity:${meter}`, window: null, quantity: null, resets_at: null,
@@ -96,9 +95,10 @@ it("keeps a whole-meter failure when a retry returns only one fresh lane", async
   expect(runNativeEngine).toHaveBeenCalledTimes(2);
   const rows = result.observations.filter((item) => item.principal_id === "antigravity");
   // Retaining the first whole-meter failure prevents the partial retry from
-  // leaving its omitted lanes backed by old fresh capacity.
-  expect(rows).toHaveLength(2);
-  expect(rows.every((item) => item.freshness === "failed" && item.window === null)).toBe(true);
+  // leaving its omitted lanes backed by old fresh capacity: every lane stays
+  // failed with the engine's own error text.
+  expect(rows).toHaveLength(4);
+  expect(rows.every((item) => item.freshness === "failed" && item.quantity === null && item.reason === "agy transient")).toBe(true);
 });
 
 it("gives up after one retry and reports the transient failure honestly when it persists", async () => {
@@ -110,7 +110,9 @@ it("gives up after one retry and reports the transient failure honestly when it 
   const result = await pollAccounts(undefined, { nativeEngineAvailable: true, daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
   expect(runNativeEngine).toHaveBeenCalledTimes(2); // one retry, not an unbounded loop
   const rows = result.observations.filter((item) => item.principal_id === "antigravity");
-  expect(rows).toHaveLength(2);
-  expect(rows.every((item) => item.freshness === "failed")).toBe(true);
-  expect(result.antigravityLocal?.antigravity.payload_kind).toBe("placeholder");
+  expect(rows).toHaveLength(4);
+  // The engine's error text survives: it is never replaced by a generic
+  // "agy logged in; quota summary not ready".
+  expect(rows.every((item) => item.freshness === "failed" && item.reason === "agy transient")).toBe(true);
+  expect(result.antigravityLocal?.antigravity).toMatchObject({ outcome: "failed", payload_kind: "error" });
 });

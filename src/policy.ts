@@ -302,6 +302,16 @@ export function isHeldReading(observation: Observation): boolean {
   return Boolean(observation.metadata?.vendor_window_held || observation.metadata?.vendor_inconsistent);
 }
 
+/** The reason text for a `failed` lane that is really blocked by its
+ * exhausted weekly lane (antigravity-lanes.ts), undefined for any other
+ * reading. It is stored `failed` so contract-1.0 consumers fail closed, but
+ * Headroom knows the state: the canary counts it as accepted, and every gate
+ * that would spend on it refuses as a known "no" rather than UNKNOWN. */
+export function blockedLaneReason(observation: Observation): string | undefined {
+  if (observation.freshness !== "failed" || observation.metadata?.lane_state !== "blocked_by_weekly") return undefined;
+  return observation.reason ?? "blocked: weekly exhausted";
+}
+
 /** True when status would count this stored windowed reading as a real answer
  * from the vendor: fresh with a usable percent shape, or an explicit
  * not_enforced, and neither held (isHeldReading) nor a synthetic exhausted
@@ -312,6 +322,7 @@ export function isAcceptedLaneReading(observation: Observation): boolean {
   if (observation.source === "manual" || observation.source === "paste") return false;
   if (isHeldReading(observation) || observation.metadata?.exhausted || observation.metadata?.retired) return false;
   if (observation.freshness === "not_enforced") return true;
+  if (blockedLaneReason(observation)) return true;
   if (observation.freshness !== "fresh") return false;
   return Boolean(observation.quantity && observation.quantity.limit !== null && observation.window?.minutes);
 }
@@ -367,6 +378,9 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   // not_enforced) so a frozen, unconfirmed baseline can never be treated as
   // capacity while it waits out its hold.
   if (isHeldReading(observation)) return { state: "UNKNOWN", reason: heldWindowReason(observation, ageMinutesSince(observation.fetched_at, now))! };
+  // A blocked lane is UNKNOWN by state (never capacity) but names why.
+  const blockedReason = blockedLaneReason(observation);
+  if (blockedReason) return { state: "UNKNOWN", reason: blockedReason };
   if (observation.freshness === "not_enforced") return { state: "NOT_ENFORCED", reason: "not enforced" };
   const parsedFetchedAt = new Date(observation.fetched_at).getTime();
   if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(observation, parsedFetchedAt, policy, now)}` };
@@ -420,6 +434,9 @@ export interface FreshnessOutcome {
    * ok is also true in that case, since a genuinely capless window is a
    * usable reading, not an unknown one. */
   notEnforced?: boolean;
+  /** True (with ok false) for a lane blocked by its exhausted weekly lane:
+   * a known absence of capacity, not an unreadable window. */
+  blocked?: boolean;
 }
 
 /**
@@ -438,6 +455,8 @@ export function freshnessGate(observation: Observation | undefined, staleMinutes
   // A held reading fails closed immediately, at any age -- see isHeldReading
   // and paceDecision's identical ordering above.
   if (isHeldReading(observation)) return { ok: false, reason: heldWindowReason(observation, ageMinutesSince(observation.fetched_at, now))! };
+  const blocked = blockedLaneReason(observation);
+  if (blocked) return { ok: false, reason: blocked, blocked: true };
   if (observation.freshness === "not_enforced") return { ok: true, reason: "not enforced", notEnforced: true };
   if (observation.freshness === "stale") return { ok: false, reason: observation.reason ?? "stale" };
   if (observation.freshness !== "fresh") return { ok: false, reason: observation.reason ?? observation.freshness };
@@ -621,12 +640,18 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   // vendor-confirmed absent limit, which requires an actual observation to
   // confirm it. An empty set must fail closed like any other unknown state.
   if (!windows.length) return { state: "UNKNOWN", reason: `no readings for ${meter}`, dispatchable: true };
+  // A lane blocked by its exhausted weekly shows as not enforced but has no
+  // capacity, so dispatch treats it as frozen (blockedLaneReason).
   const enforced = windows
     .filter((observation) => observation.window?.kind !== "count")
-    .map((observation) => ({ observation, ...paceDecision(observation, policy, now) }))
+    .map((observation) => {
+      const blocked = blockedLaneReason(observation);
+      return blocked ? { observation, state: "FREEZE" as PaceState, reason: blocked, blocked: true } : { observation, ...paceDecision(observation, policy, now), blocked: false };
+    })
     .filter((window) => window.state !== "NOT_ENFORCED");
   if (!enforced.length) return { state: "NOT_ENFORCED", reason: "not enforced", dispatchable: true };
   const deciding = enforced.reduce((worst, current) => severity[current.state] > severity[worst.state] ? current : worst);
+  if (deciding.blocked) return { state: "FREEZE", reason: `${windowLabel(deciding.observation)} ${deciding.reason}`, dispatchable: true };
   if (deciding.state === "UP" || deciding.state === "BUSY" || deciding.state === "DOWN") {
     const metadata = deciding.observation.metadata;
     const model = metadata?.model_ids?.[0] ?? "unknown";

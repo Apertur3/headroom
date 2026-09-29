@@ -1,0 +1,26 @@
+{
+  "_comment" : "SYNTHETIC, not recorded. History row 09-23 to 09-28: a whole-meter engine error (the local quota request timed out), whose real text used to be overwritten with 'agy logged in; quota summary not ready'. Same schema as an observe --record file; redacted by construction.",
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+
+      ],
+      "error" : "timed_out",
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+
+      ],
+      "payload_kind" : "none",
+      "principal" : "principal-0",
+      "source" : "local",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-25T08:00:00Z",
+  "schema" : 1
+}

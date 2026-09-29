@@ -10,6 +10,9 @@ All notable changes to this project are documented here. The format follows
 - Native engine `observe --principals <json> --record <out.json>` writes a redacted, allowlisted recording (mode 0600) of every Antigravity quota bucket the probe returned, before the usage-known filter, for regression fixtures; `scripts/record-antigravity-fixture.sh` wraps it. `observe` and `--shape` are unchanged.
 - Stale-lane canary: a meter lane with no fresh or `not_enforced` reading for `[canary] stale_after_hours` (default 6) raises `lane_stale` (again at most every 24h) and `lane_recovered` when it returns; both always go to the inbox, ignore `events_off`, reach every working notify channel, and show as a FAIL in `headroom doctor` and as `stale`/`stale_age_seconds` in status.
 
+### Fixed
+- Antigravity: a 5h lane agy disables while its weekly lane is exhausted no longer fails the whole read or logs "placeholder"; it is stored `failed` with `metadata.lane_state: "blocked_by_weekly"` and reads "blocked until <reset>", the other lanes stay fresh, gates refuse that lane, and failure reasons keep the engine's real error text. The local and remote paths now share one lane classifier. A poll that carries an explicit row for a lane in any state no longer retires that lane, so a partial read (5h absent, weekly without usage) stays refused and visible to the stale-lane canary.
+
 ## [0.2.1] - 2026-09-29
 
 ### Fixed

@@ -789,12 +789,17 @@ export class HeadroomStore {
     try {
       const stored = this.insertAll(observations);
       const byMeter = new Map<string, StoredObservation[]>();
+      // Every windowed row this poll carried, in any state: a lane the vendor
+      // answered for (failed, blocked, loading) is present, only a lane the
+      // poll never mentioned may be retired.
+      const explicit = new Map<string, Set<number>>();
+      for (const row of stored) if (row.window?.minutes) explicit.set(row.meter_id, (explicit.get(row.meter_id) ?? new Set<number>()).add(row.window.minutes));
       for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
       for (const [meter, rows] of byMeter) {
         // An incomplete vendor picture must not retire a sibling window while
         // this meter is already being held for inconsistent reset identities.
         if (rows.some((row) => this.vendorWindowSuspect(row))) continue;
-        const present = new Set(rows.map((row) => row.window!.minutes));
+        const present = explicit.get(meter)!;
         for (const old of this.latestPerWindow(meter)) {
           const minutes = old.window?.minutes;
           if (!minutes || present.has(minutes) || old.metadata?.retired) continue;
@@ -1811,7 +1816,7 @@ export class HeadroomStore {
   private newestAcceptedAt(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">): string | null {
     if (lane.window_minutes <= 0) return null;
     const placeholders = lane.meter_ids.map(() => "?").join(",");
-    const statement = this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND freshness IN ('fresh', 'not_enforced') AND source NOT IN ('manual', 'paste')
+    const statement = this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND (freshness IN ('fresh', 'not_enforced') OR (freshness = 'failed' AND metadata_json LIKE '%blocked_by_weekly%')) AND source NOT IN ('manual', 'paste')
       AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ? AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
       ORDER BY fetched_at DESC, id DESC LIMIT 50`);
     let cursorAt = "￿"; let cursorId = Number.MAX_SAFE_INTEGER;

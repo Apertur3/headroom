@@ -40,6 +40,60 @@ struct Observation: Codable {
     let upstream_schema_version: String
     let reason: String?
     let metadata: ObservationMetadata?
+    /// Antigravity only, additive: what agy sent for this lane, so the
+    /// TypeScript lane classifier (src/antigravity-lanes.ts) can tell a
+    /// disabled or usage-unknown bucket apart from a missing one. Omitted
+    /// from the JSON when nil (every Codex row).
+    var lane: LaneFacts? = nil
+}
+
+struct LaneFacts: Codable, Equatable {
+    /// quota_summary | model_quota_fallback | availability_only
+    let payload_kind: String
+    /// "reported": the bucket was in agy's answer. "not_reported": the
+    /// engine's placeholder for a weekly lane its readiness wait never saw.
+    let bucket: String
+    /// False: the bucket carries no usable usage, so the row has no quantity.
+    let usage_known: Bool
+    /// The vendor's own disabled flag, when the quota summary exposed it.
+    let disabled: Bool?
+}
+
+/// Payload facts CodexBarCore's UsageSnapshot drops: which kind of answer
+/// agy gave, and each quota-summary bucket's disabled flag by bucket id.
+struct AntigravityPayloadFacts: Equatable {
+    var payloadKind: String
+    var disabledByBucketID: [String: Bool]
+
+    /// Same vocabulary and rules as the recorder's `payload_kind`.
+    init(status: AntigravityStatusSnapshot) {
+        let input = AntigravityRecorder.input(from: status)
+        if input.isQuotaSummary {
+            payloadKind = "quota_summary"
+        } else if !input.models.isEmpty, input.models.allSatisfy({ $0.remainingFraction == nil }) {
+            payloadKind = "availability_only"
+        } else {
+            payloadKind = "model_quota_fallback"
+        }
+        disabledByBucketID = Dictionary(input.buckets.map { ($0.bucketID, $0.disabled) }, uniquingKeysWith: { first, second in first || second })
+    }
+
+    init(payloadKind: String, disabledByBucketID: [String: Bool] = [:]) {
+        self.payloadKind = payloadKind
+        self.disabledByBucketID = disabledByBucketID
+    }
+
+    /// Without the parsed status (tests that build a UsageSnapshot directly).
+    static func derived(from usage: UsageSnapshot) -> AntigravityPayloadFacts {
+        AntigravityPayloadFacts(payloadKind: AntigravitySnapshotWaiter.summaryWindows(in: usage).isEmpty ? "model_quota_fallback" : "quota_summary")
+    }
+}
+
+private final class PayloadFactsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var facts: AntigravityPayloadFacts?
+    func set(_ value: AntigravityPayloadFacts) { lock.lock(); facts = value; lock.unlock() }
+    func get() -> AntigravityPayloadFacts? { lock.lock(); defer { lock.unlock() }; return facts }
 }
 
 struct ObservationMetadata: Codable {
@@ -239,13 +293,14 @@ struct HeadroomEngine {
     }
 
     static func antigravity(_ principal: Principal) async throws -> [Observation] {
-        let snapshot = try await antigravitySnapshot(principal)
-        let observations = antigravityWindows(principal, usage: snapshot.usage)
+        let box = PayloadFactsBox()
+        let snapshot = try await antigravitySnapshot(principal, observeStatus: { box.set(AntigravityPayloadFacts(status: $0)) })
+        let observations = antigravityWindows(principal, usage: snapshot.usage, facts: box.get())
         guard !observations.isEmpty else { throw EngineError.noUsage }
         return observations
     }
 
-    static func antigravitySnapshot(_ principal: Principal) async throws -> AntigravitySnapshotFetch {
+    static func antigravitySnapshot(_ principal: Principal, observeStatus: @escaping @Sendable (AntigravityStatusSnapshot) -> Void = { _ in }) async throws -> AntigravitySnapshotFetch {
         do {
             // This is a user-owned local server (app, IDE, or `agy`). It is
             // already reachable, but its quota summary can still be warming.
@@ -260,7 +315,9 @@ struct HeadroomEngine {
                 pollNanoseconds: 1_500_000_000,
                 fetch: { remaining in
                     let status = try await AntigravityStatusProbe(timeout: min(8, remaining)).fetch()
-                    return try AntigravitySnapshotFetch(status: status)
+                    let fetch = try AntigravitySnapshotFetch(status: status)
+                    observeStatus(status)
+                    return fetch
                 })
         } catch AntigravityStatusProbeError.notRunning {
             // The TypeScript daemon owns the one long-lived agy PTY. A direct
@@ -270,18 +327,39 @@ struct HeadroomEngine {
         }
     }
 
-    static func antigravityWindows(_ principal: Principal, usage: UsageSnapshot) -> [Observation] {
+    static let quotaSummaryIDPrefix = "antigravity-quota-summary-"
+
+    static func antigravityWindows(_ principal: Principal, usage: UsageSnapshot, facts: AntigravityPayloadFacts? = nil) -> [Observation] {
         let source = "local:antigravity:warm"
         let summaryWindows = AntigravitySnapshotWaiter.summaryWindows(in: usage)
+        let facts = facts ?? .derived(from: usage)
+        // The summary windows come from CodexBarCore's public snapshot; the
+        // reflected facts only refine the no-summary case, so upstream drift
+        // in the reflection can never demote a real quota summary.
+        let kind = !summaryWindows.isEmpty ? "quota_summary" : facts.payloadKind == "availability_only" ? "availability_only" : "model_quota_fallback"
         var output: [Observation] = []
 
         if summaryWindows.isEmpty {
-            output += windows(principal, meter: "gemini", windows: [usage.primary], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
-            output += windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
+            // No quota summary: per-model representatives only. Without any
+            // fraction (availability only) their percent is not usage.
+            let lane = LaneFacts(payload_kind: kind, bucket: "reported", usage_known: kind != "availability_only", disabled: nil)
+            output += windows(principal, meter: "gemini", windows: [usage.primary], source: source, kind: AntigravitySnapshotWaiter.kind(for:), lane: lane)
+            output += windows(principal, meter: "claude-gpt", windows: [usage.secondary], source: source, kind: AntigravitySnapshotWaiter.kind(for:), lane: lane)
         } else {
-            for named in summaryWindows where named.usageKnown {
+            for named in summaryWindows {
                 guard let meter = AntigravitySnapshotWaiter.meter(for: named) else { continue }
-                output += windows(principal, meter: meter, windows: [named.window], source: source, kind: AntigravitySnapshotWaiter.kind(for:))
+                let bucketID = named.id.hasPrefix(quotaSummaryIDPrefix) ? String(named.id.dropFirst(quotaSummaryIDPrefix.count)) : named.id
+                let disabled = facts.disabledByBucketID[bucketID]
+                if named.usageKnown {
+                    output += windows(principal, meter: meter, windows: [named.window], source: source, kind: AntigravitySnapshotWaiter.kind(for:),
+                                      lane: LaneFacts(payload_kind: kind, bucket: "reported", usage_known: true, disabled: disabled))
+                } else {
+                    // Disabled or fraction-less: emitted with its state rather
+                    // than dropped, and without the placeholder percent
+                    // CodexBarCore fills in, so it can never read as capacity.
+                    output.append(unknownUsageWindow(principal, meter: meter, window: named.window, source: source,
+                                                     lane: LaneFacts(payload_kind: kind, bucket: "reported", usage_known: false, disabled: disabled)))
+                }
             }
         }
 
@@ -289,12 +367,20 @@ struct HeadroomEngine {
         // masquerade as current. Emit the missing per-group weekly lane as a
         // failed observation so Headroom's fail-closed status becomes UNKNOWN.
         let presentWeeklyMeters = Set(summaryWindows
-            .filter { $0.window.windowMinutes == AntigravitySnapshotWaiter.weeklyMinutes && $0.usageKnown }
+            .filter { $0.window.windowMinutes == AntigravitySnapshotWaiter.weeklyMinutes }
             .compactMap(AntigravitySnapshotWaiter.meter(for:)))
         for meter in AntigravitySnapshotWaiter.expectedMeters.sorted() where !presentWeeklyMeters.contains(meter) {
-            output.append(failedWeeklyWindow(principal, meter: meter, source: source))
+            output.append(failedWeeklyWindow(principal, meter: meter, source: source,
+                                             lane: LaneFacts(payload_kind: kind, bucket: "not_reported", usage_known: false, disabled: nil)))
         }
         return output
+    }
+
+    /// A reported bucket without usable usage: failed, no quantity, no reset.
+    static func unknownUsageWindow(_ principal: Principal, meter: String, window: RateWindow, source: String, lane: LaneFacts) -> Observation {
+        let now = iso(Date())!
+        let why = lane.disabled == true ? "bucket disabled" : "no remaining fraction"
+        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: AntigravitySnapshotWaiter.kind(for: window), minutes: window.windowMinutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: "vendor sent this bucket without usage (\(why))", metadata: nil, lane: lane)
     }
 
     /// `kind` classifies a seen window's `Window.kind`. Defaults to the
@@ -302,15 +388,15 @@ struct HeadroomEngine {
     /// has no fixed window-identity table). Antigravity callers pass
     /// `AntigravitySnapshotWaiter.kind(for:)` instead, which classifies by
     /// window duration/identity -- see that function's doc comment.
-    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil, kind: (RateWindow) -> String = { $0.resetsAt == nil ? "rolling" : "fixed" }) -> [Observation] {
+    static func windows(_ principal: Principal, meter: String, windows: [RateWindow?], source: String, metadata: ObservationMetadata? = nil, kind: (RateWindow) -> String = { $0.resetsAt == nil ? "rolling" : "fixed" }, lane: LaneFacts? = nil) -> [Observation] {
         windows.compactMap { value in
             guard let value, !value.isSyntheticPlaceholder else { return nil }
-            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: kind(value), minutes: value.windowMinutes, enforcement: "hard"), metadata: metadata)
+            return observation(principal, meter: meter, quantity: Quantity(used: value.usedPercent, limit: 100, remaining: value.remainingPercent, unit: "percent"), reset: value.resetsAt, observed: Date(), source: source, window: Window(kind: kind(value), minutes: value.windowMinutes, enforcement: "hard"), metadata: metadata, lane: lane)
         }
     }
 
-    static func observation(_ principal: Principal, meter: String, quantity: Quantity, reset: Date?, observed: Date, source: String, window: Window?, metadata: ObservationMetadata? = nil) -> Observation {
-        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil, metadata: metadata)
+    static func observation(_ principal: Principal, meter: String, quantity: Quantity, reset: Date?, observed: Date, source: String, window: Window?, metadata: ObservationMetadata? = nil, lane: LaneFacts? = nil) -> Observation {
+        Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: window, quantity: quantity, resets_at: iso(reset), observed_at: iso(observed)!, fetched_at: iso(Date())!, source: source, truth: "official", freshness: "fresh", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: nil, metadata: metadata, lane: lane)
     }
 
     static func notEnforcedWindow(_ principal: Principal, meter: String, minutes: Int, source: String, reason: String, metadata: ObservationMetadata? = nil) -> Observation {
@@ -318,9 +404,9 @@ struct HeadroomEngine {
         return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "rolling", minutes: minutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "official", freshness: "not_enforced", confidence: 1, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: reason, metadata: metadata)
     }
 
-    static func failedWeeklyWindow(_ principal: Principal, meter: String, source: String) -> Observation {
+    static func failedWeeklyWindow(_ principal: Principal, meter: String, source: String, lane: LaneFacts? = nil) -> Observation {
         let now = iso(Date())!
-        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "fixed", minutes: AntigravitySnapshotWaiter.weeklyMinutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: "quota summary not ready", metadata: nil)
+        return Observation(principal_id: principal.id, meter_id: "\(principal.id):\(meter)", window: Window(kind: "fixed", minutes: AntigravitySnapshotWaiter.weeklyMinutes, enforcement: "hard"), quantity: nil, resets_at: nil, observed_at: now, fetched_at: now, source: source, truth: "estimated", freshness: "failed", confidence: 0, adapter_version: Self.engineVersion, upstream_schema_version: Self.upstreamVersion, reason: "quota summary not ready", metadata: nil, lane: lane)
     }
 
     static func failed(principal: Principal, meters: [String], error: Error) -> [Observation] {

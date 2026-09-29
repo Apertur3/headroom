@@ -1,0 +1,45 @@
+{
+  "_comment" : "SYNTHETIC, not recorded. History row 09-23 to 09-28: agy served its two 5h buckets while the weekly buckets were still loading (the engine's readiness wait ran out first). Same schema as an observe --record file; redacted by construction.",
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+        {
+          "bucket_id" : "gemini-5h",
+          "disabled" : false,
+          "group" : "group-1",
+          "name" : "bucket-1",
+          "remaining_fraction" : 0.9,
+          "reset_description" : null,
+          "reset_time" : "2026-09-23T15:00:00Z",
+          "usage_known" : true
+        },
+        {
+          "bucket_id" : "3p-5h",
+          "disabled" : false,
+          "group" : "group-2",
+          "name" : "bucket-2",
+          "remaining_fraction" : 0.75,
+          "reset_description" : null,
+          "reset_time" : "2026-09-23T15:30:00Z",
+          "usage_known" : true
+        }
+      ],
+      "error" : null,
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+
+      ],
+      "payload_kind" : "quota_summary",
+      "principal" : "principal-0",
+      "source" : "local",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-23T11:00:00Z",
+  "schema" : 1
+}

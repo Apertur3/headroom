@@ -129,6 +129,13 @@ export interface Observation {
      * also a real zero-valued row so the prior count stays auditable. */
     manual?: boolean;
     manual_cleared?: boolean;
+    /** Set on a `failed` lane whose bucket carries no usage because the same
+     * group's weekly lane is exhausted (antigravity-lanes.ts). It is a known
+     * state (the canary accepts it) with no capacity: gate, can and plan
+     * refuse it for that lane. */
+    lane_state?: "blocked_by_weekly";
+    /** With lane_state: the weekly reset that unblocks the lane, when known. */
+    blocked_until?: string | null;
   };
   /** Computed at response time for a credits count whose recorded expiry has
    * passed. Raw stored observations never gain this field or get rewritten. */

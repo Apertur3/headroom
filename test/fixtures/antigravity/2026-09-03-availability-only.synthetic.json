@@ -1,0 +1,39 @@
+{
+  "_comment" : "SYNTHETIC, not recorded. History row 09-03: agy answered with model availability only (no quota summary, no fraction) before its login finished. Same schema as an observe --record file; redacted by construction.",
+  "engine_version" : "0.1.0",
+  "principals" : [
+    {
+      "account" : "redacted",
+      "buckets" : [
+
+      ],
+      "error" : null,
+      "extraction_errors" : [
+
+      ],
+      "model_quotas" : [
+        {
+          "label" : "model-1",
+          "model_id" : "gemini-3.7-flash",
+          "remaining_fraction" : null,
+          "reset_description" : null,
+          "reset_time" : null
+        },
+        {
+          "label" : "model-2",
+          "model_id" : "claude-sonnet-4",
+          "remaining_fraction" : null,
+          "reset_description" : null,
+          "reset_time" : null
+        }
+      ],
+      "payload_kind" : "availability_only",
+      "principal" : "principal-0",
+      "source" : "local",
+      "vendor" : "antigravity"
+    }
+  ],
+  "probe_version" : "v0.56.4",
+  "recorded_at" : "2026-09-03T19:38:37Z",
+  "schema" : 1
+}
