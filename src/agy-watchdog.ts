@@ -109,8 +109,9 @@ function ageText(seconds: number): string {
 }
 
 /** Kills each over-age Headroom-started process by group and reports it to the
- * daemon log and the inbox. The report names the pid, age and binary path only
- * (`ps` comm), never arguments. Returns what it killed. */
+ * daemon log and the inbox. The report names the pid, age and recorded command
+ * only (`comm`: the binary path on macOS, the process name on Linux), never
+ * arguments. Returns what it killed. */
 export async function runAgyWatchdog(options: WatchdogOptions): Promise<OverAgeProcess[]> {
   const log = options.log ?? ((message: string) => appendDaemonLog(message, options.home));
   const send = options.send ?? sendInboxMessage;

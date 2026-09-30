@@ -612,10 +612,18 @@ export class AgyKeepaliveSupervisor {
   }
 
   /** Signals the launch wrapper only if the recorded command and start time
-   * still match the live process. No or stale evidence means the pid is left
-   * alone; the next sweep or the age watchdog decides. */
-  private async killScriptVerified(pid: number): Promise<void> {
-    const evidence = this.scriptEvidence;
+   * still match the live process. Stale evidence means the pid is left alone;
+   * the next sweep or the age watchdog decides. stop() can run before
+   * recordState() has read the wrapper's identity (a slow `ps`, or a stop
+   * right after start): the identity is then read now, and trusted only if
+   * the child was still unreaped (so its pid could not have changed hands)
+   * both before and after the read. */
+  private async killScriptVerified(pid: number, child: ChildProcess): Promise<void> {
+    let evidence = this.scriptEvidence;
+    if ((!evidence || evidence.pid !== pid) && isAlive(child)) {
+      const signature = await processSignature(pid);
+      if (signature && isAlive(child)) evidence = { pid, ...signature };
+    }
     if (!evidence || evidence.pid !== pid) {
       this.log(`antigravity keepalive stop: no verified launch evidence for pid ${pid} -- left alone`);
       return;
@@ -662,7 +670,7 @@ export class AgyKeepaliveSupervisor {
       // tree starts exiting. It may otherwise write during shutdown.
       let agyPid = this.agyPidFile ? await this.awaitAgyPid(child) : undefined;
       const pid = child.pid;
-      if (typeof pid === "number") await this.killScriptVerified(pid);
+      if (typeof pid === "number") await this.killScriptVerified(pid, child);
       else child.kill("SIGTERM");
       // killTree's descendant snapshot can be unavailable when ps is denied.
       // This is still this launch's private wrapper file, captured while its
@@ -935,7 +943,7 @@ export class AgyKeepaliveSupervisor {
   private async reconcileOwnLaunchDirectory(): Promise<boolean> {
     const location = this.ownEvidenceLocation();
     if (!location) return true;
-    try { return (await reconcileEvidence(location)).unverified.length === 0; }
+    try { return (await reconcileEvidence(location, { execImpl: this.execImpl })).unverified.length === 0; }
     catch { return false; }
   }
 
@@ -957,7 +965,7 @@ export class AgyKeepaliveSupervisor {
       const agrees = state?.agyPid !== undefined
         ? state.agyPid === detailed.pid
         : await this.isThisLaunchAgy(detailed.pid, location.pidPath, state?.launchedAt);
-      if (!agrees) return (await reconcileEvidence(location)).unverified.length === 0;
+      if (!agrees) return (await reconcileEvidence(location, { execImpl: this.execImpl })).unverified.length === 0;
     } catch { return false; }
     killProcessGroup(detailed.pid, { groupOnly: true });
     return waitUntilGroupGone(detailed.pid);

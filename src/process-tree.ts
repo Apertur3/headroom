@@ -1,4 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -194,21 +195,58 @@ export async function killTree(rootPid: number, options: KillTreeOptions = {}): 
   for (const pid of targets) if (stillAlive.has(pid)) trySignalGroupAndSelf(pid, "SIGKILL");
 }
 
+/** Options for every identity read from `ps`: bounded, and in the C locale,
+ * so `lstart` (strftime's locale-dependent `%c`) reads the same whichever
+ * locale the recording and the verifying process run under (a launchd daemon
+ * gets none, a terminal often a Dutch or English one). */
+function psIdentityOptions(): { timeout: number; killSignal: NodeJS.Signals; env: NodeJS.ProcessEnv } {
+  return { timeout: 2_000, killSignal: "SIGKILL", env: { ...process.env, LC_ALL: "C" } };
+}
+
+let linuxBootId: string | undefined;
+/** Linux, default path only: command and start time from ONE read of
+ * /proc/<pid>/stat, so both describe the same process at the same instant.
+ * The start time is the kernel's own `starttime` (clock ticks since boot,
+ * fixed for the life of the process) qualified by the boot id. procps
+ * `lstart` is not stable enough to compare: every `ps` call rebuilds it from
+ * /proc/stat's `btime` (whole seconds, and moved by any clock step) plus that
+ * tick count truncated to a second. `comm` here is the field procps prints
+ * for `comm`. Undefined when the process is gone or cannot be read. */
+function linuxProcSignature(pid: number): { command: string; startedAt: string } | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  let stat: string;
+  try { stat = readFileSync(`/proc/${pid}/stat`, "utf8"); } catch { return undefined; }
+  const open = stat.indexOf("(");
+  const close = stat.lastIndexOf(")"); // comm itself may contain ')' or spaces
+  if (open < 0 || close < open) return undefined;
+  const command = stat.slice(open + 1, close);
+  const ticks = stat.slice(close + 1).trim().split(/\s+/)[19]; // field 22; the slice starts at field 3
+  if (!command || !ticks || !/^\d+$/.test(ticks)) return undefined;
+  if (linuxBootId === undefined) {
+    try { linuxBootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); } catch { linuxBootId = ""; }
+  }
+  return { command, startedAt: `boot ${linuxBootId || "unknown"} tick ${ticks}` };
+}
+
 /** A stable identity for one running process: its command (no args) and its
- * exact start timestamp, both read fresh from `ps`. Two separate `ps`
- * invocations rather than one combined `-o comm=,lstart=` line: `lstart`'s
- * own format ("Wed Sep 23 11:48:12 2026") and a command path can each
- * contain spaces, so nothing about a single combined line can tell where
+ * exact start time. On Linux both come from /proc (see linuxProcSignature).
+ * Elsewhere, and whenever a caller injects its own `execImpl` (a test's
+ * process table), they come from `ps` in the C locale: two separate
+ * invocations rather than one combined `-o comm=,lstart=` line, because
+ * `lstart`'s own format ("Wed Sep 23 11:48:12 2026") and a command path can
+ * each contain spaces, so nothing about a single combined line can tell where
  * one field ends and the other begins once both are unpredictable-width.
  * Used to prove pid reuse hasn't happened before ever killing a pid found
  * only in a state file left by an earlier daemon run (see
  * antigravity-keepalive.ts's sweepPreviousKeepalive) -- a live process whose
  * command or start time no longer matches what was recorded is never
  * touched, whatever else is running under that pid now. */
-export async function processSignature(pid: number, execImpl: ExecFile = execFileAsync): Promise<{ command: string; startedAt: string } | undefined> {
+export async function processSignature(pid: number, execImpl?: ExecFile): Promise<{ command: string; startedAt: string } | undefined> {
+  if (!execImpl && process.platform === "linux") return linuxProcSignature(pid);
+  const runner = execImpl ?? execFileAsync;
   const field = async (keyword: "comm" | "lstart"): Promise<string | undefined> => {
     try {
-      const { stdout } = await execImpl("ps", ["-o", `${keyword}=`, "-p", String(pid)]);
+      const { stdout } = await runner("ps", ["-o", `${keyword}=`, "-p", String(pid)], psIdentityOptions());
       const value = stdout.split("\n")[0]?.trim();
       return value ? value : undefined;
     } catch { return undefined; }
@@ -248,10 +286,10 @@ export async function processArgs(pid: number, execImpl: ExecFile = execFileAsyn
  * cannot answer. */
 export interface LiveIdentity { command: string; startedAt: string; ppid: number; pgid: number }
 
-export async function processIdentity(pid: number, execImpl: ExecFile = execFileAsync): Promise<LiveIdentity | undefined> {
+export async function processIdentity(pid: number, execImpl?: ExecFile): Promise<LiveIdentity | undefined> {
   const ids = async (): Promise<{ ppid: number; pgid: number } | undefined> => {
     try {
-      const { stdout } = await execImpl("ps", ["-o", "ppid=,pgid=", "-p", String(pid)]);
+      const { stdout } = await (execImpl ?? execFileAsync)("ps", ["-o", "ppid=,pgid=", "-p", String(pid)], psIdentityOptions());
       const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(stdout.split("\n")[0] ?? "");
       return match ? { ppid: Number(match[1]), pgid: Number(match[2]) } : undefined;
     } catch { return undefined; }
@@ -261,11 +299,13 @@ export async function processIdentity(pid: number, execImpl: ExecFile = execFile
 }
 
 /** processSignature for synchronous contexts (a process 'exit' handler, or a
- * signal handler about to re-raise), each `ps` bounded by a short timeout. */
+ * signal handler about to re-raise), each `ps` bounded by a short timeout.
+ * Same sources, so the same values, as processSignature's default path. */
 export function processSignatureSync(pid: number): { command: string; startedAt: string } | undefined {
+  if (process.platform === "linux") return linuxProcSignature(pid);
   const field = (keyword: "comm" | "lstart"): string | undefined => {
     try {
-      const stdout = execFileSync("ps", ["-o", `${keyword}=`, "-p", String(pid)], { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"] });
+      const stdout = execFileSync("ps", ["-o", `${keyword}=`, "-p", String(pid)], { encoding: "utf8", ...psIdentityOptions(), stdio: ["ignore", "pipe", "ignore"] });
       const value = stdout.split("\n")[0]?.trim();
       return value ? value : undefined;
     } catch { return undefined; }

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -244,11 +244,22 @@ describe.skipIf(process.platform === "win32" || !canRunTypeScriptChild)("Ctrl-C 
       "  try { return next(specifier, context); }",
       '  catch (error) { if (specifier.startsWith(".") && specifier.endsWith(".js")) return next(specifier.slice(0, -3) + ".ts", context); throw error; }',
       "} });",
-      "const { runInGroup } = await import(process.argv[2]);",
+      'import { writeSync } from "node:fs";',
+      "const { runInGroup, setGroupRunSeamsForTest } = await import(process.argv[2]);",
+      "const tree = await import(process.argv[4]);",
+      // Diagnostics only: the real lookups and signals, each written to stderr
+      // synchronously (a signal handler re-raises before an async write lands).
+      "const note = (...parts) => writeSync(2, parts.map((part) => typeof part === 'string' ? part : JSON.stringify(part)).join(' ') + '\\n');",
+      "setGroupRunSeamsForTest({",
+      "  lookup: async (pid) => { const value = await tree.processSignature(pid); note('lookup', pid, value ?? null); return value; },",
+      "  lookupSync: (pid) => { const value = tree.processSignatureSync(pid); note('lookupSync', pid, value ?? null, 'ownGroup', tree.ownProcessGroup() ?? null); return value; },",
+      "  signal: (target, signal) => { try { process.kill(target, signal); if (signal) note('signal', target, signal, 'sent'); } catch (error) { if (signal) note('signal', target, signal, error.code); throw error; } },",
+      "});",
       "runInGroup(process.argv[3], [], { timeoutMs: 25000, maxBuffer: 1024 }).catch(() => undefined);",
     ].join("\n") + "\n");
     const groupRunUrl = pathToFileURL(resolve(import.meta.dirname, "../src/engine/group-run.ts")).href;
-    const child = spawn(process.execPath, ["--no-warnings", script, groupRunUrl, engine], { stdio: ["ignore", "ignore", "pipe"] });
+    const processTreeUrl = pathToFileURL(resolve(import.meta.dirname, "../src/process-tree.ts")).href;
+    const child = spawn(process.execPath, ["--no-warnings", script, groupRunUrl, engine, processTreeUrl], { stdio: ["ignore", "ignore", "pipe"] });
     track(child.pid, root);
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
@@ -259,7 +270,12 @@ describe.skipIf(process.platform === "win32" || !canRunTypeScriptChild)("Ctrl-C 
       child.kill("SIGINT");
       const outcome = await Promise.race([exited, new Promise((done) => setTimeout(() => done("still running"), 10_000))]);
       expect(outcome, stderr).toBe("SIGINT");
-      await expectNoSurvivors(root, enginePid);
+      try { await expectNoSurvivors(root, enginePid); }
+      catch (error) {
+        const table = execFileSync("ps", ["-Ao", "pid=,ppid=,pgid=,stat=,command="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+        const group = table.split("\n").filter((line) => line.includes(root) || new RegExp(`^\\s*\\d+\\s+\\d+\\s+${enginePid}\\s`).test(line)).join("\n");
+        throw new Error(`${(error as Error).message}\nchild stderr:\n${stderr}\nstill running:\n${group}`);
+      }
     } finally {
       child.kill("SIGKILL");
       if (enginePid) { try { process.kill(-enginePid, "SIGKILL"); } catch { /* gone */ } }

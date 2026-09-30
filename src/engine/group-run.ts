@@ -1,6 +1,5 @@
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import { ownProcessGroup, processSignature, processSignatureSync, type ExecFile } from "../process-tree.js";
+import { spawn } from "node:child_process";
+import { ownProcessGroup, processSignature, processSignatureSync } from "../process-tree.js";
 
 /**
  * Runs an engine child in its OWN process group, so a timeout, a daemon stop
@@ -58,9 +57,6 @@ let startsRefused = false;
 let signalCleanupEnabled = true;
 let signalHandlersInstalled = false;
 
-const execFileAsync = promisify(execFile);
-const boundedPs: ExecFile = ((file: string, args: readonly string[]) => execFileAsync(file, args, { timeout: 2_000, killSignal: "SIGKILL" })) as unknown as ExecFile;
-
 interface GroupRunSeams {
   signal(target: number, signal: NodeJS.Signals | 0): void;
   lookup(pid: number): Promise<ProcessSignatureValue | undefined>;
@@ -70,7 +66,8 @@ interface GroupRunSeams {
 
 const defaultSeams: GroupRunSeams = {
   signal: (target, signal) => { process.kill(target, signal); },
-  lookup: (pid) => processSignature(pid, boundedPs),
+  // The default path: bounded `ps`, or /proc on Linux, the same source as lookupSync.
+  lookup: (pid) => processSignature(pid),
   lookupSync: (pid) => processSignatureSync(pid),
   raise: (signal) => { process.kill(process.pid, signal); },
 };

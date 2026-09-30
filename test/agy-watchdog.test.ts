@@ -75,7 +75,9 @@ describe.skipIf(process.platform === "win32")("agy age watchdog", () => {
       expect(logged.join("\n")).toContain(`pid ${agyPid}`);
       const inbox = (await inboxTexts(root)).join("\n");
       expect(inbox).toContain(`pid ${agyPid}`);
-      expect(inbox).toMatch(/age \d+m\d+s, \/\S+\)/); // age, then the ps command name only, no arguments
+      // Age, then the recorded command only, one token, no arguments: a path
+      // on macOS (/bin/sh for this script), the process name (agy) on Linux.
+      expect(inbox).toMatch(process.platform === "darwin" ? /age \d+m\d+s, \/[^\s,()]+\)/ : /age \d+m\d+s, agy\)/);
     } finally { await supervisor.stop(); }
   }, 20_000);
 
