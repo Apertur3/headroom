@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.3] - 2026-09-30
 
 ### Fixed
 - The stale-lane canary and `doctor` no longer report a fresh count window (Codex or Grok credits) as "never accepted": a fresh reading with a remaining count and no minutes now counts as accepted.
