@@ -20,7 +20,7 @@
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { creditsLapsed } from "./credits.js";
 import { withEffectiveFreshness } from "./pace.js";
-import { blockedLaneReason, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
+import { blockedLaneReason, blockedLaneSummary, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
@@ -198,7 +198,8 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   const resetInfo = servedResetsIn(observation, now);
   const overdueText = formatOverdueReset(resetInfo);
   const overdue = overdueText ? ` ↻ ${overdueText}` : "";
-  if (blockedLaneReason(observation)) return `${label(observation)} blocked until ${blockedUntilText(observation)} (weekly exhausted)`;
+  const blockedSummary = blockedLaneSummary(observation);
+  if (blockedSummary) return blockedSummary;
   if (state === "NOT_ENFORCED") return `${label(observation)} n/a${observation.reason ? ` (${observation.reason})` : ""}`;
   if (!observation.quantity || state === "UNKNOWN") {
     // The last known reading is named "at <clock time>" here (unlike the

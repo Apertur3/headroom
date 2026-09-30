@@ -100,27 +100,28 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   output.push(primary ? tagged(primary) : tagged({ ...base(account, "main", now), window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no 5-hour window from endpoint or session logs" }));
   const weekly = rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now, SOURCE, "fresh", true);
   output.push(tagged(weekly ?? { ...base(account, "main", now), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no weekly window" }));
-  // The Spark entry is only ever present in this array when the request
-  // explicitly reported on it (see the `Array.isArray` guard): a payload
-  // that omits `additional_rate_limits` entirely means this vendor call
-  // never asked about Spark at all, and an existing Spark reading (however
-  // old) is left completely alone -- same as before this fix. Once the
-  // array IS present but has no entry whose name matches "spark" -- the
-  // reported stuck-UNKNOWN shape, an otherwise-successful response that
-  // simply has nothing to say about an idle Spark meter this time -- both of its
-  // windows are still reported, honestly, as not_enforced rather than
-  // silently emitting zero rows for the meter (which let the store's last
-  // real reading freeze in place and age into "stale Nm" forever, since
-  // nothing ever superseded it).
-  if (Array.isArray(usage.additional_rate_limits)) {
-    const sparkEntry = usage.additional_rate_limits.find((entry): entry is ObjectValue =>
-      object(entry) && String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") && object(entry.rate_limit));
-    const sparkRateLimit = sparkEntry ? sparkEntry.rate_limit as ObjectValue : undefined;
-    const five = rate(account, "spark", sparkRateLimit?.primary_window ?? sparkRateLimit?.primary, 300, now, SOURCE, "fresh", true);
-    const week = rate(account, "spark", sparkRateLimit?.secondary_window ?? sparkRateLimit?.secondary, 10_080, now, SOURCE, "fresh", true);
-    output.push(tagged(five ?? notEnforced(account, "spark", 300, now, "vendor sent no Spark data for the 5-hour window in this response")));
-    output.push(tagged(week ?? notEnforced(account, "spark", 10_080, now, "vendor sent no Spark data for the weekly window in this response")));
-  }
+  // Spark rows are emitted on every successful reply. This is the only call
+  // that reads Spark, so a reply with no `additional_rate_limits` at all (the
+  // vendor no longer reports the feature) is as much a vendor-confirmed
+  // statement as an array with no spark entry (an idle meter): both windows
+  // report not_enforced. Emitting nothing left the last row -- often a failed
+  // one from an earlier outage -- current forever, UNKNOWN with a canary
+  // alert although the API itself worked.
+  const additional = Array.isArray(usage.additional_rate_limits) ? usage.additional_rate_limits : undefined;
+  const sparkEntry = additional?.find((entry): entry is ObjectValue =>
+    object(entry) && String(entry.limit_name ?? entry.metered_feature ?? "").toLowerCase().includes("spark") && object(entry.rate_limit));
+  const sparkRateLimit = sparkEntry ? sparkEntry.rate_limit as ObjectValue : undefined;
+  const five = rate(account, "spark", sparkRateLimit?.primary_window ?? sparkRateLimit?.primary, 300, now, SOURCE, "fresh", true);
+  const week = rate(account, "spark", sparkRateLimit?.secondary_window ?? sparkRateLimit?.secondary, 10_080, now, SOURCE, "fresh", true);
+  // Absence of Spark data only means "no cap" when the same reply also
+  // produced a parsed main window. A partial reply (e.g. `{"rate_limit":{}}`)
+  // proves nothing about Spark and must fail closed like any other outage.
+  const mainParsed = primary !== undefined || weekly !== undefined;
+  const sparkAbsent = (minutes: number, label: string): Observation => mainParsed
+    ? notEnforced(account, "spark", minutes, now, additional ? `vendor sent no Spark data for the ${label} window in this response` : "vendor no longer reports Spark")
+    : { ...base(account, "spark", now), window: { kind: minutes === 300 ? "rolling" : "fixed", minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: `partial Codex reply (no main window); Spark ${label} window unknown` };
+  output.push(tagged(five ?? sparkAbsent(300, "5-hour")));
+  output.push(tagged(week ?? sparkAbsent(10_080, "weekly")));
   if (object(credits) && number(credits.available_count) !== undefined) {
     const available = number(credits.available_count)!;
     const expiries = (Array.isArray(credits.credits) ? credits.credits : []).flatMap((credit) => object(credit) && string(credit.status) === "available" && typeof credit.expires_at === "string" ? [credit.expires_at] : []).sort();

@@ -149,8 +149,8 @@ describe("Codex moving idle windows (issue #50)", () => {
       primary: { used_percent: 0, window_minutes: 300, resets_at: Math.floor((Date.parse(at) + 300 * 60_000 + offsetSeconds * 1_000) / 1000) },
       secondary: { used_percent: 0, window_minutes: 10_080, resets_at: Math.floor((Date.parse(at) + 10_080 * 60_000 + offsetSeconds * 1_000) / 1000) },
     } });
-    const marked = observationsFromCodexUsage(usage(60), {}, account, new Date(at));
-    const beyond = observationsFromCodexUsage(usage(91), {}, account, new Date(at));
+    const marked = observationsFromCodexUsage(usage(60), {}, account, new Date(at)).filter((row) => row.meter_id === "codex-main:main");
+    const beyond = observationsFromCodexUsage(usage(91), {}, account, new Date(at)).filter((row) => row.meter_id === "codex-main:main");
     expect(marked.every((row) => row.metadata?.codex_idle_window)).toBe(true);
     expect(beyond.some((row) => row.metadata?.codex_idle_window)).toBe(false);
   });
@@ -172,7 +172,7 @@ describe("Codex moving idle windows (issue #50)", () => {
     } finally { store.close(); }
   });
 
-  it("does not make an omitted stale Spark window available from fresh main idle data", async () => {
+  it("replaces a stale Spark window with not_enforced when a successful reply omits Spark entirely", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-codex-idle-spark-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
@@ -184,9 +184,9 @@ describe("Codex moving idle windows (issue #50)", () => {
         secondary: { used_percent: 0, window_minutes: 10_080, resets_at: Math.floor((Date.parse(at) + 10_080 * 60_000) / 1000) },
       } }, {}, account, new Date(at));
       store.insertPoll(mainRows);
-      const spark = store.latestPerWindow("codex-main:spark")[0]!;
-      expect(spark.freshness).toBe("stale");
-      expect(paceDecision(spark, undefined, new Date(at))).toMatchObject({ state: "UNKNOWN" });
+      const spark = store.latestPerWindow("codex-main:spark").find((row) => row.window?.minutes === 10_080)!;
+      expect(spark).toMatchObject({ freshness: "not_enforced", reason: "vendor no longer reports Spark" });
+      expect(paceDecision(spark, undefined, new Date(at))).toMatchObject({ state: "NOT_ENFORCED" });
     } finally { store.close(); }
   });
 

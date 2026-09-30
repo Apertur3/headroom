@@ -234,19 +234,34 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect(sparkFive?.reason).toBeUndefined();
     });
 
-    it("leaves an existing Spark reading completely untouched when the response never mentions additional_rate_limits at all", () => {
-      // No `additional_rate_limits` key at all: this vendor call never asked
-      // about Spark, unlike the shape above where the key is present as an
-      // array but has no spark entry in it. The adapter must
-      // not synthesize anything for the meter in this case (unchanged from
-      // before this fix -- see codex-idle-window.test.ts's identically
-      // named store-level test for the read-side guarantee this protects).
+    it("reports Spark as not_enforced (vendor no longer reports Spark) when additional_rate_limits is absent from a successful reply", () => {
       const usage = { plan_type: "pro", rate_limit: {
         primary_window: { used_percent: 4, reset_at: 1788408000, limit_window_seconds: 18000 },
         secondary_window: { used_percent: 16, reset_at: 1788968897, limit_window_seconds: 604800 },
       } };
-      const rows = observationsFromCodexUsage(usage, {}, codex, at);
-      expect(rows.some((row) => row.meter_id === "codex-main:spark")).toBe(false);
+      const rows = observationsFromCodexUsage(usage, {}, codex, at).filter((row) => row.meter_id === "codex-main:spark");
+      expect(rows.map((row) => row.window?.minutes)).toEqual([300, 10_080]);
+      for (const row of rows) expect(row).toMatchObject({ freshness: "not_enforced", quantity: null, resets_at: null, reason: "vendor no longer reports Spark" });
+    });
+
+    it("fails Spark closed when the reply carries no main window (partial reply)", () => {
+      const rows = observationsFromCodexUsage({ plan_type: "pro", rate_limit: {} }, {}, codex, at).filter((row) => row.meter_id === "codex-main:spark");
+      expect(rows.map((row) => row.window?.minutes)).toEqual([300, 10_080]);
+      for (const row of rows) expect(row).toMatchObject({ freshness: "failed", quantity: null, reason: expect.stringContaining("partial Codex reply") });
+    });
+
+    it("keeps gate refusing for Spark after a partial reply follows an earlier Spark failure", async () => {
+      const root = await mkdtemp(join(tmpdir(), "headroom-codex-partial-"));
+      const store = await HeadroomStore.open(join(root, ".headroom"));
+      try {
+        const earlier = new Date(at.getTime() - 3_600_000);
+        const outage = await observeCodex(codex, { now: () => earlier, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 500 }) });
+        store.insertPoll(outage);
+        store.insertPoll(observationsFromCodexUsage({ plan_type: "pro", rate_limit: {} }, {}, codex, at));
+        for (const need of [{ window: "5h" as const, points: 1 }, { window: "wk" as const, points: 1 }]) {
+          expect(gateFor(store, [need], "codex-main:spark", 0, false, at).allowed, need.window).toBe(false);
+        }
+      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
     });
   });
 
