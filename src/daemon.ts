@@ -1193,6 +1193,8 @@ export class HeadroomDaemon {
             pid: this.keepalive?.pid ?? null,
             uptime_ms: this.keepalive?.uptimeMs ?? null,
             login_state: this.keepalive?.loginState ?? "unknown",
+            /** An external Antigravity server (IDE, the user's agy) is serving reads, so our own keepalive is suppressed. */
+            external_server: this.externalServerNoted,
             local_reads: Object.fromEntries(this.antigravityLocal),
           },
         }; break;

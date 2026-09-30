@@ -7,7 +7,7 @@ import { HeadroomStore, safeHeadroomDirectory } from "./store.js";
 import { headroomVersion } from "./version.js";
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { withEffectiveFreshness } from "./pace.js";
-import { paceDecision, reserveFor } from "./policy.js";
+import { blockedLaneSummary, paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
@@ -564,6 +564,9 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
     if (rows.some((r) => r.metadata?.vendor_inconsistent)) note = " (vendor readings inconsistent, holding)";
     else if (rows.some((r) => r.metadata?.vendor_window_held)) note = " (new window unconfirmed, holding)";
     if (isUnknownOnly && !view.verbose) note = "";
+    // A lane blocked by its exhausted weekly is a known state, not UNKNOWN.
+    const blockedNotes = rows.flatMap((r) => blockedLaneSummary(r) ?? []);
+    if (blockedNotes.length) note += ` - ${blockedNotes.join("; ")}`;
 
     const wideLine = `${prefix}${meterId.padEnd(meterColWidth)}  ${windowParts.join("  ")}  ${displayState}${note}`;
     if (view.width >= 80 && length(wideLine) <= view.width) {

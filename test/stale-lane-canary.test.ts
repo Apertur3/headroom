@@ -172,6 +172,35 @@ describe("stale-lane canary", () => {
     store.close();
   });
 
+  it("counts a fresh count-window row (credits, no minutes, no limit) as accepted", async () => {
+    const { store, home } = await setup();
+    const credits = (when: Date): Observation => ({ ...lane("cx", "credits", 300, when), window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 2, unit: "credits" }, resets_at: null });
+    store.insert(failure("cx", "credits", at(0), "Codex usage unavailable"));
+    store.insert(credits(at(30)));
+    seedHealthy(store, 0, 31);
+    expect(findStaleLanes(store, ACCOUNTS, 6, at(31))).toEqual([]);
+    await deliverNotifications(store, options(home, at(31)));
+    expect(await inbox(home)).toEqual([]);
+    store.close();
+  });
+
+  it("doctor reports no stale lane for a fresh count-window row", async () => {
+    const { store, home } = await setup();
+    const when = new Date(Date.now() - 60_000); const old = new Date(Date.now() - 30 * HOUR);
+    store.insert(failure("cx", "credits", old, "Codex usage unavailable"));
+    store.insert({ ...lane("cx", "credits", 300, when), window: { kind: "count", minutes: null, enforcement: "hard" }, quantity: { used: 0, limit: null, remaining: 2, unit: "credits" }, resets_at: null });
+    store.close();
+    const previous = process.env.HEADROOM_HOME;
+    process.env.HEADROOM_HOME = home;
+    try {
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      await mkdir(home, { recursive: true });
+      await writeFile(join(home, "accounts.toml"), '[[accounts]]\nname = "cx"\nvendor = "codex"\nlocation = "/tmp/cx"\nadapter = "native"\n');
+      const checks = await doctorChecks();
+      expect(checks.filter((item) => item.check.startsWith("lane cx:credits"))).toEqual([]);
+    } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
+  });
+
   it("makes doctor FAIL on a stale lane, naming its age and last error", async () => {
     const { store, home } = await setup();
     store.insert(lane("agy", "claude-gpt", 300, new Date(Date.now() - 30 * HOUR)));

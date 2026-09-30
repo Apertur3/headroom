@@ -363,7 +363,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
   if (daemon.status === "available") {
     output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
     output.push(check("OK", "daemon health", "responding", "no action needed"));
-    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
+    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; external_server?: boolean; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
     const antigravity = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
     const keepalive = health.keepalive;
     if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
@@ -377,6 +377,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : local?.outcome === "fresh" ? "no action needed" : "check the Antigravity local reader above and headroom logs";
       output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
     }
+    else if (keepalive?.external_server) output.push(check("OK", "Antigravity keepalive", "reads served by the running Antigravity app; keepalive not needed", "no action needed"));
     else output.push(check("WARN", "Antigravity keepalive", "agy is not running; its local summary is required", "run: agy and check headroom logs"));
   } else {
     // A missing daemon never blocks reading a configured principal -- every

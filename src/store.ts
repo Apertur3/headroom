@@ -1684,7 +1684,19 @@ export class HeadroomStore {
         -- A cleared/expired manual fact does not hide a newer failed poll:
         -- rank it beside that failure so the newer row can explain the live
         -- state rather than leaving this meter blank after filtering.
-        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced')
+        -- A blocked_by_weekly lane is a failed row that is still a vendor
+        -- answer (see blockedLaneReason): it ranks with fresh, so an older
+        -- fresh row for the same window cannot outrank it and then be hidden
+        -- by it below, which left the window missing from status. A newer row of
+        -- any freshness outranks it, so a later ordinary failure is not hidden.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(metadata_json, '$.lane_state') = 'blocked_by_weekly'
+                           -- ...but only while no newer row of any freshness exists for the window.
+                           AND NOT EXISTS (
+                             SELECT 1 FROM observations AS newer_any
+                             WHERE newer_any.meter_id = observations.meter_id
+                               AND COALESCE(CAST(json_extract(newer_any.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                               AND (newer_any.fetched_at > observations.fetched_at OR (newer_any.fetched_at = observations.fetched_at AND newer_any.id > observations.id))
+                           )))
                          AND NOT (source = 'manual' AND (
                            EXISTS (
                              SELECT 1 FROM observations AS newer_manual
@@ -1814,14 +1826,16 @@ export class HeadroomStore {
    * returns the first one status would accept. Stops at that row, so a
    * healthy lane costs one indexed page. */
   private newestAcceptedAt(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">): string | null {
-    if (lane.window_minutes <= 0) return null;
+    // A windowless lane (window_minutes 0) is a count window such as Codex
+    // credits: a window object with no minutes.
+    const windowless = lane.window_minutes <= 0;
     const placeholders = lane.meter_ids.map(() => "?").join(",");
     const statement = this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND (freshness IN ('fresh', 'not_enforced') OR (freshness = 'failed' AND metadata_json LIKE '%blocked_by_weekly%')) AND source NOT IN ('manual', 'paste')
-      AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ? AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
+      AND ${windowless ? "json_extract(window_json, '$.minutes') IS NULL AND window_json IS NOT NULL" : "CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?"} AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
       ORDER BY fetched_at DESC, id DESC LIMIT 50`);
     let cursorAt = "￿"; let cursorId = Number.MAX_SAFE_INTEGER;
     for (;;) {
-      const rows = statement.all(...lane.meter_ids, lane.window_minutes, cursorAt, cursorAt, cursorId) as Row[];
+      const rows = statement.all(...lane.meter_ids, ...(windowless ? [] : [lane.window_minutes]), cursorAt, cursorAt, cursorId) as Row[];
       for (const row of rows) { const observation = observationFromRow(row); if (isAcceptedLaneReading(observation)) return observation.fetched_at; }
       if (rows.length < 50) return null;
       const last = rows[rows.length - 1]; cursorAt = String(last.fetched_at); cursorId = Number(last.id);
@@ -1834,7 +1848,7 @@ export class HeadroomStore {
   laneReadingsSince(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">, since: string): Observation[] {
     const placeholders = lane.meter_ids.map(() => "?").join(",");
     return (this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND fetched_at >= ? AND source NOT IN ('manual', 'paste')
-      AND (window_json IS NULL OR CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?) ORDER BY fetched_at DESC, id DESC`).all(...lane.meter_ids, since, lane.window_minutes) as Row[]).map(observationFromRow);
+      AND (window_json IS NULL OR json_extract(window_json, '$.minutes') IS NULL OR CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?) ORDER BY fetched_at DESC, id DESC`).all(...lane.meter_ids, since, lane.window_minutes) as Row[]).map(observationFromRow);
   }
 
   /** The reason on the newest failed poll of this lane's meter after `since`, if any. */

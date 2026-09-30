@@ -5,7 +5,7 @@
  * sustainable-pace figure that the CLI, the daemon and the MCP server all
  * attach to the same observation objects the same way.
  */
-import { isHeldReading } from "./policy.js";
+import { blockedLaneSummary, isHeldReading } from "./policy.js";
 import { formatResetsIn, withResetsIn, type ResetsIn } from "./resets.js";
 import type { LastKnownReading, Observation } from "./types.js";
 
@@ -199,7 +199,15 @@ export function withStatusInfo(
 ): Array<Observation & BurnInfo & { sustainable_percent_per_hour: number | null; last_known: LastKnownReading | null } & ResetsIn> {
   const served = withEffectiveFreshness(observations, stalenessMinutes, now);
   return withResetsIn(withLastKnown(withPaceInfo(served, burn, now), lastKnown), now)
-    .map((item) => ({ ...item, ...staleMark(item, now), status_enriched_at: now.toISOString() }));
+    .map((item) => ({ ...item, ...staleMark(item, now), ...blockedMark(item), status_enriched_at: now.toISOString() }));
+}
+
+/** Additive: a lane blocked by its exhausted weekly carries a one-line
+ * summary for readers that render text (MCP quota_status, the dashboard).
+ * Absent on every other row, and never a number. */
+function blockedMark(item: Observation): { blocked_summary?: string } {
+  const summary = blockedLaneSummary(item);
+  return summary ? { blocked_summary: summary } : {};
 }
 
 /** The explicit "this is not current" marker: any windowed reading served
