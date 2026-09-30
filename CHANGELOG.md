@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- The stale-lane canary and `doctor` no longer report a fresh count window (Codex or Grok credits) as "never accepted": a fresh reading with a remaining count and no minutes now counts as accepted.
+- Codex Spark no longer stays UNKNOWN when the usage API answers without any `additional_rate_limits`: both Spark windows report `not_enforced` ("vendor no longer reports Spark") instead of leaving an old failed row current.
+- A lane blocked by its exhausted weekly (Antigravity 5h) now shows in `headroom status`, the dashboard and MCP `quota_status` as "5h blocked until <time> (weekly exhausted)", never with a number, even when an older fresh row exists for that window. Blocked rows carry an additive `blocked_summary` field.
+- `doctor` reports OK ("reads served by the running Antigravity app; keepalive not needed") instead of a WARN when an external Antigravity server serves the reads and the keepalive is correctly suppressed. The daemon `health` keepalive block gains an additive `external_server` field.
+
 ## [0.2.2] - 2026-09-30
 
 ### Added
