@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
+import { setProcIdentityDeniedForTest } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
 /**
@@ -55,7 +56,8 @@ async function withoutPs<T>(root: string, body: () => Promise<T>): Promise<T> {
   await writeFile(join(bin, "ps"), "#!/bin/sh\necho 'ps: denied' >&2\nexit 1\n", { mode: 0o700 });
   const previous = process.env.PATH;
   process.env.PATH = `${bin}:${previous ?? ""}`;
-  try { return await body(); } finally { process.env.PATH = previous; }
+  setProcIdentityDeniedForTest(true); // a host that denies ps denies /proc too
+  try { return await body(); } finally { process.env.PATH = previous; setProcIdentityDeniedForTest(false); }
 }
 
 describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level disable stops an existing keepalive through the same serialized path an account-level disable uses", () => {

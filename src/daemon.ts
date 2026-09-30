@@ -8,6 +8,9 @@ import { readDashboardStore } from "./dashboard-data.js";
 import { claudeGrantGate, syncClaudeProbeState } from "./adapters/claude.js";
 import { pollAccounts, withBackoffReasons, PROTECTED_STATUS_PATTERN, type AntigravityLocalRead, type PollOptions, type PollResult } from "./collector.js";
 import { AgyKeepaliveSupervisor, resolveAgyBinary, sweepPreviousKeepalive } from "./antigravity-keepalive.js";
+import { externalAntigravityServerPids } from "./antigravity-discovery.js";
+import { recordedLaunchPids, runAgyWatchdog } from "./agy-watchdog.js";
+import { allowEngineStarts, liveEngineGroupPids, refuseEngineStarts, setEngineSignalCleanup, terminateEngineGroups } from "./engine/group-run.js";
 import { appendDaemonLog } from "./logs.js";
 import { isProcessGroupAlive } from "./process-tree.js";
 import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform } from "./paths.js";
@@ -247,6 +250,13 @@ export class HeadroomDaemon {
    * completions can both sweep: the slower one may find and kill the state a
    * faster one has just launched. Waiters re-evaluate after this settles. */
   private keepaliveReconcilePending: Promise<void> | undefined;
+  /** True while the last discovery found an Antigravity server Headroom did
+   * not start (the IDE's language server, the user's own agy). It stops our
+   * keepalive from starting, and it is exactly as good a source for the
+   * local probe, so poll() still lets the collector read it. */
+  private externalServerNoted = false;
+  /** Single-flight guard for the agy age watchdog pass. */
+  private agyWatchdogRunning = false;
   private readonly antigravityLocal = new Map<string, AntigravityLocalRead>();
   private connectionCount = 0;
   /** Guards against a second timer-firing pass starting while a slow one
@@ -328,6 +338,11 @@ export class HeadroomDaemon {
   }
 
   async start(): Promise<void> {
+    // The daemon handles its own signals (a graceful stop() that sweeps the
+    // engine groups), so group-run must not install its CLI-read handlers
+    // here; and engine starts are open until stop() closes them.
+    setEngineSignalCleanup(false);
+    allowEngineStarts();
     // Before any fetch can happen: an operator's shell proxy must never
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
@@ -428,6 +443,40 @@ export class HeadroomDaemon {
     }
   }
 
+  /** An Antigravity IDE language server or agy that Headroom did not start is
+   * already reachable. Headroom's own trees (the keepalive, recorded launch
+   * pids, live engine groups) never count. */
+  private async externalAntigravityServerPresent(): Promise<boolean> {
+    const owned = [this.keepalive?.pid, ...liveEngineGroupPids(), ...await recordedLaunchPids(this.home)]
+      .filter((pid): pid is number => typeof pid === "number");
+    const found = await externalAntigravityServerPids({ ownedRoots: owned });
+    if (found.length && !this.externalServerNoted) void appendDaemonLog("antigravity keepalive: an Antigravity server is already reachable; not running our own agy", this.home);
+    if (!found.length && this.externalServerNoted) void appendDaemonLog("antigravity keepalive: the external Antigravity server is gone; keepalive may start again", this.home);
+    this.externalServerNoted = found.length > 0;
+    return found.length > 0;
+  }
+
+  /** A local Antigravity server the native probe may read: the daemon's own
+   * keepalive, or an external one (IDE, the user's agy) that discovery found
+   * and that is the only reason our keepalive is not running. Discovery runs
+   * only while policy wants a keepalive, so the external half is gated on the
+   * same policy switch: with it off, nothing is probed, as before. */
+  private localAntigravityServerAvailable(policy: Policy): boolean {
+    return this.keepalive?.running === true || (this.externalServerNoted && policy.antigravity_keepalive && process.platform !== "win32");
+  }
+
+  /** The agy age watchdog, run once per poll pass and never overlapping itself.
+   * Tracked in notifyInFlight so stop() drains it. */
+  private runAgyWatchdogPass(policy: Policy): void {
+    if (this.stopping || this.agyWatchdogRunning || process.platform === "win32") return;
+    this.agyWatchdogRunning = true;
+    const maxAgeMs = (policy.agy_max_age_minutes ?? 10) * 60_000;
+    this.trackNotify(runAgyWatchdog({ home: this.home, maxAgeMs, exemptLaunchId: this.keepalive?.launchId })
+      .then(() => undefined)
+      .catch((error: unknown) => appendDaemonLog(`agy watchdog failed: ${safeError(error)}`, this.home))
+      .finally(() => { this.agyWatchdogRunning = false; }));
+  }
+
   private async attemptStartKeepalive(accounts: Account[], policy: Policy): Promise<void> {
     // An existing supervisor must be re-checked to ensure policy and the
     // accounts it serves still justify it. A non-running supervisor with a
@@ -445,6 +494,9 @@ export class HeadroomDaemon {
         && gateAccounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
       this.stopKeepaliveUnless(stillJustified, "policy or account disable");
       if (!stillJustified) return;
+      // An IDE or agy server showed up since we started: stop ours at this
+      // check rather than run two.
+      if (await this.externalAntigravityServerPresent()) { this.stopKeepaliveUnless(false, "external Antigravity server reachable"); return; }
       // A supervisor that still owns a lifecycle (a live child, an orphan
       // reap, a scheduled restart) manages it itself; its pid-file discovery
       // may still be pending, so a daemon sweep must not clear that evidence
@@ -526,6 +578,9 @@ export class HeadroomDaemon {
       // awaits filesystem work; do not start the stale binary merely because
       // some enabled Antigravity account still exists.
       if (finalAntigravity.name !== antigravity.name || finalAntigravity.agy_path !== antigravity.agy_path) return;
+      // Only start our own agy when nobody else's server can answer the probe.
+      if (await this.externalAntigravityServerPresent()) return;
+      if (this.stopping) return;
       this.keepalive ??= new AgyKeepaliveSupervisor({ binary, home: this.home });
       this.keepalive.start();
     } catch (error) {
@@ -535,6 +590,9 @@ export class HeadroomDaemon {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    // Before anything below can await: no engine read may start from here on,
+    // including one queued behind a read the sweep further down will kill.
+    refuseEngineStarts();
     for (const timer of this.schedulers.values()) clearTimeout(timer);
     this.schedulers.clear();
     // A disable cycle (currentAccounts()) may have a keepalive stop still in
@@ -549,6 +607,11 @@ export class HeadroomDaemon {
     if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
     this.maintenanceTimer = undefined;
     await this.keepalive?.stop();
+    // Any engine read still running must not outlive the daemon: TERM, then
+    // KILL, the whole group, re-swept (bounded) until none is tracked. Starts
+    // were refused above, so nothing new can appear behind the sweep.
+    // (process 'exit' reaps them synchronously too.)
+    await terminateEngineGroups();
     // Keep the listener bound while this drains. A new daemon treats binding
     // that listener as proof it may reclaim delivery claims, so closing it
     // first would let a replacement resend while this process still writes.
@@ -1328,7 +1391,7 @@ export class HeadroomDaemon {
     const blocked = this.backoff.get(key);
     // Keepalive's local source has no vendor request budget. It is deliberately
     // attempted during a remote backoff so a newly-warmed agy can recover status.
-    const warmOnly = blocked !== undefined && blocked.until > now && this.keepalive?.running === true;
+    const warmOnly = blocked !== undefined && blocked.until > now && this.localAntigravityServerAvailable(policy);
     if (blocked && blocked.until > now && !warmOnly) return { rate_limited: true };
     if (!forced && principal === undefined && !warmOnly) {
       try {
@@ -1351,7 +1414,9 @@ export class HeadroomDaemon {
     const current = this.inFlight.get(key);
     if (current) return current;
     const task = this.poller(principal, {
-      daemonOwnsAntigravity: this.keepalive?.running === true,
+      // "May probe a local Antigravity server": our keepalive, or one the
+      // discovery found that Headroom did not start (the IDE's).
+      daemonOwnsAntigravity: this.localAntigravityServerAvailable(policy),
       skipRemoteAntigravity: warmOnly,
       antigravityLoginState: this.keepalive?.loginState ?? "unknown",
       claudeGrant: claudeGrantGate(this.store),
@@ -1382,6 +1447,7 @@ export class HeadroomDaemon {
       // as the notification pass above.
       void checkModelAvailability(this.store, accounts.filter((account): account is ProviderAccount => !isLocalAccount(account) && isAccountEnabled(account)))
         .catch((error: unknown) => appendDaemonLog(`model availability check failed: ${safeError(error)}`, this.home));
+      this.runAgyWatchdogPass(policy);
       for (const [principalId, read] of Object.entries(result.antigravityLocal ?? {})) {
         if (disabled.has(principalId)) continue;
         this.antigravityLocal.set(principalId, read);

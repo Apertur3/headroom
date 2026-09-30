@@ -34,3 +34,16 @@ vi.mock("../src/host-health.js", async (original) => {
   };
   return { ...actual, checkHostHealth: (policy?: HostGuardPolicy, deps?: HostHealthDeps) => actual.checkHostHealth(policy, deps ?? idleHost) };
 });
+
+// Whether an Antigravity IDE or agy runs on the machine is a property of the
+// developer's host, not of the code under test: a running IDE would stop every
+// daemon test's keepalive from starting. Tests of discovery itself inject their
+// own process list to externalAntigravityServerPids().
+vi.mock("../src/antigravity-discovery.js", async (original) => {
+  const actual = await original<typeof import("../src/antigravity-discovery.js")>();
+  return {
+    ...actual,
+    externalAntigravityServerPids: (options?: Parameters<typeof actual.externalAntigravityServerPids>[0]) =>
+      actual.externalAntigravityServerPids({ list: async () => [], ...options }),
+  };
+});

@@ -397,7 +397,7 @@ enum AntigravityRecorder {
         // here. Record mode only calls `AntigravityStatusProbe.fetch()`, which
         // on macOS reads the process table via sysctl and talks to the already
         // running language server over localhost. It launches no agy session
-        // (that is `AgyBootstrap`, used only by `observe`), so there is nothing
+        // (the engine never starts agy), so there is nothing
         // of ours to shut down, and the shutdown would create CodexBar's
         // `~/.codexbar/antigravity/agy-session.lock`, rewrite session records
         // and kill sessions owned by other tools.
