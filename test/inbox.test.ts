@@ -318,13 +318,20 @@ describe("sendInboxMessageAt", () => {
       return realWriteFileAtomic(writePath, data, mode, beforeCommit);
     });
     try {
-      const options = { to: "session-superseded", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 68, home: path, inFlightTimeoutMs: 20 };
-      const original = sendInboxMessageAt({ ...options, now: new Date(1_000) });
-      await originalWriteStartedPromise;
-      // The original has started the atomic writer but has not committed.
-      // Once its in-flight entry expires, a retry writes the durable message.
-      await new Promise((resolve) => setTimeout(resolve, 40));
-      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000) });
+      const options = { to: "session-superseded", kind: "handoff" as const, text: '{"timer":"wake","at":"2026-09-28T12:00:00.000Z","action":"check"}', from: "headroom-timer", delivery_id: 68, home: path };
+      // Only the expiry timer is faked, so the original's in-flight entry
+      // expires exactly when the test says. The retry gets a long timeout of
+      // its own: a slow runner must never expire the retry mid-write.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let original!: ReturnType<typeof sendInboxMessageAt>;
+      try {
+        original = sendInboxMessageAt({ ...options, now: new Date(1_000), inFlightTimeoutMs: 20 });
+        await originalWriteStartedPromise;
+        // The original has started the atomic writer but has not committed.
+        // Once its in-flight entry expires, a retry writes the durable message.
+        vi.advanceTimersByTime(20);
+      } finally { vi.useRealTimers(); }
+      const retry = await sendInboxMessageAt({ ...options, now: new Date(2_000), inFlightTimeoutMs: 60_000 });
       expect(retry.delivered).toBe(true);
 
       releaseOriginal!();
