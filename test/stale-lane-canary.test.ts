@@ -142,7 +142,8 @@ describe("stale-lane canary", () => {
     expect(posts).toHaveLength(1);
     const text = posts[0];
     expect(text).toMatch(/Headroom can't read your Antigravity \(agy\) usage since (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), September \d+\./);
-    expect(text).toContain("Treat its claude-gpt, gemini numbers as unknown until this clears.");
+    expect(text).toContain("Treat its Antigravity (agy) numbers as unknown until this clears.");
+    expect(/Headroom can't read.*?clears\./.exec(text)![0]).not.toContain(":");
     expect(text).not.toMatch(/agy:|STALE|RECOVER|\blane\b|5h|weekly/i);
     // Coming back sends no recovery message.
     store.insert(lane("agy", "claude-gpt", 300, at(56)));

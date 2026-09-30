@@ -268,12 +268,6 @@ export interface HumanStaleAlert {
   text: string;
 }
 
-function meterName(meter: string, principal: string): string {
-  let name = meter;
-  while (name.startsWith(`${principal}:`)) name = name.slice(principal.length + 1);
-  return name && name !== principal ? name : "usage";
-}
-
 /**
  * The owed human messages: one per principal whose oldest stale lane has been
  * stale for more than 24 hours and that has not been told about this episode.
@@ -300,8 +294,7 @@ export function pendingHumanAlerts(store: HeadroomStore, accounts: Account[], st
     const vendor = accountVendor ? VENDOR_NAMES[accountVendor] ?? accountVendor : principal;
     const who = vendor.toLowerCase() === principal.toLowerCase() || !accountVendor ? vendor : `${vendor} (${principal})`;
     const date = new Date(since).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
-    const names = [...new Set(old.map((lane) => meterName(lane.meter, principal)))].sort();
-    alerts.push({ id: `usage_unreadable:${principal}:${since}`, principal, since, text: `Headroom can't read your ${who} usage since ${date}. Treat its ${names.join(", ")} numbers as unknown until this clears.` });
+    alerts.push({ id: `usage_unreadable:${principal}:${since}`, principal, since, text: `Headroom can't read your ${who} usage since ${date}. Treat its ${who} numbers as unknown until this clears.` });
   }
   return alerts;
 }
