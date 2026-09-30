@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSyn
 import { lstat, open, readdir, readFile, rmdir, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
-import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processArgs, processElapsedSeconds, processSignature, type ExecFile } from "./process-tree.js";
+import { descendantsOf, isProcessGroupAlive, killProcessGroup, killTree, listProcesses, processArgs, processElapsedSeconds, processSignature, killVerifiedTree, type ExecFile } from "./process-tree.js";
 
 type Spawn = (command: string, args: string[], options: { stdio: "ignore"; env: NodeJS.ProcessEnv; detached?: boolean }) => ChildProcess;
 
@@ -50,6 +50,9 @@ export interface AgyKeepaliveOptions {
    * giving up and recording script's pid alone. */
   pidDiscoveryAttempts?: number;
   pidDiscoveryIntervalMs?: number;
+  /** Test seam for the process table stop() verifies before it signals. */
+  execImpl?: ExecFile;
+  log?: (message: string) => void;
 }
 
 export interface KeepaliveState {
@@ -423,7 +426,7 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
   }
   if (pidFileEntry && !candidates.has(pidFileEntry.pid)) candidates.set(pidFileEntry.pid, {});
 
-  const verified: Array<{ pid: number; tier: "ps" | "ps-free" }> = [];
+  const verified: Array<{ pid: number; tier: "ps" | "ps-free"; command?: string; startedAt?: string }> = [];
   const unverified = new Set<number>();
   // The ps-free tier exists for hosts where the process table cannot be read.
   // Where it can, a pid without a recorded ps signature is never signalled on
@@ -435,7 +438,7 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
     if (recorded.command && recorded.startedAt) {
       const live = await processSignature(pid, options.execImpl);
       if (live) {
-        if (live.command === recorded.command && live.startedAt === recorded.startedAt) verified.push({ pid, tier: "ps" });
+        if (live.command === recorded.command && live.startedAt === recorded.startedAt) verified.push({ pid, tier: "ps", command: recorded.command, startedAt: recorded.startedAt });
         // A different live signature proves the recorded process is gone;
         // never fall through to weaker evidence for a recycled pid.
         continue;
@@ -453,12 +456,14 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
     if (isProcessGroupAlive(pid)) unverified.add(pid);
   }
 
-  const kill = options.killTree ?? killTree;
   const swept: number[] = [];
-  for (const { pid, tier } of verified) {
+  for (const { pid, tier, command, startedAt } of verified) {
     try {
-      if (tier === "ps") await kill(pid);
-      else killProcessGroup(pid, { groupOnly: true });
+      if (tier === "ps") {
+        // Every signal re-verifies the recorded command and start time first.
+        if (options.killTree) await options.killTree(pid);
+        else if (command && startedAt) await killVerifiedTree({ pid, command, startedAt }, { execImpl: options.execImpl });
+      } else killProcessGroup(pid, { groupOnly: true });
     } catch { unverified.add(pid); continue; }
     if (await waitUntilGroupGone(pid)) swept.push(pid);
     else unverified.add(pid);
@@ -581,6 +586,10 @@ export class AgyKeepaliveSupervisor {
   private readonly killGraceMs: number;
   private readonly pidDiscoveryAttempts: number;
   private readonly pidDiscoveryIntervalMs: number;
+  private readonly execImpl: ExecFile | undefined;
+  /** The wrapper's command and start time, as `ps` reported them when this launch recorded its state. */
+  private scriptEvidence: { pid: number; command: string; startedAt: string } | undefined;
+  private readonly log: (message: string) => void;
   /** Where the launch wrapper writes agy's pid (see agyPtyCommand). Known
    * without `ps`, so stop() and an unexpected script exit can reap agy even
    * on a host where the process table cannot be read. */
@@ -598,6 +607,21 @@ export class AgyKeepaliveSupervisor {
     this.killGraceMs = options.killGraceMs ?? 300;
     this.pidDiscoveryAttempts = options.pidDiscoveryAttempts ?? 20;
     this.pidDiscoveryIntervalMs = options.pidDiscoveryIntervalMs ?? 100;
+    this.execImpl = options.execImpl;
+    this.log = options.log ?? (() => undefined);
+  }
+
+  /** Signals the launch wrapper only if the recorded command and start time
+   * still match the live process. No or stale evidence means the pid is left
+   * alone; the next sweep or the age watchdog decides. */
+  private async killScriptVerified(pid: number): Promise<void> {
+    const evidence = this.scriptEvidence;
+    if (!evidence || evidence.pid !== pid) {
+      this.log(`antigravity keepalive stop: no verified launch evidence for pid ${pid} -- left alone`);
+      return;
+    }
+    const result = await killVerifiedTree({ pid, command: evidence.command, startedAt: evidence.startedAt }, { graceMs: this.killGraceMs, execImpl: this.execImpl });
+    if (result === "not-ours") this.log(`antigravity keepalive stop: pid ${pid} no longer matches its recorded command and start time -- left alone`);
   }
 
   get running(): boolean { return this.child !== undefined && this.child.exitCode === null; }
@@ -638,7 +662,7 @@ export class AgyKeepaliveSupervisor {
       // tree starts exiting. It may otherwise write during shutdown.
       let agyPid = this.agyPidFile ? await this.awaitAgyPid(child) : undefined;
       const pid = child.pid;
-      if (typeof pid === "number") await killTree(pid, { graceMs: this.killGraceMs });
+      if (typeof pid === "number") await this.killScriptVerified(pid);
       else child.kill("SIGTERM");
       // killTree's descendant snapshot can be unavailable when ps is denied.
       // This is still this launch's private wrapper file, captured while its
@@ -671,6 +695,7 @@ export class AgyKeepaliveSupervisor {
 
   private launch(): void {
     if (this.stopping || this.child) return;
+    this.scriptEvidence = undefined;
     try {
       const launchId = randomUUID();
       this.configureLaunchDirectory(launchId); // must exist, mode 0700, before spawn
@@ -806,6 +831,7 @@ export class AgyKeepaliveSupervisor {
       // method's own doc comment for why the generation check alone,
       // followed by an async write, would not be enough.
       if (this.launchGeneration !== generation || this.child !== child || !isAlive(child)) return;
+      this.scriptEvidence = { pid: scriptPid, command: scriptSignature.command, startedAt: scriptSignature.startedAt };
       writeKeepaliveStateSync(statePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
   }

@@ -166,6 +166,7 @@ export interface KillTreeOptions {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Must not be used where pid reuse matters: its SIGKILL escalation re-signals bare pids. Use killVerifiedTree.
 /**
  * Terminate `rootPid` and everything descended from it, however many
  * process groups or sessions the tree has split into. Walks the live
