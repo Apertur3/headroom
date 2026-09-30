@@ -234,19 +234,14 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect(sparkFive?.reason).toBeUndefined();
     });
 
-    it("leaves an existing Spark reading completely untouched when the response never mentions additional_rate_limits at all", () => {
-      // No `additional_rate_limits` key at all: this vendor call never asked
-      // about Spark, unlike the shape above where the key is present as an
-      // array but has no spark entry in it. The adapter must
-      // not synthesize anything for the meter in this case (unchanged from
-      // before this fix -- see codex-idle-window.test.ts's identically
-      // named store-level test for the read-side guarantee this protects).
+    it("reports Spark as not_enforced (vendor no longer reports Spark) when additional_rate_limits is absent from a successful reply", () => {
       const usage = { plan_type: "pro", rate_limit: {
         primary_window: { used_percent: 4, reset_at: 1788408000, limit_window_seconds: 18000 },
         secondary_window: { used_percent: 16, reset_at: 1788968897, limit_window_seconds: 604800 },
       } };
-      const rows = observationsFromCodexUsage(usage, {}, codex, at);
-      expect(rows.some((row) => row.meter_id === "codex-main:spark")).toBe(false);
+      const rows = observationsFromCodexUsage(usage, {}, codex, at).filter((row) => row.meter_id === "codex-main:spark");
+      expect(rows.map((row) => row.window?.minutes)).toEqual([300, 10_080]);
+      for (const row of rows) expect(row).toMatchObject({ freshness: "not_enforced", quantity: null, resets_at: null, reason: "vendor no longer reports Spark" });
     });
   });
 
