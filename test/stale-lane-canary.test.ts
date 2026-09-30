@@ -102,16 +102,69 @@ describe("stale-lane canary", () => {
     store.close();
   });
 
-  it("is not silenced by events_off, and reaches a working channel while the inbox still gets it", async () => {
-    const { store, home } = await setup();
-    const config: NotifyConfig = { ...parseNotifyConfig('[notify]\nchannels = ["webhook"]\nevents_off = ["source_failed", "source_recovered"]\n[notify.webhook]\nurl = "https://example.com/hook"\n')! };
-    expect(config.events).not.toContain("lane_stale");
+  const webhook = (extra = ""): NotifyConfig => parseNotifyConfig(`[notify]\nchannels = ["webhook"]\n${extra}[notify.webhook]\nurl = "https://example.com/hook"\n`)!;
+  const recorder = (): { posts: string[]; fetcher: typeof fetch } => {
     const posts: string[] = [];
-    const fetcher: typeof fetch = async (input) => { posts.push(await (input as Request).text()); return new Response("ok", { status: 200 }); };
+    return { posts, fetcher: async (input) => { posts.push(await (input as Request).text()); return new Response("ok", { status: 200 }); } };
+  };
+
+  it("sends nothing to channels on lane_stale or lane_recovered, while the inbox still gets both", async () => {
+    const { store, home } = await setup();
+    const { posts, fetcher } = recorder();
+    const config = webhook();
     store.insert(lane("agy", "claude-gpt", 300, at(0)));
     await deliverNotifications(store, options(home, at(7), { config, fetcher }));
-    expect(posts.join("\n")).toContain("STALE LANE agy:claude-gpt 5h");
-    expect(await inbox(home)).toHaveLength(1);
+    store.insert(lane("agy", "claude-gpt", 300, at(9)));
+    await deliverNotifications(store, options(home, at(9), { config, fetcher }));
+    store.insert(lane("agy", "claude-gpt", 300, at(9.25)));
+    await deliverNotifications(store, options(home, at(9.25), { config, fetcher }));
+    store.insert(lane("agy", "claude-gpt", 300, at(9.6)));
+    await deliverNotifications(store, options(home, at(9.6), { config, fetcher }));
+    await deliverNotifications(store, options(home, at(9.7), { config, fetcher }));
+    expect((await inbox(home)).map((message) => message.event)).toEqual(["lane_stale", "lane_recovered"]);
+    expect(posts).toEqual([]);
+    store.close();
+  });
+
+  it("sends one plain message per principal once a lane has been stale for over 24 hours, only once per episode", async () => {
+    const { store, home } = await setup();
+    const { posts, fetcher } = recorder();
+    const config = webhook("events_off = [\"source_failed\"]\n");
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    store.insert(lane("agy", "gemini", 300, at(0)));
+    store.insert(lane("agy", "gemini", 10_080, at(0)));
+    seedHealthy(store, 0, 60);
+    await deliverNotifications(store, options(home, at(20), { config, fetcher }));
+    expect(posts).toEqual([]);
+    await deliverNotifications(store, options(home, at(26), { config, fetcher }));
+    await deliverNotifications(store, options(home, at(40), { config, fetcher }));
+    await deliverNotifications(store, options(home, at(55), { config, fetcher }));
+    expect(posts).toHaveLength(1);
+    const text = posts[0];
+    expect(text).toMatch(/Headroom can't read your Antigravity \(agy\) usage since (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), September \d+\./);
+    expect(text).toContain("Treat its Antigravity (agy) numbers as unknown until this clears.");
+    expect(/Headroom can't read.*?clears\./.exec(text)![0]).not.toContain(":");
+    expect(text).not.toMatch(/agy:|STALE|RECOVER|\blane\b|5h|weekly/i);
+    // Coming back sends no recovery message.
+    store.insert(lane("agy", "claude-gpt", 300, at(56)));
+    store.insert(lane("agy", "gemini", 300, at(56)));
+    store.insert(lane("agy", "gemini", 10_080, at(56)));
+    await deliverNotifications(store, options(home, at(56), { config, fetcher }));
+    expect(posts).toHaveLength(1);
+    store.close();
+  });
+
+  it("holds the plain message during quiet hours and sends it afterwards", async () => {
+    const { store, home } = await setup();
+    const { posts, fetcher } = recorder();
+    const quiet = webhook('quiet_hours = "00:00-23:59"\n');
+    store.insert(lane("agy", "claude-gpt", 300, at(0)));
+    seedHealthy(store, 0, 40);
+    await deliverNotifications(store, options(home, at(26), { config: quiet, fetcher }));
+    expect(posts).toEqual([]);
+    await deliverNotifications(store, options(home, at(27), { config: webhook(), fetcher }));
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toContain("Headroom can't read your Antigravity (agy) usage since");
     store.close();
   });
 
