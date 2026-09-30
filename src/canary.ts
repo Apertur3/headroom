@@ -6,11 +6,12 @@
  * `lane_stale` alert per lane, at most once per 24 hours while it stays
  * stale, and one `lane_recovered` when it has come back for good.
  *
- * Unlike source_failed, which is hysteresis-gated and switchable, this ignores
- * the notify event switches (`events`, `events_on`, `events_off`) and the
- * channel configuration entirely. Every alert is written to the Headroom
- * inbox first; channels are an addition, and `headroom doctor` reports the
- * same lanes on demand from the store, so no configuration can hide one.
+ * Both go to the Headroom inbox and the daemon log only, never to an external
+ * channel, and `headroom doctor` reports the same lanes on demand from the
+ * store. The one human-facing message is `usage_unreadable`: a plain-language
+ * note, once per stale episode and grouped per principal, for a principal that
+ * has had a stale lane for more than 24 hours. It travels through the normal
+ * notify channels and respects quiet hours.
  */
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -252,4 +253,52 @@ export async function runLaneCanary(store: HeadroomStore, options: CanaryOptions
     store.setDaemonState(stateKey, JSON.stringify({ state: "ok", last_alert_at: state.last_alert_at }));
   }
   return items;
+}
+
+/** A principal must have a stale lane this long before a human is told. */
+export const HUMAN_ALERT_AFTER_MS = 24 * 3_600_000;
+const HUMAN_STATE_PREFIX = "canary:human:";
+const VENDOR_NAMES: Record<string, string> = { codex: "Codex", claude: "Claude", antigravity: "Antigravity", gemini: "Gemini", grok: "Grok", kimi: "Kimi" };
+
+export interface HumanStaleAlert {
+  id: string;
+  principal: string;
+  /** Start of the stale episode, the key that makes the alert once-only. */
+  since: string;
+  text: string;
+}
+
+/**
+ * The owed human messages: one per principal whose oldest stale lane has been
+ * stale for more than 24 hours and that has not been told about this episode.
+ * Also retires the episode state of principals that are no longer stale, so a
+ * later outage is a new episode. Does not record a send; the caller calls
+ * `markHumanAlertSent` once the message is actually queued.
+ */
+export function pendingHumanAlerts(store: HeadroomStore, accounts: Account[], staleAfterHours: number, now: Date): HumanStaleAlert[] {
+  const stale = findStaleLanes(store, accounts, staleAfterHours, now);
+  const byPrincipal = new Map<string, StaleLane[]>();
+  for (const lane of stale) byPrincipal.set(lane.principal, [...(byPrincipal.get(lane.principal) ?? []), lane]);
+  for (const account of accounts) {
+    const key = `${HUMAN_STATE_PREFIX}${account.name}`;
+    if (!byPrincipal.has(account.name) && store.daemonState(key)) store.setDaemonState(key, "");
+  }
+  const alerts: HumanStaleAlert[] = [];
+  for (const [principal, lanes] of byPrincipal) {
+    if (store.daemonState(`${HUMAN_STATE_PREFIX}${principal}`)) continue;
+    const old = lanes.filter((lane) => lane.age_seconds * 1000 > HUMAN_ALERT_AFTER_MS);
+    if (!old.length) continue;
+    const since = old.reduce((a, b) => (Date.parse(a.since) <= Date.parse(b.since) ? a : b)).since;
+    const account = accounts.find((candidate) => candidate.name === principal);
+    const accountVendor = account && !isLocalAccount(account) ? account.vendor : undefined;
+    const vendor = accountVendor ? VENDOR_NAMES[accountVendor] ?? accountVendor : principal;
+    const who = vendor.toLowerCase() === principal.toLowerCase() || !accountVendor ? vendor : `${vendor} (${principal})`;
+    const date = new Date(since).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+    alerts.push({ id: `usage_unreadable:${principal}:${since}`, principal, since, text: `Headroom can't read your ${who} usage since ${date}. Treat its ${who} numbers as unknown until this clears.` });
+  }
+  return alerts;
+}
+
+export function markHumanAlertSent(store: HeadroomStore, alert: HumanStaleAlert, now: Date): void {
+  store.setDaemonState(`${HUMAN_STATE_PREFIX}${alert.principal}`, JSON.stringify({ since: alert.since, sent_at: now.toISOString() }));
 }
