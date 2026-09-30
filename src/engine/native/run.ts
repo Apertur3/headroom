@@ -9,7 +9,7 @@ import { outboundEnvironment, redact } from "../../security.js";
 import type { Observation, ProviderAccount } from "../../types.js";
 import { readEngineLock } from "../codexbar/install.js";
 import { normalizeObservations } from "../observation.js";
-import { runInGroup } from "../group-run.js";
+import { ENGINE_SHUTTING_DOWN, engineStartsRefused, runInGroup } from "../group-run.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const devBinary = join(repoRoot, "engine", ".build", "release", "headroom-engine");
@@ -86,6 +86,9 @@ export async function runNativeEngine(enginePath: string, accounts: ProviderAcco
   const deadline = Date.now() + timeoutMs;
   const key = `${enginePath}\0${JSON.stringify(accounts.map(({ name, vendor, location }) => [name, vendor, location]))}`;
   for (;;) {
+    // A daemon that began stopping starts no engine, including one that was
+    // queued here behind the read its shutdown sweep just killed.
+    if (engineStartsRefused()) throw new Error(ENGINE_SHUTTING_DOWN);
     const current = engineFlight;
     if (!current) break;
     if (current.key === key) return current.promise;

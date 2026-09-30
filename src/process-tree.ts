@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -240,4 +240,145 @@ export async function processArgs(pid: number, execImpl: ExecFile = execFileAsyn
     const value = stdout.split("\n")[0]?.trim();
     return value ? value : undefined;
   } catch { return undefined; }
+}
+
+/** A process's signature (see processSignature) plus its parent and process
+ * group, all read fresh from `ps`. Undefined when the process is gone or `ps`
+ * cannot answer. */
+export interface LiveIdentity { command: string; startedAt: string; ppid: number; pgid: number }
+
+export async function processIdentity(pid: number, execImpl: ExecFile = execFileAsync): Promise<LiveIdentity | undefined> {
+  const ids = async (): Promise<{ ppid: number; pgid: number } | undefined> => {
+    try {
+      const { stdout } = await execImpl("ps", ["-o", "ppid=,pgid=", "-p", String(pid)]);
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(stdout.split("\n")[0] ?? "");
+      return match ? { ppid: Number(match[1]), pgid: Number(match[2]) } : undefined;
+    } catch { return undefined; }
+  };
+  const [signature, groupIds] = await Promise.all([processSignature(pid, execImpl), ids()]);
+  return signature && groupIds ? { ...signature, ...groupIds } : undefined;
+}
+
+/** processSignature for synchronous contexts (a process 'exit' handler, or a
+ * signal handler about to re-raise), each `ps` bounded by a short timeout. */
+export function processSignatureSync(pid: number): { command: string; startedAt: string } | undefined {
+  const field = (keyword: "comm" | "lstart"): string | undefined => {
+    try {
+      const stdout = execFileSync("ps", ["-o", `${keyword}=`, "-p", String(pid)], { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"] });
+      const value = stdout.split("\n")[0]?.trim();
+      return value ? value : undefined;
+    } catch { return undefined; }
+  };
+  const command = field("comm");
+  const startedAt = command ? field("lstart") : undefined;
+  return command && startedAt ? { command, startedAt } : undefined;
+}
+
+let ownGroupCache: { value: number | undefined } | undefined;
+/** This process's own process group id, read once. Undefined on win32 or
+ * when `ps` cannot tell. Group signals are never sent to it. */
+export function ownProcessGroup(): number | undefined {
+  if (ownGroupCache) return ownGroupCache.value;
+  let value: number | undefined;
+  if (process.platform !== "win32") {
+    try {
+      const stdout = execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"] });
+      const parsed = Number(stdout.trim());
+      value = Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+    } catch { value = undefined; }
+  }
+  ownGroupCache = { value };
+  return value;
+}
+
+/** A process identified by what `ps` reported for it at a time it was
+ * provably Headroom's: pid, command, and exact start time. */
+export interface VerifiedProcess { pid: number; command: string; startedAt: string }
+
+export interface VerifiedKillOptions {
+  execImpl?: ExecFile;
+  /** How long SIGTERM gets before SIGKILL. */
+  graceMs?: number;
+  /** How long to wait for the kernel to confirm the SIGKILLs. */
+  confirmMs?: number;
+  /** Test seam; process.kill by default. */
+  signal?: (target: number, signal: NodeJS.Signals) => void;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export type VerifiedKillResult = "killed" | "not-ours" | "survived";
+
+function sameProcess(live: { command: string; startedAt: string } | undefined, recorded: VerifiedProcess): boolean {
+  return live !== undefined && live.command === recorded.command && live.startedAt === recorded.startedAt;
+}
+
+/** Re-reads `target`'s identity and, with no await between that read and the
+ * signal, sends `signal` to its process group when it leads one (never a
+ * group id <= 1 or this process's own group) or else to the pid alone. A pid
+ * whose command or start time changed belongs to someone else now and is
+ * never signalled. */
+async function signalVerified(target: VerifiedProcess, signal: NodeJS.Signals, options: VerifiedKillOptions): Promise<void> {
+  const live = await processIdentity(target.pid, options.execImpl);
+  if (!live || !sameProcess(live, target) || target.pid <= 1 || target.pid === process.pid) return;
+  const own = ownProcessGroup();
+  const asGroup = live.pgid === target.pid && live.pgid > 1 && live.pgid !== own;
+  const send = options.signal ?? ((pid: number, sig: NodeJS.Signals): void => { process.kill(pid, sig); });
+  try { send(asGroup ? -target.pid : target.pid, signal); }
+  catch { /* ESRCH: exited since the read; EPERM: not ours to signal */ }
+}
+
+/** The verified root plus every descendant proven to be one: a child counts
+ * only when `ps` reports its ppid as a tree member whose own identity still
+ * matches AFTER the child was read, so that parent was the same process for
+ * the whole interval. */
+async function collectVerifiedTree(root: VerifiedProcess, options: VerifiedKillOptions): Promise<VerifiedProcess[] | undefined> {
+  if (!sameProcess(await processSignature(root.pid, options.execImpl), root)) return undefined;
+  const snapshot = await listProcesses(options.execImpl);
+  const tree: VerifiedProcess[] = [root];
+  const queue: VerifiedProcess[] = [root];
+  while (queue.length) {
+    const parent = queue.shift() as VerifiedProcess;
+    for (const entry of snapshot) {
+      if (entry.ppid !== parent.pid || tree.some((member) => member.pid === entry.pid)) continue;
+      const live = await processIdentity(entry.pid, options.execImpl);
+      if (!live || live.ppid !== parent.pid) continue;
+      if (!sameProcess(await processSignature(parent.pid, options.execImpl), parent)) continue;
+      const child = { pid: entry.pid, command: live.command, startedAt: live.startedAt };
+      tree.push(child); queue.push(child);
+    }
+  }
+  return tree;
+}
+
+/**
+ * Terminates a process Headroom recorded, and its descendants, without ever
+ * signalling a pid the kernel has since handed to someone else. Unlike
+ * killTree(), whose SIGKILL escalation re-signals bare pids after a sleep,
+ * every individual signal here follows a fresh identity read (command and
+ * exact start time) with no await in between. SIGTERM first, SIGKILL after
+ * `graceMs` to whatever still matches, then a bounded wait for the kernel to
+ * confirm. "not-ours" means the root no longer matches its record (already
+ * gone, or recycled) and nothing was signalled.
+ */
+export async function killVerifiedTree(root: VerifiedProcess, options: VerifiedKillOptions = {}): Promise<VerifiedKillResult> {
+  if (process.platform === "win32") return "not-ours";
+  const tree = await collectVerifiedTree(root, options);
+  if (!tree) return "not-ours";
+  const sleep = options.sleep ?? defaultSleep;
+  const stillOurs = async (): Promise<VerifiedProcess[]> => {
+    const found: VerifiedProcess[] = [];
+    for (const member of tree) if (sameProcess(await processSignature(member.pid, options.execImpl), member)) found.push(member);
+    return found;
+  };
+  const waitGone = async (ms: number): Promise<VerifiedProcess[]> => {
+    const deadline = Date.now() + ms;
+    let remaining = await stillOurs();
+    while (remaining.length && Date.now() < deadline) { await sleep(50); remaining = await stillOurs(); }
+    return remaining;
+  };
+  for (const member of tree) await signalVerified(member, "SIGTERM", options);
+  const survivors = await waitGone(options.graceMs ?? 300);
+  if (!survivors.length) return "killed";
+  for (const member of survivors) await signalVerified(member, "SIGKILL", options);
+  return (await waitGone(options.confirmMs ?? 1_500)).length ? "survived" : "killed";
 }

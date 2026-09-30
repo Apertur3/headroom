@@ -3,10 +3,12 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
+import type { PollOptions } from "../src/collector.js";
+import { liveEngineGroupCount } from "../src/engine/group-run.js";
 import { runNativeEngine } from "../src/engine/native/run.js";
 import { isProcessGroupAlive } from "../src/process-tree.js";
 import type { ProviderAccount } from "../src/types.js";
-import { processesMentioning, writeGrandchildEngine } from "./helpers/fake-engine.js";
+import { processesMentioning, writeCountingEngine, writeGrandchildEngine } from "./helpers/fake-engine.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 
 // The suite-wide setup mocks discovery to "nothing running"; this file needs
@@ -75,8 +77,8 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     try {
       if (!await startDaemon(daemon)) return;
       const internal = daemon as unknown as Internal;
+      // attempt() settles only once the whole start decision has been made.
       await attempt(daemon);
-      await new Promise((resolve) => setTimeout(resolve, 300));
       expect(internal.keepalive?.running).not.toBe(true);
       await expect(readFile(infoFile, "utf8")).rejects.toThrow();
 
@@ -91,6 +93,63 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
       expect(internal.keepalive).toBeUndefined();
     } finally {
       await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 30_000);
+
+  it("a reachable external server (the IDE) is still read: only our own keepalive is suppressed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-ide-")); temporary.push(root);
+    const infoFile = join(root, "agy-pid.txt");
+    const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "accounts.toml"), accountsToml(fakeAgy), { mode: 0o600 });
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    external.pids = [4_000_000]; // somebody else's IDE language server
+    const seen: PollOptions[] = [];
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async (_principal, options) => { seen.push(options ?? {}); return { observations: [], failures: [] }; } });
+    try {
+      if (!await startDaemon(daemon)) return;
+      const internal = daemon as unknown as Internal;
+      await attempt(daemon);
+      expect(internal.keepalive?.running).not.toBe(true);
+      await expect(readFile(infoFile, "utf8")).rejects.toThrow();
+      await internal.poll(undefined, true);
+      await vi.waitFor(() => expect(seen.length).toBeGreaterThan(0), { timeout: 5_000, interval: 20 });
+      // The collector probes a local server only when this is set.
+      expect(seen.every((options) => options.daemonOwnsAntigravity === true)).toBe(true);
+    } finally {
+      await daemon.stop();
+      if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
+    }
+  }, 30_000);
+
+  it("stop() refuses a read queued behind the running one: no engine starts after the shutdown sweep", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-daemon-engine-race-")); temporary.push(root);
+    const { engine, enginePidFile, grandchildPidFile } = await writeGrandchildEngine(root);
+    const queuedLog = join(root, "queued.log");
+    const queuedEngine = await writeCountingEngine(root, queuedLog, 1);
+    const account = (name: string): ProviderAccount => ({ name, vendor: "antigravity", location: "agy", adapter: "native" } as ProviderAccount);
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
+    const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async () => ({ observations: [], failures: [] }) });
+    let stopped = false; let enginePid: number | undefined;
+    let running: Promise<string> = Promise.resolve(""); let queued: Promise<string> = Promise.resolve("");
+    try {
+      if (!await startDaemon(daemon)) return;
+      running = runNativeEngine(engine, [account("one")], { timeoutMs: 25_000 }).then(() => "resolved", (error: Error) => error.message);
+      track(Number(await waitForFile(grandchildPidFile)), root);
+      enginePid = track(Number(await waitForFile(enginePidFile)), root) as number;
+      // A read for other accounts waits its turn behind the running one.
+      queued = runNativeEngine(queuedEngine, [account("two")], { timeoutMs: 25_000 }).then(() => "resolved", (error: Error) => error.message);
+      stopped = true; await daemon.stop();
+      expect(liveEngineGroupCount()).toBe(0);
+      expect(await queued).toMatch(/shutting down/);
+      await running;
+      expect(await readFile(queuedLog, "utf8").catch(() => "")).toBe("");
+      await vi.waitFor(() => expect(processesMentioning(root)).toEqual([]), { timeout: 5_000, interval: 20 });
+      expect(isProcessGroupAlive(enginePid)).toBe(false);
+    } finally {
+      if (!stopped) await daemon.stop();
+      await Promise.all([running, queued]);
+      if (enginePid) { try { process.kill(-enginePid, "SIGKILL"); } catch { /* gone */ } }
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
   }, 30_000);

@@ -1,8 +1,8 @@
-import { launchEvidenceLocations, readKeepaliveState, waitUntilGroupGone } from "./antigravity-keepalive.js";
-import { liveEngineGroupPids, terminateGroup } from "./engine/group-run.js";
+import { launchEvidenceLocations, readKeepaliveState } from "./antigravity-keepalive.js";
+import { liveEngineGroups, terminateEngineGroup } from "./engine/group-run.js";
 import { sendInboxMessage } from "./inbox.js";
 import { appendDaemonLog } from "./logs.js";
-import { isProcessGroupAlive, killTree, processElapsedSeconds, processSignature, type ExecFile } from "./process-tree.js";
+import { killVerifiedTree, processElapsedSeconds, processSignature, type ExecFile, type VerifiedKillResult } from "./process-tree.js";
 
 /**
  * Age watchdog for agy processes Headroom started. Run on every poll pass.
@@ -14,11 +14,25 @@ import { isProcessGroupAlive, killTree, processElapsedSeconds, processSignature,
  * are never touched), and (2) the leader of a live engine process group
  * (spawned by group-run.ts, which tracks it). One launch is exempt: the
  * daemon's own current keepalive, identified by its launch id.
+ *
+ * Finding a candidate and killing it are separated by awaits (other
+ * candidates' `ps` reads, earlier kills), during which a verified process can
+ * exit and its pid be recycled. So the finding never licenses a signal on its
+ * own: every signal re-verifies identity immediately before it is sent
+ * (killVerifiedTree for launches, group-run's own verified path for engine
+ * groups).
  */
 
 export const AGY_WATCHDOG_INBOX_SESSION = "headroom-watchdog";
 
-export interface OverAgeProcess { pid: number; ageSeconds: number; command: string; source: "keepalive-launch" | "engine-group" }
+export interface OverAgeProcess {
+  pid: number;
+  ageSeconds: number;
+  command: string;
+  source: "keepalive-launch" | "engine-group";
+  /** The recorded `ps` start time (keepalive launches), re-checked before every signal. */
+  startedAt?: string;
+}
 
 export interface WatchdogOptions {
   home: string;
@@ -27,8 +41,8 @@ export interface WatchdogOptions {
   exemptLaunchId?: string;
   execImpl?: ExecFile;
   /** Test seams. */
-  kill?: (pid: number) => Promise<void>;
-  engineGroupPids?: () => number[];
+  kill?: (item: OverAgeProcess) => Promise<VerifiedKillResult>;
+  engineGroups?: () => Array<{ pid: number; ageMs: number; command?: string }>;
   log?: (message: string) => Promise<void>;
   send?: typeof sendInboxMessage;
 }
@@ -54,7 +68,7 @@ export async function findOverAgeLaunchProcesses(options: Pick<WatchdogOptions, 
       if (!live || live.command !== item.command || live.startedAt !== item.startedAt) continue;
       const age = await processElapsedSeconds(item.pid, options.execImpl);
       if (age === undefined || age * 1000 < options.maxAgeMs) continue;
-      found.set(item.pid, { pid: item.pid, ageSeconds: age, command: live.command, source: "keepalive-launch" });
+      found.set(item.pid, { pid: item.pid, ageSeconds: age, command: item.command, startedAt: item.startedAt, source: "keepalive-launch" });
     }
   }
   return [...found.values()];
@@ -75,15 +89,19 @@ export async function recordedLaunchPids(home: string): Promise<number[]> {
   return pids;
 }
 
-async function findOverAgeEngineGroups(options: WatchdogOptions): Promise<OverAgeProcess[]> {
-  const found: OverAgeProcess[] = [];
-  for (const pid of (options.engineGroupPids ?? liveEngineGroupPids)()) {
-    const age = await processElapsedSeconds(pid, options.execImpl);
-    if (age === undefined || age * 1000 < options.maxAgeMs) continue;
-    const live = await processSignature(pid, options.execImpl);
-    found.push({ pid, ageSeconds: age, command: live?.command ?? "unknown", source: "engine-group" });
-  }
-  return found;
+/** Engine groups are aged by group-run's own spawn clock, not by a `ps`
+ * lookup of a pid that could have changed hands. */
+function findOverAgeEngineGroups(options: WatchdogOptions): OverAgeProcess[] {
+  return (options.engineGroups ?? liveEngineGroups)()
+    .filter((group) => group.ageMs >= options.maxAgeMs)
+    .map((group) => ({ pid: group.pid, ageSeconds: Math.floor(group.ageMs / 1000), command: group.command ?? "unknown", source: "engine-group" as const }));
+}
+
+async function killCandidate(item: OverAgeProcess, options: WatchdogOptions): Promise<VerifiedKillResult> {
+  if (options.kill) return options.kill(item);
+  if (item.source === "engine-group") return (await terminateEngineGroup(item.pid)) ? "killed" : "not-ours";
+  if (!item.startedAt) return "not-ours";
+  return killVerifiedTree({ pid: item.pid, command: item.command, startedAt: item.startedAt }, { execImpl: options.execImpl });
 }
 
 function ageText(seconds: number): string {
@@ -96,16 +114,16 @@ function ageText(seconds: number): string {
 export async function runAgyWatchdog(options: WatchdogOptions): Promise<OverAgeProcess[]> {
   const log = options.log ?? ((message: string) => appendDaemonLog(message, options.home));
   const send = options.send ?? sendInboxMessage;
-  const candidates = [...await findOverAgeLaunchProcesses(options), ...await findOverAgeEngineGroups(options)];
+  const candidates = [...await findOverAgeLaunchProcesses(options), ...findOverAgeEngineGroups(options)];
   const killed: OverAgeProcess[] = [];
   for (const item of candidates) {
-    // A sibling kill (script's tree includes agy) may already have taken it.
-    if (!isProcessGroupAlive(item.pid)) continue;
-    try {
-      if (options.kill) await options.kill(item.pid);
-      else if (item.source === "engine-group") await terminateGroup(item.pid);
-      else { await killTree(item.pid); await waitUntilGroupGone(item.pid); }
-    } catch (error) { await log(`agy watchdog: could not kill pid ${item.pid}: ${(error as Error).message}`).catch(() => undefined); continue; }
+    let outcome: VerifiedKillResult;
+    try { outcome = await killCandidate(item, options); }
+    catch (error) { await log(`agy watchdog: could not kill pid ${item.pid}: ${(error as Error).message}`).catch(() => undefined); continue; }
+    // Gone already (a sibling kill took it: script's tree includes agy), or
+    // the pid is no longer the recorded process: nothing was signalled.
+    if (outcome === "not-ours") continue;
+    if (outcome === "survived") { await log(`agy watchdog: pid ${item.pid} (${item.source}) still alive after SIGKILL`).catch(() => undefined); continue; }
     killed.push(item);
     const text = `agy watchdog killed pid ${item.pid} (${item.source}, age ${ageText(item.ageSeconds)}, ${item.command}); Headroom-started agy must not outlive ${Math.round(options.maxAgeMs / 60_000)}m`;
     await log(text).catch(() => undefined);

@@ -1,13 +1,19 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgyKeepaliveSupervisor, keepaliveLaunchStateFilePath } from "../src/antigravity-keepalive.js";
 import { AGY_WATCHDOG_INBOX_SESSION, runAgyWatchdog } from "../src/agy-watchdog.js";
-import { externalAntigravityServerPids, isAntigravityServerCommand } from "../src/antigravity-discovery.js";
+import * as discovery from "../src/antigravity-discovery.js";
 import { parsePolicy } from "../src/policy.js";
+import type { ExecFile } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+
+const { externalAntigravityServerPids, isAntigravityServerCommand } = discovery;
+/** Added with the executable-only matching fix; read lazily so its absence
+ * fails only the test that needs it. */
+const parseProcessListing = (comm: string, args: string) => (discovery as unknown as { parseProcessListing: typeof discovery.parseProcessListing }).parseProcessListing(comm, args);
 
 const temporary: string[] = [];
 useProcessReaper();
@@ -139,5 +145,109 @@ describe("Antigravity server discovery", () => {
     ];
     expect(await externalAntigravityServerPids({ list, ownedRoots: [10] })).toEqual([20]);
     expect(await externalAntigravityServerPids({ list, ownedRoots: [10, 20] })).toEqual([]);
+  });
+});
+
+type FakeRow = { command: string; startedAt: () => string; ppid?: number; pgid?: number; etime?: string };
+
+/** A fake `ps` that knows only the fabricated pids in `table`. `startedAt` is
+ * read at call time, so a test can recycle a pid between two queries. */
+function fakePs(table: Map<number, FakeRow>, onEtime?: () => void): ExecFile {
+  return (async (_file: string, args: readonly string[]) => {
+    if (args[0] === "-Ao" || args[0] === "-wwAo") return { stdout: "", stderr: "" };
+    const pid = Number(args[args.indexOf("-p") + 1]);
+    const row = table.get(pid);
+    if (!row) throw Object.assign(new Error("no such process"), { code: 1 });
+    const fields = String(args[args.indexOf("-o") + 1]).split(",").map((field) => field.replace(/=$/, ""));
+    const value = (field: string): string => {
+      if (field === "comm") return row.command;
+      if (field === "lstart") return row.startedAt();
+      if (field === "etime") { onEtime?.(); return row.etime ?? "01:00:00"; }
+      if (field === "ppid") return String(row.ppid ?? 1);
+      if (field === "pgid") return String(row.pgid ?? pid);
+      throw new Error(`unexpected ps field ${field}`);
+    };
+    return { stdout: `${fields.map(value).join(" ")}\n`, stderr: "" };
+  }) as unknown as ExecFile;
+}
+
+describe.skipIf(process.platform === "win32")("agy watchdog: pid reuse", () => {
+  it("never signals a recorded pid that was recycled after it was verified", async () => {
+    const root = await fixture("headroom-wd-reuse-");
+    const launchId = "0b5c1d6e-2f3a-4b7c-8d9e-0a1b2c3d4e5f";
+    const agyPid = 4_000_001; const scriptPid = 4_000_002;
+    await mkdir(join(root, "keepalive", launchId), { recursive: true, mode: 0o700 });
+    const recordedAt = new Date().toISOString();
+    await writeFile(join(root, "keepalive", launchId, "state.json"), JSON.stringify({
+      scriptPid, scriptCommand: "/usr/bin/script", scriptStartedAt: "Mon Sep 28 10:00:00 2026",
+      agyPid, agyCommand: "/fake/bin/agy", agyStartedAt: "Mon Sep 28 10:00:01 2026",
+      recordedAt, launchId, launchedAt: recordedAt, verified: true,
+    }), { mode: 0o600 });
+    // Both processes verify and are over age. The moment the watchdog has read
+    // both ages, the kernel hands both pids to strangers (new start times).
+    let etimeQueries = 0;
+    const recycled = (): boolean => etimeQueries >= 2;
+    const table = new Map<number, FakeRow>([
+      [agyPid, { command: "/fake/bin/agy", startedAt: () => recycled() ? "Tue Sep 29 09:00:00 2026" : "Mon Sep 28 10:00:01 2026", ppid: scriptPid }],
+      [scriptPid, { command: "/usr/bin/script", startedAt: () => recycled() ? "Tue Sep 29 09:00:02 2026" : "Mon Sep 28 10:00:00 2026" }],
+    ]);
+    const execImpl = fakePs(table, () => { etimeQueries += 1; });
+    const signalled: Array<[number, string | number | undefined]> = [];
+    const realKill = process.kill.bind(process);
+    const spy = vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+      if (Math.abs(target) === agyPid || Math.abs(target) === scriptPid) {
+        signalled.push([target, signal]);
+        return true; // the strangers are alive; nothing is ever delivered
+      }
+      return realKill(target, signal as NodeJS.Signals);
+    }) as typeof process.kill);
+    try {
+      const killed = await runAgyWatchdog({ home: root, maxAgeMs: 60_000, execImpl, engineGroups: () => [], log: async () => undefined });
+      expect(etimeQueries).toBeGreaterThanOrEqual(2);
+      expect(killed).toEqual([]);
+      expect(signalled.filter(([, signal]) => signal !== 0 && signal !== undefined)).toEqual([]);
+    } finally { spy.mockRestore(); }
+  }, 20_000);
+});
+
+describe("Antigravity server discovery: the executable decides, never an argument", () => {
+  it("an editor or pager naming an agy path or an antigravity-cli directory is not a server", () => {
+    expect(isAntigravityServerCommand("/usr/bin/vim /Users/you/.local/bin/agy")).toBe(false);
+    expect(isAntigravityServerCommand("tail -f /tmp/antigravity-cli/log")).toBe(false);
+    expect(isAntigravityServerCommand("/usr/bin/less /Applications/Antigravity.app/Contents/x/language_server_macos --csrf_token t")).toBe(false);
+    expect(isAntigravityServerCommand("/bin/cat /opt/tools/language_server_x --app_data_dir antigravity")).toBe(false);
+  });
+
+  it("still recognises the servers the probe reads", () => {
+    expect(isAntigravityServerCommand("/Users/you/.local/bin/agy")).toBe(true);
+    expect(isAntigravityServerCommand("/Users/you/.local/bin/agy --some-flag")).toBe(true);
+    expect(isAntigravityServerCommand("/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm --csrf_token abc")).toBe(true);
+    expect(isAntigravityServerCommand("/opt/ls/language_server_linux_x64 --app_data_dir antigravity --csrf_token t")).toBe(true);
+    expect(isAntigravityServerCommand("/Users/you/.gemini/antigravity-cli/bin/antigravity-cli serve")).toBe(true);
+  });
+
+  it("discovery ignores processes whose arguments merely mention agy or antigravity-cli", async () => {
+    const list = async () => [
+      { pid: 30, ppid: 1, command: "vim /Users/you/.local/bin/agy", executable: "/usr/bin/vim" },
+      { pid: 31, ppid: 1, command: "tail -f /tmp/antigravity-cli/log", executable: "/usr/bin/tail" },
+      { pid: 32, ppid: 1, command: "/Users/you/.local/bin/agy", executable: "/Users/you/.local/bin/agy" },
+      // A path with a space: the listing supplies the executable separately.
+      { pid: 33, ppid: 1, command: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos --csrf_token t", executable: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos" },
+    ];
+    expect(await externalAntigravityServerPids({ list })).toEqual([32, 33]);
+  });
+
+  it("parses the joined ps listings into executable and arguments", () => {
+    const rows = parseProcessListing(
+      "  30     1 /usr/bin/vim\n  33     1 /Applications/Antigravity IDE.app/Contents/x/language_server_macos\n  40     1 language_server\n",
+      "  30 vim /Users/you/.local/bin/agy\n  33 /Applications/Antigravity IDE.app/Contents/x/language_server_macos --csrf_token t\n  40 /usr/share/antigravity/bin/language_server_linux_x64 --csrf_token t\n",
+    );
+    expect(rows).toEqual([
+      { pid: 30, ppid: 1, executable: "/usr/bin/vim", command: "vim /Users/you/.local/bin/agy" },
+      { pid: 33, ppid: 1, executable: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos", command: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos --csrf_token t" },
+      // procps truncates comm to 15 characters; the argv[0] it prefixes wins.
+      { pid: 40, ppid: 1, executable: "/usr/share/antigravity/bin/language_server_linux_x64", command: "/usr/share/antigravity/bin/language_server_linux_x64 --csrf_token t" },
+    ]);
+    expect(rows.filter((row) => isAntigravityServerCommand(row.command, row.executable)).map((row) => row.pid)).toEqual([33, 40]);
   });
 });

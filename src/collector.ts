@@ -40,7 +40,9 @@ export interface PollResult {
 export interface PollOptions {
   /** Overrides the platform's native-engine availability for controlled callers. */
   nativeEngineAvailable?: boolean;
-  /** Set only by the daemon while it owns a warmed `agy` PTY. */
+  /** Set only by the daemon, while a local Antigravity server may be probed:
+   * its own warmed `agy` PTY, or a server it discovered but did not start
+   * (the IDE's language server, the user's agy). */
   daemonOwnsAntigravity?: boolean;
   /** Remote quota failures are backed off independently from the warm local probe. */
   skipRemoteAntigravity?: boolean;
