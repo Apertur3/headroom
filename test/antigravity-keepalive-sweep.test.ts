@@ -1282,6 +1282,12 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: the unexp
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
       const pidFilePath = launchPidPath(root, supervisor);
       await waitForFile(pidFilePath);
+      // recordState() writes the verified record asynchronously (ps-bound).
+      // Barrier: corrupt only after that final write has landed, or a slow
+      // runner lets it overwrite the corruption with valid state.
+      await vi.waitFor(async () => {
+        expect(JSON.parse(await readFile(launchStatePath(root, supervisor), "utf8"))).toMatchObject({ verified: true, agyPid: expect.any(Number) });
+      }, { timeout: 5_000, interval: 20 });
       expect(spawnCount).toBe(1);
 
       // Corrupt the JSON state right before killing script -- the pid file

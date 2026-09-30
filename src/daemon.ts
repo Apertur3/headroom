@@ -1413,6 +1413,12 @@ export class HeadroomDaemon {
     await syncClaudeProbeState(this.store);
     const current = this.inFlight.get(key);
     if (current) return current;
+    // The interval gates above ran before several awaits. A concurrent poll
+    // that both started and finished during them left no in-flight entry to
+    // join, yet did set lastPoll: without this re-check the late arrival
+    // would fire a second, duplicate vendor poll. Same await-free step as
+    // the inFlight check and set, so nothing can slip in between.
+    if (!forced && !warmOnly && (this.lastPoll.get(key) ?? 0) + interval > Date.now()) return { observations: [], failures: [] };
     const task = this.poller(principal, {
       // "May probe a local Antigravity server": our keepalive, or one the
       // discovery found that Headroom did not start (the IDE's).
