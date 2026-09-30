@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.4] - 2026-09-30
+
+### Changed
+- Stale-lane alerts no longer message the phone. `lane_stale` and `lane_recovered` stay in the Headroom inbox, `headroom doctor` and the daemon log, and are never sent to Telegram, webhooks or any other channel. A person now gets one plain message, through the normal channels and respecting quiet hours, only when a principal has had a stale lane for more than 24 hours: "Headroom can't read your <vendor> usage since <day, date>. Treat its <name> numbers as unknown until this clears." It is sent once per stale episode, grouped per principal, with no recovery message.
+
 ## [0.2.3] - 2026-09-30
 
 ### Fixed
