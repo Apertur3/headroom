@@ -113,8 +113,15 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   const sparkRateLimit = sparkEntry ? sparkEntry.rate_limit as ObjectValue : undefined;
   const five = rate(account, "spark", sparkRateLimit?.primary_window ?? sparkRateLimit?.primary, 300, now, SOURCE, "fresh", true);
   const week = rate(account, "spark", sparkRateLimit?.secondary_window ?? sparkRateLimit?.secondary, 10_080, now, SOURCE, "fresh", true);
-  output.push(tagged(five ?? notEnforced(account, "spark", 300, now, additional ? "vendor sent no Spark data for the 5-hour window in this response" : "vendor no longer reports Spark")));
-  output.push(tagged(week ?? notEnforced(account, "spark", 10_080, now, additional ? "vendor sent no Spark data for the weekly window in this response" : "vendor no longer reports Spark")));
+  // Absence of Spark data only means "no cap" when the same reply also
+  // produced a parsed main window. A partial reply (e.g. `{"rate_limit":{}}`)
+  // proves nothing about Spark and must fail closed like any other outage.
+  const mainParsed = primary !== undefined || weekly !== undefined;
+  const sparkAbsent = (minutes: number, label: string): Observation => mainParsed
+    ? notEnforced(account, "spark", minutes, now, additional ? `vendor sent no Spark data for the ${label} window in this response` : "vendor no longer reports Spark")
+    : { ...base(account, "spark", now), window: { kind: minutes === 300 ? "rolling" : "fixed", minutes, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: `partial Codex reply (no main window); Spark ${label} window unknown` };
+  output.push(tagged(five ?? sparkAbsent(300, "5-hour")));
+  output.push(tagged(week ?? sparkAbsent(10_080, "weekly")));
   if (object(credits) && number(credits.available_count) !== undefined) {
     const available = number(credits.available_count)!;
     const expiries = (Array.isArray(credits.credits) ? credits.credits : []).flatMap((credit) => object(credit) && string(credit.status) === "available" && typeof credit.expires_at === "string" ? [credit.expires_at] : []).sort();

@@ -1687,8 +1687,16 @@ export class HeadroomStore {
         -- A blocked_by_weekly lane is a failed row that is still a vendor
         -- answer (see blockedLaneReason): it ranks with fresh, so an older
         -- fresh row for the same window cannot outrank it and then be hidden
-        -- by it below, which left the window missing from status.
-        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(metadata_json, '$.lane_state') = 'blocked_by_weekly'))
+        -- by it below, which left the window missing from status. A newer row of
+        -- any freshness outranks it, so a later ordinary failure is not hidden.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(metadata_json, '$.lane_state') = 'blocked_by_weekly'
+                           -- ...but only while no newer row of any freshness exists for the window.
+                           AND NOT EXISTS (
+                             SELECT 1 FROM observations AS newer_any
+                             WHERE newer_any.meter_id = observations.meter_id
+                               AND COALESCE(CAST(json_extract(newer_any.window_json, '$.minutes') AS TEXT), 'none') = COALESCE(CAST(json_extract(observations.window_json, '$.minutes') AS TEXT), 'none')
+                               AND (newer_any.fetched_at > observations.fetched_at OR (newer_any.fetched_at = observations.fetched_at AND newer_any.id > observations.id))
+                           )))
                          AND NOT (source = 'manual' AND (
                            EXISTS (
                              SELECT 1 FROM observations AS newer_manual

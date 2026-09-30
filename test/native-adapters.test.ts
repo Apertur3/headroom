@@ -243,6 +243,26 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       expect(rows.map((row) => row.window?.minutes)).toEqual([300, 10_080]);
       for (const row of rows) expect(row).toMatchObject({ freshness: "not_enforced", quantity: null, resets_at: null, reason: "vendor no longer reports Spark" });
     });
+
+    it("fails Spark closed when the reply carries no main window (partial reply)", () => {
+      const rows = observationsFromCodexUsage({ plan_type: "pro", rate_limit: {} }, {}, codex, at).filter((row) => row.meter_id === "codex-main:spark");
+      expect(rows.map((row) => row.window?.minutes)).toEqual([300, 10_080]);
+      for (const row of rows) expect(row).toMatchObject({ freshness: "failed", quantity: null, reason: expect.stringContaining("partial Codex reply") });
+    });
+
+    it("keeps gate refusing for Spark after a partial reply follows an earlier Spark failure", async () => {
+      const root = await mkdtemp(join(tmpdir(), "headroom-codex-partial-"));
+      const store = await HeadroomStore.open(join(root, ".headroom"));
+      try {
+        const earlier = new Date(at.getTime() - 3_600_000);
+        const outage = await observeCodex(codex, { now: () => earlier, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 500 }) });
+        store.insertPoll(outage);
+        store.insertPoll(observationsFromCodexUsage({ plan_type: "pro", rate_limit: {} }, {}, codex, at));
+        for (const need of [{ window: "5h" as const, points: 1 }, { window: "wk" as const, points: 1 }]) {
+          expect(gateFor(store, [need], "codex-main:spark", 0, false, at).allowed, need.window).toBe(false);
+        }
+      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+    });
   });
 
   it("maps verified Antigravity quota buckets to the two 5-hour and weekly meters", async () => {

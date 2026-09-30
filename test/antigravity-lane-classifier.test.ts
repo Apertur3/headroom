@@ -301,3 +301,39 @@ describe("partial read: gemini 5h absent, weekly without usage (review finding)"
     } finally { store.close(); }
   });
 });
+
+describe("weekly resets while the 5h bucket keeps failing (review finding)", () => {
+  const HOUR = 3_600_000;
+  const meter = `${PRINCIPAL}:gemini`;
+
+  it("shows the newer ordinary failure, not the older blocked row, and keeps the gate unknown", async () => {
+    const record = await principalFrom("2026-09-29-weekly-exhausted.json");
+    const { rows: blocked } = await localPoll(record);
+    const at = new Date(Date.parse(NOW) + HOUR).toISOString();
+    // Weekly is back to fresh capacity; the 5h bucket still has no usage.
+    const bucket = (name: "gemini" | "claude-gpt", minutes: 300 | 10_080, usage: boolean) => ({
+      meter: name, minutes, remaining: usage ? 0.9 : null, usageKnown: usage, disabled: null, resetsAt: usage ? "2026-10-08T00:00:00Z" : null,
+    });
+    const payload = { kind: "quota_summary" as const, buckets: [bucket("gemini", 300, false), bucket("gemini", 10_080, true), bucket("claude-gpt", 300, true), bucket("claude-gpt", 10_080, true)] };
+    const newer = antigravityLaneObservations(classifyAntigravityLanes(payload), PRINCIPAL, { now: at, source: "test" });
+    const root = await mkdtemp(join(tmpdir(), "headroom-agy-newer-failure-"));
+    temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      store.insertPoll(blocked.map((row) => ({ ...row, observed_at: NOW, fetched_at: NOW })));
+      store.insertPoll(newer);
+      const now = new Date(Date.parse(at) + 60_000);
+      const five = store.latestPerWindow(meter).find((row) => row.window?.minutes === 300)!;
+      expect(five.freshness).toBe("failed");
+      expect(five.metadata?.lane_state).not.toBe("blocked_by_weekly");
+      expect(five.fetched_at).toBe(at);
+      expect(paceDecision(five, defaultPolicy, now).state).toBe("UNKNOWN");
+      expect(paceDecision(five, defaultPolicy, now).reason).not.toContain("weekly exhausted");
+      const can = canConsume([meter], new Map([[meter, store.latestPerWindow(meter)]]), defaultPolicy, false, now);
+      expect(can.allowed).toBe(false);
+      expect(can.state).not.toBe("FREEZE");
+      const gate = gateFor(store, [{ window: "5h", points: 1 }], meter, 0, false, now);
+      expect(gate).toMatchObject({ allowed: false, unknown: true });
+    } finally { store.close(); }
+  });
+});
