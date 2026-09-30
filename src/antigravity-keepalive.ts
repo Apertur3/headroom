@@ -827,7 +827,7 @@ export class AgyKeepaliveSupervisor {
         if (agyPid === undefined) await sleep(this.pidDiscoveryIntervalMs);
       }
       if (this.child !== child) return;
-      const agySignature = agyPid !== undefined ? await processSignature(agyPid) : undefined;
+      const agySignature = agyPid !== undefined ? await this.signatureAfterExec(agyPid, child) : undefined;
       const state: KeepaliveState = {
         scriptPid, scriptCommand: scriptSignature.command, scriptStartedAt: scriptSignature.startedAt,
         launchedAt, recordedAt: new Date().toISOString(), verified: true, launchId,
@@ -842,6 +842,21 @@ export class AgyKeepaliveSupervisor {
       this.scriptEvidence = { pid: scriptPid, command: scriptSignature.command, startedAt: scriptSignature.startedAt };
       writeKeepaliveStateSync(statePath, state);
     } catch { /* best-effort only; the next sweep just finds nothing recorded */ }
+  }
+
+  /** agy's signature as it will stay. The wrapper writes its pid file BEFORE
+   * it execs agy, and exec changes the command, so a read inside that window
+   * would record the wrapper shell and no later check would ever match agy.
+   * While the pid's arguments still name this launch's pid file it is the
+   * wrapper: wait (bounded) for the exec. Without `ps` arguments, read as before. */
+  private async signatureAfterExec(pid: number, child: ChildProcess): Promise<{ command: string; startedAt: string } | undefined> {
+    const marker = this.agyPidFile;
+    for (let attempt = 0; marker && attempt < this.pidDiscoveryAttempts && this.child === child; attempt += 1) {
+      const args = await processArgs(pid);
+      if (args === undefined || !args.includes(marker)) break;
+      await sleep(this.pidDiscoveryIntervalMs);
+    }
+    return processSignature(pid);
   }
 
   /** stop() right after start() can beat the wrapper to its pid file; wait

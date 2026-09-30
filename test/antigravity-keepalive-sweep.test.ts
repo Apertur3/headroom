@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgyKeepaliveSupervisor, InvalidKeepaliveEvidenceError, keepaliveLaunchAgyPidFilePath, keepaliveLaunchStateFilePath, keepaliveStateFilePath, sweepPreviousKeepalive } from "../src/antigravity-keepalive.js";
-import { killTree, processSignature } from "../src/process-tree.js";
+import { killTree, processSignature, setProcIdentityDeniedForTest } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
 
 const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
@@ -154,15 +154,17 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor.stop() (re
   }, 15_000);
 });
 
-/** Runs `body` with a `ps` on PATH that always fails, the way a sandbox that
- * denies the process table behaves, then restores PATH. */
+/** Runs `body` with a `ps` on PATH that always fails and /proc identity
+ * reads refused, the way a sandbox that denies the process table behaves,
+ * then restores both. */
 async function withoutPs<T>(root: string, body: () => Promise<T>): Promise<T> {
   const bin = join(root, "no-ps-bin");
   await mkdir(bin, { recursive: true });
   await writeFile(join(bin, "ps"), "#!/bin/sh\necho 'ps: denied' >&2\nexit 1\n", { mode: 0o700 });
   const previous = process.env.PATH;
   process.env.PATH = `${bin}:${previous ?? ""}`;
-  try { return await body(); } finally { process.env.PATH = previous; }
+  setProcIdentityDeniedForTest(true);
+  try { return await body(); } finally { process.env.PATH = previous; setProcIdentityDeniedForTest(false); }
 }
 
 describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leaves agy behind (product paths)", () => {

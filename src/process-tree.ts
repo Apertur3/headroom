@@ -204,6 +204,11 @@ function psIdentityOptions(): { timeout: number; killSignal: NodeJS.Signals; env
 }
 
 let linuxBootId: string | undefined;
+let procIdentityDenied = false;
+/** Test seam: behave as a host where /proc cannot be read (a sandbox that
+ * denies the process table denies both `ps` and /proc), so the ps-free tiers
+ * are exercised on Linux too. */
+export function setProcIdentityDeniedForTest(denied: boolean): void { procIdentityDenied = denied; }
 /** Linux, default path only: command and start time from ONE read of
  * /proc/<pid>/stat, so both describe the same process at the same instant.
  * The start time is the kernel's own `starttime` (clock ticks since boot,
@@ -213,7 +218,7 @@ let linuxBootId: string | undefined;
  * tick count truncated to a second. `comm` here is the field procps prints
  * for `comm`. Undefined when the process is gone or cannot be read. */
 function linuxProcSignature(pid: number): { command: string; startedAt: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (procIdentityDenied || !Number.isInteger(pid) || pid <= 0) return undefined;
   let stat: string;
   try { stat = readFileSync(`/proc/${pid}/stat`, "utf8"); } catch { return undefined; }
   const open = stat.indexOf("(");

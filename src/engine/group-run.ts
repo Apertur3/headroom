@@ -56,6 +56,8 @@ let exitHookInstalled = false;
 let startsRefused = false;
 let signalCleanupEnabled = true;
 let signalHandlersInstalled = false;
+/** Engine spawns in progress (synchronous; see runInGroup). */
+let spawning = 0;
 
 interface GroupRunSeams {
   signal(target: number, signal: NodeJS.Signals | 0): void;
@@ -258,7 +260,7 @@ function removeSignalHandlers(): void {
 }
 
 function syncSignalHandlers(): void {
-  const wanted = signalCleanupEnabled && process.platform !== "win32" && liveEngineGroupCount() > 0;
+  const wanted = signalCleanupEnabled && process.platform !== "win32" && (liveEngineGroupCount() > 0 || spawning > 0);
   if (wanted && !signalHandlersInstalled) {
     signalHandlersInstalled = true;
     for (const signal of CLEANUP_SIGNALS) process.prependListener(signal, onCleanupSignal);
@@ -300,7 +302,16 @@ export function runInGroup(command: string, args: string[], options: GroupRunOpt
   const graceMs = options.graceMs ?? ENGINE_KILL_GRACE_MS;
   return new Promise((resolve, reject) => {
     let stdout = ""; let stderr = ""; let overflow = false; let timedOut = false; let settled = false;
-    const child = spawn(command, args, { env: options.env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true });
+    // The handlers go in BEFORE spawn: a signal that lands after the engine
+    // exists but before it is tracked would otherwise take the default action
+    // and leave the new group behind. A JS signal listener only runs between
+    // ticks, so by the time it does, the group below is tracked.
+    spawning += 1;
+    syncSignalHandlers();
+    let child;
+    try { child = spawn(command, args, { env: options.env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true }); }
+    catch (error) { spawning -= 1; syncSignalHandlers(); throw error; }
+    spawning -= 1;
     const pid = child.pid;
     let group: EngineGroup | undefined;
     if (typeof pid === "number") {
@@ -309,8 +320,8 @@ export function runInGroup(command: string, args: string[], options: GroupRunOpt
       tracked.identityRead = seams.lookup(pid).then((identity) => { if (!tracked.exited && identity) tracked.identity = identity; }, () => undefined);
       group = tracked;
       liveGroups.set(pid, tracked);
-      syncSignalHandlers();
     }
+    syncSignalHandlers();
     const finish = async (outcome: () => void): Promise<void> => {
       if (settled) return;
       settled = true;

@@ -256,6 +256,7 @@ describe.skipIf(process.platform === "win32" || !canRunTypeScriptChild)("Ctrl-C 
       "  signal: (target, signal) => { try { process.kill(target, signal); if (signal) note('signal', target, signal, 'sent'); } catch (error) { if (signal) note('signal', target, signal, error.code); throw error; } },",
       "});",
       "runInGroup(process.argv[3], [], { timeoutMs: 25000, maxBuffer: 1024 }).catch(() => undefined);",
+      "note('spawned', 'SIGINT listeners', process.listenerCount('SIGINT'));",
     ].join("\n") + "\n");
     const groupRunUrl = pathToFileURL(resolve(import.meta.dirname, "../src/engine/group-run.ts")).href;
     const processTreeUrl = pathToFileURL(resolve(import.meta.dirname, "../src/process-tree.ts")).href;
