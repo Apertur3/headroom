@@ -1684,7 +1684,11 @@ export class HeadroomStore {
         -- A cleared/expired manual fact does not hide a newer failed poll:
         -- rank it beside that failure so the newer row can explain the live
         -- state rather than leaving this meter blank after filtering.
-        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced')
+        -- A blocked_by_weekly lane is a failed row that is still a vendor
+        -- answer (see blockedLaneReason): it ranks with fresh, so an older
+        -- fresh row for the same window cannot outrank it and then be hidden
+        -- by it below, which left the window missing from status.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(metadata_json, '$.lane_state') = 'blocked_by_weekly'))
                          AND NOT (source = 'manual' AND (
                            EXISTS (
                              SELECT 1 FROM observations AS newer_manual

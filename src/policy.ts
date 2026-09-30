@@ -320,6 +320,17 @@ export function blockedLaneReason(observation: Observation): string | undefined 
   return observation.reason ?? "blocked: weekly exhausted";
 }
 
+/** One line naming a blocked lane and when it unblocks, e.g. "5h blocked
+ * until 2026-09-30T20:21:49Z (weekly exhausted)"; never a number. Undefined
+ * for any reading that is not a blocked lane. Shared by the text status and
+ * the served `blocked_summary` field so they cannot drift apart. */
+export function blockedLaneSummary(observation: Observation): string | undefined {
+  if (!blockedLaneReason(observation)) return undefined;
+  const minutes = observation.window?.minutes;
+  const window = minutes === 300 ? "5h" : minutes === 10_080 ? "wk" : minutes && minutes % 60 === 0 ? `${minutes / 60}h` : minutes ? `${minutes}m` : "-";
+  return `${window} blocked until ${observation.metadata?.blocked_until ?? "its weekly reset (time not reported)"} (weekly exhausted)`;
+}
+
 /** True when status would count this stored windowed reading as a real answer
  * from the vendor: fresh with a usable percent shape, or an explicit
  * not_enforced, and neither held (isHeldReading) nor a synthetic exhausted
