@@ -332,6 +332,9 @@ export function isAcceptedLaneReading(observation: Observation): boolean {
   if (observation.freshness === "not_enforced") return true;
   if (blockedLaneReason(observation)) return true;
   if (observation.freshness !== "fresh") return false;
+  // A count window (Codex/Grok credits) has no minutes and no limit: the
+  // remaining count is its whole reading.
+  if (observation.window?.kind === "count") return observation.quantity?.remaining !== undefined && observation.quantity.remaining !== null;
   return Boolean(observation.quantity && observation.quantity.limit !== null && observation.window?.minutes);
 }
 

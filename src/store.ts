@@ -1814,14 +1814,16 @@ export class HeadroomStore {
    * returns the first one status would accept. Stops at that row, so a
    * healthy lane costs one indexed page. */
   private newestAcceptedAt(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">): string | null {
-    if (lane.window_minutes <= 0) return null;
+    // A windowless lane (window_minutes 0) is a count window such as Codex
+    // credits: a window object with no minutes.
+    const windowless = lane.window_minutes <= 0;
     const placeholders = lane.meter_ids.map(() => "?").join(",");
     const statement = this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND (freshness IN ('fresh', 'not_enforced') OR (freshness = 'failed' AND metadata_json LIKE '%blocked_by_weekly%')) AND source NOT IN ('manual', 'paste')
-      AND CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ? AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
+      AND ${windowless ? "json_extract(window_json, '$.minutes') IS NULL AND window_json IS NOT NULL" : "CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?"} AND (fetched_at < ? OR (fetched_at = ? AND id < ?))
       ORDER BY fetched_at DESC, id DESC LIMIT 50`);
     let cursorAt = "￿"; let cursorId = Number.MAX_SAFE_INTEGER;
     for (;;) {
-      const rows = statement.all(...lane.meter_ids, lane.window_minutes, cursorAt, cursorAt, cursorId) as Row[];
+      const rows = statement.all(...lane.meter_ids, ...(windowless ? [] : [lane.window_minutes]), cursorAt, cursorAt, cursorId) as Row[];
       for (const row of rows) { const observation = observationFromRow(row); if (isAcceptedLaneReading(observation)) return observation.fetched_at; }
       if (rows.length < 50) return null;
       const last = rows[rows.length - 1]; cursorAt = String(last.fetched_at); cursorId = Number(last.id);
@@ -1834,7 +1836,7 @@ export class HeadroomStore {
   laneReadingsSince(lane: Pick<LaneRecord, "meter_ids" | "window_minutes">, since: string): Observation[] {
     const placeholders = lane.meter_ids.map(() => "?").join(",");
     return (this.prepared(`SELECT * FROM observations WHERE meter_id IN (${placeholders}) AND fetched_at >= ? AND source NOT IN ('manual', 'paste')
-      AND (window_json IS NULL OR CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?) ORDER BY fetched_at DESC, id DESC`).all(...lane.meter_ids, since, lane.window_minutes) as Row[]).map(observationFromRow);
+      AND (window_json IS NULL OR json_extract(window_json, '$.minutes') IS NULL OR CAST(json_extract(window_json, '$.minutes') AS INTEGER) = ?) ORDER BY fetched_at DESC, id DESC`).all(...lane.meter_ids, since, lane.window_minutes) as Row[]).map(observationFromRow);
   }
 
   /** The reason on the newest failed poll of this lane's meter after `since`, if any. */
