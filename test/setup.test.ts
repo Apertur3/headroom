@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +26,20 @@ async function captureLog<T>(run: () => Promise<T>): Promise<{ result: T; logs: 
   try { return { result: await run(), logs }; }
   finally { spy.mockRestore(); }
 }
+
+describe("headroom setup rerun", () => {
+  it("--yes keeps an existing accounts.toml instead of overwriting it", async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), "headroom-setup-userhome-"));
+    const headroomHome = await mkdtemp(join(tmpdir(), "headroom-setup-home-"));
+    temporary.push(fakeHome, headroomHome);
+    const custom = '[[accounts]]\nname = "my-claude"\nvendor = "claude"\nlocation = "/nowhere"\nadapter = "native-ts"\n';
+    await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
+      await writeFile(accountsPath(), custom);
+      await captureLog(() => runSetup(["--yes", "--skip-service", "--skip-mcp"], { finalCheck: async () => undefined }));
+      expect(await readFile(accountsPath(), "utf8")).toBe(custom);
+    });
+  });
+});
 
 describe("headroom setup, non-interactive (vitest's own stdin is never a TTY)", () => {
   it("with no flags at all, narrates the full plan, asks nothing, and changes nothing", async () => {
