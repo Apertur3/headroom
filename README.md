@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <sub><b>1,898 tests</b> on macOS, Ubuntu and Windows CI &middot; a stale or failed reading prints <b>UNKNOWN</b>, never a number &middot; <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
+  <sub><b>1,898 tests</b> (1,867 run on Ubuntu, 1,687 on Windows) in CI &middot; a stale or failed reading prints <b>UNKNOWN</b>, never a number &middot; <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
 </p>
 
 ![The Headroom browser dashboard: two subscriptions, their 5-hour and weekly windows, pace states and a remaining-capacity chart](docs/assets/dashboard.png)
@@ -147,7 +147,7 @@ for every one.
 
 | | |
 |---|---|
-| Tests | 1,898 (`npm test`, vitest; 1 skipped), run on every push. Method and limits: [docs/verification.md](docs/verification.md) |
+| Tests | 1,898 defined (`npm test`, vitest). Run on every push: 1,867 on Ubuntu (31 skipped), 1,687 on Windows (211 skipped, mostly POSIX-only), 1,897 on macOS (1 skipped). Method and limits: [docs/verification.md](docs/verification.md) |
 | CI platforms | macOS, Ubuntu and Windows (`macos-latest`, `ubuntu-latest`, `windows-latest`): lint, tests, build, `npm pack --dry-run`, privacy sweep, `npm audit` |
 | Daily use | one macOS machine; this is the only environment a person uses every day |
 | Install from the packed tarball | scripted cold-install smoke test ([`smoke-cold.sh`](scripts/smoke-cold.sh)) runs in the release workflow; also checked by hand on macOS and on Linux ARM64 |
