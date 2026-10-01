@@ -90,4 +90,31 @@ describe("public-audit check 2 and GitHub's synthetic PR merge commit", () => {
     await mergeOnTop(root, PERSONAL, synthetic);
     expect(await audit(root, "pull_request")).toContain("personal email in commit metadata");
   });
+
+  describe("in a shallow clone (actions/checkout default)", () => {
+    async function shallow(root: string): Promise<string> {
+      const dest = await mkdtemp(join(tmpdir(), "headroom-public-audit-shallow-")); temporary.push(dest);
+      await rm(dest, { recursive: true, force: true });
+      await git(root, NOREPLY, "clone", "-q", "--depth", "1", `file://${root}`, dest);
+      return dest;
+    }
+
+    it("ignores a personal-email synthetic merge under pull_request", async () => {
+      const root = await fakeRepo();
+      await mergeOnTop(root, PERSONAL, synthetic);
+      expect(await audit(await shallow(root), "pull_request")).not.toContain("personal email");
+    });
+
+    it("flags the same shallow tip when not a pull_request run", async () => {
+      const root = await fakeRepo();
+      await mergeOnTop(root, PERSONAL, synthetic);
+      expect(await audit(await shallow(root), undefined)).toContain("personal email in commit metadata");
+    });
+
+    it("flags a shallow normal personal-email tip under pull_request", async () => {
+      const root = await fakeRepo();
+      await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "real work");
+      expect(await audit(await shallow(root), "pull_request")).toContain("personal email in commit metadata");
+    });
+  });
 });
