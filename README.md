@@ -5,21 +5,94 @@
   </picture>
 </p>
 
-Headroom tells your agents how much of each AI subscription is left before they spend it.
+**Headroom tells your agents how much of each AI subscription is left, before they spend it.**
 
-One daemon reads quota across Claude, Codex, Antigravity, Grok, Kimi, and local
-vLLM or llama.cpp pools. It keeps history, detects resets, and gives cooperating agents a budget
-check before they start work. Stale or failed readings stay UNKNOWN. Antigravity support is
+<p align="center">
+  <a href="https://github.com/Apertur3/headroom/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Apertur3/headroom/actions/workflows/ci.yml/badge.svg?branch=master"></a>
+  <a href="https://www.npmjs.com/package/headroomd"><img alt="npm" src="https://img.shields.io/npm/v/headroomd"></a>
+  <a href="https://github.com/Apertur3/headroom/actions/workflows/release.yml"><img alt="Release" src="https://github.com/Apertur3/headroom/actions/workflows/release.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+![The Headroom browser dashboard: two subscriptions, their 5-hour and weekly windows, pace states and a remaining-capacity chart](docs/assets/dashboard.png)
+
+<sub>Synthetic data. Regenerate with `node scripts/render-dashboard-demo.mjs` (see [CONTRIBUTING.md](CONTRIBUTING.md)).</sub>
+
+## Install in 30 seconds
+
+Node 22.13 or newer.
+
+```sh
+npm install -g headroomd      # or: brew install apertur3/tap/headroom
+headroom setup                # finds your logins, runs the doctor, asks before each change
+headroom                      # one line per meter
+```
+
+One daemon reads quota across Claude, Codex, Antigravity, Grok, Kimi, and local vLLM or
+llama.cpp pools. It keeps history, detects resets, and gives cooperating agents a budget check
+before they start work. Stale or failed readings stay UNKNOWN. Antigravity support is
 experimental; provider-specific limits are described below.
 
 ![headroom output](docs/assets/headroom-terminal.svg)
 
-## The problem
+## Why
 
-Before an agent starts several jobs, it needs to know whether the account can afford them and
-which other jobs have already reserved capacity. Headroom combines the vendor readings with
-cooperative reservations to answer that question. When a reading is stale or failed it says UNKNOWN, and
-UNKNOWN never counts as capacity.
+An agent that fans out several jobs needs two answers first: can this account afford them, and
+which other jobs have already reserved capacity? Vendor screens answer neither for a program,
+and a guessed number is worse than none: an orchestrator that believes a stale 20% will burn the
+week in an afternoon. Headroom combines vendor readings with cooperative reservations. When a
+reading is stale or failed it says UNKNOWN, and UNKNOWN never counts as capacity.
+
+## Design principles
+
+Each of these is a rule the code enforces and a test pins. Past real-world breakage is the
+reason for every one.
+
+- **Fail closed: never a fake number.** A missing, stale, held or inconsistent reading becomes
+  UNKNOWN, and `can` answers NO for it unless you pass `--allow-unknown`
+  ([`freshnessGate`, `canConsume`](src/policy.ts), tested in
+  [`store-policy.test.ts`](test/store-policy.test.ts)). Antigravity lanes that report no usage are
+  classified as blocked, idle or unknown, never filled in
+  ([`antigravity-lanes.ts`](src/antigravity-lanes.ts),
+  [`antigravity-lane-classifier.test.ts`](test/antigravity-lane-classifier.test.ts)).
+- **A stale-lane canary that cannot be silenced and does not spam humans.** A meter lane with no
+  fresh reading for 6 hours (configurable) raises an alert into the inbox and `headroom doctor`.
+  It runs before and independently of the notification config, so a muted channel or
+  `events_off` cannot hide it. External channels get nothing per lane; at most one plain-language
+  message per principal per episode, after 24 hours, held during quiet hours
+  ([`canary.ts`](src/canary.ts), [`stale-lane-canary.test.ts`](test/stale-lane-canary.test.ts)).
+- **Process hygiene: only kill what Headroom provably started.** A process is signalled only if
+  recorded evidence (pid, command and start time from when Headroom launched it) still matches
+  the live process, re-checked immediately before every signal, so a recycled pid is never hit.
+  An age watchdog reaps Headroom-started `agy` processes that outlive their limit
+  ([`process-tree.ts`](src/process-tree.ts), [`agy-watchdog.ts`](src/agy-watchdog.ts),
+  [`antigravity-keepalive-stop-recycled-pid.test.ts`](test/antigravity-keepalive-stop-recycled-pid.test.ts),
+  [`agy-watchdog.test.ts`](test/agy-watchdog.test.ts)). The test suite itself fails if any
+  process it started outlives the run ([`global-leak-gate.ts`](test/global-leak-gate.ts)).
+- **Secrets only in the OS secret store.** Headroom's own credentials (notification tokens) are
+  read at use time from the macOS Keychain (`secret-tool` on Linux, Credential Manager on
+  Windows) and never written to disk; vendor tokens are read from the vendor's own store at call
+  time and dropped. Output and logs are redacted
+  ([`notify.ts`](src/notify.ts), [`security.ts`](src/security.ts),
+  [`security.test.ts`](test/security.test.ts), [SECURITY.md](SECURITY.md)).
+- **A redacted fixture per past breakage.** Every Antigravity failure shape seen in the field
+  has a fixture (recorded and redacted, or synthetic) and a test that runs it through the real
+  code path ([`test/fixtures/antigravity/`](test/fixtures/antigravity),
+  [`record-antigravity-fixture.sh`](scripts/record-antigravity-fixture.sh)). The repo
+  also scans itself and its packed npm tarball for private addresses, emails and home paths
+  ([`privacy-sweep.sh`](scripts/privacy-sweep.sh), run in CI).
+
+## Honest numbers
+
+| | |
+|---|---|
+| Tests | 1,898 (`npm test`, vitest; 1 skipped), run on every push |
+| CI platforms | macOS, Ubuntu and Windows (`ubuntu-latest`, `windows-latest`, `macos-latest`): lint, tests, build, `npm pack --dry-run`, privacy sweep, `npm audit` |
+| Daily use | one macOS machine; this is the only environment a person uses every day |
+| Install from the packed tarball | scripted cold-install smoke test ([`smoke-cold.sh`](scripts/smoke-cold.sh)) runs in the release workflow; also checked by hand on macOS and on Linux ARM64 |
+| Not verified | an install from the npm registry on a real Windows machine; a person using it daily on Windows or Linux with real accounts. On Windows only the source is covered by CI |
+| Antigravity | experimental; macOS 14 or later only, and it depends on a private local endpoint that the vendor can change |
+| Vendor endpoints | private and unversioned. Headroom pins them, records redacted fixtures and prints UNKNOWN when a shape changes, but it cannot promise they keep working |
 
 ## A budget check before a job
 
@@ -70,14 +143,12 @@ Headroom is not a router. Which model is good at what is your opinion and change
 in `~/.headroom/routing.toml`; Headroom only filters your fallback list by budget. It also never sits in
 the request path.
 
-## Install
+## Install in detail
 
-Node 22.13 or newer.
+The three commands above are the short path. Discovery on its own:
 
 ```sh
-npm install -g headroomd
 headroom accounts discover   # finds Claude, Codex, Antigravity, Grok and Kimi logins
-headroom                     # one line per meter
 ```
 
 On macOS and Linux, `brew install apertur3/tap/headroom` installs the same package and adds a
@@ -160,11 +231,13 @@ is pinned and checksum verified, and every query lands in an audit log. Details 
 
 ## Status
 
-Stable since 0.1.0 (2026-09-11). Used daily on one macOS machine with two Claude config dirs, one Codex home, one
-Antigravity account and two local inference boxes. Every release is installed from the npm
-registry into a fresh home on Linux (a Raspberry Pi 5) and Windows 11 (a VM) and walked through
-the quickstart by script; CI runs the suite on all three platforms. Vendor endpoints are private and change without notice; Headroom pins, records
-fixtures, backs off on 401, 403 and 429, and prints UNKNOWN instead of a stale number. Antigravity requires
-macOS and a daemon-kept `agy`; see [vendor setup](docs/vendors.md#antigravity).
+Stable since 0.1.0 (2026-09-11); the current release is on npm. Vendor endpoints are private and
+change without notice: Headroom pins them, records fixtures, backs off on 401, 403 and 429, and
+prints UNKNOWN instead of a stale number. What is and is not verified is in
+[Honest numbers](#honest-numbers). Antigravity requires macOS and a daemon-kept `agy`; see
+[vendor setup](docs/vendors.md#antigravity).
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and the issues labelled
+[good first issue](https://github.com/Apertur3/headroom/labels/good%20first%20issue).
 
 MIT. Third party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

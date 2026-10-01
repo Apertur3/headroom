@@ -444,10 +444,10 @@ Those platforms report Antigravity as UNKNOWN rather than trying the retired Gem
 consumer OAuth path. See [vendors.md](vendors.md#antigravity).
 
 CI runs lint, the full test suite and a build on `ubuntu-latest`, `windows-latest` and
-`macos-latest` on every push, and every release is installed from the npm registry into a fresh
-home on macOS, Linux (a Raspberry Pi 5) and Windows 11 (a VM), where a scripted run walks the
-install, discovery, doctor, daemon, socket or named pipe, service install and MCP steps above.
-What has not happened yet is a person using it daily on Windows with real accounts; the
+`macos-latest` on every push. Each release's packed tarball goes through the scripted cold-install
+smoke test (`scripts/smoke-cold.sh`), and has been installed by hand on macOS and on Linux ARM64.
+Not verified: an install from the npm registry on a real Windows machine (on Windows only the
+source is covered by CI), and a person using it daily on Windows or Linux with real accounts; the
 daily-used environment is macOS.
 
 ## Staying up to date
