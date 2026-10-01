@@ -150,7 +150,7 @@ export function isClaudeGrantIssue(reason: string | null | undefined): boolean {
  * isClaudeGrantIssue above must never match. */
 export function claudeLoggedOutFix(configDir: string): string {
   const directory = resolve(configDir);
-  return directory === resolve(homedir(), ".claude") ? "run: claude and sign in" : `run: CLAUDE_CONFIG_DIR=${directory} claude and sign in`;
+  return directory === resolve(homedir(), ".claude") ? "run: claude and sign in" : `${claudeRunWithDirectory(directory)} and sign in`;
 }
 
 /** Full reason text for the logged-out state above, built from
@@ -530,9 +530,16 @@ export async function syncClaudeProbeState(
 
 interface Credential { token: string; expired: boolean; }
 
+/** "run: CLAUDE_CONFIG_DIR=<dir> claude" is POSIX-only; on Windows print the
+ * PowerShell and cmd equivalents instead. */
+function claudeRunWithDirectory(directory: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32") return `run: CLAUDE_CONFIG_DIR=${directory} claude`;
+  return `run: in PowerShell: $env:CLAUDE_CONFIG_DIR="${directory}"; claude  (in cmd: set "CLAUDE_CONFIG_DIR=${directory}" && claude)`;
+}
+
 function claudeCommandForDirectory(configDir: string): string {
   const directory = resolve(configDir);
-  return directory === resolve(homedir(), ".claude") ? "run: claude" : `run: CLAUDE_CONFIG_DIR=${directory} claude`;
+  return directory === resolve(homedir(), ".claude") ? "run: claude" : claudeRunWithDirectory(directory);
 }
 
 function claudeCommand(account: ProviderAccount): string { return claudeCommandForDirectory(account.location); }

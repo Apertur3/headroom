@@ -30,6 +30,23 @@ describe("windows service file: schtasks only accepts UTF-16 task XML", () => {
   });
 });
 
+describe.skipIf(process.platform !== "win32")("schtasks accepts the generated task XML (win32 only)", () => {
+  it("schtasks /Create /XML succeeds on the generated file", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const home = await mkdtemp(join(tmpdir(), "headroom-win-"));
+    temporary.push(home);
+    const name = `HeadroomXmlTest${process.pid}${Date.now()}`;
+    const xml = serviceContents("C:\\h\\cli.js", "win32", process.execPath, "tester", home, { LOCALAPPDATA: home });
+    const file = join(home, "task.xml");
+    await writeFile(file, serviceFileBytes("win32", xml));
+    try {
+      execFileSync("schtasks", ["/Create", "/TN", name, "/XML", file, "/F"], { stdio: "pipe" });
+    } finally {
+      try { execFileSync("schtasks", ["/Delete", "/TN", name, "/F"], { stdio: "pipe" }); } catch { /* not created */ }
+    }
+  });
+});
+
 describe("claude credential file without a login (issue seen on a fresh Windows user)", () => {
   it("doctor does not call a credential file OK when it only holds MCP tokens", async () => {
     const dir = await mkdtemp(join(tmpdir(), "headroom-cred-"));
@@ -39,6 +56,15 @@ describe("claude credential file without a login (issue seen on a fresh Windows 
     if (process.platform === "darwin") return; // macOS reads the Keychain, not this file
     expect(result.level).toBe("FAIL");
     expect(result.fix).toContain("claude");
+  });
+
+  it("does not call a credential file OK when claudeAiOauth has no expiresAt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "headroom-cred-"));
+    temporary.push(dir);
+    await writeFile(join(dir, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "t" } }), { mode: 0o600 });
+    const result = await credentialCheck({ name: "claude-main", vendor: "claude", location: dir, adapter: "native-ts" } as never, new Map(), undefined);
+    if (process.platform === "darwin") return;
+    expect(result.level).toBe("FAIL");
   });
 
   it("still reports OK when a claudeAiOauth token is present", async () => {

@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, parseClaudeCredential, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { findStaleLanes, laneAgeText } from "./canary.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
@@ -47,9 +47,9 @@ export async function doctorFileStatus(path: string): Promise<FileStatus> {
 
 async function hasClaudeLogin(path: string): Promise<boolean> {
   try {
-    const root: unknown = JSON.parse(await readFile(path, "utf8"));
-    const oauth = (root as { claudeAiOauth?: { accessToken?: unknown } } | null)?.claudeAiOauth;
-    return typeof oauth?.accessToken === "string" && oauth.accessToken.trim() !== "";
+    // Same parser the adapter uses, so doctor and status agree on what a login is.
+    parseClaudeCredential(await readFile(path, "utf8"));
+    return true;
   } catch { return false; }
 }
 
