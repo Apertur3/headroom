@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="390" viewBox="0 0 800 390" role="img" aria-label="Terminal: an agent asks headroom can, is told NO because the Codex week is ahead of pace, is told YES for Claude, and runs a job under a reservation">
+  <title>headroom can: NO for the meter that is ahead of pace, YES for the one with room</title>
+  <style>
+    @keyframes f0{0%,2%{width:340px}10%,94%{width:163px}98%,100%{width:340px}}#f0{animation:f0 17s infinite cubic-bezier(.2,.7,.2,1)}
+    @keyframes fl0{0%,10.59%{opacity:0}11.47%,94%{opacity:1}98%,100%{opacity:0}}#fl0{animation:fl0 17s infinite}
+    @keyframes f1{0%,2%{width:340px}10%,94%{width:241px}98%,100%{width:340px}}#f1{animation:f1 17s infinite cubic-bezier(.2,.7,.2,1)}
+    @keyframes fl1{0%,10.59%{opacity:0}11.47%,94%{opacity:1}98%,100%{opacity:0}}#fl1{animation:fl1 17s infinite}
+    @keyframes c0{0%,15.29%{opacity:0}16.18%,94%{opacity:1}98%,100%{opacity:0}}#c0{animation:c0 17s infinite}
+    @keyframes k1{0%,18.24%{width:0}26.88%,94%{width:800px}98%,100%{width:0}}#k1-clip rect{animation:k1 17s infinite steps(42)}
+    @keyframes o2{0%,28.94%{opacity:0}29.82%,94%{opacity:1}98%,100%{opacity:0}}#o2{animation:o2 17s infinite}
+    @keyframes c3{0%,38.35%{opacity:0}39.24%,94%{opacity:1}98%,100%{opacity:0}}#c3{animation:c3 17s infinite}
+    @keyframes k4{0%,41.29%{width:0}50.15%,94%{width:800px}98%,100%{width:0}}#k4-clip rect{animation:k4 17s infinite steps(43)}
+    @keyframes o5{0%,52.21%{opacity:0}53.09%,94%{opacity:1}98%,100%{opacity:0}}#o5{animation:o5 17s infinite}
+    @keyframes c6{0%,61.62%{opacity:0}62.5%,94%{opacity:1}98%,100%{opacity:0}}#c6{animation:c6 17s infinite}
+    @keyframes k7{0%,64.56%{width:0}82.47%,94%{width:800px}98%,100%{width:0}}#k7-clip rect{animation:k7 17s infinite steps(87)}
+    @keyframes o8{0%,84.53%{opacity:0}85.41%,94%{opacity:1}98%,100%{opacity:0}}#o8{animation:o8 17s infinite}
+    @media (prefers-reduced-motion: reduce){text,rect{animation:none!important}clipPath rect{width:800px!important}}
+  </style>
+  <g font-family="SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace">
+    <rect x="0.5" y="0.5" width="799" height="389" rx="10" fill="#0d1117" stroke="#30363d"/>
+    <path d="M0.5 10.5a10 10 0 0 1 10-10h779a10 10 0 0 1 10 10V40H0.5z" fill="#161b22"/>
+    <circle cx="24" cy="21" r="6" fill="#ff5f56"/><circle cx="44" cy="21" r="6" fill="#ffbd2e"/><circle cx="64" cy="21" r="6" fill="#27c93f"/>
+    <text x="400" y="26" fill="#8b949e" font-size="12" text-anchor="middle">headroom (synthetic data)</text>
+    <text x="28" y="70" fill="#8b949e" font-size="13">codex-main:main wk</text>
+    <rect x="236" y="59" width="340" height="14" rx="7" fill="#21262d"/>
+    <rect id="f0" x="236" y="59" width="163" height="14" rx="7" fill="#f0883e"/>
+    <text id="fl0" x="590" y="70" fill="#e6edf3" font-size="13" xml:space="preserve"><tspan font-weight="700">48% left</tspan> <tspan fill="#f0883e">CONSERVE</tspan></text>
+    <text x="28" y="96" fill="#8b949e" font-size="13">claude-main:all wk</text>
+    <rect x="236" y="85" width="340" height="14" rx="7" fill="#21262d"/>
+    <rect id="f1" x="236" y="85" width="241" height="14" rx="7" fill="#3fb950"/>
+    <text id="fl1" x="590" y="96" fill="#e6edf3" font-size="13" xml:space="preserve"><tspan font-weight="700">71% left</tspan> <tspan fill="#3fb950">HARVEST</tspan></text>
+    <text id="c0" x="28" y="146" fill="#6e7681" font-size="13"># An agent asks before it starts a Codex build</text>
+    <clipPath id="k1-clip"><rect x="0" y="152" width="800" height="22"/></clipPath>
+    <text x="28" y="168" fill="#e6edf3" font-size="13" clip-path="url(#k1-clip)" xml:space="preserve"><tspan fill="#8b949e">$</tspan> headroom can codex-build --owner builder</text>
+    <text id="o2" x="28" y="190" fill="#e6edf3" font-size="13" xml:space="preserve"><tspan fill="#f85149" font-weight="700">NO</tspan> codex-main:main CONSERVE (wk 52% CONSERVE, resets in 5d)</text>
+    <text id="c3" x="28" y="226" fill="#6e7681" font-size="13"># Codex is ahead of its weekly pace, so try Claude</text>
+    <clipPath id="k4-clip"><rect x="0" y="232" width="800" height="22"/></clipPath>
+    <text x="28" y="248" fill="#e6edf3" font-size="13" clip-path="url(#k4-clip)" xml:space="preserve"><tspan fill="#8b949e">$</tspan> headroom can claude-heavy --owner builder</text>
+    <text id="o5" x="28" y="270" fill="#e6edf3" font-size="13" xml:space="preserve"><tspan fill="#3fb950" font-weight="700">YES</tspan> claude-main:all HARVEST (wk 29% HARVEST, resets in 2d)</text>
+    <text id="c6" x="28" y="306" fill="#6e7681" font-size="13"># Reserve the capacity, run the job, release it</text>
+    <clipPath id="k7-clip"><rect x="0" y="312" width="800" height="22"/></clipPath>
+    <text x="28" y="328" fill="#e6edf3" font-size="13" clip-path="url(#k7-clip)" xml:space="preserve"><tspan fill="#8b949e">$</tspan> headroom run --meter claude-main:all --need wk:10 --owner builder -- echo job started</text>
+    <text id="o8" x="28" y="350" fill="#e6edf3" font-size="13" xml:space="preserve">job started</text>
+  </g>
+</svg>
