@@ -25,8 +25,8 @@ const MARK = (stroke, accent) => `<g stroke="${stroke}" stroke-width="7" stroke-
 
 function hero({ ink, sub, accent }) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 120" width="760" height="120" role="img" aria-label="Headroom: ${TAGLINE}">
-  <g transform="translate(250,8) scale(1.1)">${MARK(ink, accent)}</g>
-  <text x="326" y="58" fill="${ink}" font-family="${FONT}" font-size="48" font-weight="600" letter-spacing="-1">headroom</text>
+  <g transform="translate(236,8) scale(1.1)">${MARK(ink, accent)}</g>
+  <text x="312" y="58" fill="${ink}" font-family="${FONT}" font-size="48" font-weight="600" letter-spacing="-1">headroom</text>
   <text x="380" y="100" fill="${sub}" font-family="${FONT}" font-size="19" text-anchor="middle">${TAGLINE}</text>
 </svg>
 `;
