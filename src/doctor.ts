@@ -45,6 +45,14 @@ export async function doctorFileStatus(path: string): Promise<FileStatus> {
   } catch (error: unknown) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe"; }
 }
 
+async function hasClaudeLogin(path: string): Promise<boolean> {
+  try {
+    const root: unknown = JSON.parse(await readFile(path, "utf8"));
+    const oauth = (root as { claudeAiOauth?: { accessToken?: unknown } } | null)?.claudeAiOauth;
+    return typeof oauth?.accessToken === "string" && oauth.accessToken.trim() !== "";
+  } catch { return false; }
+}
+
 export async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} credential`, "local adapter has no credential", "no action needed");
   if (account.vendor === "claude" && process.platform === "darwin") {
@@ -117,6 +125,11 @@ export async function credentialCheck(account: Account, grantsNeeded: Map<string
       : check("FAIL", `principal ${account.name} credential`, shared ? `${label} is readable by group or other (${kimiPath})` : `missing or unsafe ${label} (${kimiPath})`, fix);
   }
   const path = credentialPath(account.vendor, account.location);
+  // Off macOS the Claude login lives in this file, which Claude Code also fills with MCP tokens
+  // before any login: a file with no claudeAiOauth token is logged out, not a present credential.
+  if (account.vendor === "claude" && (await doctorFileStatus(path)) === "present" && !(await hasClaudeLogin(path))) {
+    return check("FAIL", `principal ${account.name} credential`, `no Claude login in ${path} (it holds no claudeAiOauth token)`, claudeLoggedOutFix(account.location));
+  }
   return (await doctorFileStatus(path)) === "present"
     ? check("OK", `principal ${account.name} credential`, `credential file present (${path})`, "no action needed")
     : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, `run: ${account.vendor}`);

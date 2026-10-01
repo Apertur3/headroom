@@ -26,7 +26,7 @@ function xml(value: string): string { return value.replace(/&/g, "&amp;").replac
 export function windowsTaskXml(script: string, runtime: string, username = userInfo().username, logPath?: string, pathValue = serviceEnvironmentPath(homedir(), "win32")): string {
   const command = logPath ? "cmd.exe" : runtime;
   const arguments_ = logPath ? `/d /s /c "set \"PATH=${pathValue}\" && \"${runtime}\" \"${script}\" daemon >> \"${logPath}\" 2>&1"` : `"${script}" daemon`;
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>${xml(username)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Settings><Hidden>true</Hidden><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable></Settings><Actions Context="Author"><Exec><Command>${xml(command)}</Command><Arguments>${xml(arguments_)}</Arguments></Exec></Actions></Task>\n`;
+  return `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>${xml(username)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Settings><Hidden>true</Hidden><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable></Settings><Actions Context="Author"><Exec><Command>${xml(command)}</Command><Arguments>${xml(arguments_)}</Arguments></Exec></Actions></Task>\n`;
 }
 
 export function serviceContents(script: string, platform = process.platform, runtime = process.execPath, username = userInfo().username, home = homedir(), env = process.env): string {
@@ -35,6 +35,18 @@ export function serviceContents(script: string, platform = process.platform, run
   if (platform === "darwin") return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>com.headroom.daemon</string><key>ProgramArguments</key><array><string>${xml(runtime)}</string><string>${xml(script)}</string><string>daemon</string></array><key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(path)}</string></dict><key>StandardOutPath</key><string>${xml(log)}</string><key>StandardErrorPath</key><string>${xml(log)}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n`;
   if (platform === "win32") return windowsTaskXml(script, runtime, username, log, path);
   return `[Unit]\nDescription=Headroom quota daemon\n[Service]\nEnvironment="PATH=${path}"\nExecStart=${JSON.stringify(runtime)} ${JSON.stringify(script)} daemon\nStandardOutput=append:${log}\nStandardError=append:${log}\nRestart=on-failure\n[Install]\nWantedBy=default.target\n`;
+}
+
+/** schtasks rejects a task XML that is not UTF-16 ("unable to switch the encoding"), so the
+ * Windows file is written as UTF-16LE with a byte-order mark; every other platform stays UTF-8. */
+export function serviceFileBytes(platform: string, contents: string): Buffer {
+  return platform === "win32" ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(contents, "utf16le")]) : Buffer.from(contents, "utf8");
+}
+
+async function readServiceFile(path: string): Promise<string | undefined> {
+  const bytes = await readFile(path).catch(() => undefined);
+  if (!bytes) return undefined;
+  return bytes[0] === 0xff && bytes[1] === 0xfe ? bytes.subarray(2).toString("utf16le") : bytes.toString("utf8");
 }
 
 /**
@@ -54,7 +66,7 @@ export async function installService(script = process.argv[1] ?? "headroom", pla
   if (!dryRun) {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     await mkdir(dirname(daemonLogPath(headroomHome({ platform, home, env }), platform)), { recursive: true, mode: 0o700 });
-    await writeFile(path, contents, { mode: 0o600 });
+    await writeFile(path, serviceFileBytes(platform, contents), { mode: 0o600 });
   }
   return { path, command, dryRun, contents, script, runtime };
 }
@@ -160,7 +172,7 @@ export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: n
 export async function installAndStartService(script = process.argv[1] ?? "headroom", platform = process.platform, home = homedir(), runtime = process.execPath, env = process.env, username = userInfo().username, options: ServiceStartOptions = {}): Promise<ServiceStartResult> {
   const path = servicePath(platform, home, env);
   const probe = options.probe ?? defaultDaemonProbe;
-  const previous = await readFile(path, "utf8").catch(() => undefined);
+  const previous = await readServiceFile(path);
   const contents = serviceContents(script, platform, runtime, username, home, env);
   const manual = (await installService(script, platform, home, runtime, true, env, username)).command;
   const runner = options.runner ?? defaultServiceRunner;
