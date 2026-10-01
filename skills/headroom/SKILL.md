@@ -96,17 +96,18 @@ into a real reading instead of dispatching blind.
 - `headroom plan import <file>` : load a budget plan's per-session shares as advisory leases.
 - `headroom gate --need 5h:N [--need wk:N] [--plan] [--allowance pro_rata|fill] --owner X` : pre-dispatch check before a lane.
 - `headroom wait --meter M --until-reset [--max 6h]` : block until a window resets.
-
-When a lane waits for a reset or build, keep it in one blocking call instead of ending turns to
-poll: each turn-end wakes the orchestrator and resends its context. Use
-`headroom wait --meter M --until-reset --max 6h` for a reset, or one shell until-loop for a build.
-`quota_wait` only suggests a sleep; an MCP-only lane should pass that duration to one blocking
-sleep call.
-
 - `headroom fill --meter M --until-reset [--lane-cost N] [--allowance pro_rata|fill] --owner X` : lanes and action classes that fit before the window's unspent points are lost at reset.
 - `headroom heartbeat --owner <name> --every <duration> [--resume "<sentence>"]` : record or refresh your own heartbeat with the daemon (`--stop` to deregister; `heartbeat list` to see every registered one).
 - `headroom timer set --owner <name> --name <id> --at <ISO|+duration> --action "<text>"` : a named wake-up the daemon delivers, once, to your inbox when due (`timer list` / `timer clear --owner <name> --name <id>`).
 - MCP tools `quota_status`, `quota_can`, `quota_events`, `quota_lease_start`, `quota_lease_end`, `quota_leases`, `quota_cost`, `quota_rate`, `quota_spend`, `quota_inbox`, `quota_plan`, `quota_gate`, `quota_wait`, `quota_fill`, `quota_usage_paste`, `quota_route`, and `quota_heartbeat` expose the same (`quota_wait` never blocks: it returns the reset time and a suggested sleep; named wake-ups are CLI-only, no MCP tool).
+
+When a lane waits for a reset or build, keep it in one blocking call instead of ending turns to
+poll: each turn-end wakes the orchestrator and resends its context. Use
+`headroom wait --meter M --until-reset --max 6h` for a reset. For a long build, run one shell
+loop such as `until [ -f build.done ]; do sleep 30; done`. `quota_wait` never blocks: it returns
+`suggested_sleep_seconds`, capped at 3600 and null when the reset time is unknown. An MCP-only lane
+should sleep that long in one blocking call, then call `quota_wait` again to re-check; if it is
+null, re-check on a sensible interval.
 
 Credit/count meters are informational, not dispatch capacity: never name one in routing or pass
 one to `can`, `route`, or `gate`. `quota_plan` treats only a manual entry or a fresh, unheld vendor

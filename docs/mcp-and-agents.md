@@ -349,11 +349,13 @@ here either. CLI: `headroom gate` (exit 2 when it does not fit).
 `meter`. Never blocks: returns the window's reset time and a suggested sleep in seconds so the
 caller can wait itself. CLI: `headroom wait --until-reset` blocks for you.
 
-For a reset or long build, keep the waiting lane in one blocking call rather than ending turns
-repeatedly to poll: each turn-end wakes the orchestrator and resends its context. Use
-`headroom wait --meter M --until-reset --max 6h` for a reset, or one shell until-loop for a build.
-An MCP-only agent should pass `quota_wait`'s suggested sleep to one blocking sleep call;
-`quota_wait` itself never blocks.
+When a lane waits for a reset or build, keep it in one blocking call instead of ending turns to
+poll: each turn-end wakes the orchestrator and resends its context. Use
+`headroom wait --meter M --until-reset --max 6h` for a reset. For a long build, run one shell
+loop such as `until [ -f build.done ]; do sleep 30; done`. `quota_wait` never blocks: it returns
+`suggested_sleep_seconds`, capped at 3600 and null when the reset time is unknown. An MCP-only lane
+should sleep that long in one blocking call, then call `quota_wait` again to re-check; if it is
+null, re-check on a sensible interval.
 
 ### `quota_fill`
 
