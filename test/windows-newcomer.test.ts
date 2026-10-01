@@ -1,7 +1,8 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { claudeRunWithDirectory } from "../src/adapters/claude.js";
 import { credentialCheck } from "../src/doctor.js";
 import { installService, serviceContents, serviceFileBytes } from "../src/service.js";
 
@@ -36,7 +37,7 @@ describe.skipIf(process.platform !== "win32")("schtasks accepts the generated ta
     const home = await mkdtemp(join(tmpdir(), "headroom-win-"));
     temporary.push(home);
     const name = `HeadroomXmlTest${process.pid}${Date.now()}`;
-    const xml = serviceContents("C:\\h\\cli.js", "win32", process.execPath, "tester", home, { LOCALAPPDATA: home });
+    const xml = serviceContents("C:\\h\\cli.js", "win32", process.execPath, userInfo().username, home, { LOCALAPPDATA: home });
     const file = join(home, "task.xml");
     await writeFile(file, serviceFileBytes("win32", xml));
     try {
@@ -44,6 +45,16 @@ describe.skipIf(process.platform !== "win32")("schtasks accepts the generated ta
     } finally {
       try { execFileSync("schtasks", ["/Delete", "/TN", name, "/F"], { stdio: "pipe" }); } catch { /* not created */ }
     }
+  });
+});
+
+describe("claude sign-in hint per platform", () => {
+  it("keeps the POSIX form off Windows and prints PowerShell and cmd forms on win32", () => {
+    expect(claudeRunWithDirectory("/x", "linux")).toBe("run: CLAUDE_CONFIG_DIR=/x claude");
+    expect(claudeRunWithDirectory("/x", "darwin")).toBe("run: CLAUDE_CONFIG_DIR=/x claude");
+    const win = claudeRunWithDirectory("C:\\x", "win32");
+    expect(win).toContain('$env:CLAUDE_CONFIG_DIR="C:\\x"; claude');
+    expect(win).toContain('set "CLAUDE_CONFIG_DIR=C:\\x" && claude');
   });
 });
 

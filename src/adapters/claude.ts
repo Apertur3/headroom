@@ -532,7 +532,7 @@ interface Credential { token: string; expired: boolean; }
 
 /** "run: CLAUDE_CONFIG_DIR=<dir> claude" is POSIX-only; on Windows print the
  * PowerShell and cmd equivalents instead. */
-function claudeRunWithDirectory(directory: string, platform: NodeJS.Platform = process.platform): string {
+export function claudeRunWithDirectory(directory: string, platform: NodeJS.Platform = process.platform): string {
   if (platform !== "win32") return `run: CLAUDE_CONFIG_DIR=${directory} claude`;
   return `run: in PowerShell: $env:CLAUDE_CONFIG_DIR="${directory}"; claude  (in cmd: set "CLAUDE_CONFIG_DIR=${directory}" && claude)`;
 }
