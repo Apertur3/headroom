@@ -1,8 +1,12 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
-    <img alt="headroom: your agents check the meter before they spend it" src="docs/assets/hero-light.svg" width="760">
+    <img alt="headroom" src="docs/assets/hero-light.svg" width="320">
   </picture>
+</p>
+
+<p align="center">
+  Your agents check the meter before they spend it.
 </p>
 
 <p align="center">
@@ -20,7 +24,7 @@
 </p>
 
 <p align="center">
-  <sub><b>1,898 tests</b> (1,867 run on Ubuntu, 1,687 on Windows) in CI &middot; a stale or failed reading prints <b>UNKNOWN</b>, never a number &middot; <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
+  <sub><b>Tests run in CI on macOS, Ubuntu and Windows</b> &middot; a stale or failed reading prints <b>UNKNOWN</b>, never a number &middot; <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
 </p>
 
 ![The Headroom browser dashboard: two subscriptions, their 5-hour and weekly windows, pace states and a remaining-capacity chart](docs/assets/dashboard.png)
@@ -34,9 +38,12 @@
 Node 22.13 or newer.
 
 ```sh
-npm install -g headroomd      # or: brew install apertur3/tap/headroom
-headroom setup                # finds your logins, runs the doctor, asks before each change
-headroom                      # one line per meter
+# or: brew install apertur3/tap/headroom
+npm install -g headroomd
+# finds your logins, runs the doctor, asks before each change
+headroom setup
+# one line per meter
+headroom
 ```
 
 ---
@@ -58,7 +65,8 @@ flowchart LR
 Without a check, an agent can find the limit by hitting it, in the middle of a task:
 
 ```sh
-codex exec "refactor the billing module"        # weekly limit reached mid-task, work stops half done
+# weekly limit reached mid-task, work stops half done
+codex exec "refactor the billing module"
 ```
 
 With Headroom, the same agent asks first and has a plan for a NO:
@@ -69,7 +77,8 @@ if headroom can codex-build --owner builder; then
 elif headroom can claude-heavy --owner builder; then
   claude -p "refactor the billing module"
 else
-  headroom wait --meter codex-main:main --until-reset --max 6h   # or queue the job for later
+  # or queue the job for later
+  headroom wait --meter codex-main:main --until-reset --max 6h
 fi
 ```
 
@@ -147,11 +156,11 @@ for every one.
 
 | | |
 |---|---|
-| Tests | 1,898 defined (`npm test`, vitest). Run on every push: 1,867 on Ubuntu (31 skipped), 1,687 on Windows (211 skipped, mostly POSIX-only), 1,897 on macOS (1 skipped). Method and limits: [docs/verification.md](docs/verification.md) |
+| Tests | `npm test` (vitest), run on every push on macOS, Ubuntu and Windows; some tests are POSIX-only and skip on Windows. Current counts are in the CI logs; method and limits: [docs/verification.md](docs/verification.md) |
 | CI platforms | macOS, Ubuntu and Windows (`macos-latest`, `ubuntu-latest`, `windows-latest`): lint, tests, build, `npm pack --dry-run`, privacy sweep, `npm audit` |
 | Daily use | one macOS machine; this is the only environment a person uses every day |
 | Install from the packed tarball | scripted cold-install smoke test ([`smoke-cold.sh`](scripts/smoke-cold.sh)) runs in the release workflow; also checked by hand on macOS and on Linux ARM64 |
-| Windows | **experimental.** Checked on a real Windows 11 machine: install, `accounts discover`, `doctor`, `status` / `can` / `gate` / `dashboard` (UNKNOWN, never a fake number), HTML report permissions, the daemon on a named pipe, `uninstall`. Not verified: reading a real Claude login, MCP registration, starting the background service (a bug in `install-service` is being fixed), and the process watchdog (inactive on Windows). PowerShell's default execution policy blocks the `npm` and `headroom` `.ps1` shims; use `cmd`, or relax the policy |
+| Windows | **experimental.** Version 0.2.4 was installed from the npm registry on a Windows 11 machine, and these worked: install, `accounts discover`, `doctor`, `status` / `can` / `gate` / `dashboard` (UNKNOWN, never a fake number), HTML report permissions, the daemon on a named pipe, `uninstall`. Not verified: reading a real Claude login, MCP registration, and the process watchdog (inactive on Windows). Starting the background service failed on 0.2.4 (`install-service` wrote the task XML in the wrong encoding); the fix is in [#110](https://github.com/Apertur3/headroom/pull/110) and has not been re-verified on a real machine. PowerShell's default execution policy blocks the `npm` and `headroom` `.ps1` shims; use `cmd`, or relax the policy |
 | Works with | Claude Code through MCP (registered with `claude mcp add`, covered by [`mcp-registration.test.ts`](test/mcp-registration.test.ts) and [`daemon-mcp.test.ts`](test/daemon-mcp.test.ts)); any agent that can run a shell command, through the CLI and `--json`. Other MCP clients: untested |
 | Antigravity | experimental; macOS 14 or later only, and it depends on a private local endpoint that the vendor can change |
 | Vendor endpoints | private and unversioned. Headroom pins them, records redacted fixtures and prints UNKNOWN when a shape changes, but it cannot promise they keep working |
@@ -164,11 +173,19 @@ Runnable against synthetic data, no logins needed. Build once, then point the CL
 
 ```sh
 npm run build
-eval "$(node scripts/demo-home.mjs)"     # sets HEADROOM_HOME to a throwaway home
-bash examples/orchestrator-loop.sh       # walks a fallback list, dispatches on the first class with room
-bash examples/ci-gate.sh                 # refuses a job the budget cannot cover (exit 1)
-bash examples/mcp-quota-can.sh           # the MCP call a client sends, over stdio
+# sets HEADROOM_HOME to a throwaway demo home
+eval "$(node scripts/demo-home.mjs)"
+# walks a fallback list, dispatches on the first class with room
+bash examples/orchestrator-loop.sh
+# refuses a job the budget cannot cover (exit 1)
+bash examples/ci-gate.sh
+# the MCP call a client sends, over stdio
+bash examples/mcp-quota-can.sh
 ```
+
+The scripts refuse to run unless `HEADROOM_HOME` points at that demo home, so they cannot touch a real
+`~/.headroom`, and they call the repo build (`dist/cli.js`), not a global `headroom`. They print which
+binary they use.
 
 See [`examples/`](examples) for the scripts and the starter `accounts.toml`, `policy.toml` and
 `routing.toml`.

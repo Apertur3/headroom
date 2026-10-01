@@ -11,11 +11,12 @@
 #   claude mcp add --scope user headroom -- headroom mcp
 set -euo pipefail
 
-HEADROOM="${HEADROOM:-headroom}"
+# shellcheck source=examples/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 CLASS="${CLASS:-codex-build}"
 
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"example","version":"0"}}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"quota_can\",\"arguments\":{\"action_class\":\"${CLASS}\",\"owner\":\"example\"}}}" \
-  | "$HEADROOM" mcp | tail -n 1
+  | "${headroom_cmd[@]}" mcp | tail -n 1

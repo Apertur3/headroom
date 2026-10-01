@@ -10,11 +10,12 @@
 #   NEED_WK=60 METER=codex-main:main bash examples/ci-gate.sh   # refused
 set -euo pipefail
 
-HEADROOM="${HEADROOM:-headroom}"
+# shellcheck source=examples/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 METER="${METER:-claude-main:all}"
 NEED_WK="${NEED_WK:-5}"
 
-if "$HEADROOM" gate --need "wk:${NEED_WK}" --meter "$METER" --owner ci 2>/dev/null; then
+if "${headroom_cmd[@]}" gate --need "wk:${NEED_WK}" --meter "$METER" --owner ci 2>/dev/null; then
   echo "budget ok, starting the agent job"
 else
   echo "budget check failed for ${METER} (needs ${NEED_WK} weekly points); not starting the job" >&2

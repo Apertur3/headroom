@@ -33,6 +33,9 @@ const SPAN = 3 * 24 * HOUR;
 export async function seedDemoHome(home, now = new Date(Math.floor(Date.now() / 60_000) * 60_000)) {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   process.env.HEADROOM_HOME = home;
+  // The examples/ scripts refuse to run unless this marker is present, so they
+  // can never be pointed at a real home by accident.
+  writeFileSync(join(home, ".headroom-demo-home"), "synthetic data; safe for examples/\n");
   const { HeadroomStore } = await import(join(root, "dist", "store.js"));
 
   // The credential locations point at directories that do not exist, so even

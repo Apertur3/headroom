@@ -38,8 +38,8 @@ Run the full suite once before you push, not in a loop: it opens many SQLite sto
 processes. The suite fails if a process it started is still alive afterwards, so a leaked child
 shows up as a red run, not a silent one.
 
-Run `headroom` against your own accounts before opening a pull request and paste the redacted
-output in the description. You do not need real accounts to work on most of the code: the tests
+If you have accounts to try it on, run `headroom` before opening a pull request and paste the output
+in the description, with account names, ids and emails redacted first. You do not need real accounts to work on most of the code: the tests
 use fixtures and fake clocks.
 
 When a change affects documented behavior, verify the built CLI help for the affected command,
@@ -56,7 +56,7 @@ keep the JSON contract and examples aligned, and check relative documentation li
 | `test/` | One `*.test.ts` per area; `test/fixtures/` and `fixtures/` hold recorded or synthetic vendor payloads; `test/helpers/` holds shared fakes |
 | `docs/` | User docs shipped in the package: quickstart, concepts, MCP, JSON contract, vendors |
 | `skills/headroom/SKILL.md` | The agent skill. Keep it in step with the CLI and MCP tools |
-| `examples/` | Starter `accounts.toml`, `policy.toml`, `routing.toml` |
+| `examples/` | Starter `accounts.toml`, `policy.toml`, `routing.toml`, and the demo scripts `ci-gate.sh`, `mcp-quota-can.sh`, `orchestrator-loop.sh` (with the shared guard `lib.sh`) |
 | `scripts/` | Build, release, privacy sweep, fixture recorder, demo screenshot |
 
 ## Pull requests

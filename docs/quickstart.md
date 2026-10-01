@@ -446,9 +446,13 @@ consumer OAuth path. See [vendors.md](vendors.md#antigravity).
 CI runs lint, the full test suite and a build on `ubuntu-latest`, `windows-latest` and
 `macos-latest` on every push. Each release's packed tarball goes through the scripted cold-install
 smoke test (`scripts/smoke-cold.sh`), and has been installed by hand on macOS and on Linux ARM64.
-Not verified: an install from the npm registry on a real Windows machine (on Windows only the
-source is covered by CI), and a person using it daily on Windows or Linux with real accounts; the
-daily-used environment is macOS.
+Windows: version 0.2.4 was installed from the npm registry on a Windows 11 machine. Install,
+`accounts discover`, `doctor`, `status` / `can` / `gate` / `dashboard` (UNKNOWN without a Claude login,
+never a number), the HTML report, the daemon on a named pipe and `uninstall` worked. Starting the
+background service failed (the task XML was written in the wrong encoding); the fix is in PR #110 and
+has not been re-verified on a real machine. Not verified on Windows: reading a real Claude login, MCP
+registration and the process watchdog (inactive on Windows). Windows stays experimental. On Linux only the
+source is covered by CI, and nobody uses it daily with real accounts; the daily-used environment is macOS.
 
 ## Staying up to date
 

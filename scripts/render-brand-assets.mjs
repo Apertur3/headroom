@@ -23,11 +23,10 @@ const MARK = (stroke, accent) => `<g stroke="${stroke}" stroke-width="7" stroke-
     <line x1="18" y1="42" x2="46" y2="42"/>
   </g>`;
 
-function hero({ ink, sub, accent }) {
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 120" width="760" height="120" role="img" aria-label="Headroom: ${TAGLINE}">
+function hero({ ink, accent }) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="220 0 320 76" width="320" height="76" role="img" aria-label="headroom">
   <g transform="translate(236,8) scale(1.1)">${MARK(ink, accent)}</g>
   <text x="312" y="58" fill="${ink}" font-family="${FONT}" font-size="48" font-weight="600" letter-spacing="-1">headroom</text>
-  <text x="380" y="100" fill="${sub}" font-family="${FONT}" font-size="19" text-anchor="middle">${TAGLINE}</text>
 </svg>
 `;
 }
@@ -42,8 +41,8 @@ const card = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" wid
 </svg>
 `;
 
-writeFileSync(join(assets, "hero-light.svg"), hero({ ink: "#1f2328", sub: "#59636e", accent: "#d1570a" }));
-writeFileSync(join(assets, "hero-dark.svg"), hero({ ink: "#e6edf3", sub: "#9da7b3", accent: "#f0883e" }));
+writeFileSync(join(assets, "hero-light.svg"), hero({ ink: "#1f2328", accent: "#d1570a" }));
+writeFileSync(join(assets, "hero-dark.svg"), hero({ ink: "#e6edf3", accent: "#f0883e" }));
 writeFileSync(join(assets, "social-card.svg"), card);
 
 const chrome = [process.env.CHROME,
