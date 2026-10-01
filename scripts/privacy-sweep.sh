@@ -180,7 +180,9 @@ scan_one_labeled_file() {
 # to prove public-audit check 2 passes a real noreply commit. Any other file,
 # or any other address in that file, is still flagged.
 allowed_fixture_email() {
-  [[ "$1" == "test/public-audit-synthetic-merge.test.ts" && "$2" == "1+dev@users.noreply.github.com" ]]
+  # The second path is this file itself: the allowlist entry names the literal address.
+  [[ "$1" == "test/public-audit-synthetic-merge.test.ts" || "$1" == "scripts/privacy-sweep.sh" ]] \
+    && [[ "$2" == "1+dev@users.noreply.github.com" ]]
 }
 
 # Runs every check across a whole set of files (everything except LICENSE and
