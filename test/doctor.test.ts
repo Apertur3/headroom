@@ -1,10 +1,11 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { adapterCheck, antigravityOrphanCheck, doctorFileStatus, hostPressureCheck } from "../src/doctor.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { adapterCheck, antigravityOrphanCheck, doctorFileStatus, homeCheck, hostPressureCheck } from "../src/doctor.js";
 import { defaultHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "../src/host-health.js";
 import type { ProcessEntry } from "../src/process-tree.js";
+import { HeadroomStore } from "../src/store.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -113,3 +114,56 @@ describe("doctor: host pressure check", () => {
     expect(result.detail).toContain("mode: warn");
   });
 });
+
+describe("doctor: home directory permission check", () => {
+  it.skipIf(process.platform === "win32")("names the actual directory in chmod 700 fix for 0755 home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-home-custom-")); temporary.push(root);
+    const home = join(root, "custom-headroom");
+    await mkdir(home, { recursive: true, mode: 0o755 });
+    await chmod(home, 0o755);
+    const { check, store } = await homeCheck(home);
+    expect(check.level).toBe("FAIL");
+    expect(check.fix).toBe(`chmod 700 ${home}`);
+    expect(store).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("quotes the home path if it contains spaces", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-home-space-")); temporary.push(root);
+    const home = join(root, "custom headroom");
+    await mkdir(home, { recursive: true, mode: 0o755 });
+    await chmod(home, 0o755);
+    const { check, store } = await homeCheck(home);
+    expect(check.level).toBe("FAIL");
+    expect(check.fix).toBe(`chmod 700 "${home}"`);
+    expect(store).toBeUndefined();
+  });
+
+  it("names the actual home path in chmod 700 fix when store rejects group/world permissions", async () => {
+    const spy = vi.spyOn(HeadroomStore, "open").mockRejectedValueOnce(
+      new Error("Refusing ~/.headroom with group or world permissions; run: chmod 700 ~/.headroom")
+    );
+    try {
+      const { check, store } = await homeCheck("/var/headroom/custom");
+      expect(check.level).toBe("FAIL");
+      expect(check.fix).toBe("chmod 700 /var/headroom/custom");
+      expect(store).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("quotes the actual home path in chmod 700 fix when path contains spaces", async () => {
+    const spy = vi.spyOn(HeadroomStore, "open").mockRejectedValueOnce(
+      new Error("Refusing ~/.headroom with group or world permissions; run: chmod 700 ~/.headroom")
+    );
+    try {
+      const { check, store } = await homeCheck("/var/headroom/custom home");
+      expect(check.level).toBe("FAIL");
+      expect(check.fix).toBe('chmod 700 "/var/headroom/custom home"');
+      expect(store).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
