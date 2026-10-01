@@ -1,7 +1,7 @@
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { CLAUDE_GRANT_LAPSED_PREFIX, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
+import { CLAUDE_GRANT_LAPSED_PREFIX, parseClaudeCredential, claudeKeychainMetadata, CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeLoggedOutFix, claudeServiceName, formatLocalTimestamp, isClaudeKeychainInaccessibleReason, isClaudeLoggedOutReason, probeSigningIdentity, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
 import { findStaleLanes, laneAgeText } from "./canary.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
@@ -43,6 +43,14 @@ export async function doctorFileStatus(path: string): Promise<FileStatus> {
     if (process.platform !== "win32" && (info.mode & 0o022) !== 0) return "unsafe";
     return "present";
   } catch (error: unknown) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe"; }
+}
+
+async function hasClaudeLogin(path: string): Promise<boolean> {
+  try {
+    // Same parser the adapter uses, so doctor and status agree on what a login is.
+    parseClaudeCredential(await readFile(path, "utf8"));
+    return true;
+  } catch { return false; }
 }
 
 export async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
@@ -117,6 +125,11 @@ export async function credentialCheck(account: Account, grantsNeeded: Map<string
       : check("FAIL", `principal ${account.name} credential`, shared ? `${label} is readable by group or other (${kimiPath})` : `missing or unsafe ${label} (${kimiPath})`, fix);
   }
   const path = credentialPath(account.vendor, account.location);
+  // Off macOS the Claude login lives in this file, which Claude Code also fills with MCP tokens
+  // before any login: a file with no claudeAiOauth token is logged out, not a present credential.
+  if (account.vendor === "claude" && (await doctorFileStatus(path)) === "present" && !(await hasClaudeLogin(path))) {
+    return check("FAIL", `principal ${account.name} credential`, `no Claude login in ${path} (it holds no claudeAiOauth token)`, claudeLoggedOutFix(account.location));
+  }
   return (await doctorFileStatus(path)) === "present"
     ? check("OK", `principal ${account.name} credential`, `credential file present (${path})`, "no action needed")
     : check("FAIL", `principal ${account.name} credential`, `missing or unsafe credential file (${path})`, `run: ${account.vendor}`);
@@ -139,7 +152,8 @@ export async function homeCheck(home: string): Promise<{ check: DoctorCheck; sto
     return { check: check("OK", "home directory", detail, "no action needed"), store };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unsafe Headroom home directory";
-    const fix = /group or world permissions/.test(message) ? "chmod 700 ~/.headroom" : `fix ownership or permissions on ${home}`;
+    const quoted = /\s/.test(home) ? `"${home}"` : home;
+    const fix = /group or world permissions/.test(message) ? `chmod 700 ${quoted}` : `fix ownership or permissions on ${home}`;
     return { check: check("FAIL", "home directory", message, fix), store: undefined };
   }
 }

@@ -169,7 +169,8 @@ describe("doctor home directory and keychain grant checks", () => {
     }
     expect(check.level).toBe("FAIL");
     expect(check.detail).toContain("run: chmod 700 ~/.headroom");
-    expect(check.fix).toBe("chmod 700 ~/.headroom");
+    const quoted = /\s/.test(home) ? `"${home}"` : home;
+    expect(check.fix).toBe(`chmod 700 ${quoted}`);
     expect(store).toBeUndefined();
   });
 
