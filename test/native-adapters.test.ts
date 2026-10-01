@@ -4,7 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
-  claudeLoggedOutFix, claudeLoggedOutReason, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
+  claudeLoggedOutFix, claudeLoggedOutReason, claudeRunWithDirectory, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
   isClaudeLoggedOutReason, logUnknownClaudeTopLevelKeys, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
@@ -804,8 +804,8 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const expiredCodex = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() - 1 } }) });
     const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: "token", expiry_date: "2026-09-03T17:26:35Z" }) });
-    expect(expiredClaude[0].reason).toBe(`token expired; run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
-    expect(missingClaude[0].reason).toBe(`no credentials in Keychain for this config dir; run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
+    expect(expiredClaude[0].reason).toBe(`token expired; ${claudeRunWithDirectory(claude2Dir)}`);
+    expect(missingClaude[0].reason).toBe(`no credentials in Keychain for this config dir; ${claudeRunWithDirectory(claude2Dir)}`);
     expect(expiredCodex[0].reason).toBe(`token expired; run: CODEX_HOME=${codex2Dir} codex login`);
     expect(expiredAntigravity[0].reason).toBe("token expired; run: gemini");
   });
@@ -819,8 +819,8 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const claude2 = { ...claude, name: "claude-2", location: "/Users/test/.claude2" };
     const rejected401 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
     const rejected403 = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: "token", expiresAt: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 403 }) });
-    expect(rejected401[0].reason).toBe(`Claude rejected the token (401); run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
-    expect(rejected403[0].reason).toBe(`Claude rejected the token (403); run: CLAUDE_CONFIG_DIR=${claude2Dir} claude`);
+    expect(rejected401[0].reason).toBe(`Claude rejected the token (401); ${claudeRunWithDirectory(claude2Dir)}`);
+    expect(rejected403[0].reason).toBe(`Claude rejected the token (403); ${claudeRunWithDirectory(claude2Dir)}`);
 
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const codexRejected401 = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() + 60_000 } }), fetch: async () => new Response("{}", { status: 401 }) });
@@ -939,7 +939,7 @@ describe("Claude Keychain grant gate", () => {
       keychainMetadata: mustNotRun,
     });
     expect(rows.every((row) => row.freshness === "failed")).toBe(true);
-    expect(rows[0].reason).toBe(`Claude Code is logged out for ${resolve(claude.location)}; run: CLAUDE_CONFIG_DIR=${resolve(claude.location)} claude and sign in`);
+    expect(rows[0].reason).toBe(`Claude Code is logged out for ${resolve(claude.location)}; ${claudeRunWithDirectory(resolve(claude.location))} and sign in`);
     expect(isClaudeGrantIssue(rows[0].reason)).toBe(false);
     expect(isClaudeLoggedOutReason(rows[0].reason)).toBe(true);
   });
@@ -971,7 +971,7 @@ describe("Claude Keychain grant gate", () => {
     const expired = await observeClaude(claude, { platform: "darwin", now: () => at, probe: async () => { throw new ClaudeProbeError("missing", "token expired"); }, keychainMetadata: mustNotRun });
     expect(denied[0].reason).toBe(claudeGrantNeededReason("claude-main"));
     expect(timedOut[0].reason).toBe(claudeGrantNeededReason("claude-main"));
-    expect(expired[0].reason).toBe(`token expired; run: CLAUDE_CONFIG_DIR=${resolve(claude.location)} claude`);
+    expect(expired[0].reason).toBe(`token expired; ${claudeRunWithDirectory(resolve(claude.location))}`);
   });
 
   it("builds synthetic gate-blocked observations without ever attempting the probe", () => {
