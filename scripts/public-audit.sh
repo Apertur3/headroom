@@ -61,7 +61,17 @@ archives="$(git ls-files -z -- '*.tgz' '*.tar.gz' '*.zip' '*.dmg' '*.pkg' | tr '
 [ -n "$archives" ] && note "archive tracked: $archives"
 
 # 2. commit identities that are not GitHub noreply addresses
-bad_mail=$(git log --format='%ae%n%ce' | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
+# In a pull_request run actions/checkout checks out GitHub's synthetic merge commit ("Merge <sha> into <sha>"),
+# whose author/committer is the PR author's primary email. It is never pushed (a squash merge records the real
+# commits), so only that one commit is skipped: every real commit is still checked.
+id_revs=HEAD
+if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] \
+  && git log -1 --format=%s HEAD | grep -q -E '^Merge [0-9a-f]{40} into [0-9a-f]{40}$' \
+  && [ "$(git rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')" = 3 ]; then
+  id_revs="HEAD^1 HEAD^2"
+fi
+# shellcheck disable=SC2086
+bad_mail=$(git log --format='%ae%n%ce' $id_revs | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
 [ -n "$bad_mail" ] && note "personal email in commit metadata: $bad_mail"
 
 # 3. generic PII patterns in tracked files (POSIX ERE only; allowed placeholders filtered out afterwards)
