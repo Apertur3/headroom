@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 120" width="760" height="120" role="img" aria-label="Headroom: Your agents check the meter before they spend it.">
+  <g transform="translate(250,8) scale(1.1)"><g stroke="#1f2328" stroke-width="7" stroke-linecap="round" fill="none">
+    <line x1="10" y1="12" x2="54" y2="12" stroke="#d1570a"/>
+    <line x1="18" y1="24" x2="18" y2="56"/>
+    <line x1="46" y1="24" x2="46" y2="56"/>
+    <line x1="18" y1="42" x2="46" y2="42"/>
+  </g></g>
+  <text x="326" y="58" fill="#1f2328" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="48" font-weight="600" letter-spacing="-1">headroom</text>
+  <text x="380" y="100" fill="#59636e" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="19" text-anchor="middle">Your agents check the meter before they spend it.</text>
+</svg>

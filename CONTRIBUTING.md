@@ -84,11 +84,21 @@ Every real-world breakage gets a fixture, so it cannot come back unnoticed.
 4. Add a test that feeds the fixture through the code path that really receives it, and asserts the
    reading is UNKNOWN or blocked, never a made-up number.
 
-## The demo screenshot
+## Demo data and generated images
 
-`docs/assets/dashboard.png` is generated from synthetic data by
-`node scripts/render-dashboard-demo.mjs` (run `npm run build` first; it needs a local Chrome or
-Chromium, or set `CHROME`). Pass `--html out.html` to keep the HTML and skip the screenshot.
+Everything public-facing is generated from synthetic data by scripts in `scripts/`; nothing is
+captured from a real account. Run `npm run build` first. The screenshot and social preview need a
+local Chrome or Chromium (or set `CHROME`).
+
+| Script | Produces |
+|---|---|
+| `scripts/render-dashboard-demo.mjs` | `docs/assets/dashboard.png` (pass `--html out.html` to keep the HTML) |
+| `scripts/render-flow-demo.mjs` | `docs/assets/headroom-flow-demo.svg`, the real CLI output drawn as a terminal |
+| `scripts/render-brand-assets.mjs` | the README hero banners and `docs/assets/social-preview.png` (1280x640) |
+| `scripts/demo-home.mjs` | a seeded throwaway `HEADROOM_HOME` for the `examples/` scripts |
+
+Use cached commands (`can`, `gate`, `dashboard`) against a demo home. `headroom status` polls, and
+the demo accounts point at logins that do not exist.
 
 ## Reporting a problem
 
