@@ -152,7 +152,8 @@ export async function homeCheck(home: string): Promise<{ check: DoctorCheck; sto
     return { check: check("OK", "home directory", detail, "no action needed"), store };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unsafe Headroom home directory";
-    const fix = /group or world permissions/.test(message) ? "chmod 700 ~/.headroom" : `fix ownership or permissions on ${home}`;
+    const quoted = /\s/.test(home) ? `"${home}"` : home;
+    const fix = /group or world permissions/.test(message) ? `chmod 700 ${quoted}` : `fix ownership or permissions on ${home}`;
     return { check: check("FAIL", "home directory", message, fix), store: undefined };
   }
 }
