@@ -87,6 +87,11 @@ async function stepDiscoverAccounts(options: SetupOptions): Promise<boolean> {
   if (existing !== undefined) {
     console.log(`accounts.toml already exists at ${path}:`);
     console.log(existing.trimEnd());
+    // --yes must not clobber hand-edited accounts; overwriting needs an explicit answer.
+    if (options.yes && !options.planOnly) {
+      console.log("Keeping the existing accounts.toml (rerun `headroom accounts discover` to rewrite it).");
+      return true;
+    }
   }
   const question = existing !== undefined ? "Rerun discovery and overwrite accounts.toml?" : "Scan for Claude, Codex and Antigravity accounts and write accounts.toml?";
   if (options.planOnly) {
@@ -195,7 +200,7 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
   }
   try {
     const code = await runClaudeMcpAdd();
-    console.log(code === 0 ? "  registered" : `  claude mcp add exited with code ${code}`);
+    console.log(code === 0 ? "  registered" : `  claude mcp add exited with code ${code} (if it said the server already exists, it is already registered)`);
   } catch (error) { return surviveStepError(options, error); }
   return true;
 }

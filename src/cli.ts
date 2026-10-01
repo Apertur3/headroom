@@ -2056,6 +2056,11 @@ export async function keychain(argv: string[]): Promise<number> {
   // Printed before anything else so a reader who came here from an older
   // README, or from a stored marker, learns that there is nothing to answer.
   if (process.platform === "darwin") console.log("Checking that the Claude credential is readable. No Keychain dialog is involved: the probe reads it through /usr/bin/security, which the item already admits.");
+  if (process.platform === "win32") {
+    // On Windows the Claude login is a file, not a Keychain item: there is no grant to check and no probe to build.
+    console.log("Nothing to grant on this platform: the Claude login is read from <config dir>/.credentials.json. Run `headroom doctor` to check it, or `claude` to log in.");
+    return 0;
+  }
   const requested = option(parsed, "--principal");
   const accounts = (await readAccounts()).filter((item): item is ProviderAccount => isAccountEnabled(item) && !isLocalAccount(item) && item.vendor === "claude");
   const targets = requested ? accounts.filter((item) => item.name === requested) : accounts;
