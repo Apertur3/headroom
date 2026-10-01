@@ -146,6 +146,7 @@ scan_one_labeled_file() {
   while IFS=: read -r lineno match; do
     [[ -z "$lineno" ]] && continue
     case "$match" in *@*.example.com|*@example.com) continue ;; esac
+    allowed_fixture_email "$label" "$match" && continue
     flag "$label" "$lineno" "email address other than example.com"
   done < <(run_grep -noIE "$EMAIL_PATTERN" "$path")
 
@@ -174,6 +175,16 @@ scan_one_labeled_file() {
   done < "$validated_denylist"
 }
 
+# Explicit fixture allowlist: exactly one file may carry exactly one literal
+# GitHub noreply identity. test/public-audit-synthetic-merge.test.ts needs it
+# to prove public-audit check 2 passes a real noreply commit. Any other file,
+# or any other address in that file, is still flagged.
+allowed_fixture_email() {
+  # The second path is this file itself: the allowlist entry names the literal address.
+  [[ "$1" == "test/public-audit-synthetic-merge.test.ts" || "$1" == "scripts/privacy-sweep.sh" ]] \
+    && [[ "$2" == "1+dev@users.noreply.github.com" ]]
+}
+
 # Runs every check across a whole set of files (everything except LICENSE and
 # package.json) in one grep invocation per check, prefixing each reported
 # path with $1 and stripping $2 (the packed tarball's own extraction root)
@@ -191,6 +202,7 @@ scan_files() {
   while IFS=: read -r path lineno match; do
     [[ -z "$path" ]] && continue
     case "$match" in *@*.example.com|*@example.com) continue ;; esac
+    allowed_fixture_email "$path" "$match" && continue
     flag "$path" "$lineno" "email address other than example.com"
   done < <(run_grep -nHoIE "$EMAIL_PATTERN" -- "${files[@]}" | sed -E "$relabel")
 
