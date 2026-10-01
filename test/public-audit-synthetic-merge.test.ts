@@ -10,7 +10,7 @@ vi.setConfig({ testTimeout: 60_000 });
 const execFileAsync = promisify(execFile);
 const realScript = join(__dirname, "..", "scripts", "public-audit.sh");
 const NOREPLY = "1+dev@users.noreply.github.com";
-const PERSONAL = "someone@personal.test";
+const PERSONAL = "someone@example.com";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
