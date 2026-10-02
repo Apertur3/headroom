@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { socketPath } from "../src/daemon.js";
+import { checkedSocketPath, socketPath } from "../src/daemon.js";
 
 describe("socketPath", () => {
   it("puts the POSIX socket inside the Headroom home", () => {
     expect(socketPath("/home/test/.headroom", "linux", "test")).toBe("/home/test/.headroom/headroom.sock");
+  });
+
+  it.each([["darwin", 103], ["linux", 107], ["freebsd", 107]] as const)("checks the byte boundary on %s", (platform, limit) => {
+    const home = "/" + "a".repeat(limit - "/headroom.sock".length - 1);
+    const path = `${home}/headroom.sock`;
+    expect(checkedSocketPath(home, platform, "test")).toBe(path);
+    const tooLong = `${home}a/headroom.sock`;
+    // Clients still get the plain path and treat it as "no daemon".
+    expect(socketPath(`${home}a`, platform, "test")).toBe(tooLong);
+    expect(() => checkedSocketPath(`${home}a`, platform, "test")).toThrow(
+      `Headroom socket path "${tooLong}" is ${limit + 1} bytes; the limit is ${limit} bytes on ${platform}. Set HEADROOM_HOME to a shorter directory.`
+    );
+  });
+
+  it("counts UTF-8 bytes rather than characters", () => {
+    const home = "/" + "é".repeat(46);
+    const path = `${home}/headroom.sock`;
+    expect(path.length).toBeLessThan(103);
+    expect(() => checkedSocketPath(home, "darwin", "test")).toThrow(`is ${Buffer.byteLength(path)} bytes; the limit is 103 bytes`);
+  });
+
+  it("does not impose a Unix socket limit on a Windows home", () => {
+    expect(checkedSocketPath("C:\\Users\\test\\" + "a".repeat(200), "win32", "test")).toMatch(/^\\\\\.\\pipe\\headroom-test-[0-9a-f]{8}$/);
   });
 
   it("gives two Windows homes of one user two different named pipes", () => {

@@ -22,7 +22,7 @@ import { codexResponseShape } from "./adapters/codex.js";
 import { pollAccounts } from "./collector.js";
 import { checkModelAvailability } from "./model-catalog.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
-import { daemonRequest, socketPath, HeadroomDaemon } from "./daemon.js";
+import { daemonRequest, socketPath, socketPathProblem, HeadroomDaemon } from "./daemon.js";
 import { serveMcp } from "./mcp.js";
 import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
@@ -63,8 +63,20 @@ function since(value: string | undefined): string {
  * Every write/dispatch path (lease start, gate with a lease, `can --lease`,
  * `run`, and every other command not listed in requestDaemonReadThrough's own
  * doc comment) keeps calling this, unchanged. */
+/** An overlong socket path means no daemon can run, so the request falls back
+ * to a direct read as before; say once on stderr why, never as an error. */
+let socketHintShown = false;
+function clientSocketPath(): string {
+  const path = socketPath();
+  if (!socketHintShown && socketPathProblem(path)) {
+    socketHintShown = true;
+    process.stderr.write("(daemon socket path is too long for this platform; set HEADROOM_HOME to a shorter directory, see headroom doctor)\n");
+  }
+  return path;
+}
+
 async function requestDaemon(method: string, params: Record<string, unknown> = {}): Promise<unknown | undefined> {
-  const request = await daemonRequest(socketPath(), method, params);
+  const request = await daemonRequest(clientSocketPath(), method, params);
   if (request.status === "available") return request.result;
   if (request.status === "unresponsive") throw new Error("Headroom daemon socket is present but health did not respond within 2s");
   return undefined;
@@ -91,7 +103,7 @@ type DaemonReadOutcome = { kind: "available"; result: unknown } | { kind: "absen
  * caller decides, only what a read-only caller may still answer from.
  */
 async function requestDaemonReadThrough(method: string, params: Record<string, unknown> = {}): Promise<DaemonReadOutcome> {
-  const request = await daemonRequest(socketPath(), method, params, 2_000, 30_000, undefined, 2);
+  const request = await daemonRequest(clientSocketPath(), method, params, 2_000, 30_000, undefined, 2);
   if (request.status === "available") return { kind: "available", result: request.result };
   if (request.status === "unresponsive") return { kind: "cache" };
   return { kind: "absent" };
