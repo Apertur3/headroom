@@ -38,7 +38,7 @@
   <sub>Sources: Claude, Codex, Antigravity, Grok, Kimi, local vLLM and llama.cpp. A stale or failed reading prints <b>UNKNOWN</b>, never a number. <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
 </p>
 
-<p align="center"><sub>Headroom is an independent open source project. It is not affiliated with, sponsored by or endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Claude, Codex, Antigravity, Grok and Kimi are trademarks of their respective owners, used here only to name the services Headroom reads. Several sources are read through undocumented vendor endpoints with your own login: see <a href="#vendor-endpoints-and-your-accounts">Vendor endpoints and your accounts</a>.</sub></p>
+<p align="center"><sub>Headroom is an independent open source project. It is not affiliated with, sponsored by or endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Claude, Codex, Antigravity, Grok and Kimi are trademarks of their respective owners, used here only to name the services Headroom reads. This project is the npm package <code>headroomd</code> (repository Apertur3/headroom) and is not related to other projects named Headroom, for example the context-compression library headroomlabs-ai/headroom. Several sources are read through undocumented vendor endpoints with your own login: see <a href="#vendor-endpoints-and-your-accounts">Vendor endpoints and your accounts</a>.</sub></p>
 
 ---
 
@@ -54,11 +54,12 @@
 
 ## Install in 30 seconds
 
-Node 22.13 or newer.
+Node 22.13 or newer. The npm package is `headroomd`; the Homebrew formula is
+`apertur3/tap/headroom`. Both install the `headroom` command.
 
 ```sh
-# or: brew install apertur3/tap/headroom
 npm install -g headroomd
+# or, on macOS and Linux: brew install apertur3/tap/headroom
 # finds your logins, runs the doctor, asks before each change
 headroom setup
 # one line per meter
