@@ -412,7 +412,8 @@ supersedes these rows by being newer. CLI: `headroom usage --paste`.
 ## How an orchestrator should use them
 
 This mirrors `skills/headroom/SKILL.md`, which any Claude Code session with the skill installed
-already follows:
+already follows. A short version to paste into an agent's `CLAUDE.md` or `AGENTS.md` is the
+[For agents](../README.md#for-agents) block in the README.
 
 1. Pick the pool by capability first, from your own routing table. Headroom has no opinion on
    which model is good at what, and never will.
