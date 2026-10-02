@@ -33,5 +33,5 @@ processes. The suite fails if a process it started is still alive when it ends
   wall-clock waits with injected clocks are welcome.
 - **Real vendors.** The suite never calls a real vendor. Vendor endpoints are private and can
   change; the fixtures show what they returned when recorded.
-- **Platforms.** Windows is experimental: see "Honest numbers" in the [README](../README.md#honest-numbers)
+- **Platforms.** Windows is experimental: see "Platform support and known limitations" in the [README](../README.md#platform-support-and-known-limitations)
   for what was and was not checked on a real machine.

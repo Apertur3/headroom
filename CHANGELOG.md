@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Documentation
+- README: an agent-first opening, a "For agents" block to paste into `CLAUDE.md` or `AGENTS.md`, MCP registration out of the collapsed setup, and corrected claims about reservations, `--allow-unknown`, where secrets live, the Windows daemon pipe and process checks; docs/quickstart.md now describes the dashboard graph as the remaining-capacity burndown it draws.
+
 ### Fixed
 - An overlong Unix socket path now names the path, its UTF-8 byte length, the platform limit and the fix (a shorter `HEADROOM_HOME`) instead of a bare `listen EINVAL`. The daemon refuses to start with that message and `headroom doctor` reports it as a FAIL and continues its other checks; other commands still fall back to a direct read, with a one-line hint on stderr. Windows named pipes are unchanged (#105, thanks @anshurajbisoyi98-ctrl).
 

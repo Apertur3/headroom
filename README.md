@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <b>Headroom reads your real AI subscription limits and tells an agent go, wait or reroute, before it spends.</b>
+  <b>Coding agents ask Headroom before they start work and get go, wait or reroute, from the limits your AI subscriptions report. They ask through the CLI or MCP in Claude Code, so you stop babysitting usage meters and reset times.</b>
 </p>
 
 <p align="center">
@@ -18,7 +18,8 @@
 </p>
 
 <p align="center">
-  <a href="#install-in-30-seconds"><b>Install</b></a> &nbsp;&middot;&nbsp;
+  <a href="#install"><b>Install</b></a> &nbsp;&middot;&nbsp;
+  <a href="#for-agents"><b>For agents</b></a> &nbsp;&middot;&nbsp;
   <a href="#why"><b>Why</b></a> &nbsp;&middot;&nbsp;
   <a href="#demo"><b>Demo</b></a> &nbsp;&middot;&nbsp;
   <a href="#design-principles"><b>Design principles</b></a> &nbsp;&middot;&nbsp;
@@ -35,10 +36,10 @@
 </table>
 
 <p align="center">
-  <sub>Sources: Claude, Codex, Antigravity, Grok, Kimi, local vLLM and llama.cpp. A stale or failed reading prints <b>UNKNOWN</b>, never a number. <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
+  <sub>Sources: five subscription services (Claude, Codex, Kimi, and the experimental Antigravity and Grok) and two local server types (vLLM and llama.cpp). A stale or failed reading prints <b>UNKNOWN</b>, never a number. <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
 </p>
 
-<p align="center"><sub>Headroom is an independent open source project. It is not affiliated with, sponsored by or endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Claude, Codex, Antigravity, Grok and Kimi are trademarks of their respective owners, used here only to name the services Headroom reads. This project is the npm package <code>headroomd</code> (repository Apertur3/headroom) and is not related to other projects named Headroom, for example the context-compression library headroomlabs-ai/headroom. Several sources are read through undocumented vendor endpoints with your own login: see <a href="#vendor-endpoints-and-your-accounts">Vendor endpoints and your accounts</a>.</sub></p>
+<p align="center"><sub>Independent open source project, not affiliated with, sponsored by or endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Several integrations use undocumented vendor endpoints with your own login: see <a href="#vendor-endpoints-and-your-accounts">Vendor endpoints and your accounts</a>. Claude, Codex, Antigravity, Grok and Kimi are trademarks of their respective owners, used here only to name the services Headroom reads. This is the npm package <code>headroomd</code> (repository Apertur3/headroom), not related to other projects named Headroom such as the context-compression library headroomlabs-ai/headroom.</sub></p>
 
 ---
 
@@ -52,7 +53,7 @@
 
 ---
 
-## Install in 30 seconds
+## Install
 
 Node 22.13 or newer. The npm package is `headroomd`; the Homebrew formula is
 `apertur3/tap/headroom`. Both install the `headroom` command.
@@ -62,14 +63,26 @@ npm install -g headroomd
 # or, on macOS and Linux: brew install apertur3/tap/headroom
 # finds your logins, runs the doctor, asks before each change
 headroom setup
-# one line per meter
+# one block per account: percent used, reset time and pace state per window
 headroom
 ```
 
 Already running Claude Code or another agent? Copy [skills/headroom/SKILL.md](skills/headroom/SKILL.md) into its skills directory and say "set up headroom".
 
+`headroom setup` offers to register the MCP server for your default Claude Code profile. To
+register it by hand, or in another profile:
+
+```sh
+claude mcp add --scope user headroom -- headroom mcp
+CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add --scope user headroom -- headroom mcp
+```
+
+Agents without MCP, Codex for example, call the CLI. Then give your agents the instructions in
+[For agents](#for-agents). The MCP tools and example calls are in
+[docs/mcp-and-agents.md](docs/mcp-and-agents.md).
+
 <details>
-<summary>Discovery, setup, notifications, MCP registration, optional profiles</summary>
+<summary>Manual setup and optional configuration</summary>
 
 The three commands above are the short path. Discovery on its own:
 
@@ -99,14 +112,6 @@ Keep an optional second profile that is deliberately logged out without polling 
 `enabled = false` to its `[[accounts]]` block, or run `headroom accounts disable <name>`.
 It remains configured and can be restored with `headroom accounts enable <name>`.
 
-Register the MCP server in each Claude Code profile:
-
-```sh
-claude mcp add --scope user headroom -- headroom mcp
-CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add --scope user headroom -- headroom mcp
-```
-
-Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your skills directory.
 Full walkthrough, including what each step grants and why: [docs/quickstart.md](docs/quickstart.md).
 
 `status`/`doctor` check the npm registry at most once a day (a plain GET of the `headroomd`
@@ -119,25 +124,88 @@ version, no account data) and print a one-line notice when a newer `headroomd` i
 
 ---
 
+## For agents
+
+Paste this into the `CLAUDE.md` or `AGENTS.md` your agents read, and replace the placeholders with
+your own action classes, meters and agent name. The agent then checks Headroom before it dispatches
+work, instead of asking you.
+
+```markdown
+## Usage limits (Headroom)
+
+Check Headroom before you start work on a subscription. Do not ask me about usage or reset times.
+
+- `headroom can <class> --owner <your-name>`: exit 0 means go, exit 2 means no. Any other exit
+  is an error: treat it as no. Classes are the `[consumes]` entries in `~/.headroom/routing.toml`.
+- On no, try the next class in your fallback list. If none has room, run
+  `headroom wait --meter <meter> --until-reset --max 6h` (exit 3 means it timed out), then run
+  `headroom can` again before you start anything.
+- Start a job with
+  `headroom run --meter <meter> --need <window>:<points> --owner <your-name> -- <command>`,
+  for example `--need 5h:10` for 10 percent of the 5-hour window. It reserves the points, runs
+  the command and releases them when it exits. Exit 2 means refused; otherwise it returns the
+  command's own exit code.
+- UNKNOWN means there is no trustworthy reading. Treat it as no. Never pass `--allow-unknown`
+  unless I ask for it.
+- For the full picture, read `headroom --json`, not the human view.
+- In Claude Code with the Headroom MCP server, `quota_can` answers the same question as
+  `headroom can`.
+```
+
+A plain `can` is advisory. A reservation tells other agents that use Headroom the points are taken;
+it does not limit what the job itself spends, and it cannot stop tools that do not use Headroom.
+The longer version, with pace states, leases and reserves, is
+[skills/headroom/SKILL.md](skills/headroom/SKILL.md).
+
+---
+
+## Platform support and known limitations
+
+| Platform | Status |
+|---|---|
+| macOS | The primary platform: daily use on one machine, plus CI. Antigravity needs macOS 14 or later |
+| Linux | CI on Ubuntu; cold install also checked by hand on ARM64 |
+| Windows | **Experimental.** Tests run in CI and 0.2.4 was installed on a Windows 11 machine. Reading a real Claude login, MCP registration and the process watchdog are not verified, and the service fix in [#110](https://github.com/Apertur3/headroom/pull/110) is not re-verified on a real machine. Full detail below |
+| Antigravity | Experimental. Depends on a private local endpoint that the vendor can change |
+| Grok | Experimental. Reads the Grok CLI's undocumented chat-proxy endpoint and presents itself as the Grok CLI |
+
+<details>
+<summary>The full table: tests, CI, install checks, Windows, vendor endpoints</summary>
+
+| | |
+|---|---|
+| Tests | `npm test` (vitest), run on every push on macOS, Ubuntu and Windows; some tests are POSIX-only and skip on Windows. Current counts are in the CI logs; method and limits: [docs/verification.md](docs/verification.md) |
+| CI platforms | macOS, Ubuntu and Windows (`macos-latest`, `ubuntu-latest`, `windows-latest`): lint, tests, build, `npm pack --dry-run`, privacy sweep, `npm audit` |
+| Daily use | one macOS machine; this is the only environment a person uses every day |
+| Install from the packed tarball | scripted cold-install smoke test ([`smoke-cold.sh`](scripts/smoke-cold.sh)) runs in the release workflow; also checked by hand on macOS and on Linux ARM64 |
+| Windows | **experimental.** Version 0.2.4 was installed from the npm registry on a Windows 11 machine, and these worked: install, `accounts discover`, `doctor`, `status` / `can` / `gate` / `dashboard` (UNKNOWN, never a fake number), HTML report permissions, the daemon on a named pipe, `uninstall`. Not verified: reading a real Claude login, MCP registration, and the process watchdog (inactive on Windows). Starting the background service failed on 0.2.4 (`install-service` wrote the task XML in the wrong encoding); the fix is in [#110](https://github.com/Apertur3/headroom/pull/110) and has not been re-verified on a real machine. PowerShell's default execution policy blocks the `npm` and `headroom` `.ps1` shims; use `cmd`, or relax the policy |
+| Works with | Claude Code through MCP (registered with `claude mcp add`, covered by [`mcp-registration.test.ts`](test/mcp-registration.test.ts) and [`daemon-mcp.test.ts`](test/daemon-mcp.test.ts)); any agent that can run a shell command, through the CLI and `--json`. Other MCP clients: untested |
+| Antigravity | experimental; macOS 14 or later only, and it depends on a private local endpoint that the vendor can change |
+| Vendor endpoints | private and unversioned. Headroom pins them, records redacted fixtures and prints UNKNOWN when a shape changes, but it cannot promise they keep working |
+
+</details>
+
+---
+
 ## Why
 
 An agent that fans out several jobs needs two answers first: can this account afford them, and
 which other jobs have already reserved capacity? Vendor screens answer neither for a program, and
-a guessed number is worse than none: an orchestrator that believes a stale 20% will burn the week
-in an afternoon. Headroom combines vendor readings with cooperative reservations. When a reading
-is stale or failed it says UNKNOWN, and UNKNOWN never counts as capacity.
+a stale reading can send more work to an account that no longer has capacity. Headroom combines
+vendor readings with cooperative reservations. When a reading is stale or failed it says UNKNOWN
+instead of a number, and `can` answers NO for it unless you pass `--allow-unknown`.
 
 One daemon reads quota across Claude, Codex, Antigravity, Grok, Kimi, and local vLLM or llama.cpp
 pools, keeps history, and detects resets. Antigravity and Grok support is experimental.
 
 <p align="center">
-  <img alt="Terminal card: headroom prints one line per meter with percent used, reset time and pace state" src="docs/assets/headroom-terminal.svg" width="760">
+  <img alt="Terminal card: headroom prints one block per account with percent used, reset time and pace state per window, then headroom can codex-build answers NO" src="docs/assets/headroom-terminal.svg" width="760">
 </p>
 
 ### How it differs from a usage analyzer
 
 Usage analyzers such as [ccusage](https://github.com/ccusage/ccusage) read local usage files and
-report estimated costs. Headroom reads the limits your plan actually enforces, from the vendors' own
+report estimated costs. Headroom reads the usage and limits your vendors report, from their own
 usage endpoints, and answers before work starts: `can`, `gate`, `route`, leases and an inbox, for
 agents that dispatch work. They answer different questions and work side by side.
 
@@ -145,7 +213,9 @@ agents that dispatch work. They answer different questions and work side by side
 
 ## Before and after
 
-Without a check, an agent can find the limit by hitting it, in the middle of a task. With Headroom it asks first and has a plan for a NO.
+Without a check, an agent finds the limit by hitting it, in the middle of a task. With Headroom it
+checks first and tries the next class in your fallback list when the answer is NO. `can` only
+checks; when several jobs start at once, use `headroom run` so each one reserves its capacity.
 
 **Without Headroom**
 
@@ -159,17 +229,17 @@ codex exec "refactor the billing module"
 ```sh
 if headroom can codex-build --owner builder; then
   codex exec "refactor the billing module"
-elif headroom can claude-heavy --owner builder; then
+elif headroom can claude-fable --owner builder; then
   claude -p "refactor the billing module"
 else
-  # or queue the job for later
+  # no class has room: wait for a reset, then check again before dispatching
   headroom wait --meter codex-main:main --until-reset --max 6h
 fi
 ```
 
-`headroom run --meter ... --need ... -- <command>` goes one step further: it checks, reserves the
-capacity for the job's duration so two agents cannot spend the same points, runs the command, and
-releases the reservation. Runnable examples against synthetic data are in [`examples/`](examples).
+`headroom run --meter ... --need ... --owner ... -- <command>` goes one step further: it checks,
+reserves the capacity for the job's duration so other agents that use Headroom see it as taken,
+runs the command, and releases the reservation. Runnable examples against synthetic data are in [`examples/`](examples).
 
 ---
 
@@ -177,14 +247,14 @@ releases the reservation. Runnable examples against synthetic data are in [`exam
 
 <table>
 <tr>
-<td width="33%" valign="top"><b>Reads real limits</b><br>The usage endpoints your plans enforce, for Claude, Codex, Antigravity, Grok, Kimi and local vLLM or llama.cpp pools.</td>
+<td width="33%" valign="top"><b>Reads real limits</b><br>Subscription usage and limits as Claude, Codex, Antigravity, Grok and Kimi report them, plus availability and load for local vLLM or llama.cpp pools.</td>
 <td width="33%" valign="top"><b>Pace, not just percent</b><br>HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset.</td>
 <td width="33%" valign="top"><b>Go, wait or reroute</b><br><code>can</code>, <code>gate</code>, <code>route</code>, <code>plan</code>, <code>fill</code> and <code>wait</code> answer before the job starts.</td>
 </tr>
 <tr>
-<td valign="top"><b>Reservations</b><br>Leases and per-meter reserves, so two agents cannot spend the same points (<code>run</code>, <code>can --lease</code>).</td>
-<td valign="top"><b>Fails closed</b><br>A stale or failed reading prints UNKNOWN. UNKNOWN never counts as capacity.</td>
-<td valign="top"><b>Local only</b><br>A daemon on a 0600 socket (a named pipe on Windows), Headroom's own secrets in the OS store, no telemetry. One npm update check a day, off with <code>update_check = false</code>.</td>
+<td valign="top"><b>Reservations</b><br>Leases and per-meter reserves coordinate capacity among agents that use Headroom (<code>run</code>, <code>can --lease</code>).</td>
+<td valign="top"><b>Fails closed</b><br>A stale or failed reading prints UNKNOWN, never a number. By default, <code>can</code> answers NO for it.</td>
+<td valign="top"><b>Local only</b><br>A daemon on a 0600 socket (a named pipe on Windows), Headroom's own secrets in the OS store, no telemetry. The CLI checks npm for a newer version at most once a day; turn it off with <code>update_check = false</code>.</td>
 </tr>
 </table>
 
@@ -250,10 +320,10 @@ Open the generated file in your browser. The report shows subscription usage and
 
 Each of these is a rule the code enforces and a test pins. Past real-world breakage is the reason for every one.
 
-- **Fail closed: never a fake number.** A missing, stale or inconsistent reading becomes UNKNOWN, and `can` answers NO for it.
+- **Fail closed: never a fake number.** A missing, stale or inconsistent reading becomes UNKNOWN, and `can` answers NO for it unless you explicitly pass `--allow-unknown`.
 - **A stale-lane canary that cannot be silenced.** A lane with no fresh reading for 6 hours raises an alert, whatever the notification config says.
-- **Only kill what Headroom provably started.** A process is signalled only if its recorded pid, command and start time still match.
-- **Secrets only in the OS secret store.** Read at use time, never written to disk, redacted from output.
+- **Only kill what Headroom provably started.** On macOS and Linux, a process is signalled only if its recorded pid, command and start time still match.
+- **Secrets stay in their own stores.** Notification tokens live in the OS secret store; vendor credentials are read at use time from the vendor's own store or credential file and never copied. Output is redacted.
 - **A redacted fixture per past breakage.** Every Antigravity failure shape seen in the field has a fixture and a test.
 
 <details>
@@ -281,10 +351,11 @@ Each of these is a rule the code enforces and a test pins. Past real-world break
   [`agy-watchdog.test.ts`](test/agy-watchdog.test.ts)). The test suite itself fails if any
   process it started outlives the run ([`global-leak-gate.ts`](test/global-leak-gate.ts)). The
   watchdog and the pid and start-time checks are not active on Windows.
-- **Secrets only in the OS secret store.** Headroom's own credentials (notification tokens) are
+- **Secrets stay in their own stores.** Headroom's own credentials (notification tokens) are
   read at use time from the macOS Keychain (`secret-tool` on Linux, Credential Manager on
-  Windows) and never written to disk; vendor tokens are read from the vendor's own store at call
-  time and dropped. Output and logs are redacted
+  Windows) and never written to disk; vendor tokens are read at call time from the vendor's own
+  store or credential file (for Kimi's manual token and the Moonshot key, a 0600 file you save
+  yourself) and dropped. Output and logs are redacted
   ([`notify.ts`](src/notify.ts), [`security.ts`](src/security.ts),
   [`security.test.ts`](test/security.test.ts), [SECURITY.md](SECURITY.md)).
 - **A redacted fixture per past breakage.** Every Antigravity failure shape seen in the field
@@ -293,34 +364,6 @@ Each of these is a rule the code enforces and a test pins. Past real-world break
   [`record-antigravity-fixture.sh`](scripts/record-antigravity-fixture.sh)). The repo
   also scans itself and its packed npm tarball for private addresses, emails and home paths
   ([`privacy-sweep.sh`](scripts/privacy-sweep.sh), run in CI).
-
-</details>
-
----
-
-## Honest numbers
-
-| Platform | Status |
-|---|---|
-| macOS | The primary platform: daily use on one machine, plus CI. Antigravity needs macOS 14 or later |
-| Linux | CI on Ubuntu; cold install also checked by hand on ARM64 |
-| Windows | **Experimental.** Tests run in CI and 0.2.4 was installed on a Windows 11 machine. Reading a real Claude login, MCP registration and the process watchdog are not verified, and the service fix in [#110](https://github.com/Apertur3/headroom/pull/110) is not re-verified on a real machine. Full detail below |
-| Antigravity | Experimental. Depends on a private local endpoint that the vendor can change |
-| Grok | Experimental. Reads the Grok CLI's undocumented chat-proxy endpoint and presents itself as the Grok CLI |
-
-<details>
-<summary>The full table: tests, CI, install checks, Windows, vendor endpoints</summary>
-
-| | |
-|---|---|
-| Tests | `npm test` (vitest), run on every push on macOS, Ubuntu and Windows; some tests are POSIX-only and skip on Windows. Current counts are in the CI logs; method and limits: [docs/verification.md](docs/verification.md) |
-| CI platforms | macOS, Ubuntu and Windows (`macos-latest`, `ubuntu-latest`, `windows-latest`): lint, tests, build, `npm pack --dry-run`, privacy sweep, `npm audit` |
-| Daily use | one macOS machine; this is the only environment a person uses every day |
-| Install from the packed tarball | scripted cold-install smoke test ([`smoke-cold.sh`](scripts/smoke-cold.sh)) runs in the release workflow; also checked by hand on macOS and on Linux ARM64 |
-| Windows | **experimental.** Version 0.2.4 was installed from the npm registry on a Windows 11 machine, and these worked: install, `accounts discover`, `doctor`, `status` / `can` / `gate` / `dashboard` (UNKNOWN, never a fake number), HTML report permissions, the daemon on a named pipe, `uninstall`. Not verified: reading a real Claude login, MCP registration, and the process watchdog (inactive on Windows). Starting the background service failed on 0.2.4 (`install-service` wrote the task XML in the wrong encoding); the fix is in [#110](https://github.com/Apertur3/headroom/pull/110) and has not been re-verified on a real machine. PowerShell's default execution policy blocks the `npm` and `headroom` `.ps1` shims; use `cmd`, or relax the policy |
-| Works with | Claude Code through MCP (registered with `claude mcp add`, covered by [`mcp-registration.test.ts`](test/mcp-registration.test.ts) and [`daemon-mcp.test.ts`](test/daemon-mcp.test.ts)); any agent that can run a shell command, through the CLI and `--json`. Other MCP clients: untested |
-| Antigravity | experimental; macOS 14 or later only, and it depends on a private local endpoint that the vendor can change |
-| Vendor endpoints | private and unversioned. Headroom pins them, records redacted fixtures and prints UNKNOWN when a shape changes, but it cannot promise they keep working |
 
 </details>
 
@@ -337,7 +380,7 @@ Headroom reads Claude, Codex, Grok and Kimi through native TypeScript adapters.
 Antigravity is experimental and supported on macOS 14 or later: it requires a logged-in
 `agy` and a running Headroom daemon. The npm and Homebrew packages include a universal
 macOS reader, verified by SHA-256 before use. Gemini CLI is not required or supported for consumer subscriptions;
-Google retired that access on June 18, 2026.
+[Google ended consumer Gemini CLI access on June 18, 2026](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/).
 
 For Antigravity quota, the bundled macOS reader finds the running Antigravity language server
 (the daemon-kept `agy`) in the process list, takes its local port and, where the process has one,
@@ -426,13 +469,16 @@ Per-vendor detail: [docs/vendors.md](docs/vendors.md).
 
 ## Security
 
-Headroom never writes a secret to disk or to output. On macOS `headroom-claude-probe` reads the Claude Keychain token
-through `/usr/bin/security`, which the Keychain item's own access list admits, and makes the usage
-request itself, so the token never enters Node or stdout and no dialog is needed. It ships
+Headroom never writes a vendor credential or notification token to disk, and redacts secrets from
+its output. On macOS a bundled helper, `headroom-claude-probe`, reads Claude Code's Keychain token
+by running `/usr/bin/security`, which the Keychain item's own access list admits, keeps it in the
+helper's memory and makes the usage request itself, so the token never reaches Node or Headroom's
+output. With Claude Code 2.1.263 on macOS 26.5 this needed no Keychain dialog. The helper ships
 inside the npm package as a universal binary, verified against a recorded SHA-256 before every use.
-Tokens are otherwise read at call time from the Keychain or the vendor's own credential file and
-dropped after the request. The daemon listens on a 0600 local
-socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry. Apart from
+Tokens are otherwise read at call time from the vendor's own credential file and dropped after the
+request. The daemon listens on a 0600 local socket on macOS and Linux. On Windows it uses a named
+pipe where both sides prove they hold a per-daemon session token, kept in a 0600 file under
+`HEADROOM_HOME`. There is no telemetry. Apart from
 the vendors you configure and the notification channels you enable, the only request Headroom
 makes unprompted is the daily npm version check above, a plain GET with no account data
 (`update_check = false` turns it off); `headroom update` and `headroom engine install` contact npm
@@ -442,10 +488,11 @@ lands in an audit log. Details in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-Stable since 0.1.0 (2026-09-11); the current release is on npm. Vendor endpoints are private and
+Releases are published to npm as `headroomd`; [CHANGELOG.md](CHANGELOG.md) lists what changed in
+each one. Vendor endpoints are private and
 change without notice: Headroom pins them, records fixtures, backs off on 401, 403 and 429, and
 prints UNKNOWN instead of a stale number. What is and is not verified is in
-[Honest numbers](#honest-numbers). Antigravity requires macOS and a daemon-kept `agy`; see
+[Platform support and known limitations](#platform-support-and-known-limitations). Antigravity requires macOS and a daemon-kept `agy`; see
 [vendor setup](docs/vendors.md#antigravity).
 
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) and the issues labelled
