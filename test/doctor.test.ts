@@ -2,12 +2,27 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { adapterCheck, antigravityOrphanCheck, doctorFileStatus, homeCheck, hostPressureCheck } from "../src/doctor.js";
+import { adapterCheck, antigravityOrphanCheck, doctorChecks, doctorFileStatus, homeCheck, hostPressureCheck } from "../src/doctor.js";
+import { socketPath } from "../src/daemon.js";
 import { defaultHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "../src/host-health.js";
 import type { ProcessEntry } from "../src/process-tree.js";
 import { HeadroomStore } from "../src/store.js";
 
 const temporary: string[] = [];
+
+it.skipIf(process.platform === "win32")("doctor reports an overlong socket path without losing the remaining diagnostics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hr-doctor-")); temporary.push(root);
+  const home = join(root, "a".repeat(110));
+  let message = "";
+  try { socketPath(home); } catch (error) { message = (error as Error).message; }
+  vi.stubEnv("HEADROOM_HOME", home);
+  try {
+    const checks = await doctorChecks();
+    expect(message).toContain("Set HEADROOM_HOME to a shorter directory.");
+    expect(checks).toContainEqual(expect.objectContaining({ check: "daemon socket", level: "FAIL", detail: message, fix: "set HEADROOM_HOME to a shorter directory" }));
+    expect(checks.some((item) => item.check === "daemon log")).toBe(true);
+  } finally { vi.unstubAllEnvs(); }
+});
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 describe("doctor file checks", () => {
@@ -166,4 +181,3 @@ describe("doctor: home directory permission check", () => {
     }
   });
 });
-

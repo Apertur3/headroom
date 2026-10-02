@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Overlong Unix socket paths now name the path, UTF-8 byte length, platform limit and shorter `HEADROOM_HOME` remedy instead of a bare `listen EINVAL`. `headroom doctor` reports the same diagnostic and continues its other checks (#105). Windows named pipes are unchanged.
 ## [0.2.6] - 2026-10-02
 
 ### Changed
