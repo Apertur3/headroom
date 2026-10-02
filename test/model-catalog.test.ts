@@ -224,7 +224,7 @@ describe("checkModelAvailability orchestration", () => {
 
       await checkModelAvailability(store, [
         account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
-      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
+      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity, antigravityModelCatalog: true });
       expect(readCodex).toHaveBeenCalledWith(resolve("/tmp/codex-live"), undefined, expect.any(Date));
       expect(readClaude).toHaveBeenCalledWith(resolve("/tmp/claude-live"), undefined, undefined, expect.any(Date));
       expect(fetchAntigravity).toHaveBeenCalledTimes(1);

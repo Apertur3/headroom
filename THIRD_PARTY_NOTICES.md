@@ -14,3 +14,10 @@ components are included in [LICENSE](LICENSE).
 
 System frameworks are supplied by macOS. Headroom's pace-state and dispatch logic are original
 to this project.
+
+## Trademarks and affiliation
+
+Headroom is an independent open source project. It is not affiliated with, sponsored by or
+endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Claude, Claude Code, Codex, ChatGPT,
+Antigravity, Gemini, Grok and Kimi are trademarks of their respective owners. Headroom uses these
+names only to identify the services it reads (nominative use) and ships no vendor logos.

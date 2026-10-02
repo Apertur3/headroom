@@ -1705,7 +1705,7 @@ export async function observe(argv: string[]): Promise<number> {
   if (directCatalogAccounts?.length && directCatalogHome) {
     await (async () => {
       const catalogStore = await HeadroomStore.open(directCatalogHome!);
-      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!, { antigravityModelCatalog: policy.antigravity_model_catalog }); }
       finally { catalogStore.close(); }
     })().catch(() => undefined);
   }

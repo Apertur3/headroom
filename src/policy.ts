@@ -81,6 +81,13 @@ export interface Policy {
    * notice line. Never affects `headroom update` itself, which is always an
    * explicit, human-initiated check. */
   update_check: boolean;
+  /** Whether the hourly model-availability check may call Antigravity's
+   * `fetchAvailableModels` on `cloudcode-pa.googleapis.com`. That call needs a
+   * Google OAuth token, and the only one Headroom can use is the Gemini CLI's
+   * own `~/.gemini/oauth_creds.json`, so it is off by default: with `false`
+   * Headroom never opens that file and makes no Google call for Antigravity.
+   * Quota reads never depend on it (they use agy's local summary). */
+  antigravity_model_catalog: boolean;
   /** From `[canary] stale_after_hours`: hours a meter lane may go without a
    * fresh or explicit not_enforced reading before the stale-lane canary
    * raises `lane_stale`. The canary ignores the notify event switches. */
@@ -104,7 +111,7 @@ export function defaultAntigravityKeepalive(platform = process.platform): boolea
 
 export const defaultPolicy: Policy = {
   freeze_reserve_pct: 10, pace_grace_fraction: 0.10, staleness_minutes: 15, poll_interval_minutes: 5, principal_intervals: {}, reserve: {}, reserve_meta: {},
-  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", allowance: "pro_rata", statusline_snapshot_dirs: [], update_check: true, canary_stale_after_hours: 6, agy_max_age_minutes: 10, policy_mtime: null,
+  antigravity_keepalive: defaultAntigravityKeepalive(), pacing: "even", allowance: "pro_rata", statusline_snapshot_dirs: [], update_check: true, antigravity_model_catalog: false, canary_stale_after_hours: 6, agy_max_age_minutes: 10, policy_mtime: null,
 };
 
 /** True once `entry.until` (an ISO instant) is at or before `now`. Entries
@@ -171,6 +178,7 @@ export function parsePolicy(text: string, now: Date = new Date()): Policy {
   let proxy: string | undefined;
   let antigravityKeepalive: boolean | undefined;
   let updateCheck: boolean | undefined;
+  let antigravityModelCatalog: boolean | undefined;
   let pacing: Policy["pacing"] | undefined;
   let allowance: Policy["allowance"] | undefined;
   let statuslineSnapshotDirs: string[] | undefined;
@@ -245,6 +253,8 @@ export function parsePolicy(text: string, now: Date = new Date()): Policy {
     if (/^agy_max_age_minutes\s*=/.test(line)) throw new Error("Invalid Headroom policy");
     const updateCheckMatch = /^update_check\s*=\s*(true|false)\s*$/.exec(line);
     if (updateCheckMatch) { updateCheck = updateCheckMatch[1] === "true"; continue; }
+    const modelCatalogMatch = /^antigravity_model_catalog\s*=\s*(true|false)\s*$/.exec(line);
+    if (modelCatalogMatch) { antigravityModelCatalog = modelCatalogMatch[1] === "true"; continue; }
     const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
     if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
     if (/^pacing\s*=/.test(line)) throw new Error("Invalid Headroom policy");
@@ -282,7 +292,7 @@ export function parsePolicy(text: string, now: Date = new Date()): Policy {
   }
   if (freezeReserveMeta) reserveMeta.freeze_reserve_pct = { percent: freeze, ...freezeReserveMeta };
   if (!Number.isFinite(freeze) || freeze < 0 || freeze > 100 || !Number.isFinite(grace) || grace < 0 || grace > 1 || !Number.isFinite(stale) || stale <= 0 || !Number.isFinite(interval) || interval <= 0 || Object.values(principalIntervals).some((value) => !Number.isFinite(value) || value <= 0) || Object.values(reserves).some((value) => !Number.isFinite(value) || value < 0 || value > 90) || (canaryStaleAfterHours !== undefined && (!Number.isFinite(canaryStaleAfterHours) || canaryStaleAfterHours < 0.25 || canaryStaleAfterHours > 720)) || (agyMaxAgeMinutes !== undefined && (!Number.isFinite(agyMaxAgeMinutes) || agyMaxAgeMinutes < 1 || agyMaxAgeMinutes > 1440))) throw new Error("Invalid Headroom policy");
-  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, reserve_meta: reserveMeta, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, allowance: allowance ?? defaultPolicy.allowance, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, canary_stale_after_hours: canaryStaleAfterHours ?? defaultPolicy.canary_stale_after_hours, agy_max_age_minutes: agyMaxAgeMinutes ?? defaultPolicy.agy_max_age_minutes, policy_mtime: null, ...(proxy ? { proxy } : {}) };
+  return { freeze_reserve_pct: freeze, pace_grace_fraction: grace, staleness_minutes: stale, poll_interval_minutes: interval, principal_intervals: principalIntervals, reserve: reserves, reserve_meta: reserveMeta, antigravity_keepalive: antigravityKeepalive ?? defaultAntigravityKeepalive(), pacing: pacing ?? defaultPolicy.pacing, allowance: allowance ?? defaultPolicy.allowance, statusline_snapshot_dirs: statuslineSnapshotDirs ?? defaultPolicy.statusline_snapshot_dirs, update_check: updateCheck ?? defaultPolicy.update_check, antigravity_model_catalog: antigravityModelCatalog ?? defaultPolicy.antigravity_model_catalog, canary_stale_after_hours: canaryStaleAfterHours ?? defaultPolicy.canary_stale_after_hours, agy_max_age_minutes: agyMaxAgeMinutes ?? defaultPolicy.agy_max_age_minutes, policy_mtime: null, ...(proxy ? { proxy } : {}) };
 }
 
 /** "; next poll ~HH:MM" appended to a stale reading's reason, estimated from

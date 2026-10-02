@@ -217,10 +217,15 @@ unavailable rather than evidence that its models remain available.
 
 ## Antigravity
 
-Headroom reads the local quota summary of a logged-in Antigravity CLI (`agy`).
-It does not need Gemini CLI, read its OAuth credentials, or call the retired
-consumer Code Assist path. The daemon owns a hidden agy process on macOS/Linux;
-agy owns authentication and token refresh.
+Headroom reads the local quota summary of a logged-in Antigravity CLI (`agy`). The bundled
+reader finds the Antigravity language server in the process list, takes its local port and,
+where the process has one, the local CSRF token from its command line, and asks that server on
+127.0.0.1 for the quota summary. It never reads agy's OAuth or session credential. Quota does not
+need Gemini CLI, read its OAuth credentials, or call the retired consumer Code Assist path. The
+daemon owns a hidden agy process on macOS/Linux; agy owns authentication and token refresh.
+The daemon reads the tail of agy's newest log under `~/.gemini/antigravity-cli/log` for
+login-state markers only. The optional model-list check below is the one exception, and it is
+off by default.
 
 The npm and Homebrew packages include the reader for macOS 14 or later, on both Apple
 silicon and Intel. Headroom verifies its bundled SHA-256 record before every use. No Swift
@@ -280,14 +285,18 @@ same read stay fresh. Both Antigravity paths (the daemon's local read and the re
 `src/antigravity-lanes.ts`: fresh, blocked by weekly, loading, missing, unavailable
 (availability-only answer) or error (the engine's own error text kept).
 
-### Model catalog (`model_available`)
+### Model catalog (`model_available`, opt-in)
 
-Unlike quota (agy's own warm local summary, above), Headroom has no local model-list read for
-Antigravity: it calls `fetchAvailableModels` on the same `cloudcode-pa.googleapis.com` host,
-with the same Google OAuth credential class (`GoogleCredential`, `src/adapters/google-code-assist.ts`)
-and the same resolved Code Assist project id the deprecated remote quota fallback already uses --
-no new credential type, no new host. That credential is the Gemini CLI's own OAuth file
-(`~/.gemini/oauth_creds.json`); an install that discovered its `antigravity` account purely from
+Off by default. Headroom has no local model-list read for Antigravity, so this check calls
+Google's undocumented `loadCodeAssist` and `fetchAvailableModels` on
+`cloudcode-pa.googleapis.com`, at most once an hour, announcing `User-Agent: antigravity` and
+`ideType: ANTIGRAVITY`. Its credential is the Gemini CLI's own OAuth file
+(`~/.gemini/oauth_creds.json`), not agy's; an expired token is refreshed in memory at
+`oauth2.googleapis.com` with the OAuth client found in the installed Gemini CLI and is never
+written back. Vendor terms may restrict a third-party tool using that credential this way, so the
+check runs only after you set `antigravity_model_catalog = true` in `policy.toml`. With the
+default `false`, Headroom never opens that file and makes no Google call for Antigravity. When
+enabled, an install that discovered its `antigravity` account purely from
 `agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
 no model catalog for that principal (never a failure of the ordinary quota read).
 An HTTP success without the expected `models` object is likewise unavailable, not an authoritative
