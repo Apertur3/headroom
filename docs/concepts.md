@@ -230,8 +230,8 @@ Example: `claude-main model token share (estimated, local session logs, current 
 ## Cost model and local_preference
 
 Every meter carries one of two cost models. Subscription meters are `sunk`: the capacity was
-already paid for and expires unused at reset, so leaving it idle is a straight loss and a HARVEST
-window is worth spending. Local pools are `marginal`: every request costs real energy on real
+already paid for and expires unused at reset, so a HARVEST window can be preferred for real,
+queued work. Local pools are `marginal`: every request costs real energy on real
 hardware, so Headroom never assumes idle local capacity should be used just because it's free of a
 subscription limit. `local_preference` in `routing.toml` controls when local pools even get
 considered: `fallback` (the default) offers them only once every subscription meter an action
@@ -353,16 +353,20 @@ elapsed; spending ahead of it by more than a small tolerance is refused even whe
 check would allow it. The burst check looks at the meter's own last-10-minutes burn independent of
 any plan: more than twice the plan rate refuses with a reason naming when the line would catch up.
 `pacing = "none"` skips both, leaving only the plain reserve/plan-line checks. `headroom fill --meter
-M --until-reset [--lane-cost N] --owner X` answers "how many more lanes fit before this window's
-unspent points are lost at reset": under even pacing, with the default pro-rata basis, it only offers
+M --until-reset [--lane-cost N] --owner X` reports how many lanes of queued work fit in the
+remaining window: under even pacing, with the default pro-rata basis, it only offers
 the window's full remainder in the last 45 minutes before reset, offering the pro-rata allowance
 instead any earlier than that. It also lists, per `routing.toml` `[cost.<class>]` entry, how many
 runs of that class fit the window's remaining points and remaining minutes (a learned median cost
 overrides the static config number once samples exist).
 
+Unspent quota is information, not a target. `fill`, `plan`, and burn-to-target views describe
+capacity for real, queued work; they never call for inventing work to exhaust a window. Leaving
+capacity unused at reset is acceptable.
+
 The allowance basis is `"pro_rata"` by default. An orchestrator may set policy `allowance = "fill"`
-or pass `--allowance fill` when it deliberately wants to spend a use-it-or-lose-it 5h window before
-its reset and no other work needs that capacity. The fill basis keeps the gate cap (including the
+or pass `--allowance fill` when queued work should use available 5h capacity before reset and no
+other work needs that capacity. The fill basis keeps the gate cap (including the
 reserve floor), projects other owners' open leases and the meter's recent 60-minute burn to the lane
 end, and refuses if the requested work would cross that cap. `--duration <minutes>` (or a routing
 class's configured duration) defines that horizon, never beyond the reset. `fill` keeps its existing
