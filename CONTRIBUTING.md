@@ -3,6 +3,10 @@
 Thanks for taking a look. Headroom moves quickly; small, focused pull requests
 land fastest. Bug fixes bump the patch version, new features the minor version.
 
+Headroom is a side project. Every issue and pull request gets read, and replies usually come
+within a few days, but there is no guarantee, so a quiet week is not a no. Small, focused pull
+requests against a `good first issue` are the easiest to review.
+
 ## Ground rules
 
 - Never commit a credential, a fixture with a real token, or an email address. Fixtures are
