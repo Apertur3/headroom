@@ -10,7 +10,7 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const execFileAsync = promisify(execFile);
 const realScript = join(__dirname, "..", "scripts", "ci-scope.sh");
-const EMAIL = "1+dev@users.noreply.github.com";
+const EMAIL = "dev@example.com";
 const PR_ENV = { GITHUB_EVENT_NAME: "pull_request", GITHUB_REF: "refs/pull/7/merge" };
 
 const temporary: string[] = [];
