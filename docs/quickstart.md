@@ -331,10 +331,11 @@ Enter to jump to its panel. Use the mouse wheel to scroll too; Arrow keys or `j`
 line, PageUp/PageDown or space scroll a screen, and Home/End move to the ends. The right edge
 shows the scroll position and the footer reports rows below the fold.
 Each hard percent window gets a fixed 60-column, eight-row graph (40 by 6 below 100 columns)
-after two distinct readings in that window. Its vertical scale is always 0 to 100% used; the
-used and plan lines are continuous. Immediately after a reset, the prior period stays visible
-until the new period has two readings. The vertical marker is now, and the shaded top band
-protects the configured reserve.
+after two distinct readings in that window. It is a burndown of remaining capacity: the vertical
+scale is always 100% remaining at the top to 0% at the bottom, and the remaining and dotted plan
+lines are continuous. Immediately after a reset, the prior period stays visible until the new
+period has two readings. The vertical marker is now, and the shaded bottom band protects the
+configured reserve.
 `--ascii` uses half blocks instead of braille dots, also selected automatically for `TERM=dumb`.
 
 At 100 columns, the account-wide weekly meter also shows a braille sparkline for the last seven days
