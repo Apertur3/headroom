@@ -30,13 +30,15 @@
     <td align="center"><b>7</b><br><sub>sources read</sub></td>
     <td align="center"><b>3</b><br><sub>OSes tested in CI</sub></td>
     <td align="center"><b>1</b><br><sub>local daemon, one call per decision</sub></td>
-    <td align="center"><b>0</b><br><sub>telemetry</sub></td>
+    <td align="center"><b>0</b><br><sub>telemetry (one opt-out update check)</sub></td>
   </tr>
 </table>
 
 <p align="center">
   <sub>Sources: Claude, Codex, Antigravity, Grok, Kimi, local vLLM and llama.cpp. A stale or failed reading prints <b>UNKNOWN</b>, never a number. <a href="docs/verification.md">Full writeup</a> &middot; <a href="docs/verification.md#reproduce-it">Reproduce it</a></sub>
 </p>
+
+<p align="center"><sub>Headroom is an independent open source project. It is not affiliated with, sponsored by or endorsed by Anthropic, OpenAI, Google, xAI or Moonshot AI. Claude, Codex, Antigravity, Grok and Kimi are trademarks of their respective owners, used here only to name the services Headroom reads. This project is the npm package <code>headroomd</code> (repository Apertur3/headroom) and is not related to other projects named Headroom, for example the context-compression library headroomlabs-ai/headroom. Several sources are read through undocumented vendor endpoints with your own login: see <a href="#vendor-endpoints-and-your-accounts">Vendor endpoints and your accounts</a>.</sub></p>
 
 ---
 
@@ -52,11 +54,12 @@
 
 ## Install in 30 seconds
 
-Node 22.13 or newer.
+Node 22.13 or newer. The npm package is `headroomd`; the Homebrew formula is
+`apertur3/tap/headroom`. Both install the `headroom` command.
 
 ```sh
-# or: brew install apertur3/tap/headroom
 npm install -g headroomd
+# or, on macOS and Linux: brew install apertur3/tap/headroom
 # finds your logins, runs the doctor, asks before each change
 headroom setup
 # one line per meter
@@ -106,8 +109,11 @@ CLAUDE_CONFIG_DIR=~/.claude2 claude mcp add --scope user headroom -- headroom mc
 Codex and Gemini agents call the CLI. Copy `skills/headroom/SKILL.md` into your skills directory.
 Full walkthrough, including what each step grants and why: [docs/quickstart.md](docs/quickstart.md).
 
-`status`/`doctor` print a one-line notice when a newer `headroomd` is out; run `headroom update`
-(never automatic) to install it -- see [Staying up to date](docs/quickstart.md#staying-up-to-date).
+`status`/`doctor` check the npm registry at most once a day (a plain GET of the `headroomd`
+version, no account data) and print a one-line notice when a newer `headroomd` is out; run
+`headroom update` (never automatic) to install it. Set `update_check = false` in
+`~/.headroom/policy.toml` to turn the check off -- see
+[Staying up to date](docs/quickstart.md#staying-up-to-date).
 
 </details>
 
@@ -122,7 +128,7 @@ in an afternoon. Headroom combines vendor readings with cooperative reservations
 is stale or failed it says UNKNOWN, and UNKNOWN never counts as capacity.
 
 One daemon reads quota across Claude, Codex, Antigravity, Grok, Kimi, and local vLLM or llama.cpp
-pools, keeps history, and detects resets. Antigravity support is experimental.
+pools, keeps history, and detects resets. Antigravity and Grok support is experimental.
 
 <p align="center">
   <img alt="Terminal card: headroom prints one line per meter with percent used, reset time and pace state" src="docs/assets/headroom-terminal.svg" width="760">
@@ -178,14 +184,14 @@ releases the reservation. Runnable examples against synthetic data are in [`exam
 <tr>
 <td valign="top"><b>Reservations</b><br>Leases and per-meter reserves, so two agents cannot spend the same points (<code>run</code>, <code>can --lease</code>).</td>
 <td valign="top"><b>Fails closed</b><br>A stale or failed reading prints UNKNOWN. UNKNOWN never counts as capacity.</td>
-<td valign="top"><b>Local only</b><br>A daemon on a 0600 socket (a named pipe on Windows), secrets in the OS store, no telemetry.</td>
+<td valign="top"><b>Local only</b><br>A daemon on a 0600 socket (a named pipe on Windows), Headroom's own secrets in the OS store, no telemetry. One npm update check a day, off with <code>update_check = false</code>.</td>
 </tr>
 </table>
 
 <table>
 <tr>
 <td><b>Reads</b></td>
-<td>Claude &middot; Codex &middot; Antigravity (experimental) &middot; Grok &middot; Kimi &middot; local vLLM &middot; local llama.cpp</td>
+<td>Claude &middot; Codex &middot; Antigravity (experimental) &middot; Grok (experimental) &middot; Kimi &middot; local vLLM &middot; local llama.cpp</td>
 </tr>
 <tr>
 <td><b>Called from</b></td>
@@ -300,6 +306,7 @@ Each of these is a rule the code enforces and a test pins. Past real-world break
 | Linux | CI on Ubuntu; cold install also checked by hand on ARM64 |
 | Windows | **Experimental.** Tests run in CI and 0.2.4 was installed on a Windows 11 machine. Reading a real Claude login, MCP registration and the process watchdog are not verified, and the service fix in [#110](https://github.com/Apertur3/headroom/pull/110) is not re-verified on a real machine. Full detail below |
 | Antigravity | Experimental. Depends on a private local endpoint that the vendor can change |
+| Grok | Experimental. Reads the Grok CLI's undocumented chat-proxy endpoint and presents itself as the Grok CLI |
 
 <details>
 <summary>The full table: tests, CI, install checks, Windows, vendor endpoints</summary>
@@ -332,7 +339,13 @@ Antigravity is experimental and supported on macOS 14 or later: it requires a lo
 macOS reader, verified by SHA-256 before use. Gemini CLI is not required or supported for consumer subscriptions;
 Google retired that access on June 18, 2026.
 
-For Antigravity, Headroom reads agy's local quota summary without reading its token.
+For Antigravity quota, the bundled macOS reader finds the running Antigravity language server
+(the daemon-kept `agy`) in the process list, takes its local port and, where the process has one,
+the local CSRF token from its command line, and asks that server on 127.0.0.1 for its quota
+summary. It does not read agy's OAuth or session credential. The daemon also reads the tail of
+agy's newest log under `~/.gemini/antigravity-cli/log` for login-state markers only. The optional
+Antigravity model-list check is off by default and is the one path that uses the Gemini CLI's
+OAuth file; see [Vendor endpoints and your accounts](#vendor-endpoints-and-your-accounts).
 Missing or failed summaries stay UNKNOWN. An idle window with real fractions may carry
 a doubt marker when its reset time looks synthetic. A five-hour window entirely absent
 from an otherwise-successful response (a genuinely idle rolling window) prints `n/a`
@@ -387,16 +400,44 @@ See [`examples/`](examples) for the scripts and the starter `accounts.toml`, `po
 - [docs/json-contract.md](docs/json-contract.md): the versioned field-by-field shape of every `--json` output and MCP tool result, and its compatibility promise
 - [docs/vendors.md](docs/vendors.md): what Headroom reads per vendor, and its known live limitations
 
+## Vendor endpoints and your accounts
+
+Several adapters read usage endpoints that the vendors do not document as public APIs. Headroom
+calls them with your own credentials, taken from the vendor CLIs you installed and signed in to on
+the same machine, and only to read usage: it sends no prompts, changes no account settings, and
+never writes to another tool's credential store. Use it only with accounts you own. Vendor terms
+may restrict this kind of access, and a vendor can change or block an endpoint at any time; use it
+at your own risk. Headroom does not rotate credentials to get past a block or a limit.
+
+| Source | What Headroom calls | Credential | Documented by the vendor |
+|---|---|---|---|
+| Claude, statusline snapshot (preferred) | No network call: reads the JSON Claude Code passes to its `statusLine` command | None | Not applicable (local) |
+| Claude, usage probe | `GET api.anthropic.com/api/oauth/usage` | Claude Code's OAuth token, from the macOS Keychain or `.credentials.json` | No. Sends `User-Agent: claude-code/2.1.0` |
+| Codex | `GET chatgpt.com/backend-api/wham/usage` and `.../wham/rate-limit-reset-credits`; also the Codex CLI's local session logs | ChatGPT token in `~/.codex/auth.json` | No. Sends `User-Agent: CodexBar`; the credits call also sends `originator: Codex Desktop` |
+| Antigravity quota (experimental) | agy's local language server on 127.0.0.1 | agy's local CSRF token from its process command line, where present; not agy's OAuth or session credential | No (private local endpoint) |
+| Antigravity model list (experimental, off by default) | `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` and `:fetchAvailableModels`, at most hourly | The Gemini CLI's OAuth file `~/.gemini/oauth_creds.json`; an expired token is refreshed in memory at `oauth2.googleapis.com` with the OAuth client found in the installed Gemini CLI, never written back | No. Sends `User-Agent: antigravity` and `ideType: ANTIGRAVITY`. Enable only with `antigravity_model_catalog = true` in `policy.toml` |
+| Grok (experimental) | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` and `/v1/settings` | Bearer token from `~/.grok/auth.json` (written by `grok login`) | No. Sends `x-xai-token-auth: xai-grok-cli`, the value the Grok CLI sends, so the request presents itself as the Grok CLI |
+| Kimi, CLI credential | `GET api.kimi.com/coding/v1/usages` | Access token from `~/.kimi-code/credentials/kimi-code.json` | No. Sends `x-msh-platform: kimi_code_cli` |
+| Kimi, manual token | The `www.kimi.com/apiv2` web gateway | A `kimi-auth` web session token you save yourself to a 0600 file (default `~/.kimi/auth.token`) | No |
+| Kimi, optional balance | `GET api.moonshot.ai/v1/users/me/balance` | A Moonshot API key you save to a 0600 `moonshot.key` file | Yes (Moonshot platform API) |
+| Local vLLM, llama.cpp | Your own server at the `base_url` you configure | None from a vendor | Not applicable |
+
+Per-vendor detail: [docs/vendors.md](docs/vendors.md).
+
 ## Security
 
-No secret touches disk or output. On macOS `headroom-claude-probe` reads the Claude Keychain token
+Headroom never writes a secret to disk or to output. On macOS `headroom-claude-probe` reads the Claude Keychain token
 through `/usr/bin/security`, which the Keychain item's own access list admits, and makes the usage
 request itself, so the token never enters Node or stdout and no dialog is needed. It ships
 inside the npm package as a universal binary, verified against a recorded SHA-256 before every use.
 Tokens are otherwise read at call time from the Keychain or the vendor's own credential file and
 dropped after the request. The daemon listens on a 0600 local
-socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry, the engine
-is pinned and checksum verified, and every query lands in an audit log. Details in [SECURITY.md](SECURITY.md).
+socket on macOS and Linux, or a current-user Windows named pipe. There is no telemetry. Apart from
+the vendors you configure and the notification channels you enable, the only request Headroom
+makes unprompted is the daily npm version check above, a plain GET with no account data
+(`update_check = false` turns it off); `headroom update` and `headroom engine install` contact npm
+and GitHub only when you run them. The engine is pinned and checksum verified, and every query
+lands in an audit log. Details in [SECURITY.md](SECURITY.md).
 
 
 ## Status

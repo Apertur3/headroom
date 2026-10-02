@@ -9,6 +9,12 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - Overlong Unix socket paths now name the path, UTF-8 byte length, platform limit and shorter `HEADROOM_HOME` remedy instead of a bare `listen EINVAL`. `headroom doctor` reports the same diagnostic and continues its other checks (#105). Windows named pipes are unchanged.
 
+### Changed
+- The Antigravity model-list check, which reads the Gemini CLI's OAuth file and calls Google's Code Assist `fetchAvailableModels`, is now off by default. Set `antigravity_model_catalog = true` in `policy.toml` to turn it back on. Antigravity quota is unaffected.
+
+### Documentation
+- README: a not-affiliated notice, a "Vendor endpoints and your accounts" section listing each endpoint, credential and client header, Grok marked experimental, and exact wording for the Antigravity reader and the opt-out npm update check. SECURITY.md rules 5, 9 and 12 and THIRD_PARTY_NOTICES.md updated to match.
+
 ## [0.2.5] - 2026-10-02
 
 ### Fixed

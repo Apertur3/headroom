@@ -64,8 +64,11 @@ cookies, which unlock paid subscriptions.
    The packaged macOS native reader is part of the npm artifact, whose integrity and provenance
    cover both binary and digest. Each resolution checks the digest, regular file types, ownership
    and permissions under the package root. A missing digest, changed binary or unsafe path fails
-   closed; it never falls through to an unverified development build. Antigravity uses agy
-   through its local quota summary and does not read Gemini CLI OAuth credentials.
+   closed; it never falls through to an unverified development build. Antigravity quota uses agy
+   through its local quota summary (a local CSRF token from agy's process command line, where
+   present; never agy's OAuth or session credential). Only the optional Antigravity model-list
+   check reads the Gemini CLI's OAuth file, and it is off unless `antigravity_model_catalog = true`
+   is set in `policy.toml`.
 6. **No debug surfaces in release.** No debug endpoints, no source maps (disabled in the build,
    `sourceMap`/`declarationMap` both false), no verbose stack traces to clients.
 7. **Audit log.** Every query to the daemon, every scheduled vendor poll (Claude's own probe
@@ -76,7 +79,12 @@ cookies, which unlock paid subscriptions.
    returned, not silently dropped.
 8. **Dependencies pinned and audited.** Lockfile committed, `npm audit` in CI, minimal dependency
    set.
-9. **No telemetry.** Headroom phones home to nothing.
+9. **No telemetry, one opt-out update check.** Headroom sends no analytics, crash reports or usage
+   data anywhere. Apart from the vendors you configure and the notification channels you enable,
+   the only request it makes unprompted is a once-a-day npm registry version check from `status`
+   and `doctor` (a plain `GET registry.npmjs.org/headroomd/latest`, no account data); set
+   `update_check = false` in `policy.toml` to disable it. `headroom update` and `headroom engine
+   install` contact npm and GitHub only when you run them.
 10. **Keychain read path.** On macOS, `headroom-claude-probe` reads the Claude credential and
     performs the Anthropic request itself. It prints only bounded usage JSON; tokens, refresh
     tokens, and email never cross to Node, and nothing writes the token anywhere -- the probe
@@ -124,7 +132,11 @@ cookies, which unlock paid subscriptions.
     Keychain probe drives its request through a `URLSessionDataDelegate` that does the same,
     cancelling the task mid-response rather than accumulating a full oversized reply first.
 12. **Outbound allowlist.** Credential-backed requests only target `api.anthropic.com`,
-    `chatgpt.com`, the Google OAuth/Code Assist hosts, and configured local base URLs. Proxy
+    `chatgpt.com`, the Google OAuth/Code Assist hosts (used only by the opt-in Antigravity
+    model-list check), `cli-chat-proxy.grok.com`, `www.kimi.com`, `api.kimi.com`,
+    `api.moonshot.ai`, and configured local base URLs. The same allowlist admits
+    `registry.npmjs.org` and `api.github.com` for the update check and release notes, which carry
+    no credential. Proxy
     environment variables are ignored unless a `proxy` value is explicitly set in `policy.toml`:
     the `headroom` launcher (`bin/headroom.js`) strips them from the child process's environment
     *before* spawning Node, because Node decides whether to install an env-driven proxy dispatcher
