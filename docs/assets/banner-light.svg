@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 240" width="900" height="240" role="img" aria-label="headroom: A fuel gauge for AI coding agents.">
+  <g transform="translate(190,24) scale(1.3)"><g fill="none" stroke-linecap="round">
+    <path d="M8.00,62.00 A52,52 0 0 1 112.00,62.00" stroke="#d0d7de" stroke-width="9"/>
+    <path d="M8.00,62.00 A52,52 0 0 1 92.01,21.02" stroke="#d1570a" stroke-width="9"/>
+    <g stroke="#1f2328" stroke-width="2.5"><line x1="24.00" y1="62.00" x2="18.00" y2="62.00"/><line x1="34.54" y1="36.54" x2="30.30" y2="32.30"/><line x1="60.00" y1="26.00" x2="60.00" y2="20.00"/><line x1="85.46" y1="36.54" x2="89.70" y2="32.30"/><line x1="96.00" y1="62.00" x2="102.00" y2="62.00"/></g>
+    <line x1="60" y1="62" x2="84.63" y2="30.48" stroke="#1f2328" stroke-width="5"/>
+    <circle cx="60" cy="62" r="7" fill="#1f2328" stroke="none"/>
+  </g></g>
+  <text x="352" y="104" fill="#1f2328" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="84" font-weight="600" letter-spacing="-2">headroom</text>
+  <text x="450" y="154" fill="#59636e" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" text-anchor="middle">A fuel gauge for AI coding agents.</text>
+  <g transform="translate(282,182)"><rect width="92" height="34" rx="17" fill="#f6f8fa" stroke="#d0d7de"/><circle cx="19" cy="17" r="5" fill="#2da44e"/><text x="32" y="22.5" fill="#1f2328" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="700">YES</text></g><g transform="translate(386,182)"><rect width="82" height="34" rx="17" fill="#f6f8fa" stroke="#d0d7de"/><circle cx="19" cy="17" r="5" fill="#cf222e"/><text x="32" y="22.5" fill="#1f2328" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="700">NO</text></g><g transform="translate(480,182)"><rect width="138" height="34" rx="17" fill="#f6f8fa" stroke="#d0d7de"/><circle cx="19" cy="17" r="5" fill="#bf8700"/><text x="32" y="22.5" fill="#1f2328" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="15" font-weight="700">UNKNOWN</text></g>
+</svg>

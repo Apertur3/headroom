@@ -1,13 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
   <rect width="1280" height="640" fill="#0d1117"/>
-  <g transform="translate(120,150) scale(3.4)"><g stroke="#e6edf3" stroke-width="7" stroke-linecap="round" fill="none">
-    <line x1="10" y1="12" x2="54" y2="12" stroke="#f0883e"/>
-    <line x1="18" y1="24" x2="18" y2="56"/>
-    <line x1="46" y1="24" x2="46" y2="56"/>
-    <line x1="18" y1="42" x2="46" y2="42"/>
+  <g transform="translate(110,150) scale(2.6)"><g fill="none" stroke-linecap="round">
+    <path d="M8.00,62.00 A52,52 0 0 1 112.00,62.00" stroke="#30363d" stroke-width="9"/>
+    <path d="M8.00,62.00 A52,52 0 0 1 92.01,21.02" stroke="#f0883e" stroke-width="9"/>
+    <g stroke="#e6edf3" stroke-width="2.5"><line x1="24.00" y1="62.00" x2="18.00" y2="62.00"/><line x1="34.54" y1="36.54" x2="30.30" y2="32.30"/><line x1="60.00" y1="26.00" x2="60.00" y2="20.00"/><line x1="85.46" y1="36.54" x2="89.70" y2="32.30"/><line x1="96.00" y1="62.00" x2="102.00" y2="62.00"/></g>
+    <line x1="60" y1="62" x2="84.63" y2="30.48" stroke="#e6edf3" stroke-width="5"/>
+    <circle cx="60" cy="62" r="7" fill="#e6edf3" stroke="none"/>
   </g></g>
-  <text x="380" y="300" fill="#e6edf3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="120" font-weight="600" letter-spacing="-2">headroom</text>
-  <text x="384" y="370" fill="#9da7b3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="36">Your agents check the meter before they spend it.</text>
-  <text x="384" y="430" fill="#9da7b3" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="28">can / gate / route, from your real plan limits</text>
-  <text x="384" y="480" fill="#6e7681" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="24">Claude  Codex  Antigravity  Grok  Kimi  local pools</text>
+  <text x="440" y="300" fill="#e6edf3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="120" font-weight="600" letter-spacing="-2">headroom</text>
+  <text x="444" y="370" fill="#9da7b3" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="36">A fuel gauge for AI coding agents.</text>
+  <text x="444" y="430" fill="#9da7b3" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="28">can / gate / route, from your real plan limits</text>
+  <text x="444" y="480" fill="#6e7681" font-family="SFMono-Regular,Menlo,Consolas,monospace" font-size="24">Claude  Codex  Antigravity  Grok  Kimi  local pools</text>
 </svg>
