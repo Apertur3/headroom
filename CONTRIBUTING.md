@@ -69,6 +69,8 @@ keep the JSON contract and examples aligned, and check relative documentation li
   the failing test.
 - `npm run lint`, `npm test` and `bash scripts/privacy-sweep.sh` pass locally. CI repeats them on
   macOS, Ubuntu and Windows.
+- A docs-only pull request (README, CHANGELOG, `docs/` and the other files `scripts/ci-scope.sh`
+  allows) runs a fast subset: lint, the audits and the doc-reading tests. Any code change runs the full matrix.
 - Use fake clocks and injected dependencies, not wall-clock sleeps. Timing races have been the
   main source of flaky tests here.
 - Update the docs and `CHANGELOG.md` (under an `Unreleased` heading) when behavior changes. The
