@@ -466,7 +466,9 @@ headroomd 0.2.0 is available; run: headroom update
 That check sends nothing but the package name -- no account identifiers, no telemetry -- and a
 failed check is silent (never delays a status line; at most a debug line in `headroom logs
 --tail`). Set `update_check = false` in `policy.toml` to turn it, and the network call behind it,
-off entirely.
+off entirely. The request is a plain `GET https://registry.npmjs.org/headroomd/latest`; the
+registry sees your IP address, as with any npm request. It is the only request Headroom makes
+unprompted apart from the vendors you configure and the notification channels you enable.
 
 Run the update yourself:
 

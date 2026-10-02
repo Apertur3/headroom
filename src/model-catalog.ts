@@ -16,9 +16,11 @@
  *  - Claude: Claude Code's own local model-catalog cache under the config
  *    dir (`cache/model-catalog/*.json`), one file per token the CLI has
  *    used; the newest by `fetchedAt` wins. No network call at all.
- *  - Antigravity: `cloudcode-pa.googleapis.com`'s `fetchAvailableModels`,
- *    the same host, credential and project id `observeAntigravity` already
- *    uses for `loadCodeAssist`/`retrieveUserQuota`.
+ *  - Antigravity (opt-in, `antigravity_model_catalog = true` in policy.toml):
+ *    `cloudcode-pa.googleapis.com`'s `fetchAvailableModels`, authenticated
+ *    with the Gemini CLI's own OAuth file (`~/.gemini/oauth_creds.json`).
+ *    That is a different credential from the one agy uses for quota, so it is
+ *    off by default and nothing here opens that file unless the caller opts in.
  *
  * A vendor with no available source (Claude with no catalog cache yet,
  * Codex with no `models_cache.json`) is reported as `undefined`, never an
@@ -149,6 +151,9 @@ export interface ModelAvailabilityDependencies {
   readCodexModelCatalog?: typeof readCodexModelCatalog;
   readClaudeModelCatalog?: typeof readClaudeModelCatalog;
   fetchAntigravityModelCatalog?: typeof fetchAntigravityModelCatalog;
+  /** `policy.antigravity_model_catalog`. Absent or false: Antigravity
+   * principals are skipped before any file read or network call. */
+  antigravityModelCatalog?: boolean;
 }
 
 /** Model lists change rarely; this is checked independently of the ordinary
@@ -179,6 +184,9 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
     // but this guard makes a parked principal safe even for a new caller.
     if (!isAccountEnabled(account)) continue;
     if (account.vendor !== "codex" && account.vendor !== "claude" && account.vendor !== "antigravity") continue;
+    // Opt-in only: the Antigravity catalog call reads the Gemini CLI's OAuth
+    // file, so without explicit consent it is skipped before the claim below.
+    if (account.vendor === "antigravity" && dependencies.antigravityModelCatalog !== true) continue;
     const key = daemonStateKey(account.name);
     // Claim before the reader's first await. This is a BEGIN IMMEDIATE
     // transaction in the store, so overlapping daemon polls and direct CLI
