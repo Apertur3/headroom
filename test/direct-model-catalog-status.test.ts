@@ -61,7 +61,8 @@ describe("direct status model catalog check", () => {
         // A cold Windows runner can take well over vi.waitFor's 1 s default
         // just to open the store and poll; give it a realistic budget.
         await vi.waitFor(() => expect(mocks.checkModelAvailability).toHaveBeenCalledTimes(1), { timeout: 15_000, interval: 20 });
-        expect(mocks.checkModelAvailability).toHaveBeenCalledWith(expect.anything(), [account]);
+        // No policy.toml here, so the Antigravity catalog opt-in is off.
+        expect(mocks.checkModelAvailability).toHaveBeenCalledWith(expect.anything(), [account], { antigravityModelCatalog: false });
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]).observations).toHaveLength(1);
         release?.();
