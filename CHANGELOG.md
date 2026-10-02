@@ -6,7 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-02
+
 ### Changed
+- Releases published as 0.2.5 read the Gemini CLI OAuth file for the Antigravity model list by default; 0.2.6 makes that opt-in.
 - The Antigravity model-list check, which reads the Gemini CLI's OAuth file and calls Google's Code Assist `fetchAvailableModels`, is now off by default. Set `antigravity_model_catalog = true` in `policy.toml` to turn it back on. Antigravity quota is unaffected.
 
 ### Documentation
