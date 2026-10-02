@@ -351,6 +351,12 @@ scroll the same content stream. Colour requires a terminal; `NO_COLOR` or `--no-
 
 ## 6. Install the daemon
 
+On POSIX, the complete socket path (`<HEADROOM_HOME>/headroom.sock`) must fit in
+103 UTF-8 bytes on macOS or 107 bytes on Linux. An overlong path reports its
+length and limit; set `HEADROOM_HOME` to a shorter directory. `headroom doctor`
+reports the same error without stopping its other diagnostics. Windows uses
+named pipes and is unaffected by this Unix socket limit.
+
 ```sh
 headroom install-service
 ```

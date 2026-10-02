@@ -113,7 +113,14 @@ export function socketPath(home = headroomHome(), platform = process.platform, u
     const homeDigest = sha256Hex(canonicalizeHomeForPipe(home, platform)).slice(0, 8);
     return `\\\\.\\pipe\\headroom-${username}-${homeDigest}`;
   }
-  return joinForPlatform(platform, home, "headroom.sock");
+  const path = joinForPlatform(platform, home, "headroom.sock");
+  // sun_path includes a terminating NUL: 104 bytes on macOS, 108 on Linux.
+  const limit = platform === "darwin" ? 103 : 107;
+  const bytes = Buffer.byteLength(path, "utf8");
+  if (bytes > limit) {
+    throw new Error(`Headroom socket path "${path}" is ${bytes} bytes; the limit is ${limit} bytes on ${platform}. Set HEADROOM_HOME to a shorter directory.`);
+  }
+  return path;
 }
 
 const SESSION_FILE = "pipe-session-token";

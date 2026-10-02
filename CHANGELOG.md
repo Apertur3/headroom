@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Overlong Unix socket paths now name the path, UTF-8 byte length, platform limit and shorter `HEADROOM_HOME` remedy instead of a bare `listen EINVAL`. `headroom doctor` reports the same diagnostic and continues its other checks (#105). Windows named pipes are unchanged.
+
 ## [0.2.5] - 2026-10-02
 
 ### Fixed

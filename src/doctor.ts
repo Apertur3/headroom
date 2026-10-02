@@ -373,38 +373,45 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
   output.push(await antigravityOrphanCheck());
   output.push(await hostPressureCheck(checkHostHealth, await readHostGuardPolicy(home)));
 
-  const daemon = await daemonRequest(socketPath(), "health");
-  if (daemon.status === "available") {
-    output.push(check("OK", "daemon socket", socketPath(), "no action needed"));
-    output.push(check("OK", "daemon health", "responding", "no action needed"));
-    const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; external_server?: boolean; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
-    const antigravity = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
-    const keepalive = health.keepalive;
-    if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
-    else if (!keepaliveEnabled) output.push(check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
-    else if (keepalive?.running && keepalive.pid) {
-      const local = antigravity ? keepalive.local_reads?.[antigravity.name] : undefined;
-      const uptime = keepalive.uptime_ms === undefined || keepalive.uptime_ms === null ? "?" : `${Math.floor(keepalive.uptime_ms / 1000)}s`;
-      const read = local ? `; local ${local.outcome ?? "unknown"} (${local.payload_kind ?? "unknown"})` : "; local read not recorded yet";
-      const state = keepalive.login_state === "logged_in" ? "logged in" : keepalive.login_state === "not_logged_in" ? "not logged in" : "login state pending";
-      const level: DoctorLevel = keepalive.login_state !== "logged_in" || local?.outcome !== "fresh" ? "WARN" : "OK";
-      const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : local?.outcome === "fresh" ? "no action needed" : "check the Antigravity local reader above and headroom logs";
-      output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
+  let path: string | undefined;
+  try { path = socketPath(home); }
+  catch (error) {
+    output.push(check("FAIL", "daemon socket", safeError(error), "set HEADROOM_HOME to a shorter directory"));
+  }
+  if (path !== undefined) {
+    const daemon = await daemonRequest(path, "health");
+    if (daemon.status === "available") {
+      output.push(check("OK", "daemon socket", path, "no action needed"));
+      output.push(check("OK", "daemon health", "responding", "no action needed"));
+      const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; external_server?: boolean; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
+      const antigravity = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
+      const keepalive = health.keepalive;
+      if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));
+      else if (!keepaliveEnabled) output.push(check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
+      else if (keepalive?.running && keepalive.pid) {
+        const local = antigravity ? keepalive.local_reads?.[antigravity.name] : undefined;
+        const uptime = keepalive.uptime_ms === undefined || keepalive.uptime_ms === null ? "?" : `${Math.floor(keepalive.uptime_ms / 1000)}s`;
+        const read = local ? `; local ${local.outcome ?? "unknown"} (${local.payload_kind ?? "unknown"})` : "; local read not recorded yet";
+        const state = keepalive.login_state === "logged_in" ? "logged in" : keepalive.login_state === "not_logged_in" ? "not logged in" : "login state pending";
+        const level: DoctorLevel = keepalive.login_state !== "logged_in" || local?.outcome !== "fresh" ? "WARN" : "OK";
+        const fix = keepalive.login_state === "not_logged_in" ? "run: agy" : local?.outcome === "fresh" ? "no action needed" : "check the Antigravity local reader above and headroom logs";
+        output.push(check(level, "Antigravity keepalive", `agy: pid ${keepalive.pid}, up ${uptime}, ${state}${read}`, fix));
+      }
+      else if (keepalive?.external_server) output.push(check("OK", "Antigravity keepalive", "reads served by the running Antigravity app; keepalive not needed", "no action needed"));
+      else output.push(check("WARN", "Antigravity keepalive", "agy is not running; its local summary is required", "run: agy and check headroom logs"));
+    } else {
+      // A missing daemon never blocks reading a configured principal -- every
+      // CLI/MCP entry point falls back to a direct read -- so it is a WARN, not
+      // a FAIL. A socket that exists but does not answer health is different:
+      // requestDaemon() throws on that state instead of falling back, which
+      // does block a read, so it stays FAIL.
+      const level: DoctorLevel = daemon.status === "absent" ? "WARN" : "FAIL";
+      output.push(check(level, "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
+      output.push(check(level, "daemon health", daemon.status === "absent" ? "not available" : "present but unresponsive", "headroom install-service"));
+      if (accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) output.push(keepaliveEnabled
+        ? check("WARN", "Antigravity keepalive", "cannot inspect agy without a healthy daemon", "headroom install-service")
+        : check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
     }
-    else if (keepalive?.external_server) output.push(check("OK", "Antigravity keepalive", "reads served by the running Antigravity app; keepalive not needed", "no action needed"));
-    else output.push(check("WARN", "Antigravity keepalive", "agy is not running; its local summary is required", "run: agy and check headroom logs"));
-  } else {
-    // A missing daemon never blocks reading a configured principal -- every
-    // CLI/MCP entry point falls back to a direct read -- so it is a WARN, not
-    // a FAIL. A socket that exists but does not answer health is different:
-    // requestDaemon() throws on that state instead of falling back, which
-    // does block a read, so it stays FAIL.
-    const level: DoctorLevel = daemon.status === "absent" ? "WARN" : "FAIL";
-    output.push(check(level, "daemon socket", daemon.status === "absent" ? "not found" : "present but unresponsive", "headroom install-service"));
-    output.push(check(level, "daemon health", daemon.status === "absent" ? "not available" : "present but unresponsive", "headroom install-service"));
-    if (accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) output.push(keepaliveEnabled
-      ? check("WARN", "Antigravity keepalive", "cannot inspect agy without a healthy daemon", "headroom install-service")
-      : check("OK", "Antigravity keepalive", "disabled by policy; no agy process expected", "set antigravity_keepalive = true to enable warm local summaries"));
   }
 
   output.push(await configCheck("policy", join(home, "policy.toml")));
