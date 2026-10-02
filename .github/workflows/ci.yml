@@ -15,8 +15,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Docs-only fast path. docs_only=true only for a pull_request whose merge
+      # commit changes nothing but allowlisted docs (see scripts/ci-scope.sh);
+      # pushes, tags, and any doubt or error run the full matrix. The decision
+      # uses the base branch's copy of the script (first parent of the merge
+      # commit), never the copy under review, so a PR cannot widen its own
+      # fast path. Every job still reports, so the required checks stay green.
+      - name: Decide CI scope
+        id: scope
+        shell: bash
+        run: |
+          out=docs_only=false
+          script="$(mktemp)"
+          if git show 'HEAD^1:scripts/ci-scope.sh' > "$script" 2>/dev/null; then
+            out="$(bash "$script")" || out=docs_only=false
+          else
+            echo "full CI: no base-branch copy of scripts/ci-scope.sh"
+          fi
+          rm -f "$script"
+          [ "$out" = docs_only=true ] || out=docs_only=false
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
       - name: Select Swift 6.2 toolchain
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.scope.outputs.docs_only != 'true'
         run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
       - uses: actions/setup-node@v4
         with:
@@ -26,7 +47,19 @@ jobs:
       - run: npm audit --audit-level=high
       - run: bash scripts/public-audit.sh
       - run: npm run lint
-      - run: bash scripts/privacy-sweep.sh
-      - run: npm test
-      - run: npm run build
-      - run: npm pack --dry-run
+      # Packs the tarball, which on macOS builds the Swift engine (prepack).
+      # A docs-only run keeps it on Linux only.
+      - if: steps.scope.outputs.docs_only != 'true' || runner.os == 'Linux'
+        run: bash scripts/privacy-sweep.sh
+      # The tests that read tracked docs: the retired-brand scan over every
+      # tracked file and the docs/homebrew-tap-seed formula check. Add any new
+      # test that reads README, docs/ or the other allowlisted files here.
+      - name: Doc-reading tests (docs-only fast path)
+        if: steps.scope.outputs.docs_only == 'true'
+        run: npx vitest run test/rename.test.ts test/homebrew-formula.test.ts
+      - if: steps.scope.outputs.docs_only != 'true'
+        run: npm test
+      - if: steps.scope.outputs.docs_only != 'true'
+        run: npm run build
+      - if: steps.scope.outputs.docs_only != 'true'
+        run: npm pack --dry-run
