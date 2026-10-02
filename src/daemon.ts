@@ -113,13 +113,28 @@ export function socketPath(home = headroomHome(), platform = process.platform, u
     const homeDigest = sha256Hex(canonicalizeHomeForPipe(home, platform)).slice(0, 8);
     return `\\\\.\\pipe\\headroom-${username}-${homeDigest}`;
   }
-  const path = joinForPlatform(platform, home, "headroom.sock");
-  // sun_path includes a terminating NUL: 104 bytes on macOS, 108 on Linux.
+  return joinForPlatform(platform, home, "headroom.sock");
+}
+
+/** Why a Unix socket path cannot be bound, or undefined when it can. sun_path
+ * includes a terminating NUL: 104 bytes on macOS, 108 on Linux. A Windows
+ * named pipe has no such limit. Clients use this to treat an overlong path as
+ * "no daemon" (and fall back to a direct read, as before); only the daemon
+ * itself and `headroom doctor` turn it into an error. */
+export function socketPathProblem(path: string, platform = process.platform): string | undefined {
+  if (platform === "win32") return undefined;
   const limit = platform === "darwin" ? 103 : 107;
   const bytes = Buffer.byteLength(path, "utf8");
-  if (bytes > limit) {
-    throw new Error(`Headroom socket path "${path}" is ${bytes} bytes; the limit is ${limit} bytes on ${platform}. Set HEADROOM_HOME to a shorter directory.`);
-  }
+  if (bytes <= limit) return undefined;
+  return `Headroom socket path "${path}" is ${bytes} bytes; the limit is ${limit} bytes on ${platform}. Set HEADROOM_HOME to a shorter directory.`;
+}
+
+/** socketPath() for the daemon's own listen: throws the explanation instead of
+ * letting listen() fail with a bare EINVAL. */
+export function checkedSocketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
+  const path = socketPath(home, platform, username);
+  const problem = socketPathProblem(path, platform);
+  if (problem) throw new Error(problem);
   return path;
 }
 
@@ -341,7 +356,10 @@ export class HeadroomDaemon {
 
   static async create(options: { home?: string; path?: string; poller?: Poller; keepalive?: AgyKeepaliveSupervisor; connectionLimits?: Partial<ConnectionLimits>; deliveryTimeoutMs?: number } = {}): Promise<HeadroomDaemon> {
     const home = await safeHeadroomDirectory(options.home);
-    return new HeadroomDaemon(await HeadroomStore.open(home), options.path ?? socketPath(home), options.poller ?? pollAccounts, home, options.keepalive, { ...DEFAULT_CONNECTION_LIMITS, ...options.connectionLimits }, options.deliveryTimeoutMs);
+    const path = options.path ?? socketPath(home);
+    const problem = socketPathProblem(path);
+    if (problem) throw new Error(problem);
+    return new HeadroomDaemon(await HeadroomStore.open(home), path,options.poller ?? pollAccounts, home, options.keepalive, { ...DEFAULT_CONNECTION_LIMITS, ...options.connectionLimits }, options.deliveryTimeoutMs);
   }
 
   async start(): Promise<void> {
@@ -1671,6 +1689,9 @@ export async function daemonRequest(path: string, method: string, params: Json =
   | { status: "unresponsive" }
 > {
   if (signal?.aborted) return { status: "absent" };
+  // No daemon can listen on an overlong path, so there is nothing to dial:
+  // every caller then takes its usual no-daemon fallback.
+  if (socketPathProblem(path)) return { status: "absent" };
   // Mutual auth (win32 only) is verified entirely inside rpc() itself now: a
   // reply -- health included -- whose transcript proof does not check out
   // comes back as `undefined`, indistinguishable here from no daemon

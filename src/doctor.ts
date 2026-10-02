@@ -8,7 +8,7 @@ import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
-import { daemonRequest, socketPath } from "./daemon.js";
+import { checkedSocketPath, daemonRequest } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
@@ -374,7 +374,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
   output.push(await hostPressureCheck(checkHostHealth, await readHostGuardPolicy(home)));
 
   let path: string | undefined;
-  try { path = socketPath(home); }
+  try { path = checkedSocketPath(home); }
   catch (error) {
     output.push(check("FAIL", "daemon socket", safeError(error), "set HEADROOM_HOME to a shorter directory"));
   }

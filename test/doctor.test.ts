@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { adapterCheck, antigravityOrphanCheck, doctorChecks, doctorFileStatus, homeCheck, hostPressureCheck } from "../src/doctor.js";
-import { socketPath } from "../src/daemon.js";
+import { checkedSocketPath } from "../src/daemon.js";
 import { defaultHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "../src/host-health.js";
 import type { ProcessEntry } from "../src/process-tree.js";
 import { HeadroomStore } from "../src/store.js";
@@ -14,7 +14,7 @@ it.skipIf(process.platform === "win32")("doctor reports an overlong socket path 
   const root = await mkdtemp(join(tmpdir(), "hr-doctor-")); temporary.push(root);
   const home = join(root, "a".repeat(110));
   let message = "";
-  try { socketPath(home); } catch (error) { message = (error as Error).message; }
+  try { checkedSocketPath(home); } catch (error) { message = (error as Error).message; }
   vi.stubEnv("HEADROOM_HOME", home);
   try {
     const checks = await doctorChecks();
