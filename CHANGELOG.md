@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.5] - 2026-10-02
+
+### Fixed
+- `headroom setup --yes` keeps an existing `accounts.toml` instead of rewriting it, and explains that a `claude mcp add` exit saying the server already exists means it is already registered (#103).
+- Windows: `install-service` writes the scheduled-task XML as UTF-16 so `schtasks` accepts it. `headroom doctor` no longer reports a Claude credential file as present when it holds only MCP tokens and no login. `keychain grant` says there is nothing to grant on Windows. Claude sign-in hints include PowerShell and cmd forms (#110).
+- `headroom doctor` names the actual `HEADROOM_HOME` path in the home permissions fix (#111, thanks @DYNOSuprovo).
+- `public-audit` skips GitHub's synthetic PR merge commit in its identity check, and CI fetches full history for it (#114, #115).
+
+### Documentation
+- Agents that wait should block in one call rather than poll (#112, thanks @terminalchai).
+- New README with a fuel-gauge banner and animated demo, a contributing guide, issue and PR templates, and runnable examples against a demo home (#109, #116).
+
 ## [0.2.4] - 2026-09-30
 
 ### Changed
