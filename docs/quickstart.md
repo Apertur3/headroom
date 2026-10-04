@@ -364,7 +364,9 @@ headroom install-service
 
 This writes a service definition (a launchd agent on macOS, a systemd user unit on Linux, a Task
 Scheduler XML on Windows), loads it, and waits a few seconds for the daemon to answer. Running it
-again with nothing changed says "already installed and running". Pass `--no-start` to only write
+again with nothing changed says "already installed and running". On Windows, if the running daemon
+is from another version or serves an older pipe name (after `npm i -g` over a running service), it
+is asked to shut down and the task is started again, so the new version takes over. Pass `--no-start` to only write
 the file. If the service manager refuses (launchd has no GUI session to load into over ssh), the
 file is still written and the exact command to run yourself is printed:
 

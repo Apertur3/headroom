@@ -210,38 +210,77 @@ describe("headroom update: service restart", () => {
     });
   }
 
-  for (const [state, endCode] of [["running", 0], ["stopped", 1]] as const) {
-    it(`ends a ${state} Windows task before starting the updated daemon`, async () => {
-      const lstatFn = vi.fn(async (path: string) => {
-        expect(path).toBe("D:\\headroom-state\\headroom-daemon.xml");
-        return { isFile: () => true };
-      });
-      const spy = spySpawn([
-        { code: 0, stdout: "", stderr: "" }, // npm install
-        { code: endCode, stdout: "", stderr: "" }, // /End: succeeds only while running
-        { code: 0, stdout: "", stderr: "" }, // /Run starts the updated task
-        { code: 0, stdout: "1.2.3\n", stderr: "" }, // installed binary
-      ]);
-
-      const code = await runUpdate([], {
+  /** Windows: the daemon is asked to shut down over its pipe (mocked), the task is ended as a
+   * backup and run again, and the restart counts only once a daemon answers afterwards. */
+  async function windowsUpdate(shutdown: "accepted" | "absent" | "unsupported", endCode: number, answersAfterRun: boolean, stillAnswers = false) {
+    const lstatFn = vi.fn(async (path: string) => {
+      expect(path).toBe("D:\\headroom-state\\headroom-daemon.xml");
+      return { isFile: () => true };
+    });
+    const spy = spySpawn([
+      { code: 0, stdout: "", stderr: "" }, // npm install
+      { code: endCode, stdout: "", stderr: "" }, // /End: succeeds only while running
+      { code: 0, stdout: "", stderr: "" }, // /Run starts the updated task
+      { code: 0, stdout: "", stderr: "" }, // a second /Run when the first went unanswered
+      { code: 0, stdout: "1.2.3\n", stderr: "" }, // installed binary
+    ]);
+    const requestShutdown = vi.fn(async () => shutdown);
+    const ran = () => spy.calls.some((call) => call.args[0] === "/Run");
+    const kill = vi.spyOn(process, "kill");
+    const logs: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { logs.push(line); });
+    const logSpy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
+    let code: number;
+    try {
+      code = await runUpdate([], {
         fetch: registryFetch("999.0.0"),
         spawnFn: spy.spawnFn,
         home: "D:\\headroom-state",
         userHome: "C:\\Users\\headroom-update",
         platform: "win32",
         lstatFn: lstatFn as unknown as typeof lstat,
+        requestShutdown,
+        probeDaemon: async () => stillAnswers || (answersAfterRun && ran()),
+        sleep: async () => undefined,
+        stopWaitMs: 0,
+        waitMs: 0,
       });
+    } finally { errorSpy.mockRestore(); logSpy.mockRestore(); kill.mockRestore(); }
+    expect(kill).not.toHaveBeenCalled();
+    expect(lstatFn).toHaveBeenCalledTimes(1);
+    expect(requestShutdown).toHaveBeenCalledTimes(1);
+    return { code, calls: spy.calls, logs };
+  }
 
+  for (const [state, shutdown, endCode] of [["running", "accepted", 0], ["stopped", "absent", 1]] as const) {
+    it(`shuts a ${state} Windows daemon down, ends the task as a backup, then starts the updated daemon`, async () => {
+      const { code, calls, logs } = await windowsUpdate(shutdown, endCode, true);
       expect(code).toBe(0);
-      expect(lstatFn).toHaveBeenCalledTimes(1);
-      expect(spy.calls).toEqual([
+      expect(calls).toEqual([
         { command: "npm.cmd", args: ["install", "-g", "headroomd@999.0.0"] },
         { command: "schtasks", args: ["/End", "/TN", "Headroom Daemon"] },
         { command: "schtasks", args: ["/Run", "/TN", "Headroom Daemon"] },
         { command: "headroom.cmd", args: ["--version"] },
       ]);
+      expect(logs).toContain("restarted the Headroom service");
     });
   }
+
+  it("Windows: runs the task once more when the first /Run goes unanswered, then reports it could not confirm", async () => {
+    const { code, calls, logs } = await windowsUpdate("accepted", 0, false);
+    expect(code).toBe(0);
+    expect(calls.filter((call) => call.args[0] === "/Run")).toHaveLength(2);
+    expect(logs.join("\n")).toContain("could not restart the Headroom service");
+  });
+
+  it("Windows: never runs the task while an older daemon that cannot take the shutdown request keeps answering", async () => {
+    const { code, calls, logs } = await windowsUpdate("unsupported", 0, true, true);
+    expect(code).toBe(0);
+    expect(calls.some((call) => call.args[0] === "/Run")).toBe(false);
+    const output = logs.join("\n");
+    expect(output).toContain("it is from a version without the shutdown request");
+    expect(output).toContain("stop the node.exe running `headroom daemon`");
+  });
 });
 
 // Real spawn(), a real fake npm executable on PATH, no injected spawnFn: this

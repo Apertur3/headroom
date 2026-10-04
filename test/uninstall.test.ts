@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsToml } from "../src/registry.js";
 import { servicePath } from "../src/service.js";
+import { DAEMON_STOP_BUDGET_MS, DAEMON_STOP_WAIT_MS } from "../src/daemon-stop.js";
 import { runUninstall, type UninstallOverrides } from "../src/uninstall.js";
 import type { ProviderAccount } from "../src/types.js";
 
@@ -44,7 +45,7 @@ const posix: UninstallOverrides = { platform: "linux" };
 const posixQuote = (value: string): string => /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
 // No daemon answers and no wait really sleeps: on a Windows runner the stop-and-wait sequence
 // (#136) runs for these tests too, and must never dial a real pipe or slow the suite.
-const noDaemon: UninstallOverrides = { probeDaemon: async () => false, sleep: async () => {} };
+const noDaemon: UninstallOverrides = { probeDaemon: async () => false, requestShutdown: async () => "absent", sleep: async () => {} };
 const WINDOWS_END = 'schtasks /End /TN "Headroom Daemon"';
 const WINDOWS_DELETE = 'schtasks /Delete /TN "Headroom Daemon" /F';
 
@@ -312,9 +313,11 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
 });
 
 /** #136: on Windows, schtasks /Delete leaves the running daemon alive and it keeps headroom.db
- * open, so uninstall must end the task, wait for the daemon to go, and only then delete the task
- * and the home. The scheduler (runServiceStop) and the daemon probe are mocked; process.kill is
- * spied on to prove nothing is ever killed (a Windows process's identity cannot be verified). */
+ * open, and schtasks /End does not stop it either (it ends only the task's cmd.exe wrapper). So
+ * uninstall asks the daemon to shut down over its pipe, waits for it to go, ends the task as a
+ * backup, and only then deletes the task and the home. The shutdown request, the scheduler
+ * (runServiceStop) and the daemon probe are mocked; process.kill is spied on to prove nothing is
+ * ever killed (a Windows process's identity cannot be verified). */
 describe("headroom uninstall on Windows: stop the daemon before deleting the home", () => {
   async function windowsSetup(): Promise<{ fakeHome: string; headroomHome: string; env: Record<string, string> }> {
     const { fakeHome, headroomHome } = await makeTempHomes();
@@ -330,7 +333,7 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
     return path;
   }
 
-  it("ends the task, waits for the daemon to exit, then deletes the task, then the home", async () => {
+  it("asks the daemon to shut down, waits for it to exit, ends the task as a backup, then deletes the task, then the home", async () => {
     const { headroomHome, env } = await windowsSetup();
     const events: string[] = [];
     let homeExistedAtDelete: boolean | undefined;
@@ -339,25 +342,32 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
       if (command === WINDOWS_DELETE) homeExistedAtDelete = await fileExists(headroomHome);
       return 0;
     });
-    let answers = 2; // still up for two probes after /End, then gone
+    let answers = 2; // still up for two probes after the shutdown request, then gone
     const probeDaemon = async () => { events.push("probe"); return answers-- > 0; };
+    const requestShutdown = vi.fn(async () => { events.push("shutdown"); return "accepted" as const; });
     const kill = vi.spyOn(process, "kill");
     let code = -1;
     let logs: string[] = [];
     try {
       await withEnv(env, async () => {
         await writeWindowsTask(headroomHome);
-        const captured = await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, sleep: async () => { events.push("sleep"); } }));
+        const captured = await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown, sleep: async () => { events.push("sleep"); } }));
         code = captured.result;
         logs = captured.logs;
       });
     } finally { kill.mockRestore(); }
     expect(code).toBe(0);
+    expect(requestShutdown).toHaveBeenCalledTimes(1);
     expect(runServiceStop.mock.calls.map(([command]) => command)).toEqual([WINDOWS_END, WINDOWS_DELETE]);
+    const shutdown = events.indexOf("shutdown");
     const end = events.indexOf(WINDOWS_END);
     const remove = events.indexOf(WINDOWS_DELETE);
-    // Two answers and then three consecutive misses, all between /End and /Delete.
-    expect(events.slice(end + 1, remove).filter((event) => event === "probe")).toHaveLength(5);
+    // Order: shutdown request, then the wait (two answers and three consecutive misses), then the
+    // backup /End, then /Delete; the home goes last (it still existed at /Delete).
+    expect(shutdown).toBe(0);
+    expect(events.slice(shutdown + 1, end).filter((event) => event === "probe")).toHaveLength(5);
+    expect(end).toBeLessThan(remove);
+    expect(events.slice(end + 1, remove)).toEqual([]);
     expect(homeExistedAtDelete).toBe(true);
     expect(await fileExists(headroomHome)).toBe(false);
     temporary.splice(temporary.indexOf(headroomHome), 1);
@@ -375,20 +385,70 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
     try {
       await withEnv(env, async () => {
         await writeWindowsTask(headroomHome);
-        const captured = await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon: async () => true, sleep: async () => {}, stopWaitMs: 0 }));
+        const captured = await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon: async () => true, requestShutdown: async () => "accepted", sleep: async () => {}, stopWaitMs: 0 }));
         code = captured.result;
         logs = captured.logs;
       });
     } finally { kill.mockRestore(); }
     expect(code).toBe(1);
     const output = logs.join("\n");
-    expect(output).toContain("the Headroom daemon is still running 0s after the task was ended");
+    expect(output).toContain("the Headroom daemon is still running 0s after it was asked to stop: it accepted the shutdown request but kept answering");
     expect(output).toContain("cannot verify a Windows process's identity, so it does not kill it");
     expect(output).toContain(`not deleted: the daemon is still running (see step 1); ${headroomHome} was left in place`);
     expect(output).toContain("Uninstall finished with errors.");
     expect(await fileExists(join(headroomHome, "headroom.db"))).toBe(true);
     // Only the scheduler's own end and delete ran: no taskkill, no signal to any pid.
     expect(runServiceStop.mock.calls.map(([command]) => command)).toEqual([WINDOWS_END, WINDOWS_DELETE]);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("keeps waiting for an accepted shutdown that is still draining at 10 s, within the daemon's own stop budget, and then deletes the home", async () => {
+    const { headroomHome, env } = await windowsSetup();
+    // A virtual clock: every sleep advances it, so the default (unshortened) wait runs instantly.
+    let now = 1_000_000;
+    const start = now;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const runServiceStop = vi.fn(async (_command: string) => 0);
+    // A slow graceful stop: the daemon still answers 15 s after it accepted the request.
+    const probeDaemon = async () => now - start < 15_000;
+    const kill = vi.spyOn(process, "kill");
+    let code = -1;
+    try {
+      await withEnv(env, async () => {
+        await writeWindowsTask(headroomHome);
+        code = (await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown: async () => "accepted", sleep: async (ms) => { now += ms; } }))).result;
+      });
+    } finally { clock.mockRestore(); kill.mockRestore(); }
+    expect(DAEMON_STOP_WAIT_MS).toBeGreaterThan(DAEMON_STOP_BUDGET_MS);
+    expect(now - start).toBeGreaterThan(15_000);
+    expect(now - start).toBeLessThan(DAEMON_STOP_WAIT_MS);
+    expect(code).toBe(0);
+    expect(await fileExists(headroomHome)).toBe(false);
+    temporary.splice(temporary.indexOf(headroomHome), 1);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("falls back to /End and the bounded wait for an older daemon without the shutdown request, and says so when it survives", async () => {
+    const { headroomHome, env } = await windowsSetup();
+    const events: string[] = [];
+    const runServiceStop = vi.fn(async (command: string) => { events.push(command); return 0; });
+    const probeDaemon = async () => { events.push("probe"); return true; };
+    const kill = vi.spyOn(process, "kill");
+    let code = -1;
+    let logs: string[] = [];
+    try {
+      await withEnv(env, async () => {
+        await writeWindowsTask(headroomHome);
+        const captured = await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown: async () => "unsupported", sleep: async () => {}, stopWaitMs: 0 }));
+        code = captured.result;
+        logs = captured.logs;
+      });
+    } finally { kill.mockRestore(); }
+    expect(code).toBe(1);
+    // No pointless wait before /End: an older daemon will not stop on its own.
+    expect(events[0]).toBe(WINDOWS_END);
+    expect(logs.join("\n")).toContain("it is from a version without the shutdown request, and schtasks /End did not stop it");
+    expect(await fileExists(join(headroomHome, "headroom.db"))).toBe(true);
     expect(kill).not.toHaveBeenCalled();
   });
 
@@ -414,12 +474,14 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
     const { headroomHome, env } = await windowsSetup();
     const runServiceStop = vi.fn(async (_command: string) => 0);
     const probeDaemon = vi.fn(async () => false);
+    const requestShutdown = vi.fn(async () => "absent" as const);
     let logs: string[] = [];
     await withEnv(env, async () => {
       await writeWindowsTask(headroomHome);
-      logs = (await captureLog(() => runUninstall(["--dry-run", "--home"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon }))).logs;
+      logs = (await captureLog(() => runUninstall(["--dry-run", "--home"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown }))).logs;
     });
-    expect(logs.join("\n")).toContain(`would end the task (${WINDOWS_END}) and wait up to 10s for the daemon to exit`);
+    expect(requestShutdown).not.toHaveBeenCalled();
+    expect(logs.join("\n")).toContain(`would ask the daemon to shut down, wait up to 27s for it to exit, then end the task (${WINDOWS_END})`);
     expect(runServiceStop).not.toHaveBeenCalled();
     expect(probeDaemon).not.toHaveBeenCalled();
   });

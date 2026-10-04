@@ -26,6 +26,7 @@ import { accountsPath, readAccounts } from "./registry.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
 import { safeError, stripAmbientProxyEnvironment } from "./security.js";
+import { headroomVersion } from "./version.js";
 
 type Json = Record<string, unknown>;
 export type Poller = (principal?: string, options?: PollOptions) => Promise<PollResult>;
@@ -347,6 +348,19 @@ export class HeadroomDaemon {
    * update while the listener is in `stopping`; this proxy still refuses every
    * method once close begins, but does not cancel work stop() is awaiting. */
   private readonly drainingStore: HeadroomStore;
+  /** The package version this process started as, read once in start(). An in-place `npm i -g`
+   * replaces package.json under a running daemon; reading it lazily at the first health request
+   * would report the new version and hide that this process still runs the old code. */
+  private startedVersion: string | undefined;
+  /** Set by the first authorized `shutdown` request; later ones answer "already requested". */
+  private shutdownWasRequested = false;
+  private resolveShutdownRequest: () => void = () => undefined;
+  /** Resolves once an authorized `shutdown` request arrives. The process entry point (`headroom
+   * daemon`) awaits it alongside SIGINT/SIGTERM and then runs the same graceful stop(): on Windows a
+   * process cannot be sent a signal it can handle, so this request is the only clean way for another
+   * Headroom command (uninstall, install-service after an upgrade) to stop the daemon. The daemon
+   * never stops itself from inside the request handler, so the reply is always written first. */
+  readonly shutdownRequested: Promise<void> = new Promise<void>((resolve) => { this.resolveShutdownRequest = resolve; });
 
   private constructor(private readonly rawStore: HeadroomStore, private readonly path: string, private readonly poller: Poller, private readonly home: string, keepalive: AgyKeepaliveSupervisor | undefined, private readonly connectionLimits: ConnectionLimits, private readonly deliveryTimeoutMs: number = DELIVERY_TIMEOUT_MS) {
     this.keepalive = keepalive;
@@ -397,6 +411,7 @@ export class HeadroomDaemon {
     // here; and engine starts are open until stop() closes them.
     setEngineSignalCleanup(false);
     allowEngineStarts();
+    this.startedVersion = await headroomVersion();
     // Before any fetch can happen: an operator's shell proxy must never
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
@@ -929,6 +944,18 @@ export class HeadroomDaemon {
       if (!expected || !safeTimingEqual(received, expected)) return reject(-32001, "Unauthorized pipe client");
       authenticatedThisCall = true;
     }
+    if (request.method === "shutdown") {
+      // Authorized exactly like every other mutating request: on Windows the transcript-proof check
+      // just above has already rejected a client that does not hold the session token, and on POSIX
+      // the 0600 socket decided who could connect at all. Idempotent: a repeat, or a request while a
+      // signal-driven stop is already draining, only reports that the daemon is stopping.
+      const already = this.shutdownWasRequested || this.stopping;
+      this.shutdownWasRequested = true;
+      this.auditQuietly(caller, "shutdown", null, already ? "repeat" : "ok");
+      if (!already) void appendDaemonLog(`shutdown requested by ${caller}`, this.home);
+      this.resolveShutdownRequest();
+      return finish(rpcResult(request.id, { state: "stopping", already_requested: already }));
+    }
     if (this.stopping && request.method !== "health") return finish(rpcError(request.id, -32000, "Headroom daemon is stopping"));
     try {
       let result: unknown;
@@ -1240,6 +1267,8 @@ export class HeadroomDaemon {
         case "health": result = {
           state: this.stopping ? "stopping" : "running",
           socket: this.path,
+          // Lets install-service tell a daemon an older install started (after an in-place upgrade) from a current one.
+          version: this.startedVersion ?? await headroomVersion(),
           in_flight: this.inFlight.size,
           backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })),
           keepalive: {
@@ -1734,6 +1763,29 @@ export async function daemonRequest(path: string, method: string, params: Json =
   if (health === undefined) return (await socketExists(path)) ? { status: "unresponsive" } : { status: "absent" };
   const result = await rpc(path, method, params, requestTimeoutMs, Math.min(requestTimeoutMs, RPC_ABSOLUTE_DEADLINE_MS), signal);
   return result === undefined ? { status: "unresponsive" } : { status: "available", result };
+}
+
+/** What asking the daemon on `path` to shut down produced. "accepted": it is stopping (or already
+ * was). "absent": nothing listens there. "unsupported": a daemon from a version without the request
+ * answered "Method not found". "refused": it answered with another error (for example a failed proof).
+ * "unresponsive": something holds the pipe but did not answer in time. */
+export type ShutdownOutcome = "accepted" | "absent" | "unsupported" | "refused" | "unresponsive";
+
+/** Asks the daemon to stop itself gracefully over its own authenticated pipe or socket (the same
+ * proof every mutating request carries). Bounded by short timeouts; never throws. Dials the legacy
+ * Windows pipe name too when nothing listens on the current one, as every client does. */
+export async function requestDaemonShutdown(path = socketPath()): Promise<ShutdownOutcome> {
+  try {
+    const reply = await daemonRequest(path, "shutdown", {}, 1_000, 3_000);
+    if (reply.status !== "available") return reply.status;
+    const value = reply.result as { state?: unknown; error?: { code?: unknown; message?: unknown } } | null;
+    if (value && typeof value === "object" && value.error) {
+      if (value.error.code === -32601) return "unsupported";
+      // A daemon that already began a signal-driven stop rejects everything but health with this.
+      return value.error.code === -32000 && value.error.message === "Headroom daemon is stopping" ? "accepted" : "refused";
+    }
+    return value && typeof value === "object" && value.state === "stopping" ? "accepted" : "refused";
+  } catch { return "unresponsive"; }
 }
 
 export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000, absoluteTimeoutMs = RPC_ABSOLUTE_DEADLINE_MS, signal?: AbortSignal): Promise<unknown | undefined> {

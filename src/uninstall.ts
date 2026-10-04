@@ -10,7 +10,9 @@ import { launchEnvironment } from "./orchestrator-reads.js";
 import { headroomHome } from "./paths.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
-import { servicePath, uninstallService } from "./service.js";
+import { servicePath, stopWindowsDaemon, uninstallService, waitForDaemonExit, windowsStopFailure } from "./service.js";
+import type { ShutdownOutcome } from "./daemon.js";
+import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
 import { isYes } from "./setup.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 
@@ -31,18 +33,17 @@ export interface UninstallOverrides {
   servicePlatform?: NodeJS.Platform;
   /** True while a Headroom daemon for this home answers health; overridden in tests. */
   probeDaemon?: () => Promise<boolean>;
+  /** Asks the daemon to shut down over its authenticated pipe (Windows); overridden in tests. */
+  requestShutdown?: () => Promise<ShutdownOutcome>;
   /** Test seam so the bounded waits do not really sleep. */
   sleep?: (ms: number) => Promise<void>;
-  /** How long to wait for the daemon to exit after the Windows task is ended (default 10 s). */
+  /** How long to wait for the Windows daemon to exit after the shutdown request (default DAEMON_STOP_WAIT_MS: the daemon's own worst-case stop plus a margin). */
   stopWaitMs?: number;
 }
 
 /** Task Scheduler task name; matches service.ts's WINDOWS_TASK. */
 const WINDOWS_TASK = "Headroom Daemon";
 const WINDOWS_END_COMMAND = `schtasks /End /TN "${WINDOWS_TASK}"`;
-/** Consecutive health misses before the daemon counts as gone: one miss can be a busy daemon. */
-const STOP_CONFIRMATIONS = 3;
-const PROBE_INTERVAL_MS = 500;
 
 interface UninstallOptions {
   home: boolean;
@@ -102,29 +103,16 @@ async function defaultProbeDaemon(): Promise<boolean> {
   return (await daemonRequest(socketPath(), "health", {}, 500, 500)).status === "available";
 }
 
-/** Polls until the daemon has missed STOP_CONFIRMATIONS health probes in a row (true) or the
- * deadline passes while it still answers (false). With waitMs 0 this is a plain check: any answer
- * means it is running. */
-async function waitForDaemonExit(probe: () => Promise<boolean>, sleep: (ms: number) => Promise<void>, waitMs: number): Promise<boolean> {
-  const deadline = Date.now() + waitMs;
-  let misses = 0;
-  for (;;) {
-    let answering: boolean;
-    try { answering = await probe(); } catch { answering = false; }
-    misses = answering ? 0 : misses + 1;
-    if (misses >= STOP_CONFIRMATIONS) return true;
-    // Past the deadline, give up only while it still answers: a streak of misses already under way
-    // gets its remaining (at most STOP_CONFIRMATIONS - 1) probes.
-    if (misses === 0 && Date.now() > deadline) return false;
-    await sleep(PROBE_INTERVAL_MS);
-  }
+async function defaultRequestShutdown(): Promise<ShutdownOutcome> {
+  const { requestDaemonShutdown, socketPath } = await import("./daemon.js");
+  return requestDaemonShutdown(socketPath());
 }
 
 /** Printed when the Windows daemon outlives the wait. Headroom has no way to verify a Windows process's
  * identity (process-tree.ts's identity checks need `ps`), so it never kills one by name or pid. */
-function daemonStillRunningMessage(waitMs: number): string[] {
+function daemonStillRunningMessage(waitMs: number, why: string): string[] {
   return [
-    `  the Headroom daemon is still running ${Math.round(waitMs / 1000)}s after the task was ended.`,
+    `  the Headroom daemon is still running ${Math.round(waitMs / 1000)}s after it was asked to stop: ${why}.`,
     "  Headroom cannot verify a Windows process's identity, so it does not kill it.",
     "  Stop it yourself (Task Manager: the node.exe running `headroom daemon`, or Ctrl+C in its window), then run `headroom uninstall --home` again.",
   ];
@@ -163,9 +151,9 @@ async function stepService(options: UninstallOptions, overrides: UninstallOverri
   try { await lstat(path); } catch { present = false; }
   if (!present) { console.log(`  no Headroom service found at ${path}; nothing to do`); return true; }
   const plan = await uninstallService(platform, homedir(), true);
-  const waitMs = overrides.stopWaitMs ?? 10_000;
+  const waitMs = overrides.stopWaitMs ?? DAEMON_STOP_WAIT_MS;
   if (options.dryRun) {
-    if (platform === "win32") console.log(`  (dry run) would end the task (${WINDOWS_END_COMMAND}) and wait up to ${Math.round(waitMs / 1000)}s for the daemon to exit`);
+    if (platform === "win32") console.log(`  (dry run) would ask the daemon to shut down, wait up to ${Math.round(waitMs / 1000)}s for it to exit, then end the task (${WINDOWS_END_COMMAND})`);
     console.log(`  (dry run) would stop it: ${plan.command}`);
     console.log(`  (dry run) would remove ${path}`);
     return true;
@@ -174,18 +162,29 @@ async function stepService(options: UninstallOptions, overrides: UninstallOverri
   let ok = true;
   if (platform === "win32") {
     // schtasks /Delete removes the task but not the daemon it already started, which then keeps
-    // headroom.db open and makes deleting the home fail with EBUSY (#136). End the task first and
-    // wait, bounded, for the daemon to stop answering. A non-zero /End (the task was not running)
-    // is not itself a failure: the wait decides.
-    console.log(`  ending the task: ${WINDOWS_END_COMMAND}`);
-    try {
-      const code = await runServiceStop(WINDOWS_END_COMMAND);
-      if (code !== 0) console.log(`  end command exited ${code} (continuing; the task may not be running)`);
-    } catch (error) { console.log(`  end command failed: ${safeError(error)} (continuing)`); }
+    // headroom.db open and makes deleting the home fail with EBUSY (#136). schtasks /End does not
+    // stop it either (it ends only the task's cmd.exe wrapper), so ask the daemon itself to shut
+    // down over its authenticated pipe, wait, bounded, for it to stop answering, and end the task
+    // as a backup. A non-zero /End (the task was not running) is not itself a failure: the wait decides.
+    console.log("  asking the daemon to shut down");
     const sleep = overrides.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    if (await waitForDaemonExit(overrides.probeDaemon ?? defaultProbeDaemon, sleep, waitMs)) console.log("  the daemon is not running");
+    const stop = await stopWindowsDaemon({
+      requestShutdown: overrides.requestShutdown ?? defaultRequestShutdown,
+      probe: overrides.probeDaemon ?? defaultProbeDaemon,
+      end: async () => {
+        console.log(`  ending the task: ${WINDOWS_END_COMMAND}`);
+        try {
+          const code = await runServiceStop(WINDOWS_END_COMMAND);
+          if (code !== 0) console.log(`  end command exited ${code} (continuing; the task may not be running)`);
+          return { code, output: "" };
+        } catch (error) { console.log(`  end command failed: ${safeError(error)} (continuing)`); return { code: 1, output: safeError(error) }; }
+      },
+      sleep,
+      waitMs,
+    });
+    if (stop.stopped) console.log("  the daemon is not running");
     else {
-      for (const line of daemonStillRunningMessage(waitMs)) console.error(line);
+      for (const line of daemonStillRunningMessage(waitMs, windowsStopFailure(stop))) console.error(line);
       options.daemonStillRunning = true;
       ok = false;
     }

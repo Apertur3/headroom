@@ -7,7 +7,9 @@ import { appendDaemonLog } from "./logs.js";
 import { headroomHome } from "./paths.js";
 import type { Policy } from "./policy.js";
 import { outboundFetch, readBoundedRegularFile, redact, safeError, safeOutputDirectory, writeFileAtomic } from "./security.js";
-import { servicePath } from "./service.js";
+import { restartWindowsDaemon, servicePath, type ServiceRunner } from "./service.js";
+import type { ShutdownOutcome } from "./daemon.js";
+import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
 import { isYes } from "./setup.js";
 import { HeadroomStore } from "./store.js";
 import { headroomVersion } from "./version.js";
@@ -187,25 +189,49 @@ async function serviceExists(platform: NodeJS.Platform, userHome: string, env: N
   catch { return false; }
 }
 
+/** macOS and Linux only: their service managers restart a running daemon cleanly (SIGTERM, then a
+ * fresh start). Windows goes through restartWindowsDaemon instead. */
 function restartServiceCommand(platform: NodeJS.Platform): { command: string; args: string[] } {
   if (platform === "darwin") return { command: "launchctl", args: ["kickstart", "-k", `gui/${typeof process.getuid === "function" ? process.getuid() : 0}/com.headroom.daemon`] };
-  if (platform === "win32") return { command: "schtasks", args: ["/Run", "/TN", "Headroom Daemon"] };
   return { command: "systemctl", args: ["--user", "restart", "headroom.service"] };
+}
+
+/** The Windows daemon seams `headroom update` uses to restart the service cleanly; tests pass fakes. */
+export interface WindowsRestartSeams {
+  requestShutdown?: () => Promise<ShutdownOutcome>;
+  probeDaemon?: () => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+  stopWaitMs?: number;
+  waitMs?: number;
 }
 
 /** Only touches a service Headroom itself installed (servicePath() existing
  * as a file); a machine that never ran `install-service` gets no restart
  * attempt at all, matching install-service/uninstall-service's own scope. */
-async function restartServiceIfPresent(platform: NodeJS.Platform, userHome: string, env: NodeJS.ProcessEnv, spawnFn: typeof spawn, lstatFn: typeof lstat = lstat): Promise<"restarted" | "failed" | "absent"> {
-  if (!(await serviceExists(platform, userHome, env, lstatFn))) return "absent";
-  // Headroom's Windows task uses IgnoreNew, so /Run alone reports success
-  // while an old daemon keeps running. /End is intentionally best-effort: a
-  // stopped task has nothing to end, and the following /Run is still the
-  // authoritative result. Both commands use fixed argument vectors.
-  if (platform === "win32") await runCommand("schtasks", ["/End", "/TN", "Headroom Daemon"], spawnFn);
+async function restartServiceIfPresent(platform: NodeJS.Platform, userHome: string, env: NodeJS.ProcessEnv, spawnFn: typeof spawn, lstatFn: typeof lstat = lstat, windows: WindowsRestartSeams = {}): Promise<{ state: "restarted" | "failed" | "absent"; reason?: string }> {
+  if (!(await serviceExists(platform, userHome, env, lstatFn))) return { state: "absent" };
+  if (platform === "win32") {
+    // Headroom's Windows task uses IgnoreNew, so /Run alone reports success while an old daemon keeps
+    // running, and /End alone does not stop that daemon (it ends only the task's cmd.exe wrapper). Ask
+    // the daemon to shut down over its pipe, wait, end the task as a backup, then /Run and confirm.
+    // Every command uses a fixed argument vector.
+    const home = env.HEADROOM_HOME;
+    const daemon = await import("./daemon.js");
+    const path = daemon.socketPath(home);
+    const probe = windows.probeDaemon ?? (async () => (await daemon.daemonRequest(path, "health", {}, 500, 500)).status === "available");
+    const runner: ServiceRunner = async (command, args) => { const result = await runCommand(command, args, spawnFn); return { code: result.code, output: `${result.stdout}${result.stderr}`.trim() }; };
+    const restart = await restartWindowsDaemon({
+      runner, probe, confirm: probe,
+      requestShutdown: windows.requestShutdown ?? (() => daemon.requestDaemonShutdown(path)),
+      sleep: windows.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      stopWaitMs: windows.stopWaitMs ?? DAEMON_STOP_WAIT_MS,
+      waitMs: windows.waitMs ?? 10_000,
+    });
+    return restart.state === "restarted" ? { state: "restarted" } : { state: "failed", reason: restart.reason ?? "the daemon did not answer after schtasks /Run" };
+  }
   const { command, args } = restartServiceCommand(platform);
   const result = await runCommand(command, args, spawnFn);
-  return result.code === 0 ? "restarted" : "failed";
+  return { state: result.code === 0 ? "restarted" : "failed" };
 }
 
 // ---- the 24-hour cached check behind the status/doctor notice line ----
@@ -298,7 +324,7 @@ async function defaultAskYesNo(question: string): Promise<boolean> {
   finally { rl.close(); }
 }
 
-export interface RunUpdateDependencies {
+export interface RunUpdateDependencies extends WindowsRestartSeams {
   fetch?: typeof fetch;
   spawnFn?: typeof spawn;
   /** Headroom state directory, including the database and local settings. */
@@ -379,9 +405,9 @@ export async function runUpdate(argv: string[], deps: RunUpdateDependencies = {}
     return 1;
   }
 
-  const restart = await restartServiceIfPresent(platform, userHome, serviceEnv, spawnFn, lstatFn);
-  if (restart === "restarted") console.log("restarted the Headroom service");
-  else if (restart === "failed") console.error("could not restart the Headroom service; restart it yourself");
+  const restart = await restartServiceIfPresent(platform, userHome, serviceEnv, spawnFn, lstatFn, deps);
+  if (restart.state === "restarted") console.log("restarted the Headroom service");
+  else if (restart.state === "failed") console.error(`could not restart the Headroom service${restart.reason ? ` (${restart.reason})` : ""}; restart it yourself${platform === "win32" ? ": stop the node.exe running `headroom daemon` (Task Manager), then run `headroom install-service`" : ""}`);
 
   const installedVersion = await installedBinaryVersion(platform, spawnFn);
   console.log(installedVersion ? `headroom ${installedVersion} installed` : `installed ${PACKAGE_NAME}@${latest} (could not read the installed binary's own version)`);
