@@ -46,7 +46,7 @@ async function fakeHomeWithGeminiCredential(): Promise<string> {
 }
 
 function catalogFetch() {
-  return vi.fn(async () => new Response(JSON.stringify({ models: { "synthetic-model": { displayName: "Synthetic Model" } } })));
+  return vi.fn(async (_request: RequestInfo | URL) => new Response(JSON.stringify({ models: { "synthetic-model": { displayName: "Synthetic Model" } } })));
 }
 
 const geminiFileReads = () => fsCalls.paths.filter((path) => path.includes("oauth_creds.json"));

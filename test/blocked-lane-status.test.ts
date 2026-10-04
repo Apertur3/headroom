@@ -70,7 +70,7 @@ describe("blocked Antigravity lane in served status", () => {
         expect(text, form).toContain("blocked");
       }
 
-      const model: DashboardModel = { now, version: "0.0.0", direct: false, policy: defaultPolicy, vendors: new Map([["agy", "antigravity"]]), observations: served, burns: {}, resetSeen: {}, events: [], leases: [], notices: [] };
+      const model: DashboardModel = { now, version: "0.0.0", direct: false, policy: defaultPolicy, vendors: new Map([["agy", "antigravity"]]), observations: served, burns: {}, resetSeen: {}, events: [], leases: [], notices: [], planDowngraded: [] };
       expect(renderDashboard(model, { width: 200, height: 40, verbose: false, eventsWide: false, scroll: 0 }).join("\n")).toContain(BLOCKED);
     } finally { store.close(); }
 

@@ -157,13 +157,13 @@ describe("daemon JSON-RPC", () => {
       const keepalive = { running: true, pid: 17, uptimeMs: 2_000, start() {}, stop() { return Promise.resolve(); } } as never;
       const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock"), keepalive, poller: async (_principal, option) => {
         options.push(option as Record<string, unknown> | undefined);
-        return { observations: [], failures: [], antigravityLocal: { antigravity: { outcome: "failed", payload_kind: "placeholder", at: "2026-09-03T12:00:00Z" } } };
+        return { observations: [], failures: [], antigravityLocal: { antigravity: { outcome: "failed", payload_kind: "none" as const, at: "2026-09-03T12:00:00Z" } } };
       } });
       const internal = daemon as unknown as { backoff: Map<string, { failures: number; until: number }>; poll(principal: string | undefined, forced: boolean): Promise<unknown>; antigravityLocal: Map<string, unknown> };
       internal.backoff.set("all", { failures: 1, until: Date.now() + 60_000 });
       await internal.poll(undefined, false);
       expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
-      expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "placeholder" });
+      expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "none" });
       await daemon.stop();
     });
   });

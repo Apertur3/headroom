@@ -65,7 +65,7 @@ describe("collector gate for a Claude principal awaiting a Keychain grant", () =
       "",
     ].join("\n"), { mode: 0o600 });
     await withHeadroomHome(root, async () => {
-      const result = await pollAccounts(undefined, { claudeGrant: { needsGrant: () => true, markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); }, markProbeSucceeded: () => { throw new Error("must not be called: the probe was never attempted"); } } });
+      const result = await pollAccounts(undefined, { claudeGrant: { needsGrant: () => true, markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); }, markProbeSucceeded: () => { throw new Error("must not be called: the probe was never attempted"); }, probePath: () => undefined } });
       const claudeRows = result.observations.filter((item) => item.principal_id === "claude-main");
       expect(claudeRows).toHaveLength(3);
       expect(claudeRows.every((item) => item.freshness === "failed" && item.reason === claudeGrantNeededReason("claude-main"))).toBe(true);

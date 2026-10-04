@@ -171,7 +171,6 @@ describe("headroom _complete-meters (hidden)", () => {
         // If an assertion above failed, do not let the test fixture's open
         // client conceal the original failure by hanging server.close().
         client?.destroy();
-        server.closeAllConnections?.();
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     });

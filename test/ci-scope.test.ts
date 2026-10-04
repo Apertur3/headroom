@@ -93,6 +93,17 @@ describe("scripts/ci-scope.sh", () => {
     expect(log).toContain("docs/concepts.md");
   });
 
+  it("skills markdown only => true, but any other file under skills/ => false", async () => {
+    const docs = await baseRepo();
+    await prMerge(docs, async (r) => { await put(r, "skills/headroom/SKILL.md", "new\n"); await put(r, "skills/notes.md", "new\n"); });
+    expect(await expectScope(docs, true)).toContain("skills/headroom/SKILL.md");
+    for (const path of ["skills/headroom/run.sh", "skills/headroom/data.json", "skills/SKILL.md.bak", "skillsx/a.md"]) {
+      const root = await baseRepo();
+      await prMerge(root, async (r) => { await put(r, path, "new\n"); });
+      expect(await expectScope(root, false), path).toContain("full CI");
+    }
+  });
+
   it("mixed docs + src => false", async () => {
     const root = await baseRepo();
     await prMerge(root, async (r) => { await put(r, "README.md", "new\n"); await put(r, "src/cli.ts", "new\n"); });

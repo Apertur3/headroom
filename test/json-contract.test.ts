@@ -211,7 +211,7 @@ describe("CLI --json field shapes", () => {
     try {
       const storedBaseline = store.insert(stale);
       const newerAt = new Date(now.getTime() - 60_000).toISOString();
-      const suspect = { ...stale, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" }, resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt };
+      const suspect: Observation = { ...stale, quantity: { used: 41, limit: 100, remaining: 59, unit: "percent" }, resets_at: new Date(now.getTime() + 4 * 86_400_000).toISOString(), observed_at: newerAt, fetched_at: newerAt };
       const storedSuspect = store.insert(suspect);
       store.setDaemonState("vendor_window_suspect:codex-main:spark:10080", JSON.stringify({
         baseline_id: storedBaseline.id, suspect_id: storedSuspect.id,

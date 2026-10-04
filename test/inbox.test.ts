@@ -284,7 +284,7 @@ describe("sendInboxMessageAt", () => {
       if (writes === 1) {
         firstWriteStarted!();
         await new Promise<void>(() => { /* genuinely never settles */ });
-        return;
+        return false;
       }
       return realWriteFileAtomic(writePath, data, mode);
     });

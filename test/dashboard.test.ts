@@ -26,6 +26,7 @@ function fixedModel(): DashboardModel {
     events: [{ id: "event-1", kind: "reset_seen", created_at: "2026-09-08T11:50:00Z", principal_id: "account-a", meter_id: "account-a:all", reason: null, origin: "inferred", confidence: 0.8, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: { unscheduled: true } }],
     leases: [{ id: "lease-1", owner: "worker", meter_id: "account-a:all", expected_percent: 5, spent_percent: 1, started_at: "2026-09-08T11:50:00Z", expires_at: "2026-09-08T12:20:00Z", ended_at: null, ended_reason: null, note: null, action_class: null }],
     notices: ["Capacity appeared; re-plan"],
+    planDowngraded: [],
   };
 }
 function terminal(tty = true) {

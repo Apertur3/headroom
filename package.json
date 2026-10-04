@@ -50,6 +50,7 @@
     "build": "tsc -p tsconfig.json",
     "prepack": "(npm run build && bash scripts/build-probe.sh && bash scripts/build-native-engine.sh) 1>&2",
     "lint": "tsc --noEmit -p tsconfig.json",
+    "lint:tests": "tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run",
     "engine:build": "bash scripts/build-engine.sh",
     "smoke-cold": "bash scripts/smoke-cold.sh",

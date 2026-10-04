@@ -45,6 +45,7 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
           needsGrant: () => true,
           markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); },
           markProbeSucceeded: () => { throw new Error("must not be called: the probe was never attempted"); },
+          probePath: () => undefined,
         },
       });
       const rows = result.observations.filter((item) => item.principal_id === "claude-main");
@@ -101,6 +102,7 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
           needsGrant: () => { gateConsulted = true; return true; }, // block the probe too: only the gating behavior is under test here
           markGrantNeeded: () => undefined,
           markProbeSucceeded: () => undefined,
+          probePath: () => undefined,
         },
       });
       expect(gateConsulted).toBe(true);
@@ -114,7 +116,7 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
     await withHeadroomHome(home, async () => {
       let gateConsulted = false;
       const result = await pollAccounts(undefined, {
-        claudeGrant: { needsGrant: () => { gateConsulted = true; return true; }, markGrantNeeded: () => undefined, markProbeSucceeded: () => undefined },
+        claudeGrant: { needsGrant: () => { gateConsulted = true; return true; }, markGrantNeeded: () => undefined, markProbeSucceeded: () => undefined, probePath: () => undefined },
       });
       expect(gateConsulted).toBe(true);
       expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: grant needed" });

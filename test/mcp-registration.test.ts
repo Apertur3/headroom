@@ -5,14 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeSecurityToolFailureReason, isClaudeKeychainInaccessibleReason } from "../src/adapters/claude.js";
 import { credentialCheck, mcpRegistrationCheck, mcpRegistrationFor } from "../src/doctor.js";
 import { CLAUDE_MCP_ADD_ARGS, MCP_ADD_COMMAND } from "../src/mcp-registration.js";
-import type { Account } from "../src/types.js";
+import type { Account, ProviderAccount } from "../src/types.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
 // A non-default profile directory keeps every read inside the temp dir: its .claude.json sits
 // inside it, so the real ~/.claude.json is never opened.
-async function profile(config: unknown): Promise<Account> {
+async function profile(config: unknown): Promise<ProviderAccount> {
   const location = await mkdtemp(join(tmpdir(), "headroom-mcp-scope-")); temporary.push(location);
   await mkdir(location, { recursive: true });
   await writeFile(join(location, ".claude.json"), JSON.stringify(config));

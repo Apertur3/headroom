@@ -47,6 +47,7 @@ jobs:
       - run: npm audit --audit-level=high
       - run: bash scripts/public-audit.sh
       - run: npm run lint
+      - run: npm run lint:tests
       # Packs the tarball, which on macOS builds the Swift engine (prepack).
       # A docs-only run keeps it on Linux only.
       - if: steps.scope.outputs.docs_only != 'true' || runner.os == 'Linux'

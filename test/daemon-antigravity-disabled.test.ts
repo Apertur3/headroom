@@ -237,7 +237,7 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
         throw error;
       }
       const internal = daemon as unknown as {
-        keepalive: { running: boolean; pid?: number } | undefined;
+        keepalive: { running: boolean; pid?: number; launchId?: string } | undefined;
         currentAccounts(): Promise<unknown>;
       };
       const scriptPid = track(internal.keepalive?.pid, root) as number;
@@ -289,7 +289,7 @@ describe.skipIf(process.platform === "win32")("Antigravity keepalive respects th
         throw error;
       }
       const internal = daemon as unknown as {
-        keepalive: { running: boolean; pid?: number } | undefined;
+        keepalive: { running: boolean; pid?: number; launchId?: string } | undefined;
         currentAccounts(): Promise<unknown>;
         maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void>;
       };
