@@ -45,12 +45,12 @@ async function tempRoot(label: string): Promise<string> {
  * work a poll cycle across several accounts does, just wide enough that its
  * total synchronous cost is measurable on any machine without needing real
  * disk contention to reproduce. */
-function manyFreshObservations(count: number, now: Date): Observation[] {
+function manyFreshObservations(count: number, now: Date, prefix = "synthetic"): Observation[] {
   const items: Observation[] = [];
   for (let index = 0; index < count; index += 1) {
     items.push({
-      principal_id: `synthetic-${index}`,
-      meter_id: `synthetic-${index}:all`,
+      principal_id: `${prefix}-${index}`,
+      meter_id: `${prefix}-${index}:all`,
       window: { kind: "rolling", minutes: 300, enforcement: "hard" },
       quantity: { used: 12, limit: 100, remaining: 88, unit: "percent" },
       resets_at: new Date(now.getTime() + 3_600_000).toISOString(),
@@ -72,20 +72,31 @@ describe("store.insertPoll event-loop cost (the poll-cycle stall)", () => {
     const root = await tempRoot("insertpoll-bench");
     const store = await HeadroomStore.open(root);
     try {
-      const observations = manyFreshObservations(2_000, new Date());
-      const start = Date.now();
-      const stored = store.insertPoll(observations);
-      const elapsed = Date.now() - start;
-      expect(stored).toHaveLength(2_000);
+      // The first poll pays one-off costs (statement preparation, page cache,
+      // first-write file growth, antivirus scanning of the new db on Windows
+      // CI) that are not the steady-state stall this test guards. Warm up
+      // outside the measurement, then take several samples of fresh polls and
+      // assert on the median against the 2s health budget, with the worst
+      // sample under a looser documented ceiling so one descheduled slice on a
+      // shared runner cannot fail the run (issue #135).
+      store.insertPoll(manyFreshObservations(100, new Date(), "warm"));
+      const samples: number[] = [];
+      for (let round = 0; round < 5; round += 1) {
+        const observations = manyFreshObservations(2_000, new Date(), `round${round}`);
+        const start = Date.now();
+        const stored = store.insertPoll(observations);
+        samples.push(Date.now() - start);
+        expect(stored).toHaveLength(2_000);
+      }
+      samples.sort((x, y) => x - y);
+      const median = samples[Math.floor(samples.length / 2)]!;
       // Measured ~963ms before the prepared-statement cache + one-transaction
-      // fix, ~148ms after, on this machine -- both numbers well below what a
-      // real household's poll (a handful of accounts, not 2000) would ever
-      // see, but wide enough here to make the fixed cost repeatable without
-      // depending on real disk or CPU contention. The budget below is the
-      // CLI/MCP health timeout itself, not a number tuned to this run.
-      expect(elapsed).toBeLessThan(2_000);
+      // fix, ~148ms after, on a dev machine. The median budget is the CLI/MCP
+      // health timeout itself; the max ceiling is 5x that.
+      expect(median).toBeLessThan(2_000);
+      expect(samples[samples.length - 1]).toBeLessThan(10_000);
     } finally { store.close(); }
-  }, 20_000);
+  }, 60_000);
 });
 
 // A Unix socket on POSIX; Windows uses a named pipe (covered in pipe-auth.test.ts).
