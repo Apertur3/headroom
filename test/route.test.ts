@@ -156,6 +156,7 @@ describe("headroom route (CLI)", () => {
     const root2 = await mkdtemp(join(tmpdir(), "headroom-route-norouting-")); temporary.push(root2);
     const home2 = join(root2, ".headroom");
     await mkdir(home2, { recursive: true, mode: 0o700 });
+    await writeFile(join(home2, "accounts.toml"), '[[accounts]]\nname = "claude-1"\nvendor = "claude"\nlocation = "/tmp/claude-1"\n');
     await withHeadroomHome(home2, async () => {
       await expect(main(["route", "--class", "claude-fable", "--owner", "x"])).rejects.toThrow("No routing.toml configured");
     });

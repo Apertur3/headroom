@@ -70,7 +70,7 @@ for a vLLM or llama.cpp box.
 If `accounts.toml` doesn't exist yet and you run a bare `headroom` first, it says so plainly:
 
 ```
-No accounts configured yet. Run: headroom accounts discover
+No accounts configured yet. Run `headroom accounts discover` (or `headroom setup`) to find your Claude and Codex logins.
 ```
 
 ## 3. Check the installation
