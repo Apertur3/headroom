@@ -360,7 +360,7 @@ instead any earlier than that. It also lists, per `routing.toml` `[cost.<class>]
 runs of that class fit the window's remaining points and remaining minutes (a learned median cost
 overrides the static config number once samples exist).
 
-Unspent quota is information, not a target. `fill`, `plan`, and burn-to-target views describe
+Unspent quota is information, not a target. `fill`, `plan`, and HARVEST pace states describe
 capacity for real, queued work; they never call for inventing work to exhaust a window. Leaving
 capacity unused at reset is acceptable.
 
