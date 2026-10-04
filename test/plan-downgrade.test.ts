@@ -34,6 +34,7 @@ function reading(plan: string, at: string, meter = "codex-main:main", credits?: 
 const quietWebhook: NotifyConfig = {
   channels: ["webhook"], preset: "quiet", events_on: [], events_off: [], events: [], threshold_percent: 90,
   quiet_hours: { start: 23 * 60, end: 7 * 60 }, telegram: { chat_id: null }, ntfy: { topic: null, server: "https://ntfy.sh" }, webhook: { url: "https://example.com/hook" }, notify_scheduled_short: false,
+  source_health_min_polls: 2, source_health_min_minutes: 15,
 };
 
 function notifications(calls: string[], now = new Date()): NotifyOptions {

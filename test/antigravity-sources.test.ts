@@ -98,8 +98,8 @@ describe("agy keepalive", () => {
 
   it("starts a fake binary beneath script's PTY and terminates only its owned process", () => {
     const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
-    const spawn = vi.fn(() => child) as never;
-    const supervisor = new AgyKeepaliveSupervisor({ binary: "/tmp/fake agy", platform: "darwin", spawn });
+    const spawn = vi.fn(() => child);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: "/tmp/fake agy", platform: "darwin", spawn: spawn as never });
     supervisor.start();
     expect(spawn).toHaveBeenCalledWith("/usr/bin/script", ["-q", "/dev/null", "/tmp/fake agy"], expect.objectContaining({ stdio: "ignore" }));
     const environment = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
@@ -115,8 +115,8 @@ describe("agy keepalive", () => {
   it("quotes a quote and a semicolon so the Linux script -qefc command cannot break out", () => {
     const malicious = "echo pwned; touch /tmp/headroom-shellquote-poc; exit 3'; echo also-pwned #";
     const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, kill: vi.fn(() => true) });
-    const spawn = vi.fn(() => child) as never;
-    const supervisor = new AgyKeepaliveSupervisor({ binary: malicious, platform: "linux", spawn });
+    const spawn = vi.fn(() => child);
+    const supervisor = new AgyKeepaliveSupervisor({ binary: malicious, platform: "linux", spawn: spawn as never });
     supervisor.start();
     const args = (spawn.mock.calls[0] as unknown as [string, string[], unknown])[1];
     expect(args[0]).toBe("-qefc");

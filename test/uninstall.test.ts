@@ -160,7 +160,7 @@ describe("headroom uninstall: background service", () => {
     const path = servicePath(process.platform, fakeHome, { ...process.env, HEADROOM_HOME: headroomHome });
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, "fake service file");
-    const runServiceStop = vi.fn(async () => 0);
+    const runServiceStop = vi.fn(async (_command: string) => 0);
     let code = -1;
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
@@ -196,7 +196,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("removes it for a registered non-default profile, setting CLAUDE_CONFIG_DIR", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const account = await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     let code = -1;
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
@@ -213,7 +213,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("removes a user-scope entry with --scope user and no directory", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
     });
@@ -230,7 +230,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
       [join(fakeHome, "elsewhere")]: { mcpServers: { other: { command: "other" } } },
     }, mcpServers: { other: { command: "other" } } };
     await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;
@@ -246,7 +246,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
     await mkdir(bound, { recursive: true });
     const config = { mcpServers: { headroom: { command: "headroom" } }, projects: { [bound]: { mcpServers: { headroom: { command: "headroom" } } } } };
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true, config });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
     });
@@ -256,7 +256,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("removes it for the default profile without setting CLAUDE_CONFIG_DIR", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     await writeClaudeAccount(fakeHome, headroomHome, { registered: true });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       await runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove });
     });
@@ -267,7 +267,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("skips an unregistered profile entirely", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: false });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       const captured = await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove }));
@@ -280,7 +280,7 @@ describe("headroom uninstall: Claude Code MCP registration", () => {
   it("prints the command instead of running it when `claude` is not on PATH", async () => {
     const { fakeHome, headroomHome } = await makeTempHomes();
     const account = await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       const captured = await captureLog(() => runUninstall([], { ...posix, claudeOnPath: async () => false, runClaudeMcpRemove }));
@@ -442,7 +442,7 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
-      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove: vi.fn(async () => 0) }))).logs;
+      logs = (await captureLog(() => runUninstall([], { claudeOnPath: async () => true, runClaudeMcpRemove: vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0) }))).logs;
     });
     expect(logs.join("\n")).toContain(`mkdir -p '${gone}'`);
   });
@@ -452,7 +452,7 @@ describe("headroom uninstall: removal environment and vanished directories", () 
     const gone = join(fakeHome, "deleted-worktree");
     const config = { projects: { [gone]: { mcpServers: { headroom: { command: "headroom" } } } } };
     await writeClaudeAccount(fakeHome, headroomHome, { profileDirName: ".claude2", registered: true, config });
-    const runClaudeMcpRemove = vi.fn(async () => 0);
+    const runClaudeMcpRemove = vi.fn(async (_env: NodeJS.ProcessEnv, _scope: "user" | "local", _cwd?: string) => 0);
     let logs: string[] = [];
     await withEnv({ HOME: fakeHome, USERPROFILE: fakeHome, HEADROOM_HOME: headroomHome, PATH: "" }, async () => {
       logs = (await captureLog(() => runUninstall([], { ...posix, claudeOnPath: async () => true, runClaudeMcpRemove }))).logs;

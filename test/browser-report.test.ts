@@ -608,10 +608,10 @@ describe("chart scoping, gap splitting, resets, and jitter tolerance", () => {
     const model = sampleModel({
       observations: [obs],
       events: [
-        { id: "e1", kind: "reset_seen", created_at: "2026-09-16T11:30:00Z", meter_id: "claude-main:all", origin: "vendor_reported", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
-        { id: "e2", kind: "free_reset_used", created_at: "2026-09-16T11:45:00Z", meter_id: "claude-main:all", origin: "inferred", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
-        { id: "e3", kind: "source_failed", created_at: "2026-09-16T11:35:00Z", meter_id: "claude-main:all", origin: "inferred", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
-        { id: "e4", kind: "lease_started", created_at: "2026-09-16T11:40:00Z", meter_id: "claude-main:all", origin: "direct", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
+        { id: "e1", kind: "reset_seen", created_at: "2026-09-16T11:30:00Z", principal_id: "claude-main", reason: null, meter_id: "claude-main:all", origin: "vendor_reported", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
+        { id: "e2", kind: "free_reset_used", created_at: "2026-09-16T11:45:00Z", principal_id: "claude-main", reason: null, meter_id: "claude-main:all", origin: "inferred", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
+        { id: "e3", kind: "source_failed", created_at: "2026-09-16T11:35:00Z", principal_id: "claude-main", reason: null, meter_id: "claude-main:all", origin: "inferred", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
+        { id: "e4", kind: "lease_started", created_at: "2026-09-16T11:40:00Z", principal_id: "claude-main", reason: null, meter_id: "claude-main:all", origin: "vendor_reported", confidence: 1, evidence_observation_ids: [], corrected_by: null, last_seen_at: null, metadata: {} },
       ],
     });
 

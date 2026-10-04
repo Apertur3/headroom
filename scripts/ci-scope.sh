@@ -17,9 +17,9 @@
 #
 # Allowlist: README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md,
 # THIRD_PARTY_NOTICES.md, LICENSE, CODE_OF_CONDUCT.md, docs/**,
-# .github/ISSUE_TEMPLATE/**, .github/PULL_REQUEST_TEMPLATE*.
+# skills/**/*.md, .github/ISSUE_TEMPLATE/**, .github/PULL_REQUEST_TEMPLATE*.
 # Everything else (src, scripts, tests, workflows, package files, engine,
-# fixtures, skills, examples, dotfiles, anything unknown) runs the full CI.
+# fixtures, non-markdown skill files, examples, dotfiles, anything unknown) runs the full CI.
 #
 # Usage: GITHUB_EVENT_NAME=... GITHUB_REF=... bash scripts/ci-scope.sh
 # Runs against the git repository in the current directory.
@@ -42,6 +42,7 @@ allowed_path() {
   case "$p" in
     README.md | CHANGELOG.md | CONTRIBUTING.md | SECURITY.md | THIRD_PARTY_NOTICES.md | LICENSE | CODE_OF_CONDUCT.md) return 0 ;;
     docs/?* | .github/ISSUE_TEMPLATE/?* | .github/PULL_REQUEST_TEMPLATE*) return 0 ;;
+    skills/*.md) return 0 ;;
   esac
   return 1
 }

@@ -952,7 +952,7 @@ describe("pace and consumes", () => {
       // At (not before) the baseline's own scheduled 13:00 reset -- a
       // scheduled reset (issue #20), so resetSeenFor's own marker-free string
       // is exactly what this test's plain reset-evidence lookup expects.
-      const current = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z", fetched_at: "2026-09-03T13:05:00Z", observed_at: "2026-09-03T13:05:00Z" };
+      const current: Observation = { ...first, quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" }, resets_at: "2026-09-03T17:00:00Z", fetched_at: "2026-09-03T13:05:00Z", observed_at: "2026-09-03T13:05:00Z" };
       store.insert(first);
       store.insert(current);
       const latest = store.latestPerWindow();
@@ -968,7 +968,7 @@ describe("pace and consumes", () => {
     try {
       const window = { kind: "fixed" as const, minutes: 10_080, enforcement: "hard" as const };
       const first = observation({ meter_id: "claude-main:all", window, quantity: { used: 68, limit: 100, remaining: 32, unit: "percent" }, resets_at: "2026-09-06T13:59:00Z", fetched_at: "2026-09-03T20:00:00Z", observed_at: "2026-09-03T20:00:00Z" });
-      const current = { ...first, quantity: { used: 2, limit: 100, remaining: 98, unit: "percent" }, fetched_at: "2026-09-03T20:15:00Z", observed_at: "2026-09-03T20:15:00Z" };
+      const current: Observation = { ...first, quantity: { used: 2, limit: 100, remaining: 98, unit: "percent" }, fetched_at: "2026-09-03T20:15:00Z", observed_at: "2026-09-03T20:15:00Z" };
       store.insert(first);
       store.insert(current);
       const latest = store.latestPerWindow();
@@ -986,11 +986,11 @@ describe("events output", () => {
     console.log = (line: string) => { logs.push(line); };
     try {
       printEventsOutput([], false);
-      printEventsOutput([{ id: "reset_seen:1", kind: "reset_seen", origin: "inferred", confidence: 0.9, evidence_observation_ids: [1, 2], created_at: "2026-09-03T12:00:00.000Z", corrected_by: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: null }], false);
+      printEventsOutput([{ id: "reset_seen:1", kind: "reset_seen", origin: "inferred", confidence: 0.9, evidence_observation_ids: [1, 2], created_at: "2026-09-03T12:00:00.000Z", corrected_by: null, last_seen_at: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: null }], false);
       expect(JSON.parse(logs[0])).toEqual([]);
       expect(JSON.parse(logs[1])).toEqual([expect.objectContaining({ kind: "reset_seen" })]);
       logs.length = 0;
-      printEventsOutput([{ id: "free_reset_used:2", kind: "free_reset_used", origin: "inferred", confidence: 0.8, evidence_observation_ids: [1, 2], created_at: "2026-09-03T20:15:00.000Z", corrected_by: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: "usage dropped from 68% to 2% before the scheduled reset" }], true);
+      printEventsOutput([{ id: "free_reset_used:2", kind: "free_reset_used", origin: "inferred", confidence: 0.8, evidence_observation_ids: [1, 2], created_at: "2026-09-03T20:15:00.000Z", corrected_by: null, last_seen_at: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: "usage dropped from 68% to 2% before the scheduled reset" }], true);
       expect(logs[0]).toContain("claude-main:all");
       expect(logs[0]).toContain("free reset used");
       expect(() => JSON.parse(logs[0])).toThrow();
@@ -1020,7 +1020,7 @@ describe("leases", () => {
 
   it("splits a meter delta by expected leases and makes a foreign claim conserve", () => {
     const first = observation({ window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 68, limit: 100, remaining: 32, unit: "percent" }, resets_at: "2026-09-10T12:00:00Z", fetched_at: "2026-09-03T12:00:00Z" });
-    const leases = [{ id: "a", owner: "cadence", meter_id: first.meter_id, expected_percent: 6, note: null, started_at: first.fetched_at, expires_at: "2026-09-04T12:00:00Z", ended_at: null, ended_reason: null, spent_percent: 0 }];
+    const leases = [{ id: "a", owner: "cadence", meter_id: first.meter_id, expected_percent: 6, note: null, action_class: null, started_at: first.fetched_at, expires_at: "2026-09-04T12:00:00Z", ended_at: null, ended_reason: null, spent_percent: 0 }];
     const decision = canRouteWithLeases([first.meter_id], [], new Map([[first.meter_id, [first]]]), "never", { ...defaultPolicy, pace_grace_fraction: 0 }, false, leases, "other", new Date(first.fetched_at));
     expect(decision).toMatchObject({ allowed: false, state: "CONSERVE" });
     expect(decision.reason).toBe("wk 68% + 6% leased by cadence → CONSERVE");

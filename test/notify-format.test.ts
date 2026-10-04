@@ -34,12 +34,21 @@ describe("phone notification text", () => {
       grant_lapsed: eventText(event("grant_lapsed")),
       lease_started: eventText(event("lease_started")),
       lease_ended: eventText(event("lease_ended")),
+      exhausted_reported: eventText(event("exhausted_reported")),
+      exhausted_cleared: eventText(event("exhausted_cleared")),
+      window_retired: eventText(event("window_retired")),
+      vendor_inconsistent: eventText(event("vendor_inconsistent")),
+      heartbeat_lapsed: eventText(event("heartbeat_lapsed")),
+      heartbeat_restored: eventText(event("heartbeat_restored")),
+      timer_missed: eventText(event("timer_missed")),
     } satisfies Record<EventKind, string>;
     expect(texts).toMatchInlineSnapshot(`
       {
         "credits_changed": "🪙 Credits changed
       Claude main now has 2 reset credits.
       Check the balance before using another credit.",
+        "exhausted_cleared": "✅ Claude main exhausted report cleared. Fresh capacity is available for dispatch again.",
+        "exhausted_reported": "🛑 Claude main reports its limit reached. Dispatches to Claude main are refused until then.",
         "free_reset_granted": "🎁 Free reset credit granted
       Claude main now has 2 (expire Oct 4).
       Use a credit when you need more capacity.",
@@ -49,6 +58,10 @@ describe("phone notification text", () => {
         "grant_lapsed": "🔑 Keychain grant lapsed
       Claude main.
       Run: headroom keychain grant --principal claude-main",
+        "heartbeat_lapsed": "💔 Heartbeat lapsed: claude-main
+      Last beat unknown. Nothing has picked this session's work back up.
+      No resume note was left; check what this session was doing.",
+        "heartbeat_restored": "💚 Heartbeat restored: claude-main is beating again.",
         "lease_ended": "🏁 Lease ended
       Claude main's work reservation ended.
       Unused reserved capacity is available again.",
@@ -77,6 +90,12 @@ describe("phone notification text", () => {
         "source_recovered": "✅ Source recovered
       Antigravity is reading again.
       Fresh readings are available for planning.",
+        "timer_missed": "⏰ Timer fired while claude-main is unattended
+      "timer" was due and delivered to its inbox, but claude-main's heartbeat is lapsed.",
+        "vendor_inconsistent": "⚠️ Claude main readings flip-flopped between two windows; holding the earlier one",
+        "window_retired": "🧹 Window retired
+      Claude main is no longer reported by the vendor.
+      It no longer participates in dispatch decisions.",
       }
     `);
     for (const text of Object.values(texts)) {

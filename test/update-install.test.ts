@@ -203,9 +203,9 @@ describe("headroom update: service restart", () => {
 
       expect(code).toBe(0);
       expect(spy.calls).toEqual([
-        { command: platform === "win32" ? "npm.cmd" : "npm", args: ["install", "-g", "headroomd@999.0.0"] },
+        { command: "npm", args: ["install", "-g", "headroomd@999.0.0"] },
         restart,
-        { command: platform === "win32" ? "headroom.cmd" : "headroom", args: ["--version"] },
+        { command: "headroom", args: ["--version"] },
       ]);
     });
   }
