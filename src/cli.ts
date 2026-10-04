@@ -2007,14 +2007,31 @@ async function usagePaste(argv: string[]): Promise<number> {
   return 0;
 }
 
+/** Upper bound on a graceful daemon stop before the process exits on its own. */
+const DAEMON_STOP_DEADLINE_MS = 20_000;
+
 async function daemon(): Promise<number> {
   const instance = await HeadroomDaemon.create();
   await instance.start();
   await appendDaemonLog(`daemon started; listening on ${socketPath()}`);
   await new Promise<void>((resolve) => {
-    const stop = () => { void instance.stop().then(() => appendDaemonLog("daemon stopped"), (error: unknown) => appendDaemonLog(`daemon stop failed: ${safeError(error)}`)).finally(resolve); };
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return; // a signal and a shutdown request (or two signals) share one stop()
+      stopping = true;
+      // stop() itself is bounded (each drain is capped), but nothing else may keep a process that was
+      // asked to stop alive forever: exit on our own if it has not finished. unref'd, so it never
+      // holds the process open by itself.
+      setTimeout(() => { void appendDaemonLog(`daemon stop did not finish within ${DAEMON_STOP_DEADLINE_MS / 1000}s; exiting`).finally(() => process.exit(1)); }, DAEMON_STOP_DEADLINE_MS).unref();
+      void instance.stop().then(() => appendDaemonLog("daemon stopped"), (error: unknown) => appendDaemonLog(`daemon stop failed: ${safeError(error)}`)).finally(resolve);
+    };
     process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    // The authenticated `shutdown` request: the clean stop on Windows, where no signal can be handled.
+    void instance.shutdownRequested.then(stop);
   });
+  // The pipe and the store are closed; a lingering handle (a keep-alive HTTP socket) must not keep
+  // the pipe owner's process around, or a Task Scheduler /Run right after would be ignored.
+  setTimeout(() => process.exit(0), 2_000).unref();
   return 0;
 }
 
