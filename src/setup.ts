@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { configureNotifications, type Ask } from "./notify-configure.js";
 import { doctor } from "./doctor.js";
 import { CLAUDE_MCP_ADD_ARGS, MCP_ADD_COMMAND } from "./mcp-registration.js";
-import { isAccountsMissingError, observe } from "./cli.js";
+import { isAccountsMissingError, NoAccountsConfiguredError, NO_ACCOUNTS_MESSAGE, observe } from "./cli.js";
 import { accountsPath, accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { describeServiceStart, installAndStartService, installService, type ServiceStartOptions } from "./service.js";
 import { safeError } from "./security.js";
@@ -217,7 +217,7 @@ async function stepFinalCheck(options: SetupOptions, overrides: SetupOverrides):
   }
   try { if (overrides.finalCheck) await overrides.finalCheck(); else { await doctor(); await observe([]); } }
   catch (error) {
-    console.error(isAccountsMissingError(error) ? "  No accounts configured yet. Run: headroom accounts discover" : `  failed: ${safeError(error)}`);
+    console.error(isAccountsMissingError(error) || error instanceof NoAccountsConfiguredError ? `  ${NO_ACCOUNTS_MESSAGE}` : `  failed: ${safeError(error)}`);
   }
   console.log("Pace legend: HARVEST = spend it before it expires, NORMAL = proceed, CONSERVE = slow down, FREEZE = do not spawn, UNKNOWN = treat as no capacity.");
   return true;

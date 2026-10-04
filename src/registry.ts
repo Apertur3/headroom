@@ -116,13 +116,27 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
   });
 }
 
+/** accounts.toml does not exist yet (a fresh home, before `accounts discover`).
+ * Carries ENOENT and the path like the raw fs error it replaces, but is
+ * recognised by type, so the match never depends on how the platform spells
+ * the path (drive-letter case, short 8.3 names, separators). */
+export class AccountsMissingError extends Error {
+  readonly code = "ENOENT";
+  constructor(readonly path: string) { super(`ENOENT: no such file or directory, open '${path}'`); this.name = "AccountsMissingError"; }
+}
+
 export async function readAccounts(): Promise<Account[]> {
   // No-follow and bounded: accounts.toml names every principal's credential
   // location, and both registry mutations below read it before ever
   // reaching writeFileAtomic's own symlink check on the write side -- a
   // plain readFile here would still follow a symlink planted at this path,
   // or block indefinitely reading a FIFO someone left there instead.
-  const text = await readBoundedRegularFile(accountsPath());
+  let text: string;
+  try { text = await readBoundedRegularFile(accountsPath()); }
+  catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new AccountsMissingError(accountsPath());
+    throw error;
+  }
   const accounts: Account[] = [];
   let current: Record<string, string> | undefined;
   for (const rawLine of text.split("\n")) {

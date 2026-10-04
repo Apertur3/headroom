@@ -38,7 +38,7 @@ import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAG
 import { parseTimerAt } from "./heartbeat.js";
 import { parseGateNeed, waitForReset, type FillClassFit, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, reserveSuspendedFor, routeFor, withSuspendedReserves, type RateLine, type RouteResult } from "./orchestrator-reads.js";
-import { accountsPath, accountsToml, discoverAccounts, readAccounts, readAccountsOrEmpty, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
+import { AccountsMissingError, accountsPath, accountsToml, discoverAccounts, readAccounts, readAccountsOrEmpty, setAccountEnabled, writeDiscoveredAccounts } from "./registry.js";
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
@@ -265,6 +265,7 @@ async function can(argv: string[]): Promise<number> {
   const expectOverride = expectValue === undefined ? null : Number(expectValue);
   if (expectOverride !== null && (!Number.isFinite(expectOverride) || expectOverride < 0 || expectOverride > 100)) throw new Error("--expect must be 0 through 100");
   const leaseFlag = argv.includes("--lease");
+  await requireConfiguredAccounts(2);
   const routing = await readRouting();
   if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
   const meters = routing.consumes[action];
@@ -1314,6 +1315,8 @@ async function gate(argv: string[]): Promise<number> {
   // which read as a plain "NO" against whichever meter happened to sort
   // first rather than the one the caller actually meant.
   if (!meter && !actionClass && !model) throw new Error(usage);
+  // An explicit --meter reads stored readings and needs no registry.
+  if (!meter) await requireConfiguredAccounts(2);
   let target: string | string[] | undefined = meter;
   let actionDurationMinutes: number | undefined;
   if (!meter && actionClass) {
@@ -1476,6 +1479,7 @@ async function route(argv: string[]): Promise<number> {
   const actionClass = option(argv, "--class");
   const usage = "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]";
   if (!owner || !actionClass) throw new Error(usage);
+  await requireConfiguredAccounts(2);
   const routing = await readRouting();
   if (!routing.present) throw new Error("No routing.toml configured; create ~/.headroom/routing.toml with a [consumes] section");
   const meters = routing.consumes[actionClass];
@@ -1620,6 +1624,11 @@ export async function observe(argv: string[]): Promise<number> {
       planDowngraded = store.planDowngrades(new Set(observations.map((item) => item.principal_id)));
     } finally { store.close(); }
   } else {
+    // A direct read polls the configured accounts; with an empty registry
+    // there is nothing to poll, so say so rather than print a blank reading.
+    // (A missing accounts.toml already fails in pollAccounts with the same
+    // message; an empty one keeps its exit code.)
+    if (!configuredAccounts.length) console.error(NO_ACCOUNTS_MESSAGE);
     const store = await HeadroomStore.open();
     try {
       await syncClaudeProbeState(store);
@@ -2287,6 +2296,7 @@ export async function main(argv: string[]): Promise<number> {
   // bar. statusline() itself never throws for the same reason.
   if (argv[0] === "statusline") return statusline(argv.slice(1));
   if (argv[0] === "dashboard" || argv[0] === "top") {
+    await requireConfiguredAccounts(1);
     if (argv.includes("--html")) return (await import("./browser-report.js")).htmlReportCommand(argv.slice(1));
     return (await import("./dashboard.js")).dashboardCommand(argv.slice(1));
   }
@@ -2433,11 +2443,31 @@ function sameMissingFile(left: string, right: string): boolean {
   } catch { return false; }
 }
 
+export const NO_ACCOUNTS_MESSAGE = "No accounts configured yet. Run `headroom accounts discover` (or `headroom setup`) to find your Claude and Codex logins.";
+
+/** Nothing is configured, so there is no capacity to report or grant. Carries
+ * its own exit code: 2 for the decision commands (can, gate, route: "no",
+ * never a fake yes), 1 for the reading commands. */
+export class NoAccountsConfiguredError extends Error {
+  constructor(readonly exitCode: number) { super(NO_ACCOUNTS_MESSAGE); this.name = "NoAccountsConfiguredError"; }
+}
+
+/** Throws when accounts.toml is absent or lists no account. Any other read
+ * failure (malformed file, unsafe path) is left for the command's own read to
+ * report, so it still fails closed with its own message. */
+async function requireConfiguredAccounts(exitCode: number): Promise<void> {
+  let accounts: Account[];
+  try { accounts = await readAccounts(); }
+  catch (error: unknown) { if (isAccountsMissingError(error)) throw new NoAccountsConfiguredError(exitCode); return; }
+  if (!accounts.length) throw new NoAccountsConfiguredError(exitCode);
+}
+
 /** True only for the exact ENOENT a fresh install produces the first time any
  * command reads accounts.toml -- never for a symlink/permission failure or an
  * ENOENT on some other path, which must still surface as a real error. */
 export function isAccountsMissingError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
+  if (error instanceof AccountsMissingError) return true;
   const errno = error as NodeJS.ErrnoException;
   if (errno.code !== "ENOENT" || typeof errno.path !== "string") return false;
   // Compare through the directory's real path: Windows may report a short
@@ -2466,9 +2496,9 @@ export async function runCli(argv: string[]): Promise<number> {
   try {
     return await main(argv);
   } catch (error) {
-    if (isAccountsMissingError(error)) {
-      const message = "No accounts configured yet. Run: headroom accounts discover";
-      printJsonError(message); console.error(message); return 1;
+    if (error instanceof NoAccountsConfiguredError || isAccountsMissingError(error)) {
+      printJsonError(NO_ACCOUNTS_MESSAGE); console.error(NO_ACCOUNTS_MESSAGE);
+      return error instanceof NoAccountsConfiguredError ? error.exitCode : 1;
     }
     const message = safeError(error);
     printJsonError(message); console.error(`headroom error: ${message}`); return 1;
