@@ -198,8 +198,18 @@ async function writeDurable(path: string, data: string): Promise<void> {
     await handle.writeFile(data, "utf8");
     await handle.sync();
   } finally { await handle.close(); }
-  try { await rename(temporary, path); }
-  catch (error) { await unlink(temporary).catch(() => {}); throw error; }
+  // Windows refuses to replace a file another process has open (a reader
+  // mid-read); that lasts milliseconds, so a few short retries cover it. A
+  // write that still fails is logged by the daemon and redone next poll.
+  for (let attempt = 1; ; attempt += 1) {
+    try { await rename(temporary, path); return; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt < 5 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) { await new Promise((resolve) => setTimeout(resolve, 10 * attempt)); continue; }
+      await unlink(temporary).catch(() => {});
+      throw error;
+    }
+  }
 }
 
 /** line.json first, then line.txt: the hook reads line.txt, so its mtime is

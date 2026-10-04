@@ -136,7 +136,10 @@ describe("writeAgentLine", () => {
     expect((await readdir(home)).sort()).toEqual(["line.json", "line.txt"]);
   });
 
-  it("replaces the file atomically: a concurrent reader only ever sees a whole line", async () => {
+  // POSIX rename semantics: a reader sees the old file or the new one. On
+  // Windows a reader can briefly see neither (and blocks the rename), which
+  // the writer's retry and the daemon's next poll absorb instead.
+  it.skipIf(process.platform === "win32")("replaces the file atomically: a concurrent reader only ever sees a whole line", async () => {
     const home = await tempDir("headroom-line-atomic-");
     const lines = Array.from({ length: 40 }, (_, index) => buildAgentLine([reading(`p${index}`, "all", 10_080, index)], defaultPolicy, [`p${index}`], NOW));
     await writeAgentLine(home, lines[0]);
@@ -164,7 +167,8 @@ describe("daemon writes the line after a poll", () => {
     const now = new Date();
     const fresh = (principal: string): Observation => ({
       ...reading(principal, "all", 10_080, 23), fetched_at: now.toISOString(), observed_at: now.toISOString(),
-      resets_at: new Date(now.getTime() + 3 * 86_400_000).toISOString(),
+      // Half an hour of slack so a slow runner still rounds to "3d".
+      resets_at: new Date(now.getTime() + 3 * 86_400_000 + 30 * 60_000).toISOString(),
     });
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [fresh("claude-main"), fresh("claude-off")], failures: [] }) });
     try {

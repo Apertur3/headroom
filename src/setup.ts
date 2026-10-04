@@ -28,6 +28,8 @@ export interface SetupOverrides {
   finalCheck?: () => Promise<void>;
   /** Installs the agent quota-line hook; defaults to `headroom hook install --agent claude`. */
   installHook?: () => Promise<number>;
+  /** The platform the hook step decides for (Windows has no hook install yet); overridden in tests. */
+  platform?: NodeJS.Platform;
 }
 
 interface SetupOptions {
@@ -229,7 +231,7 @@ export async function stepAgentHook(options: Pick<SetupOptions, "yes" | "planOnl
   console.log("  Adds one line to every Claude Code prompt so the agent sees live quota before it plans, for example:");
   console.log(`    ${SAMPLE_LINE}`);
   console.log(`  Cost: ${TOKEN_COST_NOTE}. Remove it any time with: headroom hook uninstall --agent claude`);
-  if (process.platform === "win32") { console.log("  not supported on Windows yet; `headroom line` prints the same line"); return true; }
+  if ((overrides.platform ?? process.platform) === "win32") { console.log("  not supported on Windows yet; `headroom line` prints the same line"); return true; }
   if (options.planOnly) { console.log(`  (dry run) would ${options.hook ? "install it (--hook)" : "ask: Add the quota line to every Claude Code prompt? [Y/n]"}`); return true; }
   let install = options.hook;
   if (!install && options.yes) { console.log("  skipped (--yes installs it only with --hook); run `headroom hook install --agent claude` later"); return true; }

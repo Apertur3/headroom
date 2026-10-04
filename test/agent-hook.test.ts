@@ -215,7 +215,7 @@ describe("setup offers the hook", () => {
   it("asks once with a sample line and the token cost; Enter means yes", async () => {
     const installHookFn = vi.fn(async () => 0);
     const questions: string[] = [];
-    const output = await captureLog(() => stepAgentHook({ yes: false, planOnly: false, hook: false, rl: { question: async (text: string) => { questions.push(text); return ""; } } }, { installHook: installHookFn }));
+    const output = await captureLog(() => stepAgentHook({ yes: false, planOnly: false, hook: false, rl: { question: async (text: string) => { questions.push(text); return ""; } } }, { installHook: installHookFn, platform: "darwin" }));
     expect(questions).toHaveLength(1);
     expect(questions[0]).toContain("[Y/n]");
     expect(output).toContain("[Headroom]");
@@ -225,24 +225,33 @@ describe("setup offers the hook", () => {
 
   it("an explicit no skips it", async () => {
     const installHookFn = vi.fn(async () => 0);
-    await captureLog(() => stepAgentHook({ yes: false, planOnly: false, hook: false, rl: { question: async () => "n" } }, { installHook: installHookFn }));
+    await captureLog(() => stepAgentHook({ yes: false, planOnly: false, hook: false, rl: { question: async () => "n" } }, { installHook: installHookFn, platform: "darwin" }));
     expect(installHookFn).not.toHaveBeenCalled();
   });
 
   it("--yes alone never installs it; --yes --hook does, without asking", async () => {
     const installHookFn = vi.fn(async () => 0);
     const question = vi.fn(async () => "y");
-    const skipped = await captureLog(() => stepAgentHook({ yes: true, planOnly: false, hook: false, rl: { question } }, { installHook: installHookFn }));
+    const skipped = await captureLog(() => stepAgentHook({ yes: true, planOnly: false, hook: false, rl: { question } }, { installHook: installHookFn, platform: "darwin" }));
     expect(installHookFn).not.toHaveBeenCalled();
     expect(skipped).toContain("--hook");
-    await captureLog(() => stepAgentHook({ yes: true, planOnly: false, hook: true, rl: undefined }, { installHook: installHookFn }));
+    await captureLog(() => stepAgentHook({ yes: true, planOnly: false, hook: true, rl: undefined }, { installHook: installHookFn, platform: "darwin" }));
     expect(installHookFn).toHaveBeenCalledTimes(1);
+    expect(question).not.toHaveBeenCalled();
+  });
+
+  it("on Windows it says the hook is not supported yet and asks nothing", async () => {
+    const installHookFn = vi.fn(async () => 0);
+    const question = vi.fn(async () => "y");
+    const output = await captureLog(() => stepAgentHook({ yes: false, planOnly: false, hook: true, rl: { question } }, { installHook: installHookFn, platform: "win32" }));
+    expect(output).toContain("not supported on Windows yet");
+    expect(installHookFn).not.toHaveBeenCalled();
     expect(question).not.toHaveBeenCalled();
   });
 
   it("a plan only describes it", async () => {
     const installHookFn = vi.fn(async () => 0);
-    const output = await captureLog(() => stepAgentHook({ yes: false, planOnly: true, hook: false, rl: undefined }, { installHook: installHookFn }));
+    const output = await captureLog(() => stepAgentHook({ yes: false, planOnly: true, hook: false, rl: undefined }, { installHook: installHookFn, platform: "darwin" }));
     expect(installHookFn).not.toHaveBeenCalled();
     expect(output).toContain("(dry run) would ask");
   });
