@@ -1,10 +1,11 @@
 import { exec, execFile, spawn } from "node:child_process";
 import { lstat, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { isAccountsMissingError } from "./cli.js";
+import { hookState, uninstallHook } from "./agent-hook.js";
 import { claudeConfigJsonPath, mcpRegistrationFor } from "./doctor.js";
 import { launchEnvironment } from "./orchestrator-reads.js";
 import { headroomHome } from "./paths.js";
@@ -293,6 +294,26 @@ async function stepHome(options: UninstallOptions, overrides: UninstallOverrides
   return true;
 }
 
+/**
+ * The agent quota-line hook (issue #149), between the MCP step and the home
+ * step: a hook left in settings.json after its script is deleted with the
+ * home would make Claude Code report a failing hook on every prompt.
+ * Best effort: a settings file it refuses to edit is reported, not fatal.
+ */
+async function stepAgentHook(options: UninstallOptions): Promise<boolean> {
+  console.log("Remove the agent quota line hook");
+  if (process.platform === "win32") { console.log("  hook install is not supported on Windows; nothing to remove"); return true; }
+  if (options.dryRun) {
+    const state = await hookState();
+    const installed = state.dirs.filter((item) => item.state === "installed").map((item) => item.dir);
+    console.log(installed.length ? `  (dry run) would remove it from ${installed.map((dir) => join(dir, "settings.json")).join(", ")}` : "  not installed; nothing to remove");
+    return true;
+  }
+  try { await uninstallHook({ log: (line) => console.log(`  ${line.trimStart()}`) }); }
+  catch (error) { console.log(`  failed: ${safeError(error)} (continuing); run: headroom hook uninstall --agent claude`); }
+  return true;
+}
+
 /** Step 4: Headroom never removes its own package while it is running --
  * this only ever prints the command for the user to run themselves. */
 function stepNpm(): void {
@@ -324,6 +345,8 @@ export async function runUninstall(argv: string[], overrides: UninstallOverrides
     if (!(await stepService(options, overrides))) ok = false;
     console.log("");
     if (!(await stepMcp(options, overrides))) ok = false;
+    console.log("");
+    if (!(await stepAgentHook(options))) ok = false;
     console.log("");
     if (!(await stepHome(options, overrides))) ok = false;
     console.log("");

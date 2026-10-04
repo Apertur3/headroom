@@ -26,6 +26,8 @@ import { daemonRequest, socketPath, socketPathProblem, HeadroomDaemon } from "./
 import { serveMcp } from "./mcp.js";
 import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
+import { LINE_USAGE, lineCommand } from "./agent-line.js";
+import { HOOK_USAGE, hookCommandMain } from "./agent-hook.js";
 import { runUninstall } from "./uninstall.js";
 import { canRouteWithLeases, parsePolicy, reserveEntryExpired, reserveFor, reserveOnCan, unknownMeterPrincipals, type CanDecision, type ReserveEntry } from "./policy.js";
 import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry } from "./policy-configure.js";
@@ -2192,7 +2194,7 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["route", "Pick the principal with the most headroom for an action class, and print its launch environment"],
   ["accounts discover|enable|disable", "Scan for accounts, or park/re-enable one configured principal"],
   ["doctor", "Diagnose the installation: principals, credentials, daemon, config (--bundle [path] writes a redacted report for a GitHub issue)"],
-  ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration"],
+  ["setup", "One-shot interactive setup: discovery, doctor, Keychain grant, service, MCP registration, agent quota line"],
   ["keychain grant", "macOS: check that the Claude credential is readable (no dialog)"],
   ["install-service", "Install the daemon as a launchd/systemd/Task Scheduler service"],
   ["uninstall-service", "Remove the installed daemon service"],
@@ -2203,6 +2205,8 @@ export const COMMAND_LIST: ReadonlyArray<readonly [string, string]> = [
   ["engine status", "Show whether the native and upstream engines are installed"],
   ["logs", "Print the tail of the daemon log"],
   ["notify", "Configure notifications, send a test message, or show the delivery ledger"],
+  ["line", "Print the one-line quota status the daemon writes after each poll (STALE with its age when old; never exits non-zero)"],
+  ["hook install|uninstall|status", "Add or remove the Claude Code prompt hook that puts the quota line in every prompt (--agent claude)"],
   ["statusline", "Read Claude Code's statusLine JSON from stdin, snapshot it as a zero-auth source, and print a compact bar (--render for the full line)"],
   ["usage", "Turn a pasted Claude Code /usage panel into observations (--paste from stdin, --clipboard from the clipboard); or import numeric usage counters from a transcript file (import, import-status)"],
   ["update", "Check the npm registry for a newer headroomd and install it (--notes, --dry-run)"],
@@ -2251,7 +2255,7 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   route: "Usage: headroom route --class <action-class> --owner <name> [--allow-unknown] [--json]",
   accounts: "Usage: headroom accounts <discover|enable|disable> [<name>]",
   doctor: "Usage: headroom doctor [--bundle [path]]",
-  setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]",
+  setup: "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp] [--hook]",
   keychain: "Usage: headroom keychain grant [--principal <claude-principal>] [--use-this-build]",
   "install-service": "Usage: headroom install-service [--dry-run] [--no-start]",
   "uninstall-service": "Usage: headroom uninstall-service [--dry-run]",
@@ -2261,6 +2265,8 @@ export const COMMAND_HELP: Readonly<Record<string, string>> = {
   engine: "Usage: headroom engine <install|status> [--pin]",
   logs: "Usage: headroom logs [--tail 50]",
   notify: NOTIFY_USAGE,
+  line: LINE_USAGE,
+  hook: HOOK_USAGE,
   statusline: "Usage: headroom statusline [--render] [--style compact|full] [--meters <m1,m2>] [--color] [--chain <command>]",
   usage: [USAGE_PASTE_HELP, `  import: ${USAGE_IMPORT_HELP}`, `  import-status: ${USAGE_IMPORT_STATUS_HELP}`].join("\n"),
   update: "Usage: headroom update [--notes] [--dry-run] [--yes]",
@@ -2295,6 +2301,10 @@ export async function main(argv: string[]): Promise<number> {
   // a statusLine command that fails to print at all blanks the user's status
   // bar. statusline() itself never throws for the same reason.
   if (argv[0] === "statusline") return statusline(argv.slice(1));
+  // Same reasoning: `line` feeds prompt hooks and agent preambles, reads one
+  // file and fails open, so nothing ahead of it may throw or print.
+  if (argv[0] === "line") return lineCommand(argv.slice(1));
+  if (argv[0] === "hook") return hookCommandMain(argv.slice(1));
   if (argv[0] === "dashboard" || argv[0] === "top") {
     await requireConfiguredAccounts(1);
     if (argv.includes("--html")) return (await import("./browser-report.js")).htmlReportCommand(argv.slice(1));

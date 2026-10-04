@@ -24,6 +24,7 @@ import { isAccountEnabled, isLocalAccount, type Account, type ProviderAccount } 
 import { headroomVersion } from "./version.js";
 import { safeError } from "./security.js";
 import { MCP_ADD_COMMAND } from "./mcp-registration.js";
+import { describeHookState, hookState } from "./agent-hook.js";
 
 export type DoctorLevel = "OK" | "INFO" | "WARN" | "FAIL";
 export interface DoctorCheck { level: DoctorLevel; check: string; detail: string; fix: string; }
@@ -429,6 +430,20 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
       : check("WARN", "daemon log", `unsafe log file (${daemonLogPath(home)})`, "fix ownership or writable permissions"));
   const mcp = await mcpRegistrationCheck(accounts);
   if (mcp) output.push(mcp);
+  output.push(await agentHookCheck(home));
+}
+
+/** The agent quota-line hook (issue #149): informational only, never a
+ * problem to fix, since the hook is optional. */
+async function agentHookCheck(home: string): Promise<DoctorCheck> {
+  try {
+    const state = await hookState({ home });
+    const installed = state.dirs.some((item) => item.state === "installed");
+    const fix = !state.supported ? "headroom line" : !installed ? "headroom hook install --agent claude (optional)" : state.line_stale ? "check the daemon: headroom logs --tail 50" : "no action needed";
+    return check("INFO", "agent quota line hook", describeHookState(state), fix);
+  } catch (error) {
+    return check("INFO", "agent quota line hook", `could not read hook state: ${safeError(error)}`, "headroom hook status");
+  }
 }
 
 /**

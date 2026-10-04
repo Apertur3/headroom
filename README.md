@@ -152,6 +152,11 @@ Check Headroom before you start work on a subscription. Do not ask me about usag
   `headroom can`.
 ```
 
+To put live quota in front of the agent on every turn, run `headroom hook install --agent claude`
+(or answer yes in `headroom setup`). Each Claude Code prompt then carries one line the daemon wrote at
+its last poll, with its age, for about 60 tokens per turn; `headroom line` prints the same line for any
+agent. Claude Code on macOS and Linux only for now; Windows, Codex and Gemini hooks are not supported yet.
+
 A plain `can` is advisory. A reservation tells other agents that use Headroom the points are taken;
 it does not limit what the job itself spends, and it cannot stop tools that do not use Headroom.
 The longer version, with pace states, leases and reserves, is
