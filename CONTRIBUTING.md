@@ -71,6 +71,7 @@ keep the JSON contract and examples aligned, and check relative documentation li
   macOS, Ubuntu and Windows.
 - A docs-only pull request (README, CHANGELOG, `docs/` and the other files `scripts/ci-scope.sh`
   allows) runs a fast subset: lint, the audits and the doc-reading tests. Any code change runs the full matrix.
+- CI runs once per pull request (a docs-only PR takes about a minute); only pushes to `master` run the full suite again.
 - Use fake clocks and injected dependencies, not wall-clock sleeps. Timing races have been the
   main source of flaky tests here.
 - Update the docs and `CHANGELOG.md` (under an `Unreleased` heading) when behavior changes. The
