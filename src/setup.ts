@@ -9,8 +9,11 @@ import { isAccountsMissingError, NoAccountsConfiguredError, NO_ACCOUNTS_MESSAGE,
 import { accountsPath, accountsToml, discoverAccounts, writeDiscoveredAccounts } from "./registry.js";
 import { describeServiceStart, installAndStartService, installService, type ServiceStartOptions } from "./service.js";
 import { safeError } from "./security.js";
+import { installHook, SAMPLE_LINE, TOKEN_COST_NOTE } from "./agent-hook.js";
 
 const execFileAsync = promisify(execFile);
+
+export const SETUP_USAGE = "Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp] [--hook]";
 
 export interface SetupOverrides {
   ask?: Ask;
@@ -23,6 +26,10 @@ export interface SetupOverrides {
   serviceStart?: ServiceStartOptions;
   /** Replaces the final doctor + observe; overridden in tests so no real Keychain, vendor or native probe is ever queried. */
   finalCheck?: () => Promise<void>;
+  /** Installs the agent quota-line hook; defaults to `headroom hook install --agent claude`. */
+  installHook?: () => Promise<number>;
+  /** The platform the hook step decides for (Windows has no hook install yet); overridden in tests. */
+  platform?: NodeJS.Platform;
 }
 
 interface SetupOptions {
@@ -30,6 +37,8 @@ interface SetupOptions {
   dryRun: boolean;
   skipService: boolean;
   skipMcp: boolean;
+  /** --hook: install the agent quota-line hook without asking (the only way --yes installs it). */
+  hook: boolean;
   /** True only when nothing this run does is allowed to change anything: either --dry-run, or
    * stdin is not a TTY and --yes was not passed. No question is ever asked in this mode; every
    * step narrates what it would have done and moves on, so a script can never get stuck on a
@@ -205,6 +214,36 @@ async function stepMcp(options: SetupOptions, overrides: SetupOverrides): Promis
   return true;
 }
 
+/** Enter and y/yes are yes; only n/no declines. For the one step whose
+ * displayed default is `[Y/n]`. */
+export function isYesDefault(answer: string): boolean {
+  const trimmed = answer.trim().toLowerCase();
+  return trimmed !== "n" && trimmed !== "no";
+}
+
+/**
+ * The agent quota line (issue #149). Offered, never silent: an interactive
+ * run asks with a sample line and the token cost, default yes; `--yes` alone
+ * skips it, and only `--hook` installs it without a question.
+ */
+export async function stepAgentHook(options: Pick<SetupOptions, "yes" | "planOnly" | "hook" | "rl">, overrides: SetupOverrides = {}): Promise<boolean> {
+  console.log("Agent quota line (optional)");
+  console.log("  Adds one line to every Claude Code prompt so the agent sees live quota before it plans, for example:");
+  console.log(`    ${SAMPLE_LINE}`);
+  console.log(`  Cost: ${TOKEN_COST_NOTE}. Remove it any time with: headroom hook uninstall --agent claude`);
+  if ((overrides.platform ?? process.platform) === "win32") { console.log("  not supported on Windows yet; `headroom line` prints the same line"); return true; }
+  if (options.planOnly) { console.log(`  (dry run) would ${options.hook ? "install it (--hook)" : "ask: Add the quota line to every Claude Code prompt? [Y/n]"}`); return true; }
+  let install = options.hook;
+  if (!install && options.yes) { console.log("  skipped (--yes installs it only with --hook); run `headroom hook install --agent claude` later"); return true; }
+  if (!install && options.rl) install = isYesDefault(await options.rl.question("  Add the quota line to every Claude Code prompt? [Y/n] "));
+  if (!install) { console.log("  skipped; run `headroom hook install --agent claude` later"); return true; }
+  try {
+    const code = await (overrides.installHook ?? (() => installHook({ log: (line) => console.log(`  ${line}`) })))();
+    if (code) console.log("  the hook was not installed everywhere; see above, then run `headroom hook install --agent claude`");
+  } catch (error) { return surviveStepError({ rl: options.rl } as SetupOptions, error); }
+  return true;
+}
+
 async function stepFinalCheck(options: SetupOptions, overrides: SetupOverrides): Promise<boolean> {
   console.log("Step 5: final check");
   if (options.planOnly) {
@@ -230,16 +269,17 @@ async function stepFinalCheck(options: SetupOptions, overrides: SetupOverrides):
  * than re-implementing any of their logic.
  */
 export async function runSetup(argv: string[], overrides: SetupOverrides = {}): Promise<number> {
-  const known = new Set(["--yes", "--dry-run", "--skip-service", "--skip-mcp"]);
-  for (const arg of argv) if (!known.has(arg)) throw new Error("Usage: headroom setup [--yes] [--dry-run] [--skip-service] [--skip-mcp]");
+  const known = new Set(["--yes", "--dry-run", "--skip-service", "--skip-mcp", "--hook"]);
+  for (const arg of argv) if (!known.has(arg)) throw new Error(SETUP_USAGE);
   const yes = argv.includes("--yes");
   const dryRun = argv.includes("--dry-run");
   const skipService = argv.includes("--skip-service");
   const skipMcp = argv.includes("--skip-mcp");
+  const hook = argv.includes("--hook");
   const interactive = (process.stdin.isTTY === true || overrides.ask !== undefined) && !dryRun;
   const planOnly = dryRun || (!interactive && !yes);
   const rl = interactive && !overrides.ask ? createInterface({ input: process.stdin, output: process.stdout }) : undefined;
-  const options: SetupOptions = { yes, dryRun, skipService, skipMcp, planOnly, interactive, rl: overrides.ask && interactive ? { question: overrides.ask } : rl };
+  const options: SetupOptions = { yes, dryRun, skipService, skipMcp, hook, planOnly, interactive, rl: overrides.ask && interactive ? { question: overrides.ask } : rl };
   try {
     console.log("Headroom setup");
     if (planOnly) console.log("(nothing will change; showing the plan)");
@@ -249,6 +289,7 @@ export async function runSetup(argv: string[], overrides: SetupOverrides = {}): 
       () => stepInstallService(options, overrides),
       () => stepNotifications(options, overrides).catch((error: unknown) => surviveStepError(options, error)),
       () => stepMcp(options, overrides),
+      () => stepAgentHook(options, overrides),
       () => stepFinalCheck(options, overrides),
     ]) {
       console.log("");

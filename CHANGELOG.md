@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A native one-line quota status for agents (#149). After each poll the daemon writes `line.txt` and `line.json` to the Headroom home (atomic, mode 0600): one binding window per account with its pace state, burn per hour and time to reset, plus Codex free resets. Account names are reduced to `[A-Za-z0-9._:-]`, and a stale or failed reading makes its account UNKNOWN, never a number.
+- `headroom line [--json] [--max-age <seconds>]` prints that line, marked `STALE (<age> ago)` past two poll intervals, or says there is no fresh reading. It always exits 0.
+- `headroom hook install|uninstall|status --agent claude` adds or removes one Claude Code `UserPromptSubmit` hook (a small shell script under `~/.headroom/hooks/`) in `CLAUDE_CONFIG_DIR` or `~/.claude`, plus `~/.claude2` when it exists. It backs each `settings.json` up once, leaves other hooks and keys alone, and refuses a file that does not parse. `headroom setup` offers it (default yes; `--yes` installs it only with `--hook`), `headroom doctor` reports its state as INFO, and `headroom uninstall` removes it. Not supported yet: Windows hook install, and Codex or Gemini hooks.
+
 ## [0.2.7] - 2026-10-04
 
 ### Documentation

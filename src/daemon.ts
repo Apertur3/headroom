@@ -17,6 +17,7 @@ import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform 
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
+import { buildAgentLine, writeAgentLine } from "./agent-line.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines, type GateOutcome, type RateLine } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
@@ -968,22 +969,11 @@ export class HeadroomDaemon {
         }
         case "status": {
           await this.poll(undefined, false);
-          const policy = await readPolicy();
-          const now = new Date();
-          const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
-          // A principal currently sitting out a live vendor 429 backoff (see
-          // poll()'s own backoff bookkeeping) still serves whatever it last
-          // read, unchanged, except its reason: naming the real deadline this
-          // backoff actually lifts at beats repeating the original failure
-          // message, which only grows staler while the backoff runs.
-          const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
           // The daemon's "status" RPC result stays the plain Observation[]
           // array it has always been -- the 1.x JSON contract forbids ever
           // turning it into an object -- so `disabled_principals` is derived
           // by the CLI/MCP layers from the registry instead of returned here.
-          // Disabled principals are still excluded from capacity: their rows
-          // were already dropped from `observations` above.
-          result = withCreditsLapsed(withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now), now);
+          result = this.servedStatus(await readPolicy(), new Date());
           break;
         }
         case "plan_downgrades": {
@@ -1460,6 +1450,36 @@ export class HeadroomDaemon {
     this.maintenanceTimer = timer;
   }
 
+  /** The enriched readings the `status` RPC serves, and the agent line is
+   * built from. Disabled principals are excluded from capacity: their rows
+   * are dropped before anything is computed. */
+  private servedStatus(policy: Policy, now: Date): Observation[] {
+    const observations = this.store.latestPerWindow().filter((item) => this.accounts.some((account) => account.name === item.principal_id && isAccountEnabled(account)));
+    // A principal currently sitting out a live vendor 429 backoff (see
+    // poll()'s own backoff bookkeeping) still serves whatever it last
+    // read, unchanged, except its reason: naming the real deadline this
+    // backoff actually lifts at beats repeating the original failure
+    // message, which only grows staler while the backoff runs.
+    const withBackoff = withBackoffReasons(observations, (id) => this.backoff.get(id)?.until ?? this.backoff.get("all")?.until, now.getTime());
+    return withCreditsLapsed(withStatusInfo(withBackoff, this.store.burnRateFor(withBackoff, now), this.store.lastKnownFor(withBackoff, now), policy.staleness_minutes, now), now);
+  }
+
+  /** Rewrites line.txt and line.json (issue #149) from this poll's readings.
+   * Built synchronously while the store is known open, written in the
+   * background and drained by stop() like a notification pass; a failure is
+   * logged and never fails the poll. */
+  private refreshAgentLine(policy: Policy): void {
+    try {
+      const now = new Date();
+      const principals = this.accounts.filter((account) => isAccountEnabled(account) && !isLocalAccount(account)).map((account) => account.name);
+      const line = buildAgentLine(this.servedStatus(policy, now), policy, principals, now);
+      this.trackNotify(writeAgentLine(this.home, line)
+        .catch((error: unknown) => appendDaemonLog(`agent line write failed: ${safeError(error)}`, this.home)));
+    } catch (error) {
+      void appendDaemonLog(`agent line build failed: ${safeError(error)}`, this.home);
+    }
+  }
+
   private async poll(principal: string | undefined, forced: boolean): Promise<PollResult | { rate_limited: true }> {
     const key = principal ?? "all";
     const now = Date.now();
@@ -1524,6 +1544,7 @@ export class HeadroomDaemon {
       for (const id of new Set(result.observations.map((item) => item.principal_id))) this.lastPoll.set(id, Date.now());
       this.store.insertPoll(result.observations);
       this.store.leases();
+      this.refreshAgentLine(policy);
       // Human-facing delivery of the events the inserts above just detected.
       // Deliberately not awaited here: a slow or failing notification
       // channel must never delay a poll, and the ledger inside carries its

@@ -415,6 +415,31 @@ cp skills/headroom/SKILL.md ~/.claude/skills/headroom/SKILL.md
 That's the skill that tells a Claude Code orchestrator to check `headroom can` before it fans out
 work and to treat UNKNOWN as no capacity, the same rule this file just described.
 
+## 9. Put the quota line in every prompt (optional)
+
+The daemon writes one line after every poll to `~/.headroom/line.txt` (and `line.json`): the
+binding window per account, its pace state, the burn per hour, the time to reset and any Codex free
+resets. A stale or failed reading makes that account UNKNOWN, never a number.
+
+```sh
+headroom line                          # print it; STALE (<age> ago) when older than two poll intervals
+headroom hook install --agent claude   # add it to every Claude Code prompt
+headroom hook status                   # where it is installed, and how old the line is
+headroom hook uninstall --agent claude # remove it again
+```
+
+```text
+[Headroom] codex-main wk 18% (+4%/h) CONSERVE, resets in 5d 11h, 1 free reset (expires Oct 29) · claude-main wk 5% (+0.4%/h) NORMAL, resets in 6d 15h (as of 42s ago)
+```
+
+The hook is a small shell script in `~/.headroom/hooks/` that reads that file and appends its age: no
+Node, no network, a few milliseconds, and it never fails a prompt. Install adds one
+`UserPromptSubmit` entry to `settings.json` in `CLAUDE_CONFIG_DIR` (or `~/.claude`) and in
+`~/.claude2` when that exists, backs each file up once first, leaves every other setting alone, and
+refuses to edit a file that does not parse. It costs about 60 tokens per turn. `headroom setup` offers
+it (default yes); `setup --yes` installs it only with `--hook`. Not supported yet: Windows (the daemon
+still writes the line, and `headroom line` prints it), and Codex or Gemini hooks.
+
 ## Shell completions
 
 `headroom completion <shell>` prints a completion script for `bash`, `zsh`, `fish` or `pwsh`,
