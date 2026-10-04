@@ -17,6 +17,12 @@ All notable changes to this project are documented here. The format follows
 - Windows: after an in-place upgrade, `headroom install-service` restarts a running daemon whose version or pipe name differs from the CLI's (shutdown request, wait, `schtasks /Run`, confirmed on the new pipe), instead of saying "already installed and running" and keeping the old one. `headroom update` restarts the service the same way. A daemon from 0.2.6 or earlier cannot take the request; install-service then says how to switch and leaves it serving on the older pipe name. `health` now reports the version the daemon started as.
 - Windows: the daemon's named pipe is now `\\.\pipe\headroom-<digest>`, with no part of the username in the name. Clients fall back to the old name, so a daemon an older version started is still found until it restarts (#137).
 
+### Upgrade notes
+- Windows: a daemon started by 0.2.6 or older must be stopped by hand once after upgrading (end node.exe), because it cannot be asked to shut down.
+
+### Documentation (Windows status)
+- README and docs/quickstart.md: Windows verified status after a real Windows 11 retest of install-service, the hash-only pipe, uninstall and upgrade restart; what is still unverified is listed.
+
 ## [0.2.6] - 2026-10-02
 
 ### Changed
