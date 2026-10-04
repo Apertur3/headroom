@@ -176,7 +176,7 @@ describe("headroom run: host guard", () => {
     expect(code).toBe(0); // the child (node -e "process.exit(0)") exits 0 on its own
     expect(lines.join("\n")).toContain("host guard warning");
     expect(lines.join("\n")).toContain("load_ratio 5.00");
-  }, 10_000);
+  });
 
   it("does not refuse and does not warn when mode is off, even for a refuse-worthy reading", async () => {
     const home = await newHome("run-off-mode");
@@ -191,7 +191,7 @@ describe("headroom run: host guard", () => {
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
-  }, 10_000);
+  });
 
   it("launches normally and prints a warning on stderr for a warn reading", async () => {
     const home = await newHome("run-warn");
@@ -207,7 +207,7 @@ describe("headroom run: host guard", () => {
     expect(code).toBe(0);
     expect(lines.join("\n")).toContain("host guard warning");
     expect(lines.join("\n")).toContain("orphaned agy/script");
-  }, 10_000);
+  });
 
   it("launches normally and prints nothing when host state is ok", async () => {
     const home = await newHome("run-ok");
@@ -221,7 +221,7 @@ describe("headroom run: host guard", () => {
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
-  }, 10_000);
+  });
 
   it("launches normally when host state is unknown -- unknown never refuses or warns", async () => {
     const home = await newHome("run-unknown");
@@ -235,5 +235,5 @@ describe("headroom run: host guard", () => {
     } finally { restore(); }
     expect(code).toBe(0);
     expect(lines.join("\n")).not.toContain("host guard");
-  }, 10_000);
+  });
 });
