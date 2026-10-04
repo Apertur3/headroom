@@ -72,7 +72,19 @@ if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] \
   && [ "$(git cat-file -p HEAD | grep -c '^parent ')" = 2 ]; then
   id_skip=1
 fi
-bad_mail=$(git log --skip="$id_skip" --format='%ae%n%ce' HEAD | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
+# ALLOWED_IDENTITY_COMMITS: full 40-hex SHAs, one per line, whose author/committer identity lines are not checked.
+# Squash-merge attribution artifact of #129: GitHub recorded the contributor's own account email as author.
+# New entries need a reason. The process for external PRs is a maintainer branch authored with the
+# contributor's noreply identity. Only an exact full SHA matches; an abbreviated one never does.
+ALLOWED_IDENTITY_COMMITS='
+ee6a71ae5ad3bb0304705b0437c75ae8f5a88b4a
+'
+nl='
+'
+bad_mail=$(git log --skip="$id_skip" --format='%H %ae %ce' HEAD | while read -r sha ae ce; do
+    case "$nl$ALLOWED_IDENTITY_COMMITS$nl" in (*"$nl$sha$nl"*) continue ;; esac
+    printf '%s\n%s\n' "$ae" "$ce"
+  done | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
 [ -n "$bad_mail" ] && note "personal email in commit metadata: $bad_mail"
 
 # 3. generic PII patterns in tracked files (POSIX ERE only; allowed placeholders filtered out afterwards)

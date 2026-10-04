@@ -76,6 +76,7 @@ keep the JSON contract and examples aligned, and check relative documentation li
 - Update the docs and `CHANGELOG.md` (under an `Unreleased` heading) when behavior changes. The
   maintainer sets version numbers.
 - Plain commit messages that say what changed and why. No generated trailers.
+- Maintainers: merge external PRs via a maintainer branch authored with the contributor's noreply identity, never squash their PR directly (GitHub would record the contributor's personal email and fail `scripts/public-audit.sh`).
 
 ## The redacted-fixture convention
 
