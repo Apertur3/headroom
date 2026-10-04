@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { track, useProcessReaper } from "./helpers/mortal-process";
+import { track, useProcessReaper } from "./helpers/mortal-process.js";
 
 const execFileAsync = promisify(execFile);
 const script = join(__dirname, "..", "scripts", "record-antigravity-fixture.sh");

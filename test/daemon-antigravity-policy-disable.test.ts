@@ -79,6 +79,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
           }
           const internal = daemon as unknown as {
             keepalive: { running: boolean; pid?: number } | undefined;
+            poll(principal: string | undefined, forced: boolean): Promise<unknown>;
           };
           expect(internal.keepalive?.running).toBe(true);
           const agyPid = track(internal.keepalive?.pid, root) as number;
@@ -89,7 +90,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
           // even while the supervisor is currently running.
           await writeFile(join(root, "policy.toml"), "antigravity_keepalive = false\n", { mode: 0o600 });
 
-          await daemon.poll(undefined, true);
+          await internal.poll(undefined, true);
 
           await vi.waitFor(() => { expect(internal.keepalive).toBeUndefined(); }, { timeout: 3_000, interval: 20 });
           await waitUntilDead(agyPid);
@@ -121,6 +122,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
           }
           const internal = daemon as unknown as {
             keepalive: { running: boolean; pid?: number } | undefined;
+            poll(principal: string | undefined, forced: boolean): Promise<unknown>;
           };
           const scriptPid = track(internal.keepalive?.pid, root) as number;
           track(Number(await waitForFile(infoFile)), root);
@@ -139,7 +141,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
           // Disable via POLICY while in exactly this state. The account
           // itself stays enabled throughout.
           await writeFile(join(root, "policy.toml"), "antigravity_keepalive = false\n", { mode: 0o600 });
-          await daemon.poll(undefined, true);
+          await internal.poll(undefined, true);
 
           await vi.waitFor(() => { expect(internal.keepalive).toBeUndefined(); }, { timeout: 3_000, interval: 20 });
           // Give the (correctly cancelled) restart every chance to have fired

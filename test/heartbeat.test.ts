@@ -43,6 +43,9 @@ async function openStore(prefix: string): Promise<{ store: HeadroomStore; home: 
 // store.ts: heartbeat record/refresh/stop
 // ---------------------------------------------------------------------------
 
+// HeadroomStore.db is private; this is the slice of its sqlite handle the test reaches into.
+type RawDb = { prepare(sql: string): { run(...params: unknown[]): unknown; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] } };
+
 describe("heartbeat record/refresh/stop", () => {
   it("records, refreshes (keeping the resume sentence when omitted), and stops", async () => {
     const { store } = await openStore("headroom-heartbeat-basic-");
@@ -748,9 +751,10 @@ describe("fireDueTimers", () => {
       const snapshot = store.dueTimers(at)[0];
       expect(snapshot.owner).toBe("orch-race");
 
-      const originalPrepare = store.db.prepare.bind(store.db);
+      const db = (store as unknown as { db: RawDb }).db;
+      const originalPrepare = db.prepare.bind(db);
       let intercepted = false;
-      const prepareSpy = vi.spyOn(store.db, "prepare").mockImplementation((sql: string) => {
+      const prepareSpy = vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
         const real = originalPrepare(sql);
         if (!intercepted && sql.startsWith("SELECT * FROM timers WHERE owner")) {
           intercepted = true;
@@ -779,7 +783,7 @@ describe("fireDueTimers", () => {
       // claimed_at/claim_token are internal-only, not on the public Timer
       // shape timers() returns -- read the raw row to prove the replaced
       // row itself was never touched by the stale attempt.
-      const raw = store.db.prepare("SELECT claimed_at, claim_token FROM timers WHERE owner = ? AND name = ?").get("orch-race", "wake") as { claimed_at: unknown; claim_token: unknown };
+      const raw = db.prepare("SELECT claimed_at, claim_token FROM timers WHERE owner = ? AND name = ?").get("orch-race", "wake") as { claimed_at: unknown; claim_token: unknown };
       expect(raw.claimed_at).toBeNull();
       expect(raw.claim_token).toBeNull();
     } finally { store.close(); }

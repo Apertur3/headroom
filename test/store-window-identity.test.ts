@@ -16,6 +16,8 @@ afterEach(async () => {
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
+// HeadroomStore.db is private; this is the slice of its sqlite handle the test reaches into.
+type RawDb = { prepare(sql: string): { run(...params: unknown[]): unknown; get(...params: unknown[]): Record<string, unknown> | undefined; all(...params: unknown[]): Record<string, unknown>[] } };
 async function open(): Promise<HeadroomStore> {
   const root = await mkdtemp(join(tmpdir(), "headroom-window-identity-"));
   temporary.push(root);
@@ -109,7 +111,7 @@ describe("store window semantic identity (#49)", () => {
       const rawJson2 = JSON.stringify({ minutes: 300, kind: "fixed", enforcement: "hard" });
 
       const insertRaw = (windowJson: string, used: number, fetchedAt: string) => {
-        store.db.prepare(`INSERT INTO observations
+        (store as unknown as { db: RawDb }).db.prepare(`INSERT INTO observations
           (principal_id, meter_id, window_json, quantity_json, resets_at, observed_at, fetched_at, source, truth, freshness, confidence, adapter_version, upstream_schema_version, reason, metadata_json)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           "claude-main",

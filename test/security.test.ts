@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createServer, type RequestListener } from "node:http";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { adaptCodexPayload } from "../src/engine/codexbar/adapt.js";
@@ -48,7 +48,7 @@ describe("outboundFetch", () => {
   const servers: ReturnType<typeof createServer>[] = [];
   afterEach(async () => { await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve())))); });
 
-  async function stub(handler: Parameters<typeof createServer>[0]): Promise<string> {
+  async function stub(handler: RequestListener): Promise<string> {
     const server = createServer(handler);
     servers.push(server);
     try { await new Promise<void>((resolve, reject) => { server.once("error", reject).listen(0, "127.0.0.1", resolve); }); }

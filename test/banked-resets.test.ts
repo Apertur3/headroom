@@ -62,7 +62,7 @@ describe("manual banked-reset storage", () => {
       const now = new Date();
       const expires = new Date(now.getTime() + 48 * 3_600_000).toISOString();
       const manual = store.recordManualCredits("claude-main", 2, expires, false, now);
-      expect(manual).toMatchObject({ meter_id: "claude-main:credits", source: "manual", truth: "estimated", freshness: "fresh", confidence: 0.9, adapter_version: "manual", metadata: { free_resets_available: 2, manual: true } });
+      expect(manual).toMatchObject({ meter_id: "claude-main:credits", source: "manual", truth: "estimated" as const, freshness: "fresh", confidence: 0.9, adapter_version: "manual", metadata: { free_resets_available: 2, manual: true } });
       expect(store.events(new Date(now.getTime() - 1_000).toISOString())).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "credits_changed", origin: "inferred", confidence: 0.9, reason: "manual credits entry" }),
       ]));
@@ -334,7 +334,7 @@ describe("credits CLI, daemon RPC, MCP and status", () => {
 
   it("marks manual credits in status and renders them expired after their expiry", () => {
     const now = new Date("2026-10-01T12:00:00Z");
-    const future = { ...vendorCredits("claude-main", 1, "2026-10-02T12:00:00Z", now), source: "manual", truth: "estimated", confidence: 0.9, adapter_version: "manual", metadata: { free_resets_available: 1, manual: true } };
+    const future = { ...vendorCredits("claude-main", 1, "2026-10-02T12:00:00Z", now), source: "manual", truth: "estimated" as const, confidence: 0.9, adapter_version: "manual", metadata: { free_resets_available: 1, manual: true } };
     const past = { ...future, resets_at: "2026-09-30T12:00:00Z" };
     expect(formatMeters([future], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 available (expires Oct 2) (manual)");
     expect(formatMeters([past], defaultPolicy, new Map(), new Map(), new Map(), now)[0]).toContain("credits 1 expired Sep 30 (manual)");
