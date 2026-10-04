@@ -9,6 +9,7 @@ import type { Policy } from "./policy.js";
 import { outboundFetch, readBoundedRegularFile, redact, safeError, safeOutputDirectory, writeFileAtomic } from "./security.js";
 import { restartWindowsDaemon, servicePath, type ServiceRunner } from "./service.js";
 import type { ShutdownOutcome } from "./daemon.js";
+import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
 import { isYes } from "./setup.js";
 import { HeadroomStore } from "./store.js";
 import { headroomVersion } from "./version.js";
@@ -223,7 +224,7 @@ async function restartServiceIfPresent(platform: NodeJS.Platform, userHome: stri
       runner, probe, confirm: probe,
       requestShutdown: windows.requestShutdown ?? (() => daemon.requestDaemonShutdown(path)),
       sleep: windows.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
-      stopWaitMs: windows.stopWaitMs ?? 10_000,
+      stopWaitMs: windows.stopWaitMs ?? DAEMON_STOP_WAIT_MS,
       waitMs: windows.waitMs ?? 10_000,
     });
     return restart.state === "restarted" ? { state: "restarted" } : { state: "failed", reason: restart.reason ?? "the daemon did not answer after schtasks /Run" };

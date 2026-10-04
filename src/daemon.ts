@@ -348,6 +348,10 @@ export class HeadroomDaemon {
    * update while the listener is in `stopping`; this proxy still refuses every
    * method once close begins, but does not cancel work stop() is awaiting. */
   private readonly drainingStore: HeadroomStore;
+  /** The package version this process started as, read once in start(). An in-place `npm i -g`
+   * replaces package.json under a running daemon; reading it lazily at the first health request
+   * would report the new version and hide that this process still runs the old code. */
+  private startedVersion: string | undefined;
   /** Set by the first authorized `shutdown` request; later ones answer "already requested". */
   private shutdownWasRequested = false;
   private resolveShutdownRequest: () => void = () => undefined;
@@ -407,6 +411,7 @@ export class HeadroomDaemon {
     // here; and engine starts are open until stop() closes them.
     setEngineSignalCleanup(false);
     allowEngineStarts();
+    this.startedVersion = await headroomVersion();
     // Before any fetch can happen: an operator's shell proxy must never
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
@@ -1263,7 +1268,7 @@ export class HeadroomDaemon {
           state: this.stopping ? "stopping" : "running",
           socket: this.path,
           // Lets install-service tell a daemon an older install started (after an in-place upgrade) from a current one.
-          version: await headroomVersion(),
+          version: this.startedVersion ?? await headroomVersion(),
           in_flight: this.inFlight.size,
           backoff: [...this.backoff.entries()].map(([principal, item]) => ({ principal, until: new Date(item.until).toISOString(), failures: item.failures })),
           keepalive: {

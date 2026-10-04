@@ -271,6 +271,39 @@ describe("install-service loads and starts the service", () => {
       expect(describeServiceStart(result)[0]).toContain("restarted the daemon so it runs this version (the running daemon serves the older pipe name");
     });
 
+    it("keeps waiting while an accepted shutdown is still draining at 10 s, then restarts (no unshortened wait is cut short)", async () => {
+      const { home, env } = await fakeHome();
+      const path = servicePath("win32", home, env); temporary.push(path); // win32 paths are backslash-joined, so on posix this is a stray file in the cwd
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, serviceContents(script, "win32", runtime, "tester", home, env));
+      let now = 1_000_000;
+      let stoppingSince: number | undefined;
+      let running: DaemonIdentity | undefined = { version: "0.2.6", socket: current.socket };
+      const events: string[] = [];
+      const runner: ServiceRunner = async (command, args) => {
+        if (command === "powershell") return { code: 0, output: "Running" };
+        events.push(args[0]);
+        if (args[0] === "/Run" && running === undefined) running = current;
+        return { code: 0, output: "" };
+      };
+      const probe = async () => {
+        // A slow graceful stop: the old daemon answers until 15 s after it accepted the request.
+        if (stoppingSince !== undefined && running?.version === "0.2.6" && now - stoppingSince >= 15_000) running = undefined;
+        return running !== undefined;
+      };
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        const result = await installAndStartService(script, "win32", home, runtime, env, "tester", {
+          sleep: async (ms) => { now += ms; }, intervalMs: 500, uid: 501, runner, probe, expected: current,
+          identify: async () => { await probe(); return running; },
+          requestShutdown: async () => { stoppingSince = now; return "accepted"; },
+        });
+        expect(result.state).toBe("restarted");
+        expect(events).toEqual(["/End", "/Run"]);
+        expect(now - stoppingSince!).toBeGreaterThan(15_000);
+      } finally { clock.mockRestore(); }
+    });
+
     it("restarts a daemon running another version on the same pipe", async () => {
       const { result, events } = await upgraded({ version: "0.2.6", socket: current.socket });
       expect(result.state).toBe("restarted");

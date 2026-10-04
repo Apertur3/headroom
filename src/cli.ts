@@ -44,6 +44,7 @@ import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./re
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { describeServiceStart, installAndStartService, installService, uninstallService } from "./service.js";
+import { DAEMON_POST_STOP_EXIT_MS, DAEMON_STOP_DEADLINE_MS } from "./daemon-stop.js";
 import { modelTokenShare } from "./session-logs.js";
 import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
@@ -2007,9 +2008,6 @@ async function usagePaste(argv: string[]): Promise<number> {
   return 0;
 }
 
-/** Upper bound on a graceful daemon stop before the process exits on its own. */
-const DAEMON_STOP_DEADLINE_MS = 20_000;
-
 async function daemon(): Promise<number> {
   const instance = await HeadroomDaemon.create();
   await instance.start();
@@ -2031,7 +2029,7 @@ async function daemon(): Promise<number> {
   });
   // The pipe and the store are closed; a lingering handle (a keep-alive HTTP socket) must not keep
   // the pipe owner's process around, or a Task Scheduler /Run right after would be ignored.
-  setTimeout(() => process.exit(0), 2_000).unref();
+  setTimeout(() => process.exit(0), DAEMON_POST_STOP_EXIT_MS).unref();
   return 0;
 }
 

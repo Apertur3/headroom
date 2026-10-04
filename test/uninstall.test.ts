@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsToml } from "../src/registry.js";
 import { servicePath } from "../src/service.js";
+import { DAEMON_STOP_BUDGET_MS, DAEMON_STOP_WAIT_MS } from "../src/daemon-stop.js";
 import { runUninstall, type UninstallOverrides } from "../src/uninstall.js";
 import type { ProviderAccount } from "../src/types.js";
 
@@ -401,6 +402,32 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
     expect(kill).not.toHaveBeenCalled();
   });
 
+  it("keeps waiting for an accepted shutdown that is still draining at 10 s, within the daemon's own stop budget, and then deletes the home", async () => {
+    const { headroomHome, env } = await windowsSetup();
+    // A virtual clock: every sleep advances it, so the default (unshortened) wait runs instantly.
+    let now = 1_000_000;
+    const start = now;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const runServiceStop = vi.fn(async (_command: string) => 0);
+    // A slow graceful stop: the daemon still answers 15 s after it accepted the request.
+    const probeDaemon = async () => now - start < 15_000;
+    const kill = vi.spyOn(process, "kill");
+    let code = -1;
+    try {
+      await withEnv(env, async () => {
+        await writeWindowsTask(headroomHome);
+        code = (await captureLog(() => runUninstall(["--home", "--yes"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown: async () => "accepted", sleep: async (ms) => { now += ms; } }))).result;
+      });
+    } finally { clock.mockRestore(); kill.mockRestore(); }
+    expect(DAEMON_STOP_WAIT_MS).toBeGreaterThan(DAEMON_STOP_BUDGET_MS);
+    expect(now - start).toBeGreaterThan(15_000);
+    expect(now - start).toBeLessThan(DAEMON_STOP_WAIT_MS);
+    expect(code).toBe(0);
+    expect(await fileExists(headroomHome)).toBe(false);
+    temporary.splice(temporary.indexOf(headroomHome), 1);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("falls back to /End and the bounded wait for an older daemon without the shutdown request, and says so when it survives", async () => {
     const { headroomHome, env } = await windowsSetup();
     const events: string[] = [];
@@ -454,7 +481,7 @@ describe("headroom uninstall on Windows: stop the daemon before deleting the hom
       logs = (await captureLog(() => runUninstall(["--dry-run", "--home"], { ...posix, servicePlatform: "win32", claudeOnPath: async () => false, runServiceStop, probeDaemon, requestShutdown }))).logs;
     });
     expect(requestShutdown).not.toHaveBeenCalled();
-    expect(logs.join("\n")).toContain(`would ask the daemon to shut down, wait up to 10s for it to exit, then end the task (${WINDOWS_END})`);
+    expect(logs.join("\n")).toContain(`would ask the daemon to shut down, wait up to 27s for it to exit, then end the task (${WINDOWS_END})`);
     expect(runServiceStop).not.toHaveBeenCalled();
     expect(probeDaemon).not.toHaveBeenCalled();
   });

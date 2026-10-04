@@ -7,6 +7,7 @@ import { joinForPlatform, headroomHome } from "./paths.js";
 import { daemonLogPath } from "./logs.js";
 import { safeError } from "./security.js";
 import { headroomVersion } from "./version.js";
+import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
 import type { ShutdownOutcome } from "./daemon.js";
 
 const execFileAsync = promisify(execFile);
@@ -257,7 +258,7 @@ export interface ServiceStartOptions {
   /** How long to wait for the daemon to answer after loading the service. */
   waitMs?: number;
   intervalMs?: number;
-  /** How long to wait for a replaced Windows task's old daemon to stop answering. */
+  /** How long to wait for a replaced Windows task's old daemon to stop answering (default DAEMON_STOP_WAIT_MS). */
   stopWaitMs?: number;
   uid?: number;
   /** Test seam so the bounded wait does not really sleep. */
@@ -336,7 +337,7 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
   const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : 0);
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const interval = options.intervalMs ?? 500;
-  const stopWindows = (end: () => Promise<{ code: number; output: string }>) => stopWindowsDaemon({ requestShutdown: options.requestShutdown ?? defaultRequestShutdown, probe, end, sleep, waitMs: options.stopWaitMs ?? 10_000, intervalMs: interval });
+  const stopWindows = (end: () => Promise<{ code: number; output: string }>) => stopWindowsDaemon({ requestShutdown: options.requestShutdown ?? defaultRequestShutdown, probe, end, sleep, waitMs: options.stopWaitMs ?? DAEMON_STOP_WAIT_MS, intervalMs: interval });
   if (previous === contents && await serviceManagerHasService(platform, uid, runner) && await probe()) {
     if (platform !== "win32") return { state: "already-running", manual };
     // After an in-place upgrade the definition is unchanged (same node, same script path) but the
@@ -347,7 +348,7 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
     if (!stale) return { state: "already-running", manual };
     const restart = await restartWindowsDaemon({
       runner, requestShutdown: options.requestShutdown ?? defaultRequestShutdown, probe, sleep, intervalMs: interval,
-      stopWaitMs: options.stopWaitMs ?? 10_000, waitMs: options.waitMs ?? 10_000,
+      stopWaitMs: options.stopWaitMs ?? DAEMON_STOP_WAIT_MS, waitMs: options.waitMs ?? 10_000,
       // Confirmed only once the daemon answers on this CLI's pipe name, not merely once anything answers.
       confirm: async () => (await identify().catch(() => undefined))?.socket === expected.socket,
     });

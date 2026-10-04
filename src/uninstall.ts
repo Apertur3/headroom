@@ -12,6 +12,7 @@ import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
 import { servicePath, stopWindowsDaemon, uninstallService, waitForDaemonExit, windowsStopFailure } from "./service.js";
 import type { ShutdownOutcome } from "./daemon.js";
+import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
 import { isYes } from "./setup.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 
@@ -36,7 +37,7 @@ export interface UninstallOverrides {
   requestShutdown?: () => Promise<ShutdownOutcome>;
   /** Test seam so the bounded waits do not really sleep. */
   sleep?: (ms: number) => Promise<void>;
-  /** How long to wait for the Windows daemon to exit after the shutdown request (default 10 s). */
+  /** How long to wait for the Windows daemon to exit after the shutdown request (default DAEMON_STOP_WAIT_MS: the daemon's own worst-case stop plus a margin). */
   stopWaitMs?: number;
 }
 
@@ -150,7 +151,7 @@ async function stepService(options: UninstallOptions, overrides: UninstallOverri
   try { await lstat(path); } catch { present = false; }
   if (!present) { console.log(`  no Headroom service found at ${path}; nothing to do`); return true; }
   const plan = await uninstallService(platform, homedir(), true);
-  const waitMs = overrides.stopWaitMs ?? 10_000;
+  const waitMs = overrides.stopWaitMs ?? DAEMON_STOP_WAIT_MS;
   if (options.dryRun) {
     if (platform === "win32") console.log(`  (dry run) would ask the daemon to shut down, wait up to ${Math.round(waitMs / 1000)}s for it to exit, then end the task (${WINDOWS_END_COMMAND})`);
     console.log(`  (dry run) would stop it: ${plan.command}`);
