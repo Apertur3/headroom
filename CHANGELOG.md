@@ -6,12 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-04
+
 ### Documentation
 - README: an agent-first opening, a "For agents" block to paste into `CLAUDE.md` or `AGENTS.md`, MCP registration out of the collapsed setup, and corrected claims about reservations, `--allow-unknown`, where secrets live, the Windows daemon pipe and process checks; docs/quickstart.md now describes the dashboard graph as the remaining-capacity burndown it draws.
+- docs/concepts.md and the headroom skill: unused quota is information, not a target; leaving capacity unused at reset is acceptable (#131, thanks @terminalchai).
 
 ### Fixed
 - On a fresh home (no `accounts.toml`, or an empty one), `status`, `can`, `gate`, `route` and `dashboard` now print one clear "No accounts configured yet" message pointing at `headroom accounts discover` (or `headroom setup`) instead of a raw ENOENT. `can`, `gate` and `route` exit 2 (no capacity, never a yes); `status` (missing file) and `dashboard` exit 1; `status` with an empty file prints the message on stderr and keeps exit 0. The missing file is recognised by type, not by comparing path strings, which could miss on Windows (#142).
-- An overlong Unix socket path now names the path, its UTF-8 byte length, the platform limit and the fix (a shorter `HEADROOM_HOME`) instead of a bare `listen EINVAL`. The daemon refuses to start with that message and `headroom doctor` reports it as a FAIL and continues its other checks; other commands still fall back to a direct read, with a one-line hint on stderr. Windows named pipes are unchanged (#105, thanks @anshurajbisoyi98-ctrl).
+- An overlong Unix socket path now names the path, its UTF-8 byte length, the platform limit and the fix (a shorter `HEADROOM_HOME`) instead of a bare `listen EINVAL`. The daemon refuses to start with that message and `headroom doctor` reports it as a FAIL and continues its other checks; other commands still fall back to a direct read, with a one-line hint on stderr. Windows named pipes are unchanged (#105, #124, thanks @anshurajbisoyi98-ctrl).
 - Windows: `headroom uninstall` ends the scheduled task and waits up to 10 seconds for the daemon to exit before it deletes the task and the home, so deleting the home no longer fails with EBUSY on `headroom.db`. If the daemon keeps running, uninstall says so, leaves the home in place and exits non-zero; it never kills a process it cannot verify (#136).
 - Windows: `schtasks /End` never stopped the daemon, because it ends only the task's `cmd.exe` wrapper and not the `node.exe` it started, so `headroom uninstall --home` always stopped with "still running". The daemon now takes an authenticated `shutdown` request over its pipe (the same proof as every other mutating request; idempotent) and stops gracefully. `headroom uninstall` sends it, waits up to 27 seconds (the daemon's own worst-case stop of 22 seconds plus a margin), then ends the task as a backup before it deletes the task and the home; a daemon that keeps answering is still reported, the home kept, and nothing killed.
 - Windows: after an in-place upgrade, `headroom install-service` restarts a running daemon whose version or pipe name differs from the CLI's (shutdown request, wait, `schtasks /Run`, confirmed on the new pipe), instead of saying "already installed and running" and keeping the old one. `headroom update` restarts the service the same way. A daemon from 0.2.6 or earlier cannot take the request; install-service then says how to switch and leaves it serving on the older pipe name. `health` now reports the version the daemon started as.
@@ -22,6 +25,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Documentation (Windows status)
 - README and docs/quickstart.md: Windows verified status after a real Windows 11 retest of install-service, the hash-only pipe, uninstall and upgrade restart; what is still unverified is listed.
+
+### Internal
+- CI runs a fast path for docs-only changes, type-checks the tests (`lint:tests`) and runs on push only for master; test fixes for pid races, an event-loop timing test and host guard launch timeouts (#126, #132, #133, #139, #144, #129, thanks @terminalchai).
 
 ## [0.2.6] - 2026-10-02
 
