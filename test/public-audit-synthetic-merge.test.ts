@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -31,7 +31,7 @@ async function git(cwd: string, email: string, ...args: string[]): Promise<strin
 async function fakeRepo(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-public-audit-")); temporary.push(root);
   await mkdir(join(root, "scripts"));
-  await copyFile(realScript, join(root, "scripts", "public-audit.sh"));
+  await writeFile(join(root, "scripts", "public-audit.sh"), await readFile(realScript));
   await git(root, NOREPLY, "init", "-q", "-b", "main");
   await git(root, NOREPLY, "add", ".");
   await git(root, NOREPLY, "commit", "-q", "-m", "base");
@@ -116,5 +116,36 @@ describe("public-audit check 2 and GitHub's synthetic PR merge commit", () => {
       await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "real work");
       expect(await audit(await shallow(root), "pull_request")).toContain("personal email in commit metadata");
     });
+  });
+});
+
+describe("public-audit check 2 ALLOWED_IDENTITY_COMMITS", () => {
+  const listed = "ee6a71ae5ad3bb0304705b0437c75ae8f5a88b4a";
+  /** Replaces the real allowlist entry in the copied script with `entry`. */
+  async function allow(root: string, entry: string): Promise<void> {
+    const path = join(root, "scripts", "public-audit.sh");
+    await writeFile(path, (await readFile(path, "utf8")).replace(listed, entry));
+  }
+
+  it("passes a listed commit with a personal email", async () => {
+    const root = await fakeRepo();
+    await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "squash of external PR");
+    await allow(root, await git(root, NOREPLY, "rev-parse", "HEAD"));
+    expect(await audit(root, undefined)).not.toContain("personal email");
+  });
+
+  it("flags an unlisted commit with the same email", async () => {
+    const root = await fakeRepo();
+    await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "listed");
+    await allow(root, await git(root, NOREPLY, "rev-parse", "HEAD"));
+    await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "unlisted");
+    expect(await audit(root, undefined)).toContain("personal email in commit metadata");
+  });
+
+  it("does not match an abbreviated SHA", async () => {
+    const root = await fakeRepo();
+    await git(root, PERSONAL, "commit", "-q", "--allow-empty", "-m", "squash of external PR");
+    await allow(root, (await git(root, NOREPLY, "rev-parse", "HEAD")).slice(0, 12));
+    expect(await audit(root, undefined)).toContain("personal email in commit metadata");
   });
 });
