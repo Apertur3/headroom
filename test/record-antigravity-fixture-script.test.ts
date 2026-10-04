@@ -123,12 +123,16 @@ describe("record-antigravity-fixture.sh", () => {
   it.skipIf(process.platform === "win32")("execs the engine: the wrapper pid is the engine pid, so no child exists", async () => {
     const run = start();
     try {
-      expect(await waitFor(() => run.pid() !== undefined)).toBe(true);
+      // Poll until the stub has reported its pid, then until it equals the
+      // wrapper's: a pid read at a fixed moment can predate the exec on a slow
+      // macOS runner. A wrapper that really forked never converges.
+      expect(await waitFor(() => run.pid() !== undefined, 20_000)).toBe(true);
+      await waitFor(() => run.pid() === run.wrapper.pid, 20_000);
       expect(run.pid()).toBe(run.wrapper.pid);
     } finally {
       run.stop();
     }
-  }, 30_000);
+  }, 45_000);
 
   it.skipIf(process.platform === "win32")("passes the principals JSON on stdin, with no secrets or arguments in it", async () => {
     const run = start();
