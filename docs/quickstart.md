@@ -442,7 +442,7 @@ otherwise) rather than just the flag name.
 
 Headroom's paths, the daemon transport, and the service installer all have Windows
 implementations: `%LOCALAPPDATA%\headroom` (or `HEADROOM_HOME`) instead of `~/.headroom`, a named
-pipe (`\\.\pipe\headroom-<username>-<home digest>`) instead of a Unix socket, and a Task Scheduler XML instead of
+pipe (`\\.\pipe\headroom-<digest of user and home>`) instead of a Unix socket, and a Task Scheduler XML instead of
 launchd or systemd. Claude and Codex read normally, straight from their credential files.
 
 Antigravity quota reading is currently supported on macOS 14 or later. Its universal native

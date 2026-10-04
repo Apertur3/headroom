@@ -26,14 +26,14 @@ describe("socketPath", () => {
   });
 
   it("does not impose a Unix socket limit on a Windows home", () => {
-    expect(checkedSocketPath("C:\\Users\\test\\" + "a".repeat(200), "win32", "test")).toMatch(/^\\\\\.\\pipe\\headroom-test-[0-9a-f]{8}$/);
+    expect(checkedSocketPath("C:\\Users\\test\\" + "a".repeat(200), "win32", "test")).toMatch(/^\\\\\.\\pipe\\headroom-[0-9a-f]{16}$/);
   });
 
   it("gives two Windows homes of one user two different named pipes", () => {
     const first = socketPath("C:\\Users\\test\\.headroom", "win32", "test");
     const second = socketPath("C:\\Users\\test\\.headroom-2", "win32", "test");
-    expect(first).toMatch(/^\\\\\.\\pipe\\headroom-test-[0-9a-f]{8}$/);
-    expect(second).toMatch(/^\\\\\.\\pipe\\headroom-test-[0-9a-f]{8}$/);
+    expect(first).toMatch(/^\\\\\.\\pipe\\headroom-[0-9a-f]{16}$/);
+    expect(second).toMatch(/^\\\\\.\\pipe\\headroom-[0-9a-f]{16}$/);
     expect(first).not.toBe(second);
   });
 

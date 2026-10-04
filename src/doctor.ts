@@ -8,7 +8,7 @@ import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
-import { checkedSocketPath, daemonRequest } from "./daemon.js";
+import { checkedSocketPath, daemonRequest, legacyPipeFallback } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { daemonLogPath } from "./logs.js";
@@ -381,9 +381,14 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
   if (path !== undefined) {
     const daemon = await daemonRequest(path, "health");
     if (daemon.status === "available") {
-      output.push(check("OK", "daemon socket", path, "no action needed"));
+      const health = daemon.result as { socket?: unknown; keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; external_server?: boolean; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
+      // A daemon an older version started answers on the legacy Windows pipe
+      // name (the client fell back to it); say so instead of printing a name
+      // nothing listens on. The next daemon start uses the current name.
+      const legacy = legacyPipeFallback(path);
+      const served = legacy !== undefined && health.socket === legacy ? `${legacy} (older pipe name; the next daemon start uses ${path})` : path;
+      output.push(check("OK", "daemon socket", served, "no action needed"));
       output.push(check("OK", "daemon health", "responding", "no action needed"));
-      const health = daemon.result as { keepalive?: { running?: boolean; pid?: number | null; uptime_ms?: number | null; login_state?: "unknown" | "logged_in" | "not_logged_in"; external_server?: boolean; local_reads?: Record<string, { outcome?: string; payload_kind?: string }> } };
       const antigravity = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity");
       const keepalive = health.keepalive;
       if (!antigravity) output.push(check("OK", "Antigravity keepalive", "no Antigravity principal configured", "no action needed"));

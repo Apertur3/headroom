@@ -26,13 +26,31 @@ export interface UninstallOverrides {
   runServiceStop?: (command: string) => Promise<number>;
   /** The platform whose shell the printed retry commands are written for; overridden in tests. */
   platform?: NodeJS.Platform;
+  /** The platform whose service manager and daemon uninstall handles (the Windows stop-then-delete
+   * sequence runs only for "win32"); overridden in tests. Defaults to process.platform. */
+  servicePlatform?: NodeJS.Platform;
+  /** True while a Headroom daemon for this home answers health; overridden in tests. */
+  probeDaemon?: () => Promise<boolean>;
+  /** Test seam so the bounded waits do not really sleep. */
+  sleep?: (ms: number) => Promise<void>;
+  /** How long to wait for the daemon to exit after the Windows task is ended (default 10 s). */
+  stopWaitMs?: number;
 }
+
+/** Task Scheduler task name; matches service.ts's WINDOWS_TASK. */
+const WINDOWS_TASK = "Headroom Daemon";
+const WINDOWS_END_COMMAND = `schtasks /End /TN "${WINDOWS_TASK}"`;
+/** Consecutive health misses before the daemon counts as gone: one miss can be a busy daemon. */
+const STOP_CONFIRMATIONS = 3;
+const PROBE_INTERVAL_MS = 500;
 
 interface UninstallOptions {
   home: boolean;
   yes: boolean;
   dryRun: boolean;
   rl: Interface | undefined;
+  /** Set when the daemon was still running after the service step, so the home must not be deleted. */
+  daemonStillRunning?: boolean;
 }
 
 /** The profile's environment for the spawned `claude`: CLAUDE_CONFIG_DIR made absolute (a local-scope
@@ -77,6 +95,41 @@ async function defaultRunServiceStop(command: string): Promise<number> {
   catch (error) { return typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1; }
 }
 
+async function defaultProbeDaemon(): Promise<boolean> {
+  // Loaded lazily, as service.ts does: daemon.ts is the whole daemon. Dials the current pipe name and
+  // falls back to the legacy one, so a daemon an older version started is seen too.
+  const { daemonRequest, socketPath } = await import("./daemon.js");
+  return (await daemonRequest(socketPath(), "health", {}, 500, 500)).status === "available";
+}
+
+/** Polls until the daemon has missed STOP_CONFIRMATIONS health probes in a row (true) or the
+ * deadline passes while it still answers (false). With waitMs 0 this is a plain check: any answer
+ * means it is running. */
+async function waitForDaemonExit(probe: () => Promise<boolean>, sleep: (ms: number) => Promise<void>, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  let misses = 0;
+  for (;;) {
+    let answering: boolean;
+    try { answering = await probe(); } catch { answering = false; }
+    misses = answering ? 0 : misses + 1;
+    if (misses >= STOP_CONFIRMATIONS) return true;
+    // Past the deadline, give up only while it still answers: a streak of misses already under way
+    // gets its remaining (at most STOP_CONFIRMATIONS - 1) probes.
+    if (misses === 0 && Date.now() > deadline) return false;
+    await sleep(PROBE_INTERVAL_MS);
+  }
+}
+
+/** Printed when the Windows daemon outlives the wait. Headroom has no way to verify a Windows process's
+ * identity (process-tree.ts's identity checks need `ps`), so it never kills one by name or pid. */
+function daemonStillRunningMessage(waitMs: number): string[] {
+  return [
+    `  the Headroom daemon is still running ${Math.round(waitMs / 1000)}s after the task was ended.`,
+    "  Headroom cannot verify a Windows process's identity, so it does not kill it.",
+    "  Stop it yourself (Task Manager: the node.exe running `headroom daemon`, or Ctrl+C in its window), then run `headroom uninstall --home` again.",
+  ];
+}
+
 function shellQuote(value: string): string { return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`; }
 
 function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "local", cwd?: string, platform: NodeJS.Platform = process.platform): string {
@@ -104,27 +157,49 @@ function claudeDisplayCommand(env: Record<string, string>, scope: "user" | "loca
  */
 async function stepService(options: UninstallOptions, overrides: UninstallOverrides): Promise<boolean> {
   console.log("Step 1: stop and remove the background service");
-  const path = servicePath();
+  const platform = overrides.servicePlatform ?? process.platform;
+  const path = servicePath(platform);
   let present = true;
   try { await lstat(path); } catch { present = false; }
   if (!present) { console.log(`  no Headroom service found at ${path}; nothing to do`); return true; }
-  const plan = await uninstallService(process.platform, homedir(), true);
+  const plan = await uninstallService(platform, homedir(), true);
+  const waitMs = overrides.stopWaitMs ?? 10_000;
   if (options.dryRun) {
+    if (platform === "win32") console.log(`  (dry run) would end the task (${WINDOWS_END_COMMAND}) and wait up to ${Math.round(waitMs / 1000)}s for the daemon to exit`);
     console.log(`  (dry run) would stop it: ${plan.command}`);
     console.log(`  (dry run) would remove ${path}`);
     return true;
   }
-  console.log(`  stopping it: ${plan.command}`);
   const runServiceStop = overrides.runServiceStop ?? defaultRunServiceStop;
+  let ok = true;
+  if (platform === "win32") {
+    // schtasks /Delete removes the task but not the daemon it already started, which then keeps
+    // headroom.db open and makes deleting the home fail with EBUSY (#136). End the task first and
+    // wait, bounded, for the daemon to stop answering. A non-zero /End (the task was not running)
+    // is not itself a failure: the wait decides.
+    console.log(`  ending the task: ${WINDOWS_END_COMMAND}`);
+    try {
+      const code = await runServiceStop(WINDOWS_END_COMMAND);
+      if (code !== 0) console.log(`  end command exited ${code} (continuing; the task may not be running)`);
+    } catch (error) { console.log(`  end command failed: ${safeError(error)} (continuing)`); }
+    const sleep = overrides.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    if (await waitForDaemonExit(overrides.probeDaemon ?? defaultProbeDaemon, sleep, waitMs)) console.log("  the daemon is not running");
+    else {
+      for (const line of daemonStillRunningMessage(waitMs)) console.error(line);
+      options.daemonStillRunning = true;
+      ok = false;
+    }
+  }
+  console.log(`  stopping it: ${plan.command}`);
   try {
     const code = await runServiceStop(plan.command);
     if (code !== 0) console.log(`  stop command exited ${code} (continuing; it may already be stopped)`);
   } catch (error) { console.log(`  stop command failed: ${safeError(error)} (continuing to remove the file)`); }
   try {
-    await uninstallService(process.platform, homedir(), false);
+    await uninstallService(platform, homedir(), false);
     console.log(`  removed ${path}`);
   } catch (error) { console.error(`  failed: ${safeError(error)}`); return false; }
-  return true;
+  return ok;
 }
 
 /**
@@ -188,7 +263,7 @@ async function stepMcp(options: UninstallOptions, overrides: UninstallOverrides)
  * itself is separate from this directory: it disappears when the binary that
  * was granted access is removed, not from anything this step does.
  */
-async function stepHome(options: UninstallOptions): Promise<boolean> {
+async function stepHome(options: UninstallOptions, overrides: UninstallOverrides): Promise<boolean> {
   console.log("Step 3: delete the Headroom home directory");
   const path = headroomHome();
   if (!options.home) { console.log(`  skipped; pass --home to also delete ${path} (accounts.toml, config, database and logs go with it)`); return true; }
@@ -197,8 +272,25 @@ async function stepHome(options: UninstallOptions): Promise<boolean> {
   if (options.dryRun) { console.log(`  (dry run) would ask to delete ${path}`); return true; }
   const confirmed = options.yes ? true : options.rl ? isYes(await options.rl.question(`  Delete ${path}? [y/N] `)) : false;
   if (!confirmed) { console.log("  skipped; not deleted"); return true; }
-  try { await rm(path, { recursive: true, force: true }); console.log(`  deleted ${path}`); }
-  catch (error) { console.error(`  failed: ${safeError(error)}`); return false; }
+  const windows = (overrides.servicePlatform ?? process.platform) === "win32";
+  if (windows) {
+    // Windows will not delete a file another process holds open, and a running daemon holds
+    // headroom.db: deleting then would remove part of the home and fail on the rest. Delete only
+    // once no daemon answers; this also covers a daemon started outside the service.
+    if (options.daemonStillRunning) { console.error(`  not deleted: the daemon is still running (see step 1); ${path} was left in place`); return false; }
+    const sleep = overrides.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    if (!(await waitForDaemonExit(overrides.probeDaemon ?? defaultProbeDaemon, sleep, 0))) {
+      console.error(`  not deleted: a Headroom daemon for this home is still running; stop it, then run \`headroom uninstall --home\` again. ${path} was left in place`);
+      return false;
+    }
+  }
+  // On Windows a just-exited daemon can hold its handles for a moment, so retry briefly on EBUSY/EPERM.
+  try { await rm(path, { recursive: true, force: true, ...(windows ? { maxRetries: 5, retryDelay: 200 } : {}) }); console.log(`  deleted ${path}`); }
+  catch (error) {
+    console.error(`  failed: ${safeError(error)}`);
+    if (windows && (error as NodeJS.ErrnoException).code === "EBUSY") console.error("  a process still holds a file in the home open; close any running `headroom` command and run `headroom uninstall --home` again");
+    return false;
+  }
   return true;
 }
 
@@ -234,7 +326,7 @@ export async function runUninstall(argv: string[], overrides: UninstallOverrides
     console.log("");
     if (!(await stepMcp(options, overrides))) ok = false;
     console.log("");
-    if (!(await stepHome(options))) ok = false;
+    if (!(await stepHome(options, overrides))) ok = false;
     console.log("");
     stepNpm();
     console.log("");

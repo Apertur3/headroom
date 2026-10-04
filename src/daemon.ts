@@ -97,6 +97,11 @@ async function boundedWait(pending: Promise<unknown>[], timeoutMs: number): Prom
   });
 }
 
+/** Current Windows pipe name -> the legacy name for the same user and home,
+ * filled in by socketPath(). A process derives a pipe name for only a handful
+ * of homes, so this never grows past a few entries. */
+const legacyPipeNames = new Map<string, string>();
+
 export function socketPath(home = headroomHome(), platform = process.platform, username = userInfo().username): string {
   // joinForPlatform, not a bare join(): join() always uses the *host* OS's
   // separator, which would mis-simulate a non-native `platform` argument
@@ -109,11 +114,35 @@ export function socketPath(home = headroomHome(), platform = process.platform, u
   // calls it with the raw, un-resolved HEADROOM_HOME) always agree on one
   // digest for one directory, whatever separator style or case either side
   // happened to spell it with.
+  //
+  // The name is a digest only: the OS username goes into the hash, never into
+  // the name itself, because pipe names show up in handle and process
+  // listings and in logs (#137). The username stays part of the input so two
+  // Windows users who point HEADROOM_HOME at the same directory still get two
+  // pipes (named pipes share one machine-wide namespace).
   if (platform === "win32") {
-    const homeDigest = sha256Hex(canonicalizeHomeForPipe(home, platform)).slice(0, 8);
-    return `\\\\.\\pipe\\headroom-${username}-${homeDigest}`;
+    const canonicalHome = canonicalizeHomeForPipe(home, platform);
+    const digest = sha256Hex(`headroom-pipe-v2\u0000${username.toLowerCase()}\u0000${canonicalHome}`).slice(0, 16);
+    const path = `\\\\.\\pipe\\headroom-${digest}`;
+    legacyPipeNames.set(path, legacyWindowsPipeName(home, username));
+    return path;
   }
   return joinForPlatform(platform, home, "headroom.sock");
+}
+
+/** The pipe name versions up to 0.2.6 listened on, which embedded the
+ * username. Only ever dialed as a fallback (see legacyPipeFallback); the
+ * daemon itself never listens on it. */
+export function legacyWindowsPipeName(home: string, username = userInfo().username): string {
+  return `\\\\.\\pipe\\headroom-${username}-${sha256Hex(canonicalizeHomeForPipe(home, "win32")).slice(0, 8)}`;
+}
+
+/** The legacy pipe a client should try when nothing listens on `path`, so a
+ * daemon an older version started (before an upgrade restarted it) is still
+ * found. Windows only; undefined for any path socketPath() did not derive.
+ * Drop this once releases that listen on the legacy name are out of use. */
+export function legacyPipeFallback(path: string, platform = process.platform): string | undefined {
+  return platform === "win32" ? legacyPipeNames.get(path) : undefined;
 }
 
 /** Why a Unix socket path cannot be bound, or undefined when it can. sun_path
@@ -1708,6 +1737,17 @@ export async function daemonRequest(path: string, method: string, params: Json =
 }
 
 export async function rpc(path: string, method: string, params: Json = {}, timeoutMs = 2_000, absoluteTimeoutMs = RPC_ABSOLUTE_DEADLINE_MS, signal?: AbortSignal): Promise<unknown | undefined> {
+  const outcome = { missing: false };
+  const value = await rpcAttempt(path, method, params, timeoutMs, absoluteTimeoutMs, signal, outcome);
+  // Only a pipe that does not exist at all (ENOENT) sends the client to the
+  // legacy name: a daemon that is there but slow, refuses, or fails the proof
+  // keeps its answer, so the fallback can never mask a live current daemon.
+  if (value !== undefined || !outcome.missing || signal?.aborted) return value;
+  const legacy = legacyPipeFallback(path);
+  return legacy === undefined ? undefined : rpcAttempt(legacy, method, params, timeoutMs, absoluteTimeoutMs, signal, { missing: false });
+}
+
+async function rpcAttempt(path: string, method: string, params: Json, timeoutMs: number, absoluteTimeoutMs: number, signal: AbortSignal | undefined, outcome: { missing: boolean }): Promise<unknown | undefined> {
   if (signal?.aborted) return undefined;
   return new Promise((resolve) => {
     const socket = createConnection(path);
@@ -1823,6 +1863,7 @@ export async function rpc(path: string, method: string, params: Json = {}, timeo
         return;
       }
     });
-    socket.once("error", () => done(undefined)); socket.once("timeout", () => done(undefined));
+    socket.once("error", (error: NodeJS.ErrnoException) => { if (!finished) outcome.missing = error.code === "ENOENT"; done(undefined); });
+    socket.once("timeout", () => done(undefined));
   });
 }
