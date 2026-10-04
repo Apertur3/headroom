@@ -287,10 +287,16 @@ describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor never leav
       supervisor.start();
       const scriptPid = track(supervisor.pid, root) as number;
       const agyPid = track(Number(await waitForFile(infoFile)), root) as number;
-      process.kill(scriptPid, "SIGKILL");
-      await waitUntilDead(agyPid); // the exit handler reaped the real agy
-      // Pretend the pid file now names a recycled pid owned by someone else.
+      // Pretend the pid file names a recycled pid owned by someone else. It is
+      // written BEFORE script dies: after the exit, the orphan reaper races to
+      // reconcile and delete this launch directory, so a late write either
+      // hit a missing directory or landed after the evidence was already gone.
+      // With conflicting evidence the reaper fails closed and leaves agy to the
+      // afterEach reaper; the property under test is only that the stranger lives.
+      await vi.waitFor(async () => { expect(JSON.parse(await readFile(launchStatePath(root, supervisor), "utf8")).agyPid).toBe(agyPid); }, { timeout: 5_000, interval: 20 });
       await writeFile(launchPidPath(root, supervisor), String(strangerPid));
+      process.kill(scriptPid, "SIGKILL");
+      await waitUntilDead(scriptPid, 10_000);
 
       await supervisor.stop(); // script is already gone: nothing proves the pid, so nothing is signalled
 
