@@ -47,7 +47,7 @@ import type { AccumulatedCodexUsageEntry, CodexQuarantineReason, CodexUsageAccum
 import { applyCodexUsageSnapshot, createCodexUsageAccumulator } from "./codex-usage-events.js";
 import { openUsageDatabase, type UsageDatabase } from "./usage-db.js";
 
-export const CURRENT_USAGE_SCHEMA_VERSION = 3;
+export const CURRENT_USAGE_SCHEMA_VERSION = 4;
 
 /** `model` is `NOT NULL` on `usage_identities`, but a Codex counter record
  * carries no model field at all (see codex-usage-events.ts). This fixed
@@ -78,7 +78,9 @@ export type PersistenceField =
   | "model" | "observed_at_ms" | "sequence" | "counter_value" | "counter_diagnosis"
   | "counter_kind" | "quarantine_reason" | "cursor_key" | "cursor_number"
   | "cursor_status" | "cursor_hash" | "cursor_device_id"
-  | "vendor" | "model_attribution" | "consistency_flags" | "rate_limit_slot";
+  | "vendor" | "model_attribution" | "consistency_flags" | "rate_limit_slot"
+  | "meter_key" | "window_minutes" | "sample_count" | "rate_value" | "coverage" | "r_squared"
+  | "window_timestamp" | "fit_id" | "changed_class" | "rate_event_kind";
 
 /** Refusal at the persistence boundary. The message names only the *field*
  * that failed, never the rejected value -- the whole point of the check is
@@ -90,7 +92,13 @@ export class UsagePersistenceError extends Error {
   }
 }
 
-type AliasKind = "source" | "principal" | "job" | "path";
+/** "meter" hashes a whole `headroom.db` meter id (e.g. `claude-main:5h`) the
+ * same opaque way "principal" hashes a `--principal` alias -- see
+ * `rate-learner.ts`'s module doc for why the learner needs this: a
+ * `usage_rate_fits`/`usage_rate_events` row lives in `usage.db` and must
+ * follow this file's own no-free-text-alias rule even though `meter_id`
+ * itself is plaintext, non-sensitive data over in `headroom.db`. */
+type AliasKind = "source" | "principal" | "job" | "path" | "meter";
 
 export type CursorStatus = "ok" | "interrupted";
 
@@ -202,6 +210,70 @@ export interface RateLimitObservationRow {
   usedPercent: PercentField;
   windowMinutes: NumericField;
   resetsAtMs: NumericField;
+  createdAt: string;
+}
+
+/** The four token classes the rate learner fits against, matching
+ * usage-events.ts's Claude counter vocabulary (`fresh_input` ==
+ * `input_tokens`, `cache_write` == `cache_creation_input_tokens`). Codex rows
+ * are not read by the learner in this build -- see rate-learner.ts's module
+ * doc for why the two vendors' counter vocabularies don't line up cleanly
+ * enough to share one fit without a guess. */
+export const RATE_TOKEN_CLASSES = ["fresh_input", "cache_read", "cache_write", "output"] as const;
+export type RateTokenClass = (typeof RATE_TOKEN_CLASSES)[number];
+
+const RATE_EVENT_KINDS = new Set<string>(["rate_changed"]);
+
+/** One fitted points-per-token estimate for one (meter, principal, model)
+ * combination, at the time it was computed. Rows are never updated in place
+ * -- each `putRateFit` call appends a new row, so the table is the drift time
+ * series `usage-prediction.md` documents, not a single current snapshot. */
+export interface RateFitRow {
+  id: number;
+  meterKey: string;
+  principalKey: string;
+  model: string;
+  windowMinutes: number | null;
+  sampleCount: number;
+  /** Points per 1,000,000 tokens of that class, from the NNLS fit's
+   * non-negative coefficients. */
+  ratePerMillion: Record<RateTokenClass, number>;
+  /** The fit's non-negative intercept term: points per interval attributed
+   * to *not* the four imported token classes -- i.e. other, un-imported
+   * usage on the same account and window. Never per-token; see
+   * `usage-prediction.md`'s coverage/bias section. */
+  rateBackgroundPerInterval: number;
+  /** Share of the fit's total observed percent movement across its sample
+   * intervals that the four token-class terms explain (0..1); the
+   * remainder is the background term above. A coverage figure, not a
+   * confidence figure -- see `rSquared` for goodness of fit. */
+  coverage: number;
+  /** Coefficient of determination of the fit against its own samples
+   * (0..1, guaranteed non-negative by the intercept-only floor -- see
+   * rate-learner.ts). Used, together with `sampleCount`, as this fit's
+   * confidence. */
+  rSquared: number;
+  windowFrom: string;
+  windowTo: string;
+  createdAt: string;
+}
+
+/** One recorded `rate_changed` drift event: a newer fit's rates moved far
+ * enough from the previous fit's, with both fits confident enough to trust
+ * the comparison, to be worth surfacing -- modeled after `headroom.db`'s
+ * `reset_seen` events (see store.ts), but kept local to `usage.db` since the
+ * rate learner's whole state is opt-in and file-scoped, independent of the
+ * meter/pace/event pipeline `headroom.db` owns. */
+export interface RateEventRow {
+  id: number;
+  kind: "rate_changed";
+  meterKey: string;
+  principalKey: string;
+  model: string;
+  priorFitId: number;
+  newFitId: number;
+  changedClass: RateTokenClass;
+  relativeChange: number;
   createdAt: string;
 }
 
@@ -342,6 +414,46 @@ function assertPersistableRateLimitObservation(observation: RateLimitObservation
   assertPercentField(observation.usedPercent);
   assertCounterField(observation.windowMinutes);
   assertCounterField(observation.resetsAtMs);
+}
+
+/** A finite, non-negative number -- every rate coefficient, coverage share
+ * and r-squared value NNLS/the learner produces is non-negative by
+ * construction (see rate-learner.ts), so a negative or non-finite value here
+ * means a caller built the row by hand rather than from a real fit. */
+function assertNonNegativeFinite(value: unknown, field: PersistenceField): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new UsagePersistenceError(field);
+  return value;
+}
+
+function assertUnitInterval(value: unknown, field: PersistenceField): number {
+  const number_ = assertNonNegativeFinite(value, field);
+  if (number_ > 1) throw new UsagePersistenceError(field);
+  return number_;
+}
+
+function assertPersistableRateFit(row: Omit<RateFitRow, "id">): void {
+  assertHex32(row.meterKey, "meter_key");
+  assertHex32(row.principalKey, "principal_key");
+  if (typeof row.model !== "string" || !(isKnownClaudeModel(row.model) || row.model === CODEX_UNAVAILABLE_MODEL)) throw new UsagePersistenceError("model");
+  if (row.windowMinutes !== null) assertRange(row.windowMinutes, "window_minutes", 1, 525_600);
+  assertRange(row.sampleCount, "sample_count", 0, Number.MAX_SAFE_INTEGER);
+  for (const rateClass of RATE_TOKEN_CLASSES) assertNonNegativeFinite(row.ratePerMillion[rateClass], "rate_value");
+  assertNonNegativeFinite(row.rateBackgroundPerInterval, "rate_value");
+  assertUnitInterval(row.coverage, "coverage");
+  assertUnitInterval(row.rSquared, "r_squared");
+  if (typeof row.windowFrom !== "string" || Number.isNaN(Date.parse(row.windowFrom))) throw new UsagePersistenceError("window_timestamp");
+  if (typeof row.windowTo !== "string" || Number.isNaN(Date.parse(row.windowTo))) throw new UsagePersistenceError("window_timestamp");
+}
+
+function assertPersistableRateEvent(row: Omit<RateEventRow, "id">): void {
+  if (row.kind !== "rate_changed" || !RATE_EVENT_KINDS.has(row.kind)) throw new UsagePersistenceError("rate_event_kind");
+  assertHex32(row.meterKey, "meter_key");
+  assertHex32(row.principalKey, "principal_key");
+  if (typeof row.model !== "string" || !(isKnownClaudeModel(row.model) || row.model === CODEX_UNAVAILABLE_MODEL)) throw new UsagePersistenceError("model");
+  assertRange(row.priorFitId, "fit_id", 1, Number.MAX_SAFE_INTEGER);
+  assertRange(row.newFitId, "fit_id", 1, Number.MAX_SAFE_INTEGER);
+  if (!RATE_TOKEN_CLASSES.includes(row.changedClass)) throw new UsagePersistenceError("changed_class");
+  assertNonNegativeFinite(row.relativeChange, "rate_value");
 }
 
 function assertPersistableCursor(row: CursorRow): void {
@@ -871,6 +983,157 @@ export class UsageStore {
       } : {}),
     })).sort((a, b) => a.vendor.localeCompare(b.vendor) || a.principalKey.localeCompare(b.principalKey) || a.sourceKey.localeCompare(b.sourceKey) || a.model.localeCompare(b.model));
   }
+
+  // -------------------------------------------------------------------
+  // Rate learner: per-identity Claude usage rows, and the fitted rate
+  // time series / drift events built from them (rate-learner.ts).
+  // -------------------------------------------------------------------
+
+  /** One row per persisted Claude identity, with its `--job` alias (if any
+   * was bound and not conflicted) attached -- everything rate-learner.ts
+   * needs to build meter-interval samples (`model`, `observedAtMs`, the four
+   * token classes) and usage-top.ts's session/lane attribution (`jobKey`),
+   * without either module reaching into raw SQL itself. Codex rows are
+   * excluded: see rate-learner.ts's module doc for why the two vendors'
+   * counter vocabularies don't share one fit in this build. A `null`
+   * counter (unset or diagnosed) contributes `0`, not a gap -- documented in
+   * usage-prediction.md as a source of under-counting, never over-counting,
+   * in the learned rates. */
+  claudeUsageRows(filter: StatusFilter & { sinceMs?: number } = {}): ClaudeUsageRow[] {
+    const rows = this.db.prepare(`SELECT u.identity_key AS identity_key, u.source_key AS source_key, u.principal_key AS principal_key,
+        u.model AS model, u.observed_at_ms AS observed_at_ms,
+        u.input_tokens_value AS input_tokens_value, u.output_tokens_value AS output_tokens_value,
+        u.cache_read_value AS cache_read_value, u.cache_creation_value AS cache_creation_value,
+        j.job_key AS job_key, j.conflicted AS job_conflicted
+      FROM usage_identities u LEFT JOIN usage_identity_jobs j ON j.identity_key = u.identity_key
+      WHERE u.vendor = 'claude'`).all()
+      .filter((row) => matchesFilter({ sourceKey: String(row.source_key), principalKey: String(row.principal_key) }, filter))
+      .filter((row) => filter.sinceMs === undefined || Number(row.observed_at_ms) >= filter.sinceMs);
+    return rows.map((row): ClaudeUsageRow => ({
+      identityKey: String(row.identity_key),
+      model: String(row.model),
+      observedAtMs: Number(row.observed_at_ms),
+      jobKey: row.job_key !== null && row.job_key !== undefined && Number(row.job_conflicted) !== 1 ? String(row.job_key) : null,
+      freshInput: numberOrNull(row.input_tokens_value) ?? 0,
+      cacheRead: numberOrNull(row.cache_read_value) ?? 0,
+      cacheWrite: numberOrNull(row.cache_creation_value) ?? 0,
+      output: numberOrNull(row.output_tokens_value) ?? 0,
+    }));
+  }
+
+  /** Appends one fitted rate to the `usage_rate_fits` time series. Never
+   * updates a prior row: drift is read back by comparing consecutive rows
+   * for the same (meterKey, principalKey, model), not by overwriting a
+   * single current value. */
+  putRateFit(row: Omit<RateFitRow, "id" | "createdAt"> & { createdAt?: string }): RateFitRow {
+    const full: Omit<RateFitRow, "id"> = { ...row, createdAt: row.createdAt ?? new Date().toISOString() };
+    assertPersistableRateFit(full);
+    const result = this.db.prepare(`INSERT INTO usage_rate_fits
+      (meter_key, principal_key, model, window_minutes, sample_count,
+       rate_fresh_input, rate_cache_read, rate_cache_write, rate_output, rate_background,
+       coverage, r_squared, window_from, window_to, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      full.meterKey, full.principalKey, full.model, full.windowMinutes, full.sampleCount,
+      full.ratePerMillion.fresh_input, full.ratePerMillion.cache_read, full.ratePerMillion.cache_write, full.ratePerMillion.output,
+      full.rateBackgroundPerInterval, full.coverage, full.rSquared, full.windowFrom, full.windowTo, full.createdAt);
+    return { id: Number(result.lastInsertRowid), ...full };
+  }
+
+  /** The fit history for one (meterKey, principalKey, model), newest first --
+   * `[0]` is the current fit, `[1]` the one it can be compared against for
+   * drift. `limit` bounds how far back a caller reads; the table itself is
+   * never pruned. */
+  rateFitHistory(meterKey: string, principalKey: string, model: string, limit = 2): RateFitRow[] {
+    return this.db.prepare(`SELECT * FROM usage_rate_fits WHERE meter_key = ? AND principal_key = ? AND model = ?
+      ORDER BY created_at DESC, id DESC LIMIT ?`).all(meterKey, principalKey, model, limit).map(rateFitFromRow);
+  }
+
+  /** The newest fit for every (meterKey, principalKey, model) triple this
+   * database has ever fitted, optionally scoped to one principal and/or one
+   * model -- the listing `headroom rates` reads. */
+  latestRateFits(filter: StatusFilter & { model?: string } = {}): RateFitRow[] {
+    const rows = this.db.prepare(`WITH ranked AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY meter_key, principal_key, model ORDER BY created_at DESC, id DESC) AS row_number
+        FROM usage_rate_fits
+      ) SELECT * FROM ranked WHERE row_number = 1`).all()
+      .filter((row) => filter.principalKeyHash === undefined || String(row.principal_key) === filter.principalKeyHash)
+      .filter((row) => filter.model === undefined || String(row.model) === filter.model)
+      .map(rateFitFromRow);
+    return rows.sort((a, b) => a.meterKey.localeCompare(b.meterKey) || a.model.localeCompare(b.model));
+  }
+
+  /** Appends one `rate_changed` drift event, cross-referencing the two fits
+   * (`priorFitId`/`newFitId`) it was derived from. */
+  putRateEvent(row: Omit<RateEventRow, "id" | "createdAt"> & { createdAt?: string }): RateEventRow {
+    const full: Omit<RateEventRow, "id"> = { ...row, createdAt: row.createdAt ?? new Date().toISOString() };
+    assertPersistableRateEvent(full);
+    const result = this.db.prepare(`INSERT INTO usage_rate_events
+      (kind, meter_key, principal_key, model, prior_fit_id, new_fit_id, changed_class, relative_change, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      full.kind, full.meterKey, full.principalKey, full.model, full.priorFitId, full.newFitId, full.changedClass, full.relativeChange, full.createdAt);
+    return { id: Number(result.lastInsertRowid), ...full };
+  }
+
+  /** The newest `rate_changed` event for one (meterKey, principalKey, model),
+   * or `undefined` if the rates for that combination have never drifted. */
+  latestRateEvent(meterKey: string, principalKey: string, model: string): RateEventRow | undefined {
+    const row = this.db.prepare(`SELECT * FROM usage_rate_events WHERE meter_key = ? AND principal_key = ? AND model = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1`).get(meterKey, principalKey, model);
+    return row ? rateEventFromRow(row) : undefined;
+  }
+}
+
+export interface ClaudeUsageRow {
+  identityKey: string;
+  model: string;
+  observedAtMs: number;
+  jobKey: string | null;
+  freshInput: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+}
+
+function rateFitFromRow(row: Record<string, unknown>): RateFitRow {
+  return {
+    id: Number(row.id),
+    meterKey: String(row.meter_key),
+    principalKey: String(row.principal_key),
+    model: String(row.model),
+    windowMinutes: row.window_minutes === null || row.window_minutes === undefined ? null : Number(row.window_minutes),
+    sampleCount: Number(row.sample_count),
+    ratePerMillion: {
+      fresh_input: Number(row.rate_fresh_input),
+      cache_read: Number(row.rate_cache_read),
+      cache_write: Number(row.rate_cache_write),
+      output: Number(row.rate_output),
+    },
+    rateBackgroundPerInterval: Number(row.rate_background),
+    coverage: Number(row.coverage),
+    rSquared: Number(row.r_squared),
+    windowFrom: String(row.window_from),
+    windowTo: String(row.window_to),
+    createdAt: String(row.created_at),
+  };
+}
+
+function rateEventFromRow(row: Record<string, unknown>): RateEventRow {
+  const changedClass = String(row.changed_class);
+  if (!RATE_TOKEN_CLASSES.includes(changedClass as RateTokenClass)) throw new UsagePersistenceError("changed_class");
+  const kind = String(row.kind);
+  if (kind !== "rate_changed") throw new UsagePersistenceError("rate_event_kind");
+  return {
+    id: Number(row.id),
+    kind: "rate_changed",
+    meterKey: String(row.meter_key),
+    principalKey: String(row.principal_key),
+    model: String(row.model),
+    priorFitId: Number(row.prior_fit_id),
+    newFitId: Number(row.new_fit_id),
+    changedClass: changedClass as RateTokenClass,
+    relativeChange: Number(row.relative_change),
+    createdAt: String(row.created_at),
+  };
 }
 
 function matchesFilter(row: { sourceKey: string; principalKey: string }, filter: StatusFilter): boolean {
@@ -1094,6 +1357,54 @@ function bootstrapSchema(db: UsageDatabase): void {
         );
         CREATE INDEX IF NOT EXISTS usage_rate_limit_observations_group ON usage_rate_limit_observations(vendor, principal_key, source_key, observed_at_ms);
       `);
+      // Deliberately falls through to the v3 -> v4 step below (no early
+      // return) so a v1 or v2 database lands on v4 in one bootstrap call,
+      // same as a fresh install.
+    }
+
+    if (version === 1 || version === 2 || version === 3) {
+      // v3 -> v4: two purely additive tables for the points-per-token rate
+      // learner (rate-learner.ts, issue #53 item 2/3): usage_rate_fits is an
+      // append-only time series of fitted rates (never updated in place, so
+      // drift is a query over history rather than a single overwritten row),
+      // usage_rate_events records the `rate_changed` drift events derived
+      // from consecutive fits. No existing table or row is touched, so this
+      // runs the same whether the database arrived here directly from v3 or
+      // by falling through from the v1/v2 branches above.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS usage_rate_fits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          meter_key TEXT NOT NULL,
+          principal_key TEXT NOT NULL,
+          model TEXT NOT NULL,
+          window_minutes INTEGER,
+          sample_count INTEGER NOT NULL,
+          rate_fresh_input REAL NOT NULL,
+          rate_cache_read REAL NOT NULL,
+          rate_cache_write REAL NOT NULL,
+          rate_output REAL NOT NULL,
+          rate_background REAL NOT NULL,
+          coverage REAL NOT NULL,
+          r_squared REAL NOT NULL,
+          window_from TEXT NOT NULL,
+          window_to TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS usage_rate_fits_lookup ON usage_rate_fits(meter_key, principal_key, model, created_at);
+        CREATE TABLE IF NOT EXISTS usage_rate_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL DEFAULT 'rate_changed',
+          meter_key TEXT NOT NULL,
+          principal_key TEXT NOT NULL,
+          model TEXT NOT NULL,
+          prior_fit_id INTEGER NOT NULL,
+          new_fit_id INTEGER NOT NULL,
+          changed_class TEXT NOT NULL,
+          relative_change REAL NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS usage_rate_events_lookup ON usage_rate_events(meter_key, principal_key, model, created_at);
+      `);
       db.exec(`PRAGMA user_version = ${CURRENT_USAGE_SCHEMA_VERSION};`);
       db.exec("COMMIT");
       return;
@@ -1204,6 +1515,38 @@ function bootstrapSchema(db: UsageDatabase): void {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS usage_rate_limit_observations_group ON usage_rate_limit_observations(vendor, principal_key, source_key, observed_at_ms);
+      CREATE TABLE IF NOT EXISTS usage_rate_fits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meter_key TEXT NOT NULL,
+        principal_key TEXT NOT NULL,
+        model TEXT NOT NULL,
+        window_minutes INTEGER,
+        sample_count INTEGER NOT NULL,
+        rate_fresh_input REAL NOT NULL,
+        rate_cache_read REAL NOT NULL,
+        rate_cache_write REAL NOT NULL,
+        rate_output REAL NOT NULL,
+        rate_background REAL NOT NULL,
+        coverage REAL NOT NULL,
+        r_squared REAL NOT NULL,
+        window_from TEXT NOT NULL,
+        window_to TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS usage_rate_fits_lookup ON usage_rate_fits(meter_key, principal_key, model, created_at);
+      CREATE TABLE IF NOT EXISTS usage_rate_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL DEFAULT 'rate_changed',
+        meter_key TEXT NOT NULL,
+        principal_key TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prior_fit_id INTEGER NOT NULL,
+        new_fit_id INTEGER NOT NULL,
+        changed_class TEXT NOT NULL,
+        relative_change REAL NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS usage_rate_events_lookup ON usage_rate_events(meter_key, principal_key, model, created_at);
     `);
     db.prepare("INSERT OR IGNORE INTO usage_meta (key, value) VALUES ('alias_salt', ?)").run(randomBytes(32).toString("hex"));
     db.exec(`PRAGMA user_version = ${CURRENT_USAGE_SCHEMA_VERSION};`);
