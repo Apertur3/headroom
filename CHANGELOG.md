@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - An overlong Unix socket path now names the path, its UTF-8 byte length, the platform limit and the fix (a shorter `HEADROOM_HOME`) instead of a bare `listen EINVAL`. The daemon refuses to start with that message and `headroom doctor` reports it as a FAIL and continues its other checks; other commands still fall back to a direct read, with a one-line hint on stderr. Windows named pipes are unchanged (#105, thanks @anshurajbisoyi98-ctrl).
+- Windows: `headroom uninstall` ends the scheduled task and waits up to 10 seconds for the daemon to exit before it deletes the task and the home, so deleting the home no longer fails with EBUSY on `headroom.db`. If the daemon keeps running, uninstall says so, leaves the home in place and exits non-zero; it never kills a process it cannot verify (#136).
+- Windows: the daemon's named pipe is now `\\.\pipe\headroom-<digest>`, with no part of the username in the name. Clients fall back to the old name, so a daemon an older version started is still found until it restarts (#137).
 
 ## [0.2.6] - 2026-10-02
 

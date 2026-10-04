@@ -95,7 +95,7 @@ current-capacity decision. `headroom accounts disable <name>` and `headroom acco
 edit only that line in place. Status renders a parked principal as
 `<name>  disabled (enabled = false in accounts.toml)` instead of its meter rows.
 - **Daemon.** Unix socket `~/.headroom/headroom.sock` on macOS and Linux, or named pipe
-  `\\.\pipe\headroom-<username>-<home digest>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
+  `\\.\pipe\headroom-<digest of user and home>` on Windows, JSON-RPC. POSIX sockets are mode 0600; Windows
   named pipes use the current process token's default DACL, which Node does not expose for further
   restriction. `headroom install-service` writes a launchd agent, systemd user unit, or Task Scheduler
   XML. Without a daemon the CLI and MCP server do a direct read and mark the result `source: "direct"`.
