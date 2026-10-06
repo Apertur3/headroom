@@ -12,6 +12,17 @@ components are included in [LICENSE](LICENSE).
 | [Swift Crypto](https://github.com/apple/swift-crypto) | Apache-2.0 | CodexBarCore cryptography dependency; macOS uses system CryptoKit |
 | [Swift Log](https://github.com/apple/swift-log) | Apache-2.0 | CodexBarCore logging dependency |
 
+The HTML dashboard report (`headroom dashboard --html`) embeds two subsetted fonts, both under the
+SIL Open Font License 1.1 (texts in [licenses/](licenses/)):
+
+| Font | Use |
+|---|---|
+| Source Serif 4 | Body text in the HTML report |
+| Spline Sans Mono | Numbers, axes and labels in the HTML report |
+
+The report's heading stack names General Sans, but that font is not bundled or redistributed: it
+is used only if the viewer already has it installed, otherwise the system sans-serif is used.
+
 System frameworks are supplied by macOS. Headroom's pace-state and dispatch logic are original
 to this project.
 
