@@ -1,5 +1,6 @@
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { SOURCE_SERIF_WOFF2_BASE64, SPLINE_MONO_WOFF2_BASE64 } from "./browser-report-fonts.js";
 import { gatherDashboard, type DashboardModel } from "./dashboard.js";
 import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
@@ -450,9 +451,9 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
   const segments = pw.current_segments;
   const resetMs = Date.parse(pw.resets_at ?? "");
 
-  const svgWidth = 800;
-  const svgHeight = 320;
-  const margin = { top: 30, right: 40, bottom: 40, left: 60 };
+  const svgWidth = 880;
+  const svgHeight = 330;
+  const margin = { top: 28, right: 150, bottom: 40, left: 44 };
   const plotWidth = svgWidth - margin.left - margin.right;
   const plotHeight = svgHeight - margin.top - margin.bottom;
 
@@ -472,63 +473,63 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
     return margin.top + (1 - fraction) * plotHeight;
   };
 
+  const plotRight = margin.left + plotWidth;
+  const plotBottom = margin.top + plotHeight;
+  const labelX = plotRight + 10;
+
   const lines: string[] = [];
   lines.push(`<svg viewBox="0 0 ${svgWidth} ${svgHeight}" class="chart-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Remaining capacity burndown chart for ${escapeHtml(pw.meter_id)}">`);
   lines.push(`  <rect width="100%" height="100%" fill="transparent" />`);
 
-  // Y-axis label explicit: "Remaining capacity"
-  lines.push(`  <text x="14" y="${margin.top - 12}" class="axis-title">Remaining capacity (%)</text>`);
-
-  // Y-axis grid lines and labels (100%, 75%, 50%, 25%, 0%)
+  // Y axis runs from 0 to 100 percent remaining; hairline gridlines, mono tick labels.
   const yTicks = [100, 75, 50, 25, 0];
   for (const rem of yTicks) {
     const y = yForRemaining(rem);
-    lines.push(`  <line x1="${margin.left}" y1="${y.toFixed(1)}" x2="${(margin.left + plotWidth).toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--grid-line)" stroke-width="1" />`);
-    lines.push(`  <text x="${(margin.left - 10).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="axis-label">${rem}%</text>`);
+    lines.push(`  <line x1="${margin.left}" y1="${y.toFixed(1)}" x2="${plotRight.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--hair)" stroke-width="1" />`);
+    lines.push(`  <text x="${(margin.left - 8).toFixed(1)}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="axis-label">${rem}%</text>`);
   }
 
-  // Reserve floor zone and line (if configured)
+  // Reserve floor: a translucent band plus a dashed line, labelled at its right end.
   if (pw.reserve_percent > 0) {
     const yRes = yForRemaining(pw.reserve_percent);
     const yZero = yForRemaining(0);
-    const h = yZero - yRes;
-    lines.push(`  <rect x="${margin.left}" y="${yRes.toFixed(1)}" width="${plotWidth.toFixed(1)}" height="${h.toFixed(1)}" fill="var(--reserve-fill)" />`);
-    lines.push(`  <line x1="${margin.left}" y1="${yRes.toFixed(1)}" x2="${(margin.left + plotWidth).toFixed(1)}" y2="${yRes.toFixed(1)}" stroke="var(--reserve-line)" stroke-dasharray="6,4" stroke-width="1.5" />`);
-    lines.push(`  <text x="${(margin.left + plotWidth - 8).toFixed(1)}" y="${(yRes - 6).toFixed(1)}" text-anchor="end" class="reserve-label">Reserve floor (${formatHumanPercent(pw.reserve_percent)}%)</text>`);
+    lines.push(`  <rect x="${margin.left}" y="${yRes.toFixed(1)}" width="${plotWidth.toFixed(1)}" height="${(yZero - yRes).toFixed(1)}" fill="var(--band)" />`);
+    lines.push(`  <line x1="${margin.left}" y1="${yRes.toFixed(1)}" x2="${plotRight.toFixed(1)}" y2="${yRes.toFixed(1)}" stroke="var(--accent)" stroke-dasharray="5,4" stroke-width="1.2" />`);
+    lines.push(`  <text x="${labelX}" y="${(yRes - 3).toFixed(1)}" class="direct-label reserve-label">Reserve floor ${formatHumanPercent(pw.reserve_percent)}%</text>`);
   }
 
-  // Straight-line Pacing Guide (not predicted usage)
+  // Straight-line pacing guide (not predicted usage), labelled at its right end.
   const yTop = yForRemaining(100);
-  const yBottom = yForRemaining(0);
-  lines.push(`  <line x1="${margin.left}" y1="${yTop.toFixed(1)}" x2="${(margin.left + plotWidth).toFixed(1)}" y2="${yBottom.toFixed(1)}" stroke="var(--guide-line)" stroke-dasharray="4,4" stroke-width="1.5" />`);
-  lines.push(`  <text x="${(margin.left + 10).toFixed(1)}" y="${(yTop + 16).toFixed(1)}" class="guide-label">Straight-line guide</text>`);
+  lines.push(`  <line x1="${margin.left}" y1="${yTop.toFixed(1)}" x2="${plotRight.toFixed(1)}" y2="${plotBottom.toFixed(1)}" stroke="var(--dim)" stroke-dasharray="4,4" stroke-width="1.4" />`);
+  lines.push(`  <text x="${labelX}" y="${(plotBottom + 4).toFixed(1)}" class="direct-label guide-label">Straight-line guide</text>`);
 
-  // Current Time ("Now") vertical line (if within window range)
+  // Current time vertical hairline (if within window range)
   const nowMs = now.getTime();
   if (Number.isFinite(resetMs) && nowMs >= startMs && nowMs <= resetMs) {
     const xNow = xForTime(nowMs);
-    lines.push(`  <line x1="${xNow.toFixed(1)}" y1="${margin.top}" x2="${xNow.toFixed(1)}" y2="${(margin.top + plotHeight).toFixed(1)}" stroke="var(--now-line)" stroke-dasharray="3,3" stroke-width="1.5" />`);
-    lines.push(`  <text x="${xNow.toFixed(1)}" y="${(margin.top - 8).toFixed(1)}" text-anchor="middle" class="now-label">Now (${escapeHtml(formatClock(now))})</text>`);
+    lines.push(`  <line x1="${xNow.toFixed(1)}" y1="${margin.top}" x2="${xNow.toFixed(1)}" y2="${plotBottom.toFixed(1)}" stroke="var(--dim)" stroke-width="1" />`);
+    lines.push(`  <text x="${xNow.toFixed(1)}" y="${(margin.top - 8).toFixed(1)}" text-anchor="middle" class="axis-label now-label">Now ${escapeHtml(formatClock(now))}</text>`);
   }
 
-  // Axes lines
-  lines.push(`  <line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${(margin.top + plotHeight).toFixed(1)}" stroke="var(--axis-line)" stroke-width="1.5" />`);
-  lines.push(`  <line x1="${margin.left}" y1="${(margin.top + plotHeight).toFixed(1)}" x2="${(margin.left + plotWidth).toFixed(1)}" y2="${(margin.top + plotHeight).toFixed(1)}" stroke="var(--axis-line)" stroke-width="1.5" />`);
+  // Baseline
+  lines.push(`  <line x1="${margin.left}" y1="${plotBottom.toFixed(1)}" x2="${plotRight.toFixed(1)}" y2="${plotBottom.toFixed(1)}" stroke="var(--dim)" stroke-width="1" />`);
 
-  // X-axis time ticks
+  // X-axis time ticks: clock times inside a day, dates beyond it.
   if (Number.isFinite(resetMs)) {
+    const sameDay = duration <= 36 * 3_600_000;
+    const tickText = (time: number): string => sameDay ? formatClock(time).slice(0, 5) : formatShortDate(time).replace(/,\s*\d\d:\d\d$/, "");
     const xTicks = [
-      { at: startMs, label: `${formatShortDate(startMs)} Start`, align: "start" },
-      { at: startMs + duration * 0.25, label: formatShortDate(startMs + duration * 0.25), align: "middle" },
-      { at: startMs + duration * 0.50, label: formatShortDate(startMs + duration * 0.50), align: "middle" },
-      { at: startMs + duration * 0.75, label: formatShortDate(startMs + duration * 0.75), align: "middle" },
-      { at: resetMs, label: `${formatShortDate(resetMs)} Reset`, align: "end" },
+      { at: startMs, label: `${tickText(startMs)} start`, align: "start" },
+      { at: startMs + duration * 0.25, label: tickText(startMs + duration * 0.25), align: "middle" },
+      { at: startMs + duration * 0.50, label: tickText(startMs + duration * 0.50), align: "middle" },
+      { at: startMs + duration * 0.75, label: tickText(startMs + duration * 0.75), align: "middle" },
+      { at: resetMs, label: `${tickText(resetMs)} reset`, align: "end" },
     ];
 
     for (const tick of xTicks) {
       const x = xForTime(tick.at);
-      lines.push(`  <line x1="${x.toFixed(1)}" y1="${(margin.top + plotHeight).toFixed(1)}" x2="${x.toFixed(1)}" y2="${(margin.top + plotHeight + 5).toFixed(1)}" stroke="var(--axis-line)" stroke-width="1" />`);
-      lines.push(`  <text x="${x.toFixed(1)}" y="${(margin.top + plotHeight + 18).toFixed(1)}" text-anchor="${tick.align}" class="axis-label">${escapeHtml(tick.label)}</text>`);
+      lines.push(`  <line x1="${x.toFixed(1)}" y1="${plotBottom.toFixed(1)}" x2="${x.toFixed(1)}" y2="${(plotBottom + 5).toFixed(1)}" stroke="var(--dim)" stroke-width="1" />`);
+      lines.push(`  <text x="${x.toFixed(1)}" y="${(plotBottom + 20).toFixed(1)}" text-anchor="${tick.align}" class="axis-label">${escapeHtml(tick.label)}</text>`);
     }
   }
 
@@ -536,7 +537,6 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
   interface PlottedMarker {
     x: number;
     glyph: string;
-    color: string;
     title: string;
   }
   const markers: PlottedMarker[] = [];
@@ -548,7 +548,6 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
       const isUnscheduled = event.kind === "reset_seen" && event.metadata?.unscheduled;
       const isFreeReset = event.kind.startsWith("free_reset_");
       const glyph = isFreeReset ? "F" : isUnscheduled ? "!" : "R";
-      const color = isUnscheduled ? "var(--badge-conserve-text)" : isFreeReset ? "var(--badge-harvest-text)" : "var(--primary)";
       const title = `${event.kind}${event.metadata?.unscheduled ? " (unscheduled)" : ""}\nTime: ${event.created_at}\nConfidence: ${Math.round(event.confidence * 100)}%`;
 
       const existing = markers.find((m) => Math.abs(m.x - xEv) < 15);
@@ -556,16 +555,15 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
         existing.glyph = "*";
         existing.title += `\n---\n${title}`;
       } else {
-        markers.push({ x: xEv, glyph, color, title });
+        markers.push({ x: xEv, glyph, title });
       }
     }
   }
 
   for (const m of markers) {
     lines.push(`  <g class="event-marker">`);
-    lines.push(`    <line x1="${m.x.toFixed(1)}" y1="${margin.top}" x2="${m.x.toFixed(1)}" y2="${(margin.top + plotHeight).toFixed(1)}" stroke="${m.color}" stroke-dasharray="2,2" stroke-width="1" opacity="0.6" />`);
-    lines.push(`    <circle cx="${m.x.toFixed(1)}" cy="${(margin.top + 10).toFixed(1)}" r="7" fill="${m.color}" />`);
-    lines.push(`    <text x="${m.x.toFixed(1)}" y="${(margin.top + 14).toFixed(1)}" text-anchor="middle" fill="#fff" font-size="10" font-weight="bold">${m.glyph}</text>`);
+    lines.push(`    <line x1="${m.x.toFixed(1)}" y1="${margin.top}" x2="${m.x.toFixed(1)}" y2="${plotBottom.toFixed(1)}" stroke="var(--accent)" stroke-dasharray="2,3" stroke-width="1" />`);
+    lines.push(`    <text x="${m.x.toFixed(1)}" y="${(margin.top - 8).toFixed(1)}" text-anchor="middle" class="marker-label">${m.glyph}</text>`);
     lines.push(`    <title>${escapeHtml(m.title)}</title>`);
     lines.push(`  </g>`);
   }
@@ -578,16 +576,17 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
       for (let i = 1; i < segment.length; i++) {
         d += ` L ${xForTime(segment[i].at).toFixed(1)} ${yForRemaining(segment[i].remaining).toFixed(1)}`;
       }
-      lines.push(`  <path d="${d}" fill="none" stroke="var(--line-stroke)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />`);
+      lines.push(`  <path d="${d}" fill="none" stroke="var(--s1)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />`);
     }
 
     // Sample dots with hover data and keyboard focus semantics
-    for (const p of points) {
+    points.forEach((p, index) => {
+      const isLast = index === points.length - 1;
       const cx = xForTime(p.at);
       const cy = yForRemaining(p.remaining);
       const formattedRem = formatHumanPercent(p.remaining);
       const formattedUsed = formatHumanPercent(p.used);
-      lines.push(`  <circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="4.5" class="sample-dot"`);
+      lines.push(`  <circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${isLast ? 4 : 2}" class="sample-dot${isLast ? " last" : ""}"`);
       lines.push(`    tabindex="0" role="img" aria-label="${formattedRem}% remaining at ${escapeHtml(p.observed_at)}"`);
       lines.push(`    data-meter="${escapeHtml(pw.meter_id)}"`);
       lines.push(`    data-observed="${escapeHtml(p.observed_at)}"`);
@@ -598,7 +597,11 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
       lines.push(`    data-confidence="${Math.round(p.confidence * 100)}%">`);
       lines.push(`    <title>Observed: ${escapeHtml(p.observed_at)}&#10;Remaining: ${formattedRem}% (Used: ${formattedUsed}%)&#10;Resets: ${escapeHtml(p.resets_at ?? "")}&#10;Freshness: ${escapeHtml(p.freshness)}</title>`);
       lines.push(`  </circle>`);
-    }
+    });
+
+    // Direct label at the line end instead of a legend.
+    const last = points[points.length - 1];
+    lines.push(`  <text x="${(xForTime(last.at) + 10).toFixed(1)}" y="${(yForRemaining(last.remaining) + 4).toFixed(1)}" class="direct-label series-label">Recorded ${formatHumanPercent(last.remaining)}%</text>`);
   } else if (points.length === 1) {
     const p = points[0];
     const cx = xForTime(p.at);
@@ -621,6 +624,26 @@ export function renderRemainingCapacityChartSvg(pw: ProcessedWindow, now: Date):
   return lines.join("\n");
 }
 
+/** One plain line under a meter's chart: what is left against an even pace. */
+function windowTakeaway(pw: ProcessedWindow, now: Date): string {
+  if (pw.is_unknown || pw.remaining_percent === null) return "No trusted reading for this window right now.";
+  const rem = formatHumanPercent(pw.remaining_percent);
+  const resetMs = Date.parse(pw.resets_at ?? "");
+  if (!pw.window_minutes || !Number.isFinite(resetMs)) return `${rem}% of this window is left.`;
+  const windowMs = pw.window_minutes * 60_000;
+  const elapsed = clamp((now.getTime() - (resetMs - windowMs)) / windowMs, 0, 1);
+  const even = Math.round((1 - elapsed) * 100);
+  const pace = pw.remaining_percent >= even
+    ? "within an even pace"
+    : "running faster than an even pace";
+  return `${rem}% is left, against ${even}% on a straight line from full to empty: ${pace}.`;
+}
+
+/** State as words plus a small dot; never a filled badge. */
+function stateMark(kind: string, text: string): string {
+  return `<span class="state ${escapeHtml(kind)}"><i class="dot" aria-hidden="true"></i>${escapeHtml(text)}</span>`;
+}
+
 /** Render a panel for a local inference pool. */
 function renderLocalPoolPanel(pw: ProcessedWindow): string {
   const state = pw.metadata?.state ?? "DOWN";
@@ -635,7 +658,7 @@ function renderLocalPoolPanel(pw: ProcessedWindow): string {
       <div class="local-header">
         <div class="local-title">
           <h4>${escapeHtml(pw.meter_id)}</h4>
-          <span class="badge ${stateClass}">● ${escapeHtml(state)}</span>
+          ${stateMark(stateClass, state)}
         </div>
         <div class="local-subtitle muted">Local Pool Concurrency · Cost Model: ${escapeHtml(costModel)}</div>
       </div>
@@ -672,7 +695,7 @@ function renderCreditsPanel(pw: ProcessedWindow): string {
       <div class="local-header">
         <div class="local-title">
           <h4>${escapeHtml(pw.meter_id)}</h4>
-          <span class="badge normal">CREDITS</span>
+          ${stateMark("normal", "CREDITS")}
         </div>
         <div class="local-subtitle muted">Informational credit balance · Soft enforcement</div>
       </div>
@@ -711,7 +734,7 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
     return `
       <div class="cell-block">
         <div class="cell-status-row">
-          <span class="badge unknown">${escapeHtml(tag)}</span>
+          ${stateMark("unknown", tag)}
           <span class="cell-reason muted" title="${escapeHtml(reason)}">${escapeHtml(reason)}</span>
         </div>
         ${overdueText ? `<div class="reset-time muted mono">↻ ${escapeHtml(overdueText)}</div>` : ""}
@@ -736,7 +759,7 @@ function renderOverviewWindowCell(pw: ProcessedWindow | undefined, now: Date): s
       </div>
       <div class="cell-numbers">
         <span class="pct mono"><strong>${formatHumanPercent(usedVal)}%</strong> used</span>
-        <span class="rem-pct muted mono">(${formatHumanPercent(remVal)}% rem)</span>
+        <span class="rem-pct muted mono">${formatHumanPercent(remVal)}% remaining</span>
         <span class="reset-time muted mono">${escapeHtml(resetText)}</span>
       </div>
     </div>
@@ -854,6 +877,17 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
 
   const defaultMeterPrincipal = subscriptionOverviewRows.find((r) => r.meter_id === defaultSelection.meter_id)?.principal_id ?? (processedWindows[0]?.principal_id || "");
 
+  // One plain sentence for the overview: which 5-hour window has the least room.
+  const trusted5h = subscriptionOverviewRows
+    .map((row) => row.window5h)
+    .filter((w): w is ProcessedWindow => Boolean(w) && !w!.is_unknown && w!.remaining_percent !== null);
+  let overviewTakeaway = "No trusted reading right now; the rows below say why.";
+  if (trusted5h.length) {
+    const tightest = trusted5h.reduce((a, b) => (b.remaining_percent! < a.remaining_percent! ? b : a));
+    const tightestReset = tightest.resets_at ? servedResetsIn(tightest, now)?.resets_in : undefined;
+    overviewTakeaway = `${tightest.meter_id} has the least room: ${formatHumanPercent(tightest.remaining_percent)}% of its 5-hour window is left${tightestReset ? `, resetting in ${tightestReset}` : ""}.`;
+  }
+
   // Safe serialized JSON payload
   const serializedData = safeJsonSerialize({
     version: model.version,
@@ -873,727 +907,397 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Headroom — Subscription capacity</title>
+  <title>Headroom: Subscription capacity</title>
   <style>
+    /* Fonts: Source Serif 4 and Spline Sans Mono are embedded subsets (SIL OFL 1.1).
+       General Sans is never bundled; it is used only if installed on the viewer's machine. */
+    @font-face { font-family: "General Sans"; src: local("General Sans"), local("GeneralSans-Variable"), local("GeneralSans-Semibold"); font-weight: 200 700; font-display: swap; }
+    @font-face { font-family: "Source Serif 4"; src: url(data:font/woff2;base64,${SOURCE_SERIF_WOFF2_BASE64}) format("woff2"); font-weight: 400; font-display: swap; }
+    @font-face { font-family: "Spline Sans Mono"; src: url(data:font/woff2;base64,${SPLINE_MONO_WOFF2_BASE64}) format("woff2"); font-weight: 400 600; font-display: swap; }
+
     :root {
-      --bg: #f8fafc;
-      --card-bg: #ffffff;
-      --card-border: #e2e8f0;
-      --card-border-hover: #cbd5e1;
-      --row-selected-bg: #eff6ff;
-      --row-selected-border: #3b82f6;
-      --text-primary: #0f172a;
-      --text-secondary: #334155;
-      --text-muted: #64748b;
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
-      --primary-bg: #eff6ff;
-      --line-stroke: #2563eb;
-      --reserve-line: #ef4444;
-      --reserve-fill: rgba(239, 68, 68, 0.08);
-      --guide-line: #64748b;
-      --now-line: #6366f1;
-      --grid-line: #f1f5f9;
-      --axis-line: #cbd5e1;
-      --bar-healthy: #10b981;
-      --bar-warning: #f59e0b;
-      --bar-danger: #ef4444;
-      --badge-harvest-bg: #dcfce7;
-      --badge-harvest-text: #166534;
-      --badge-normal-bg: #e0f2fe;
-      --badge-normal-text: #075985;
-      --badge-conserve-bg: #fef3c7;
-      --badge-conserve-text: #92400e;
-      --badge-freeze-bg: #fee2e2;
-      --badge-freeze-text: #991b1b;
-      --badge-unknown-bg: #f1f5f9;
-      --badge-unknown-text: #475569;
-      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -1px rgba(0, 0, 0, 0.04);
+      --bg: #f3f2ee;
+      --panel: #e9e8e3;
+      --ink: #141518;
+      --text2: rgba(20, 21, 24, 0.84);
+      --dim: rgba(20, 21, 24, 0.62);
+      --hair: rgba(20, 21, 24, 0.13);
+      --accent: #a8521f;
+      --s1: #3f6688;
+      --s2: #a8521f;
+      --s3: #3d8a6e;
+      --band: rgba(168, 82, 31, 0.16);
+      --sans: "General Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      --serif: "Source Serif 4", Charter, "Iowan Old Style", Georgia, serif;
+      --mono: "Spline Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     }
 
     @media (prefers-color-scheme: dark) {
       :root:not([data-theme="light"]) {
-        --bg: #090d16;
-        --card-bg: #111827;
-        --card-border: #1f2937;
-        --card-border-hover: #374151;
-        --row-selected-bg: #0f2347;
-        --row-selected-border: #38bdf8;
-        --text-primary: #f9fafb;
-        --text-secondary: #cbd5e1;
-        --text-muted: #94a3b8;
-        --primary: #38bdf8;
-        --primary-hover: #0ea5e9;
-        --primary-bg: #0c2d48;
-        --line-stroke: #38bdf8;
-        --reserve-line: #f87171;
-        --reserve-fill: rgba(248, 113, 113, 0.12);
-        --guide-line: #64748b;
-        --now-line: #818cf8;
-        --grid-line: #1e293b;
-        --axis-line: #334155;
-        --bar-healthy: #34d399;
-        --bar-warning: #fbbf24;
-        --bar-danger: #f87171;
-        --badge-harvest-bg: #064e3b;
-        --badge-harvest-text: #6ee7b7;
-        --badge-normal-bg: #0c4a6e;
-        --badge-normal-text: #7dd3fc;
-        --badge-conserve-bg: #451a03;
-        --badge-conserve-text: #fcd34d;
-        --badge-freeze-bg: #450a0a;
-        --badge-freeze-text: #fca5a5;
-        --badge-unknown-bg: #1e293b;
-        --badge-unknown-text: #cbd5e1;
-        --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
-        --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
+        --bg: #08090b;
+        --panel: #121316;
+        --ink: #eae7e0;
+        --text2: rgba(234, 231, 224, 0.84);
+        --dim: rgba(234, 231, 224, 0.62);
+        --hair: rgba(234, 231, 224, 0.13);
+        --accent: #d98552;
+        --s1: #8fb0cf;
+        --s2: #d98552;
+        --s3: #6cc0a0;
+        --band: rgba(217, 133, 82, 0.16);
       }
     }
 
     :root[data-theme="dark"] {
-      --bg: #090d16;
-      --card-bg: #111827;
-      --card-border: #1f2937;
-      --card-border-hover: #374151;
-      --row-selected-bg: #0f2347;
-      --row-selected-border: #38bdf8;
-      --text-primary: #f9fafb;
-      --text-secondary: #cbd5e1;
-      --text-muted: #94a3b8;
-      --primary: #38bdf8;
-      --primary-hover: #0ea5e9;
-      --primary-bg: #0c2d48;
-      --line-stroke: #38bdf8;
-      --reserve-line: #f87171;
-      --reserve-fill: rgba(248, 113, 113, 0.12);
-      --guide-line: #64748b;
-      --now-line: #818cf8;
-      --grid-line: #1e293b;
-      --axis-line: #334155;
-      --bar-healthy: #34d399;
-      --bar-warning: #fbbf24;
-      --bar-danger: #f87171;
-      --badge-harvest-bg: #064e3b;
-      --badge-harvest-text: #6ee7b7;
-      --badge-normal-bg: #0c4a6e;
-      --badge-normal-text: #7dd3fc;
-      --badge-conserve-bg: #451a03;
-      --badge-conserve-text: #fcd34d;
-      --badge-freeze-bg: #450a0a;
-      --badge-freeze-text: #fca5a5;
-      --badge-unknown-bg: #1e293b;
-      --badge-unknown-text: #cbd5e1;
-      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
-      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
+      --bg: #08090b;
+      --panel: #121316;
+      --ink: #eae7e0;
+      --text2: rgba(234, 231, 224, 0.84);
+      --dim: rgba(234, 231, 224, 0.62);
+      --hair: rgba(234, 231, 224, 0.13);
+      --accent: #d98552;
+      --s1: #8fb0cf;
+      --s2: #d98552;
+      --s3: #6cc0a0;
+      --band: rgba(217, 133, 82, 0.16);
     }
 
     :root[data-theme="light"] {
-      --bg: #f8fafc;
-      --card-bg: #ffffff;
-      --card-border: #e2e8f0;
-      --card-border-hover: #cbd5e1;
-      --row-selected-bg: #eff6ff;
-      --row-selected-border: #3b82f6;
-      --text-primary: #0f172a;
-      --text-secondary: #334155;
-      --text-muted: #64748b;
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
-      --primary-bg: #eff6ff;
-      --line-stroke: #2563eb;
-      --reserve-line: #ef4444;
-      --reserve-fill: rgba(239, 68, 68, 0.08);
-      --guide-line: #64748b;
-      --now-line: #6366f1;
-      --grid-line: #f1f5f9;
-      --axis-line: #cbd5e1;
-      --bar-healthy: #10b981;
-      --bar-warning: #f59e0b;
-      --bar-danger: #ef4444;
-      --badge-harvest-bg: #dcfce7;
-      --badge-harvest-text: #166534;
-      --badge-normal-bg: #e0f2fe;
-      --badge-normal-text: #075985;
-      --badge-conserve-bg: #fef3c7;
-      --badge-conserve-text: #92400e;
-      --badge-freeze-bg: #fee2e2;
-      --badge-freeze-text: #991b1b;
-      --badge-unknown-bg: #f1f5f9;
-      --badge-unknown-text: #475569;
-      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07);
+      --bg: #f3f2ee;
+      --panel: #e9e8e3;
+      --ink: #141518;
+      --text2: rgba(20, 21, 24, 0.84);
+      --dim: rgba(20, 21, 24, 0.62);
+      --hair: rgba(20, 21, 24, 0.13);
+      --accent: #a8521f;
+      --s1: #3f6688;
+      --s2: #a8521f;
+      --s3: #3d8a6e;
+      --band: rgba(168, 82, 31, 0.16);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-family: var(--serif);
       background-color: var(--bg);
-      color: var(--text-primary);
-      font-size: 14px;
-      line-height: 1.5;
-      padding: 20px;
+      color: var(--ink);
+      font-size: 16px;
+      line-height: 1.55;
+      padding: 36px 40px 32px;
       -webkit-font-smoothing: antialiased;
+      font-variant-numeric: tabular-nums;
     }
 
-    .container {
-      max-width: 1100px;
-      margin: 0 auto;
-    }
+    .container { max-width: 1040px; margin: 0 auto; }
+
+    .mono, .code { font-family: var(--mono); font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+    .muted { color: var(--dim); }
 
     header {
       display: flex;
       justify-content: space-between;
-      align-items: center;
-      padding-bottom: 16px;
-      margin-bottom: 16px;
-      border-bottom: 1px solid var(--card-border);
+      align-items: flex-start;
+      gap: 16px;
       flex-wrap: wrap;
-      gap: 12px;
+      padding-bottom: 28px;
     }
 
     h1 {
-      font-size: 20px;
-      font-weight: 700;
-      color: var(--text-primary);
-      letter-spacing: -0.3px;
+      font-family: var(--sans);
+      font-size: 30px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+      color: var(--ink);
     }
 
     h1 .subtitle {
+      display: block;
+      font-family: var(--serif);
       font-weight: 400;
-      color: var(--text-muted);
-      font-size: 16px;
+      font-size: 18px;
+      letter-spacing: 0;
+      color: var(--text2);
+      margin-top: 6px;
     }
 
     .header-meta {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin-top: 3px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--dim);
+      margin-top: 14px;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
       flex-wrap: wrap;
     }
 
-    .meta-sep { color: var(--card-border); }
-
-    .code, .mono {
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    }
-
-    .muted { color: var(--text-muted); }
+    .meta-sep { color: var(--dim); }
 
     .theme-btn {
-      background: var(--card-bg);
-      color: var(--text-primary);
-      border: 1px solid var(--card-border);
-      padding: 6px 12px;
-      border-radius: 6px;
+      background: transparent;
+      color: var(--dim);
+      border: 1px solid var(--hair);
+      padding: 5px 10px;
+      border-radius: 4px;
       cursor: pointer;
+      font-family: var(--mono);
       font-size: 12px;
-      font-weight: 500;
-      box-shadow: var(--shadow-sm);
     }
-
-    .theme-btn:hover {
-      background: var(--primary-bg);
-      border-color: var(--primary);
-    }
+    .theme-btn:hover { color: var(--ink); background: var(--panel); }
+    .theme-btn:focus-visible, .window-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     .actionable-alert {
-      background: var(--badge-conserve-bg);
-      color: var(--badge-conserve-text);
-      border: 1px solid var(--badge-conserve-text);
-      border-radius: 6px;
-      padding: 10px 14px;
-      margin-bottom: 16px;
-      font-size: 13px;
-      font-weight: 500;
-    }
-
-    /* Main Overview Card & Table */
-    .overview-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      box-shadow: var(--shadow-sm);
-      margin-bottom: 24px;
-      overflow: hidden;
-    }
-
-    .overview-header {
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--card-border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    .overview-header h2 {
+      border-top: 1px solid var(--hair);
+      border-bottom: 1px solid var(--hair);
+      color: var(--text2);
+      padding: 12px 0;
+      margin-bottom: 8px;
       font-size: 15px;
+    }
+
+    /* Sections: a plain question, a one-line takeaway, then the graphic. */
+    .block { border-top: 1px solid var(--hair); padding-top: 22px; margin-top: 30px; }
+    .block:first-of-type { margin-top: 8px; }
+
+    h2 {
+      font-family: var(--sans);
+      font-size: 22px;
       font-weight: 600;
-      color: var(--text-primary);
+      letter-spacing: -0.02em;
+      line-height: 1.25;
+      color: var(--ink);
+    }
+
+    .takeaway {
+      font-size: 17px;
+      color: var(--text2);
+      margin-top: 6px;
+      max-width: 60rem;
     }
 
     .overview-summary {
-      font-size: 13px;
-      color: var(--text-muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--dim);
+      margin-top: 10px;
     }
+    .overview-summary strong { font-weight: 500; color: var(--text2); }
 
-    .table-container {
-      width: 100%;
-      overflow-x: auto;
-    }
+    .table-container { width: 100%; overflow-x: auto; margin-top: 18px; }
 
     .meter-overview-table {
       width: 100%;
       border-collapse: collapse;
       text-align: left;
-      font-size: 13px;
     }
 
     .meter-overview-table th {
-      background: var(--bg);
-      color: var(--text-muted);
-      font-weight: 600;
-      text-transform: uppercase;
+      font-family: var(--mono);
+      font-weight: 400;
       font-size: 11px;
-      letter-spacing: 0.5px;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--card-border);
+      letter-spacing: 0.04em;
+      color: var(--dim);
+      padding: 8px 14px 8px 0;
+      border-bottom: 1px solid var(--hair);
     }
 
     .meter-row {
       cursor: pointer;
-      border-bottom: 1px solid var(--card-border);
-      transition: background-color 0.12s ease;
+      border-bottom: 1px solid var(--hair);
       outline: none;
     }
+    .meter-row:hover { background-color: var(--panel); }
+    .meter-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .meter-row.selected { background-color: var(--panel); }
 
-    .meter-row:hover {
-      background-color: var(--primary-bg);
-    }
-
-    .meter-row:focus-visible {
-      outline: 2px solid var(--primary);
-      outline-offset: -2px;
-    }
-
-    .meter-row.selected {
-      background-color: var(--row-selected-bg);
-      box-shadow: inset 3px 0 0 var(--row-selected-border);
-    }
-
-    .meter-row td {
-      padding: 12px 14px;
-      vertical-align: middle;
-    }
+    .meter-row td { padding: 14px 14px 14px 0; vertical-align: top; }
+    .meter-row td:first-child { padding-left: 12px; }
+    .meter-overview-table th:first-child { padding-left: 12px; }
 
     .meter-title strong {
-      font-size: 14px;
-      color: var(--text-primary);
+      font-family: var(--sans);
+      font-weight: 600;
+      font-size: 16px;
+      letter-spacing: -0.01em;
     }
+    .meter-account { font-family: var(--mono); font-size: 12px; margin-top: 2px; }
+    .row-alert-badge { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; font-size: 12px; }
 
-    .meter-account {
-      font-size: 12px;
-      margin-top: 1px;
-    }
-
-    .row-alert-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      margin-top: 4px;
-      font-size: 11px;
-    }
-
+    /* Meters: a thin bar on a hairline track. */
     .bar-track {
-      background: var(--card-border);
-      height: 8px;
-      border-radius: 4px;
-      overflow: hidden;
-      margin-bottom: 4px;
+      background: var(--hair);
+      height: 3px;
+      border-radius: 0;
+      margin: 8px 0 10px;
       min-width: 140px;
     }
-
-    .bar-fill {
-      height: 100%;
-      border-radius: 4px;
-      transition: width 0.2s ease;
-    }
-
-    .bar-fill.healthy { background: var(--bar-healthy); }
-    .bar-fill.warning { background: var(--bar-warning); }
-    .bar-fill.danger { background: var(--bar-danger); }
+    .bar-fill { height: 100%; border-radius: 0; }
+    .bar-fill.healthy { background: var(--s1); }
+    .bar-fill.warning, .bar-fill.danger { background: var(--accent); }
 
     .cell-numbers {
       display: flex;
       align-items: baseline;
-      gap: 6px;
+      gap: 4px 14px;
       font-size: 12px;
       flex-wrap: wrap;
     }
+    .cell-numbers strong { font-weight: 600; color: var(--ink); }
+    .cell-numbers .pct { color: var(--text2); }
+    .cell-status-row { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+    .cell-reason { font-family: var(--mono); font-size: 12px; max-width: 240px; }
 
-    .cell-status-row {
-      display: flex;
+    /* State: words plus a small dot, never a filled badge. */
+    .state {
+      display: inline-flex;
       align-items: center;
-      gap: 6px;
-    }
-
-    .cell-reason {
+      gap: 7px;
+      font-family: var(--mono);
       font-size: 12px;
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      letter-spacing: 0.02em;
+      color: var(--text2);
       white-space: nowrap;
     }
-
-    .badge {
-      display: inline-block;
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.3px;
-    }
-
-    .badge.harvest { background: var(--badge-harvest-bg); color: var(--badge-harvest-text); }
-    .badge.normal { background: var(--badge-normal-bg); color: var(--badge-normal-text); }
-    .badge.conserve { background: var(--badge-conserve-bg); color: var(--badge-conserve-text); }
-    .badge.freeze { background: var(--badge-freeze-bg); color: var(--badge-freeze-text); }
-    .badge.unknown { background: var(--badge-unknown-bg); color: var(--badge-unknown-text); }
-
-    /* Selected Meter Detail & Chart Panel */
-    .detail-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      box-shadow: var(--shadow-sm);
-      margin-bottom: 24px;
-      overflow: hidden;
-    }
+    .state .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
+    .state.harvest .dot, .state.up .dot { background: var(--s3); }
+    .state.normal .dot { background: var(--s1); }
+    .state.conserve .dot, .state.busy .dot, .state.freeze .dot, .state.down .dot { background: var(--accent); }
+    .state.unknown .dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--dim); }
 
     .detail-header {
-      padding: 14px 18px;
-      border-bottom: 1px solid var(--card-border);
       display: flex;
       justify-content: space-between;
-      align-items: center;
+      align-items: flex-end;
       flex-wrap: wrap;
       gap: 12px;
+      margin-top: 18px;
     }
-
     .detail-headline h3 {
+      font-family: var(--sans);
       font-size: 16px;
-      font-weight: 700;
-      color: var(--text-primary);
-    }
-
-    .window-tabs {
-      display: flex;
-      gap: 6px;
-    }
-
-    .window-tab {
-      background: var(--bg);
-      color: var(--text-secondary);
-      border: 1px solid var(--card-border);
-      border-radius: 5px;
-      padding: 5px 12px;
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .window-tab:hover {
-      background: var(--primary-bg);
-      color: var(--primary);
-      border-color: var(--primary);
-    }
-
-    .window-tab.active {
-      background: var(--primary);
-      color: #ffffff;
-      border-color: var(--primary);
       font-weight: 600;
+      letter-spacing: -0.01em;
     }
+    .window-tabs { display: flex; gap: 18px; }
+    .window-tab {
+      background: transparent;
+      color: var(--dim);
+      border: 0;
+      border-bottom: 1.5px solid transparent;
+      border-radius: 0;
+      padding: 2px 0;
+      font-family: var(--mono);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .window-tab:hover { color: var(--ink); }
+    .window-tab.active { color: var(--ink); border-bottom-color: var(--ink); }
 
-    .chart-panel {
-      padding: 16px 20px;
-    }
+    .chart-panel { padding-top: 6px; }
 
     .panel-meta-bar {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-      gap: 10px;
-      background: var(--bg);
-      border-radius: 6px;
-      padding: 10px 14px;
-      margin-bottom: 16px;
+      gap: 12px 24px;
+      border-top: 1px solid var(--hair);
+      border-bottom: 1px solid var(--hair);
+      padding: 14px 0;
+      margin: 12px 0 14px;
     }
+    .meta-item { display: flex; flex-direction: column; gap: 2px; }
+    .meta-label { font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; color: var(--dim); }
+    .meta-val { font-size: 20px; font-weight: 500; letter-spacing: -0.02em; color: var(--ink); }
 
-    .meta-item {
-      display: flex;
-      flex-direction: column;
-    }
+    .panel-takeaway { margin: 14px 0 0; }
 
-    .meta-label {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      color: var(--text-muted);
-      margin-bottom: 2px;
-    }
+    .chart-container { position: relative; width: 100%; overflow-x: auto; }
+    .chart-svg { width: 100%; max-width: 940px; height: auto; display: block; }
 
-    .meta-val {
-      font-size: 15px;
-      font-weight: 700;
-      color: var(--text-primary);
-    }
+    .axis-title { font-size: 11px; fill: var(--dim); font-family: var(--mono); }
+    .axis-label { font-size: 11px; fill: var(--dim); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .direct-label { font-size: 12px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .series-label { fill: var(--s1); font-weight: 600; }
+    .reserve-label { fill: var(--accent); }
+    .guide-label { fill: var(--dim); }
+    .now-label { fill: var(--text2); }
+    .marker-label { fill: var(--accent); font-size: 11px; font-weight: 600; font-family: var(--mono); }
+    .insufficient-text { font-size: 13px; fill: var(--dim); font-family: var(--serif); }
 
-    .chart-container {
-      position: relative;
-      width: 100%;
-      overflow-x: auto;
-    }
+    .sample-dot { fill: var(--s1); stroke: var(--bg); stroke-width: 1; cursor: pointer; outline: none; }
+    .sample-dot.last { stroke-width: 2; }
+    .sample-dot:hover, .sample-dot:focus { r: 5; stroke-width: 2; }
 
-    .chart-svg {
-      width: 100%;
-      max-width: 880px;
-      height: auto;
-      display: block;
-      margin: 0 auto;
-    }
-
-    .axis-title {
-      font-size: 11px;
-      font-weight: 600;
-      fill: var(--text-muted);
-      font-family: system-ui, sans-serif;
-    }
-
-    .axis-label {
-      font-size: 10px;
-      fill: var(--text-muted);
-      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    }
-
-    .reserve-label {
-      font-size: 10px;
-      font-weight: 600;
-      fill: var(--reserve-line);
-      font-family: system-ui, sans-serif;
-    }
-
-    .guide-label {
-      font-size: 10px;
-      fill: var(--guide-line);
-      font-family: system-ui, sans-serif;
-    }
-
-    .now-label {
-      font-size: 10px;
-      font-weight: 600;
-      fill: var(--now-line);
-      font-family: system-ui, sans-serif;
-    }
-
-    .insufficient-text {
-      font-size: 13px;
-      font-weight: 500;
-      fill: var(--text-muted);
-      font-family: system-ui, sans-serif;
-    }
-
-    .sample-dot {
-      fill: var(--line-stroke);
-      stroke: var(--card-bg);
-      stroke-width: 1.5;
-      cursor: pointer;
-      outline: none;
-    }
-
-    .sample-dot:hover, .sample-dot:focus {
-      r: 6.5;
-      stroke-width: 2.5;
-    }
-
-    .chart-legend {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      gap: 16px;
-      margin-top: 14px;
-      font-size: 12px;
-      color: var(--text-secondary);
-    }
-
-    .legend-item {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .legend-indicator {
-      width: 14px;
-      height: 3px;
-      border-radius: 2px;
-    }
-
-    .legend-indicator.actual { background: var(--line-stroke); }
-    .legend-indicator.reserve { background: var(--reserve-line); border-top: 1px dashed var(--reserve-line); }
-    .legend-indicator.guide { background: var(--guide-line); border-top: 1px dotted var(--guide-line); }
-    .legend-indicator.now { background: var(--now-line); }
+    .chart-note { font-family: var(--mono); font-size: 12px; color: var(--dim); margin-top: 10px; }
 
     .chart-tooltip {
       position: absolute;
       pointer-events: none;
       opacity: 0;
       transition: opacity 0.12s ease-out;
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      box-shadow: var(--shadow-md);
-      border-radius: 6px;
+      background: var(--bg);
+      border: 1px solid var(--hair);
+      border-radius: 4px;
       padding: 8px 12px;
+      font-family: var(--mono);
       font-size: 11px;
-      line-height: 1.4;
-      color: var(--text-primary);
+      line-height: 1.5;
+      color: var(--ink);
       z-index: 100;
       white-space: nowrap;
     }
 
-    /* Secondary Lower Section for Local Pools & Credits */
-    .secondary-section {
-      margin-top: 24px;
-      margin-bottom: 24px;
-    }
-
-    .secondary-heading {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 12px;
-    }
-
-    .secondary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 14px;
-    }
-
-    .secondary-metric-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 14px 16px;
-      box-shadow: var(--shadow-sm);
-    }
-
+    /* Local pools and credits: hairline rows, no cards. */
+    .secondary-grid { margin-top: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0 40px; }
+    .secondary-metric-card { border-top: 1px solid var(--hair); padding: 16px 0 18px; }
     .local-header { margin-bottom: 12px; }
     .local-title { display: flex; align-items: center; justify-content: space-between; }
-    .local-title h4 { font-size: 14px; font-weight: 600; }
-    .local-subtitle { font-size: 12px; margin-top: 2px; }
+    .local-title h4 { font-family: var(--sans); font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+    .local-subtitle { font-family: var(--mono); font-size: 12px; margin-top: 2px; }
+    .metric-mini-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 10px; }
+    .mini-label { font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; margin-bottom: 2px; }
+    .mini-val { font-size: 14px; font-weight: 500; color: var(--ink); overflow-wrap: anywhere; }
+    .pool-note { font-size: 14px; line-height: 1.45; }
+    .pool-note code { font-family: var(--mono); font-size: 12px; }
 
-    .metric-mini-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-bottom: 10px;
-    }
+    details.diagnostics-details { border-top: 1px solid var(--hair); margin-top: 44px; padding-top: 16px; font-size: 14px; }
+    details summary { cursor: pointer; user-select: none; font-family: var(--mono); font-size: 12px; color: var(--dim); }
+    details summary:hover { color: var(--ink); }
+    .diagnostics-content { margin-top: 14px; display: flex; flex-direction: column; gap: 18px; }
+    .diagnostics-content strong { font-family: var(--sans); font-weight: 600; }
+    .notice-list { font-size: 13px; }
 
-    .mini-metric {
-      background: var(--bg);
-      border-radius: 5px;
-      padding: 8px 10px;
-    }
-
-    .mini-label { font-size: 10px; font-weight: 600; text-transform: uppercase; margin-bottom: 2px; }
-    .mini-val { font-size: 13px; font-weight: 600; color: var(--text-primary); }
-
-    .pool-note { font-size: 11px; line-height: 1.4; }
-
-    /* Collapsible diagnostics */
-    details.diagnostics-details, details.notices-details {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 12px 16px;
-      margin-bottom: 20px;
-      box-shadow: var(--shadow-sm);
-      font-size: 13px;
-    }
-
-    details summary {
-      cursor: pointer;
-      user-select: none;
-      font-weight: 600;
-      color: var(--text-primary);
-    }
-
-    .diagnostics-content {
-      margin-top: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
-
-    .data-table {
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-      margin-top: 8px;
-      font-size: 12px;
-    }
-
+    .data-table { width: 100%; border-collapse: collapse; text-align: left; margin-top: 8px; font-size: 13px; }
     .data-table th {
-      background: var(--bg);
-      color: var(--text-muted);
-      font-weight: 600;
-      text-transform: uppercase;
-      font-size: 10px;
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--card-border);
+      font-family: var(--mono);
+      font-weight: 400;
+      font-size: 11px;
+      color: var(--dim);
+      padding: 6px 12px 6px 0;
+      border-bottom: 1px solid var(--hair);
     }
-
-    .data-table td {
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--card-border);
-      color: var(--text-secondary);
-    }
+    .data-table td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--hair); color: var(--text2); }
 
     footer {
-      margin-top: 30px;
+      margin-top: 44px;
       padding-top: 14px;
-      border-top: 1px solid var(--card-border);
+      border-top: 1px solid var(--hair);
+      font-family: var(--mono);
       font-size: 12px;
-      color: var(--text-muted);
-      text-align: center;
+      color: var(--dim);
     }
 
     @media (max-width: 768px) {
+      body { padding: 28px 18px; }
       .meter-overview-table thead { display: none; }
       .meter-overview-table, .meter-overview-table tbody, .meter-overview-table tr, .meter-overview-table td {
         display: block;
         width: 100%;
       }
-      .meter-row {
-        margin-bottom: 8px;
-        border: 1px solid var(--card-border);
-        border-radius: 6px;
-        padding: 8px;
-      }
-      .meter-row td {
-        border-bottom: none;
-        padding: 4px 6px;
-      }
-      .state-cell { text-align: left !important; margin-top: 4px; }
-      .mini-metric-grid { grid-template-columns: 1fr; }
+      .meter-row { padding: 8px 0; }
+      .meter-row td { padding: 4px 12px; }
+      .metric-mini-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1601,12 +1305,12 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
   <div class="container">
     <header>
       <div>
-        <h1>Headroom <span class="subtitle">— Subscription capacity</span></h1>
+        <h1>Headroom <span class="subtitle">Subscription capacity</span></h1>
         <div class="header-meta">
           <span>Local snapshot generated <time title="${escapeHtml(now.toISOString())}" class="mono">${escapeHtml(formatReportDateTime(now))}</time></span>
-          <span class="meta-sep">·</span>
+          <span class="meta-sep">/</span>
           <span>${escapeHtml(freshnessSource)}</span>
-          <span class="meta-sep">·</span>
+          <span class="meta-sep">/</span>
           <span class="mono">v${escapeHtml(model.version)}</span>
         </div>
       </div>
@@ -1617,18 +1321,17 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
 
     ${actionableNotices.length ? `
     <div class="actionable-alert">
-      ${actionableNotices.map((n) => `<div>• ${escapeHtml(redact(n))}</div>`).join("")}
+      ${actionableNotices.map((n) => `<div>${escapeHtml(redact(n))}</div>`).join("")}
     </div>
     ` : ""}
 
     <!-- Main Overview Table -->
-    <div class="overview-card">
-      <div class="overview-header">
-        <h2>Subscription Meters</h2>
-        <div class="overview-summary">
-          <span>Next scheduled reset: <strong>${escapeHtml(nextResetText)}</strong></span>
-          ${activeLeases.length ? ` · <span>${activeLeases.length} active lease${activeLeases.length === 1 ? "" : "s"}</span>` : ""}
-        </div>
+    <section class="block overview-card">
+      <h2>How much of each window is left?</h2>
+      <p class="takeaway">${escapeHtml(overviewTakeaway)}</p>
+      <div class="overview-summary">
+        <span>Next scheduled reset: <strong>${escapeHtml(nextResetText)}</strong></span>
+        ${activeLeases.length ? ` / <span>${activeLeases.length} active lease${activeLeases.length === 1 ? "" : "s"}</span>` : ""}
       </div>
       <div class="table-container">
         ${subscriptionOverviewRows.length ? `
@@ -1659,7 +1362,7 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
                   <div class="meter-account muted">${escapeHtml(row.principal_id)}</div>
                   ${row.hasIssue && row.issueReason ? `
                     <div class="row-alert-badge">
-                      <span class="badge unknown">HELD / ISSUE</span>
+                      ${stateMark("unknown", "HELD / ISSUE")}
                       <span class="muted cell-reason" title="${escapeHtml(row.issueReason)}">${escapeHtml(row.issueReason)}</span>
                     </div>
                   ` : ""}
@@ -1671,7 +1374,7 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
                   ${renderOverviewWindowCell(row.windowWeekly, now)}
                 </td>
                 <td class="state-cell" style="text-align: center;">
-                  <span class="badge ${tightestStateClass}">● ${escapeHtml(row.tightestState)}</span>
+                  ${stateMark(tightestStateClass, row.tightestState)}
                 </td>
               </tr>
               `;
@@ -1684,15 +1387,15 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
         </div>
         `}
       </div>
-    </div>
+    </section>
 
     <!-- Selected Meter Detail & Burndown Chart -->
     ${subscriptionOverviewRows.length ? `
-    <div class="detail-card" id="meter-detail-section">
+    <section class="block detail-card" id="meter-detail-section">
+      <h2>Is it being used faster than an even pace?</h2>
       <div class="detail-header">
         <div class="detail-headline">
           <h3 id="selected-meter-heading">${escapeHtml(defaultSelection.meter_id)}</h3>
-          <span class="muted" style="font-size: 13px;">Remaining capacity burndown</span>
         </div>
         <div class="window-tabs" id="window-tabs-container" role="tablist" aria-label="Window Tabs">
           ${subscriptionOverviewRows.flatMap((r) => r.windows.map((w) => {
@@ -1724,35 +1427,36 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
 
           return `
           <div class="chart-panel" id="${panelId}" style="display: ${isSelected ? "block" : "none"};">
+            <p class="takeaway panel-takeaway">${escapeHtml(windowTakeaway(pw, now))}</p>
             <div class="panel-meta-bar">
               <div class="meta-item">
-                <span class="meta-label">Remaining</span>
+                <span class="meta-label">remaining</span>
                 <span class="meta-val mono">
                   ${pw.remaining_percent !== null ? `${formatHumanPercent(pw.remaining_percent)}%` : "UNKNOWN"}
                 </span>
               </div>
               <div class="meta-item">
-                <span class="meta-label">Used</span>
+                <span class="meta-label">used</span>
                 <span class="meta-val mono">
                   ${pw.used_percent !== null ? `${formatHumanPercent(pw.used_percent)}%` : "UNKNOWN"}
                 </span>
               </div>
               <div class="meta-item">
-                <span class="meta-label">Resets In</span>
+                <span class="meta-label">resets in</span>
                 <span class="meta-val mono">${escapeHtml(displayReset)}</span>
               </div>
               <div class="meta-item">
-                <span class="meta-label">Burn Rate</span>
+                <span class="meta-label">burn rate</span>
                 <span class="meta-val mono">${pw.burn_rate !== null ? `${formatHumanPercent(pw.burn_rate)}%/h` : "—"}</span>
               </div>
               <div class="meta-item">
-                <span class="meta-label">Reserve Floor</span>
+                <span class="meta-label">reserve floor</span>
                 <span class="meta-val mono">${pw.reserve_percent > 0 ? `${formatHumanPercent(pw.reserve_percent)}%` : "0%"}</span>
               </div>
             </div>
 
             ${pw.is_unknown ? `
-            <div class="actionable-alert" style="background: var(--badge-unknown-bg); color: var(--badge-unknown-text); border-color: var(--badge-unknown-text); margin-bottom: 14px;">
+            <div class="actionable-alert">
               <div><strong>Observation ${escapeHtml(pw.freshness)}:</strong> ${escapeHtml(sanitizeFailureReason(pw.raw_reason ?? pw.decision_reason))}</div>
               ${pw.last_known ? `<div>Last known reading: ${formatHumanPercent(pw.last_known.used_percent)}% at ${escapeHtml(formatShortDate(pw.last_known.observed_at))}</div>` : ""}
             </div>
@@ -1762,37 +1466,19 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
               ${renderRemainingCapacityChartSvg(pw, now)}
             </div>
 
-            <div class="chart-legend">
-              <div class="legend-item">
-                <span class="legend-indicator actual"></span>
-                <span>Recorded remaining</span>
-              </div>
-              <div class="legend-item">
-                <span class="legend-indicator guide"></span>
-                <span>Straight-line guide <span class="muted" style="font-size: 11px;">(not predicted usage)</span></span>
-              </div>
-              <div class="legend-item">
-                <span class="legend-indicator now"></span>
-                <span>Now</span>
-              </div>
-              ${pw.reserve_percent > 0 ? `
-              <div class="legend-item">
-                <span class="legend-indicator reserve"></span>
-                <span>Reserve floor (${formatHumanPercent(pw.reserve_percent)}%)</span>
-              </div>
-              ` : ""}
-            </div>
+            <p class="chart-note">The guide is an even pace from full to empty, not predicted usage.</p>
           </div>
           `;
         }).join("")}
       </div>
-    </div>
+    </section>
     ` : ""}
 
     <!-- Secondary Section: Local Pools & Credits -->
     ${secondaryWindows.length ? `
-    <section class="secondary-section">
-      <div class="secondary-heading">Local Pools &amp; Credits</div>
+    <section class="block secondary-section">
+      <h2>What else is running on this machine?</h2>
+      <p class="takeaway">Local pools report concurrency and queue depth. Credits are informational counts.</p>
       <div class="secondary-grid">
         ${secondaryWindows.map((pw) => pw.is_local ? renderLocalPoolPanel(pw) : renderCreditsPanel(pw)).join("")}
       </div>
@@ -1850,7 +1536,7 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
               <tr>
                 <td class="mono">${escapeHtml(formatShortDate(ev.created_at))} ${escapeHtml(formatClock(ev.created_at))}</td>
                 <td class="mono">${escapeHtml(ev.meter_id ?? ev.principal_id ?? "—")}</td>
-                <td><span class="badge ${ev.kind.includes("reset") ? "harvest" : "normal"}">${escapeHtml(ev.kind)}</span></td>
+                <td>${stateMark(ev.kind.includes("reset") ? "harvest" : "normal", ev.kind)}</td>
                 <td>${escapeHtml(ev.origin)}</td>
                 <td class="mono">${Math.round(ev.confidence * 100)}%</td>
                 <td>${escapeHtml(redact(ev.reason ?? (ev.metadata?.unscheduled ? "Unscheduled reset" : "—")))}</td>
