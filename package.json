@@ -12,7 +12,12 @@
     "usage",
     "mcp",
     "agents",
-    "cli"
+    "cli",
+    "claude-code",
+    "mcp-server",
+    "model-context-protocol",
+    "codex-cli",
+    "usage-limits"
   ],
   "homepage": "https://github.com/Apertur3/headroom#readme",
   "bugs": {
@@ -61,5 +66,6 @@
     "@types/node": "20.19.43",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
-  }
+  },
+  "mcpName": "io.github.Apertur3/headroom"
 }

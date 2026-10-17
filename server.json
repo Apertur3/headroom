@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Apertur3/headroom",
+  "description": "Live subscription limits, resets and budget checks for coding agents over MCP.",
+  "repository": {
+    "url": "https://github.com/Apertur3/headroom",
+    "source": "github"
+  },
+  "version": "0.2.9",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "headroomd",
+      "version": "0.2.9",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Claude Code plugin: install with `claude plugin marketplace add Apertur3/headroom`, then `claude plugin install headroom@headroom`. It bundles the Headroom skill, MCP registration and a per-prompt quota line. Using it with `headroom hook install` does not print the line twice; install headroomd first.
+- MCP Registry listing metadata under `io.github.Apertur3/headroom`, with release publishing through GitHub OIDC.
+- A shorter README opening with install commands and a demo GIF reference.
+- npm search keywords for Claude Code, MCP servers, the Model Context Protocol, Codex CLI and usage limits.
+- Unscheduled reset messages now show how many free resets are still banked and their expiry when known (#157).
+
 ### Fixed
 - macOS and Linux: `headroom install-service` after an upgrade now restarts a daemon that still runs an older version, instead of saying "already installed and running" and leaving the old code in place. It also restarts a daemon too old to report its version, and exits non-zero unless the new version answers. Windows already did this.
 
