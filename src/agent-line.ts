@@ -88,41 +88,48 @@ function shortMeter(item: Observation): string {
 
 function round1(value: number): number { return Math.round(value * 10) / 10; }
 
-function accountFor(name: string, rows: Observation[], policy: Policy, now: Date): AgentLineAccount | undefined {
+function accountsFor(name: string, rows: Observation[], policy: Policy, now: Date): AgentLineAccount[] {
   const candidates = rows.filter(isCandidate);
   // Only a banked reset (Codex's free resets, or an operator's manual entry)
   // counts, and only while current: a money balance of the same count shape,
   // a stale vendor count or a lapsed one never reaches the line.
   const credits = rows.find((item) => isCurrentBankedResetObservation(item, policy.staleness_minutes, now) && !creditsLapsed(item, now) && (item.quantity?.remaining ?? 0) > 0);
   const freeResets = credits ? { available: Math.round(credits.quantity!.remaining ?? 0), expires_at: credits.resets_at ?? null } : undefined;
-  if (!candidates.length) return undefined;
+  if (!candidates.length) return [];
   const decided = candidates.map((item) => ({ item, state: item.metadata?.exhausted ? "FREEZE" as PaceState : paceDecision(item, policy, now).state }));
-  const unknown = decided.find((entry) => SEVERITY[entry.state] === undefined);
-  // One unknown window makes the whole account UNKNOWN: its binding window
-  // cannot be named without it. The meter is named when it is not the
-  // account's main one, so a reader knows which part is unread.
+  // The meter is named when it is not the account's main one, so a reader knows which part is read.
   const meterName = (item: Observation): string => { const meter = shortMeter(item); return meter === "all" || meter === "main" ? name : `${name}:${sanitizeName(meter)}`; };
-  if (unknown) return { name: meterName(unknown.item), state: "UNKNOWN", unknown_reason: unknownReason(unknown.item), meter: sanitizeName(unknown.item.meter_id) };
-  const binding = decided.reduce((best, entry) => {
-    const a = SEVERITY[entry.state]!; const b = SEVERITY[best.state]!;
-    if (a !== b) return a > b ? entry : best;
-    const usedA = entry.item.quantity!.used; const usedB = best.item.quantity!.used;
-    if (usedA !== usedB) return usedA > usedB ? entry : best;
-    return (entry.item.window?.minutes ?? 0) > (best.item.window?.minutes ?? 0) ? entry : best;
+  const unknown = decided.find((entry) => SEVERITY[entry.state] === undefined);
+  // One unknown window makes its whole meter unreadable (the binding window cannot be named
+  // without it), so that meter is left out. The principal reads UNKNOWN only when no meter
+  // is fully read; a stale or held meter next to a fresh one no longer hides the fresh one.
+  const unreadable = new Set(decided.filter((entry) => SEVERITY[entry.state] === undefined).map((entry) => entry.item.meter_id));
+  const known = decided.filter((entry) => !unreadable.has(entry.item.meter_id));
+  if (!known.length) return [{ name: meterName(unknown!.item), state: "UNKNOWN", unknown_reason: unknownReason(unknown!.item), meter: sanitizeName(unknown!.item.meter_id) }];
+  const byMeter = new Map<string, typeof known>();
+  for (const entry of known) byMeter.set(entry.item.meter_id, [...(byMeter.get(entry.item.meter_id) ?? []), entry]);
+  return [...byMeter.values()].map((entries, index) => {
+    const binding = entries.reduce((best, entry) => {
+      const a = SEVERITY[entry.state]!; const b = SEVERITY[best.state]!;
+      if (a !== b) return a > b ? entry : best;
+      const usedA = entry.item.quantity!.used; const usedB = best.item.quantity!.used;
+      if (usedA !== usedB) return usedA > usedB ? entry : best;
+      return (entry.item.window?.minutes ?? 0) > (best.item.window?.minutes ?? 0) ? entry : best;
+    });
+    const reset = servedResetsIn(binding.item, now);
+    return {
+      name: meterName(binding.item),
+      state: binding.state,
+      meter: sanitizeName(binding.item.meter_id),
+      window: labelForMinutes(binding.item.window?.minutes),
+      used_percent: round1(binding.item.quantity!.used),
+      burn_percent_per_hour: typeof binding.item.burn_percent_per_hour === "number" && Number.isFinite(binding.item.burn_percent_per_hour) ? round1(binding.item.burn_percent_per_hour) : null,
+      resets_in_seconds: reset.reset_overdue ? 0 : reset.resets_in_seconds,
+      ...(reset.reset_overdue ? { reset_overdue: true } : {}),
+      fetched_at: binding.item.fetched_at,
+      ...(freeResets && index === 0 ? { free_resets: freeResets } : {}),
+    };
   });
-  const reset = servedResetsIn(binding.item, now);
-  return {
-    name: meterName(binding.item),
-    state: binding.state,
-    meter: sanitizeName(binding.item.meter_id),
-    window: labelForMinutes(binding.item.window?.minutes),
-    used_percent: round1(binding.item.quantity!.used),
-    burn_percent_per_hour: typeof binding.item.burn_percent_per_hour === "number" && Number.isFinite(binding.item.burn_percent_per_hour) ? round1(binding.item.burn_percent_per_hour) : null,
-    resets_in_seconds: reset.reset_overdue ? 0 : reset.resets_in_seconds,
-    ...(reset.reset_overdue ? { reset_overdue: true } : {}),
-    fetched_at: binding.item.fetched_at,
-    ...(freeResets ? { free_resets: freeResets } : {}),
-  };
 }
 
 function expiryDay(value: string | null): string | undefined {
@@ -157,7 +164,8 @@ function joinLine(accounts: AgentLineAccount[]): string {
 }
 
 function rank(account: AgentLineAccount): number {
-  if (account.state === "UNKNOWN") return 5;
+  // Fresh readings come before UNKNOWN ones, so an expired login never pushes a real reading down.
+  if (account.state === "UNKNOWN") return 0;
   return SEVERITY[account.state] ?? 0;
 }
 
@@ -177,8 +185,7 @@ export function buildAgentLine(observations: Observation[], policy: Policy, prin
   for (const [principal, rows] of byPrincipal) {
     const name = sanitizeName(principal);
     if (!rows.length) { accounts.push({ name, state: "UNKNOWN", unknown_reason: "none" }); continue; }
-    const account = accountFor(name, rows, policy, now);
-    if (account) accounts.push(account);
+    accounts.push(...accountsFor(name, rows, policy, now));
   }
   accounts.sort((a, b) => rank(b) - rank(a) || (b.used_percent ?? 0) - (a.used_percent ?? 0) || a.name.localeCompare(b.name));
   return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts), accounts };

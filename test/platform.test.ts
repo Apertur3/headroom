@@ -106,6 +106,9 @@ describe("service generators", () => {
     const xml = windowsTaskXml("C:\\Program Files\\headroom\\cli.js", "C:\\Program Files\\nodejs\\node.exe", "example");
     expect(xml).toContain("<LogonTrigger><Enabled>true</Enabled></LogonTrigger>");
     expect(xml).toContain("<Hidden>true</Hidden>");
+    // No 72 hour default run limit, and a restart if the daemon crashes.
+    expect(xml).toContain("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>");
+    expect(xml).toContain("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>");
     expect(xml).toContain("<UserId>example</UserId>");
     expect(servicePath("win32", "C:\\Users\\example", { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" })).toBe("C:\\Users\\example\\AppData\\Local\\headroom\\headroom-daemon.xml");
     await expect(installService("cli.js", "win32", "C:\\Users\\example", "node.exe", true, { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" }, "example")).resolves.toMatchObject({ dryRun: true, command: 'schtasks /Create /TN "Headroom Daemon" /XML "C:\\Users\\example\\AppData\\Local\\headroom\\headroom-daemon.xml" /F' });

@@ -86,6 +86,35 @@ describe("buildAgentLine", () => {
     for (const account of line.accounts) expect(account.used_percent).toBeUndefined();
   });
 
+  it("shows each fresh meter of a principal and omits a stale or held one", () => {
+    const gemini = reading("antigravity", "gemini", 10_080, 15);
+    const staleClaude = reading("antigravity", "claude-gpt", 10_080, 40, { freshness: "stale" });
+    const heldClaude = reading("antigravity", "claude-gpt", 10_080, 40, { metadata: { vendor_window_held: true } });
+    for (const other of [staleClaude, heldClaude]) {
+      const line = buildAgentLine([other, gemini], defaultPolicy, ["antigravity"], NOW);
+      expect(line.accounts.map((item) => item.name)).toEqual(["antigravity:gemini"]);
+      expect(line.line).toContain("antigravity:gemini wk 15%");
+      expect(line.line).not.toContain("UNKNOWN");
+    }
+    const both = buildAgentLine([reading("antigravity", "claude-gpt", 10_080, 30), gemini], defaultPolicy, ["antigravity"], NOW);
+    expect(both.accounts.map((item) => item.name).sort()).toEqual(["antigravity:claude-gpt", "antigravity:gemini"]);
+  });
+
+  it("reads UNKNOWN for a principal only when none of its meters is fresh", () => {
+    const line = buildAgentLine([
+      reading("antigravity", "gemini", 10_080, 15, { freshness: "stale" }),
+      reading("antigravity", "claude-gpt", 10_080, 40, { freshness: "stale" }),
+    ], defaultPolicy, ["antigravity"], NOW);
+    expect(line.accounts).toHaveLength(1);
+    expect(line.accounts[0]).toMatchObject({ state: "UNKNOWN", unknown_reason: "stale" });
+    expect(line.line).toContain("UNKNOWN (stale)");
+  });
+
+  it("puts accounts with a fresh reading before UNKNOWN ones", () => {
+    const line = buildAgentLine([reading("codex-main", "main", 10_080, 5, { freshness: "failed" }), reading("claude-main", "all", 10_080, 4)], defaultPolicy, ["codex-main", "claude-main"], NOW);
+    expect(line.accounts.map((item) => item.name)).toEqual(["claude-main", "codex-main"]);
+  });
+
   it("shows an enabled account that was never read as UNKNOWN instead of dropping it", () => {
     const line = buildAgentLine([], defaultPolicy, ["claude-main"], NOW);
     expect(line.line).toBe("[Headroom] claude-main UNKNOWN (no reading)");

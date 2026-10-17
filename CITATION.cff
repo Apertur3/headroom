@@ -7,5 +7,4 @@ date-released: 2026-10-17
 license: MIT
 repository-code: "https://github.com/Apertur3/headroom"
 authors:
-  - family-names: Hermans
-    given-names: Martijn
+  - name: "Apertur3"

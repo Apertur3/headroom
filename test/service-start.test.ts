@@ -16,7 +16,7 @@ async function fakeHome(): Promise<{ home: string; env: NodeJS.ProcessEnv }> {
 
 function recorder(codes: (line: string) => number = () => 0): { runner: ServiceRunner; calls: string[] } {
   const calls: string[] = [];
-  return { calls, runner: async (command, args) => { const line = [command, ...args].join(" "); calls.push(line); return { code: codes(line), output: codes(line) ? "Bootstrap failed: 5: Input/output error" : "" }; } };
+  return { calls, runner: async (command, args) => { const line = [command, ...args].join(" "); calls.push(line); const code = codes(line); return { code, output: code ? "Bootstrap failed: 5: Input/output error" : "" }; } };
 }
 
 const script = "/usr/local/bin/headroom";
@@ -29,11 +29,12 @@ const windowsSeams = { requestShutdown: async () => "absent" as const, identify:
 describe("install-service loads and starts the service", () => {
   it("darwin: unloads any old job, bootstraps into gui/<uid>, and confirms the daemon answers", async () => {
     const { home, env } = await fakeHome();
-    const { runner, calls } = recorder();
+    const { runner, calls } = recorder((line) => line.startsWith("launchctl print") ? 113 : 0);
     const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => calls.length >= 2 });
     expect(result.state).toBe("started");
     const path = servicePath("darwin", home, env);
-    expect(calls).toEqual(["launchctl bootout gui/501/com.headroom.daemon", `launchctl bootstrap gui/501 ${path}`]);
+    // bootout, then a wait until launchd no longer lists the label (print fails), then bootstrap.
+    expect(calls).toEqual(["launchctl bootout gui/501/com.headroom.daemon", "launchctl print gui/501/com.headroom.daemon", `launchctl bootstrap gui/501 ${path}`]);
     expect(await readFile(path, "utf8")).toBe(serviceContents(script, "darwin", runtime, "tester", home, env));
     expect(describeServiceStart(result)).toContain("service loaded; the daemon is answering");
   });
@@ -60,16 +61,38 @@ describe("install-service loads and starts the service", () => {
 
   it("does not fail when launchd refuses (no GUI session over ssh): the file is written, the reason and the manual command are reported", async () => {
     const { home, env } = await fakeHome();
-    const { runner } = recorder((line) => line.startsWith("launchctl bootstrap") ? 5 : 0);
+    const { runner, calls } = recorder((line) => line.startsWith("launchctl bootstrap") ? 5 : line.startsWith("launchctl print") ? 113 : 0);
     const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => false });
     expect(result.state).toBe("not-loaded");
     expect(result.reason).toContain("exited 5");
     expect(result.reason).toContain("Input/output error");
+    // One retry only: bootstrap ran twice, not in a loop.
+    expect(calls.filter((line) => line.startsWith("launchctl bootstrap"))).toHaveLength(2);
     expect(result.manual).toBe(`launchctl bootstrap gui/$(id -u) ${servicePath("darwin", home, env)}`);
     expect(await readFile(servicePath("darwin", home, env), "utf8")).toContain("com.headroom.daemon");
     const lines = describeServiceStart(result).join("\n");
     expect(lines).toContain("could not load the service");
     expect(lines).toContain(result.manual);
+  });
+
+  it("darwin: waits for a still-loaded label to go before bootstrapping", async () => {
+    const { home, env } = await fakeHome();
+    let prints = 0;
+    const { runner, calls } = recorder((line) => line.startsWith("launchctl print") ? (++prints >= 3 ? 113 : 0) : 0);
+    const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, waitMs: 50, runner, probe: async () => calls.some((line) => line.startsWith("launchctl bootstrap")) });
+    expect(result.state).toBe("started");
+    expect(calls.filter((line) => line.startsWith("launchctl print"))).toHaveLength(3);
+    expect(calls.findIndex((line) => line.startsWith("launchctl bootstrap"))).toBeGreaterThan(calls.lastIndexOf("launchctl print gui/501/com.headroom.daemon") - 1);
+  });
+
+  it("darwin: retries bootstrap once after bootout when launchd answers error 5, then succeeds", async () => {
+    const { home, env } = await fakeHome();
+    let bootstraps = 0;
+    const { runner, calls } = recorder((line) => line.startsWith("launchctl bootstrap") ? (++bootstraps === 1 ? 5 : 0) : line.startsWith("launchctl print") ? 113 : 0);
+    const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => bootstraps >= 2 });
+    expect(result.state).toBe("started");
+    expect(calls.filter((line) => line.startsWith("launchctl bootout"))).toHaveLength(2);
+    expect(bootstraps).toBe(2);
   });
 
   it("reports a loaded service whose daemon never answers within the bounded wait", async () => {
@@ -103,7 +126,9 @@ describe("install-service loads and starts the service", () => {
     const { runner, calls } = recorder();
     let answering = false;
     await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => { const was = answering; answering = calls.length > 0; return was; } });
-    expect(calls).toHaveLength(3);
+    expect(calls[0]).toBe("launchctl print gui/501/com.headroom.daemon");
+    expect(calls).toContain("launchctl bootout gui/501/com.headroom.daemon");
+    expect(calls.some((line) => line.startsWith("launchctl bootstrap"))).toBe(true);
   });
 
   it("reloads when the plist is unchanged and a daemon answers, but the service manager does not have the service (--no-start, then a foreground daemon)", async () => {
@@ -114,7 +139,7 @@ describe("install-service loads and starts the service", () => {
     const { runner, calls } = recorder((line) => line.startsWith("launchctl print") ? 113 : 0);
     const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, probe: async () => true });
     expect(result.state).toBe("started");
-    expect(calls).toEqual(["launchctl print gui/501/com.headroom.daemon", "launchctl bootout gui/501/com.headroom.daemon", `launchctl bootstrap gui/501 ${path}`]);
+    expect(calls).toEqual(["launchctl print gui/501/com.headroom.daemon", "launchctl bootout gui/501/com.headroom.daemon", "launchctl print gui/501/com.headroom.daemon", `launchctl bootstrap gui/501 ${path}`]);
   });
 
   it("linux: asks systemd whether the unit is active and enabled before calling it already running", async () => {

@@ -30,7 +30,7 @@ function xml(value: string): string { return value.replace(/&/g, "&amp;").replac
 export function windowsTaskXml(script: string, runtime: string, username = userInfo().username, logPath?: string, pathValue = serviceEnvironmentPath(homedir(), "win32")): string {
   const command = logPath ? "cmd.exe" : runtime;
   const arguments_ = logPath ? `/d /s /c "set \"PATH=${pathValue}\" && \"${runtime}\" \"${script}\" daemon >> \"${logPath}\" 2>&1"` : `"${script}" daemon`;
-  return `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>${xml(username)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Settings><Hidden>true</Hidden><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable></Settings><Actions Context="Author"><Exec><Command>${xml(command)}</Command><Arguments>${xml(arguments_)}</Arguments></Exec></Actions></Task>\n`;
+  return `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>${xml(username)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Settings><Hidden>true</Hidden><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context="Author"><Exec><Command>${xml(command)}</Command><Arguments>${xml(arguments_)}</Arguments></Exec></Actions></Task>\n`;
 }
 
 export function serviceContents(script: string, platform = process.platform, runtime = process.execPath, username = userInfo().username, home = homedir(), env = process.env): string {
@@ -297,11 +297,12 @@ const RESTART_RUN_ATTEMPTS = 2;
 /** The service manager's own commands, in run order, to load (or reload) the service and start it.
  * `optional` steps may fail without meaning anything: launchctl bootout on a service that was never
  * loaded, and schtasks /End on a task that is not running. `confirmStopped` steps must leave the daemon
- * no longer answering before the next step runs. */
-export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: number, replacing: boolean): { command: string; args: string[]; optional?: boolean; confirmStopped?: boolean }[] {
+ * no longer answering before the next step runs; `confirmUnloaded` (launchctl bootout) waits until
+ * launchd no longer lists the label, because bootout returns before the teardown has finished. */
+export function serviceLoadSteps(platform: NodeJS.Platform, path: string, uid: number, replacing: boolean): { command: string; args: string[]; optional?: boolean; confirmStopped?: boolean; confirmUnloaded?: boolean }[] {
   if (platform === "darwin") return [
     // A rewritten plist only takes effect once the old job is gone, so unload first; on a first install this fails harmlessly.
-    { command: "launchctl", args: ["bootout", `gui/${uid}/${SERVICE_LABEL}`], optional: true },
+    { command: "launchctl", args: ["bootout", `gui/${uid}/${SERVICE_LABEL}`], optional: true, confirmUnloaded: true },
     { command: "launchctl", args: ["bootstrap", `gui/${uid}`, path] },
   ];
   if (platform === "win32") return [
@@ -338,6 +339,13 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const interval = options.intervalMs ?? 500;
   const stopWindows = (end: () => Promise<{ code: number; output: string }>) => stopWindowsDaemon({ requestShutdown: options.requestShutdown ?? defaultRequestShutdown, probe, end, sleep, waitMs: options.stopWaitMs ?? DAEMON_STOP_WAIT_MS, intervalMs: interval });
+  // Bounded: polls `launchctl print` until the label is gone (non-zero), at most waitMs.
+  const waitUntilUnloaded = async () => {
+    for (let waited = 0; waited <= (options.waitMs ?? 10_000); waited += interval) {
+      if ((await runner("launchctl", ["print", `gui/${uid}/${SERVICE_LABEL}`])).code !== 0) return;
+      await sleep(interval);
+    }
+  };
   if (previous === contents && await serviceManagerHasService(platform, uid, runner) && await probe()) {
     if (platform !== "win32") return { state: "already-running", manual };
     // After an in-place upgrade the definition is unchanged (same node, same script path) but the
@@ -367,7 +375,15 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
       if (!stop.stopped) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} did not stop the old daemon: ${windowsStopFailure(stop)}${output ? ` (${output})` : ""}`, install, manual };
       continue;
     }
-    const { code, output } = await runner(step.command, step.args);
+    let { code, output } = await runner(step.command, step.args);
+    if (step.confirmUnloaded) await waitUntilUnloaded();
+    // bootstrap of a label that is still loaded or mid-teardown fails with "Input/output error"
+    // (exit 5): boot it out, wait until it is gone, and try once more.
+    if (platform === "darwin" && step.args[0] === "bootstrap" && code === 5) {
+      await runner("launchctl", ["bootout", `gui/${uid}/${SERVICE_LABEL}`]);
+      await waitUntilUnloaded();
+      ({ code, output } = await runner(step.command, step.args));
+    }
     if (code !== 0 && !step.optional) return { state: "not-loaded", reason: `${step.command} ${step.args.join(" ")} exited ${code}${output ? `: ${output}` : ""}`, install, manual };
   }
   const waitMs = options.waitMs ?? 10_000;
