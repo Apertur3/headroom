@@ -39,7 +39,7 @@ struct Observation: Codable {
     let adapter_version: String
     let upstream_schema_version: String
     let reason: String?
-    let metadata: ObservationMetadata?
+    var metadata: ObservationMetadata?
     /// Antigravity only, additive: what agy sent for this lane, so the
     /// TypeScript lane classifier (src/antigravity-lanes.ts) can tell a
     /// disabled or usage-unknown bucket apart from a missing one. Omitted
@@ -64,6 +64,7 @@ struct LaneFacts: Codable, Equatable {
 struct AntigravityPayloadFacts: Equatable {
     var payloadKind: String
     var disabledByBucketID: [String: Bool]
+    var modelCatalog: [CatalogModel]? = nil
 
     /// Same vocabulary and rules as the recorder's `payload_kind`.
     init(status: AntigravityStatusSnapshot) {
@@ -75,12 +76,24 @@ struct AntigravityPayloadFacts: Equatable {
         } else {
             payloadKind = "model_quota_fallback"
         }
+        // Reuse the probe's parsed models, with no extra request. Reflection
+        // drift, empty lists and invalid ids cannot become retirement evidence.
+        if input.isLocal, input.extractionErrors.isEmpty, let catalog = status.modelCatalog, !catalog.isEmpty {
+            let models = catalog.map {
+                CatalogModel(id: $0.modelId.trimmingCharacters(in: .whitespacesAndNewlines),
+                             name: $0.label.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            if models.allSatisfy({ !$0.id.isEmpty && !$0.name.isEmpty }), Set(models.map(\.id)).count == models.count {
+                modelCatalog = models
+            }
+        }
         disabledByBucketID = Dictionary(input.buckets.map { ($0.bucketID, $0.disabled) }, uniquingKeysWith: { first, second in first || second })
     }
 
-    init(payloadKind: String, disabledByBucketID: [String: Bool] = [:]) {
+    init(payloadKind: String, disabledByBucketID: [String: Bool] = [:], modelCatalog: [CatalogModel]? = nil) {
         self.payloadKind = payloadKind
         self.disabledByBucketID = disabledByBucketID
+        self.modelCatalog = modelCatalog
     }
 
     /// Without the parsed status (tests that build a UsageSnapshot directly).
@@ -96,9 +109,15 @@ private final class PayloadFactsBox: @unchecked Sendable {
     func get() -> AntigravityPayloadFacts? { lock.lock(); defer { lock.unlock() }; return facts }
 }
 
+struct CatalogModel: Codable, Equatable {
+    let id: String
+    let name: String
+}
+
 struct ObservationMetadata: Codable {
     let plan: String?
     let free_resets_available: Int?
+    var model_catalog: [CatalogModel]? = nil
 }
 
 struct ResponseShape: Codable {
@@ -373,7 +392,13 @@ struct HeadroomEngine {
             output.append(failedWeeklyWindow(principal, meter: meter, source: source,
                                              lane: LaneFacts(payload_kind: kind, bucket: "not_reported", usage_known: false, disabled: nil)))
         }
-        return output
+        return output.map { observation in
+            var row = observation
+            if let models = facts.modelCatalog {
+                row.metadata = ObservationMetadata(plan: nil, free_resets_available: nil, model_catalog: models)
+            }
+            return row
+        }
     }
 
     /// A reported bucket without usable usage: failed, no quantity, no reset.
