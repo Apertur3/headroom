@@ -117,6 +117,47 @@ describe("phone notification text", () => {
     }))).toContain("no dedicated meter observed");
   });
 
+  describe("banked credits after an unscheduled reset", () => {
+    const reset = event("reset_seen", {
+      principal_id: "codex-main", meter_id: "codex-main:main",
+      metadata: { unscheduled: true, window_minutes: 10_080, used_percent: 0, previous_used_percent: 88 },
+    });
+    const reading: Observation = { ...observation, principal_id: "codex-main", meter_id: "codex-main:main", metadata: {} };
+    const credit = (count: number, expiry: string | null): Observation => ({
+      ...reading, meter_id: "codex-main:credits", source: "codex-wham",
+      window: { kind: "count", minutes: null, enforcement: "hard" },
+      quantity: { used: 0, remaining: count, limit: count, unit: "credits" },
+      metadata: { free_resets_available: count }, resets_at: expiry,
+    });
+
+    it.each([
+      [2, new Date(2026, 9, 29, 12).toISOString(), "2 free resets still banked (expire Oct 29)."],
+      [1, new Date(2026, 9, 29, 12).toISOString(), "1 free reset still banked (expire Oct 29)."],
+      [2, null, "2 free resets still banked."],
+    ] as const)("shows %s banked credits with expiry %s", (count, expiry, line) => {
+      const text = eventText(reset, [reading], [credit(count, expiry)]);
+      expect(text.split("\n").slice(2)).toEqual([line, "Plan again: a full week of capacity appeared."]);
+    });
+
+    it("also finds credits in the event evidence and falls back to the credit quantity", () => {
+      const credits = { ...credit(1, null), metadata: {} };
+      expect(eventText(reset, [credits, reading])).toContain("1 free reset still banked.");
+    });
+
+    it("uses credit metadata when the quantity is absent", () => {
+      expect(eventText(reset, [reading], [{ ...credit(2, null), quantity: null }])).toContain("2 free resets still banked.");
+    });
+
+    it("keeps the original message when zero credits or none are known", () => {
+      const expected = eventText(reset, [reading]);
+      expect(expected.split("\n")).toHaveLength(3);
+      expect(expected).not.toContain("still banked");
+      expect(eventText(reset, [reading], [credit(0, null)])).toBe(expected);
+      expect(eventText(reset, [reading])).toBe(expected);
+      expect(eventText(reset, [reading], [{ ...credit(2, null), principal_id: "codex-other", meter_id: "codex-other:credits" }])).toBe(expected);
+    });
+  });
+
   it("does not invent a percentage for old events without evidence or leak multiline markup", () => {
     expect(eventText(event("reset_seen"))).not.toContain("0%");
     expect(eventText(event("source_failed", { reason: "403\nAuthorization: Bearer synthetic-secret" }))).toBe("⚠️ Source failed\nClaude main has not answered (403).\nRows read UNKNOWN until it recovers.");

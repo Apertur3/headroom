@@ -1,0 +1,18 @@
+{
+  "name": "headroom",
+  "version": "0.2.9",
+  "description": "Check subscription limits before work, with MCP tools, a quota line and the Headroom skill.",
+  "author": {
+    "name": "Apertur3"
+  },
+  "homepage": "https://github.com/Apertur3/headroom#readme",
+  "repository": "https://github.com/Apertur3/headroom",
+  "license": "MIT",
+  "keywords": [
+    "quota",
+    "claude-code",
+    "codex",
+    "mcp",
+    "usage-limits"
+  ]
+}
