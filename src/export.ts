@@ -183,7 +183,7 @@ function csvDocument(columns: readonly string[], records: ReadonlyArray<Record<s
 const OBSERVATION_COLUMNS = ["id", "principal_id", "meter_id", "window", "quantity", "resets_at", "observed_at", "fetched_at", "source", "truth", "freshness", "confidence", "adapter_version", "upstream_schema_version", "reason", "metadata"] as const;
 const EVENT_COLUMNS = ["id", "kind", "origin", "confidence", "evidence_observation_ids", "created_at", "corrected_by", "meter_id", "principal_id", "reason", "last_seen_at"] as const;
 const SPEND_COLUMNS = ["id", "meter_id", "window_minutes", "from_at", "to_at", "delta_percent", "owner", "share_percent", "confidence"] as const;
-const LEASE_COLUMNS = ["id", "owner", "meter_id", "expected_percent", "note", "action_class", "started_at", "expires_at", "ended_at", "ended_reason", "spent_percent"] as const;
+const LEASE_COLUMNS = ["id", "owner", "meter_id", "expected_percent", "note", "action_class", "started_at", "expires_at", "ended_at", "ended_reason", "spent_percent", "spend_resolution", "spent_percent_bound", "spend_window_minutes", "spend_windows"] as const;
 
 function csvFor(kind: ExportKind, rows: CollectedRows): string {
   if (kind === "observations") return csvDocument(OBSERVATION_COLUMNS, (rows.observations ?? []) as unknown as Array<Record<string, unknown>>);

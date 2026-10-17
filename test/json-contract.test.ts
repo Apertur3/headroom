@@ -139,13 +139,10 @@ async function seedBasic(home: string, now = new Date()): Promise<void> {
     store.insert(fiveHour(10, -20 * 60_000, 4 * 3_600_000, now));
     store.insert(fiveHour(30, 0, 4 * 3_600_000, now));
     store.insert(weekly(40, now));
-    // The lease's spent_percent is booked from the usage delta observed
-    // while it is active, not from its own --expect: without a fresh
-    // reading between start and end, an immediately-ended lease spends
-    // nothing and learnedCost's median would be a flat, uninformative 0.
+    // Exact boundary readings make this a resolved learning sample.
     const lease = store.startLease("cadence", "claude-main:all", 5, 3_600_000, null, now, "claude-fable");
     store.insert(fiveHour(35, 5 * 60_000, 4 * 3_600_000, now));
-    store.endLease(lease.id, "cadence");
+    store.endLease(lease.id, "cadence", false, new Date(now.getTime() + 5 * 60_000));
   } finally { store.close(); }
 }
 
@@ -332,6 +329,8 @@ describe("CLI --json field shapes", () => {
 
   it("lease list", async () => {
     const home = await newHome("lease-list");
+    const store = await HeadroomStore.open(home);
+    try { store.insert(fiveHour(10, 0, 4 * 3_600_000, new Date())); } finally { store.close(); }
     const { logs, restore } = captureLog();
     try {
       await withHeadroomHome(home, async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCostEstimate, costConfidence, maxMoreBeforeReset, percentile, summarizeLearnedCost } from "../src/cost.js";
+import { buildCostEstimate, costConfidence, learnedCostText, maxMoreBeforeReset, percentile, summarizeLearnedCost } from "../src/cost.js";
 
 describe("percentile", () => {
   it("is 0 for an empty array", () => {
@@ -27,7 +27,7 @@ describe("summarizeLearnedCost", () => {
   it("computes median, IQR bounds and sample count from per-lease spend", () => {
     // Sorted: 2, 4, 4, 5, 9 -- median (R-7, n=5) is the middle value, 4.
     const summary = summarizeLearnedCost("review", [9, 2, 4, 5, 4]);
-    expect(summary).toMatchObject({ action_class: "review", sample_count: 5, median_percent: 4 });
+    expect(summary).toMatchObject({ action_class: "review", sample_count: 5, median_percent: 4, basis: "exact", bounded_sample_count: 0 });
     expect(summary!.iqr_low).toBeLessThanOrEqual(summary!.median_percent);
     expect(summary!.iqr_high).toBeGreaterThanOrEqual(summary!.median_percent);
   });
@@ -36,6 +36,10 @@ describe("summarizeLearnedCost", () => {
     const input = [9, 2, 4];
     summarizeLearnedCost("x", input);
     expect(input).toEqual([9, 2, 4]);
+  });
+
+  it("accepts older learned summaries without optional evidence fields in human text", () => {
+    expect(learnedCostText({ action_class: "review", sample_count: 1, median_percent: 4, iqr_low: 4, iqr_high: 4 })).toBe("median 4.00% (IQR 4.00%-4.00%, n=1)");
   });
 });
 
@@ -81,6 +85,12 @@ describe("buildCostEstimate", () => {
   it("is unknown with no expect and no learned data, and never computes max-more", () => {
     const estimate = buildCostEstimate("brand-new-class", null, undefined, 40);
     expect(estimate).toMatchObject({ source: "unknown", expected_percent: null, confidence: "none", max_more_before_reset: null });
+  });
+
+  it("treats a zero-sample summary as unknown while preserving an explicit expectation", () => {
+    const empty = { action_class: "review", sample_count: 0, median_percent: 0, iqr_low: 0, iqr_high: 0 };
+    expect(buildCostEstimate("review", null, empty, 40)).toEqual(buildCostEstimate("review", null, undefined, 40));
+    expect(buildCostEstimate("review", 5, empty, 40)).toMatchObject({ source: "given", expected_percent: 5, sample_count: 0, max_more_before_reset: 8 });
   });
 
   it("leaves max-more null when the deciding meter's remaining percent is unknown", () => {

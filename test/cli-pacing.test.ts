@@ -81,11 +81,14 @@ describe("headroom cost", () => {
   it("prints the learned median/IQR/sample-count for a class, and reports plainly when there is none yet", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
-    // learnedCost only trains on a lease once it has ended: end it
-    // immediately so this still reads back as one real zero-cost sample
-    // rather than an in-progress job with no observed spend yet.
-    const lease = store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
-    store.endLease(lease.id, "cadence");
+    // Fresh zero-movement readings cover the entire completed lease.
+    const began = new Date(Date.now() - 1000);
+    const ended = new Date(began.getTime() + 500);
+    const first = { ...fiveHour(0, 0, 5 * HOUR, "codex-main:main"), observed_at: began.toISOString(), fetched_at: began.toISOString() };
+    store.insert(first);
+    const lease = store.startLease("cadence", "codex-main:main", null, HOUR, null, began, "review");
+    store.insert({ ...first, observed_at: ended.toISOString(), fetched_at: ended.toISOString() });
+    store.endLease(lease.id, "cadence", false, ended);
     store.close();
     const { logs, restore } = captureLog();
     try {
@@ -644,6 +647,37 @@ describe("live shape: codex-main:main with no stored 5h row at all, alternating 
 });
 
 describe("headroom can: learned cost and --lease", () => {
+  it("keeps CLI and MCP can on the ordinary routing path when learning is unknown", async () => {
+    const home = await seededHome();
+    await writeFile(join(home, "routing.toml"), '[consumes]\nreview = ["claude-main:all"]\n[cost.review]\npercent = 4\nduration_minutes = 10\n', { mode: 0o600 });
+    await writeFile(join(home, "policy.toml"), 'pacing = "none"\n', { mode: 0o600 });
+    await writeFile(join(home, "accounts.toml"), '[[accounts]]\nname = "claude-main"\nvendor = "claude"\nlocation = "/nonexistent/.claude"\nadapter = "native-ts"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour(10, 0, 5 * HOUR));
+    store.close();
+    const { logs, restore } = captureLog();
+    const unknown = { source: "unknown", expected_percent: null, median_percent: null, sample_count: 0, max_more_before_reset: null };
+    try {
+      await withHeadroomHome(home, async () => {
+        expect(await main(["can", "review", "--owner", "worker", "--lease", "--json"])).toBe(0);
+        expect(JSON.parse(logs[0])).toMatchObject({ allowed: true, cost: unknown, leased_id: null });
+        const call = async (name: string, args: Record<string, unknown>) => {
+          const reply = await handleMcp(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }), async () => undefined);
+          return (reply?.result as { structuredContent: Record<string, unknown> }).structuredContent;
+        };
+        expect(await call("quota_cost", { action_class: "review" })).toMatchObject({ items: [] });
+        expect(await call("quota_can", { action_class: "review", owner: "worker", lease: true })).toMatchObject({ decision: { allowed: true }, cost: unknown, leased_id: null });
+        expect(await call("quota_can", { action_class: "review", owner: "worker", expect_percent: 95 })).toMatchObject({ decision: { allowed: false }, cost: { source: "given", expected_percent: 95 } });
+        expect(await call("quota_fill", { meter: "claude-main:all", owner: "worker" })).toMatchObject({
+          lanes: null, lane_cost_source: "unknown", lane_cost_percent: null,
+          classes: [{ action_class: "review", percent: 4, duration_minutes: 10 }],
+        });
+        expect(await main(["run", "--class", "review", "--owner", "worker", "--json", "--", process.execPath, "-e", "process.exit(99)"])).toBe(2);
+        expect(JSON.parse(logs.at(-1)!)).toMatchObject({ gate: { allowed: false, state: "UNKNOWN", reason: expect.stringContaining("provide --need") }, lease_id: null });
+      });
+    } finally { restore(); }
+  });
+
   it("reports the learned median as the expected cost with no --expect, and --lease records a new lease under the action class", async () => {
     const home = await seededHome();
     await writeFile(join(home, "routing.toml"), '[consumes]\nclaude-fable = ["claude-main:all"]\n', { mode: 0o600 });
@@ -654,15 +688,13 @@ describe("headroom can: learned cost and --lease", () => {
     // with an isolated 4-point spend to learn a clean median. `can`'s own
     // decision is evaluated against claude-main:all separately below.
     for (const [index, meterId] of ["claude-main:practice-1", "claude-main:practice-2"].entries()) {
-      const startedAt = new Date(Date.now() + index * 1000);
+      const startedAt = new Date(Date.now() - 5000 + index * 1000);
+      const endedAt = new Date(startedAt.getTime() + 500);
+      const first = { ...fiveHour(0, 0, 5 * HOUR, meterId), observed_at: startedAt.toISOString(), fetched_at: startedAt.toISOString() };
+      store.insert(first);
       const lease = store.startLease("cadence", meterId, null, HOUR, null, startedAt, "claude-fable");
-      store.insert(fiveHour(0, startedAt.getTime() - Date.now(), 5 * HOUR, meterId));
-      store.insert(fiveHour(4, startedAt.getTime() - Date.now() + 500, 5 * HOUR, meterId));
-      // learnedCost only trains on a lease once it has ended: without this,
-      // both freshly started leases below would count as unfinished jobs
-      // with no observed spend yet, not the two learned 4-point samples
-      // this test is asserting on.
-      store.endLease(lease.id, "cadence");
+      store.insert({ ...first, quantity: { used: 4, limit: 100, remaining: 96, unit: "percent" }, observed_at: endedAt.toISOString(), fetched_at: endedAt.toISOString() });
+      store.endLease(lease.id, "cadence", false, endedAt);
     }
     store.insert(fiveHour(10, 0, 5 * HOUR)); // claude-main:all: what `can` actually decides against
     store.close();
@@ -727,7 +759,7 @@ describe("headroom can: learned cost and --lease", () => {
 describe("MCP quota_cost / quota_rate / quota_plan / quota_gate / quota_wait (direct, no daemon)", () => {
   const noDaemon = async () => undefined;
 
-  it("quota_cost returns the learned summary", async () => {
+  it("quota_cost excludes an unmeasured lease", async () => {
     const home = await seededHome();
     const store = await HeadroomStore.open(home);
     const lease = store.startLease("cadence", "codex-main:main", null, HOUR, null, new Date(), "review");
@@ -735,7 +767,7 @@ describe("MCP quota_cost / quota_rate / quota_plan / quota_gate / quota_wait (di
     store.close();
     await withHeadroomHome(home, async () => {
       const response = await handleMcp('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"quota_cost","arguments":{"action_class":"review"}}}', noDaemon);
-      expect(response).toMatchObject({ result: { structuredContent: { source: "direct", items: [expect.objectContaining({ action_class: "review", sample_count: 1 })] } } });
+      expect(response).toMatchObject({ result: { structuredContent: { source: "direct", items: [] } } });
     });
   });
 

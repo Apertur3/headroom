@@ -560,7 +560,7 @@ describe("SQLite observations and event detector", () => {
       store.insert(observation({ fetched_at: "2026-09-03T12:02:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
       // Arrival order can differ from the upstream fetch order; history keeps it,
       // whereas current status must not let it replace the 12:02 reading.
-      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 30, limit: 100, remaining: 70, unit: "percent" } }));
+      store.insert(observation({ observed_at: "2026-09-03T12:01:00Z", fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 30, limit: 100, remaining: 70, unit: "percent" } }));
       expect(store.history("codex-main:main", "2026-09-03T00:00:00Z")).toHaveLength(3);
       expect(store.latestPerWindow()).toEqual([expect.objectContaining({ meter_id: "codex-main:main", fetched_at: "2026-09-03T12:02:00Z", quantity: expect.objectContaining({ used: 20 }) })]);
     } finally { store.close(); }
@@ -1005,7 +1005,7 @@ describe("leases", () => {
     try {
       const started = store.startLease("cadence", "codex-main:main", 20, 2 * 3_600_000, "fanout", new Date("2026-09-03T12:00:00Z"));
       store.insert(observation({ fetched_at: "2026-09-03T12:00:00Z", quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
-      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
+      store.insert(observation({ observed_at: "2026-09-03T12:01:00Z", fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
       expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z"))[0]).toMatchObject({ id: started.id, spent_percent: 10, ended_at: null });
       expect(() => store.endLease(started.id, "other", false, new Date("2026-09-03T12:01:00Z"))).toThrow("--force");
       const ended = store.endLease(started.id, "other", true, new Date("2026-09-03T12:01:00Z"));
@@ -1026,7 +1026,7 @@ describe("leases", () => {
     expect(decision.reason).toBe("wk 68% + 6% leased by cadence → CONSERVE");
   });
 
-  it("uses equal weights for unspecified expected shares", async () => {
+  it("leaves overlapping leases unattributable with no invented equal shares", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-lease-split-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
@@ -1034,8 +1034,8 @@ describe("leases", () => {
       store.startLease("one", "codex-main:main", null, 2 * 3_600_000, null, at);
       store.startLease("two", "codex-main:main", null, 2 * 3_600_000, null, at);
       store.insert(observation({ fetched_at: at.toISOString(), quantity: { used: 10, limit: 100, remaining: 90, unit: "percent" } }));
-      store.insert(observation({ fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
-      expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z")).map((item) => item.spent_percent).sort()).toEqual([5, 5]);
+      store.insert(observation({ observed_at: "2026-09-03T12:01:00Z", fetched_at: "2026-09-03T12:01:00Z", quantity: { used: 20, limit: 100, remaining: 80, unit: "percent" } }));
+      expect(store.leases(undefined, false, new Date("2026-09-03T12:01:00Z")).map((item) => ({ spend: item.spent_percent, resolution: item.spend_resolution, bound: item.spent_percent_bound }))).toEqual([{ spend: 0, resolution: "unattributable", bound: "lower" }, { spend: 0, resolution: "unattributable", bound: "lower" }]);
     } finally { store.close(); }
   });
 });

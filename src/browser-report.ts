@@ -1,3 +1,4 @@
+import { leaseSpendText } from "./cost.js";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { SOURCE_SERIF_WOFF2_BASE64, SPLINE_MONO_WOFF2_BASE64 } from "./browser-report-fonts.js";
@@ -1513,7 +1514,7 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
                   <td><strong>${escapeHtml(l.owner)}</strong></td>
                   <td class="mono">${escapeHtml(l.meter_id)}</td>
                   <td class="mono">${l.expected_percent !== null ? `${formatHumanPercent(l.expected_percent)}%` : "—"}</td>
-                  <td class="mono">${formatHumanPercent(l.spent_percent)}%</td>
+                  <td class="mono">${escapeHtml(leaseSpendText(l))}</td>
                   <td class="mono">${escapeHtml(formatResetsIn(secondsLeft))}</td>
                   <td>${escapeHtml(redact(l.note ?? "—"))}</td>
                 </tr>

@@ -12,7 +12,13 @@
       "meter_id": "string",
       "note": "null",
       "owner": "string",
+      "spend_resolution": "string",
+      "spend_window_minutes": "null",
+      "spend_windows": [
+        "unknown (empty array in the fixture data)"
+      ],
       "spent_percent": "number",
+      "spent_percent_bound": "string",
       "started_at": "string"
     }
   ],
