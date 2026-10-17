@@ -1,0 +1,29 @@
+# Headroom
+
+> Headroom (npm package `headroomd`) is a local daemon, CLI and MCP server that reads the quota meters of AI subscriptions (Claude, Codex, Kimi, Grok, experimental Antigravity) and local vLLM or llama.cpp pools. Agents ask it before starting work and get go, wait or reroute; a stale or failed reading is reported as UNKNOWN, never a number. It runs locally with no telemetry.
+
+## Start here
+
+- [README](https://github.com/Apertur3/headroom/blob/master/README.md): what it does, install, the block of instructions to give agents, design principles
+- [Quickstart](https://github.com/Apertur3/headroom/blob/master/docs/quickstart.md): install to first truthful line on macOS, Linux and Windows
+- [Concepts](https://github.com/Apertur3/headroom/blob/master/docs/concepts.md): principal, meter, window, observation, pace states, leases, events
+- [Design overview](https://github.com/Apertur3/headroom/blob/master/DESIGN.md): architecture and where to start reading the code
+
+## Reference
+
+- [MCP and agents](https://github.com/Apertur3/headroom/blob/master/docs/mcp-and-agents.md): the MCP tools, example calls, how an orchestrator should use them
+- [JSON contract](https://github.com/Apertur3/headroom/blob/master/docs/json-contract.md): versioned shape of every --json output and MCP tool result, and the compatibility promise
+- [Dispatch guard](https://github.com/Apertur3/headroom/blob/master/docs/dispatch.md): gating dispatched work through `headroom run`
+- [Vendors](https://github.com/Apertur3/headroom/blob/master/docs/vendors.md): what is read per vendor and known limitations
+- [Notifications](https://github.com/Apertur3/headroom/blob/master/docs/notifications.md): notification channels and presets
+- [Verification](https://github.com/Apertur3/headroom/blob/master/docs/verification.md): what is measured and how to reproduce it
+- [Spec](https://github.com/Apertur3/headroom/blob/master/docs/spec.md): the v0.2 spec
+- [Usage-based prediction](https://github.com/Apertur3/headroom/blob/master/docs/usage-prediction.md): usage ingestion foundation
+
+## Project
+
+- [Changelog](https://github.com/Apertur3/headroom/blob/master/CHANGELOG.md)
+- [Contributing](https://github.com/Apertur3/headroom/blob/master/CONTRIBUTING.md)
+- [Releasing](https://github.com/Apertur3/headroom/blob/master/docs/releasing.md): versioning and releases
+- [Security](https://github.com/Apertur3/headroom/blob/master/SECURITY.md)
+- [License](https://github.com/Apertur3/headroom/blob/master/LICENSE): MIT
