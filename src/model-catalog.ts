@@ -16,7 +16,9 @@
  *  - Claude: Claude Code's own local model-catalog cache under the config
  *    dir (`cache/model-catalog/*.json`), one file per token the CLI has
  *    used; the newest by `fetchedAt` wins. No network call at all.
- *  - Antigravity (opt-in, `antigravity_model_catalog = true` in policy.toml):
+ *  - Antigravity local: the native probe's model list is carried on quota
+ *    observations and folded by insertPoll through the same store catalog.
+ *  - Antigravity additional remote source (opt-in, `antigravity_model_catalog = true` in policy.toml):
  *    `cloudcode-pa.googleapis.com`'s `fetchAvailableModels`, authenticated
  *    with the Gemini CLI's own OAuth file (`~/.gemini/oauth_creds.json`).
  *    That is a different credential from the one agy uses for quota, so it is
@@ -76,6 +78,7 @@ export async function readCodexModelCatalog(codexHome: string, readFileFn: (path
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { return undefined; }
   if (!OBJECT(parsed) || !freshCatalogTimestamp(parsed.fetched_at, now) || !Array.isArray(parsed.models)) return undefined;
+  if (!parsed.models.every((entry) => OBJECT(entry) && typeof entry.slug === "string" && entry.slug.trim())) return undefined;
   return parsed.models.flatMap((entry): CatalogModel[] => {
     if (!OBJECT(entry) || typeof entry.slug !== "string" || !entry.slug.trim()) return [];
     if (entry.visibility === "hide") return [];
@@ -110,7 +113,7 @@ export async function readClaudeModelCatalog(configDir: string, readDir: (path: 
   if (!files.length) return undefined;
   const newest = files.sort((left, right) => (right.fetchedAt ?? 0) - (left.fetchedAt ?? 0))[0];
   const models = newest.catalog?.config?.models;
-  if (!Array.isArray(models)) return undefined;
+  if (!Array.isArray(models) || !models.every((entry) => OBJECT(entry) && typeof entry.id === "string" && entry.id.trim())) return undefined;
   return models.flatMap((entry): CatalogModel[] => {
     if (!OBJECT(entry) || typeof entry.id !== "string" || !entry.id.trim()) return [];
     const name = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : null;
@@ -195,7 +198,9 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
     try {
       const models = await catalogFor(account, dependencies, now);
       if (models === undefined) continue;
-      store.recordModelCatalog(account.name, account.vendor, models, now);
+      // The optional remote Antigravity list can add models, but is not a
+      // complete local quota read and must never count toward retirement.
+      store.recordModelCatalog(account.name, account.vendor, models, now, { retireMissing: account.vendor !== "antigravity" });
     } catch { /* The pre-I/O claim remains: a broken source is not retried every poll. */ }
   }
 }

@@ -83,6 +83,9 @@ describe("HeadroomStore.recordModelCatalog (model_available / model_retired)", (
     try {
       store.recordModelCatalog("codex-main", "codex", [{ id: "gpt-6-astra" }, { id: "gpt-6-sol" }], new Date("2026-09-23T12:00:00Z"));
 
+      // Synthetic consecutive complete catalogs: one absence is not retirement.
+      store.recordModelCatalog("codex-main", "codex", [{ id: "gpt-6-astra" }], new Date("2026-09-23T12:20:00Z"));
+      store.recordModelCatalog("codex-main", "codex", [{ id: "gpt-6-astra" }], new Date("2026-09-23T12:40:00Z"));
       const retiredAt = new Date("2026-09-23T13:00:00Z");
       const retired = store.recordModelCatalog("codex-main", "codex", [{ id: "gpt-6-astra" }], retiredAt);
       expect(retired.retired).toEqual(["gpt-6-sol"]);

@@ -238,8 +238,8 @@ export function antigravityPayloadFromEngineRows(rows: Observation[], principal:
       const key = laneKey(meter, minutes);
       const previous = fresh.get(key);
       if (!previous || (previous.quantity?.used ?? 0) < row.quantity.used) fresh.set(key, stripFacts(row));
-    } else if (facts?.bucket === "reported") {
-      buckets.push({ meter, minutes, remaining: null, usageKnown: false, disabled: facts.disabled ?? null, resetsAt: null });
+    } else if (facts?.bucket === "reported" || row.metadata?.lane_state === "blocked_by_weekly") {
+      buckets.push({ meter, minutes, remaining: null, usageKnown: false, disabled: facts?.disabled ?? null, resetsAt: null });
     } else {
       buckets.push({ meter, minutes, remaining: null, usageKnown: false, disabled: null, resetsAt: null, notReported: true });
     }
@@ -250,4 +250,21 @@ export function antigravityPayloadFromEngineRows(rows: Observation[], principal:
 /** The per-lane fresh row the engine sent, for antigravityLaneObservations. */
 export function engineFreshRow(read: EngineRead): (meter: AntigravityMeter, minutes: AntigravityWindowMinutes) => Observation | undefined {
   return (meter, minutes) => read.fresh.get(laneKey(meter, minutes));
+}
+
+/** A missing or malformed list is not an empty catalog. Require the same
+ * nonempty list on every row, so mixed/older/partial engine output fails safe. */
+export function antigravityModelCatalog(rows: readonly Observation[]): { id: string; name: string }[] | undefined {
+  if (!rows.length) return undefined;
+  let catalog: { id: string; name: string }[] | undefined;
+  for (const row of rows) {
+    const models = row.metadata?.model_catalog;
+    if (row.source !== "local:antigravity:warm" || !Array.isArray(models) || !models.length) return undefined;
+    if (!models.every((model) => model && typeof model.id === "string" && model.id.trim() && typeof model.name === "string" && model.name.trim())) return undefined;
+    const normalized = models.map((model) => ({ id: model.id.trim(), name: model.name.trim() })).sort((a, b) => a.id.localeCompare(b.id));
+    if (new Set(normalized.map((model) => model.id)).size !== normalized.length) return undefined;
+    if (catalog && JSON.stringify(catalog) !== JSON.stringify(normalized)) return undefined;
+    catalog = normalized;
+  }
+  return catalog;
 }

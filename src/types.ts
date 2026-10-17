@@ -100,6 +100,8 @@ export interface Observation {
     /** Local-pool facts. They deliberately contain no credentials or prompts. */
     state?: "UP" | "BUSY" | "DOWN";
     model_ids?: string[];
+    /** Antigravity local status models; learned only from complete quota reads. */
+    model_catalog?: { id: string; name: string }[];
     running?: number;
     waiting?: number;
     cost_model?: "sunk" | "marginal";
@@ -301,7 +303,7 @@ export interface HeadroomEvent {
    * that let delivery deduplicate noisy repeats without changing the event
    * stream. */
   /** On `model_available`/`model_retired`: the vendor model id and display
-   * name from its own catalog, and (`model_available` only) whether
+   * name and vendor from its own catalog, and (`model_available` only) whether
    * Headroom can already see a meter of its own for this id (`shares_pool:
    * false`) or a current generic meter (`shares_pool: true`). Undefined
    * means no current fresh official meter establishes either relationship. */
@@ -312,7 +314,7 @@ export interface HeadroomEvent {
    * pick the work back up. On `timer_missed`: the owner and timer name whose
    * due wake-up fired while that owner's heartbeat was lapsed, and the
    * action text Headroom delivered (never executed). */
-  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; model_name?: string | null; shares_pool?: boolean; owner?: string; interval_ms?: number; last_beat_at?: string; resume_sentence?: string | null; timer_name?: string; action?: string } | null;
+  metadata?: { unscheduled?: boolean; window_minutes?: number | null; used_percent?: number; previous_used_percent?: number; from_plan?: string; to_plan?: string; downgrade?: boolean; restored?: boolean; credit_spent_on_free_plan?: boolean; resets_at?: string; burn_percent_per_hour?: number; empty_in_seconds?: number; model_id?: string; vendor?: string; model_name?: string | null; shares_pool?: boolean; owner?: string; interval_ms?: number; last_beat_at?: string; resume_sentence?: string | null; timer_name?: string; action?: string } | null;
 }
 
 /** One orchestrator heartbeat lease: an owner's promise to beat at least

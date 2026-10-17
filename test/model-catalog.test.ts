@@ -264,3 +264,16 @@ describe("checkModelAvailability orchestration", () => {
     } finally { store.close(); }
   });
 });
+
+// Synthetic partial cache payloads must never become authoritative catalogs.
+describe("partial local model catalogs (synthetic)", () => {
+  const now = new Date("2026-10-01T12:00:00Z");
+  it("rejects a Codex model array containing an incomplete entry", async () => {
+    const read = async () => JSON.stringify({ fetched_at: now.toISOString(), models: [{ slug: "synthetic-codex", display_name: "Synthetic Codex" }, {}] });
+    expect(await readCodexModelCatalog("/synthetic", read, now)).toBeUndefined();
+  });
+  it("rejects a Claude model array containing an incomplete entry", async () => {
+    const read = async () => JSON.stringify({ fetchedAt: now.getTime(), catalog: { config: { models: [{ id: "synthetic-claude", name: "Synthetic Claude" }, {}] } } });
+    expect(await readClaudeModelCatalog("/synthetic", async () => ["synthetic.json"], read, now)).toBeUndefined();
+  });
+});

@@ -9,7 +9,7 @@ import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
 import { failedAntigravityObservations, noDaemonObservations } from "./adapters/antigravity.js";
 import {
-  antigravityLaneObservations, antigravityPayloadFromEngineRows, classifyAntigravityLanes, engineFreshRow, isSettledLane,
+  antigravityLaneObservations, antigravityModelCatalog, antigravityPayloadFromEngineRows, classifyAntigravityLanes, engineFreshRow, isSettledLane,
   type AntigravityClassification, type AntigravityLaneState, type AntigravityPayloadKind, type EngineRead,
 } from "./antigravity-lanes.js";
 import { retiredGeminiObservations } from "./adapters/gemini.js";
@@ -130,7 +130,9 @@ function classifyLocalAntigravity(rows: Observation[], principal: string): Class
 }
 
 function localLaneRows(classified: ClassifiedLocalRead, principal: string, now: string): Observation[] {
-  return [...antigravityLaneObservations(classified.classification, principal, { now, source: LOCAL_ANTIGRAVITY_SOURCE, adapterVersion: "0.1.0", freshRow: engineFreshRow(classified.read) }), ...classified.read.extra];
+  const catalog = antigravityModelCatalog(classified.rows);
+  return [...antigravityLaneObservations(classified.classification, principal, { now, source: LOCAL_ANTIGRAVITY_SOURCE, adapterVersion: "0.1.0", freshRow: engineFreshRow(classified.read) }), ...classified.read.extra]
+    .map((row) => catalog ? { ...row, metadata: { ...row.metadata, model_catalog: catalog } } : row);
 }
 
 function localReadSummary(classified: ClassifiedLocalRead, at: string): AntigravityLocalRead {
