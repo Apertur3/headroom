@@ -71,8 +71,12 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
   const minutes = event.metadata?.window_minutes ?? current?.window?.minutes;
   const window = windowName(minutes);
   const meter = `${name}${window ? ` ${window}` : ""}`;
-  const count = current?.metadata?.free_resets_available ?? (current?.quantity?.unit === "credits" ? current.quantity.remaining : null);
-  const expiry = dateText(current?.resets_at, false);
+  const credits = event.kind === "reset_seen"
+    ? [...evidence].reverse().concat(siblings).find((row) => row.principal_id === event.principal_id
+      && (row.meter_id === `${event.principal_id}:credits` || row.quantity?.unit === "credits"))
+    : current;
+  const count = credits?.metadata?.free_resets_available ?? (credits?.quantity?.unit === "credits" ? credits.quantity.remaining : null);
+  const expiry = dateText(credits?.resets_at, false);
   switch (event.kind) {
     case "reset_seen": {
       const used = event.metadata?.used_percent ?? current?.quantity?.used;
@@ -80,7 +84,8 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
       const at = formatClockTime(new Date(event.created_at));
       if (event.metadata?.unscheduled) return message("🔄 Unscheduled reset",
         `${meter} is back${used == null ? "" : ` to ${Math.round(used)}%`}${was == null ? "" : ` (was ${Math.round(was)}%)`} at ${at}.`,
-        minutes === 10_080 ? "Plan again: a full week of capacity appeared." : "Plan again: capacity appeared ahead of schedule.");
+        [count != null && count > 0 ? `${Math.round(count)} free reset${count === 1 ? "" : "s"} still banked${expiry ? ` (expire ${expiry})` : ""}.` : undefined,
+          minutes === 10_080 ? "Plan again: a full week of capacity appeared." : "Plan again: capacity appeared ahead of schedule."].filter(Boolean).join("\n"));
       const sibling = siblings.find((row) => row.meter_id === event.meter_id && row.window?.minutes && row.window.minutes !== minutes && row.freshness === "fresh" && row.quantity?.unit === "percent");
       return message(minutes === 10_080 ? "🗓️ Weekly reset" : "🗓️ Scheduled reset",
         `${meter}${used == null ? " reset" : ` is at ${Math.round(used)}% again`} (reset ${at}).`,

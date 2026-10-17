@@ -1,0 +1,21 @@
+{
+  "name": "headroom",
+  "description": "Headroom: your coding agents check their Claude and Codex limits before they start a job.",
+  "owner": {
+    "name": "Apertur3"
+  },
+  "plugins": [
+    {
+      "name": "headroom",
+      "source": "./",
+      "description": "Check subscription limits before work, with MCP tools, a quota line and the Headroom skill.",
+      "version": "0.2.8",
+      "category": "productivity",
+      "tags": [
+        "quota",
+        "mcp",
+        "usage-limits"
+      ]
+    }
+  ]
+}

@@ -255,6 +255,70 @@ jobs:
         run: |
           echo "::warning title=npm publish skipped::npm refused the publish. Either the trusted publisher for this repository and workflow is not configured on npmjs.com yet, or this version already exists. The GitHub release was created; run this workflow manually with the tag to publish again."
 
+  mcp-registry:
+    name: publish to the MCP Registry
+    needs: [tarball, publish]
+    if: >-
+      always() && github.repository == 'Apertur3/headroom' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+       github.event_name == 'workflow_dispatch') && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    # Independent of Homebrew: a registry outage cannot delay the tap update.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Resolve registry version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$RELEASE_TAG"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Release tag does not match the expected vX.Y.Z[-PRERELEASE] grammar"
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${RELEASE_TAG#v}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Wait for the npm version
+        run: |
+          for attempt in {1..30}; do
+            published="$(npm view "headroomd@$VERSION" version --prefer-online --fetch-retries=0 --fetch-timeout=5000 2>/dev/null || true)"
+            if [[ "$published" == "$VERSION" ]]; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 30 ]]; then sleep 5; fi
+          done
+          echo "::error::headroomd@$VERSION did not become available on npm within five minutes"
+          exit 1
+      - name: Set registry package versions
+        run: |
+          jq --arg version "$VERSION" '.version = $version | .packages[0].version = $version' server.json > server.tmp
+          mv server.tmp server.json
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr A-Z a-z)_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate to the MCP Registry
+        run: ./mcp-publisher login github-oidc
+      - name: Publish to the MCP Registry
+        id: publish
+        continue-on-error: true
+        run: ./mcp-publisher publish
+      - name: Registry publish did not happen
+        if: ${{ steps.publish.outcome == 'failure' }}
+        run: |
+          echo "::warning title=MCP Registry publish skipped::The registry refused the publish. Check that the npm version includes the matching mcpName and that the registry is available, then rerun this job."
+
   homebrew:
     name: update the Homebrew tap
     needs: [tarball, publish]

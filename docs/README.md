@@ -15,3 +15,7 @@ Add docs as the project earns them — don't pre-write 30. Typical ones:
 
 Architecture *decisions* and *why* go in the vault (`decisions/log.md`), not
 here. This dir is for repeatable mechanical procedures.
+
+## Integrations
+
+- [Claude Code plugin](claude-code-plugin.md): install the skill, MCP server and per-prompt quota line.

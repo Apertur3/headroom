@@ -90,6 +90,24 @@ logged-in macOS machine, verify actual Antigravity quota through the packaged da
 MCP. Include a corrupt-reader check: a modified binary must produce an integrity failure and
 UNKNOWN capacity. `headroom engine install` should report the bundled reader already available.
 
+## MCP Registry
+
+The release workflow publishes `server.json` to the official MCP Registry after npm publication.
+The first publish needs the npm version to exist with `mcpName` in its `package.json`; the job
+waits up to about five minutes for npm to serve it. `server.json` stays out of the npm tarball.
+
+The server name is `io.github.Apertur3/headroom`. GitHub OIDC grants the repository owner's
+`io.github.<owner>/*` namespace, with the owner spelled exactly as GitHub reports it, so
+`Apertur3` must keep its case. The npm `mcpName` must match the server name.
+
+The `mcp-registry` job uses `id-token: write` and `mcp-publisher login github-oidc` only, with no
+stored secret. It resolves and validates the release tag on tag pushes and manual dispatches,
+sets both versions in `server.json`, and publishes. A failed publish reports a warning and can
+be retried by rerunning the job. Homebrew runs independently.
+
+Keep the plugin manifest, marketplace entry, `server.json` and its npm package version in sync
+with `package.json` when preparing a release. `test/plugin-hook.test.ts` checks them together.
+
 ## The Homebrew tap
 
 `brew install apertur3/tap/headroom` installs the published npm tarball through Homebrew and adds

@@ -10,6 +10,9 @@ states and freshness. Capability routing stays yours, in `~/.headroom/routing.to
 
 ## Setting Headroom up
 
+When installed as a Claude Code plugin, the MCP server and per-prompt quota line are already
+registered. Skip manual MCP and hook registration.
+
 When the user asks to set up, install or configure Headroom, run these in order and stop at the
 first one that fails, showing its output:
 
