@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- macOS and Linux: `headroom install-service` after an upgrade now restarts a daemon that still runs an older version, instead of saying "already installed and running" and leaving the old code in place. It also restarts a daemon too old to report its version, and exits non-zero unless the new version answers. Windows already did this.
+
 ## [0.2.9] - 2026-10-17
 
 ### Changed
