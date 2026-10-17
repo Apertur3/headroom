@@ -51,7 +51,8 @@ it("F6 patch rejects anchor drift and unexpected construction paths, including a
   expect(patchSource(patched)).toBe(patched);
   expect(() => patchSource(patched + "\nAntigravityStatusSnapshot(modelQuotas: [])")).toThrow(/construction|snapshot/i);
 });
-it("F6 patch atomically replaces a read-only file and preserves its mode", async () => {
+// Engine patch runs only on macOS (build-native-engine.sh skips elsewhere).
+it.skipIf(process.platform === "win32")("F6 patch atomically replaces a read-only file and preserves its mode", async () => {
   const { root, checkout, dir, file } = await fixture();
   const originalLink = join(root, "original.swift");
   await chmod(file, 0o444); await link(file, originalLink);
@@ -68,7 +69,7 @@ it("F6 patch rejects a new snapshot construction in another source file before w
   await expect(exec(process.execPath, [script, checkout])).rejects.toThrow();
   expect(await readFile(file, "utf8")).toBe(source);
 });
-it("F6 preparation restores the dependency before resolving and stops on reset failure", async () => {
+it.skipIf(process.platform === "win32")("F6 preparation restores the dependency before resolving and stops on reset failure", async () => {
   const { root } = await fixture();
   const bin = join(root, "tools"); await mkdir(bin);
   const log = join(root, "calls");
