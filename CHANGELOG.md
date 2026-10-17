@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-18
+
 ### Added
 - Claude Code plugin: install with `claude plugin marketplace add Apertur3/headroom`, then `claude plugin install headroom@headroom`. It bundles the Headroom skill, MCP registration and a per-prompt quota line. Using it with `headroom hook install` does not print the line twice; install headroomd first.
 - MCP Registry listing metadata under `io.github.Apertur3/headroom`, with release publishing through GitHub OIDC.
