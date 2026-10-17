@@ -73,7 +73,7 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
   const meter = `${name}${window ? ` ${window}` : ""}`;
   const credits = event.kind === "reset_seen"
     ? [...evidence].reverse().concat(siblings).find((row) => row.principal_id === event.principal_id
-      && (row.meter_id === `${event.principal_id}:credits` || row.quantity?.unit === "credits"))
+      && row.freshness === "fresh" && (row.metadata?.free_resets_available != null || row.quantity?.unit === "credits"))
     : current;
   const count = credits?.metadata?.free_resets_available ?? (credits?.quantity?.unit === "credits" ? credits.quantity.remaining : null);
   const expiry = dateText(credits?.resets_at, false);
