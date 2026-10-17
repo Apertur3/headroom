@@ -2355,27 +2355,31 @@ export class HeadroomStore {
     const end = Math.min(Date.parse(lease.expires_at), lease.ended_at ? Date.parse(lease.ended_at) : Infinity);
     const spendWindows: LeaseSpendWindow[] = windows.map((window) => {
       const minutes = Number(window.minutes);
-      const rows = evidence.filter((row) => Number(row.window_minutes) === minutes && row.window_kind === window.kind && (row.delta_percent === null ? Date.parse(String(row.to_at)) >= start && Date.parse(String(row.from_at)) <= end : Date.parse(String(row.to_at)) > start && Date.parse(String(row.from_at)) < end));
+      const rows = evidence.filter((row) => {
+        if (Number(row.window_minutes) !== minutes || row.window_kind !== window.kind) return false;
+        const from = Date.parse(String(row.from_at)), to = Date.parse(String(row.to_at));
+        return row.delta_percent === null && from === to ? to >= start && from <= end : to > start && from < end;
+      });
       let coveredTo = start;
       let complete = lease.ended_at !== null;
       let lower = 0;
       let upper = 0;
-      let overlaps = 1;
+      let overlaps: number | null = null;
       for (const row of rows) {
         const from = Date.parse(String(row.from_at)), to = Date.parse(String(row.to_at));
         const overlappingEvidence = from < coveredTo && coveredTo > start;
         if (from > coveredTo || overlappingEvidence || row.delta_percent === null) complete = false;
         coveredTo = Math.max(coveredTo, to);
-        overlaps = Math.max(overlaps, Number(row.overlapping_leases));
+        if (row.delta_percent !== null) overlaps = Math.max(overlaps ?? 1, Number(row.overlapping_leases));
         const delta = Number(row.delta_percent ?? 0);
         upper += delta;
         if (!overlappingEvidence && from >= start && to <= end && Number(row.overlapping_leases) === 1) lower += delta;
       }
       complete &&= coveredTo >= end && rows.length > 0;
       const resolution: LeaseSpendWindow["resolution"] = version === 0 ? "legacy"
-        : overlaps > 1 ? "unattributable" : !complete ? "unresolved" : lower === upper ? "resolved" : "bounded";
+        : overlaps !== null && overlaps > 1 ? "unattributable" : !complete ? "unresolved" : lower === upper ? "resolved" : "bounded";
       return { meter_id: lease.meter_id, window_minutes: minutes, resolution,
-        lower_percent: version === 0 ? 0 : lower, upper_percent: complete && version !== 0 ? upper : null, overlapping_leases: version === 0 || !rows.length ? null : overlaps };
+        lower_percent: version === 0 ? 0 : lower, upper_percent: complete && version !== 0 ? upper : null, overlapping_leases: version === 0 ? null : overlaps };
     });
     const chosen = spendWindows[0];
     const exact = chosen?.resolution === "resolved";
@@ -2770,7 +2774,7 @@ export class HeadroomStore {
     const leases = this.prepared(`SELECT * FROM leases WHERE meter_id = ?
       AND julianday(started_at) <= julianday(?)
       AND julianday(MIN(expires_at, COALESCE(ended_at, expires_at))) >= julianday(?)`).all(current.meter_id, toAt, fromAt)
-      .filter((lease) => invalid || (Date.parse(String(lease.started_at)) < to && Math.min(Date.parse(String(lease.expires_at)), Date.parse(String(lease.ended_at ?? lease.expires_at))) > from));
+      .filter((lease) => from === to || (Date.parse(String(lease.started_at)) < Math.max(from, to) && Math.min(Date.parse(String(lease.expires_at)), Date.parse(String(lease.ended_at ?? lease.expires_at))) > Math.min(from, to)));
     for (const lease of leases) this.prepared(`INSERT OR IGNORE INTO lease_window_spend
       (lease_id,meter_id,window_minutes,observation_id,from_at,to_at,delta_percent,overlapping_leases) VALUES (?,?,?,?,?,?,?,?)`)
       .run(lease.id, current.meter_id, window.minutes, current.id, fromAt, toAt, invalid ? null : delta, leases.length);

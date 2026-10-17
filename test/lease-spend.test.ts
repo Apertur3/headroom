@@ -78,6 +78,58 @@ it.each([false, true])("excludes two leases sharing a poll even when sequential=
   } finally { store.close(); }
 });
 
+it("keeps boundary-touching leases bounded and out of a reset bracket's overlap count", async () => {
+  const { home, store } = await setup();
+  try {
+    store.insert({ ...reading(0, 0), resets_at: at(8).toISOString() });
+    const before = start(store, 1);
+    store.insert({ ...reading(5, 6), resets_at: at(8).toISOString() });
+    store.endLease(before.id, "worker", false, at(5));
+    const inside = start(store, 6, "reset");
+    store.endLease(inside.id, "worker", false, at(7));
+    const after = start(store, 10, "after");
+    store.insert({ ...reading(10, 0), resets_at: at(700).toISOString() });
+    store.endLease(after.id, "worker", false, at(11));
+    store.insert({ ...reading(15, 3), resets_at: at(700).toISOString() });
+
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    const db = new DatabaseSync(join(home, "headroom.db"));
+    try {
+      expect(db.prepare("SELECT lease_id, overlapping_leases FROM lease_window_spend WHERE delta_percent IS NULL").all())
+        .toEqual([{ lease_id: inside.id, overlapping_leases: 1 }]);
+      // Persisted rows from older writers must also respect strict overlap on read.
+      for (const id of [before.id, after.id]) db.prepare(`INSERT INTO lease_window_spend
+        (lease_id,meter_id,window_minutes,observation_id,from_at,to_at,delta_percent,overlapping_leases)
+        SELECT ?,meter_id,window_minutes,observation_id,from_at,to_at,delta_percent,overlapping_leases
+        FROM lease_window_spend WHERE lease_id = ?`).run(id, inside.id);
+    } finally { db.close(); }
+
+    expect(find(store, before.id)).toMatchObject({ spend_resolution: "bounded", spent_percent: 6,
+      spend_windows: [{ upper_percent: 6, overlapping_leases: 1 }] });
+    expect(find(store, after.id)).toMatchObject({ spend_resolution: "bounded", spent_percent: 3,
+      spend_windows: [{ upper_percent: 3, overlapping_leases: 1 }] });
+    expect(store.learnedCost("review", at(20))).toMatchObject([{ median_percent: 6, sample_count: 1, basis: "upper_bound" }]);
+  } finally { store.close(); }
+});
+
+it.each([false, true])("counts only trustworthy brackets when a reset overlaps two leases (valid bracket=%s)", async (valid) => {
+  const { store } = await setup();
+  try {
+    store.insert({ ...reading(0, 0), resets_at: at(3).toISOString() });
+    const first = start(store);
+    if (valid) store.insert({ ...reading(1, 6), resets_at: at(3).toISOString() });
+    const second = start(store, 2);
+    store.insert({ ...reading(5, 0), resets_at: at(700).toISOString() });
+    store.endLease(first.id, "worker", false, at(5));
+    store.endLease(second.id, "worker", false, at(5));
+    expect(find(store, first.id)).toMatchObject({ spend_resolution: "unresolved",
+      spend_windows: [{ upper_percent: null, overlapping_leases: valid ? 1 : null }] });
+    expect(find(store, second.id)).toMatchObject({ spend_resolution: "unresolved",
+      spend_windows: [{ upper_percent: null, overlapping_leases: null }] });
+    expect(store.learnedCost("review", at(10))).toEqual([]);
+  } finally { store.close(); }
+});
+
 it("store, JSON/CSV export, MCP and learning agree, excluding unresolved samples", async () => {
   const { home, store } = await setup();
   const oldHome = process.env.HEADROOM_HOME;
@@ -200,15 +252,15 @@ it("uses one duration consistently when fixed and rolling presentations coexist,
   } finally { store.close(); }
 });
 
-it("does not resolve conflicting readings at the same observation timestamp", async () => {
+it.each([[0, 5], [0, 1], [1, 5]])("does not resolve conflicting readings at the same observation timestamp for lease [%s, %s]", async (from, to) => {
   const { store } = await setup();
   try {
     store.insert(reading(0, 0));
-    const lease = start(store);
+    const lease = start(store, from);
     store.insert(reading(1, 5));
     store.insert({ ...reading(1, 10), fetched_at: at(2).toISOString() });
     store.insert(reading(5, 15));
-    store.endLease(lease.id, "worker", false, at(5));
+    store.endLease(lease.id, "worker", false, at(to));
     expect(find(store, lease.id)).toMatchObject({ spend_resolution: "unresolved", spent_percent_bound: "lower" });
     expect(store.learnedCost("review", at(10))).toEqual([]);
   } finally { store.close(); }
