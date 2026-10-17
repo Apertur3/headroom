@@ -364,7 +364,7 @@ async function doctorChecksTail(output: DoctorCheck[], home: string, accounts: A
     : check("INFO", "engine upstream hash", `${upstream.tag} absent or hash mismatch; optional, needed only for providers without a native adapter`, "headroom engine install"));
   output.push(native
     ? check(verifiedNative ? "OK" : "INFO", "engine native hash", verifiedNative ? `verified (${native})` : `development binary (${native}) is not release-pinned`, verifiedNative ? "no action needed" : "install the published macOS package for a verified reader")
-    : check(nativeFailure ? "FAIL" : "INFO", "engine native hash", nativeFailure ?? "no native reader for this installation", "reinstall headroomd on macOS"));
+    : check(nativeFailure ? "FAIL" : "INFO", "engine native hash", nativeFailure ?? (process.platform === "darwin" ? "no native reader for this installation" : "the native reader (Antigravity) is macOS-only"), process.platform === "darwin" ? "reinstall headroomd" : "no action needed"));
 
   if (accounts.some((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "antigravity")) {
     output.push(native

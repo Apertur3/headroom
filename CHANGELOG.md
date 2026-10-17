@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- macOS: `headroom install-service` after an upgrade no longer fails with "Bootstrap failed: 5: Input/output error" and leaves the daemon stopped. It now unloads the old service and waits until launchd has let go of it before loading the new one, retries once if launchd still refuses, and exits non-zero (naming the manual `launchctl bootstrap` command) if the daemon is not answering afterwards.
+- `headroom line` now shows every meter of an account that has a fresh reading, for example both `antigravity:gemini` and `antigravity:claude-gpt` when both are current, instead of marking the whole account UNKNOWN because one meter is stale or held. An account reads UNKNOWN only when none of its meters is fresh, and UNKNOWN accounts now come after the ones with a reading.
+- Windows: the "Headroom Daemon" task no longer has Task Scheduler's default 72 hour run limit, which silently stopped the daemon after three days; it also restarts after a crash (up to 3 times, a minute apart). Run `headroom install-service` once to replace the existing task.
+- `headroom doctor` on Linux and Windows no longer tells you to reinstall for macOS; it says the native reader (Antigravity) is macOS-only.
+
+### Documentation
+- README and quickstart: MCP registration and a real Claude login read are now verified on Windows 11, and the `keychain grant` step is marked macOS-only.
+
 ## [0.2.8] - 2026-10-17
 
 ### Added

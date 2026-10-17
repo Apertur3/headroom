@@ -2381,7 +2381,8 @@ export async function main(argv: string[]): Promise<number> {
       const started = await installAndStartService();
       describeServiceStart(started).forEach((line) => console.log(line));
       console.log(`The service will run: ${started.install?.runtime ?? process.execPath} ${started.install?.script ?? process.argv[1]} daemon`);
-      return 0;
+      // Never exit 0 on macOS or Linux when the daemon is not up (Windows keeps its exit code).
+      return process.platform !== "win32" && (started.state === "not-loaded" || started.state === "unconfirmed") ? 1 : 0;
     }
     const result = await installService(process.argv[1], process.platform, undefined, process.execPath, dryRun);
     console.log(`${result.dryRun ? "would write" : "wrote"} ${result.path}\nTo load it: ${result.command}`);

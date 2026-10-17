@@ -99,6 +99,8 @@ command's usage.
 
 ## 4. Check the Claude credential (macOS only)
 
+macOS only: skip this step on Linux and Windows, where there is no Keychain and nothing to grant.
+
 ```sh
 headroom keychain grant
 ```
@@ -480,7 +482,7 @@ consumer OAuth path. See [vendors.md](vendors.md#antigravity).
 CI runs lint, the full test suite and a build on `ubuntu-latest`, `windows-latest` and
 `macos-latest` on every push. Each release's packed tarball goes through the scripted cold-install
 smoke test (`scripts/smoke-cold.sh`), and has been installed by hand on macOS and on Linux ARM64.
-Windows: On Windows 11, `headroom install-service` registers a "Headroom Daemon" task that starts immediately and serves a per-user named pipe whose name is a hash only. `headroom uninstall --home` asks the running daemon to shut down over that pipe, removes the task and the home, and exits 0. After an in-place upgrade, `headroom install-service` restarts the daemon onto the new version, except a daemon started by 0.2.6 or older, which has no shutdown request and must be stopped by hand once (end node.exe in Task Manager). Not verified on Windows: a slow stop (the 27 second wait is covered by unit tests only), start at logon and across reboots, MCP registration, and a real Claude login read. The process watchdog is inactive on Windows. Windows stays experimental. On Linux only the
+Windows: On Windows 11, `headroom install-service` registers a "Headroom Daemon" task that starts immediately and serves a per-user named pipe whose name is a hash only. `headroom uninstall --home` asks the running daemon to shut down over that pipe, removes the task and the home, and exits 0. After an in-place upgrade, `headroom install-service` restarts the daemon onto the new version, except a daemon started by 0.2.6 or older, which has no shutdown request and must be stopped by hand once (end node.exe in Task Manager). Verified on Windows 11: MCP registration (`claude mcp add --scope user headroom -- headroom mcp` shows Connected) and a real Claude login read (fresh on the first poll). Not verified on Windows: a slow stop (the 27 second wait is covered by unit tests only) and start at logon and across reboots. The process watchdog is inactive on Windows. Windows stays experimental. On Linux only the
 source is covered by CI, and nobody uses it daily with real accounts; the daily-used environment is macOS.
 
 ## Staying up to date
