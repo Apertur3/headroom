@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.8] - 2026-10-17
 
 ### Added
 - Antigravity models from complete local agy reads now appear in `headroom models` and use the existing new-model alerts. The first catalog read seeds silently.
@@ -13,7 +13,7 @@ All notable changes to this project are documented here. The format follows
 - `headroom hook install|uninstall|status --agent claude` adds or removes one Claude Code `UserPromptSubmit` hook (a small shell script under `~/.headroom/hooks/`) in `CLAUDE_CONFIG_DIR` or `~/.claude`, plus `~/.claude2` when it exists. It backs each `settings.json` up once, leaves other hooks and keys alone, and refuses a file that does not parse. `headroom setup` offers it (default yes; `--yes` installs it only with `--hook`), `headroom doctor` reports its state as INFO, and `headroom uninstall` removes it. Not supported yet: Windows hook install, and Codex or Gemini hooks.
 
 ### Fixed
-- Model retirement requires three consecutive complete catalog reads without the model, including Claude and Codex. Failed, partial, loading and availability-only Antigravity reads cannot retire models.
+- Model retirement requires three consecutive complete catalog reads without the model, including Claude and Codex. Failed, partial, loading and availability-only Antigravity reads cannot retire models. This fixes models flapping on and off in the model list.
 
 ## [0.2.7] - 2026-10-04
 
