@@ -9,9 +9,15 @@ source is the tiebreaker, not this page.
 
 `engine/Package.swift` pins `CodexBarCore` to `steipete/codexbar` at the same release tag as the
 CodexBarCLI assets in `engine.lock.json`. Building the Swift engine (`npm run engine:build`,
-`swift build --package-path engine`, `swift test --package-path engine`) therefore fetches that
-dependency's source from GitHub over the network; there is no vendored or offline copy. A build run
-without network access to GitHub fails at dependency resolution, not at compile time.
+`swift build --package-path engine`, `swift test --package-path engine`) uses that
+dependency's source from GitHub. Before a direct Swift build or test, run
+`bash scripts/prepare-engine.sh`. It resolves the pinned dependencies and applies
+an idempotent compatibility patch to preserve the model list from the existing
+`GetUserStatus` response when CodexBar returns a quota summary. The patch rejects
+unexpected source changes. Both engine build scripts do this automatically,
+including each scratch directory used for native packaging. There is no new
+vendor request, and quota conversion, recorder output and `--shape` stay the same.
+A fresh build without network access to GitHub needs cached dependencies.
 
 ## Claude
 
@@ -285,9 +291,17 @@ same read stay fresh. Both Antigravity paths (the daemon's local read and the re
 `src/antigravity-lanes.ts`: fresh, blocked by weekly, loading, missing, unavailable
 (availability-only answer) or error (the engine's own error text kept).
 
-### Model catalog (`model_available`, opt-in)
+### Model catalog (`model_available`)
 
-Off by default. Headroom has no local model-list read for Antigravity, so this check calls
+Complete local agy quota reads automatically record the model IDs and labels
+from the probe's existing `GetUserStatus` response. No Gemini CLI credential or
+policy opt-in is needed. A missing, empty, malformed or partial model list is
+unavailable evidence. Failed, loading, availability-only or incomplete quota
+reads cannot learn or retire models. The first complete read seeds silently;
+later new IDs produce `model_available`. Retirement requires three complete
+reads without the model, using the same catalog store as Claude and Codex.
+
+An optional additional remote catalog check is off by default. It calls
 Google's undocumented `loadCodeAssist` and `fetchAvailableModels` on
 `cloudcode-pa.googleapis.com`, at most once an hour, announcing `User-Agent: antigravity` and
 `ideType: ANTIGRAVITY`. Its credential is the Gemini CLI's own OAuth file
@@ -295,12 +309,14 @@ Google's undocumented `loadCodeAssist` and `fetchAvailableModels` on
 `oauth2.googleapis.com` with the OAuth client found in the installed Gemini CLI and is never
 written back. Vendor terms may restrict a third-party tool using that credential this way, so the
 check runs only after you set `antigravity_model_catalog = true` in `policy.toml`. With the
-default `false`, Headroom never opens that file and makes no Google call for Antigravity. When
+default `false`, Headroom never opens that credential file or calls the remote
+catalog endpoints. The local quota read still learns models. When
 enabled, an install that discovered its `antigravity` account purely from
 `agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
 no model catalog for that principal (never a failure of the ordinary quota read).
 An HTTP success without the expected `models` object is likewise unavailable, not an authoritative
-empty catalog, so it cannot retire known models.
+empty catalog. This optional availability source never retires known models;
+only complete local quota reads can do that.
 The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
 (UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
 

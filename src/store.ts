@@ -1,3 +1,4 @@
+import { antigravityModelCatalog, antigravityPayloadFromEngineRows, classifyAntigravityLanes } from "./antigravity-lanes.js";
 import { constants as fsConstants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -23,6 +24,9 @@ import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type 
  * write. Long enough to cover a weekly window several times over, short
  * enough that the table stays a working set rather than an archive. */
 export const SPEND_LEDGER_RETENTION_DAYS = 30;
+
+/** Complete catalog reads required before an absent model is retired. */
+export const MODEL_RETIREMENT_READS = 3;
 
 /** How long an unscheduled reset (issue #20) stays called out: the status
  * row's "(unscheduled)" note, the grouped view's own line, and gate/plan/
@@ -788,6 +792,21 @@ export class HeadroomStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const stored = this.insertAll(observations);
+      // Learn from this poll, never cached sibling lanes. Classification also
+      // accepts a known weekly block as settled, while loading/error reads
+      // and engines without a full model list cannot alter the catalog.
+      for (const principal of new Set(observations.map((row) => row.principal_id))) {
+        const rows = observations.filter((row) => row.principal_id === principal);
+        const models = antigravityModelCatalog(rows);
+        if (!models || !classifyAntigravityLanes(antigravityPayloadFromEngineRows(rows, principal).payload).complete) continue;
+        if (!rows.every((row) => Number.isFinite(Date.parse(row.fetched_at)))) continue;
+        const at = rows.reduce((earliest, row) => Date.parse(row.fetched_at) < Date.parse(earliest) ? row.fetched_at : earliest, rows[0]!.fetched_at);
+        const key = `antigravity_model_read:${principal}`;
+        const previous = this.daemonState(key);
+        if (previous && Date.parse(previous) >= Date.parse(at)) continue;
+        this.foldModelCatalog(principal, "antigravity", models, new Date(at));
+        this.setDaemonState(key, at);
+      }
       const byMeter = new Map<string, StoredObservation[]>();
       // Every windowed row this poll carried, in any state: a lane the vendor
       // answered for (failed, blocked, loading) is present, only a lane the
@@ -1894,8 +1913,8 @@ export class HeadroomStore {
    * deterministic id (`kind:principal:modelId`) makes this idempotent under
    * `INSERT OR IGNORE`, the same guarantee `addEvent` gives its own
    * observation-keyed ids. */
-  private addModelEvent(kind: "model_available" | "model_retired", principalId: string, modelId: string, modelName: string | null, at: string): void {
-    const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName };
+  private addModelEvent(kind: "model_available" | "model_retired", vendor: string, principalId: string, modelId: string, modelName: string | null, at: string): void {
+    const metadata: NonNullable<HeadroomEvent["metadata"]> = { model_id: modelId, model_name: modelName, vendor };
     if (kind === "model_available") {
       const scope = this.modelMeterScope(principalId, modelId);
       if (scope === "dedicated") metadata.shares_pool = false;
@@ -1916,50 +1935,79 @@ export class HeadroomStore {
    * `model_available` event); an id previously marked `retired_at` reappears
    * without a fresh event (the vendor listing it again is not, by itself, as
    * newsworthy as the very first sighting, and it keeps its original
-   * `first_seen_at`); an id no longer present is marked `retired_at` = now
-   * with one `model_retired` event (excluded from every default notify
+   * `first_seen_at`); an id absent from three consecutive complete reads is
+   * marked `retired_at` = now with one `model_retired` event (excluded from every default notify
    * preset -- see notify.ts's `PRESET_EVENTS`).
    */
-  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date()): { seeded: boolean; added: string[]; retired: string[] } {
-    const at = now.toISOString();
-    const initializedKey = `model_catalog_initialized:${principalId}`;
+  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date(), options: { retireMissing?: boolean; fetchedAt?: string } = {}): { seeded: boolean; added: string[]; retired: string[] } {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const existingRows = this.prepared("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
-      const seeded = this.daemonState(initializedKey) === undefined;
-      const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
-      const seenIds = new Set(models.map((model) => model.id));
-      const added: string[] = [];
-      for (const model of models) {
-        const existing = existingById.get(model.id);
-        if (!existing) {
-          this.prepared("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
-            .run(principalId, vendor, model.id, model.name ?? null, at, at);
-          if (!seeded) {
-            added.push(model.id);
-            this.addModelEvent("model_available", principalId, model.id, model.name ?? null, at);
-          }
-          continue;
-        }
-        this.prepared("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
-          .run(at, model.name ?? null, vendor, principalId, model.id);
+      const readKey = `model_catalog_read:${vendor}:${principalId}`;
+      const previous = this.daemonState(readKey);
+      if (options.fetchedAt && previous && Date.parse(previous) >= Date.parse(options.fetchedAt)) {
+        this.db.exec("COMMIT");
+        return { seeded: false, added: [], retired: [] };
       }
-      const retired: string[] = [];
-      if (!seeded) for (const row of existingRows) {
-        if (seenIds.has(row.model_id) || row.retired_at) continue;
-        this.prepared("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
-        retired.push(row.model_id);
-        this.addModelEvent("model_retired", principalId, row.model_id, row.model_name, at);
-      }
-      // This must share the transaction with rows and events. In particular,
-      // an authoritative initial empty catalog is still an initialized check.
-      this.setDaemonState(initializedKey, at);
+      const result = this.foldModelCatalog(principalId, vendor, models, now, options.retireMissing !== false);
+      if (options.fetchedAt) this.setDaemonState(readKey, options.fetchedAt);
       this.db.exec("COMMIT");
-      return { seeded, added, retired };
+      return result;
     } catch (error) {
       try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
       throw error;
     }
+  }
+
+  /** Shared fold within the caller's write transaction. */
+  private foldModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now: Date, retireMissing = true): { seeded: boolean; added: string[]; retired: string[] } {
+    const at = now.toISOString();
+    // Separate the local baseline from legacy/remote initialization on upgrade.
+    // Only locally observed Antigravity ids are eligible for local retirement.
+    const initializedKey = vendor === "antigravity"
+      ? `model_catalog_${retireMissing ? "local" : "remote"}_initialized:${principalId}`
+      : `model_catalog_initialized:${principalId}`;
+    const existingRows = this.prepared("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
+    const seeded = this.daemonState(initializedKey) === undefined;
+    const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
+    const seenIds = new Set<string>();
+    const unique = models.filter((model) => {
+      if (seenIds.has(model.id)) return false;
+      seenIds.add(model.id);
+      return true;
+    });
+    const added: string[] = [];
+    for (const model of unique) {
+      if (vendor === "antigravity" && retireMissing) this.setDaemonState(`model_local:${principalId}:${model.id}`, at);
+      const existing = existingById.get(model.id);
+      if (!existing) {
+        this.prepared("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
+          .run(principalId, vendor, model.id, model.name ?? null, at, at);
+        if (!seeded) {
+          added.push(model.id);
+          this.addModelEvent("model_available", vendor, principalId, model.id, model.name ?? null, at);
+        }
+        continue;
+      }
+      if (retireMissing) this.setDaemonState(`model_missing:${principalId}:${model.id}`, "0");
+      this.prepared("UPDATE known_models SET last_seen_at = ?, retired_at = CASE WHEN ? THEN NULL ELSE retired_at END, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+        .run(at, Number(retireMissing), model.name ?? null, vendor, principalId, model.id);
+    }
+    const retired: string[] = [];
+    if (!seeded) for (const row of existingRows) {
+      if (seenIds.has(row.model_id) || row.retired_at) continue;
+      if (!retireMissing || (vendor === "antigravity" && !this.daemonState(`model_local:${principalId}:${row.model_id}`))) continue;
+      const key = `model_missing:${principalId}:${row.model_id}`;
+      const misses = Number(this.daemonState(key) ?? 0) + 1;
+      this.setDaemonState(key, String(misses));
+      if (misses < MODEL_RETIREMENT_READS) continue;
+      this.prepared("UPDATE known_models SET retired_at = ? WHERE principal_id = ? AND model_id = ?").run(at, principalId, row.model_id);
+      retired.push(row.model_id);
+      this.addModelEvent("model_retired", vendor, principalId, row.model_id, row.model_name, at);
+    }
+    // This must share the transaction with rows and events. In particular,
+    // an authoritative initial empty catalog is still an initialized check.
+    this.setDaemonState(initializedKey, at);
+    return { seeded, added, retired };
   }
 
   /** Every model id Headroom has ever seen in a vendor's own catalog, newest

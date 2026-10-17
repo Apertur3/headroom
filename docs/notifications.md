@@ -148,13 +148,32 @@ observed`; that is UNKNOWN information, never capacity.
 Sources, per vendor (no new credential type for any of them -- see
 `docs/vendors.md` for the exact host/credential each one reuses): Codex's own
 local `models_cache.json` cache, Claude Code's own local model-catalog
-cache, and Antigravity's `fetchAvailableModels` endpoint. Checked at most
-once an hour per principal, independent of the ordinary quota poll interval.
+cache, and the model IDs and labels already returned by Antigravity's local
+`GetUserStatus` read. Claude and Codex catalogs are checked at most once an
+hour per principal. Antigravity learns during ordinary complete local quota
+polls, with no extra credential or request. Its alert reads:
+
+```
+New model available in Antigravity: Argon
+```
+
+The optional remote Antigravity `fetchAvailableModels` check still requires
+`antigravity_model_catalog = true`; it can add models but cannot retire them.
 The very first successful check for a principal (even an authoritative empty
 catalog) seeds its known-model list silently -- no notification burst for
 models you were already using. `headroom models
 [--principal <id>] [--json|--agent]` lists every known model id with its
 `first_seen_at` (and `retired_at` once a vendor drops one).
+
+Retirement requires absence from **three consecutive complete reads** for
+all three vendors. Seeing the model resets its absence count; counts survive
+restarts. Failed or malformed catalog reads do not count. Antigravity also
+requires all four quota lanes to be settled (fresh or blocked by an exhausted
+weekly), and a nonempty, complete model list from that same local read.
+Partial, loading, availability-only and older-engine reads cannot learn or
+retire models. Replayed local rows do not advance the count. A returning
+known model clears retirement without another availability alert.
+`model_retired` remains excluded from the default calm and quiet presets.
 
 Scheduled 5h resets are delivered only with `preset = "everything"` or
 `events_on = ["reset_scheduled_short"]`. They happen several times a day, so
