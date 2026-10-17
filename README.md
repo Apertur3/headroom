@@ -9,6 +9,8 @@
   <b>Coding agents ask Headroom before they start work and get go, wait or reroute, from the limits your AI subscriptions report. They ask through the CLI or MCP in Claude Code, so you stop babysitting usage meters and reset times.</b>
 </p>
 
+<p align="center">Headroom is for people who run several AI coding agents across Claude, Codex and other subscriptions and want those agents to check the quota meters themselves before they start work.</p>
+
 <p align="center">
   <a href="https://github.com/Apertur3/headroom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Apertur3/headroom/ci.yml?branch=master&style=flat-square&label=CI"></a>
   <a href="https://www.npmjs.com/package/headroomd"><img alt="npm version" src="https://img.shields.io/npm/v/headroomd?style=flat-square&label=npm"></a>
