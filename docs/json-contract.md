@@ -27,6 +27,17 @@ JSON, after every existing field -- so a payload field that happened to be
 named `contract` or `generated_at` could never shadow the real ones, though no
 current output has one.
 
+## Additive model catalog facts
+
+Contract remains **1.0**. Local Antigravity observations can carry
+`metadata.model_catalog`, an array of `{ id: string, name: string }` from the
+same native status read. Missing or empty metadata is not an authoritative
+empty catalog. Only complete quota reads with a complete list update
+`known_models`; incomplete readings keep their existing quota semantics.
+Model events can additionally carry `metadata.vendor` (for example,
+`"antigravity"`), so notification wording does not depend on the account name.
+Existing fields, `observe` quota rows and `--shape` output are unchanged.
+
 ## Array-shaped outputs
 
 `cost`, `rate`, `spend`, and `events` (CLI `--json`, and the MCP tools of the

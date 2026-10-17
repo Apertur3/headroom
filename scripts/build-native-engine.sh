@@ -48,7 +48,7 @@ source_sha="$(
     # The build driver and compiler version affect the emitted executable too.
     # Include them in the cache key so an Xcode/Swift upgrade rebuilds it.
     printf '%s\n' "@literal toolchain $toolchain_sha"
-    printf '%s\n' scripts/build-native-engine.sh engine/Package.swift engine/Package.resolved
+    printf '%s\n' scripts/build-native-engine.sh scripts/prepare-engine.sh scripts/patch-engine-model-catalog.mjs engine/Package.swift engine/Package.resolved
     LC_ALL=C find engine/Sources/HeadroomEngine -type f -print | LC_ALL=C sort
   } | while IFS= read -r source_file; do
     if [[ "$source_file" == @literal\ * ]]; then
@@ -112,6 +112,10 @@ build_one() {
   # ever reusing a host-architecture object as the other architecture. The
   # prefix maps cover both DWARF and runtime #filePath strings in CodexBarCore
   # resources; strip alone cannot remove the latter.
+  if ! bash scripts/prepare-engine.sh "$scratch" >"$log" 2>&1; then
+    echo "native reader: dependency preparation failed" >&2
+    return 1
+  fi
   if ! swift build --package-path engine --scratch-path "$scratch" --configuration release \
       --arch "$arch" --product headroom-engine \
       -Xswiftc -file-prefix-map -Xswiftc "$repo_root=/headroom-source" \

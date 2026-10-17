@@ -1,4 +1,5 @@
 // swift-tools-version: 6.0
+// Before direct builds/tests: bash scripts/prepare-engine.sh
 import PackageDescription
 
 // Pinned to the same release as engine.lock.json's CodexBarCLI assets, so the
