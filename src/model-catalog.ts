@@ -42,6 +42,7 @@ import { isAccountEnabled, type ProviderAccount } from "./types.js";
 import type { HeadroomStore } from "./store.js";
 
 export interface CatalogModel { id: string; name: string | null; }
+export interface CatalogSnapshot { models: CatalogModel[]; fetchedAt: string; }
 
 const OBJECT = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -71,7 +72,7 @@ async function readRegularFile(path: string): Promise<string> {
  * visibility, ... }] }`. `visibility: "hide"` entries (internal test/review
  * models CodexBar itself never lists) are excluded.
  */
-export async function readCodexModelCatalog(codexHome: string, readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogModel[] | undefined> {
+export async function readCodexModelCatalog(codexHome: string, readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogSnapshot | undefined> {
   let text: string;
   try { text = await readFileFn(join(codexHome, "models_cache.json")); }
   catch { return undefined; }
@@ -79,12 +80,13 @@ export async function readCodexModelCatalog(codexHome: string, readFileFn: (path
   try { parsed = JSON.parse(text); } catch { return undefined; }
   if (!OBJECT(parsed) || !freshCatalogTimestamp(parsed.fetched_at, now) || !Array.isArray(parsed.models)) return undefined;
   if (!parsed.models.every((entry) => OBJECT(entry) && typeof entry.slug === "string" && entry.slug.trim())) return undefined;
-  return parsed.models.flatMap((entry): CatalogModel[] => {
+  const models = parsed.models.flatMap((entry): CatalogModel[] => {
     if (!OBJECT(entry) || typeof entry.slug !== "string" || !entry.slug.trim()) return [];
     if (entry.visibility === "hide") return [];
     const name = typeof entry.display_name === "string" && entry.display_name.trim() ? entry.display_name.trim() : null;
     return [{ id: entry.slug.trim(), name }];
   });
+  return models.length ? { models, fetchedAt: new Date(parsed.fetched_at as string | number).toISOString() } : undefined;
 }
 
 interface ModelCatalogFile { fetchedAt?: number; catalog?: { config?: { models?: unknown } }; }
@@ -98,7 +100,7 @@ interface ModelCatalogFile { fetchedAt?: number; catalog?: { config?: { models?:
  * hash the CLI derives from the current token. Shape: `{ fetchedAt,
  * catalog: { config: { models: [{ id, name }] } } }`.
  */
-export async function readClaudeModelCatalog(configDir: string, readDir: (path: string) => Promise<string[]> = async (path) => readdir(path), readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogModel[] | undefined> {
+export async function readClaudeModelCatalog(configDir: string, readDir: (path: string) => Promise<string[]> = async (path) => readdir(path), readFileFn: (path: string) => Promise<string> = readRegularFile, now = new Date()): Promise<CatalogSnapshot | undefined> {
   const directory = join(configDir, "cache", "model-catalog");
   let names: string[];
   try { names = await readDir(directory); } catch { return undefined; }
@@ -114,11 +116,12 @@ export async function readClaudeModelCatalog(configDir: string, readDir: (path: 
   const newest = files.sort((left, right) => (right.fetchedAt ?? 0) - (left.fetchedAt ?? 0))[0];
   const models = newest.catalog?.config?.models;
   if (!Array.isArray(models) || !models.every((entry) => OBJECT(entry) && typeof entry.id === "string" && entry.id.trim())) return undefined;
-  return models.flatMap((entry): CatalogModel[] => {
+  const catalog = models.flatMap((entry): CatalogModel[] => {
     if (!OBJECT(entry) || typeof entry.id !== "string" || !entry.id.trim()) return [];
     const name = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : null;
     return [{ id: entry.id.trim(), name }];
   });
+  return catalog.length ? { models: catalog, fetchedAt: new Date(newest.fetchedAt!).toISOString() } : undefined;
 }
 
 /**
@@ -166,10 +169,13 @@ export const MODEL_CHECK_INTERVAL_MS = 60 * 60_000;
 
 function daemonStateKey(principalId: string): string { return `model_check:${principalId}`; }
 
-async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabilityDependencies, now: Date): Promise<CatalogModel[] | undefined> {
+async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabilityDependencies, now: Date): Promise<CatalogSnapshot | undefined> {
   if (account.vendor === "codex") return (dependencies.readCodexModelCatalog ?? readCodexModelCatalog)(resolve(account.location || vendorHome("codex")), undefined, now);
   if (account.vendor === "claude") return (dependencies.readClaudeModelCatalog ?? readClaudeModelCatalog)(resolve(account.location || vendorHome("claude")), undefined, undefined, now);
-  if (account.vendor === "antigravity") return (dependencies.fetchAntigravityModelCatalog ?? fetchAntigravityModelCatalog)({ now: dependencies.now, fetch: dependencies.fetch });
+  if (account.vendor === "antigravity") {
+    const models = await (dependencies.fetchAntigravityModelCatalog ?? fetchAntigravityModelCatalog)({ now: dependencies.now, fetch: dependencies.fetch });
+    return models?.length ? { models, fetchedAt: now.toISOString() } : undefined;
+  }
   return undefined;
 }
 
@@ -196,11 +202,11 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
     // processes cannot all decide that the same hourly check is due.
     if (!store.claimDaemonInterval(key, now, MODEL_CHECK_INTERVAL_MS)) continue;
     try {
-      const models = await catalogFor(account, dependencies, now);
-      if (models === undefined) continue;
+      const catalog = await catalogFor(account, dependencies, now);
+      if (!catalog?.models.length) continue;
       // The optional remote Antigravity list can add models, but is not a
       // complete local quota read and must never count toward retirement.
-      store.recordModelCatalog(account.name, account.vendor, models, now, { retireMissing: account.vendor !== "antigravity" });
+      store.recordModelCatalog(account.name, account.vendor, catalog.models, now, { retireMissing: account.vendor !== "antigravity", fetchedAt: catalog.fetchedAt });
     } catch { /* The pre-I/O claim remains: a broken source is not retried every poll. */ }
   }
 }

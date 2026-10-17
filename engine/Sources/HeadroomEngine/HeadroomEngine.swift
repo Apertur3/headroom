@@ -83,8 +83,9 @@ struct AntigravityPayloadFacts: Equatable {
                 CatalogModel(id: $0.modelId.trimmingCharacters(in: .whitespacesAndNewlines),
                              name: $0.label.trimmingCharacters(in: .whitespacesAndNewlines))
             }
-            if models.allSatisfy({ !$0.id.isEmpty && !$0.name.isEmpty }), Set(models.map(\.id)).count == models.count {
-                modelCatalog = models
+            if models.allSatisfy({ !$0.id.isEmpty && !$0.name.isEmpty }) {
+                var seen = Set<String>()
+                modelCatalog = models.filter { seen.insert($0.id).inserted }
             }
         }
         disabledByBucketID = Dictionary(input.buckets.map { ($0.bucketID, $0.disabled) }, uniquingKeysWith: { first, second in first || second })

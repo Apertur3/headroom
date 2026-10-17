@@ -261,8 +261,14 @@ export function antigravityModelCatalog(rows: readonly Observation[]): { id: str
     const models = row.metadata?.model_catalog;
     if (row.source !== "local:antigravity:warm" || !Array.isArray(models) || !models.length) return undefined;
     if (!models.every((model) => model && typeof model.id === "string" && model.id.trim() && typeof model.name === "string" && model.name.trim())) return undefined;
-    const normalized = models.map((model) => ({ id: model.id.trim(), name: model.name.trim() })).sort((a, b) => a.id.localeCompare(b.id));
-    if (new Set(normalized.map((model) => model.id)).size !== normalized.length) return undefined;
+    const seen = new Set<string>();
+    const normalized = models.map((model) => ({ id: model.id.trim(), name: model.name.trim() }))
+      .filter((model) => {
+        if (seen.has(model.id)) return false;
+        seen.add(model.id);
+        return true;
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
     if (catalog && JSON.stringify(catalog) !== JSON.stringify(normalized)) return undefined;
     catalog = normalized;
   }

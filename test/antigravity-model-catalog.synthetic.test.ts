@@ -137,6 +137,67 @@ describe("Antigravity local catalog (synthetic)", () => {
     await poll(BASE);
     expect(modelEvents("model_retired")).toHaveLength(1);
   });
+  it("F1 seeds local models silently after a legacy remote catalog and keeps remote-only rows active", async () => {
+    store.recordModelCatalog(PRINCIPAL, "antigravity", [NEW], NOW, { retireMissing: false });
+    // Reproduce an upgraded installation's legacy remote initialization marker.
+    store.setDaemonState(`model_catalog_initialized:${PRINCIPAL}`, NOW.toISOString());
+    await poll(BASE);
+    expect(modelEvents("model_available")).toEqual([]);
+    for (let count = 0; count < 4; count++) await poll(BASE);
+    expect(store.knownModels(PRINCIPAL).find((row) => row.model_id === NEW.id)?.retired_at).toBeNull();
+    expect(modelEvents("model_retired")).toEqual([]);
+  });
+  it("F1 remote refreshes neither reset local absences nor revive locally retired models", async () => {
+    await poll([...BASE, NEW]);
+    for (let count = 0; count < 3; count++) {
+      await poll(BASE);
+      store.recordModelCatalog(PRINCIPAL, "antigravity", [NEW], NOW, { retireMissing: false });
+    }
+    expect(store.daemonState(`model_missing:${PRINCIPAL}:${NEW.id}`)).toBe("3");
+    expect(store.knownModels(PRINCIPAL).find((row) => row.model_id === NEW.id)?.retired_at).not.toBeNull();
+    expect(modelEvents("model_retired")).toHaveLength(1);
+  });
+  it("F2 partial reads strip catalogs from reused fresh rows", async () => {
+    await poll([...BASE, NEW]);
+    const partial = await poll(BASE, "partial");
+    expect(partial.every((row) => row.metadata?.model_catalog === undefined)).toBe(true);
+  });
+  it("F4 blocked lane replays use the engine timestamp rather than poll time", async () => {
+    await poll([...BASE, NEW]);
+    const rows = engineRows(BASE);
+    rows[0] = { ...rows[0], quantity: null, freshness: "failed", lane: { payload_kind: "quota_summary", bucket: "reported", usage_known: false, disabled: true } } as Observation;
+    rows[1].quantity = { used: 100, limit: 100, remaining: 0, unit: "percent" };
+    for (let count = 0; count < 4; count++) {
+      vi.mocked(runNativeEngine).mockResolvedValue(rows);
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(NOW.getTime() + (10 + count) * 3_600_000));
+      try {
+        const result = await pollAccounts(undefined, { nativeEngineAvailable: true, daemonOwnsAntigravity: true });
+        store.insertPoll(result.observations);
+      } finally { vi.useRealTimers(); }
+    }
+    expect(store.daemonState(`antigravity_model_read:${PRINCIPAL}`)).toBe(rows[0].fetched_at);
+    expect(modelEvents("model_retired")).toEqual([]);
+  });
+  it("F4 store ignores newer synthesized timestamps when guarding engine replays", async () => {
+    await poll([...BASE, NEW]);
+    const rows = engineRows(BASE);
+    rows[0] = { ...rows[0], quantity: null, freshness: "failed", lane: { payload_kind: "quota_summary", bucket: "reported", usage_known: false, disabled: true } } as Observation;
+    rows[1].quantity = { used: 100, limit: 100, remaining: 0, unit: "percent" };
+    const engineAt = rows[1].fetched_at;
+    for (let count = 0; count < 4; count++) {
+      rows[0].fetched_at = new Date(NOW.getTime() + (10 + count) * 3_600_000).toISOString();
+      store.insertPoll(rows);
+    }
+    expect(store.daemonState(`antigravity_model_read:${PRINCIPAL}`)).toBe(engineAt);
+    expect(modelEvents("model_retired")).toEqual([]);
+  });
+  it("F5 duplicate catalog ids keep their first name without dropping the catalog", async () => {
+    await poll([...BASE, { ...BASE[0], name: "Duplicate alias" }, NEW]);
+    expect(store.knownModels(PRINCIPAL).map((row) => [row.model_id, row.model_name])).toEqual([
+      [NEW.id, NEW.name], [BASE[0].id, BASE[0].name],
+    ]);
+  });
   it("headroom line names an unknown Antigravity weekly instead of a blank value", () => {
     const rows = engineRows(BASE, "partial");
     const line = buildAgentLine(rows, defaultPolicy, [PRINCIPAL], NOW);

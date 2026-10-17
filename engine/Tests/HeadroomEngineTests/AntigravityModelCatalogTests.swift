@@ -57,4 +57,16 @@ final class AntigravityModelCatalogTests: XCTestCase {
         XCTAssertNil(AntigravityPayloadFacts(status: summary().withIdentity(from: try identity(partial: true))).modelCatalog)
         XCTAssertNil(AntigravityPayloadFacts(status: summary().withIdentity(from: nil)).modelCatalog)
     }
+    func testF5DuplicateModelIDsKeepFirstEntry() throws {
+        let json = """
+        {"userStatus":{"cascadeModelConfigData":{"clientModelConfigs":[
+          {"label":"First","modelOrAlias":{"model":"synthetic-one"}},
+          {"label":"Alias","modelOrAlias":{"model":"synthetic-one"}},
+          {"label":"Second","modelOrAlias":{"model":"synthetic-two"}}
+        ]}}}
+        """
+        let identity = try AntigravityStatusProbe.parseUserStatusResponse(Data(json.utf8))
+        let facts = AntigravityPayloadFacts(status: summary().withIdentity(from: identity))
+        XCTAssertEqual(facts.modelCatalog, [CatalogModel(id: "synthetic-one", name: "First"), CatalogModel(id: "synthetic-two", name: "Second")])
+    }
 }

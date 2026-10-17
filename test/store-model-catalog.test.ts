@@ -151,3 +151,13 @@ describe("HeadroomStore.recordModelCatalog (model_available / model_retired)", (
     } finally { store.close(); }
   });
 });
+
+it("F5 fold keeps the first duplicate id without rolling back", async () => {
+  const store = await openStore("headroom-duplicate-catalog-");
+  try {
+    store.recordModelCatalog("synthetic", "codex", [{ id: "synthetic-one", name: "First" }, { id: "synthetic-one", name: "Alias" }]);
+    expect(store.knownModels("synthetic")).toMatchObject([{ model_id: "synthetic-one", model_name: "First" }]);
+    store.recordModelCatalog("synthetic", "codex", [{ id: "synthetic-two", name: "Second" }, { id: "synthetic-two", name: "Alias" }]);
+    expect(store.events("2026-01-01T00:00:00Z").filter((event) => event.kind === "model_available")).toHaveLength(1);
+  } finally { store.close(); }
+});

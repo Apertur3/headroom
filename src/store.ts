@@ -800,7 +800,7 @@ export class HeadroomStore {
         const models = antigravityModelCatalog(rows);
         if (!models || !classifyAntigravityLanes(antigravityPayloadFromEngineRows(rows, principal).payload).complete) continue;
         if (!rows.every((row) => Number.isFinite(Date.parse(row.fetched_at)))) continue;
-        const at = rows.reduce((latest, row) => Date.parse(row.fetched_at) > Date.parse(latest) ? row.fetched_at : latest, rows[0]!.fetched_at);
+        const at = rows.reduce((earliest, row) => Date.parse(row.fetched_at) < Date.parse(earliest) ? row.fetched_at : earliest, rows[0]!.fetched_at);
         const key = `antigravity_model_read:${principal}`;
         const previous = this.daemonState(key);
         if (previous && Date.parse(previous) >= Date.parse(at)) continue;
@@ -1939,10 +1939,17 @@ export class HeadroomStore {
    * marked `retired_at` = now with one `model_retired` event (excluded from every default notify
    * preset -- see notify.ts's `PRESET_EVENTS`).
    */
-  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date(), options: { retireMissing?: boolean } = {}): { seeded: boolean; added: string[]; retired: string[] } {
+  recordModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now = new Date(), options: { retireMissing?: boolean; fetchedAt?: string } = {}): { seeded: boolean; added: string[]; retired: string[] } {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const readKey = `model_catalog_read:${vendor}:${principalId}`;
+      const previous = this.daemonState(readKey);
+      if (options.fetchedAt && previous && Date.parse(previous) >= Date.parse(options.fetchedAt)) {
+        this.db.exec("COMMIT");
+        return { seeded: false, added: [], retired: [] };
+      }
       const result = this.foldModelCatalog(principalId, vendor, models, now, options.retireMissing !== false);
+      if (options.fetchedAt) this.setDaemonState(readKey, options.fetchedAt);
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
@@ -1954,13 +1961,23 @@ export class HeadroomStore {
   /** Shared fold within the caller's write transaction. */
   private foldModelCatalog(principalId: string, vendor: string, models: readonly { id: string; name?: string | null }[], now: Date, retireMissing = true): { seeded: boolean; added: string[]; retired: string[] } {
     const at = now.toISOString();
-    const initializedKey = `model_catalog_initialized:${principalId}`;
+    // Separate the local baseline from legacy/remote initialization on upgrade.
+    // Only locally observed Antigravity ids are eligible for local retirement.
+    const initializedKey = vendor === "antigravity"
+      ? `model_catalog_${retireMissing ? "local" : "remote"}_initialized:${principalId}`
+      : `model_catalog_initialized:${principalId}`;
     const existingRows = this.prepared("SELECT * FROM known_models WHERE principal_id = ?").all(principalId).map(knownModelFromRow);
     const seeded = this.daemonState(initializedKey) === undefined;
     const existingById = new Map(existingRows.map((row) => [row.model_id, row]));
-    const seenIds = new Set(models.map((model) => model.id));
+    const seenIds = new Set<string>();
+    const unique = models.filter((model) => {
+      if (seenIds.has(model.id)) return false;
+      seenIds.add(model.id);
+      return true;
+    });
     const added: string[] = [];
-    for (const model of models) {
+    for (const model of unique) {
+      if (vendor === "antigravity" && retireMissing) this.setDaemonState(`model_local:${principalId}:${model.id}`, at);
       const existing = existingById.get(model.id);
       if (!existing) {
         this.prepared("INSERT INTO known_models (principal_id, vendor, model_id, model_name, first_seen_at, last_seen_at, retired_at) VALUES (?,?,?,?,?,?,NULL)")
@@ -1971,14 +1988,14 @@ export class HeadroomStore {
         }
         continue;
       }
-      this.setDaemonState(`model_missing:${principalId}:${model.id}`, "0");
-      this.prepared("UPDATE known_models SET last_seen_at = ?, retired_at = NULL, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
-        .run(at, model.name ?? null, vendor, principalId, model.id);
+      if (retireMissing) this.setDaemonState(`model_missing:${principalId}:${model.id}`, "0");
+      this.prepared("UPDATE known_models SET last_seen_at = ?, retired_at = CASE WHEN ? THEN NULL ELSE retired_at END, model_name = COALESCE(?, model_name), vendor = ? WHERE principal_id = ? AND model_id = ?")
+        .run(at, Number(retireMissing), model.name ?? null, vendor, principalId, model.id);
     }
     const retired: string[] = [];
     if (!seeded) for (const row of existingRows) {
       if (seenIds.has(row.model_id) || row.retired_at) continue;
-      if (!retireMissing) continue;
+      if (!retireMissing || (vendor === "antigravity" && !this.daemonState(`model_local:${principalId}:${row.model_id}`))) continue;
       const key = `model_missing:${principalId}:${row.model_id}`;
       const misses = Number(this.daemonState(key) ?? 0) + 1;
       this.setDaemonState(key, String(misses));

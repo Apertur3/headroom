@@ -130,9 +130,16 @@ function classifyLocalAntigravity(rows: Observation[], principal: string): Class
 }
 
 function localLaneRows(classified: ClassifiedLocalRead, principal: string, now: string): Observation[] {
-  const catalog = antigravityModelCatalog(classified.rows);
-  return [...antigravityLaneObservations(classified.classification, principal, { now, source: LOCAL_ANTIGRAVITY_SOURCE, adapterVersion: "0.1.0", freshRow: engineFreshRow(classified.read) }), ...classified.read.extra]
-    .map((row) => catalog ? { ...row, metadata: { ...row.metadata, model_catalog: catalog } } : row);
+  const catalog = classified.classification.complete ? antigravityModelCatalog(classified.rows) : undefined;
+  // Synthesized blocked lanes belong to the engine snapshot, not this poll.
+  const readAt = classified.rows.reduce((earliest, row) => Date.parse(row.fetched_at) < Date.parse(earliest) ? row.fetched_at : earliest, classified.rows[0]?.fetched_at ?? now);
+  return [...antigravityLaneObservations(classified.classification, principal, { now: readAt, source: LOCAL_ANTIGRAVITY_SOURCE, adapterVersion: "0.1.0", freshRow: engineFreshRow(classified.read) }), ...classified.read.extra]
+    .map((row) => {
+      if (catalog) return { ...row, metadata: { ...row.metadata, model_catalog: catalog } };
+      if (!row.metadata?.model_catalog) return row;
+      const { model_catalog: _catalog, ...metadata } = row.metadata;
+      return { ...row, metadata };
+    });
 }
 
 function localReadSummary(classified: ClassifiedLocalRead, at: string): AntigravityLocalRead {
