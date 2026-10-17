@@ -350,17 +350,57 @@ describe("install-service loads and starts the service", () => {
       expect(result.state).toBe("unconfirmed");
       expect(events.filter((event) => event.includes("/Run"))).toHaveLength(2);
     });
+  });
 
-    it("does not change macOS: an unchanged plist with an answering daemon is already running, whatever it reports", async () => {
+  describe.each([["darwin", "launchctl kickstart -k gui/501/com.headroom.daemon"], ["linux", "systemctl --user restart headroom.service"]] as const)("%s: restart an older daemon after an upgrade", (platform, restartLine) => {
+    const expected: DaemonIdentity = { version: "0.2.9", socket: "/run/headroom.sock" };
+    /** Unchanged service definition, running, and a daemon that answers: the state after `npm i -g` over a running service. */
+    async function upgraded(running: DaemonIdentity, afterRestart: DaemonIdentity = expected, restartCode = 0) {
       const { home, env } = await fakeHome();
-      const path = servicePath("darwin", home, env);
+      const path = servicePath(platform, home, env);
       await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, serviceContents(script, "darwin", runtime, "tester", home, env));
-      const identify = vi.fn(async () => ({ version: "0.0.1", socket: "/elsewhere" }));
-      const { runner } = recorder();
-      const result = await installAndStartService(script, "darwin", home, runtime, env, "tester", { ...fast, runner, identify, expected: current, probe: async () => true });
+      await writeFile(path, serviceContents(script, platform, runtime, "tester", home, env));
+      let daemon = running;
+      const calls: string[] = [];
+      const runner: ServiceRunner = async (command, args) => {
+        const line = [command, ...args].join(" ");
+        calls.push(line);
+        if (line === restartLine) { if (restartCode === 0) daemon = afterRestart; return { code: restartCode, output: restartCode ? "denied" : "" }; }
+        return { code: 0, output: "" };
+      };
+      const result = await installAndStartService(script, platform, home, runtime, env, "tester", { ...fast, runner, identify: async () => daemon, expected, probe: async () => true });
+      return { result, restarts: calls.filter((line) => line === restartLine) };
+    }
+
+    it("restarts a daemon running another version and reports it once the new version answers", async () => {
+      const { result, restarts } = await upgraded({ ...expected, version: "0.2.8" });
+      expect(result.state).toBe("restarted");
+      expect(restarts).toHaveLength(1);
+      expect(describeServiceStart(result)[0]).toBe("restarted the daemon so it runs this version (the running daemon is version 0.2.8, this is 0.2.9)");
+    });
+
+    it("leaves a daemon with this version alone", async () => {
+      const { result, restarts } = await upgraded(expected);
       expect(result.state).toBe("already-running");
-      expect(identify).not.toHaveBeenCalled();
+      expect(restarts).toEqual([]);
+    });
+
+    it("restarts a daemon too old to report its version", async () => {
+      const { result } = await upgraded({ socket: expected.socket });
+      expect(result.state).toBe("restarted");
+      expect(describeServiceStart(result)[0]).toContain("predates version 0.2.9");
+    });
+
+    it("never reports success when the old version keeps answering after the restart", async () => {
+      const { result } = await upgraded({ ...expected, version: "0.2.8" }, { ...expected, version: "0.2.8" });
+      expect(result.state).toBe("unconfirmed");
+      expect(describeServiceStart(result).join("\n")).toContain("the new version did not answer");
+    });
+
+    it("reports not-loaded when the service manager refuses the restart", async () => {
+      const { result } = await upgraded({ ...expected, version: "0.2.8" }, expected, 1);
+      expect(result.state).toBe("not-loaded");
+      expect(result.reason).toContain("exited 1");
     });
   });
 

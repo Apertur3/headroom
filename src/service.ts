@@ -265,9 +265,9 @@ export interface ServiceStartOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Windows: asks the running daemon to shut down over its pipe (requestDaemonShutdown). */
   requestShutdown?: () => Promise<ShutdownOutcome>;
-  /** Windows: the running daemon's own version and pipe name, from its health reply. */
+  /** The running daemon's own version and pipe name, from its health reply. */
   identify?: () => Promise<DaemonIdentity | undefined>;
-  /** Windows: the version and pipe name this CLI's daemon would have. */
+  /** The version and pipe name this CLI's daemon would have. */
   expected?: DaemonIdentity;
 }
 
@@ -276,8 +276,8 @@ export type ServiceStartState =
   | "already-running"
   /** Loaded, and the daemon answered. */
   | "started"
-  /** Windows: the definition was current but the running daemon was an older one (another version or
-   * pipe name, after an in-place upgrade); it was shut down cleanly and the new one answers. */
+  /** The definition was current but the running daemon was an older one (another version or
+   * pipe name, after an in-place upgrade); it was restarted and the new one answers. */
   | "restarted"
   /** Windows: the running daemon is an older one and could not be stopped cleanly; it keeps serving
    * (clients still find a daemon on the older pipe name). `reason` says why. */
@@ -347,13 +347,25 @@ export async function installAndStartService(script = process.argv[1] ?? "headro
     }
   };
   if (previous === contents && await serviceManagerHasService(platform, uid, runner) && await probe()) {
-    if (platform !== "win32") return { state: "already-running", manual };
     // After an in-place upgrade the definition is unchanged (same node, same script path) but the
-    // daemon still runs the old code, on the old pipe name. Restart it then, and only then.
+    // daemon still runs the old code (on Windows, also the old pipe name). Restart it then, and only then.
     const identify = options.identify ?? defaultDaemonIdentity;
     const expected = options.expected ?? await defaultExpectedIdentity();
     const stale = staleDaemonReason(await identify().catch(() => undefined), expected);
     if (!stale) return { state: "already-running", manual };
+    if (platform !== "win32") {
+      // launchd and systemd restart the job themselves; success is only the new version answering.
+      const restart = platform === "darwin" ? { command: "launchctl", args: ["kickstart", "-k", `gui/${uid}/${SERVICE_LABEL}`] } : { command: "systemctl", args: ["--user", "restart", "headroom.service"] };
+      const { code, output } = await runner(restart.command, restart.args);
+      if (code !== 0) return { state: "not-loaded", reason: `${restart.command} ${restart.args.join(" ")} exited ${code}${output ? `: ${output}` : ""}`, manual };
+      const waitMs = options.waitMs ?? 10_000;
+      const deadline = Date.now() + waitMs;
+      for (let waited = 0; waited <= waitMs && Date.now() <= deadline; waited += interval) {
+        if ((await identify().catch(() => undefined))?.version === expected.version) return { state: "restarted", reason: stale, manual };
+        await sleep(interval);
+      }
+      return { state: "unconfirmed", reason: `restarted the daemon, but the new version did not answer (${stale})`, manual };
+    }
     const restart = await restartWindowsDaemon({
       runner, requestShutdown: options.requestShutdown ?? defaultRequestShutdown, probe, sleep, intervalMs: interval,
       stopWaitMs: options.stopWaitMs ?? DAEMON_STOP_WAIT_MS, waitMs: options.waitMs ?? 10_000,
@@ -405,6 +417,7 @@ export function describeServiceStart(result: ServiceStartResult): string[] {
   ];
   const lines = result.install ? [`wrote ${result.install.path}`] : [];
   if (result.state === "started") lines.push("service loaded; the daemon is answering");
+  else if (result.state === "unconfirmed" && result.reason) lines.push(result.reason, "check `headroom logs --tail`, then `headroom doctor`");
   else if (result.state === "unconfirmed") lines.push("service loaded, but the daemon has not answered yet; check `headroom logs --tail`, then `headroom doctor`");
   else lines.push(`could not load the service: ${result.reason}`, `load it yourself from a normal login session: ${result.manual}`);
   return lines;

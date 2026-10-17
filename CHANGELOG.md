@@ -13,6 +13,9 @@ All notable changes to this project are documented here. The format follows
 - npm search keywords for Claude Code, MCP servers, the Model Context Protocol, Codex CLI and usage limits.
 - Unscheduled reset messages now show how many free resets are still banked and their expiry when known (#157).
 
+### Fixed
+- macOS and Linux: `headroom install-service` after an upgrade now restarts a daemon that still runs an older version, instead of saying "already installed and running" and leaving the old code in place. It also restarts a daemon too old to report its version, and exits non-zero unless the new version answers. Windows already did this.
+
 ## [0.2.9] - 2026-10-17
 
 ### Changed
