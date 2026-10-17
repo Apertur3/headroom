@@ -95,8 +95,8 @@ describe("usage.db schema migration to v3", () => {
     const { home } = await setupHome("codex-collector-fresh-");
     const store = (await UsageStore.open({ home, create: true }))!;
     try {
-      expect(CURRENT_USAGE_SCHEMA_VERSION).toBe(3);
-      expect(store.schemaVersion()).toBe(3);
+      expect(CURRENT_USAGE_SCHEMA_VERSION).toBe(4);
+      expect(store.schemaVersion()).toBe(CURRENT_USAGE_SCHEMA_VERSION);
     } finally {
       store.close();
     }
@@ -179,7 +179,7 @@ describe("usage.db schema migration to v3", () => {
 
     const store = (await UsageStore.open({ home, create: true }))!;
     try {
-      expect(store.schemaVersion()).toBe(3);
+      expect(store.schemaVersion()).toBe(CURRENT_USAGE_SCHEMA_VERSION);
       const totals = store.groupedTotals();
       expect(totals).toHaveLength(1);
       expect(totals[0].vendor).toBe("claude");
@@ -261,7 +261,7 @@ describe("usage.db schema migration to v3", () => {
 
     const store = (await UsageStore.open({ home, create: true }))!;
     try {
-      expect(store.schemaVersion()).toBe(3);
+      expect(store.schemaVersion()).toBe(CURRENT_USAGE_SCHEMA_VERSION);
       // The pre-existing v2 row is untouched by the purely additive v2 -> v3
       // step (no ALTER TABLE on usage_identities this time, only a new table).
       const totals = store.groupedTotals();
