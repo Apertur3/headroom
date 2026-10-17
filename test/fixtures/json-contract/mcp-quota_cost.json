@@ -4,6 +4,8 @@
   "items": [
     {
       "action_class": "string",
+      "basis": "string",
+      "bounded_sample_count": "number",
       "iqr_high": "number",
       "iqr_low": "number",
       "median_percent": "number",

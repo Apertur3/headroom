@@ -1,8 +1,10 @@
+import type { Lease } from "./types.js";
+
 /**
  * Learned cost per action class: pure statistics over a set of per-lease
  * spent-percent totals, plus the confidence and "how many more fit" figures
  * `can` and `fill` print alongside them. src/store.ts collects the samples
- * (lease_spend joined to leases, grouped by the lease's action_class); this
+ * (resolved or bounded window measurements grouped by action_class); this
  * module turns them into a summary with no database access of its own.
  */
 export interface LearnedCost {
@@ -11,6 +13,22 @@ export interface LearnedCost {
   median_percent: number;
   iqr_low: number;
   iqr_high: number;
+  /** Additive; older daemon responses may omit the evidence summary. */
+  basis?: "exact" | "upper_bound";
+  bounded_sample_count?: number;
+}
+
+export function learnedCostText(cost: LearnedCost): string {
+  const bound = cost.basis === "upper_bound";
+  return `median ${bound ? "at most " : ""}${cost.median_percent.toFixed(2)}% (IQR ${cost.iqr_low.toFixed(2)}%-${cost.iqr_high.toFixed(2)}%, n=${cost.sample_count}${bound ? `, conservative; ${cost.bounded_sample_count ?? "unknown"} bounded` : ""})`;
+}
+
+/** Bound labels also protect human output from displaying unknown as zero. */
+export function leaseSpendText(lease: Lease, digits = 1): string {
+  if (!lease.spent_percent_bound) return "unknown";
+  const value = `${lease.spent_percent.toFixed(digits)}%`;
+  if (lease.spent_percent_bound === "exact") return value;
+  return `${lease.spent_percent_bound === "upper" ? "at most" : "at least"} ${value} (${lease.spend_resolution})`;
 }
 
 /** Linear-interpolation percentile (the common "R-7" method), on an already
@@ -26,7 +44,7 @@ export function percentile(sorted: number[], fraction: number): number {
 
 /** Median and interquartile range of a set of per-lease spent-percent totals
  * for one action class. Returns undefined for an empty sample set. */
-export function summarizeLearnedCost(actionClass: string, spentPercents: number[]): LearnedCost | undefined {
+export function summarizeLearnedCost(actionClass: string, spentPercents: number[], boundedSampleCount = 0): LearnedCost | undefined {
   if (!spentPercents.length) return undefined;
   const sorted = [...spentPercents].sort((a, b) => a - b);
   return {
@@ -35,6 +53,8 @@ export function summarizeLearnedCost(actionClass: string, spentPercents: number[
     median_percent: percentile(sorted, 0.5),
     iqr_low: percentile(sorted, 0.25),
     iqr_high: percentile(sorted, 0.75),
+    basis: boundedSampleCount > 0 ? "upper_bound" : "exact",
+    bounded_sample_count: boundedSampleCount,
   };
 }
 
@@ -63,6 +83,9 @@ export interface CostEstimate {
   /** floor(remaining_percent / expected_percent) on the deciding meter's
    * current window. Null when either figure is unknown. */
   max_more_before_reset: number | null;
+  /** Evidence behind the learned statistics, absent when unknown. */
+  basis?: LearnedCost["basis"];
+  bounded_sample_count?: number;
 }
 
 export function maxMoreBeforeReset(remainingPercent: number, expectedCostPercent: number): number | null {
@@ -71,6 +94,7 @@ export function maxMoreBeforeReset(remainingPercent: number, expectedCostPercent
 }
 
 export function buildCostEstimate(actionClass: string, expectOverride: number | null, learned: LearnedCost | undefined, remainingPercent: number | null): CostEstimate {
+  if (learned && learned.sample_count <= 0) learned = undefined;
   const source: CostEstimate["source"] = expectOverride !== null ? "given" : learned ? "learned" : "unknown";
   const expected = expectOverride !== null ? expectOverride : learned ? learned.median_percent : null;
   const confidence = expectOverride !== null ? "high" : costConfidence(learned?.sample_count ?? 0);
@@ -79,6 +103,7 @@ export function buildCostEstimate(actionClass: string, expectOverride: number | 
     action_class: actionClass, expected_percent: expected, source, confidence,
     sample_count: learned?.sample_count ?? 0, median_percent: learned?.median_percent ?? null,
     iqr_low: learned?.iqr_low ?? null, iqr_high: learned?.iqr_high ?? null, max_more_before_reset: maxMore,
+    ...(learned ? { basis: learned.basis ?? "exact", bounded_sample_count: learned.bounded_sample_count ?? 0 } : {}),
   };
 }
 
@@ -97,9 +122,8 @@ export const UNATTRIBUTED_OWNER = "unattributed";
  * meter at the moment the delta was observed.
  *
  * The split is proportional to each owner's declared expectation, with an
- * owner who declared nothing weighted as 1 -- the same weighting
- * store.attributeLeaseSpend() already uses for per-lease spend, so the two
- * views of the same movement never disagree about who was holding what.
+ * owner who declared nothing weighted as 1. These owner shares are estimates;
+ * lease learning separately requires complete, single-lease evidence.
  * When every weight is zero (every active owner declared an expectation of
  * exactly 0) the split falls back to equal shares rather than dividing by
  * zero and dropping the delta.

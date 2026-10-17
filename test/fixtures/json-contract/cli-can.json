@@ -3,6 +3,8 @@
   "contract": "string",
   "cost": {
     "action_class": "string",
+    "basis": "string",
+    "bounded_sample_count": "number",
     "confidence": "string",
     "expected_percent": "number",
     "iqr_high": "number",

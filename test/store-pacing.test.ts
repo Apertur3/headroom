@@ -194,16 +194,15 @@ describe("store.learnedCost", () => {
       // active lease on its own meter across one usage delta, so each
       // lease's attributed spend is exactly that delta with no splitting.
       const spend = (meterId: string, percentDelta: number, actionClass: string, at: Date) => {
-        store.startLease("cadence", meterId, null, 3_600_000, null, at, actionClass);
+        const lease = store.startLease("cadence", meterId, null, 3_600_000, null, at, actionClass);
         store.insert({ principal_id: "codex-main", meter_id: meterId, window: { kind: "fixed", minutes: 100, enforcement: "hard" }, quantity: { used: 0, limit: 100, remaining: 100, unit: "percent" }, resets_at: "2026-09-03T20:00:00Z", observed_at: at.toISOString(), fetched_at: at.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" });
         store.insert({ principal_id: "codex-main", meter_id: meterId, window: { kind: "fixed", minutes: 100, enforcement: "hard" }, quantity: { used: percentDelta, limit: 100, remaining: 100 - percentDelta, unit: "percent" }, resets_at: "2026-09-03T20:00:00Z", observed_at: new Date(at.getTime() + 1000).toISOString(), fetched_at: new Date(at.getTime() + 1000).toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture" });
+        store.endLease(lease.id, "cadence", false, new Date(at.getTime() + 1000));
       };
       spend("codex-main:one", 2, "review", now);
       spend("codex-main:two", 4, "review", new Date(now.getTime() + 2000));
       spend("codex-main:three", 4, "review", new Date(now.getTime() + 4000));
-      // Past every lease's 1h ttl, so learnedCost's own expiry sweep has
-      // ended all three before counting them -- see "keeps an in-progress
-      // lease out of the statistics" below for the still-active case.
+      // All three ended at their final readings, with complete coverage.
       const wellAfterExpiry = new Date(now.getTime() + 2 * 3_600_000);
 
       const learned = store.learnedCost("review", wellAfterExpiry);
@@ -217,14 +216,14 @@ describe("store.learnedCost", () => {
     } finally { store.close(); }
   });
 
-  it("counts an ended lease with no spend as a real zero-cost sample, not a missing one", async () => {
+  it("excludes an ended lease with no readings instead of inventing a zero-cost sample", async () => {
     const store = await open();
     try {
       const now = new Date("2026-09-03T12:00:00Z");
       const lease = store.startLease("cadence", "codex-main:main", null, 60_000, null, now, "idle-check");
       store.endLease(lease.id, "cadence", false, new Date(now.getTime() + 1000));
       const learned = store.learnedCost("idle-check", new Date(now.getTime() + 2000));
-      expect(learned).toEqual([expect.objectContaining({ action_class: "idle-check", sample_count: 1, median_percent: 0 })]);
+      expect(learned).toEqual([]);
     } finally { store.close(); }
   });
 
@@ -236,15 +235,14 @@ describe("store.learnedCost", () => {
       // this must not look like a completed, genuinely free job.
       store.startLease("cadence", "codex-main:main", null, 60_000, null, now, "idle-check");
       expect(store.learnedCost("idle-check", new Date(now.getTime() + 1000))).toEqual([]);
-      // Past the ttl, the same lease has expired (with no observed spend)
-      // and now counts as one real zero-cost sample.
-      expect(store.learnedCost("idle-check", new Date(now.getTime() + 61_000))).toEqual([expect.objectContaining({ action_class: "idle-check", sample_count: 1, median_percent: 0 })]);
+      // Expiry provides no measurement evidence either.
+      expect(store.learnedCost("idle-check", new Date(now.getTime() + 61_000))).toEqual([]);
     } finally { store.close(); }
   });
 });
 
 describe("store.learnedCostForMeter", () => {
-  it("aggregates every ended lease on a meter regardless of action_class, but not an in-progress one", async () => {
+  it("excludes expired leases without evidence regardless of action_class", async () => {
     const store = await open();
     try {
       const now = new Date("2026-09-03T12:00:00Z");
@@ -253,7 +251,7 @@ describe("store.learnedCostForMeter", () => {
       const stillActive = new Date(now.getTime() + 2000);
       expect(store.learnedCostForMeter("claude-main:all", stillActive)?.sample_count).toBeUndefined();
       const pastExpiry = new Date(now.getTime() + 61_000);
-      expect(store.learnedCostForMeter("claude-main:all", pastExpiry)?.sample_count).toBe(2);
+      expect(store.learnedCostForMeter("claude-main:all", pastExpiry)).toBeUndefined();
       expect(store.learnedCostForMeter("no-such-meter", pastExpiry)).toBeUndefined();
     } finally { store.close(); }
   });

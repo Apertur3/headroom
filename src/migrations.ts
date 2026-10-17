@@ -273,12 +273,34 @@ const ADD_TIMER_DELIVERY_ID: Migration = {
   },
 };
 
+/** Old scalar rows cannot be separated into windows safely. Keep them intact;
+ * existing leases default to legacy and never become learning samples. */
+const ADD_LEASE_WINDOW_SPEND: Migration = {
+  version: 8,
+  description: "per-window lease movement evidence; legacy leases remain unresolved",
+  up(db) {
+    addColumnIfMissing(db, "ALTER TABLE leases ADD COLUMN spend_version INTEGER NOT NULL DEFAULT 0");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS lease_window_spend (
+        lease_id TEXT NOT NULL, meter_id TEXT NOT NULL, window_minutes INTEGER NOT NULL,
+        observation_id INTEGER NOT NULL, from_at TEXT NOT NULL, to_at TEXT NOT NULL,
+        delta_percent REAL, overlapping_leases INTEGER NOT NULL,
+        PRIMARY KEY (lease_id, observation_id)
+      );
+      CREATE INDEX IF NOT EXISTS lease_window_spend_meter ON lease_window_spend(meter_id);
+    `);
+  },
+};
+
 /** Every migration, in ascending version order. Append here; never insert or
  * edit in place. */
-export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS, ADD_TIMER_CLAIM_RECOVERY, ADD_TIMER_DELIVERY_ID];
+export const MIGRATIONS: Migration[] = [BASELINE, ADD_EVENT_METADATA, ADD_KNOWN_MODELS, ADD_HEARTBEATS_AND_TIMERS, ADD_TIMER_DELIVERY_ATTEMPTS, ADD_TIMER_CLAIM_RECOVERY, ADD_TIMER_DELIVERY_ID, ADD_LEASE_WINDOW_SPEND];
 
 /** The highest schema version this binary knows how to open and migrate to. */
 export const CURRENT_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
+
+/** Older read-only stores have no per-window lease evidence table. */
+export const LEASE_WINDOW_SPEND_SCHEMA_VERSION = ADD_LEASE_WINDOW_SPEND.version;
 
 /** The schema version at or above which the `heartbeats`/`timers` tables
  * exist (ADD_HEARTBEATS_AND_TIMERS, above). `HeadroomStore.open()` always
