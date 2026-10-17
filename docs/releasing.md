@@ -57,6 +57,7 @@ keychain; the next build creates one fresh. Check a build with
    Fixed, Removed, Security, and a Breaking list when one exists.
 2. `package.json` and `package-lock.json` carry the same version; the release workflow refuses a
    tag that does not match.
+   `CITATION.cff` (in the same commit) carries the same `version` and the release `date-released`.
 3. The tag is `v<version>` on `master`, annotated, created by the maintainer and pushed after
    `npm run release:check` is green.
 4. The release workflow verifies on ubuntu and macos (the CI workflow already covers windows on
