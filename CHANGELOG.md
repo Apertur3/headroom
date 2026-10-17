@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-17
+
+### Changed
+- Lease spend is now recorded per meter window instead of one number summed across the 5-hour, weekly and rolling windows. A lease's headline figure comes from the shortest percent window, and each lease says how sure that figure is: `resolved`, `bounded`, `unresolved`, `unattributable` or `legacy`. A lease that ran alone between two fresh readings gets an upper bound (`spent_percent_bound`), which learned costs may use and label as an upper bound. Leases that shared an interval stay unattributable. Existing leases are marked `legacy` and no longer train learned costs, so learned costs may show unknown until new leases come in. New JSON fields: `spend_resolution`, `spent_percent_bound`, `spend_window_minutes`, `spend_windows`, and on learned costs `basis` and `bounded_sample_count`; nothing was removed.
+
 ### Fixed
 - macOS: `headroom install-service` after an upgrade no longer fails with "Bootstrap failed: 5: Input/output error" and leaves the daemon stopped. It now unloads the old service and waits until launchd has let go of it before loading the new one, retries once if launchd still refuses, and exits non-zero (naming the manual `launchctl bootstrap` command) if the daemon is not answering afterwards.
 - `headroom line` now shows every meter of an account that has a fresh reading, for example both `antigravity:gemini` and `antigravity:claude-gpt` when both are current, instead of marking the whole account UNKNOWN because one meter is stale or held. An account reads UNKNOWN only when none of its meters is fresh, and UNKNOWN accounts now come after the ones with a reading.
