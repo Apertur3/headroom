@@ -31,7 +31,7 @@ describe("Codex model catalog reader (local cache file, no network)", () => {
       ],
     }));
     const models = await readCodexModelCatalog(home, undefined, at);
-    expect(models).toEqual([{ id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" }]);
+    expect(models).toEqual({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" }], fetchedAt: "2026-09-23T17:20:36.000Z" });
   });
 
   it("returns undefined, never an empty array, when the cache file does not exist yet", async () => {
@@ -68,7 +68,7 @@ describe("Claude model catalog reader (local cache directory, no network)", () =
       fetchedAt: at.getTime() - 1000, catalog: { config: { models: [{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }] } },
     }));
     const models = await readClaudeModelCatalog(configDir, undefined, undefined, at);
-    expect(models).toEqual([{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }]);
+    expect(models).toEqual({ models: [{ id: "claude-opus-5-5", name: "Opus 5.5" }, { id: "claude-sonnet-5", name: "Sonnet 5" }], fetchedAt: new Date(at.getTime() - 1000).toISOString() });
   });
 
   it("skips one malformed cache file rather than failing the whole read", async () => {
@@ -78,7 +78,7 @@ describe("Claude model catalog reader (local cache directory, no network)", () =
     await mkdir(catalogDir, { recursive: true });
     await writeFile(join(catalogDir, "broken.json"), "{not json");
     await writeFile(join(catalogDir, "good.json"), JSON.stringify({ fetchedAt: at.getTime(), catalog: { config: { models: [{ id: "claude-haiku-4-5", name: "Haiku 4.5" }] } } }));
-    expect(await readClaudeModelCatalog(configDir, undefined, undefined, at)).toEqual([{ id: "claude-haiku-4-5", name: "Haiku 4.5" }]);
+    expect(await readClaudeModelCatalog(configDir, undefined, undefined, at)).toEqual({ models: [{ id: "claude-haiku-4-5", name: "Haiku 4.5" }], fetchedAt: at.toISOString() });
   });
 
   it("returns undefined when the config dir has no model-catalog cache yet", async () => {
@@ -170,7 +170,7 @@ describe("checkModelAvailability orchestration", () => {
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
       const at = new Date("2026-09-23T18:00:00Z");
-      const readCodex = vi.fn().mockResolvedValue([{ id: "gpt-6-astra", name: "GPT-6-Astra" }]);
+      const readCodex = vi.fn().mockResolvedValue({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }], fetchedAt: "2026-09-23T18:00:00Z" });
       const accounts = [account("codex-main", "codex")];
       await checkModelAvailability(store, accounts, { now: () => at, readCodexModelCatalog: readCodex });
       expect(readCodex).toHaveBeenCalledTimes(1);
@@ -185,7 +185,7 @@ describe("checkModelAvailability orchestration", () => {
 
       // Past the hour, and with a genuinely new model, it checks again and emits one event.
       const later = new Date(at.getTime() + MODEL_CHECK_INTERVAL_MS + 1000);
-      readCodex.mockResolvedValue([{ id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" }]);
+      readCodex.mockResolvedValue({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }, { id: "gpt-6-sol", name: "GPT-6-Sol" }], fetchedAt: later.toISOString() });
       await checkModelAvailability(store, accounts, { now: () => later, readCodexModelCatalog: readCodex });
       expect(readCodex).toHaveBeenCalledTimes(2);
       expect(store.events("2026-01-01T00:00:00Z").filter((event) => event.kind === "model_available")).toHaveLength(1);
@@ -209,8 +209,8 @@ describe("checkModelAvailability orchestration", () => {
     const home = await tempDir("headroom-model-check-disabled-");
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
-      const readCodex = vi.fn().mockResolvedValue([{ id: "gpt-6-astra", name: "GPT-6-Astra" }]);
-      const readClaude = vi.fn().mockResolvedValue([{ id: "claude-sonnet-5", name: "Sonnet 5" }]);
+      const readCodex = vi.fn().mockResolvedValue({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }], fetchedAt: "2026-09-23T18:00:00Z" });
+      const readClaude = vi.fn().mockResolvedValue({ models: [{ id: "claude-sonnet-5", name: "Sonnet 5" }], fetchedAt: "2026-09-23T18:00:00Z" });
       const fetchAntigravity = vi.fn().mockResolvedValue([]);
       await checkModelAvailability(store, [
         account("codex-parked", "codex", false), account("claude-parked", "claude", false), account("antigravity-parked", "antigravity", false),
@@ -252,15 +252,67 @@ describe("checkModelAvailability orchestration", () => {
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
       const at = new Date("2026-09-23T18:00:00Z");
-      let release: ((models: { id: string; name: string }[]) => void) | undefined;
-      const readCodex = vi.fn(() => new Promise<{ id: string; name: string }[]>((resolve) => { release = resolve; }));
+      let release: ((catalog: { models: { id: string; name: string }[]; fetchedAt: string }) => void) | undefined;
+      const readCodex = vi.fn(() => new Promise<{ models: { id: string; name: string }[]; fetchedAt: string }>((resolve) => { release = resolve; }));
       const accounts = [account("codex-main", "codex")];
       const first = checkModelAvailability(store, accounts, { now: () => at, readCodexModelCatalog: readCodex });
       await Promise.resolve();
       await checkModelAvailability(store, accounts, { now: () => at, readCodexModelCatalog: readCodex });
       expect(readCodex).toHaveBeenCalledTimes(1);
-      release?.([{ id: "gpt-6-astra", name: "GPT-6-Astra" }]);
+      release?.({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }], fetchedAt: at.toISOString() });
       await first;
+    } finally { store.close(); }
+  });
+});
+
+// Synthetic partial cache payloads must never become authoritative catalogs.
+describe("partial local model catalogs (synthetic)", () => {
+  const now = new Date("2026-10-01T12:00:00Z");
+  it("rejects a Codex model array containing an incomplete entry", async () => {
+    const read = async () => JSON.stringify({ fetched_at: now.toISOString(), models: [{ slug: "synthetic-codex", display_name: "Synthetic Codex" }, {}] });
+    expect(await readCodexModelCatalog("/synthetic", read, now)).toBeUndefined();
+  });
+  it("rejects a Claude model array containing an incomplete entry", async () => {
+    const read = async () => JSON.stringify({ fetchedAt: now.getTime(), catalog: { config: { models: [{ id: "synthetic-claude", name: "Synthetic Claude" }, {}] } } });
+    expect(await readClaudeModelCatalog("/synthetic", async () => ["synthetic.json"], read, now)).toBeUndefined();
+  });
+});
+
+describe("F3 cache snapshot evidence (synthetic)", () => {
+  const start = new Date("2026-10-01T12:00:00Z");
+  it.each(["codex", "claude"] as const)("F3 %s empty catalogs are unavailable", async (vendor) => {
+    const read = async () => JSON.stringify(vendor === "codex" ? { fetched_at: start.toISOString(), models: [] } : { fetchedAt: start.getTime(), catalog: { config: { models: [] } } });
+    expect(await (vendor === "codex" ? readCodexModelCatalog("/synthetic", read, start) : readClaudeModelCatalog("/synthetic", async () => ["catalog.json"], read, start))).toBeUndefined();
+  });
+  it("F3 hidden-only Codex catalogs are unavailable", async () => {
+    expect(await readCodexModelCatalog("/synthetic", async () => JSON.stringify({ fetched_at: start.toISOString(), models: [{ slug: "synthetic-hidden", visibility: "hide" }] }), start)).toBeUndefined();
+  });
+  it.each(["codex", "claude"] as const)("F3 %s counts distinct cache timestamps per principal across restart", async (vendor) => {
+    const home = await tempDir("headroom-cache-replay-");
+    const cache = vendor === "codex" ? home : join(home, "cache", "model-catalog");
+    await mkdir(cache, { recursive: true });
+    const file = join(cache, vendor === "codex" ? "models_cache.json" : "catalog.json");
+    let fetched = start;
+    const write = (ids: string[]) => writeFile(file, JSON.stringify(vendor === "codex" ? { fetched_at: fetched.toISOString(), models: ids.map((slug) => ({ slug })) } : { fetchedAt: fetched.getTime(), catalog: { config: { models: ids.map((id) => ({ id })) } } }));
+    let store = await HeadroomStore.open(join(home, "store"));
+    const accounts: ProviderAccount[] = ["synthetic-a", "synthetic-b"].map((name) => ({ name, vendor, location: home, adapter: "native-ts" }));
+    try {
+      await write(["synthetic-base", "synthetic-old"]);
+      await checkModelAvailability(store, accounts, { now: () => start });
+      fetched = new Date(start.getTime() + MODEL_CHECK_INTERVAL_MS);
+      await write(["synthetic-base"]);
+      for (let hour = 1; hour <= 4; hour++) {
+        await checkModelAvailability(store, accounts, { now: () => new Date(start.getTime() + hour * MODEL_CHECK_INTERVAL_MS) });
+        if (hour === 2) { store.close(); store = await HeadroomStore.open(join(home, "store")); }
+      }
+      expect(accounts.map((account) => store.daemonState(`model_missing:${account.name}:synthetic-old`))).toEqual(["1", "1"]);
+      expect(store.knownModels().every((row) => row.retired_at === null)).toBe(true);
+      for (let hour = 5; hour <= 6; hour++) {
+        fetched = new Date(start.getTime() + hour * MODEL_CHECK_INTERVAL_MS);
+        await write(["synthetic-base"]);
+        await checkModelAvailability(store, accounts, { now: () => fetched });
+      }
+      expect(store.knownModels().filter((row) => row.retired_at !== null)).toHaveLength(2);
     } finally { store.close(); }
   });
 });
