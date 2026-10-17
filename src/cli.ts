@@ -34,7 +34,7 @@ import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry 
 import { checkHostHealth, hostGuardRefusal, hostGuardWarning, readHostGuardPolicy, type HostHealth } from "./host-health.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
 import { normalizeUnmarkedDaemonStatus } from "./status-normalization.js";
-import { buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
+import { leaseSpendText, learnedCostText, buildCostEstimate, type CostEstimate, type LearnedCost } from "./cost.js";
 import { budgetPlanLeases, parseBudgetPlan } from "./budget-plan.js";
 import { isInboxKind, readInbox, sendInboxMessage, INBOX_KINDS, MAX_INBOX_MESSAGE_BYTES, type InboxKind, type InboxMessage } from "./inbox.js";
 import { parseTimerAt } from "./heartbeat.js";
@@ -456,7 +456,7 @@ async function disabledMeterInList(meters: string[]): Promise<{ meter: string; r
 }
 
 function printLeases(items: Lease[]): void {
-  for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${item.spent_percent.toFixed(2)}%  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
+  for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${leaseSpendText(item, 2)}  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
 }
 
 export function endedLeaseMessage(lease: Lease): string { return lease.already_ended ? `already ended ${lease.id} (owner ${lease.owner})` : `ended ${lease.id} (owner ${lease.owner})`; }
@@ -656,7 +656,7 @@ async function cost(argv: string[]): Promise<number> {
   }
   if (asJson) { console.log(JSON.stringify(items)); return 0; }
   if (!items.length) { console.log(actionClass ? `no learned cost for ${actionClass} yet` : "no learned cost yet"); return 0; }
-  for (const item of items) console.log(`${item.action_class}  median ${item.median_percent.toFixed(2)}% (IQR ${item.iqr_low.toFixed(2)}%-${item.iqr_high.toFixed(2)}%, n=${item.sample_count})`);
+  for (const item of items) console.log(`${item.action_class}  ${learnedCostText(item)}`);
   return 0;
 }
 
@@ -1070,7 +1070,13 @@ async function run(argv: string[]): Promise<number> {
       target = meters;
       const learned = store.learnedCost(actionClass)[0];
       if (!needs.length && learned) needs.push({ window: "5h", points: learned.median_percent });
-      if (!needs.length) throw new Error(`No learned cost for ${actionClass}; provide --need`);
+      if (!needs.length) {
+        const reason = `No learned cost for ${actionClass}; provide --need`;
+        const decision: CanDecision = { allowed: false, meter: meters[0], state: "UNKNOWN", reason, meters: meters.map((meter) => ({ meter, state: "UNKNOWN", reason })) };
+        if (flags.includes("--json")) console.log(JSON.stringify(withContract({ host, gate: decision, lease_id: null })));
+        else console.error(reason);
+        return 2;
+      }
     }
     if (!needs.length) throw new Error("--need is required unless --class has a learned cost");
     const disabled = await disabledMeterInList(Array.isArray(target) ? target : [target]);
@@ -1832,7 +1838,8 @@ function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | 
   if (cost.expected_percent !== null) {
     const iqr = cost.iqr_low !== null && cost.iqr_high !== null ? ` (IQR ${cost.iqr_low.toFixed(1)}-${cost.iqr_high.toFixed(1)}%, n=${cost.sample_count})` : "";
     const maxMore = cost.max_more_before_reset === null ? "" : `; max ${cost.max_more_before_reset} more before reset at the current sustainable pace`;
-    console.log(`cost: ${cost.source} ${cost.expected_percent.toFixed(1)}%${iqr}, confidence ${cost.confidence}${maxMore}`);
+    const bound = cost.source === "learned" && cost.basis === "upper_bound" ? "at most " : "";
+    console.log(`cost: ${cost.source} ${bound}${cost.expected_percent.toFixed(1)}%${bound ? " (conservative)" : ""}${iqr}, confidence ${cost.confidence}${maxMore}`);
   }
   if (leasedId) console.log(`leased ${leasedId}`);
 }

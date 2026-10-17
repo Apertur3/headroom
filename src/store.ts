@@ -5,14 +5,14 @@ import { randomInt, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
 import { decodeResetSeen, encodeResetSeen } from "./resets.js";
-import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
+import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, LeaseSpendWindow, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";
 import { defaultPolicy, isAcceptedLaneReading, paceDecision } from "./policy.js";
 import type { BurnInfo } from "./pace.js";
 import { leastSquaresBurnPerHour, emptyInSeconds } from "./pace.js";
 import { attributeSpend, summarizeLearnedCost, type LearnedCost } from "./cost.js";
-import { CURRENT_SCHEMA_VERSION, HEARTBEATS_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion, TIMER_DELIVERY_SCHEMA_VERSION } from "./migrations.js";
+import { CURRENT_SCHEMA_VERSION, HEARTBEATS_SCHEMA_VERSION, LEASE_WINDOW_SPEND_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion, TIMER_DELIVERY_SCHEMA_VERSION } from "./migrations.js";
 import { isReservedSessionId, redact, serializeInboxEnvelope, SAFE_READ_MAX_BYTES, SESSION_ID_PATTERN, TIMER_DELIVERY_FROM, TIMER_DELIVERY_KIND } from "./security.js";
 import { creditSource, creditsLapsed, isCreditsObservation, usableCredits, type BankedCreditSource } from "./credits.js";
 
@@ -711,7 +711,7 @@ export class HeadroomStore {
     // Independent of the window-scoped previous()/detectEvents() path above:
     // a windowless failure is only ever closed by this separate check.
     if (stored.freshness === "fresh") this.recoverWindowlessFailure(stored);
-    if (!held && previous) this.attributeLeaseSpend(previous, stored);
+    if (!held && stored.freshness === "fresh") this.attributeLeaseSpend(stored);
     if (!held && stored.freshness === "fresh") this.recordSpendLedger(stored);
     if (!held && stored.freshness === "fresh") this.detectPaceProjection(stored);
     return stored;
@@ -1523,44 +1523,27 @@ export class HeadroomStore {
     });
   }
 
-  /**
-   * Median, interquartile range and sample count of the per-lease total
-   * spent percent, grouped by the lease's action_class (set by `lease start
-   * --class` or `can --lease`). Only a lease that has actually ENDED --
-   * finished normally or expired -- counts as a sample: an in-progress
-   * lease has no observed spend yet, so counting it would let a batch of
-   * just-started jobs drag the median toward zero and inflate the sample
-   * count before any of them are actually done. A completed lease with
-   * genuinely zero spend still counts as one real (zero-cost) sample --
-   * only an unfinished lease is excluded, not a finished free one.
-   * Restricted to one class when given, otherwise every class that has at
-   * least one sample.
-   */
+  /** Complete, single-lease measurements train costs, using the whole interval's
+   * upper bound when movement straddles a lease boundary. Each meter uses
+   * its shortest recorded hard percent window, including zero movement when
+   * fresh readings cover the whole lease. Legacy scalar totals never train. */
   learnedCost(actionClass?: string, now = new Date()): LearnedCost[] {
-    this.expireLeases(now);
-    const filter = actionClass ? "WHERE l.action_class = ? AND l.ended_at IS NOT NULL" : "WHERE l.action_class IS NOT NULL AND l.ended_at IS NOT NULL";
-    const rows = this.prepared(`SELECT l.action_class AS action_class, COALESCE(SUM(s.amount_percent), 0) AS spent
-      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter} GROUP BY l.id`).all(...(actionClass ? [actionClass] : []));
-    const byClass = new Map<string, number[]>();
-    for (const row of rows) {
-      const key = String(row.action_class);
-      const list = byClass.get(key) ?? [];
-      list.push(Number(row.spent));
-      byClass.set(key, list);
+    const byClass = new Map<string, { spent: number[]; bounded: number }>();
+    for (const lease of this.leases(undefined, false, now)) {
+      if (!lease.ended_at || (lease.spend_resolution !== "resolved" && lease.spend_resolution !== "bounded") || !lease.action_class || (actionClass && lease.action_class !== actionClass)) continue;
+      const samples = byClass.get(lease.action_class) ?? { spent: [], bounded: 0 };
+      samples.spent.push(lease.spent_percent);
+      if (lease.spend_resolution === "bounded") samples.bounded += 1;
+      byClass.set(lease.action_class, samples);
     }
-    return [...byClass.entries()].map(([key, spent]) => summarizeLearnedCost(key, spent)).filter((item): item is LearnedCost => item !== undefined).sort((a, b) => a.action_class.localeCompare(b.action_class));
+    return [...byClass.entries()].map(([key, samples]) => summarizeLearnedCost(key, samples.spent, samples.bounded)).filter((item): item is LearnedCost => item !== undefined).sort((a, b) => a.action_class.localeCompare(b.action_class));
   }
 
-  /** The same median/IQR/count learned-cost summary, but grouped by meter
-   * instead of action_class: `fill`'s fallback lane cost when --lane-cost is
-   * omitted, from whatever leases (of any class) have run against that
-   * meter before. Only ended/expired leases count, for the same reason
-   * learnedCost excludes an in-progress one. */
+  /** Same evidence and window selection as learnedCost, across all classes. */
   learnedCostForMeter(meterId: string, now = new Date()): LearnedCost | undefined {
-    this.expireLeases(now);
-    const rows = this.prepared(`SELECT l.id AS id, COALESCE(SUM(s.amount_percent), 0) AS spent
-      FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.meter_id = ? AND l.ended_at IS NOT NULL GROUP BY l.id`).all(meterId);
-    return summarizeLearnedCost(meterId, rows.map((row) => Number(row.spent)));
+    const samples = this.leases(meterId, false, now)
+      .filter((lease) => lease.ended_at && (lease.spend_resolution === "resolved" || lease.spend_resolution === "bounded"));
+    return summarizeLearnedCost(meterId, samples.map((lease) => lease.spent_percent), samples.filter((lease) => lease.spend_resolution === "bounded").length);
   }
 
   private detectEvents(previous: StoredObservation, current: StoredObservation, scheduledRolloverAt?: string): void {
@@ -2226,7 +2209,7 @@ export class HeadroomStore {
 
   private expireLeases(now = new Date()): void {
     const at = now.toISOString();
-    const expired = this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.ended_at IS NULL AND l.expires_at <= ? GROUP BY l.id").all(at).map(leaseFromRow);
+    const expired = this.prepared("SELECT l.* FROM leases l WHERE l.ended_at IS NULL AND l.expires_at <= ?").all(at).map(leaseFromRow);
     for (const lease of expired) {
       this.prepared("UPDATE leases SET ended_at = ?, ended_reason = 'expired' WHERE id = ? AND ended_at IS NULL").run(at, lease.id);
       this.addLeaseEvent("lease_ended", { ...lease, ended_at: at, ended_reason: "expired" });
@@ -2248,9 +2231,9 @@ export class HeadroomStore {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error("ttl must be positive");
     this.expireLeases(now);
     const lease: Lease = { id: randomUUID(), owner: owner.trim(), meter_id: meterId.trim(), expected_percent: expectedPercent, note, action_class: actionClass && actionClass.trim() ? actionClass.trim() : null, started_at: now.toISOString(), expires_at: new Date(now.getTime() + ttlMs).toISOString(), ended_at: null, ended_reason: null, spent_percent: 0 };
-    this.prepared("INSERT INTO leases (id,owner,meter_id,expected_percent,note,action_class,started_at,expires_at,ended_at,ended_reason) VALUES (?,?,?,?,?,?,?,?,?,?)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.action_class, lease.started_at, lease.expires_at, null, null);
+    this.prepared("INSERT INTO leases (id,owner,meter_id,expected_percent,note,action_class,started_at,expires_at,ended_at,ended_reason,spend_version) VALUES (?,?,?,?,?,?,?,?,?,?,1)").run(lease.id, lease.owner, lease.meter_id, lease.expected_percent, lease.note, lease.action_class, lease.started_at, lease.expires_at, null, null);
     this.addLeaseEvent("lease_started", lease);
-    return lease;
+    return this.withLeaseSpend(lease, 1);
   }
 
   /**
@@ -2301,9 +2284,9 @@ export class HeadroomStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.expireLeases(now);
-      const row = this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.id = ? GROUP BY l.id").get(id);
+      const row = this.prepared("SELECT l.* FROM leases l WHERE l.id = ?").get(id);
       if (!row) throw new Error("lease not found");
-      const lease = leaseFromRow(row);
+      const lease = this.withLeaseSpend(leaseFromRow(row), Number(row.spend_version ?? 0));
       if (lease.ended_at) {
         this.db.exec("COMMIT");
         return { ...lease, already_ended: true };
@@ -2312,7 +2295,7 @@ export class HeadroomStore {
       const rawNote = string(row.note);
       const group = atomicLeaseGroup(rawNote);
       const members = group
-        ? this.prepared("SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id WHERE l.note = ? AND l.owner = ? AND l.ended_at IS NULL GROUP BY l.id").all(rawNote, lease.owner).map(leaseFromRow)
+        ? this.prepared("SELECT l.* FROM leases l WHERE l.note = ? AND l.owner = ? AND l.ended_at IS NULL").all(rawNote, lease.owner).map(leaseFromRow)
         : [lease];
       const at = now.toISOString();
       let returned: Lease | undefined;
@@ -2320,7 +2303,7 @@ export class HeadroomStore {
         const ended = { ...member, ended_at: at, ended_reason: "ended" };
         this.prepared("UPDATE leases SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL").run(ended.ended_at, ended.ended_reason, member.id);
         this.addLeaseEvent("lease_ended", ended);
-        if (member.id === id) returned = ended;
+        if (member.id === id) returned = this.withLeaseSpend(ended, Number(row.spend_version ?? 0));
       }
       this.db.exec("COMMIT");
       return returned ?? { ...lease, ended_at: at, ended_reason: "ended" };
@@ -2352,7 +2335,54 @@ export class HeadroomStore {
   private selectLeases(meterId: string | undefined, activeOnly: boolean, now: Date): Lease[] {
     const filter = [meterId ? "l.meter_id = ?" : "", activeOnly ? "l.ended_at IS NULL AND l.expires_at > ?" : ""].filter(Boolean).join(" AND ");
     const params = [...(meterId ? [meterId] : []), ...(activeOnly ? [now.toISOString()] : [])];
-    return this.prepared(`SELECT l.*, COALESCE(SUM(s.amount_percent), 0) AS spent_percent FROM leases l LEFT JOIN lease_spend s ON s.lease_id = l.id ${filter ? `WHERE ${filter}` : ""} GROUP BY l.id ORDER BY l.started_at DESC`).all(...params).map(leaseFromRow);
+    const windowsByMeter = new Map<string, Row[]>();
+    return this.prepared(`SELECT l.* FROM leases l ${filter ? `WHERE ${filter}` : ""} ORDER BY l.started_at DESC`).all(...params)
+      .map((row) => this.withLeaseSpend(leaseFromRow(row), Number(row.spend_version ?? 0), windowsByMeter));
+  }
+
+  /** Use one consistent hard window per meter, never a sum of window units.
+   * Read-only connections to older schemas expose legacy uncertainty too. */
+  private withLeaseSpend(lease: Lease, version: number, windowsByMeter = new Map<string, Row[]>()): Lease {
+    const windows = windowsByMeter.get(lease.meter_id) ?? this.prepared(`SELECT json_extract(window_json, '$.minutes') AS minutes, MIN(json_extract(window_json, '$.kind')) AS kind FROM observations
+      WHERE meter_id = ? AND json_extract(window_json, '$.enforcement') = 'hard'
+      AND json_extract(window_json, '$.kind') IN ('fixed', 'rolling')
+      AND json_extract(quantity_json, '$.unit') = 'percent'
+      AND json_extract(window_json, '$.minutes') > 0 GROUP BY minutes ORDER BY minutes`).all(lease.meter_id);
+    windowsByMeter.set(lease.meter_id, windows);
+    const hasSchema = this.schemaVersion() >= LEASE_WINDOW_SPEND_SCHEMA_VERSION;
+    const evidence = hasSchema ? this.prepared("SELECT s.*, json_extract(o.window_json, '$.kind') AS window_kind FROM lease_window_spend s JOIN observations o ON o.id = s.observation_id WHERE lease_id = ? ORDER BY julianday(from_at), observation_id").all(lease.id) : [];
+    const start = Date.parse(lease.started_at);
+    const end = Math.min(Date.parse(lease.expires_at), lease.ended_at ? Date.parse(lease.ended_at) : Infinity);
+    const spendWindows: LeaseSpendWindow[] = windows.map((window) => {
+      const minutes = Number(window.minutes);
+      const rows = evidence.filter((row) => Number(row.window_minutes) === minutes && row.window_kind === window.kind && (row.delta_percent === null ? Date.parse(String(row.to_at)) >= start && Date.parse(String(row.from_at)) <= end : Date.parse(String(row.to_at)) > start && Date.parse(String(row.from_at)) < end));
+      let coveredTo = start;
+      let complete = lease.ended_at !== null;
+      let lower = 0;
+      let upper = 0;
+      let overlaps = 1;
+      for (const row of rows) {
+        const from = Date.parse(String(row.from_at)), to = Date.parse(String(row.to_at));
+        const overlappingEvidence = from < coveredTo && coveredTo > start;
+        if (from > coveredTo || overlappingEvidence || row.delta_percent === null) complete = false;
+        coveredTo = Math.max(coveredTo, to);
+        overlaps = Math.max(overlaps, Number(row.overlapping_leases));
+        const delta = Number(row.delta_percent ?? 0);
+        upper += delta;
+        if (!overlappingEvidence && from >= start && to <= end && Number(row.overlapping_leases) === 1) lower += delta;
+      }
+      complete &&= coveredTo >= end && rows.length > 0;
+      const resolution: LeaseSpendWindow["resolution"] = version === 0 ? "legacy"
+        : overlaps > 1 ? "unattributable" : !complete ? "unresolved" : lower === upper ? "resolved" : "bounded";
+      return { meter_id: lease.meter_id, window_minutes: minutes, resolution,
+        lower_percent: version === 0 ? 0 : lower, upper_percent: complete && version !== 0 ? upper : null, overlapping_leases: version === 0 || !rows.length ? null : overlaps };
+    });
+    const chosen = spendWindows[0];
+    const exact = chosen?.resolution === "resolved";
+    return { ...lease, spent_percent: chosen?.upper_percent ?? chosen?.lower_percent ?? 0,
+      spend_resolution: chosen?.resolution ?? (version === 0 ? "legacy" : "unresolved"),
+      spent_percent_bound: exact ? "exact" : chosen?.upper_percent !== null && chosen?.upper_percent !== undefined ? "upper" : "lower",
+      spend_window_minutes: chosen?.window_minutes ?? null, spend_windows: spendWindows };
   }
 
   /* -----------------------------------------------------------------------
@@ -2721,16 +2751,29 @@ export class HeadroomStore {
     return earliest === undefined ? undefined : new Date(earliest);
   }
 
-  private attributeLeaseSpend(previous: StoredObservation, current: StoredObservation): void {
-    if (previous.freshness !== "fresh" || current.freshness !== "fresh" || previous.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
+  private attributeLeaseSpend(current: StoredObservation): void {
+    const window = current.window;
+    if (!window?.minutes || window.enforcement !== "hard" || !["fixed", "rolling"].includes(window.kind) || current.quantity?.unit !== "percent") return;
+    const previous = this.freshBaseline(current);
+    if (!previous || previous.quantity?.unit !== "percent") return;
+    const from = Date.parse(previous.observed_at), to = Date.parse(current.observed_at);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) return;
     const delta = current.quantity.used - previous.quantity.used;
-    if (!Number.isFinite(delta) || delta <= 0) return;
-    const leases = this.leases(current.meter_id, true, new Date(current.fetched_at)).filter((lease) => lease.started_at <= current.fetched_at && lease.expires_at > previous.fetched_at);
-    if (!leases.length) return;
-    const weights = leases.map((lease) => lease.expected_percent ?? 1);
-    const total = weights.reduce((sum, value) => sum + value, 0);
-    if (total <= 0) return;
-    for (let index = 0; index < leases.length; index += 1) this.prepared("INSERT INTO lease_spend (lease_id,meter_id,observation_id,amount_percent,estimated,at) VALUES (?,?,?,?,?,?)").run(leases[index].id, current.meter_id, current.id, delta * weights[index] / total, 1, current.fetched_at);
+    if (to === from && delta === 0 && this.sameReset(previous.resets_at, current.resets_at)) return;
+    // Reset crossings, held readings and decreases do not bound consumption.
+    const invalid = [previous, current].some((o) => o.metadata?.vendor_inconsistent || o.metadata?.vendor_window_held)
+      || !this.sameReset(previous.resets_at, current.resets_at)
+      || (previous.resets_at !== null && Date.parse(previous.resets_at) <= to)
+      || !Number.isFinite(delta) || delta < 0 || to <= from;
+    const fromAt = new Date(Math.min(from, to)).toISOString();
+    const toAt = new Date(Math.max(from, to)).toISOString();
+    const leases = this.prepared(`SELECT * FROM leases WHERE meter_id = ?
+      AND julianday(started_at) <= julianday(?)
+      AND julianday(MIN(expires_at, COALESCE(ended_at, expires_at))) >= julianday(?)`).all(current.meter_id, toAt, fromAt)
+      .filter((lease) => invalid || (Date.parse(String(lease.started_at)) < to && Math.min(Date.parse(String(lease.expires_at)), Date.parse(String(lease.ended_at ?? lease.expires_at))) > from));
+    for (const lease of leases) this.prepared(`INSERT OR IGNORE INTO lease_window_spend
+      (lease_id,meter_id,window_minutes,observation_id,from_at,to_at,delta_percent,overlapping_leases) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(lease.id, current.meter_id, window.minutes, current.id, fromAt, toAt, invalid ? null : delta, leases.length);
   }
 
   /**

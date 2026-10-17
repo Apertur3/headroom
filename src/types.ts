@@ -249,8 +249,24 @@ export interface Lease {
   ended_at: string | null;
   ended_reason: string | null;
   spent_percent: number;
+  /** Additive accounting evidence. Absent only on older daemon responses. */
+  spend_resolution?: LeaseSpendWindow["resolution"];
+  spent_percent_bound?: "exact" | "upper" | "lower";
+  spend_window_minutes?: number | null;
+  spend_windows?: LeaseSpendWindow[];
   /** Returned by an idempotent end request; never persisted. */
   already_ended?: boolean;
+}
+
+/** Bounds describe meter movement, shared by every lease in a poll bracket.
+ * A null upper bound means coverage is incomplete, never known zero. */
+export interface LeaseSpendWindow {
+  meter_id: string;
+  window_minutes: number;
+  resolution: "resolved" | "bounded" | "unattributable" | "unresolved" | "legacy";
+  lower_percent: number;
+  upper_percent: number | null;
+  overlapping_leases: number | null;
 }
 
 /** One owner's attributed movement on one meter window, aggregated from the

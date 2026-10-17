@@ -12,7 +12,20 @@
       "meter_id": "string",
       "note": "string",
       "owner": "string",
+      "spend_resolution": "string",
+      "spend_window_minutes": "number",
+      "spend_windows": [
+        {
+          "lower_percent": "number",
+          "meter_id": "string",
+          "overlapping_leases": "null",
+          "resolution": "string",
+          "upper_percent": "null",
+          "window_minutes": "number"
+        }
+      ],
       "spent_percent": "number",
+      "spent_percent_bound": "string",
       "started_at": "string"
     }
   ]

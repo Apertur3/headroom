@@ -253,7 +253,12 @@ state, reason }`. `CostEstimate` is `{ action_class: string, expected_percent:
 number | null, source: "given" | "learned" | "unknown", confidence: "none" |
 "low" | "medium" | "high", sample_count: number, median_percent: number |
 null, iqr_low: number | null, iqr_high: number | null,
-max_more_before_reset: number | null }`. `host` is additive (see "Shared
+max_more_before_reset: number | null, basis?: "exact" | "upper_bound",
+bounded_sample_count?: number }`. The optional evidence fields describe the
+learned statistics, even when `source` is `given`; see `cost` below. With no
+samples and no explicit expectation, `source` is `unknown`, percent estimates
+and max-more are null, and ordinary quota/policy routing still applies.
+`host` is additive (see "Shared
 vocabulary" above) -- a fresh local read on every call, regardless of whether
 the decision itself came from the daemon or a direct read; it never affects
 `allowed`.
@@ -322,6 +327,10 @@ section). Three distinct outcomes share this shape:
   null`.
 - **Launched**: `gate: CanDecision` with `allowed: true`, `lease_id` the
   reservation covering the child process's run.
+
+`run --class` without explicit `--need` and without learned samples returns
+an `UNKNOWN` quota refusal with exit `2` and asks for `--need`, rather than
+throwing or assuming a zero-cost action. Explicit needs work without learning.
 
 A `host.state: "warn"` reading (or a `"refuse"` reading under `host_guard.mode
 = "warn"`) never changes this shape or the exit code -- it only adds a
@@ -473,6 +482,46 @@ string, ended_at: string | null, ended_reason: string | null, spent_percent:
 number, already_ended?: boolean }`. `already_ended` appears only in the
 response to `lease end`, never in a list.
 
+Additive spend fields (also present in JSON exports, with the same columns
+appended in CSV exports): `spend_resolution: "resolved" | "bounded" |
+"unattributable" | "unresolved" | "legacy"`, `spent_percent_bound: "exact" |
+"upper" | "lower"`, `spend_window_minutes: number | null`, and
+`spend_windows: LeaseSpendWindow[]`. Older daemon responses may omit them.
+No existing field is removed or changes type; `spent_percent` stays numeric.
+It is the chosen window's resolved movement when `spent_percent_bound` is
+`exact`, an upper bound when `upper`, and a lower bound when `lower`.
+A lower bound of zero is **unknown spend**, never evidence of a free lease.
+
+`LeaseSpendWindow` is `{ meter_id: string, window_minutes: number,
+resolution: <same enum as spend_resolution>, lower_percent: number,
+upper_percent: number | null, overlapping_leases: number | null }`. A null upper
+bound means incomplete coverage. `overlapping_leases` includes this lease;
+it is the maximum number of leases sharing any measurement bracket, including
+completed or sequential leases within that bracket; null means no trustworthy
+bracket evidence. Bounds are shared, never
+split by expected spend. These are bounds on **observed meter movement**;
+vendor reporting delay and rolling-window expiry can hide actual consumption.
+
+Learning and `spent_percent` consistently choose the shortest hard percent
+window recorded for each meter (smallest positive `window.minutes`; fixed
+preferred to rolling if both have the same duration), never
+sum percentages from different windows. Only ended leases with complete
+fresh-reading coverage and no other lease sharing any bracket train costs.
+Resolved samples use exact movement; bounded samples use `upper_percent`
+(the whole bracketing interval's movement, which can include background use)
+as a conservative training value. Shared, unresolved and legacy evidence
+never trains either per-class or per-meter costs.
+Positive movement crossing a lease boundary is bounded, even for one lease;
+only movement measured wholly within the lease can be exact. Zero movement
+can resolve zero when fresh brackets cover the entire lease. Missing coverage,
+reset crossings, decreases and inconsistent readings leave coverage unresolved.
+`unattributable` means another lease shares evidence; `bounded` means full
+coverage gives an upper bound but cannot isolate movement at a boundary.
+Active leases remain unresolved (or unattributable) and expose a lower bound.
+Pre-migration leases are `legacy`, with unknown spend and no training eligibility;
+their old scalar rows are preserved, never converted into window measurements.
+Human displays label bounds and uncertainty explicitly.
+
 `lease start` and `lease end` have no `--json` output of their own on the
 CLI (`start` prints the new lease's id; `end` prints one confirmation line);
 `lease end` exits `1` on an owner mismatch without `--force`, `0` otherwise.
@@ -525,8 +574,16 @@ confirmation line); `timer list --json` always exits `0`.
 ### `cost` (bare array -- see "Array-shaped outputs")
 
 `LearnedCost[]`: `{ action_class: string, sample_count: number,
-median_percent: number, iqr_low: number, iqr_high: number }`, one row per
-action class with at least one ended lease. Exit codes: always `0`.
+median_percent: number, iqr_low: number, iqr_high: number,
+basis?: "exact" | "upper_bound", bounded_sample_count?: number }`, one row
+per action class with at least one eligible ended lease (see lease spend
+above). `sample_count` includes resolved and bounded samples;
+`bounded_sample_count` counts the bounded subset. `basis` is `upper_bound`
+when any sample is bounded, otherwise `exact`. The median and IQR use the
+conservative values when bounded, and human text labels the estimate "at most".
+These additive evidence fields may be absent on older daemon responses.
+No eligible samples yields an empty array, never a zero-cost learned row.
+Exit codes: always `0`.
 
 MCP `quota_cost`: enveloped, `{ contract, generated_at, source?: "direct",
 items: LearnedCost[] }` -- the MCP tool result is an object even though the

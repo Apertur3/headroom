@@ -75,8 +75,8 @@ describe("store window semantic identity (#49)", () => {
         observed_at: "2026-09-06T12:02:00Z",
       }));
 
-      // 4. Start lease at 12:02:30
-      store.startLease("worker-example", "claude-main:all", 20, 3_600_000, null, new Date("2026-09-06T12:02:30Z"));
+      // 4. Start lease at 12:02:00
+      store.startLease("worker-example", "claude-main:all", 20, 3_600_000, null, new Date("2026-09-06T12:02:00Z"));
 
       // 5. Insert 40% at 12:03 with window b
       store.insert(makeObservation({
@@ -147,7 +147,7 @@ describe("store window semantic identity (#49)", () => {
       expect(reading?.observed_at).toBe("2026-09-06T11:30:00Z");
 
       // 2. New insert should find the latest raw row (25%) as baseline and previous
-      store.startLease("worker-1", "claude-main:all", 10, 3_600_000, null, new Date("2026-09-06T11:35:00Z"));
+      store.startLease("worker-1", "claude-main:all", 10, 3_600_000, null, new Date("2026-09-06T11:30:00Z"));
       store.insert(makeObservation({
         window: { kind: "fixed", minutes: 300, enforcement: "hard" },
         quantity: { used: 35, limit: 100, remaining: 65, unit: "percent" },
@@ -198,11 +198,12 @@ describe("store window semantic identity (#49)", () => {
       }));
 
       // Now insert a second reading for the 300m hard fixed window
-      store.startLease("worker-2", "claude-main:all", 10, 3_600_000, null, new Date("2026-09-06T12:04:00Z"));
+      store.startLease("worker-2", "claude-main:all", 10, 3_600_000, null, new Date("2026-09-06T12:00:00Z"));
       store.insert(makeObservation({
         window: { kind: "fixed", minutes: 300, enforcement: "hard" },
         quantity: { used: 30, limit: 100, remaining: 70, unit: "percent" },
         fetched_at: "2026-09-06T12:05:00Z",
+        observed_at: "2026-09-06T12:05:00Z",
       }));
 
       // Lease spend and ledger delta should be against the 20% reading (delta = 10),
@@ -331,6 +332,7 @@ describe("store window semantic identity (#49)", () => {
         freshness: "failed",
         reason: "Keychain grant needed; run: headroom keychain grant --principal claude-main",
         fetched_at: "2026-09-06T12:05:00Z",
+        observed_at: "2026-09-06T12:05:00Z",
       }));
 
       failedEvents = store.events("2026-09-06T00:00:00Z").filter((e) => e.kind === "source_failed");

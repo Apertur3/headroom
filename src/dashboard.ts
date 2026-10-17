@@ -1,3 +1,4 @@
+import { leaseSpendText } from "./cost.js";
 import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
@@ -669,7 +670,7 @@ function dashboardContent(model: DashboardModel, view: DashboardView): Dashboard
     lines.push("");
     const events = ["EVENTS (last 8)", ...[...model.events].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 8).map((event) => `${clock(event.created_at)} ${event.metadata?.unscheduled ? "!unscheduled " : ""}${event.kind} ${event.meter_id ?? event.principal_id ?? "-"}`)];
     if (events.length === 1) events.push("No events");
-    const right = ["LEASES / RESERVES / PACING", ...active.map((lease) => `${lease.owner} ${lease.meter_id} ${lease.expected_percent ?? "?"}% held, ${lease.spent_percent.toFixed(1)}% spent, ${formatResetsIn(Math.max(0, (Date.parse(lease.expires_at) - model.now.getTime()) / 1000))} left`)];
+    const right = ["LEASES / RESERVES / PACING", ...active.map((lease) => `${lease.owner} ${lease.meter_id} ${lease.expected_percent ?? "?"}% held, ${leaseSpendText(lease)} spent, ${formatResetsIn(Math.max(0, (Date.parse(lease.expires_at) - model.now.getTime()) / 1000))} left`)];
     if (!active.length) right.push("No active leases");
     for (const meter of [...new Set(model.observations.map((row) => row.meter_id))]) { const reserve = reserveFor(model.policy.reserve, meter); if (reserve > 0) right.push(`reserve ${meter}: ${reserve}%`); }
     if (model.policy.pacing === "none") right.push("Even pacing disabled; hard limits still apply");
