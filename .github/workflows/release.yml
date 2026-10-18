@@ -354,14 +354,15 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: Wait for the npm version
         run: |
-          for attempt in {1..30}; do
-            published="$(npm view "headroomd@$VERSION" version --prefer-online --fetch-retries=0 --fetch-timeout=5000 2>/dev/null || true)"
+          for attempt in {1..60}; do
+            # Registry document with cache-busting: `npm view` lags the CDN after publish (#163).
+            published="$(curl -fsS --max-time 10 -H 'Cache-Control: no-cache' "https://registry.npmjs.org/headroomd/${VERSION}?t=$(date +%s)" 2>/dev/null | jq -r '.version // empty' || true)"
             if [[ "$published" == "$VERSION" ]]; then
               exit 0
             fi
-            if [[ "$attempt" -lt 30 ]]; then sleep 5; fi
+            if [[ "$attempt" -lt 60 ]]; then sleep 15; fi
           done
-          echo "::error::headroomd@$VERSION did not become available on npm within five minutes"
+          echo "::error::headroomd@$VERSION did not become available on npm within fifteen minutes"
           exit 1
       - name: Set registry package versions
         run: |
