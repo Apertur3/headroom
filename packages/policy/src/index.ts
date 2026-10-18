@@ -54,7 +54,7 @@ function optionsWithDefaults(options?: PolicyOptions): Required<PolicyOptions> {
 
 export function paceState(reading: MeterReading, options: PolicyOptions | undefined, now: Date): { state: PaceState; reason: string } {
   if (reading?.status === "rejected") return { state: "FREEZE", reason: "rate limit rejected" };
-  if (!finite(reading?.usedPercent)) return { state: "UNKNOWN", reason: "no usage reading" };
+  if (!finite(reading?.usedPercent) || reading.usedPercent < 0) return { state: "UNKNOWN", reason: "no usage reading" };
   if (!Number.isFinite(instant(now))) return { state: "UNKNOWN", reason: "invalid current time" };
   if (!finite(reading.windowMinutes) || reading.windowMinutes <= 0) return { state: "UNKNOWN", reason: "missing window" };
   const policy = optionsWithDefaults(options);
@@ -123,7 +123,9 @@ function deadline(decision: Evaluated, now: Date, options: Required<PolicyOption
   if (decision.ok) return null;
   const nowMs = instant(now);
   const reset = timestamp(decision.reading?.resetsAt);
-  if (decision.state === "FREEZE" && reset > nowMs) return iso(reset);
+  // A reset further out than one window is bad data (e.g. epoch milliseconds): recheck instead of holding for years.
+  const windowMs = (decision.reading?.windowMinutes ?? 0) * 60_000;
+  if (decision.state === "FREEZE" && reset > nowMs && reset - nowMs <= windowMs) return iso(reset);
   if (decision.state === "CONSERVE") {
     const hold = nowMs + options.conserveHoldMinutes * 60_000;
     return iso(reset > nowMs ? Math.min(hold, reset) : hold);

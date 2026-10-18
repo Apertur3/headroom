@@ -13,7 +13,7 @@ function files(directory) {
 }
 function assertPure(source, path) {
   const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  assert.doesNotMatch(code, /\b(?:process|require|globalThis)\b|\bfetch\s*\(|\bDate\s*\.\s*now\b|\bnew\s+Date\s*\(\s*\)|node:/, path);
+  assert.doesNotMatch(code, /\b(?:process|require|globalThis)\b|\bfetch\s*\(|\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bperformance\b|\beval\s*\(|\bnew\s+Date\s*\(\s*\)|node:/, path);
   const imports = /\b(?:import|export)\s+(?:[^;]*?\s+from\s*)?["']([^"']+)["']|\b(?:import|require)\s*\(\s*["']([^"']+)["']/g;
   for (const match of code.matchAll(imports)) {
     const specifier = match[1] ?? match[2];
@@ -34,7 +34,7 @@ test("purity guard detects external dependencies, ambient effects and escaping i
     'import x from "external";', 'export { x } from "external";', 'import "external";',
     'import("external")', 'import(variable)', 'require("./local.js")',
     'import x from "../../../escape.js";', 'process.env', 'globalThis.x', 'fetch("url")',
-    'Date.now()', 'new Date()', 'const x = "node:fs";',
+    'Date.now()', 'new Date()', 'Math.random()', 'performance.now()', 'eval("1")', 'const x = "node:fs";',
   ]) assert.throws(() => assertPure(source, path), source);
   assertPure('import { x } from "./local.js"; export { x } from "../other.js"; new Date(0); import ( "./local.js" ); /* Date.now() */', path);
 });

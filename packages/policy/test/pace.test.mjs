@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { defaultPolicyOptions, paceState, pace } from "../dist/index.js";
+import { defaultPolicyOptions, paceState, pace, holdUntil } from "../dist/index.js";
 import { formatResetsIn, paceCore } from "../dist/core.js";
 import { now, at, reading } from "./helpers.mjs";
 
@@ -80,4 +80,9 @@ test("core supports custom stale reasons and exact duration formatting", () => {
   assert.deepEqual(paceCore(input, now), { state: "UNKNOWN", reason: "stale 16m" });
   assert.equal(paceCore(input, now, (age) => `age ${age}`).reason, "age 16");
   for (const [seconds, expected] of [[-1, "0m"], [3599, "59m"], [3600, "1h"], [3660, "1h 1m"], [172800, "2d"], [176400, "2d 1h"]]) assert.equal(formatResetsIn(seconds), expected);
+});
+
+test("negative usage is UNKNOWN and an out-of-window reset does not hold for years", () => {
+  assert.equal(pace([reading({ usedPercent: -50 })], now).state, "UNKNOWN");
+  assert.equal(holdUntil({ class: "a" }, [reading({ status: "rejected", resetsAt: "9999-01-01T00:00:00Z" })], now), at(5));
 });
