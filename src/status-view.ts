@@ -20,7 +20,7 @@
 import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { creditsLapsed } from "./credits.js";
 import { withEffectiveFreshness } from "./pace.js";
-import { blockedLaneReason, blockedLaneSummary, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
+import { blockedLaneReason, blockedLaneSummary, isVisibilityOnly, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
 import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
@@ -221,6 +221,7 @@ function formatWindow(observation: Observation, state: PaceState, reason: string
   // reader can see why a healthy-looking percentage still produced a NO from
   // gate/fill/route/can. It never changes the pace state beside it.
   const reset = overdueText ? overdue : ` ↻${formatReset(observation.resets_at, now)}${countdown}`;
+  if (isVisibilityOnly(observation)) return `${label(observation)} ${Math.round(observation.quantity.used)}% (unconfirmed)${reset}${inconsistent}`;
   return `${label(observation)} ${Math.round(observation.quantity.used)}%${reserveNote(reservePercent)}${reset} ${state}${doubt}${inconsistent}${evidence}${paceSegment(observation)}`;
 }
 
@@ -575,7 +576,7 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
           used: observation.metadata?.exhausted ? "exhausted (vendor)" : usedCell(observation, decision.state),
           reset: blocked ? `until ${blockedUntilText(observation)}` : overdue ?? (countdown ? known : `resets in ${formatResetsIn(seconds as number)}`),
           resetCoarse: blocked ? `until ${blockedUntilText(observation)}` : overdue ?? (countdown ? known : `resets in ${formatResetsInCoarse(seconds as number)}`),
-          state: isCredits(observation) ? "" : observation.metadata?.exhausted ? "FREEZE" : blocked ? "blocked" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
+          state: isCredits(observation) ? "" : isVisibilityOnly(observation) && decision.state !== "UNKNOWN" ? "(unconfirmed)" : observation.metadata?.exhausted ? "FREEZE" : blocked ? "blocked" : decision.state === "NOT_ENFORCED" ? "not enforced" : decision.state,
           detail: detailLine(observation, reserveFor(policy.reserve, observation.meter_id), resetSeen.get(windowKey(observation)), freeResetUsed.get(windowKey(observation)), now),
           unknown,
           // The lease belongs to the meter, not to one of its windows, so it

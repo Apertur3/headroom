@@ -112,6 +112,10 @@ export interface Observation {
      * that carries a real percent is never dropped just because the vendor
      * calls it inactive. */
     vendor_active?: boolean;
+    /** Shown for visibility only: not yet confirmed to be a pool that can
+     * gate work (a scoped Claude limit). Status and the line show it with no
+     * pace state. */
+    unconfirmed?: boolean;
     exhausted?: boolean;
     /** A synthetic exhausted report that has been superseded or explicitly
      * cleared stays in history but must never win a current-window read. */

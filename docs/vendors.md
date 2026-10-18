@@ -114,11 +114,13 @@ A scoped limit's `is_active: false` flag means "no percent to show" only when th
 percent in the response -- that meter reports freshness `not_enforced` (`n/a` in the CLI), same as
 before. A scoped limit that carries a percent is never dropped just because the vendor flags it
 inactive: Headroom emits it as a real, fresh window (enforcement `soft` rather than `hard`,
-`metadata.vendor_active: false`, reason "vendor flags this limit inactive; shown because it carries
-a cap"), since a real cap the vendor's own `/usage` dashboard shows near its limit is exactly the
-number an orchestrator needs, whatever the vendor calls the bucket. `gate --model fable` (and
-`--meter <principal>:fable` directly) answers against this meter; `can` for the `claude-fable`
-routing class already consumes it via `routing.toml`.
+`metadata.vendor_active: false`, `metadata.unconfirmed: true`, reason "separate weekly limit,
+unconfirmed: shown for visibility only"). Whether this pool really sits outside the account-wide
+weekly is not confirmed, so it is visibility only: `status` and `line` show it as
+`claude-main:fable wk 41% (unconfirmed)` with no pace state. A targeted `can`, `gate`, `route` or
+`run` on it is refused (UNKNOWN, never dispatchable, `--allow-unknown` included) with "claude-main:fable
+is visibility-only (unconfirmed); check claude-main:all instead"; global scans and `plan` skip it.
+Promoting it to a hard window is a one-line change in `scoped()` once confirmed.
 
 ### No banked/free-reset field, as of 2026-09-23
 

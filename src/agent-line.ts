@@ -17,7 +17,7 @@ import { basename, dirname, join } from "node:path";
 import { readPolicy } from "./config.js";
 import { creditsLapsed, isCurrentBankedResetObservation } from "./credits.js";
 import { headroomHome } from "./paths.js";
-import { blockedLaneReason, defaultPolicy, paceDecision, type Policy } from "./policy.js";
+import { blockedLaneReason, defaultPolicy, isVisibilityOnly, paceDecision, type Policy } from "./policy.js";
 import { formatResetsIn, servedResetsIn } from "./resets.js";
 import { formatRatePercent, labelForMinutes } from "./status-view.js";
 import type { Observation, PaceState } from "./types.js";
@@ -53,6 +53,8 @@ export interface AgentLine {
   observed_at: string;
   line: string;
   accounts: AgentLineAccount[];
+  /** Readings shown for visibility only: no pace state, never ranked. */
+  unconfirmed?: { name: string; text: string }[];
 }
 
 /** Account and meter names come from accounts.toml and the vendors; only this
@@ -67,6 +69,7 @@ export function sanitizeName(name: string): string {
  * weekly (that weekly is itself a candidate and reads FREEZE). */
 function isCandidate(item: Observation): boolean {
   if (item.window?.kind === "state" || item.window?.kind === "count") return false;
+  if (isVisibilityOnly(item)) return false;
   if (item.freshness === "not_enforced") return false;
   if (blockedLaneReason(item) !== undefined) return false;
   return item.quantity?.unit === "percent" || item.quantity === null || item.quantity === undefined;
@@ -141,6 +144,18 @@ function expiryDay(value: string | null): string | undefined {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(date);
 }
 
+/** "claude-main:fable wk 41% (unconfirmed)": a fresh reading with no pace state,
+ * never ranked. Stale or failed readings are left out. */
+function unconfirmedSegments(rows: Observation[]): { name: string; text: string }[] {
+  return rows
+    .filter((item) => isVisibilityOnly(item) && item.freshness === "fresh" && item.quantity?.unit === "percent")
+    .map((item) => {
+      const name = sanitizeName(item.meter_id);
+      return { name, text: `${name} ${labelForMinutes(item.window?.minutes)} ${Math.round(item.quantity!.used)}% (unconfirmed)` };
+    })
+    .sort((a, b) => a.text.localeCompare(b.text));
+}
+
 function segment(account: AgentLineAccount): string {
   if (account.state === "UNKNOWN") return `${account.name} UNKNOWN (${account.unknown_reason === "none" ? "no reading" : account.unknown_reason})`;
   const burn = account.burn_percent_per_hour;
@@ -154,9 +169,9 @@ function segment(account: AgentLineAccount): string {
 
 /** Joins the account segments, most constrained first, dropping from the end
  * past MAX_LINE_CHARS and naming how many were left out. */
-function joinLine(accounts: AgentLineAccount[]): string {
-  if (!accounts.length) return `${PREFIX} no accounts with a quota reading`;
-  const segments = accounts.map(segment);
+function joinLine(accounts: AgentLineAccount[], extra: string[] = []): string {
+  if (!accounts.length && !extra.length) return `${PREFIX} no accounts with a quota reading`;
+  const segments = [...accounts.map(segment), ...extra];
   let kept = segments.length;
   const render = (count: number): string => `${PREFIX} ${segments.slice(0, count).join(SEPARATOR)}${count < segments.length ? `${SEPARATOR}+${segments.length - count} more` : ""}`;
   while (kept > 1 && render(kept).length > MAX_LINE_CHARS) kept -= 1;
@@ -187,8 +202,9 @@ export function buildAgentLine(observations: Observation[], policy: Policy, prin
     if (!rows.length) { accounts.push({ name, state: "UNKNOWN", unknown_reason: "none" }); continue; }
     accounts.push(...accountsFor(name, rows, policy, now));
   }
+  const unconfirmed = [...byPrincipal.values()].flatMap((rows) => unconfirmedSegments(rows));
   accounts.sort((a, b) => rank(b) - rank(a) || (b.used_percent ?? 0) - (a.used_percent ?? 0) || a.name.localeCompare(b.name));
-  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts), accounts };
+  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts, unconfirmed.map((item) => item.text)), accounts, ...(unconfirmed.length ? { unconfirmed } : {}) };
 }
 
 /** temp file in the same directory, fsync, rename: a reader sees the old line

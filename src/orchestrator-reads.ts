@@ -11,7 +11,7 @@ import { readRouting } from "./config.js";
 import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, windowNeedLabel, windowNeedMinutes, type FillClassFit, type FillResult, type GateNeed, type GateResult, type PlanResult } from "./pacing.js";
 import { maxMoreBeforeReset } from "./cost.js";
 import {
-  blockedLaneReason, canConsume, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
+  blockedLaneReason, canConsume, isVisibilityOnly, defaultPolicy, freshnessGate, formatReserveCeiling, reserveAttributionBracket, reserveCeilingSteps, reserveEntryFor, reserveFor,
   withOtherOwnerReservations, type CanDecision, type Policy, type ReserveEntry,
 } from "./policy.js";
 import { withPaceInfo } from "./pace.js";
@@ -24,7 +24,7 @@ import { disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account
  * for the advisory remaining-percent figure `can`'s cost report prints. Used
  * identically by the CLI and the MCP server's direct (no-daemon) path. */
 export function pickDecidingObservation(rows: Observation[]): Observation | undefined {
-  const candidates = rows.filter((row) => row.freshness === "fresh" && row.quantity?.unit === "percent" && row.window?.kind !== "count");
+  const candidates = rows.filter((row) => row.freshness === "fresh" && row.quantity?.unit === "percent" && row.window?.kind !== "count" && !isVisibilityOnly(row));
   if (!candidates.length) return undefined;
   return candidates.reduce((worst, row) => ((row.quantity as { used: number }).used > (worst.quantity as { used: number }).used ? row : worst));
 }
@@ -36,7 +36,7 @@ export function pickDecidingObservation(rows: Observation[]): Observation | unde
  * it has no percent to report -- unlike knownPercentWindows below. */
 function enforcedPercentWindows(store: HeadroomStore, meterId: string): StoredObservation[] {
   return store.latestPerWindow(meterId)
-    .filter((row) => row.quantity?.unit === "percent" && row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes)
+    .filter((row) => row.quantity?.unit === "percent" && row.window?.kind !== "state" && row.window?.kind !== "count" && !isVisibilityOnly(row) && row.window?.minutes)
     .sort((a, b) => (a.window!.minutes as number) - (b.window!.minutes as number));
 }
 
@@ -47,7 +47,7 @@ function enforcedPercentWindows(store: HeadroomStore, meterId: string): StoredOb
  * cannot distinguish once the row is filtered out. */
 function knownPercentWindows(store: HeadroomStore, meterId: string): StoredObservation[] {
   return store.latestPerWindow(meterId)
-    .filter((row) => row.window?.kind !== "state" && row.window?.kind !== "count" && row.window?.minutes && (row.quantity?.unit === "percent" || row.freshness === "not_enforced" || blockedLaneReason(row)))
+    .filter((row) => row.window?.kind !== "state" && row.window?.kind !== "count" && !isVisibilityOnly(row) && row.window?.minutes && (row.quantity?.unit === "percent" || row.freshness === "not_enforced" || blockedLaneReason(row)))
     .sort((a, b) => (a.window!.minutes as number) - (b.window!.minutes as number));
 }
 
@@ -397,6 +397,11 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     if (id.endsWith(":credits") || rawRows.some((row) => row.window?.kind === "count")) {
       if (!explicitTarget) continue;
       return { allowed: false, reason: `count meter ${id} cannot be used for dispatch`, meters_checked: checked };
+    }
+    // A visibility-only meter is not capacity: a global scan skips it, a targeted gate refuses it.
+    if (rawRows.length && rawRows.every(isVisibilityOnly)) {
+      if (!explicitTarget) continue;
+      return { allowed: false, reason: `${id} is visibility-only (unconfirmed); check ${id.slice(0, id.indexOf(":"))}:all instead`, meters_checked: checked, unknown: true };
     }
     const { short, long } = meterWindows(store, id);
     if (!short && !long) {
