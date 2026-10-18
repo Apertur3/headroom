@@ -1073,7 +1073,86 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
  * CLI.
  * ---------------------------------------------------------------------- */
 
-export const NOTIFY_USAGE = "Usage: headroom notify (configure [--dry-run] | --test | --last <n>)";
+export const NOTIFY_USAGE = [
+  "Usage: headroom notify (configure [--dry-run] | --test | --last <n>)",
+  "       headroom notify --text \"<message>\" [--kind <slug>] [--every <minutes>] [--ignore-quiet-hours]",
+  "  --text exits 0 sent, 1 no channel or all failed, 2 usage error, 3 suppressed by the per-kind rate limit, 4 deferred by quiet hours",
+].join("\n");
+
+const KIND_PATTERN = /^[a-z0-9-]{1,40}$/;
+
+export interface TextArgs { text: string; kind: string; titled: boolean; everyMinutes: number; ignoreQuiet: boolean; }
+
+export function parseTextArgs(argv: string[]): TextArgs {
+  const values: Record<string, string> = {};
+  let ignoreQuiet = false;
+  for (let i = 0; i < argv.length; i += 1) {
+    const flag = argv[i];
+    if (flag === "--ignore-quiet-hours") { ignoreQuiet = true; continue; }
+    if (flag !== "--text" && flag !== "--kind" && flag !== "--every") throw new Error(`unknown argument ${flag}`);
+    const value = argv[i + 1];
+    if (value === undefined) throw new Error(`${flag} needs a value`);
+    values[flag] = value;
+    i += 1;
+  }
+  const text = values["--text"];
+  if (!text?.trim()) throw new Error("--text needs a non-empty message");
+  const kind = values["--kind"] ?? "custom";
+  if (!KIND_PATTERN.test(kind)) throw new Error("--kind must match [a-z0-9-]{1,40}");
+  const every = values["--every"] === undefined ? 60 : Number(values["--every"]);
+  if (!Number.isInteger(every) || every < 0) throw new Error("--every takes a whole number of minutes");
+  return { text, kind, titled: values["--kind"] !== undefined, everyMinutes: every, ignoreQuiet };
+}
+
+/** One free-text message through every configured channel, direct (no daemon).
+ * The per-kind rate limit lives in daemon_state so it survives restarts. A
+ * quiet-hours deferral does not touch it. Exit: 0 sent, 1 nothing sent,
+ * 3 suppressed, 4 deferred. */
+export async function notifyText(args: TextArgs, options: NotifyOptions = {}): Promise<number> {
+  const home = options.home ?? headroomHome();
+  const config = options.config ?? await readNotifyConfig(home);
+  if (!config || !config.channels.length) { console.log(`No [notify] channels in ${join(home, "policy.toml")}. See docs/notifications.md.`); return 1; }
+  const now = options.now ?? new Date();
+  const store = await HeadroomStore.open(home);
+  try {
+    const key = `notify_text:${args.kind}`;
+    const last = store.daemonState(key);
+    if (last) {
+      const ago = now.getTime() - new Date(last).getTime();
+      if (ago < args.everyMinutes * 60_000) { console.log(`suppressed: last ${args.kind} notice ${Math.max(0, Math.floor(ago / 60_000))}m ago`); return 3; }
+    }
+    if (!args.ignoreQuiet && inQuietHours(config, now)) {
+      const end = config.quiet_hours!.end;
+      console.log(`deferred: quiet hours until ${String(Math.floor(end / 60)).padStart(2, "0")}:${String(end % 60).padStart(2, "0")}`);
+      return 4;
+    }
+    const channels = await prepareChannelsInternal(config, options);
+    const secrets = channels.flatMap((channel) => channel.secrets);
+    const body = scrubSecrets(args.titled ? `🚨 ${args.kind}\n${args.text}` : args.text, secrets).slice(0, CHUNK_LIMIT);
+    const stamp = now.toISOString();
+    let sent = 0;
+    for (const channel of channels) {
+      if (!channel.ready) { console.log(`${channel.channel.padEnd(8)} disabled  ${channel.detail}`); continue; }
+      const id = `text:${args.kind}:${stamp}`;
+      const item: NotifyItem = { id, kind: `text:${args.kind}`, meter: null, principal: null, at: stamp, text: body };
+      store.notifyEnqueue(id, channel.channel, encodeItem(item), stamp);
+      const row = store.notifyDelivery(id, channel.channel);
+      try {
+        await channel.deliver([item]);
+        if (row) store.notifyDelivered([row.id], stamp);
+        console.log(`${channel.channel.padEnd(8)} sent      ${channel.detail}`);
+        sent += 1;
+      } catch (error: unknown) {
+        const detail = scrubSecrets(error, channel.secrets);
+        if (row) store.notifyAttemptFailed([row.id], detail, stamp, 1);
+        console.log(`${channel.channel.padEnd(8)} failed    ${detail}`);
+      }
+    }
+    if (sent) store.setDaemonState(key, stamp);
+    store.audit("cli", "notify", null, sent ? "ok" : "failed");
+    return sent ? 0 : 1;
+  } finally { store.close(); }
+}
 
 /** Sends one message per configured channel and reports what happened.
  * Deliberately outside the ledger: a test message is not an event, and must
@@ -1115,6 +1194,11 @@ export async function notifyLast(limit: number, home?: string): Promise<number> 
 
 export async function notifyCommand(argv: string[]): Promise<number> {
   if (argv[0] === "configure") return (await import("./notify-configure.js")).configureNotifications(argv.slice(1));
+  if (argv.includes("--text")) {
+    let args: TextArgs;
+    try { args = parseTextArgs(argv); } catch (error: unknown) { console.error(`${(error as Error).message}\n${NOTIFY_USAGE}`); return 2; }
+    return notifyText(args);
+  }
   if (argv.includes("--test")) return notifyTest();
   const at = argv.indexOf("--last");
   if (at >= 0) {
