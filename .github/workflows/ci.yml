@@ -63,5 +63,9 @@ jobs:
         run: npm test
       - if: steps.scope.outputs.docs_only != 'true'
         run: npm run build
+      - name: "@headroomd/policy build and tests"
+        if: steps.scope.outputs.docs_only != 'true'
+        working-directory: packages/policy
+        run: npm test
       - if: steps.scope.outputs.docs_only != 'true'
         run: npm pack --dry-run

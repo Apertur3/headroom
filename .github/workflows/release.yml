@@ -255,6 +255,54 @@ jobs:
         run: |
           echo "::warning title=npm publish skipped::npm refused the publish. Either the trusted publisher for this repository and workflow is not configured on npmjs.com yet, or this version already exists. The GitHub release was created; run this workflow manually with the tag to publish again."
 
+  publish-policy:
+    name: publish @headroomd/policy
+    if: >-
+      github.repository == 'Apertur3/headroom' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # Independent of the headroomd release: the first publish of this package
+    # is a manual step (see docs/policy-package.md), so a refusal here must
+    # never fail the release run.
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest && npm --version
+      - run: npm ci --ignore-scripts
+      - name: Build and test the package
+        working-directory: packages/policy
+        run: npm run build && npm test
+      - name: Is this version already on npm
+        id: exists
+        working-directory: packages/policy
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if npm view "@headroomd/policy@$version" version --prefer-online >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=@headroomd/policy $version already on npm::Nothing to publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: npm publish
+        id: publish
+        if: ${{ steps.exists.outputs.published == 'false' }}
+        continue-on-error: true
+        working-directory: packages/policy
+        run: npm publish --provenance --access public
+      - name: Publish did not happen
+        if: ${{ steps.publish.outcome == 'failure' }}
+        run: |
+          echo "::warning title=@headroomd/policy publish skipped::npm refused the publish. The npm org headroomd may not exist yet, and trusted publishing needs the package to exist first, so the first publish is a manual step by the owner. After that, add this repository and release.yml as a trusted publisher on npmjs.com."
+
   mcp-registry:
     name: publish to the MCP Registry
     needs: [tarball, publish]
