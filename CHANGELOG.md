@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-10-18
+
 ### Added
 - `headroom notify --text "<message>" [--kind <slug>] [--every <minutes>] [--ignore-quiet-hours]` sends a message of your own through your notification channels, so other tools can reach you through Headroom. It repeats at most once per `--every` minutes for each kind, waits out quiet hours unless told otherwise, works without the daemon, and exits 0 sent, 1 nothing sent, 2 usage error, 3 suppressed, 4 deferred.
 

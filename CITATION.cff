@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "Headroom"
 abstract: "Headroom is a local daemon, CLI and MCP server that reads AI subscription quota meters and tells coding agents whether to go, wait or reroute before they start work."
-version: 0.2.10
+version: 0.2.11
 date-released: 2026-10-18
 license: MIT
 repository-code: "https://github.com/Apertur3/headroom"
