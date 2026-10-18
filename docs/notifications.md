@@ -296,6 +296,38 @@ attempts per event; the first failure and the final give-up are logged. Requests
 time out after five seconds, redirects are refused, responses are bounded, and
 resolved credentials are scrubbed from errors.
 
+## Sending your own message
+
+Another tool can escalate to you through the channels you already configured:
+
+```sh
+headroom notify --text "<message>" [--kind <slug>] [--every <minutes>] [--ignore-quiet-hours]
+```
+
+It sends one message through every configured channel and works without the daemon.
+With `--kind` the text is `🚨 <kind>` on the first line and your message below it;
+without it, just your message. Secrets are scrubbed, the text is cut at 3800
+characters, and each request times out after five seconds. Every sent message
+appears in `headroom notify --last`.
+
+- `--kind` is a slug of `a-z`, `0-9` and `-`, 1 to 40 characters (default `custom`).
+  The rate limit is per kind, so one noisy tool cannot silence another.
+- `--every` is the minimum number of minutes between sent messages of the same kind
+  (default 60). Inside it, nothing is sent and the command prints
+  `suppressed: last <kind> notice <N>m ago`. The last send time is kept in the store,
+  so it survives restarts.
+- Quiet hours apply by default: the command prints `deferred: quiet hours until HH:MM`
+  and sends nothing, and a deferral does not use up the rate limit, so the caller can
+  retry later. `--ignore-quiet-hours` sends anyway.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Sent on at least one channel |
+| 1 | No channel configured, or every channel failed or is disabled |
+| 2 | Usage error |
+| 3 | Suppressed by the rate limit |
+| 4 | Deferred by quiet hours |
+
 If nothing arrives, check that the daemon is running, inspect `headroom logs`,
 and run `headroom notify --test`. A disabled channel reports its missing setting
 or secret-store problem. `headroom notify --last 20` shows pending, sent and failed
