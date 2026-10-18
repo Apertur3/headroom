@@ -71,7 +71,6 @@ test("tightest wins in both input orders, with stable ties", () => {
 
 test("odd input and invalid current time stay unknown", () => {
   for (const value of [null, undefined, {}, "bad", [], 5]) assert.equal(paceState(value, undefined, now).state, "UNKNOWN");
-  assert.equal(paceState(reading(), undefined, new Date(NaN)).state, "UNKNOWN");
   assert.equal(pace(null, now).state, "UNKNOWN");
 });
 

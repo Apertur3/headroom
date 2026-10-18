@@ -43,3 +43,17 @@ test("garbage and invalid received times never throw", () => {
   const throwing = { get rate_limit_info() { throw new Error("bad"); } };
   assert.deepEqual(fromClaudeRateLimitEvent(throwing, now), []);
 });
+
+test("rejected windows are always reported; names map by prefix", () => {
+  const rejected = { status: "rejected", resetsAt: 1792260000 };
+  const noUtil = adapt({ ...rejected, rateLimitType: "five_hour" });
+  assert.deepEqual(noUtil, [{ meter: "five_hour", windowMinutes: 300, usedPercent: null, resetsAt: new Date(1792260000 * 1000).toISOString(), fetchedAt: now.toISOString(), status: "rejected" }]);
+  const unknown = adapt({ ...rejected, rateLimitType: "mystery", unifiedWindows: { five_hour: { utilization: 0.1, resetsAt: 1 } } });
+  assert.deepEqual(unknown.map((r) => [r.meter, r.windowMinutes, r.usedPercent, r.status]), [["five_hour", 300, 10, undefined], ["mystery", 0, null, "rejected"]]);
+  assert.equal(unknown[1].resetsAt, new Date(1792260000 * 1000).toISOString());
+  const opus = adapt({ rateLimitType: "seven_day_opus", status: "allowed", unifiedWindows: { seven_day_opus: { utilization: 0.4, resetsAt: 1792260000 } } });
+  assert.deepEqual(opus.map((r) => [r.meter, r.windowMinutes, r.usedPercent, r.status]), [["seven_day_opus", 10080, 40, "allowed"]]);
+  assert.deepEqual(adapt({ rateLimitType: "mystery", status: "allowed", utilization: 0.5, resetsAt: 1792260000 }), []);
+  assert.deepEqual(adapt({ unifiedWindows: { mystery: { utilization: 0.5, resetsAt: 1 } } }), []);
+  assert.equal(adapt({ status: "rejected", rateLimitType: "mystery" }).length, 1);
+});
