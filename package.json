@@ -60,7 +60,8 @@
     "test": "vitest run",
     "engine:build": "bash scripts/build-engine.sh",
     "smoke-cold": "bash scripts/smoke-cold.sh",
-    "release:check": "bash scripts/release-check.sh"
+    "release:check": "bash scripts/release-check.sh",
+    "sync:pace-core": "node scripts/sync-pace-core.mjs"
   },
   "devDependencies": {
     "@types/node": "20.19.43",

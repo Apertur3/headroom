@@ -1,3 +1,4 @@
+import { paceCore } from "./pace-core.js";
 import { expandHome } from "./paths.js";
 import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetSecondsRemaining } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
@@ -418,39 +419,18 @@ export function paceDecision(observation: Observation | undefined, policy = defa
   if (observation.freshness === "stale") return { state: "UNKNOWN", reason: `${observation.reason ?? "stale"}${nextPollHint(observation, parsedFetchedAt, policy, now)}` };
   if (observation.freshness !== "fresh") return { state: "UNKNOWN", reason: observation.reason ?? observation.freshness };
   if (!observation.quantity || observation.quantity.limit === null || !observation.window?.minutes) return { state: "UNKNOWN", reason: observation.reason ?? "missing window or quantity" };
-  const fetched = parsedFetchedAt;
-  if (!Number.isFinite(fetched)) return { state: "UNKNOWN", reason: "invalid fetch time" };
-  const ageMinutes = Math.max(0, Math.floor((now.getTime() - fetched) / 60_000));
-  if (now.getTime() - fetched > policy.staleness_minutes * 60_000) return { state: "UNKNOWN", reason: `${staleOrHeldReason(observation, ageMinutes)}${nextPollHint(observation, fetched, policy, now)}` };
-  const used = observation.quantity.used;
-  if (used >= 100 - policy.freeze_reserve_pct) return { state: "FREEZE", reason: "reserve reached" };
-  const reset = observation.resets_at ? new Date(observation.resets_at).getTime() : Number.NaN;
-  if (!Number.isFinite(reset)) return { state: "UNKNOWN", reason: "reset unknown" };
-  const duration = observation.window.minutes * 60_000;
-  // For fixed windows this is exactly resets_at - duration; rolling windows use
-  // the same inferred start, which is the only vendor-independent anchor we have.
-  const start = reset - duration;
-  const elapsedFraction = Math.min(1, Math.max(0, (now.getTime() - start) / duration));
-  // A window burning fast enough to run dry before its own reset is CONSERVE
-  // regardless of the straight-line surplus below: the straight-line rule
-  // only looks at usage-to-date against elapsed time, so it can still read
-  // NORMAL or even HARVEST one poll before a fast, recent burn empties the
-  // window early. Grace still holds off this projection unless the window
-  // would stall within 30 minutes -- an opening burst that is about to run
-  // out right away is not what grace exists to protect.
-  const resetsInSeconds = Math.max(0, (reset - now.getTime()) / 1000);
-  const emptyIn = observation.empty_in_seconds ?? null;
-  const projectingStall = emptyIn !== null && emptyIn < resetsInSeconds;
-  const inGrace = elapsedFraction < policy.pace_grace_fraction;
-  if (inGrace && !(projectingStall && emptyIn! < 1800)) return { state: "NORMAL", reason: "grace period" };
-  if (projectingStall) {
-    const burn = observation.burn_percent_per_hour ?? 0;
-    return { state: "CONSERVE", reason: `burning ${Math.round(burn)}%/h, empty in ${formatResetsIn(emptyIn!)}, reset in ${formatResetsIn(resetsInSeconds)}` };
-  }
-  const surplus = (1 - used / observation.quantity.limit) - (1 - elapsedFraction);
-  if (surplus > 0.10) return { state: "HARVEST", reason: "ahead of pace" };
-  if (surplus < -0.10) return { state: "CONSERVE", reason: "behind pace" };
-  return { state: "NORMAL", reason: "on pace" };
+  return paceCore({
+    used: observation.quantity.used,
+    limit: observation.quantity.limit,
+    windowMinutes: observation.window.minutes,
+    resetsAt: observation.resets_at,
+    fetchedAtMs: parsedFetchedAt,
+    emptyInSeconds: observation.empty_in_seconds,
+    burnPercentPerHour: observation.burn_percent_per_hour,
+    stalenessMinutes: policy.staleness_minutes,
+    freezeReservePct: policy.freeze_reserve_pct,
+    graceFraction: policy.pace_grace_fraction,
+  }, now, (ageMinutes) => `${staleOrHeldReason(observation, ageMinutes)}${nextPollHint(observation, parsedFetchedAt, policy, now)}`);
 }
 
 export function paceState(observation: Observation, policy = defaultPolicy, now = new Date()): PaceState { return paceDecision(observation, policy, now).state; }
