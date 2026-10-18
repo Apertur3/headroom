@@ -19,6 +19,7 @@ export default defineConfig({
     // cheaper than trying to keep this list in sync with every worktree
     // that comes and goes -- alongside vitest's own defaults, which this
     // otherwise-empty `exclude` array would replace rather than extend.
-    exclude: [...configDefaults.exclude, ".claude/**"],
+    // This package runs its dependency-free tests with the built-in test runner.
+    exclude: [...configDefaults.exclude, ".claude/**", "packages/policy/test/**"],
   },
 });
