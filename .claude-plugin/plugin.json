@@ -1,6 +1,6 @@
 {
   "name": "headroom",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "Check subscription limits before work, with MCP tools, a quota line and the Headroom skill.",
   "author": {
     "name": "Apertur3"

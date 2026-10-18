@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-10-18
+
 ### Changed
 - Claude's scoped weekly limit (Fable and other model-scoped buckets the vendor flags inactive but still reports a percent for) is now labelled "separate weekly limit, unconfirmed: shown for visibility only" and carries `metadata.unconfirmed: true` beside `metadata.vendor_active: false`. It stays a soft window. `status` and `line` show `claude-main:fable wk 41% (unconfirmed)` with no pace state. A targeted `can`, `gate`, `route` or `run` on it is refused as UNKNOWN (never dispatchable, even with `--allow-unknown`) and points at `<principal>:all`; global scans and `plan` skip it.
 - JSON contract, additive only: the new `reason` text, `metadata.unconfirmed`, and an optional `unconfirmed` array on `line.json`.
