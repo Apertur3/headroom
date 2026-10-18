@@ -61,8 +61,8 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
       freshness: "fresh", truth: "official",
       quantity: { used: 92, limit: 100, remaining: 8, unit: "percent" },
       window: expect.objectContaining({ enforcement: "soft" }),
-      reason: "vendor flags this limit inactive; shown because it carries a cap",
-      metadata: { vendor_active: false },
+      reason: "separate weekly limit, unconfirmed: shown for visibility only",
+      metadata: { vendor_active: false, unconfirmed: true },
     });
   });
 

@@ -595,9 +595,12 @@ function window(account: ProviderAccount, meter: string, raw: unknown, minutes: 
  * Headroom read the same account's scoped meter as "inactive") was exactly
  * this case, a bucket with a real percent that got dropped because the flag
  * was trusted over the number sitting right beside it. Enforcement is
- * `soft` and `metadata.vendor_active` is `false` only in that case, purely
- * descriptive (nothing in Headroom currently branches on `enforcement`) so
- * a caller can still tell the two states apart. A scoped limit with no
+ * `soft` and `metadata.vendor_active` is `false` only in that case. It also
+ * carries `metadata.unconfirmed: true`: whether this separate weekly pool
+ * really sits outside the account-wide weekly is not confirmed, so the
+ * reading is for visibility only. A targeted `can`, `gate` or `route` on it
+ * is refused (UNKNOWN, never dispatchable), global scans and plans skip it,
+ * and `status` and `line` show it with no pace state. A scoped limit with no
  * percent at all -- active or not -- has nothing to report and keeps the
  * original not_enforced reporting.
  */
@@ -605,7 +608,7 @@ function scoped(account: ProviderAccount, meter: string, candidate: unknown, now
   const inactive = isObject(candidate) && candidate.is_active === false;
   if (inactive) {
     const real = window(account, meter, candidate, 10_080, now);
-    if (real) return { ...real, window: { ...real.window!, enforcement: "soft" }, reason: "vendor flags this limit inactive; shown because it carries a cap", metadata: { vendor_active: false } };
+    if (real) return { ...real, window: { ...real.window!, enforcement: "soft" }, reason: "separate weekly limit, unconfirmed: shown for visibility only", metadata: { vendor_active: false, unconfirmed: true } };
     return { ...base(account, meter, now), window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "vendor marks scoped limit inactive" };
   }
   return window(account, meter, candidate, 10_080, now) ?? { ...base(account, meter, now), window: { kind: "rolling", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no scoped limit in response" };

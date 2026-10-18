@@ -620,6 +620,15 @@ export interface CanDecision {
 
 interface MeterDecision extends Omit<MeterPaceDecision, "meter"> { dispatchable: boolean; }
 
+/** A scoped limit not yet confirmed to gate work: shown, never decided on. */
+export function isVisibilityOnly(observation: Pick<Observation, "window" | "metadata">): boolean {
+  return observation.metadata?.unconfirmed === true && observation.window?.enforcement === "soft";
+}
+
+function visibilityOnlyMeter(windows: readonly Pick<Observation, "window" | "metadata">[]): boolean {
+  return windows.length > 0 && windows.every(isVisibilityOnly);
+}
+
 function isCountMeter(meter: string, observations: Observation | Observation[] | undefined): boolean {
   const windows = observations === undefined ? [] : Array.isArray(observations) ? observations : [observations];
   return meter.endsWith(":credits") || windows.some((observation) => observation.window?.kind === "count");
@@ -647,6 +656,10 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   if (isCountMeter(meter, windows)) {
     return { state: "UNKNOWN", reason: `count meter ${meter} cannot be used for dispatch`, dispatchable: false };
   }
+  // A visibility-only meter cannot be consumed: refuse, whatever --allow-unknown says.
+  if (visibilityOnlyMeter(windows)) {
+    return { state: "UNKNOWN", reason: `${meter} is visibility-only (unconfirmed); check ${meter.slice(0, meter.indexOf(":"))}:all instead`, dispatchable: false };
+  }
   // No reading at all (a fresh install, a misspelled routing meter, or an
   // absent adapter) is UNKNOWN, never NOT_ENFORCED: NOT_ENFORCED is a
   // vendor-confirmed absent limit, which requires an actual observation to
@@ -655,7 +668,7 @@ function meterDecision(meter: string, observations: Observation | Observation[] 
   // A lane blocked by its exhausted weekly shows as not enforced but has no
   // capacity, so dispatch treats it as frozen (blockedLaneReason).
   const enforced = windows
-    .filter((observation) => observation.window?.kind !== "count")
+    .filter((observation) => observation.window?.kind !== "count" && !isVisibilityOnly(observation))
     .map((observation) => {
       const blocked = blockedLaneReason(observation);
       return blocked ? { observation, state: "FREEZE" as PaceState, reason: blocked, blocked: true } : { observation, ...paceDecision(observation, policy, now), blocked: false };

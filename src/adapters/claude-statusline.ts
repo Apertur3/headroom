@@ -292,7 +292,7 @@ function bucketObservation(principal: string, meter: string, bucket: StatuslineB
     resets_at: epochToIso(bucket.resets_at), observed_at: observedAtIso, fetched_at: fetchedAtIso,
     source: STATUSLINE_SOURCE, truth: "official", freshness, confidence: freshness === "fresh" ? 1 : 0.5,
     adapter_version: "native-ts", upstream_schema_version: "v0.56.4",
-    ...(active ? {} : { reason: "vendor flags this limit inactive; shown because it carries a cap", metadata: { vendor_active: false } }),
+    ...(active ? {} : { reason: "separate weekly limit, unconfirmed: shown for visibility only", metadata: { vendor_active: false, unconfirmed: true } }),
   };
 }
 
