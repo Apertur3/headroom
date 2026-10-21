@@ -32,6 +32,8 @@ export function resetHistory(events: HeadroomEvent[], now = new Date()): MeterRe
   for (const event of [...events].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))) {
     const at = Date.parse(event.created_at);
     if (event.kind !== "reset_seen" || !event.meter_id || !(at >= since && at <= now.getTime())) continue;
+    const minutes = event.metadata?.window_minutes;
+    if (typeof minutes === "number" && minutes < 1440) continue; // sub-daily windows (5h) would bury the weekly story
     const unscheduled = event.metadata?.unscheduled === true;
     const cls: ResetClass = !unscheduled ? "scheduled"
       : free.some((f) => f.principal_id === event.principal_id && Math.abs(Date.parse(f.created_at) - at) <= BANKED_MATCH_MS) ? "banked" : "early";

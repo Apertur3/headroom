@@ -17,6 +17,7 @@ describe("resetHistory", () => {
     // one banked reset recorded on two meters of the same principal
     event("free_reset_used", ago(5, 2), "acme:credits", "acme"),
     event("free_reset_used", ago(5, 1), "acme:main", "acme"),
+    event("reset_seen", ago(3), "acme:main", "acme", { window_minutes: 300 }),
     event("reset_seen", ago(31), "acme:main", "acme", { unscheduled: true, previous_used_percent: 99 }),
     event("reset_seen", ago(2), "other:main", "other", { unscheduled: true, previous_used_percent: 10 }),
   ];
@@ -29,7 +30,7 @@ describe("resetHistory", () => {
     expect(acme.resets.map((r) => r.class)).toEqual(["banked", "early", "scheduled"]);
   });
 
-  it("does not match a free reset of another principal and drops resets past 30 days", () => {
+  it("does not match a free reset of another principal and drops resets past 30 days and sub-daily windows", () => {
     expect(other.early).toBe(1);
     expect(acme.resets).toHaveLength(3);
   });
