@@ -8,7 +8,8 @@ import { paceDecision, reserveFor } from "./policy.js";
 import { formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { redact, writeFileAtomic } from "./security.js";
 import { formatReset, label, planDowngradeLine } from "./status-view.js";
-import { type HeadroomEvent, type Lease, type Observation, type PaceState } from "./types.js";
+import { renderResetsSection } from "./reset-history.js";
+import { type HeadroomEvent, type Observation, type PaceState } from "./types.js";
 
 export const IDLE_WINDOW_REASON = "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder";
 
@@ -869,14 +870,11 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
       issueReason,
     };
   });
-
   // Determine default selected meter and window
   const defaultSelection = determineDefaultSelection(processedWindows) ?? {
     meter_id: subscriptionOverviewRows[0]?.meter_id ?? (processedWindows[0]?.meter_id || ""),
     window_minutes: subscriptionOverviewRows[0]?.window5h?.window_minutes ?? (processedWindows[0]?.window_minutes || null),
   };
-
-  const defaultMeterPrincipal = subscriptionOverviewRows.find((r) => r.meter_id === defaultSelection.meter_id)?.principal_id ?? (processedWindows[0]?.principal_id || "");
 
   // One plain sentence for the overview: which 5-hour window has the least room.
   const trusted5h = subscriptionOverviewRows
@@ -1486,6 +1484,7 @@ export function renderBrowserReport(model: DashboardModel, options: BrowserRepor
     </section>
     ` : ""}
 
+    ${renderResetsSection(model.resets, new Set(model.observations.map((row) => row.meter_id)), escapeHtml)}
     <!-- Collapsed Operational Details & Events -->
     <details class="diagnostics-details">
       <summary>

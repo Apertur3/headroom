@@ -7,6 +7,7 @@ import type { PlanDowngrade } from "./store.js";
 import { isAccountEnabled, isLocalAccount, type Account, type HeadroomEvent, type Lease, type Observation } from "./types.js";
 import { defaultPolicy, type Policy } from "./policy.js";
 import { headroomVersion } from "./version.js";
+import { resetHistory, RESET_HISTORY_DAYS, type MeterResets } from "./reset-history.js";
 
 export interface DashboardSnapshot {
   observations: Observation[];
@@ -16,6 +17,8 @@ export interface DashboardSnapshot {
   burns: Record<string, Array<number | null>>;
   notices: string[];
   planDowngraded: PlanDowngrade[];
+  /** Absent from an older daemon. */
+  resets?: MeterResets[];
 }
 
 export interface DashboardModel extends DashboardSnapshot {
@@ -64,6 +67,7 @@ export function readDashboardStore(store: HeadroomStore, now = new Date(), rows 
     leases: store.leases(undefined, true, now), resetSeen: Object.fromEntries(store.resetSeenFor(rows, now)),
     notices: store.recentUnscheduledResets(meters, now).map((item) => `unscheduled reset on ${item.meter_id}; capacity appeared, re-plan`),
     planDowngraded: store.planDowngrades(new Set(rows.map((row) => row.principal_id))),
+    resets: resetHistory(store.events(new Date(now.getTime() - RESET_HISTORY_DAYS * 86_400_000).toISOString()), now),
   };
 }
 

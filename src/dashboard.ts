@@ -12,6 +12,7 @@ import { blockedLaneSummary, paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
 import { safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
+import { resetSummary } from "./reset-history.js";
 import { isAccountEnabled, isLocalAccount, type Account, type HeadroomEvent, type Observation } from "./types.js";
 
 export interface DashboardModel extends CachedDashboardModel {
@@ -578,6 +579,8 @@ function meterOverviewLines(model: DashboardModel, view: DashboardView, focusedM
         lines.push(`    ${part}`);
       }
     }
+    const resets = model.resets?.find((item) => item.meter_id === meterId);
+    if (resets) lines.push(...wrap(`    resets: ${resetSummary(resets)}`, view.width));
 
     if (!view.verbose && !hasFreshInModel) {
       const unknownRows = rows.filter((r) => dashboardDecision(r, model).state === "UNKNOWN" || r.metadata?.vendor_window_held || r.metadata?.vendor_inconsistent);
