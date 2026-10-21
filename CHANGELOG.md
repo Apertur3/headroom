@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-10-22
+
+### Added
+- Reset history in the dashboard: per meter, the weekly (daily or longer) resets of the last 30 days, each marked scheduled, banked free reset, or early by the vendor, with the usage it gave back. The HTML report has a "Did a limit reset early?" section, and `headroom dashboard` prints one summary line per meter.
+- Gauge mark icons `docs/assets/mark-gauge-light.svg` and `docs/assets/mark-gauge-dark.svg`.
+
+### Fixed
+- The release job now polls the npm registry for the published version for up to 15 minutes before publishing to the MCP Registry (#170).
+
+### Security
+- vite updated to 8.3.5 (GHSA-vfpm-58rq-9qcg, dev dependency) (#172).
+
 ## [0.2.12] - 2026-10-18
 
 ### Changed
