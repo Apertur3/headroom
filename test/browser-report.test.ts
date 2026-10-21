@@ -158,6 +158,19 @@ describe("browser report pure renderer", () => {
     tempDirs = [];
   });
 
+  it("shows the reset history for shown meters only", () => {
+    const resets = [
+      { meter_id: "codex-main:main", scheduled: 1, banked: 1, early: 2, given_back: 150, last_scheduled: "2026-09-01T10:00:00.000Z", resets: [
+        { at: "2026-09-10T10:00:00.000Z", class: "early" as const, used_before: 60 }, { at: "2026-09-05T10:00:00.000Z", class: "banked" as const, used_before: 90 },
+        { at: "2026-09-01T10:00:00.000Z", class: "scheduled" as const, used_before: null } ] },
+      { meter_id: "retired:main", scheduled: 1, banked: 0, early: 0, given_back: 0, last_scheduled: null, resets: [] },
+    ];
+    const html = renderBrowserReport(sampleModel({ resets }));
+    expect(html).toContain("2 early by vendor, 1 banked, 1 scheduled in 30d, 150% usage given back");
+    expect(html).not.toContain("retired:main");
+    expect(renderBrowserReport(sampleModel())).not.toContain("resets-section");
+  });
+
   it("produces a complete, standalone HTML document without external assets or telemetry", () => {
     const model = sampleModel();
     const html = renderBrowserReport(model);
