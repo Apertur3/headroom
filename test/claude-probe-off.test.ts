@@ -25,9 +25,12 @@ async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none")
   return home;
 }
 
-async function poll(home: string, run?: () => Promise<string>) {
+const stream = () => readFile(new URL("./fixtures/claude/usage-stream.synthetic.jsonl", import.meta.url), "utf8");
+const t0 = new Date();
+
+async function poll(home: string, run?: () => Promise<string>, now: () => Date = () => t0) {
   const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
-  try { return await pollAccounts(undefined, run ? { claudeUsage: { run } } : {}); }
+  try { return await pollAccounts(undefined, run ? { claudeUsage: { run, now } } : {}); }
   finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
 }
 
@@ -55,17 +58,56 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
     expect(probe.observeClaude).toHaveBeenCalledTimes(1);
   });
 
-  it("with no snapshot, Claude Code's /usage fills the meters (Fable too) from native:claude-usage; a fresh snapshot never runs it", async () => {
-    const run = vi.fn(async () => readFile(new URL("./fixtures/claude/usage-stream.synthetic.jsonl", import.meta.url), "utf8"));
+  it("with no snapshot, Claude Code's /usage fills the meters (Fable too) from native:claude-usage", async () => {
+    const run = vi.fn(async () => stream());
     const none = await poll(await setup(false, "none"), run);
     expect(run).toHaveBeenCalledTimes(1);
     expect(none.observations).toEqual(expect.arrayContaining([
       expect.objectContaining({ meter_id: "claude-main:all", source: "native:claude-usage", freshness: "fresh", quantity: expect.objectContaining({ used: 7 }) }),
       expect.objectContaining({ meter_id: "claude-main:fable", source: "native:claude-usage", freshness: "fresh" }),
     ]));
-    run.mockClear();
-    const fresh = await poll(await setup(false, "fresh"), run);
-    expect(run).not.toHaveBeenCalled();
-    expect(fresh.observations.every((item) => item.source === "native:claude-statusline")).toBe(true);
+  });
+
+
+  it("probe on + fresh snapshot + recent ok /usage: zero probe calls over 3 polls", async () => {
+    const home = await setup(true, "fresh");
+    const run = vi.fn(async () => stream());
+    for (let i = 0; i < 3; i++) await poll(home, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(probe.observeClaude).not.toHaveBeenCalled();
+  });
+
+  it("probe on + /usage error + no snapshot: the probe runs once per poll", async () => {
+    const home = await setup(true, "none");
+    probe.observeClaude.mockResolvedValue([]);
+    const run = vi.fn(async () => { throw new Error("exit 1"); });
+    for (let i = 0; i < 3; i++) await poll(home, run);
+    expect(run).toHaveBeenCalledTimes(1); // throttled, but the failed run still counts as unknown
+    expect(probe.observeClaude).toHaveBeenCalledTimes(3);
+  });
+
+  it("probe off + fresh snapshot: /usage refreshes the Fable row at most every 10 minutes", async () => {
+    const home = await setup(false, "fresh");
+    const run = vi.fn(async () => stream());
+    let clock = t0.getTime();
+    const first = await poll(home, run, () => new Date(clock));
+    expect(first.observations).toContainEqual(expect.objectContaining({ meter_id: "claude-main:fable", source: "native:claude-usage", freshness: "fresh" }));
+    expect(first.observations.filter((item) => item.meter_id === "claude-main:all").every((item) => item.source === "native:claude-statusline")).toBe(true);
+    clock += 60_000;
+    await poll(home, run, () => new Date(clock));
+    expect(run).toHaveBeenCalledTimes(1);
+    clock += 11 * 60_000;
+    await poll(home, run, () => new Date(clock));
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("throttled after an ok run with no snapshot: no probe, nothing added", async () => {
+    const home = await setup(true, "none");
+    const run = vi.fn(async () => stream());
+    await poll(home, run);
+    const second = await poll(home, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(probe.observeClaude).not.toHaveBeenCalled();
+    expect(second.failures).toEqual([]);
   });
 });

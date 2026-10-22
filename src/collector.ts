@@ -197,58 +197,37 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   const claudePolicy = claudePrincipalsPresent ? await readPolicy() : undefined;
   const statuslineDirs = claudePolicy ? statuslineSnapshotDirs(claudePolicy.statusline_snapshot_dirs) : [];
   for (const account of tsAccounts) {
-    // The statusline snapshot is the zero-auth fallback, never the preferred
-    // source: it carries only the 5h and weekly account-wide figures, while
-    // the granted probe also returns every model-scoped bucket (Fable,
-    // Routines). Skipping a granted probe whenever a snapshot was fresh left
-    // the scoped meters stale for as long as the snapshot kept arriving.
-    const claudeSnapshot = account.vendor === "claude"
-      ? await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date())
-      : undefined;
-    // Order: fresh statusline snapshot, then Claude Code's own `/usage` (at most
-    // every 10 minutes per profile), then the token probe only if claude_probe.
+    // Claude read order, every poll: a fresh statusline snapshot (5h and weekly),
+    // Claude Code's own `/usage` (at most every 10 minutes per profile, run
+    // whatever the snapshot, and the only source of scoped meters such as
+    // Fable), then the token probe as a last resort, only when claude_probe is
+    // on and the account would otherwise have no fresh reading.
+    const claudeAccounts = providerAccounts.filter((item) => item.vendor === "claude");
     if (account.vendor === "claude") {
-      const probeOn = claudePolicy?.claude_probe === true;
-      if (claudeSnapshot && !probeOn) {
-        observations.push(...observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date()));
-        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
+      const snapshot = await freshStatuslineSnapshot(statuslineDirs, account, claudeAccounts, new Date());
+      const usage = await observeClaudeUsage(account, options.claudeUsage);
+      const usageError = "error" in usage ? usage.error : "throttled" in usage ? usage.throttled.error : undefined;
+      const fromSnapshot = snapshot ? observationsFromStatuslineSnapshot(snapshot, account.name, new Date()) : [];
+      if (snapshot || !usageError) {
+        // Account-wide windows come from the snapshot (live); /usage adds what it does not carry.
+        const covered = new Set(fromSnapshot.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
+        const rows = "rows" in usage ? usage.rows.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`)) : [];
+        // Throttled after a good run: keep the last reading; only an old snapshot can add rows.
+        const old = snapshot || "rows" in usage ? undefined : await latestStatuslineSnapshot(statuslineDirs, account, claudeAccounts, new Date());
+        observations.push(...fromSnapshot, ...rows, ...(old ? observationsFromStatuslineSnapshot(old, account.name, new Date()) : []));
+        claudeProbeOutcomes[account.name] = snapshot ? "skipped: statusline fresh" : "skipped: claude usage";
         continue;
       }
-      let usageError: string | undefined;
-      if (!claudeSnapshot) {
-        const usage = await observeClaudeUsage(account, options.claudeUsage);
-        if (usage && "rows" in usage) {
-          observations.push(...usage.rows);
-          claudeProbeOutcomes[account.name] = "skipped: claude usage";
-          continue;
-        }
-        if (usage) usageError = usage.error;
-        else if (!probeOn) {
-          // Ran under 10 minutes ago: keep the last reading; only an old snapshot can add rows.
-          const old = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
-          if (old) observations.push(...observationsFromStatuslineSnapshot(old, account.name, new Date()));
-          claudeProbeOutcomes[account.name] = "skipped: claude usage";
-          continue;
-        }
-      }
-      if (!probeOn) {
-        const latest = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
+      if (claudePolicy?.claude_probe !== true) {
+        const latest = await latestStatuslineSnapshot(statuslineDirs, account, claudeAccounts, new Date());
         observations.push(...(latest ? observationsFromStatuslineSnapshot(latest, account.name, new Date()) : claudeProbeOffObservations(account, new Date(), usageError)));
         claudeProbeOutcomes[account.name] = "skipped: claude_probe off";
         continue;
       }
     }
     if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
-      if (claudeSnapshot) {
-        // A principal blocked pending a grant still reads its account-wide
-        // figures from the snapshot; its scoped meters stay grant-needed.
-        observations.push(...observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date()));
-        observations.push(...claudeGrantNeededObservations(account).filter((item) => !item.meter_id.endsWith(":all")));
-        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
-      } else {
-        observations.push(...claudeGrantNeededObservations(account));
-        claudeProbeOutcomes[account.name] = "skipped: grant needed";
-      }
+      observations.push(...claudeGrantNeededObservations(account));
+      claudeProbeOutcomes[account.name] = "skipped: grant needed";
       continue;
     }
     if (account.vendor === "claude") claudeProbeOutcomes[account.name] = "called";
@@ -257,15 +236,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     // under, never silently switching to a different candidate that happens
     // to resolve too (a repo checkout built alongside an existing global
     // install, for one).
-    let result = account.vendor === "claude" ? await observeClaude(account, { probePath: options.claudeGrant?.probePath() }) : await observeCodex(account);
-    if (claudeSnapshot && !result.some((item) => item.freshness === "fresh")) {
-      // The probe failed this poll (transport, backoff, a denied dialog): the
-      // snapshot still answers the account-wide windows; the probe's own
-      // failure rows stay for every meter the snapshot does not carry.
-      const fromSnapshot = observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date());
-      const covered = new Set(fromSnapshot.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
-      result = [...fromSnapshot, ...result.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`))];
-    }
+    const result = account.vendor === "claude" ? await observeClaude(account, { probePath: options.claudeGrant?.probePath() }) : await observeCodex(account);
     observations.push(...result);
     if (account.vendor === "claude" && options.claudeGrant) {
       if (result.some((item) => item.freshness === "fresh")) options.claudeGrant.markProbeSucceeded();

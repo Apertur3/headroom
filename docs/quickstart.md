@@ -189,8 +189,7 @@ prefers a snapshot under 10 minutes old, and reads a Fable-scoped or other
 model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **A profile
 set up this way is read without opening the Keychain item at all.** A profile whose statusline
 hasn't rendered yet (or has gone stale) is read by running Claude Code's own `/usage` at most every
-10 minutes; `headroom doctor` says so. Set `claude_probe = true` in `policy.toml` to add the older
-token probe as a last resort.
+10 minutes (which also refreshes the scoped meters); `headroom doctor` says so. Set `claude_probe = true` in `policy.toml` to add the direct token request as a last resort, used only when neither gives a reading.
 
 ## 4c. When the meter is blocked, paste the panel
 

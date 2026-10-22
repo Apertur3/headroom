@@ -36,7 +36,7 @@ describe("claude /usage runner", () => {
     const dir = await stampDir();
     const run = vi.fn(async () => stream());
     expect(await observeClaudeUsage(account, { run, now: () => at, stampDir: dir })).toHaveProperty("rows");
-    expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + 60_000), stampDir: dir })).toBeUndefined();
+    expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + 60_000), stampDir: dir })).toEqual({ throttled: {} });
     expect(run).toHaveBeenCalledTimes(1);
     expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS + 1000), stampDir: dir })).toHaveProperty("rows");
     expect(run).toHaveBeenCalledTimes(2);
@@ -75,7 +75,7 @@ describe("claude /usage runner hardening", () => {
     const run = vi.fn(async () => stream());
     const other = { ...account, location: "/elsewhere/.claude-work" };
     const results = await Promise.all([observeClaudeUsage(account, { run, now: () => at, stampDir: dir }), observeClaudeUsage(account, { run, now: () => at, stampDir: dir }), observeClaudeUsage(other, { run, now: () => at, stampDir: dir })]);
-    expect(results.filter((item) => item !== undefined)).toHaveLength(2); // one winner per location; same basename no longer shares a throttle
+    expect(results.filter((item) => !("throttled" in item))).toHaveLength(2); // one winner per location; same basename no longer shares a throttle
     await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS), stampDir: dir });
     expect((await readdir(dir)).length).toBe(2); // the older stamp for that key was removed
   });

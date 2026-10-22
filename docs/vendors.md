@@ -21,25 +21,31 @@ A fresh build without network access to GitHub needs cached dependencies.
 
 ## Claude
 
-Headroom reads Claude Code usage in this order: a fresh statusline snapshot, then Claude Code's own
-`/usage` (`claude -p "/usage" --output-format stream-json ...`, source `native:claude-usage`, at
-most once per 10 minutes per profile, no shell, no model turn, parsing only the structured
-`usage_report` and failing closed with a reason when it is absent), then, only if you set
-`claude_probe = true`, the vendor probe.
+Headroom reads Claude Code usage in this order, on every poll:
+
+1. A fresh statusline snapshot gives the 5h and weekly windows.
+2. Claude Code's own `/usage` (`claude -p "/usage" --output-format stream-json ...`, source
+   `native:claude-usage`) runs at most once per 10 minutes per profile, whether or not a snapshot is
+   fresh. It gives every window, including the scoped weekly meters (Fable), which the statusline
+   does not carry. No shell is involved except for a Windows `.cmd` launcher, there is no model
+   turn, only the structured `usage_report` is read, and any malformed entry fails the whole read
+   with a reason. The outcome of the last run is kept, so a throttled poll knows whether it worked.
+3. Only if `claude_probe = true` and the account would otherwise have no fresh reading (no fresh
+   snapshot, and `/usage` failed this poll or failed on its last run), the direct usage request
+   below.
+4. Otherwise the reading shows as stale or unknown, with the reason.
 
 ### The `claude_probe` switch
 
 `claude_probe` in `policy.toml` is a boolean, default `false`. With `false`, the Claude collector
-never touches the Keychain or Anthropic's endpoint for Claude: it uses the statusline snapshot and
-`claude /usage`; if both fail the reading shows as stale or unknown, not as an error, and
-`headroom doctor` says how to wire the statusline (set Claude Code's `statusLine` command to
-`headroom statusline`). The statusline only runs inside interactive sessions (never under
-`claude -p`), and a replayed render does not restamp the snapshot unless the session's API time
-grew. A file whose `source` is not `statusline` is ignored. With
-`true`, a stale snapshot is topped up by the probe below, which calls `GET
-api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth token as `User-Agent:
-headroomd/<version>`. Anthropic's terms restrict using Claude subscription OAuth tokens outside
-Claude Code; read them before enabling.
+never touches the Keychain or Anthropic's endpoint: it uses the statusline snapshot and
+`claude /usage`, and `headroom doctor` says how to wire the statusline (set Claude Code's
+`statusLine` command to `headroom statusline`). The statusline only runs inside interactive
+sessions (never under `claude -p`), and a replayed render does not restamp the snapshot unless that
+session's API time grew. A file whose `source` is not `statusline` is ignored. With `true`, the
+last-resort request is `GET api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth token
+and `User-Agent: headroomd/<version>`. Anthropic's terms restrict using Claude subscription OAuth
+tokens outside Claude Code; read them before enabling.
 
 ### Zero-auth source: the statusline snapshot
 

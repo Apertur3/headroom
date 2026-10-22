@@ -7,20 +7,20 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- Behaviour change: the Claude usage probe is now off by default (`claude_probe = false`). Claude is read from the statusline snapshot only, with no Keychain or network access; a missing or old snapshot shows as stale or unknown. Upgrade step: set the `statusLine` command in your Claude `settings.json` (each profile) to `headroom statusline`, or chain your existing one with `headroom statusline --chain '<your command>'`, or set `claude_probe = true` in `policy.toml` to keep the old token fallback. Until then Headroom runs Claude Code's own `/usage` (at most every 10 minutes per profile); `headroom status` and `headroom doctor` print this fix as one line. Headroom never edits your Claude settings.
-- Honest client identity: every vendor request (Claude probe, Codex, Grok, Kimi) now sends `User-Agent: headroomd/<version>`. The `claude-code/2.1.0`, `CodexBar`, `originator: Codex Desktop`, `x-xai-token-auth: xai-grok-cli` and `x-msh-platform: kimi_code_cli` headers and the Kimi web-gateway `Origin`/`Referer` are gone.
-- The Antigravity keepalive is opt-in on every platform: `antigravity_keepalive` now defaults to `false`.
+- Claude usage is read through Claude Code by default: the statusline snapshot first, then Claude Code's own `/usage` (at most every 10 minutes per profile, run whether or not a snapshot is fresh, and the source of the scoped weekly meters). The direct usage request is opt-in with `claude_probe = true` in `policy.toml` and is used only when no other reading is available. To see live figures between `/usage` runs, set your Claude `statusLine` to `headroom statusline` (or chain an existing one with `--chain`); `headroom status` and `headroom doctor` show this as one line. Headroom never edits your Claude settings.
+- Requests to vendor services identify as `headroomd/<version>`.
+- `antigravity_keepalive` now defaults to `false`.
 
 ### Added
-- `claude_probe` in `policy.toml` (boolean). When `false`, the Claude collector never touches the Keychain or Anthropic's endpoint.
-- Claude source `native:claude-usage`: when no statusline snapshot is fresh, Headroom runs Claude Code's own `claude -p "/usage"` (at most every 10 minutes per profile, no shell, structured `usage_report` only, fails closed) and reads the 5h, weekly and scoped (Fable) meters from it.
-- `headroom statusline` restamps its snapshot only when the session's API time grew and never lowers a figure within one reset; a snapshot file whose `source` is not `statusline` is ignored.
+- `claude_probe` setting in `policy.toml`.
+- Claude source `native:claude-usage` (Claude Code's `/usage` report), including the scoped weekly meters.
+- `headroom statusline` keeps a snapshot fresh only while its session makes requests, and never lowers a figure within one reset window.
 
 ### Removed
-- The opt-in Antigravity model catalog (it used the Gemini CLI OAuth token), the Google Code Assist client with its scraped OAuth client, and the unused remote Antigravity and Gemini quota readers. `antigravity_model_catalog` in an old `policy.toml` is accepted and ignored. The local `agy` quota path is unchanged.
+- The experimental Antigravity model list and unused remote Antigravity and Gemini readers. `antigravity_model_catalog` in an old `policy.toml` is ignored. Local Antigravity quota reading is unchanged.
 
-### Security
-- SECURITY.md: the rules are design goals, not a warranty; the Windows session-token description no longer claims mode 0600; states that the engine links SweetCookieKit but Headroom never reads browser cookies.
+### Fixed
+- Documentation: SECURITY.md wording on design goals and the Windows session file; third-party notice for SweetCookieKit.
 
 ## [0.2.13] - 2026-10-22
 

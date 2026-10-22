@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, open, readdir, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { headroomHome } from "../paths.js";
@@ -25,8 +25,8 @@ const ENV_KEYS = ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "USERPROFILE", "A
 
 export type ClaudeUsageRunner = (binary: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string; timeout: number }) => Promise<string>;
 export interface ClaudeUsageDependencies { run?: ClaudeUsageRunner; now?: () => Date; stampDir?: string; binary?: string }
-/** `undefined`: ran recently, nothing to add. */
-export type ClaudeUsageResult = { rows: Observation[] } | { error: string } | undefined;
+/** `throttled`: ran within the interval; `error` carries the reason when that run failed, absent when it succeeded. */
+export type ClaudeUsageResult = { rows: Observation[] } | { error: string } | { throttled: { error?: string } };
 
 /** Windows npm installs expose `claude.cmd`, which only a shell can start. Safe here: every argument is a constant and the only variable input travels in env. */
 export const needsShell = (binary: string, platform: string = process.platform): boolean => platform === "win32" && /\.(cmd|bat)$/i.test(binary);
@@ -57,18 +57,25 @@ function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
   return env;
 }
 
-/** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket; false when it already exists. */
-async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<boolean> {
+/** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket.
+ * The stamp later holds the run's outcome (JSON `{error?}`), so a throttled poll knows whether the last run worked. */
+async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ path: string } | { throttled: { error?: string } } | { error: string }> {
   const dir = dependencies.stampDir ?? join(headroomHome(), "claude-usage");
   const key = createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12);
   // ponytail: bucket-aligned throttle, two runs can straddle a boundary
   const name = `${key}.${Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS)}.stamp`;
+  const path = join(dir, name);
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    await (await open(join(dir, name), "wx", 0o600)).close();
+    await (await open(path, "wx", 0o600)).close();
     for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old !== name) await unlink(join(dir, old)).catch(() => undefined);
-    return true;
-  } catch { return false; } // already claimed, or cannot record the claim: fail closed rather than run unthrottled
+    return { path };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return { error: "claude /usage could not record its run claim" }; // fail closed rather than run unthrottled
+    // An empty stamp is a run still in flight: not a failure.
+    const recorded = await readFile(path, "utf8").then((text) => text ? JSON.parse(text) as { error?: unknown } : {} as { error?: unknown }, (): { error?: unknown } => ({}));
+    return { throttled: typeof recorded.error === "string" ? { error: recorded.error } : {} };
+  }
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -100,7 +107,14 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
 
 export async function observeClaudeUsage(account: ProviderAccount, dependencies: ClaudeUsageDependencies = {}): Promise<ClaudeUsageResult> {
   const now = dependencies.now?.() ?? new Date();
-  if (!await claimSlot(account, dependencies, now)) return undefined;
+  const claim = await claimSlot(account, dependencies, now);
+  if (!("path" in claim)) return claim;
+  const result = await run(account, dependencies, now);
+  await writeFile(claim.path, JSON.stringify("error" in result ? { error: result.error } : {}), { mode: 0o600 }).catch(() => undefined);
+  return result;
+}
+
+async function run(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ rows: Observation[] } | { error: string }> {
   try {
     const stdout = await (dependencies.run ?? defaultRun)(resolveBinary(dependencies.binary ?? process.env.HEADROOM_CLAUDE_BIN ?? "claude"), ARGS, { env: childEnvironment(account), cwd: tmpdir(), timeout: TIMEOUT_MS });
     const body = usageBodyFromStream(stdout);
