@@ -51,7 +51,7 @@ export function stripAmbientProxyEnvironment(proxy: string | undefined, env: Nod
 
 export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
   const parsed = new URL(url);
-  if (parsed.hostname === "api.anthropic.com" || parsed.hostname === "chatgpt.com" || parsed.hostname === "cloudcode-pa.googleapis.com" || parsed.hostname === "oauth2.googleapis.com") return parsed;
+  if (parsed.hostname === "api.anthropic.com" || parsed.hostname === "chatgpt.com") return parsed;
   // The Grok CLI's chat proxy, the only host the Grok adapter contacts.
   if (parsed.hostname === "cli-chat-proxy.grok.com") return parsed;
   // Kimi's subscription gateway, the Kimi Code CLI's own usages endpoint, and

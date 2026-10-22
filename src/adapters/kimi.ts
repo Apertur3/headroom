@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { vendorJson } from "../limits.js";
 import { expandHome } from "../paths.js";
+import { userAgent } from "../version.js";
 import { outboundFetch, readBoundedRegularFile, redact } from "../security.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
@@ -57,11 +58,6 @@ const LOGIN_STEP = "sign in at https://www.kimi.com/code/console and copy the ki
 /** The Kimi Code CLI's own login command, which is the only thing that can
  * replace an expired CLI credential: Headroom does not refresh it. */
 const CLI_LOGIN_STEP = "run: kimi login";
-/** The one identity header the Kimi Code CLI sends that says nothing about the
- * operator's machine. Headroom deliberately leaves out the CLI's hostname, OS
- * version and device-id headers: that is telemetry about this machine, and the
- * device id would mean creating a file inside another tool's home. */
-const CLI_PLATFORM = "kimi_code_cli";
 /** A credential that expires within the minute is treated as already expired,
  * so a poll cannot spend a request on a token that dies in flight. */
 const CLI_EXPIRY_GRACE_MS = 60_000;
@@ -414,8 +410,7 @@ function gatewayRequest(url: string, token: string, body: unknown): Request {
       "Content-Type": "application/json",
       Accept: "application/json",
       "connect-protocol-version": "1",
-      Origin: "https://www.kimi.com",
-      Referer: "https://www.kimi.com/code/console",
+      "User-Agent": userAgent(),
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -476,7 +471,7 @@ async function observeMoonshotCredits(account: ProviderAccount, path: string, do
   try { key = await readKimiToken(path); }
   catch (error) { return failed(account, `${error instanceof Error ? error.message.replace("token file", "credits key file") : "Moonshot key unavailable"} (${path})`, now, ["credits"], CREDITS_SOURCE); }
   try {
-    const response = await outboundFetch(doFetch, new Request(MOONSHOT_BALANCE_URL, { headers: { Authorization: `Bearer ${key}`, Accept: "application/json" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+    const response = await outboundFetch(doFetch, new Request(MOONSHOT_BALANCE_URL, { headers: { Authorization: `Bearer ${key}`, Accept: "application/json", "User-Agent": userAgent() }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
     if (!response.ok) throw new ProviderHTTPError(response.status, "Moonshot balance");
     return [observationFromMoonshotBalance(await vendorJson(response), account, at)];
   } catch (error) {
@@ -501,7 +496,7 @@ async function observeKimiCodeCli(account: ProviderAccount, path: string, doFetc
   if (kimiCliCredentialExpired(credential, at)) return failed(account, `Kimi CLI credential expired; ${CLI_LOGIN_STEP} (Headroom never refreshes it)`, timestamp, CODE_METERS);
   try {
     const response = await outboundFetch(doFetch, new Request(CODE_USAGES_URL, {
-      headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "x-msh-platform": CLI_PLATFORM },
+      headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "User-Agent": userAgent() },
       signal: AbortSignal.timeout(TIMEOUT_MS),
     }));
     if (!response.ok) throw new ProviderHTTPError(response.status, "Kimi");

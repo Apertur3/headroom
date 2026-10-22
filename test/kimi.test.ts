@@ -168,6 +168,8 @@ describe("observeKimi", () => {
     for (const request of requests) {
       expect(request.method).toBe("POST");
       expect(request.headers.get("authorization")).toBe("Bearer synthetic-opaque-token");
+      expect(request.headers.get("user-agent")).toMatch(/^headroomd\/\S+$/);
+      expect([request.headers.get("origin"), request.headers.get("referer"), request.headers.get("x-msh-platform")]).toEqual([null, null, null]);
       expect(() => allowedOutbound(request.url)).not.toThrow();
     }
     expect(rows.filter((row) => row.freshness === "fresh").length).toBeGreaterThan(0);
@@ -222,6 +224,7 @@ describe("observeKimi", () => {
     });
     const rows = await observeKimi(target, { fetch: fetcher, now: () => at });
     expect(requests.map((request) => new URL(request.url).hostname)).toContain("api.moonshot.ai");
+    for (const request of requests) expect(request.headers.get("user-agent")).toMatch(/^headroomd\/\S+$/);
     expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "fresh", quantity: expect.objectContaining({ remaining: 12.5, unit: "credits" }) });
     expect(JSON.stringify(rows)).not.toContain("synthetic-moonshot-key");
   });
@@ -338,7 +341,8 @@ describe("Kimi Code CLI credential source", () => {
     expect(requests.map((request) => new URL(request.url).hostname)).toEqual(["api.kimi.com"]);
     expect(requests[0].method).toBe("GET");
     expect(requests[0].headers.get("authorization")).toBe("Bearer synthetic-cli-access-token");
-    expect(requests[0].headers.get("x-msh-platform")).toBe("kimi_code_cli");
+    expect(requests[0].headers.get("x-msh-platform")).toBeNull();
+    expect(requests[0].headers.get("user-agent")).toMatch(/^headroomd\//);
     // No machine identity travels with the request, and no cookie is involved.
     expect(requests[0].headers.get("cookie")).toBeNull();
     expect(requests[0].headers.get("x-msh-device-id")).toBeNull();

@@ -12,9 +12,9 @@ let anthropicUsageHost = "api.anthropic.com"
 
 /// The Apple-signed tool this probe reads the credential through.
 ///
-/// Claude Code 2.1.263 rewrites `Claude Code-credentials` (and the
+/// Claude Code 2.1.263 writes `Claude Code-credentials` (and the
 /// per-profile `Claude Code-credentials-<hash>` items) with an access list
-/// that admits Apple-signed tools but not third-party applications. A direct
+/// that names Apple's `security` tool. A direct
 /// `SecItemCopyMatching` with `kSecReturnData` from this probe therefore
 /// comes back `errSecItemNotFound` even from the user's own Terminal, with no
 /// dialog offered at all, while `/usr/bin/security find-generic-password -w`
@@ -161,7 +161,7 @@ struct HeadroomClaudeProbe {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("headroomd/\(ProcessInfo.processInfo.environment["HEADROOM_VERSION"] ?? "unknown")", forHTTPHeaderField: "User-Agent")
         let wait = DispatchSemaphore(value: 0)
         let resultBox = ResultBox()
         let delegate = RedirectRefusingDelegate()

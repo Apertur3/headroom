@@ -70,6 +70,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-external-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), accountsToml(fakeAgy), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     external.pids = [4_000_000]; // somebody else's IDE language server
@@ -101,6 +102,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-ide-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), accountsToml(fakeAgy), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     external.pids = [4_000_000]; // somebody else's IDE language server
@@ -172,6 +174,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     let enginePid: number | undefined;
     try {
       if (!await startDaemon(daemon)) return;
+      await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
       await writeFile(join(root, "accounts.toml"), accountsToml(engine), { mode: 0o600 });
       const polling = (daemon as unknown as Internal).poll(undefined, true).catch(() => undefined);
       track(Number(await waitForFile(grandchildPidFile)), root);

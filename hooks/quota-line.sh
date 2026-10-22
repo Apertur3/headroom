@@ -1,7 +1,7 @@
 #!/bin/sh
 # Read the daemon's last quota line without polling a vendor.
 {
-  for dir in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude" "$HOME/.claude2"; do
+  for dir in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; do
     [ -n "$dir" ] || continue
     settings="$dir/settings.json"
     if [ -f "$settings" ] && grep -qsF 'hooks/claude-line.sh' "$settings"; then

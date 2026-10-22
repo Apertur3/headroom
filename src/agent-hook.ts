@@ -72,9 +72,9 @@ export function isHeadroomCommand(command: unknown): boolean {
 }
 
 /** Every Claude config dir to cover: CLAUDE_CONFIG_DIR if set, else
- * ~/.claude, plus ~/.claude2 when it exists. Only existing dirs are kept. */
+ * ~/.claude. Only an existing dir is kept. */
 export async function claudeConfigDirs(env: NodeJS.ProcessEnv = process.env, home = homedir()): Promise<string[]> {
-  const candidates = [env.CLAUDE_CONFIG_DIR ? env.CLAUDE_CONFIG_DIR : join(home, ".claude"), join(home, ".claude2")];
+  const candidates = [env.CLAUDE_CONFIG_DIR ? env.CLAUDE_CONFIG_DIR : join(home, ".claude")];
   const unique = [...new Set(candidates)];
   const existing: string[] = [];
   for (const dir of unique) {

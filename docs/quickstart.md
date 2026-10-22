@@ -99,7 +99,7 @@ command's usage.
 
 ## 4. Check the Claude credential (macOS only)
 
-macOS only: skip this step on Linux and Windows, where there is no Keychain and nothing to grant.
+macOS only, and only if you set `claude_probe = true`: skip this step otherwise, and on Linux and Windows, where there is no Keychain and nothing to grant.
 
 ```sh
 headroom keychain grant
@@ -113,12 +113,12 @@ the real error (an absent login, a `security` run that failed, an expired token)
 Windows there is no Keychain at all: Headroom reads the token straight from
 `<config-dir>/.credentials.json`.
 
-## 4b. Or skip the credential read entirely: `headroom statusline`
+## 4b. Wire the statusline (the default Claude source): `headroom statusline`
 
-Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+Claude Code hands its `statusLine` command a JSON object when an interactive session renders its statusline (it never runs under `claude -p`), containing
 `rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`, `resets_at`) -- the exact
 numbers the vendor probe exists to fetch, already sitting on stdin for free.
-Register `headroom statusline` as that command and Headroom reads it as a zero-auth source instead:
+Register `headroom statusline` as that command and Headroom reads it as its zero-auth Claude source (no credential read):
 
 ```json
 {
@@ -185,10 +185,11 @@ to one poll interval old (`poll_interval_minutes`, five minutes by default). Not
 ever calls a vendor, so the line cannot delay your prompt.
 
 Every reading this way snapshots to `~/.headroom/statusline/<profile>.json` (0600); the collector
-prefers a snapshot under 10 minutes old over the vendor probe, and reads a Fable-scoped or other
+prefers a snapshot under 10 minutes old, and reads a Fable-scoped or other
 model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **A profile
 set up this way is read without opening the Keychain item at all.** A profile whose statusline
-hasn't rendered yet (or has gone stale) still falls back to the probe.
+hasn't rendered yet (or has gone stale) is read by running Claude Code's own `/usage` at most every
+10 minutes (which also refreshes the scoped meters); `headroom doctor` says so. Set `claude_probe = true` in `policy.toml` to add the direct token request as a last resort, used only when neither gives a reading.
 
 ## 4c. When the meter is blocked, paste the panel
 
@@ -436,8 +437,8 @@ headroom hook uninstall --agent claude # remove it again
 
 The hook is a small shell script in `~/.headroom/hooks/` that reads that file and appends its age: no
 Node, no network, a few milliseconds, and it never fails a prompt. Install adds one
-`UserPromptSubmit` entry to `settings.json` in `CLAUDE_CONFIG_DIR` (or `~/.claude`) and in
-`~/.claude2` when that exists, backs each file up once first, leaves every other setting alone, and
+`UserPromptSubmit` entry to `settings.json` in `CLAUDE_CONFIG_DIR` (or `~/.claude`),
+backs the file up once first, leaves every other setting alone, and
 refuses to edit a file that does not parse. It costs about 60 tokens per turn. `headroom setup` offers
 it (default yes); `setup --yes` installs it only with `--hook`. Not supported yet: Windows (the daemon
 still writes the line, and `headroom line` prints it), and Codex or Gemini hooks.

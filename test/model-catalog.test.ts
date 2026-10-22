@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  checkModelAvailability, fetchAntigravityModelCatalog, MODEL_CATALOG_MAX_AGE_MS, MODEL_CHECK_INTERVAL_MS,
+  checkModelAvailability, MODEL_CATALOG_MAX_AGE_MS, MODEL_CHECK_INTERVAL_MS,
   readClaudeModelCatalog, readCodexModelCatalog,
 } from "../src/model-catalog.js";
 import { HeadroomStore } from "../src/store.js";
@@ -96,76 +96,12 @@ describe("Claude model catalog reader (local cache directory, no network)", () =
   });
 });
 
-describe("Antigravity model catalog reader (fetchAvailableModels, same credential as quota)", () => {
-  const at = new Date("2026-09-23T18:00:00Z");
-
-  it("resolves the project from the stored credential and parses the models map", async () => {
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({})))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        models: { "gemini-2.5-pro": { displayName: "Gemini 2.5 Pro" }, "claude-sonnet": { displayName: "Claude Sonnet" } },
-      })));
-    const models = await fetchAntigravityModelCatalog({
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z", project: "stored-project" }),
-      fetch,
-    });
-    expect(models).toEqual([{ id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" }, { id: "claude-sonnet", name: "Claude Sonnet" }]);
-    const requests = fetch.mock.calls.map(([request]) => request as Request);
-    expect(requests[1].url).toBe("https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels");
-    expect(await requests[1].text()).toBe(JSON.stringify({ project: "stored-project" }));
-  });
-
-  it("returns undefined, never throws, when no Code Assist project can be resolved", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({})));
-    const models = await fetchAntigravityModelCatalog({
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z" }),
-      fetch,
-    });
-    expect(models).toBeUndefined();
-    expect(fetch).toHaveBeenCalledTimes(1); // never calls fetchAvailableModels without a project
-  });
-
-  it("returns undefined on a non-2xx response instead of throwing", async () => {
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({})))
-      .mockResolvedValueOnce(new Response("{}", { status: 500 }));
-    const models = await fetchAntigravityModelCatalog({
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z", project: "stored-project" }),
-      fetch,
-    });
-    expect(models).toBeUndefined();
-  });
-
-  it("does not retire models from a 200 response with an invalid catalog body", async () => {
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({})))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ unexpected: "shape" })));
-    const models = await fetchAntigravityModelCatalog({
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-23T20:00:00Z", project: "stored-project" }),
-      fetch,
-    });
-    expect(models).toBeUndefined();
-  });
-
-  it("returns undefined, never throws, with no credentials on disk", async () => {
-    const models = await fetchAntigravityModelCatalog({
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
-    });
-    expect(models).toBeUndefined();
-  });
-});
-
 describe("checkModelAvailability orchestration", () => {
   function account(name: string, vendor: ProviderAccount["vendor"], enabled = true): ProviderAccount {
     return { name, vendor, ...(enabled ? {} : { enabled: false }), location: `/tmp/${name}`, adapter: "native-ts" };
   }
 
-  it("checks every codex/claude/antigravity principal once, then skips all of them inside the hourly throttle", async () => {
+  it("checks every codex/claude principal once, then skips all of them inside the hourly throttle", async () => {
     const home = await tempDir("headroom-model-check-throttle-");
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
@@ -192,13 +128,13 @@ describe("checkModelAvailability orchestration", () => {
     } finally { store.close(); }
   });
 
-  it("ignores local pool accounts and vendors with no reader (gemini, grok, kimi)", async () => {
+  it("ignores local pool accounts and vendors with no reader (gemini, grok, kimi, antigravity)", async () => {
     const home = await tempDir("headroom-model-check-vendors-");
     const store = await HeadroomStore.open(join(home, ".headroom"));
     try {
       const readCodex = vi.fn();
       const readClaude = vi.fn();
-      await checkModelAvailability(store, [account("g", "gemini"), account("k", "kimi"), account("x", "grok")], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude });
+      await checkModelAvailability(store, [account("g", "gemini"), account("k", "kimi"), account("x", "grok"), account("a", "antigravity")], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude });
       expect(readCodex).not.toHaveBeenCalled();
       expect(readClaude).not.toHaveBeenCalled();
       expect(store.knownModels()).toHaveLength(0);
@@ -211,23 +147,19 @@ describe("checkModelAvailability orchestration", () => {
     try {
       const readCodex = vi.fn().mockResolvedValue({ models: [{ id: "gpt-6-astra", name: "GPT-6-Astra" }], fetchedAt: "2026-09-23T18:00:00Z" });
       const readClaude = vi.fn().mockResolvedValue({ models: [{ id: "claude-sonnet-5", name: "Sonnet 5" }], fetchedAt: "2026-09-23T18:00:00Z" });
-      const fetchAntigravity = vi.fn().mockResolvedValue([]);
       await checkModelAvailability(store, [
-        account("codex-parked", "codex", false), account("claude-parked", "claude", false), account("antigravity-parked", "antigravity", false),
-      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity });
+        account("codex-parked", "codex", false), account("claude-parked", "claude", false),
+      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude });
       expect(readCodex).not.toHaveBeenCalled();
       expect(readClaude).not.toHaveBeenCalled();
-      expect(fetchAntigravity).not.toHaveBeenCalled();
       expect(store.knownModels("codex-parked")).toEqual([]);
       expect(store.knownModels("claude-parked")).toEqual([]);
-      expect(store.knownModels("antigravity-parked")).toEqual([]);
 
       await checkModelAvailability(store, [
-        account("codex-live", "codex"), account("claude-live", "claude"), account("antigravity-live", "antigravity"),
-      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude, fetchAntigravityModelCatalog: fetchAntigravity, antigravityModelCatalog: true });
+        account("codex-live", "codex"), account("claude-live", "claude"),
+      ], { readCodexModelCatalog: readCodex, readClaudeModelCatalog: readClaude });
       expect(readCodex).toHaveBeenCalledWith(resolve("/tmp/codex-live"), undefined, expect.any(Date));
       expect(readClaude).toHaveBeenCalledWith(resolve("/tmp/claude-live"), undefined, undefined, expect.any(Date));
-      expect(fetchAntigravity).toHaveBeenCalledTimes(1);
       expect(store.knownModels("codex-live")).toHaveLength(1);
       expect(store.knownModels("claude-live")).toHaveLength(1);
     } finally { store.close(); }

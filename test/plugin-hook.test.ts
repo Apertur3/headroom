@@ -41,7 +41,7 @@ describe.skipIf(process.platform === "win32")("plugin quota line", () => {
     expect(run()).toMatch(/^Claude 5h 20% NORMAL \(as of \d+s ago\)\n$/);
   });
 
-  it.each(["config", ".claude", ".claude2"])("defers to an installed hook in %s", async (dir) => {
+  it.each(["config", ".claude"])("defers to an installed hook in %s", async (dir) => {
     const { user, home, run } = await sandbox();
     await mkdir(join(user, dir), { recursive: true });
     await writeFile(join(user, dir, "settings.json"), JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "sh hooks/claude-line.sh" }] }] } }));

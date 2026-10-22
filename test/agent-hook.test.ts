@@ -83,16 +83,14 @@ describe.skipIf(process.platform === "win32")("headroom hook install / uninstall
     expect(await readFile(join(dir, backups[0]), "utf8")).toBe(original);
   });
 
-  it("refuses to touch a settings file that does not parse, and installs into the others", async () => {
-    const { user, home, options, logs } = await sandbox([".claude", ".claude2"]);
+  it("refuses to touch a settings file that does not parse", async () => {
+    const { user, home, options, logs } = await sandbox();
     const broken = "{ \"model\": \"opus\", // a comment\n}\n";
     await writeFile(join(user, ".claude", "settings.json"), broken);
     expect(await installHook(options)).toBe(1);
     expect(await readFile(join(user, ".claude", "settings.json"), "utf8")).toBe(broken);
     expect((await readdir(join(user, ".claude"))).filter((name) => name.includes("headroom-bak"))).toEqual([]);
     expect(logs.join("\n")).toMatch(/refusing to edit .*\.claude\/settings\.json: it is not valid JSON/);
-    // ~/.claude2 had no settings.json: it gets one with only the hook.
-    expect(JSON.parse(await readFile(join(user, ".claude2", "settings.json"), "utf8"))).toEqual({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: hookCommand(home) }] }] } });
     expect(await uninstallHook(options)).toBe(1);
     expect(await readFile(join(user, ".claude", "settings.json"), "utf8")).toBe(broken);
   });
@@ -104,15 +102,15 @@ describe.skipIf(process.platform === "win32")("headroom hook install / uninstall
     await expect(stat(hookScriptPath(home))).rejects.toThrow();
   });
 
-  it("covers CLAUDE_CONFIG_DIR instead of ~/.claude, plus ~/.claude2, and never creates a config dir", async () => {
-    const { user, options } = await sandbox([".claude2", "custom"]);
+  it("covers CLAUDE_CONFIG_DIR instead of ~/.claude, and never creates a config dir", async () => {
+    const { user, options } = await sandbox(["custom"]);
     const env = { CLAUDE_CONFIG_DIR: join(user, "custom") };
-    expect(await claudeConfigDirs(env, user)).toEqual([join(user, "custom"), join(user, ".claude2")]);
+    expect(await claudeConfigDirs(env, user)).toEqual([join(user, "custom")]);
     expect(await installHook({ ...options, env })).toBe(0);
     await expect(stat(join(user, ".claude"))).rejects.toThrow();
     expect(await readdir(join(user, "custom"))).toEqual(["settings.json"]);
     // Without CLAUDE_CONFIG_DIR, ~/.claude is the default and does not exist here.
-    expect(await claudeConfigDirs({}, user)).toEqual([join(user, ".claude2")]);
+    expect(await claudeConfigDirs({}, user)).toEqual([]);
   });
 
   it("does nothing when no Claude config dir exists", async () => {

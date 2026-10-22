@@ -5,6 +5,7 @@ import { CLAUDE_GRANT_LAPSED_PREFIX, parseClaudeCredential, claudeKeychainMetada
 import { findStaleLanes, laneAgeText } from "./canary.js";
 import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
+import { claudeStatuslineNotice, freshStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { grokAuthPath } from "./adapters/grok.js";
 import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
@@ -56,6 +57,13 @@ async function hasClaudeLogin(path: string): Promise<boolean> {
 
 export async function credentialCheck(account: Account, grantsNeeded: Map<string, string>, store: HeadroomStore | undefined): Promise<DoctorCheck> {
   if (isLocalAccount(account)) return check("OK", `principal ${account.name} credential`, "local adapter has no credential", "no action needed");
+  const claudePolicy = account.vendor === "claude" ? await readPolicy().catch(() => undefined) : undefined;
+  if (claudePolicy?.claude_probe === false) {
+    const fresh = await freshStatuslineSnapshot(statuslineSnapshotDirs(claudePolicy.statusline_snapshot_dirs), account as ProviderAccount, [account as ProviderAccount], new Date());
+    return fresh
+      ? check("OK", `principal ${account.name} credential`, "fresh statusline snapshot (claude_probe = false: Keychain and network not used)", "no action needed")
+      : check("INFO", `principal ${account.name} credential`, "no fresh statusline snapshot; claude_probe = false, so Claude is read through `claude /usage` at most every 10 minutes", "set Claude Code's statusLine command to `headroom statusline` (docs/quickstart.md) for live readings; claude_probe = true opts into the token probe");
+  }
   if (account.vendor === "claude" && process.platform === "darwin") {
     // A principal already marked grant-needed must never touch the Keychain
     // item again here: the keychainGrantCheck below already reports the same
@@ -293,7 +301,7 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
   output.push(homeResult);
   if (store) output.push(check("OK", "schema version", `${store.schemaVersion()} (this binary supports up to ${CURRENT_SCHEMA_VERSION})`, "no action needed"));
   try {
-    let keepaliveEnabled = process.platform === "darwin" || process.platform === "linux";
+    let keepaliveEnabled = false;
     try { keepaliveEnabled = (await readPolicy()).antigravity_keepalive; } catch { /* The policy check below reports the parse error. */ }
     let accounts: Account[] = [];
     try {
@@ -553,7 +561,10 @@ export async function doctor(argv: string[] = []): Promise<number> {
   // policy config check, a failed registry call at most logs a debug line):
   // the update notice must never turn a routine `doctor` run into a failure.
   try {
-    const notice = await updateNoticeLine(await readPolicy());
+    const policyNow = await readPolicy();
+    const statuslineNotice = await claudeStatuslineNotice(policyNow, (await readAccounts()).filter((item): item is ProviderAccount => !isLocalAccount(item))).catch(() => undefined);
+    if (statuslineNotice) console.log(statuslineNotice);
+    const notice = await updateNoticeLine(policyNow);
     if (notice) console.log(notice);
   } catch { /* nothing to report here */ }
   const checks = await doctorChecks();

@@ -93,20 +93,3 @@ export function engineRowsFromRecord(record: RecordPrincipal, principal: string,
   }
   return output;
 }
-
-/** The same recorded answer as a retrieveUserQuota body for the remote adapter. */
-export function remoteBodyFromRecord(record: RecordPrincipal): unknown {
-  if (record.payload_kind !== "quota_summary") {
-    return { models: Object.fromEntries(record.model_quotas.map((model) => [model.model_id, { quotaInfo: model.remaining_fraction === null ? {} : { remainingFraction: model.remaining_fraction } }])) };
-  }
-  return {
-    buckets: record.buckets.flatMap((bucket) => {
-      const lane = bucketLane(bucket.bucket_id);
-      if (!lane) return [];
-      return [{
-        modelId: `${lane.meter}-${lane.minutes === 300 ? "5-hour" : "weekly"}`, disabled: bucket.disabled, resetTime: bucket.reset_time,
-        ...(bucket.remaining_fraction === null ? {} : { remainingFraction: bucket.remaining_fraction }),
-      }];
-    }),
-  };
-}

@@ -157,8 +157,6 @@ polls, with no extra credential or request. Its alert reads:
 New model available in Antigravity: Argon
 ```
 
-The optional remote Antigravity `fetchAvailableModels` check still requires
-`antigravity_model_catalog = true`; it can add models but cannot retire them.
 The very first successful check for a principal (even an authoritative empty
 catalog) seeds its known-model list silently -- no notification burst for
 models you were already using. `headroom models

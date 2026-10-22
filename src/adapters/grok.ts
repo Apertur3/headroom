@@ -1,3 +1,4 @@
+import { userAgent } from "../version.js";
 import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -176,7 +177,7 @@ export function observationsFromGrokBilling(billing: unknown, settings: unknown,
 }
 
 function headers(token: string): HeadersInit {
-  return { Authorization: `Bearer ${token}`, "x-xai-token-auth": "xai-grok-cli", Accept: "application/json", "User-Agent": "headroom" };
+  return { Authorization: `Bearer ${token}`, Accept: "application/json", "User-Agent": userAgent() };
 }
 
 /** The plan name is enrichment: a settings call that fails, times out, or

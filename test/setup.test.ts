@@ -96,7 +96,7 @@ describe("headroom setup --dry-run", () => {
     // the item already admits.
     expect(output).not.toContain("grant Keychain access");
     expect(output).not.toContain("headroom keychain grant");
-    if (process.platform === "darwin") expect(output).toContain("no Keychain dialog to answer");
+    if (process.platform === "darwin") expect(output).toContain("statusLine command to `headroom statusline`");
     expect(output).toContain("Setup finished.");
     expect(accountsExists).toBe(false);
     expect(await fileExists(join(headroomHome, "Library", "LaunchAgents", "com.headroom.daemon.plist"))).toBe(false);
@@ -166,7 +166,7 @@ describe("headroom setup --yes", () => {
     expect(output).not.toContain("headroom keychain grant");
     expect(output).not.toContain("Keychain access granted");
     expect(output).not.toContain("credential readable, no dialog needed");
-    if (process.platform === "darwin") expect(output).toContain("no Keychain dialog to answer");
+    if (process.platform === "darwin") expect(output).toContain("statusLine command to `headroom statusline`");
   });
 });
 

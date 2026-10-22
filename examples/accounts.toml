@@ -14,11 +14,11 @@ adapter = "native-ts"
 # alias = "main"
 
 [[accounts]]
-name = "claude-2"
+name = "claude-work"
 vendor = "claude"
-location = "~/.claude2"
+location = "~/.claude-work"
 adapter = "native-ts"
-# Set this to false to keep an optional or logged-out profile configured but never poll it.
+# A second profile of an account you own. Set enabled = false to keep a logged-out profile configured but never poll it.
 # enabled = false
 
 [[accounts]]

@@ -64,7 +64,12 @@ describe("Claude read exit 36 (keychain not accessible from this session)", () =
   it.skipIf(process.platform !== "darwin")("doctor does not call the credential OK when the last live read hit it", async () => {
     const store = { latest: () => ({ freshness: "failed", reason: CLAUDE_KEYCHAIN_INACCESSIBLE_REASON }), audit: () => undefined };
     const account: Account = { name: "claude-test", vendor: "claude", location: "/nonexistent/.claude-test", adapter: "native-ts" };
-    const result = await credentialCheck(account, new Map(), store as never);
+    const home = await mkdtemp(join(tmpdir(), "headroom-cred-check-")); temporary.push(home);
+    await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
+    const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
+    let result: Awaited<ReturnType<typeof credentialCheck>>;
+    try { result = await credentialCheck(account, new Map(), store as never); }
+    finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
     expect(result.level).toBe("WARN");
     expect(result.detail).toContain("not accessible from this session");
     expect(result.fix).toContain("security unlock-keychain");

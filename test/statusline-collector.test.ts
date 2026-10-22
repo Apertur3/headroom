@@ -1,8 +1,9 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { pollAccounts } from "../src/collector.js";
+import { claudeStatuslineNotice } from "../src/adapters/claude-statusline.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -17,6 +18,7 @@ async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise
 async function accountsHome(root: string, location: string): Promise<string> {
   const home = join(root, ".headroom");
   await mkdir(home, { recursive: true, mode: 0o700 });
+  await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
   await writeFile(join(home, "accounts.toml"), [
     "[[accounts]]",
     'name = "claude-main"',
@@ -41,6 +43,7 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
     }));
     await withHeadroomHome(home, async () => {
       const result = await pollAccounts(undefined, {
+        claudeUsage: { run: async () => { throw new Error("exit 1"); } },
         claudeGrant: {
           needsGrant: () => true,
           markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); },
@@ -53,13 +56,11 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 12 }), source: "native:claude-statusline", freshness: "fresh" }),
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 10_080 }), quantity: expect.objectContaining({ used: 34 }) }),
       ]));
-      // The snapshot carries no model-scoped buckets: those stay grant-needed.
-      expect(rows.some((item) => item.meter_id !== "claude-main:all" && item.freshness === "failed" && /grant/i.test(item.reason ?? ""))).toBe(true);
       expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: statusline fresh" });
     });
   });
 
-  it("attempts the granted probe even when a snapshot is fresh, and falls back to the snapshot for the account-wide windows when the probe fails", async () => {
+  it("never attempts the granted probe while a snapshot is fresh, even with claude_probe on", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-statusline-granted-")); temporary.push(root);
     const location = "/nonexistent/.claude-statusline-test";
     const home = await accountsHome(root, location);
@@ -71,12 +72,11 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
     }));
     await withHeadroomHome(home, async () => {
       const result = await pollAccounts(undefined, {
+        claudeUsage: { run: async () => { throw new Error("exit 1"); } },
         claudeGrant: { needsGrant: () => false, markGrantNeeded: () => {}, markProbeSucceeded: () => {}, probePath: () => undefined },
       });
-      expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "called" });
+      expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: statusline fresh" });
       const rows = result.observations.filter((item) => item.principal_id === "claude-main");
-      // The probe cannot read a nonexistent config dir, so the account-wide
-      // windows come from the snapshot; every other row is the probe's own failure.
       expect(rows).toEqual(expect.arrayContaining([
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 12 }), source: "native:claude-statusline", freshness: "fresh" }),
       ]));
@@ -121,5 +121,55 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
       expect(gateConsulted).toBe(true);
       expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: grant needed" });
     });
+  });
+
+  it("claude_probe = false: reads the snapshot only, and a missing snapshot is stale, not failed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-probe-off-")); temporary.push(root);
+    const home = await accountsHome(root, "/nonexistent/.claude-statusline-test");
+    await writeFile(join(home, "policy.toml"), "claude_probe = false\n", { mode: 0o600 });
+    const boom = () => { throw new Error("must not be called: claude_probe is off"); };
+    const gate = { needsGrant: boom, markGrantNeeded: boom, markProbeSucceeded: boom, probePath: boom };
+    await withHeadroomHome(home, async () => {
+      const missing = await pollAccounts(undefined, { claudeGrant: gate });
+      expect(missing.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: claude_probe off" });
+      expect(missing.observations.every((item) => item.freshness === "stale" && item.quantity === null)).toBe(true);
+      expect(missing.failures).toEqual([]);
+      await mkdir(join(home, "statusline"), { recursive: true });
+      await writeFile(join(home, "statusline", ".claude-statusline-test.json"), JSON.stringify({
+        profile: ".claude-statusline-test", observed_at: Math.floor(Date.now() / 1000) - 3600,
+        five_hour: { used_percent: 12, resets_at: null }, seven_day: { used_percent: 34, resets_at: null }, extra: {},
+      }));
+      const old = await pollAccounts(undefined, { claudeGrant: gate });
+      expect(old.observations).toEqual(expect.arrayContaining([expect.objectContaining({ meter_id: "claude-main:all", freshness: "stale", quantity: expect.objectContaining({ used: 12 }) })]));
+    });
+  });
+
+  it("claude_probe = false: a collector-shaped file (alias main, used_pct) for the default profile is read fresh", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-collector-shape-")); temporary.push(root);
+    const home = await accountsHome(root, join(homedir(), ".claude"));
+    const dir = join(root, "state");
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "policy.toml"), `claude_probe = false\nstatusline_snapshot_dirs = [${JSON.stringify(dir)}]\n`, { mode: 0o600 });
+    await writeFile(join(dir, "main.json"), JSON.stringify({
+      alias: "main", observed_at: Math.floor(Date.now() / 1000) - 5,
+      five_hour: { used_pct: 4, resets_at: null }, seven_day: { used_pct: 60, resets_at: null }, source: "statusline",
+    }), { mode: 0o600 });
+    await withHeadroomHome(home, async () => {
+      const result = await pollAccounts(undefined, {});
+      expect(result.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ meter_id: "claude-main:all", freshness: "fresh", source: "native:claude-statusline", quantity: expect.objectContaining({ used: 4 }) }),
+      ]));
+    });
+  });
+
+  it("claudeStatuslineNotice: says how to wire the statusline only when the probe is off and no snapshot is fresh", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-statusline-notice-")); temporary.push(root);
+    const dir = join(root, "state"); await mkdir(dir, { recursive: true, mode: 0o700 });
+    const account = { name: "claude-main", vendor: "claude", location: join(root, ".claude-x"), adapter: "native-ts" } as const;
+    const policy = { claude_probe: false, statusline_snapshot_dirs: [dir] };
+    expect(await claudeStatuslineNotice(policy, [account])).toContain("headroom statusline");
+    expect(await claudeStatuslineNotice({ ...policy, claude_probe: true }, [account])).toBeUndefined();
+    await writeFile(join(dir, ".claude-x.json"), JSON.stringify({ profile: ".claude-x", observed_at: Math.floor(Date.now() / 1000), five_hour: { used_percent: 1, resets_at: null }, seven_day: null, extra: {} }), { mode: 0o600 });
+    expect(await claudeStatuslineNotice(policy, [account])).toBeUndefined();
   });
 });

@@ -9,6 +9,7 @@ import { outboundFetch, redact } from "../security.js";
 import { assertVendorResponseLimits, vendorJson } from "../limits.js";
 import { credentialPath } from "../paths.js";
 import { executablePath } from "../paths.js";
+import { userAgent } from "../version.js";
 import type { Observation, ProviderAccount } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -247,7 +248,7 @@ async function claudeProbe(configDir: string, pinnedPath?: string): Promise<stri
   catch (error) { throw new ClaudeProbeError("unavailable", error instanceof Error ? error.message : "Claude probe unavailable"); }
   if (!helper) throw new ClaudeProbeError("unavailable", "Claude probe not built; run npm run engine:build");
   try {
-    const { stdout } = await execFileAsync(helper, ["--config-dir", resolve(configDir)], { timeout: TIMEOUT_MS + 2_000, maxBuffer: 1024 * 1024 + 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
+    const { stdout } = await execFileAsync(helper, ["--config-dir", resolve(configDir)], { timeout: TIMEOUT_MS + 2_000, maxBuffer: 1024 * 1024 + 1024, windowsHide: true, env: { PATH: process.env.PATH ?? "", HEADROOM_VERSION: userAgent().split("/")[1] } });
     const value: unknown = JSON.parse(stdout);
     assertVendorResponseLimits(value);
     return stdout;
@@ -576,6 +577,11 @@ export function claudeGrantNeededObservations(account: ProviderAccount, now = ne
   return failed(account, claudeGrantNeededReason(account.name), now.toISOString());
 }
 
+/** `claude_probe = false` and no statusline snapshot yet: unknown, shown stale (not failed). */
+export function claudeProbeOffObservations(account: ProviderAccount, now = new Date(), cause?: string): Observation[] {
+  return failed(account, `claude_probe is off and no statusline snapshot yet; set Claude Code's statusLine command to headroom statusline${cause ? ` (${cause})` : ""}`, now.toISOString()).map((row) => ({ ...row, freshness: "stale" as const }));
+}
+
 function window(account: ProviderAccount, meter: string, raw: unknown, minutes: number, now: string): Observation | undefined {
   if (!isObject(raw)) return undefined;
   const used = finiteNumber(raw.utilization) ?? finiteNumber(raw.percent);
@@ -714,7 +720,7 @@ export async function claudeResponseShape(account: ProviderAccount, dependencies
   try { credential = parseClaudeCredential(payload, now); }
   catch { throw new Error(`credentials invalid; ${claudeCommand(account)}`); }
   if (credential.expired) throw new Error(`token expired; ${claudeCommand(account)}`);
-  const response = await outboundFetch(dependencies.fetch ?? fetch, new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+  const response = await outboundFetch(dependencies.fetch ?? fetch, new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": userAgent() }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
   if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
   return shape(await vendorJson(response));
 }
@@ -732,7 +738,7 @@ export async function observeClaude(account: ProviderAccount, dependencies: Clau
     credentialLoaded = true;
     const credential = parseClaudeCredential(payload, now);
     if (credential.expired) return failed(account, `token expired; ${claudeCommand(account)}`, timestamp);
-    const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0" }, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const request = new Request("https://api.anthropic.com/api/oauth/usage", { method: "GET", headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": userAgent() }, signal: AbortSignal.timeout(TIMEOUT_MS) });
     const response = await outboundFetch(dependencies.fetch ?? fetch, request);
     if (!response.ok) throw new ProviderHTTPError(response.status, "Claude");
     return observationsFromClaudeUsage(await vendorJson(response), account, now);

@@ -2,6 +2,7 @@
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { existsSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join, basename, delimiter, dirname } from "node:path";
@@ -14,7 +15,7 @@ import { engineStatus, installEngine, installNativeEngine } from "./engine/codex
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCredentialReadable, probeBinaryHash, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
-import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { claudeStatuslineNotice, formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile, writeSnapshotLocked } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
@@ -1731,11 +1732,13 @@ export async function observe(argv: string[]): Promise<number> {
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
+    const statuslineNotice = await claudeStatuslineNotice(policy, (await readAccountsOrEmpty()).filter((item): item is ProviderAccount => !isLocalAccount(item))).catch(() => undefined);
+    if (statuslineNotice) console.log(statuslineNotice);
   }
   if (directCatalogAccounts?.length && directCatalogHome) {
     await (async () => {
       const catalogStore = await HeadroomStore.open(directCatalogHome!);
-      try { await checkModelAvailability(catalogStore, directCatalogAccounts!, { antigravityModelCatalog: policy.antigravity_model_catalog }); }
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
       finally { catalogStore.close(); }
     })().catch(() => undefined);
   }
@@ -1750,6 +1753,7 @@ async function responseShape(argv: string[]): Promise<number> {
   if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   if (account.vendor === "gemini") throw new Error(GEMINI_RETIRED_REASON);
   if (account.vendor === "antigravity") throw new Error("Antigravity uses agy local quota summaries; inspect headroom doctor and headroom --principal <id> --json instead");
+  if (account.vendor === "claude" && !(await readPolicy()).claude_probe) throw new Error("--shape for Claude uses the token probe, which is off; set claude_probe = true in policy.toml to opt in");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
     : account.vendor === "claude" ? { usage: await claudeResponseShape(account) }
     : undefined;
@@ -1931,7 +1935,7 @@ async function statusline(argv: string[]): Promise<number> {
       const home = await safeHeadroomDirectory();
       const dir = await safeOutputDirectory(join(home, "statusline"));
       const path = join(dir, `${profile}.json`);
-      await writeFileAtomic(path, JSON.stringify(snapshot), 0o600);
+      snapshot = await writeSnapshotLocked(path, snapshot, now);
     }
   } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }
   if (chainCommand) {

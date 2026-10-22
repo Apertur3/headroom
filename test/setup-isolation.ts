@@ -13,6 +13,8 @@ process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
 process.env.HEADROOM_HOME = join(isolatedHome, ".headroom");
 delete process.env.CLAUDE_CONFIG_DIR;
+// No test may run the developer's real `claude` for `/usage`; a missing binary fails closed.
+process.env.HEADROOM_CLAUDE_BIN = join(isolatedHome, "no-such-claude");
 
 // Rendered clocks and day ticks appear in snapshot tests; pin the zone so a
 // runner in UTC and a developer in Europe agree on every frame.

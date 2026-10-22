@@ -21,13 +21,35 @@ A fresh build without network access to GitHub needs cached dependencies.
 
 ## Claude
 
-Headroom reads Claude Code usage two ways: a zero-auth statusline snapshot (preferred whenever
-it's fresh) and the vendor probe (the fallback, and the only path for a profile that has never
-rendered a statusline).
+Headroom reads Claude Code usage in this order, on every poll:
+
+1. A fresh statusline snapshot gives the 5h and weekly windows.
+2. Claude Code's own `/usage` (`claude -p "/usage" --output-format stream-json ...`, source
+   `native:claude-usage`) runs at most once per 10 minutes per profile, whether or not a snapshot is
+   fresh. It gives every window, including the scoped weekly meters (Fable), which the statusline
+   does not carry. No shell is involved except for a Windows `.cmd` launcher, there is no model
+   turn, only the structured `usage_report` is read, and any malformed entry fails the whole read
+   with a reason. The outcome of the last run is kept, so a throttled poll knows whether it worked.
+3. Only if `claude_probe = true` and the account would otherwise have no fresh reading (no fresh
+   snapshot, and `/usage` failed this poll or failed on its last run), the direct usage request
+   below.
+4. Otherwise the reading shows as stale or unknown, with the reason.
+
+### The `claude_probe` switch
+
+`claude_probe` in `policy.toml` is a boolean, default `false`. With `false`, the Claude collector
+never touches the Keychain or Anthropic's endpoint: it uses the statusline snapshot and
+`claude /usage`, and `headroom doctor` says how to wire the statusline (set Claude Code's
+`statusLine` command to `headroom statusline`). The statusline only runs inside interactive
+sessions (never under `claude -p`), and a replayed render does not restamp the snapshot unless that
+session's API time grew. A file whose `source` is not `statusline` is ignored. With `true`, the
+last-resort request is `GET api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth token
+and `User-Agent: headroomd/<version>`. Anthropic's terms restrict using Claude subscription OAuth
+tokens outside Claude Code; read them before enabling.
 
 ### Zero-auth source: the statusline snapshot
 
-Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+Claude Code hands its `statusLine` command a JSON object when an interactive session renders its statusline (it never runs under `claude -p`), containing
 `rate_limits.five_hour`/`rate_limits.seven_day` (`used_percentage`, `resets_at`, epoch seconds) and
 possibly other model-scoped buckets. `headroom statusline`, registered as that command (see
 quickstart.md), snapshots it to `<HEADROOM_HOME>/statusline/<profile>.json` (0600; `<profile>` is
@@ -72,8 +94,7 @@ so the token never reaches Node or Headroom's own output. On Linux and Windows, 
 token directly from `<config-dir>/.credentials.json` (default `~/.claude/.credentials.json`).
 
 **The probe reads through `/usr/bin/security`, and there is nothing to grant.** Claude Code
-2.1.263 rewrites its Keychain items with an access list that admits Apple-signed tools and not
-third-party applications. Measured on macOS 26.5 with that version: `SecItemCopyMatching` with
+2.1.263 writes its Keychain items with an access list that names Apple's `security` tool. Measured on macOS 26.5 with that version: `SecItemCopyMatching` with
 `kSecReturnData` from the probe is refused (`errSecAuthFailed`, and `errSecItemNotFound` on other
 machines) even from the user's own Terminal, with no dialog offered at all, while `security
 find-generic-password -s "Claude Code-credentials" -a <user> -w` returns the token with exit 0 and
@@ -260,7 +281,8 @@ location = "agy"
 adapter = "native-ts"
 ```
 
-Keep `antigravity_keepalive = true` in policy.toml (the macOS default). Discovery finds
+The keepalive is opt-in: set `antigravity_keepalive = true` in policy.toml to enable it (default
+`false`). Google's terms restrict using third-party tools with Antigravity; read them first. Discovery finds
 agy on PATH or its installation directory. An optional `agy_path` in the account entry
 selects an explicit executable when the service cannot find it. Rerunning discovery replaces
 the account file, including manually configured entries.
@@ -303,22 +325,7 @@ reads cannot learn or retire models. The first complete read seeds silently;
 later new IDs produce `model_available`. Retirement requires three complete
 reads without the model, using the same catalog store as Claude and Codex.
 
-An optional additional remote catalog check is off by default. It calls
-Google's undocumented `loadCodeAssist` and `fetchAvailableModels` on
-`cloudcode-pa.googleapis.com`, at most once an hour, announcing `User-Agent: antigravity` and
-`ideType: ANTIGRAVITY`. Its credential is the Gemini CLI's own OAuth file
-(`~/.gemini/oauth_creds.json`), not agy's; an expired token is refreshed in memory at
-`oauth2.googleapis.com` with the OAuth client found in the installed Gemini CLI and is never
-written back. Vendor terms may restrict a third-party tool using that credential this way, so the
-check runs only after you set `antigravity_model_catalog = true` in `policy.toml`. With the
-default `false`, Headroom never opens that credential file or calls the remote
-catalog endpoints. The local quota read still learns models. When
-enabled, an install that discovered its `antigravity` account purely from
-`agy` on PATH, with no Gemini CLI history on the machine, has no such file, and the check reports
-no model catalog for that principal (never a failure of the ordinary quota read).
-An HTTP success without the expected `models` object is likewise unavailable, not an authoritative
-empty catalog. This optional availability source never retires known models;
-only complete local quota reads can do that.
+Headroom makes no Google call for the model list and never reads the Gemini CLI's OAuth file. An old `antigravity_model_catalog` key in `policy.toml` is accepted and ignored.
 The fixed weekly window gets no such treatment: a missing weekly bucket stays a `failed`
 (UNKNOWN) read, since the vendor has never been observed to omit it while healthy.
 
