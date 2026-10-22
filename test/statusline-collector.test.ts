@@ -43,6 +43,7 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
     }));
     await withHeadroomHome(home, async () => {
       const result = await pollAccounts(undefined, {
+        claudeUsage: { run: async () => { throw new Error("exit 1"); } },
         claudeGrant: {
           needsGrant: () => true,
           markGrantNeeded: () => { throw new Error("must not be called: the probe was never attempted"); },
@@ -55,13 +56,11 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 12 }), source: "native:claude-statusline", freshness: "fresh" }),
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 10_080 }), quantity: expect.objectContaining({ used: 34 }) }),
       ]));
-      // The snapshot carries no model-scoped buckets: those stay grant-needed.
-      expect(rows.some((item) => item.meter_id !== "claude-main:all" && item.freshness === "failed" && /grant/i.test(item.reason ?? ""))).toBe(true);
       expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: statusline fresh" });
     });
   });
 
-  it("attempts the granted probe even when a snapshot is fresh, and falls back to the snapshot for the account-wide windows when the probe fails", async () => {
+  it("never attempts the granted probe while a snapshot is fresh, even with claude_probe on", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-statusline-granted-")); temporary.push(root);
     const location = "/nonexistent/.claude-statusline-test";
     const home = await accountsHome(root, location);
@@ -73,12 +72,11 @@ describe("pollAccounts: statusline snapshot as a zero-auth Claude source", () =>
     }));
     await withHeadroomHome(home, async () => {
       const result = await pollAccounts(undefined, {
+        claudeUsage: { run: async () => { throw new Error("exit 1"); } },
         claudeGrant: { needsGrant: () => false, markGrantNeeded: () => {}, markProbeSucceeded: () => {}, probePath: () => undefined },
       });
-      expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "called" });
+      expect(result.claudeProbeOutcomes).toEqual({ "claude-main": "skipped: statusline fresh" });
       const rows = result.observations.filter((item) => item.principal_id === "claude-main");
-      // The probe cannot read a nonexistent config dir, so the account-wide
-      // windows come from the snapshot; every other row is the probe's own failure.
       expect(rows).toEqual(expect.arrayContaining([
         expect.objectContaining({ meter_id: "claude-main:all", window: expect.objectContaining({ minutes: 300 }), quantity: expect.objectContaining({ used: 12 }), source: "native:claude-statusline", freshness: "fresh" }),
       ]));
