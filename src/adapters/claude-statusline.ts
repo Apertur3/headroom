@@ -344,6 +344,19 @@ export async function latestStatuslineSnapshot(dirs: string[], account: Provider
   return best;
 }
 
+/** One line for `status`/`doctor` when claude_probe is off and an enabled Claude
+ * principal has no fresh snapshot (the state a pre-0.2.14 upgrade lands in). */
+export async function claudeStatuslineNotice(policy: { claude_probe: boolean; statusline_snapshot_dirs: string[] }, accounts: ProviderAccount[], now = new Date()): Promise<string | undefined> {
+  if (policy.claude_probe) return undefined;
+  const claude = accounts.filter((account) => account.vendor === "claude" && isAccountEnabled(account));
+  const dirs = statuslineSnapshotDirs(policy.statusline_snapshot_dirs);
+  const missing: string[] = [];
+  for (const account of claude) if (!await freshStatuslineSnapshot(dirs, account, claude, now)) missing.push(account.name);
+  return missing.length
+    ? `Claude has no fresh statusline snapshot for ${missing.join(", ")}: set Claude Code's statusLine command to \`headroom statusline\` (or \`headroom statusline --chain "<your current command>"\`), or set claude_probe = true in policy.toml to keep the token probe.`
+    : undefined;
+}
+
 /** The collector's own entry point: a snapshot for this principal that is
  * actually fresh right now, or undefined -- covering "no snapshot at all"
  * and "a snapshot exists but is stale" alike, since the collector treats

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseRouting, seedExampleConfig } from "../src/config.js";
-import { defaultAntigravityKeepalive, parsePolicy } from "../src/policy.js";
+import { parsePolicy } from "../src/policy.js";
 
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof import("node:fs/promises")>();
@@ -11,12 +11,12 @@ vi.mock("node:fs/promises", async (original) => {
 });
 
 describe("policy defaults", () => {
-  it("keeps Antigravity alive when the key is absent on macOS and Linux", () => {
-    const policy = parsePolicy("poll_interval_minutes = 5\n");
-    expect(policy.antigravity_keepalive).toBe(defaultAntigravityKeepalive());
-    expect(defaultAntigravityKeepalive("darwin")).toBe(true);
-    expect(defaultAntigravityKeepalive("linux")).toBe(true);
-    expect(defaultAntigravityKeepalive("win32")).toBe(false);
+  it("keepalive and the Claude probe: keepalive is opt-in, the probe is on, and a retired catalog key still loads", () => {
+    expect(parsePolicy("").antigravity_keepalive).toBe(false);
+    expect(parsePolicy("antigravity_keepalive = true\n").antigravity_keepalive).toBe(true);
+    expect(parsePolicy("").claude_probe).toBe(false);
+    expect(parsePolicy("claude_probe = true\n").claude_probe).toBe(true);
+    expect(parsePolicy("antigravity_model_catalog = true\n")).toEqual(parsePolicy(""));
   });
 
   it("defaults pacing to even, and parses an explicit pacing = \"none\"", () => {

@@ -4,6 +4,13 @@ Headroom reads private usage endpoints with the user's own credentials and runs 
 The threat model is a single-user machine; the assets are the user's OAuth tokens and session
 cookies, which unlock paid subscriptions.
 
+These rules are design goals, not a warranty; see LICENSE.
+
+Headroom's engine links SweetCookieKit (a dependency of CodexBarCore), so browser-cookie strings
+such as "Chrome Safe Storage" appear in the binary. Headroom never reads browser cookies or
+cookie stores: the engine only calls the CLI-based fetchers, and the Kimi web-session token is a
+file you save yourself.
+
 ## Rules the code must satisfy
 
 1. **No secret on disk in plaintext, ever.** Credentials are read at call time from each account's
@@ -22,7 +29,7 @@ cookies, which unlock paid subscriptions.
    is machine-global, so any local process (including one running as a different user, with no
    access to the real session token) can create the same pipe name before the real daemon starts
    and try to answer in its place. Windows authentication is therefore mutual, not one-sided: a
-   random per-daemon session token is stored mode 0600 under `HEADROOM_HOME`, and it never crosses
+   random per-daemon session token is stored under `HEADROOM_HOME` (mode 0600 on macOS and Linux; on Windows Node's file mode is not applied and Headroom does not change the file's ACL, so the file is protected only by the permissions it inherits from the Headroom home directory, normally your user profile), and it never crosses
    the pipe in either direction. On every connection the daemon sends a fresh random server nonce
    first; the client answers with its own freshly generated client nonce plus, for every method but
    `health`, an HMAC-SHA256 proof of the server nonce keyed by the token it read locally. A client
@@ -66,9 +73,10 @@ cookies, which unlock paid subscriptions.
    and permissions under the package root. A missing digest, changed binary or unsafe path fails
    closed; it never falls through to an unverified development build. Antigravity quota uses agy
    through its local quota summary (a local CSRF token from agy's process command line, where
-   present; never agy's OAuth or session credential). Only the optional Antigravity model-list
-   check reads the Gemini CLI's OAuth file, and it is off unless `antigravity_model_catalog = true`
-   is set in `policy.toml`.
+   present; never agy's OAuth or session credential). Headroom never reads the Gemini CLI's
+   OAuth file. The Claude probe is opt-in (`claude_probe = true` in `policy.toml`); by default
+   Claude is read from the statusline snapshot only, with no Keychain or network access. Every
+   vendor request identifies itself as `headroomd/<version>`.
 6. **No debug surfaces in release.** No debug endpoints, no source maps (disabled in the build,
    `sourceMap`/`declarationMap` both false), no verbose stack traces to clients.
 7. **Audit log.** Every query to the daemon, every scheduled vendor poll (Claude's own probe
@@ -93,9 +101,9 @@ cookies, which unlock paid subscriptions.
     The probe reads it through `/usr/bin/security find-generic-password -s <service> -a <user>
     -w`, spawned by absolute path with an explicit argument vector, never a shell; stdout is
     captured in memory, stderr is discarded, and a run that has not finished within 10 seconds is
-    terminated. That tool is what the item's own access list admits: Claude Code 2.1.263 rewrites
+    terminated. That tool is what the item's own access list admits: Claude Code 2.1.263 writes
     `Claude Code-credentials` (and the per-profile `Claude Code-credentials-<hash>` items) with an
-    access list that admits Apple-signed tools and not third-party applications, so a direct
+    access list that names Apple's `security` tool, so a direct
     `SecItemCopyMatching` from the probe is refused while `security` returns the secret with no
     dialog at all, even from a sandboxed shell. The framework call is still made first, with
     `kSecUseAuthenticationUI: kSecUseAuthenticationUIFail` and

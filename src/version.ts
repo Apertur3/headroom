@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,4 +26,10 @@ export async function headroomVersion(): Promise<string> {
     cached = typeof parsed.version === "string" && parsed.version ? parsed.version : "unknown";
   } catch { cached = "unknown"; }
   return cached;
+}
+
+/** The honest client identity every vendor request carries: `headroomd/<version>`. */
+export function userAgent(): string {
+  try { return `headroomd/${(JSON.parse(readFileSync(join(packageRoot(), "package.json"), "utf8")) as { version?: string }).version ?? "unknown"}`; }
+  catch { return "headroomd/unknown"; }
 }

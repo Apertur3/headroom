@@ -915,8 +915,7 @@ const routeFits = (state: PaceState, allowUnknown: boolean): boolean =>
  * operator allowed for it), picks the one with the most remaining percent on
  * its own tightest (deciding, worst-state) window, among principals that
  * currently fit at all (not FREEZE/CONSERVE/DOWN, and not UNKNOWN unless
- * allowUnknown) -- the live equivalent of the dogfooded "claude-main is at
- * 90%, claude-2 is at 10%, launch the next lane under claude-2" call an
+ * allowUnknown) -- the live equivalent of the pick an
  * orchestrator makes by hand today. Every candidate's own state and reason
  * is still reported (not just the winner), so a caller can see why a
  * principal was skipped. `owner` (the caller's own identity, as `can` also

@@ -8,23 +8,12 @@ import {
   isClaudeLoggedOutReason, logUnknownClaudeTopLevelKeys, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
-import {
-  antigravityResponseShape, discoverGeminiOAuthClient, discoverGeminiOAuthClientDetail,
-  observationsFromAntigravityQuota, observeAntigravity, parseAntigravityCredential,
-} from "../src/adapters/antigravity.js";
 import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
 import { gateFor } from "../src/orchestrator-reads.js";
 import { HeadroomStore } from "../src/store.js";
 
-// OAuth-client-shaped fixture values are assembled at runtime so that no
-// secret-shaped literal ever sits in the repository or its history.
-const OAUTH_HOST = ["apps", "googleusercontent", "com"].join(".");
-const oauthId = (prefix: string, tag: string): string => `${prefix}-${tag}.${OAUTH_HOST}`;
-const oauthSecret = (tail: string): string => ["GOCSPX", tail].join("-");
-
 const claude = { name: "claude-main", vendor: "claude", location: "/Users/test/.claude", adapter: "native-ts" } as const;
 const codex = { name: "codex-main", vendor: "codex", location: "/Users/test/.codex", adapter: "native-ts" } as const;
-const antigravity = { name: "antigravity", vendor: "antigravity", location: "/Users/test/.gemini/antigravity-cli", adapter: "native-ts" } as const;
 const at = new Date("2026-09-03T17:26:36Z");
 // The adapters build their "run: CLAUDE_CONFIG_DIR=... claude" / "run:
 // CODEX_HOME=... codex login" reason text from resolve(account.location):
@@ -265,433 +254,11 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     });
   });
 
-  it("maps verified Antigravity quota buckets to the two 5-hour and weekly meters", async () => {
-    const body = JSON.parse(await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8"));
-    const rows = observationsFromAntigravityQuota(body, antigravity, at);
-    expect(rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 24, limit: 100, remaining: 76, unit: "percent" }, source: "remote:antigravity" }),
-      expect.objectContaining({ meter_id: "antigravity:gemini", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 66, limit: 100, remaining: 34, unit: "percent" } }),
-      expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: { used: 19, limit: 100, remaining: 81, unit: "percent" } }),
-      expect.objectContaining({ meter_id: "antigravity:claude-gpt", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: { used: 58, limit: 100, remaining: 42, unit: "percent" } }),
-    ]));
-  });
-
-  it("flags a synthetic-reset idle quota snapshot with the shared doubt marker instead of failing it", () => {
-    const at = new Date("2026-09-03T17:26:36Z");
-    const rows = observationsFromAntigravityQuota({ buckets: [
-      { modelId: "gemini-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
-      { modelId: "gemini-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
-      { modelId: "claude-gpt-5-hour", remainingFraction: 1, resetTime: "2026-09-03T22:26:36Z" },
-      { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
-    ] }, antigravity, at);
-    // Every window here is idle with a manufactured reset, so the vendor's own
-    // 0%-used numbers stay (freshness fresh, quantity present) but truth and
-    // confidence flag the doubt -- see engine/observation.ts's IDLE_WINDOW_REASON.
-    expect(rows.filter((row) => row.meter_id === "antigravity:gemini")).toEqual(expect.arrayContaining([
-      expect.objectContaining({ freshness: "fresh", truth: "estimated", confidence: 0.5, reason: "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder", quantity: expect.objectContaining({ used: 0 }) }),
-    ]));
-  });
-
-  // Issue #55: AGY leaves an inactive rolling 5h window out of an otherwise
-  // healthy retrieveUserQuota response entirely (no bucket at all, not a
-  // bucket with used=0) -- see observationsFromAntigravityQuota's comment.
-  // Before this fix that omission was mapped to freshness "failed" every
-  // poll, which froze the store's last real fresh reading forever (fresh
-  // always outranks failed in latestPerWindow regardless of age) and let it
-  // age into "5h stale Nm" even though the vendor's own app would show 100%.
-  // A first fix attempt synthesized a fresh 100%-remaining reading instead --
-  // a number the vendor never sent, rejected by the owner as exactly the
-  // placeholder shape Headroom already treats with suspicion elsewhere. The
-  // shipped fix instead reports the honest thing: `not_enforced`, no
-  // quantity, no resets_at, no invented percentage.
-  describe("issue #55: a missing 5h bucket must read as an honest not_enforced gap, never an invented 100%", () => {
-    it("(a) reports a missing 5h bucket as not_enforced with no quantity, no resets_at and no invented percentage, replaces a stale real reading in the store, and does not block a 5h gate", async () => {
-      const body = { buckets: [
-        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
-        // No gemini-5-hour bucket at all: genuinely inactive, nothing to report.
-        { modelId: "claude-gpt-weekly", remainingFraction: 0.58, resetTime: "2026-09-10T17:26:36Z" },
-      ] };
-      const rows = observationsFromAntigravityQuota(body, antigravity, at);
-      const gemini5h = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 300);
-      expect(gemini5h).toMatchObject({
-        freshness: "not_enforced", window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-        quantity: null, resets_at: null, reason: "vendor sent no 5h bucket in this response",
-      });
-      // Never the rejected placeholder shape: no 100%, no reset manufactured
-      // from fetch time plus window length.
-      expect(gemini5h?.quantity).not.toMatchObject({ used: 0, remaining: 100 });
-      expect(gemini5h?.resets_at).toBeNull();
-      const geminiWeekly = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 10_080);
-      expect(geminiWeekly).toMatchObject({ freshness: "fresh", truth: "official", quantity: { used: 14 } });
-
-      const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
-      const store = await HeadroomStore.open(join(root, ".headroom"));
-      try {
-        // A real, aged 5h reading from an earlier, active poll must not
-        // freeze in place once the window goes idle: insertPoll's own
-        // "windows omitted by this poll" bookkeeping treats a not_enforced
-        // row as present (not omitted), and latestPerWindow ranks
-        // not_enforced alongside fresh, so the newer not_enforced reading
-        // replaces the stale real one instead of both hiding each other.
-        store.insertPoll([
-          { ...gemini5h!, freshness: "fresh", truth: "official", quantity: { used: 45, limit: 100, remaining: 55, unit: "percent" }, resets_at: "2026-09-03T18:00:00Z", fetched_at: "2026-09-03T12:00:00Z", observed_at: "2026-09-03T12:00:00Z", reason: undefined },
-          { ...geminiWeekly!, fetched_at: "2026-09-03T12:00:00Z", observed_at: "2026-09-03T12:00:00Z" },
-        ]);
-        store.insertPoll(rows);
-        const current = store.latestPerWindow("antigravity:gemini").find((row) => row.window?.minutes === 300);
-        expect(current).toMatchObject({ freshness: "not_enforced", quantity: null, reason: "vendor sent no 5h bucket in this response" });
-
-        const gate = gateFor(store, [{ window: "wk", points: 1 }, { window: "5h", points: 3 }], "antigravity:gemini", 0, false, at);
-        expect(gate.allowed).toBe(true);
-        expect(gate.unknown).toBeUndefined();
-        // The agent can tell the 5h check was skipped for lack of data,
-        // rather than silently passed.
-        expect(gate.reason).toContain("5h not enforced");
-      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
-    });
-
-    it("(b) keeps a real, enforced 5h reading exactly as the vendor reported it -- a real bucket with usage is always preserved", () => {
-      const body = { buckets: [
-        { modelId: "gemini-5-hour", remainingFraction: 0.01, resetTime: "2026-09-03T21:26:36Z" }, // 1% remaining, 99% used
-        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
-      ] };
-      const rows = observationsFromAntigravityQuota(body, antigravity, at);
-      const gemini5h = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 300);
-      expect(gemini5h).toMatchObject({ freshness: "fresh", truth: "official", confidence: 1, quantity: { used: 99, remaining: 1 }, resets_at: new Date("2026-09-03T21:26:36Z").toISOString() });
-      expect(gemini5h?.reason).toBeUndefined();
-    });
-
-    it("(c) a response with no enforced 5h window for either AGY pool leaves both not_enforced, independently, never blocking a 5h gate on either", async () => {
-      const body = { buckets: [
-        { modelId: "gemini-weekly", remainingFraction: 0.86, resetTime: "2026-09-10T17:26:36Z" },
-        { modelId: "claude-gpt-weekly", remainingFraction: 1, resetTime: "2026-09-10T17:26:36Z" },
-      ] };
-      const rows = observationsFromAntigravityQuota(body, antigravity, at);
-      const fiveHourRows = rows.filter((row) => row.window?.minutes === 300);
-      expect(fiveHourRows).toHaveLength(2);
-      expect(fiveHourRows.every((row) => row.freshness === "not_enforced" && row.quantity === null && row.resets_at === null)).toBe(true);
-      // Gemini's fresh weekly usage must never leak onto the separate claude-gpt pool.
-      const claudeGptWeekly = rows.find((row) => row.meter_id === "antigravity:claude-gpt" && row.window?.minutes === 10_080);
-      expect(claudeGptWeekly?.quantity?.used).toBe(0);
-      const geminiWeekly = rows.find((row) => row.meter_id === "antigravity:gemini" && row.window?.minutes === 10_080);
-      expect(geminiWeekly?.quantity?.used).toBe(14);
-
-      const root = await mkdtemp(join(tmpdir(), "headroom-agy-55-"));
-      const store = await HeadroomStore.open(join(root, ".headroom"));
-      try {
-        store.insertPoll(rows);
-        // The two pools stay fully independent: neither's not_enforced 5h
-        // gap nor its weekly reading is visible on the other's meter.
-        expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:gemini", 0, false, at).allowed).toBe(true);
-        expect(gateFor(store, [{ window: "5h", points: 3 }], "antigravity:claude-gpt", 0, false, at).allowed).toBe(true);
-        const geminiRows = store.latestPerWindow("antigravity:gemini");
-        const claudeGptRows = store.latestPerWindow("antigravity:claude-gpt");
-        expect(geminiRows.every((row) => row.meter_id === "antigravity:gemini")).toBe(true);
-        expect(claudeGptRows.every((row) => row.meter_id === "antigravity:claude-gpt")).toBe(true);
-      } finally { store.close(); await rm(root, { recursive: true, force: true }); }
-    });
-  });
-
-  it("rejects an availability-only Antigravity quota answer without treating model availability as quota", async () => {
-    // A project already on the stored credential resolves immediately, so
-    // exactly two requests go out (loadCodeAssist, then retrieveUserQuota).
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({})))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at,
-      credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z", project: "stored-project" }),
-      fetch,
-    });
-    expect(rows).toHaveLength(4);
-    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "quota endpoint returned availability only", quantity: null })]));
-    const requests = fetch.mock.calls.map(([request]) => request as Request);
-    expect(requests.map((request) => request.url)).toEqual([
-      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-    ]);
-    expect(requests[1].headers.get("User-Agent")).toBe("antigravity");
-    expect(requests[1].headers.get("x-goog-api-client")).toBeNull();
-    expect(await requests[1].text()).toBe(JSON.stringify({ project: "stored-project" }));
-  });
-
-  it("returns UNKNOWN with a finish-setup reason, and never calls onboardUser, when no Code Assist project can be resolved", async () => {
-    // No project on the stored credential and no cloudaicompanionProject on
-    // loadCodeAssist's response: the account has real allowedTiers, which
-    // used to be enough to trigger an automatic onboardUser POST. That call
-    // must never happen -- only loadCodeAssist is fetched.
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
-      currentTier: { id: "legacy-tier" },
-      allowedTiers: [{ id: "free-tier", isDefault: false }, { id: "standard-tier", isDefault: true }],
-    })));
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at,
-      credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch,
-    });
-    expect(rows).toHaveLength(4);
-    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "no Code Assist project; finish setup in the Gemini CLI", quantity: null })]));
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const requests = fetch.mock.calls.map(([request]) => request as Request);
-    expect(requests.map((request) => request.url)).toEqual(["https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"]);
-  });
-
-  it("preserves a redacted Google Code Assist refusal reason", async () => {
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at,
-      credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "UNSUPPORTED_CLIENT", message: "Gemini Code Assist for individuals is no longer supported for person@example.com; Bearer eyJ.not-a-token" } }), { status: 403 }),
-    });
-    expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ freshness: "failed", reason: "HTTP 403 UNSUPPORTED_CLIENT: Gemini Code Assist for individuals is no longer supported for [REDACTED]; [REDACTED]" })]));
-  });
-
-  it("recognizes a 429 Antigravity refusal as a protected status the same way a 401/403 one is", async () => {
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at,
-      credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "RATE_LIMITED", message: "too many requests" } }), { status: 429 }),
-    });
-    const failed = rows.find((row) => row.freshness === "failed");
-    expect(failed?.reason).toMatch(/^HTTP 429\b/);
-    // The exact bug this regresses: collector.ts's/daemon.ts's backoff
-    // detection previously only matched a parenthesized "(429)" (the shape
-    // ProviderHTTPError produces for Claude/Codex), never Google's own bare
-    // "HTTP 429" wording, so an Antigravity rate limit was silently retried.
-    expect(PROTECTED_STATUS_PATTERN.test(failed?.reason ?? "")).toBe(true);
-  });
-
-  it("still recognizes the parenthesized status format other vendor adapters use", () => {
+  it("recognizes a bare HTTP status and the parenthesized format other vendor adapters use as protected statuses", () => {
+    expect(PROTECTED_STATUS_PATTERN.test("HTTP 429: too many requests")).toBe(true);
     expect(PROTECTED_STATUS_PATTERN.test("Claude usage request failed (401)")).toBe(true);
     expect(PROTECTED_STATUS_PATTERN.test("Codex usage request failed (429)")).toBe(true);
     expect(PROTECTED_STATUS_PATTERN.test("no credentials in Keychain for this config dir")).toBe(false);
-  });
-
-  it("refreshes expired Gemini CLI OAuth in memory before posting quota", async () => {
-    const quota = await readFile(new URL("../fixtures/http/antigravity/retrieve-user-quota.synthetic.json", import.meta.url), "utf8");
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 })))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ cloudaicompanionProject: "stored-project" })))
-      .mockResolvedValueOnce(new Response(quota));
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "old-access", refresh_token: "refresh-only", expiry_date: at.getTime() - 1 }),
-      oauthClient: async () => ({ clientId: "test-client.apps.googleusercontent.com", clientSecret: "test-client-secret" }), fetch,
-    });
-    expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
-    const requests = fetch.mock.calls.map(([request]) => request as Request);
-    expect(requests.map((request) => request.url)).toEqual([
-      "https://oauth2.googleapis.com/token",
-      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-    ]);
-    expect(await requests[0].text()).toContain("grant_type=refresh_token");
-    expect(requests[2].headers.get("Authorization")).toBe("Bearer new-access");
-    expect(await requests[2].text()).toBe(JSON.stringify({ project: "stored-project" }));
-  });
-
-  it("resolves the project from loadCodeAssist's own cloudaicompanionProject, never from an onboardUser call", async () => {
-    const loadCodeAssist = {
-      cloudaicompanionProject: { id: "already-provisioned-project" },
-      currentTier: { id: "legacy-tier", name: "Legacy" },
-      allowedTiers: [{ id: "free-tier", isDefault: false }, { id: "standard-tier", isDefault: true }],
-    };
-    const quota = { buckets: [
-      { modelId: "gemini-5-hour", remainingFraction: 0.5, resetTime: "2026-09-03T22:26:36Z" },
-      { modelId: "gemini-weekly", remainingFraction: 0.5, resetTime: "2026-09-10T17:26:36Z" },
-      { modelId: "claude-gpt-5-hour", remainingFraction: 0.5, resetTime: "2026-09-03T22:26:36Z" },
-      { modelId: "claude-gpt-weekly", remainingFraction: 0.5, resetTime: "2026-09-10T17:26:36Z" },
-    ] };
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
-      .mockResolvedValueOnce(new Response(JSON.stringify(quota)));
-    const rows = await observeAntigravity(antigravity, {
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch,
-    });
-    expect(rows).toContainEqual(expect.objectContaining({ freshness: "fresh", source: "remote:antigravity" }));
-    const requests = fetch.mock.calls.map(([request]) => request as Request);
-    // Exactly two requests: allowedTiers being present (a real onboarding
-    // signal in the old code) must never trigger a third, onboardUser, call.
-    expect(requests.map((request) => request.url)).toEqual([
-      "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-      "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-    ]);
-    expect(await requests[1].text()).toBe(JSON.stringify({ project: "already-provisioned-project" }));
-  });
-
-  it("--shape reports loadCodeAssist's tier/reasonCode and every response's key shape", async () => {
-    const loadCodeAssist = { cloudaicompanionProject: "already-resolved", currentTier: { id: "legacy-tier" }, ineligibleTiers: [{ id: "free-tier", reasonCode: "UNSUPPORTED_CLIENT" }] };
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ buckets: [] })));
-    const shape = await antigravityResponseShape(antigravity, {
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch,
-    });
-    expect(shape).toMatchObject({ loadCodeAssist: { tier: "legacy-tier", reasonCode: "UNSUPPORTED_CLIENT" } });
-    expect(shape.onboardUser).toBeUndefined(); // onboardUser does not exist anywhere in this adapter
-    expect((shape.loadCodeAssist as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.currentTier.id", kind: "string" }]));
-    expect((shape.retrieveUserQuota as { shape: unknown }).shape).toEqual(expect.arrayContaining([{ path: "$.buckets", kind: "array" }]));
-  });
-
-  it("--shape still reports loadCodeAssist's tier/reasonCode when retrieveUserQuota itself is denied (verified live against a real free-tier Antigravity account)", async () => {
-    const loadCodeAssist = { cloudaicompanionProject: "aicode-consumers", currentTier: { id: "free-tier", name: "Antigravity" }, allowedTiers: [{ id: "free-tier", isDefault: true }, { id: "standard-tier" }] };
-    const fetch = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 403, message: "The caller does not have permission", status: "PERMISSION_DENIED" } }), { status: 403 }));
-    const shape = await antigravityResponseShape(antigravity, {
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch,
-    });
-    expect(shape).toMatchObject({ loadCodeAssist: { tier: "free-tier", reasonCode: null }, retrieveUserQuota: { error: "HTTP 403 The caller does not have permission" } });
-    expect(shape.onboardUser).toBeUndefined();
-  });
-
-  it("--shape reports the finish-setup reason, and issues no retrieveUserQuota request, when no project can be resolved", async () => {
-    const loadCodeAssist = { currentTier: { id: "legacy-tier" }, allowedTiers: [{ id: "standard-tier", isDefault: true }] };
-    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(loadCodeAssist)));
-    const shape = await antigravityResponseShape(antigravity, {
-      now: () => at, credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-03T18:26:36Z" }),
-      fetch,
-    });
-    expect(shape).toMatchObject({ retrieveUserQuota: { error: "no Code Assist project; finish setup in the Gemini CLI" } });
-    expect(shape.onboardUser).toBeUndefined();
-    expect(fetch).toHaveBeenCalledTimes(1);
-  });
-
-  it("extracts the Gemini CLI OAuth client from GEMINI_OAUTH2_JS_PATH, preferring the named OAUTH_CLIENT_ID/SECRET constants", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-oauth2-"));
-    const file = join(root, "oauth2.js");
-    // Padded with unrelated googleusercontent.com/GOCSPX-shaped noise the
-    // named-constant regex must skip past in favor of the actual assignment.
-    await writeFile(file, [
-      `// unrelated: ${oauthId("111111111111", "noise")}`,
-      `const OAUTH_CLIENT_ID = '${oauthId("681255809395", "realid")}';`,
-      `const OAUTH_CLIENT_SECRET = '${oauthSecret("realsecret1234567890abcd")}';`,
-    ].join("\n"));
-    const previous = { path: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
-    delete process.env.GEMINI_OAUTH_CLIENT_ID;
-    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
-    process.env.GEMINI_OAUTH2_JS_PATH = file;
-    try {
-      const detail = await discoverGeminiOAuthClientDetail();
-      expect(detail).toEqual({ client: { clientId: oauthId("681255809395", "realid"), clientSecret: oauthSecret("realsecret1234567890abcd") }, layout: `GEMINI_OAUTH2_JS_PATH (${file})` });
-      await expect(discoverGeminiOAuthClient()).resolves.toEqual(detail!.client);
-    } finally {
-      if (previous.path === undefined) delete process.env.GEMINI_OAUTH2_JS_PATH; else process.env.GEMINI_OAUTH2_JS_PATH = previous.path;
-      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
-      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("falls back to scanning bundle/chunk-*.js when gemini's own PATH binary symlinks straight into a bootstrap bundle/gemini.js that doesn't carry the client itself", async () => {
-    // Reproduces the real Homebrew gemini-cli layout on this machine: `gemini`
-    // on PATH resolves (via realpath) directly into `bundle/gemini.js`, a tiny
-    // bootstrap that dynamically imports the real code from content-hashed
-    // sibling files -- none of the fixed oauth2.js/bundle/gemini.js candidate
-    // paths ever contain the client on that layout, only a scan of every .js
-    // file in the bundle directory finds it.
-    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-bundle-"));
-    const versionDir = join(root, "Cellar", "gemini-cli", "0.0.0-test", "libexec", "lib", "node_modules", "@google", "gemini-cli");
-    const bundleDir = join(versionDir, "bundle");
-    await mkdir(bundleDir, { recursive: true });
-    await mkdir(join(root, "bin"), { recursive: true });
-    await writeFile(join(bundleDir, "gemini.js"), "#!/usr/bin/env node\n// bootstrap only, imports chunk-*.js at runtime\n");
-    await chmod(join(bundleDir, "gemini.js"), 0o755);
-    await writeFile(join(bundleDir, "chunk-ABCDEFGH.js"), [
-      `var unrelatedClientElsewhere = '${oauthId("999999999999", "other")}';`,
-      `var OAUTH_CLIENT_ID = "${oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345")}";`,
-      `var OAUTH_CLIENT_SECRET = "${oauthSecret("abcdefghijklmnopqrstuvwxyz01")}";`,
-    ].join("\n"));
-    await symlink(join(bundleDir, "gemini.js"), join(root, "bin", "gemini"));
-    const previous = { path: process.env.PATH, override: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
-    delete process.env.GEMINI_OAUTH2_JS_PATH;
-    delete process.env.GEMINI_OAUTH_CLIENT_ID;
-    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
-    // delimiter, not a hardcoded ":": a Windows path's own drive letter
-    // ("C:\...") already contains a colon, which would otherwise tear the
-    // very entry this test is adding in two before geminiBinary() ever sees it.
-    process.env.PATH = `${join(root, "bin")}${delimiter}${previous.path ?? ""}`;
-    try {
-      const detail = await discoverGeminiOAuthClientDetail();
-      expect(detail?.client).toEqual({ clientId: oauthId("681255809395", "abcdefghijklmnopqrstuvwxyz012345"), clientSecret: oauthSecret("abcdefghijklmnopqrstuvwxyz01") });
-      expect(detail?.layout).toContain("chunk scan");
-    } finally {
-      if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
-      if (previous.override !== undefined) process.env.GEMINI_OAUTH2_JS_PATH = previous.override;
-      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
-      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("GEMINI_OAUTH2_JS_PATH pointing at a symlink is treated as unavailable, never followed", async () => {
-    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-oauth2-symlink-"));
-    const real = join(root, "real-oauth2.js");
-    await writeFile(real, [
-      `const OAUTH_CLIENT_ID = '${oauthId("681255809395", "realid")}';`,
-      `const OAUTH_CLIENT_SECRET = '${oauthSecret("realsecret1234567890abcd")}';`,
-    ].join("\n"));
-    const link = join(root, "oauth2-link.js");
-    await symlink(real, link);
-    const previous = { path: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET, envPath: process.env.PATH };
-    delete process.env.GEMINI_OAUTH_CLIENT_ID;
-    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
-    process.env.GEMINI_OAUTH2_JS_PATH = link;
-    process.env.PATH = ""; // no real gemini binary on PATH to fall back to
-    try {
-      const detail = await discoverGeminiOAuthClientDetail();
-      expect(detail?.layout ?? "").not.toContain("GEMINI_OAUTH2_JS_PATH");
-    } finally {
-      if (previous.path === undefined) delete process.env.GEMINI_OAUTH2_JS_PATH; else process.env.GEMINI_OAUTH2_JS_PATH = previous.path;
-      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
-      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
-      if (previous.envPath === undefined) delete process.env.PATH; else process.env.PATH = previous.envPath;
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("a chunk scan never reads past its 200-file budget", async () => {
-    // 201 tiny chunk files, sorted so the one carrying the real OAuth client
-    // sorts last -- past the 200-file budget scanDirectoryForOAuthClient is
-    // allowed to spend, so it must never be reached.
-    const root = await mkdtemp(join(tmpdir(), "headroom-gemini-chunk-budget-"));
-    const versionDir = join(root, "Cellar", "gemini-cli", "0.0.0-test", "libexec", "lib", "node_modules", "@google", "gemini-cli");
-    const bundleDir = join(versionDir, "bundle");
-    await mkdir(bundleDir, { recursive: true });
-    await mkdir(join(root, "bin"), { recursive: true });
-    await writeFile(join(bundleDir, "gemini.js"), "#!/usr/bin/env node\n// bootstrap only, imports chunk-*.js at runtime\n");
-    await chmod(join(bundleDir, "gemini.js"), 0o755);
-    for (let index = 0; index < 200; index += 1) await writeFile(join(bundleDir, `chunk-${String(index).padStart(4, "0")}.js`), `// padding chunk ${index}\n`);
-    await writeFile(join(bundleDir, "chunk-9999-real.js"), [
-      `var OAUTH_CLIENT_ID = "${oauthId("681255809395", "shouldnotbefound")}";`,
-      `var OAUTH_CLIENT_SECRET = "${oauthSecret("shouldnotbefound0123456789ab")}";`,
-    ].join("\n"));
-    await symlink(join(bundleDir, "gemini.js"), join(root, "bin", "gemini"));
-    const previous = { path: process.env.PATH, override: process.env.GEMINI_OAUTH2_JS_PATH, id: process.env.GEMINI_OAUTH_CLIENT_ID, secret: process.env.GEMINI_OAUTH_CLIENT_SECRET };
-    delete process.env.GEMINI_OAUTH2_JS_PATH;
-    delete process.env.GEMINI_OAUTH_CLIENT_ID;
-    delete process.env.GEMINI_OAUTH_CLIENT_SECRET;
-    process.env.PATH = `${join(root, "bin")}${delimiter}`;
-    try {
-      const detail = await discoverGeminiOAuthClientDetail();
-      expect(detail?.client.clientId).not.toBe(oauthId("681255809395", "shouldnotbefound"));
-    } finally {
-      if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
-      if (previous.override !== undefined) process.env.GEMINI_OAUTH2_JS_PATH = previous.override;
-      if (previous.id !== undefined) process.env.GEMINI_OAUTH_CLIENT_ID = previous.id;
-      if (previous.secret !== undefined) process.env.GEMINI_OAUTH_CLIENT_SECRET = previous.secret;
-      await rm(root, { recursive: true, force: true });
-    }
   });
 
   it("always emits a main weekly row so a missing vendor field replaces prior data", () => {
@@ -785,8 +352,7 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const rejectedFetch = async () => { throw new Error(secret); };
     const claudeRows = await observeClaude(claude, { platform: "darwin", now: () => at, keychain: async () => JSON.stringify({ claudeAiOauth: { accessToken: secret, expiresAt: at.getTime() + 60_000 } }), fetch: rejectedFetch });
     const codexRows = await observeCodex(codex, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: secret, expires_at: at.getTime() + 60_000 } }), fetch: rejectedFetch });
-    const antigravityRows = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: secret, expiry_date: "2026-09-03T18:26:36Z" }), fetch: rejectedFetch });
-    const output = JSON.stringify([claudeRows, codexRows, antigravityRows, log.mock.calls]);
+    const output = JSON.stringify([claudeRows, codexRows, log.mock.calls]);
     expect(output).not.toContain(secret);
     expect(output).not.toContain("Bearer");
     log.mockRestore();
@@ -803,11 +369,9 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     const missingClaude = await observeClaude(claude2, { platform: "darwin", now: () => at, keychain: async () => { throw new Error("missing"); } });
     const codex2 = { ...codex, location: "/Users/test/.codex2" };
     const expiredCodex = await observeCodex(codex2, { now: () => at, readFile: async () => JSON.stringify({ tokens: { access_token: "token", expires_at: at.getTime() - 1 } }) });
-    const expiredAntigravity = await observeAntigravity(antigravity, { now: () => at, credentialPaths: () => ["gemini-oauth"], readFile: async () => JSON.stringify({ access_token: "token", expiry_date: "2026-09-03T17:26:35Z" }) });
     expect(expiredClaude[0].reason).toBe(`token expired; ${claudeRunWithDirectory(claude2Dir)}`);
     expect(missingClaude[0].reason).toBe(`no credentials in Keychain for this config dir; ${claudeRunWithDirectory(claude2Dir)}`);
     expect(expiredCodex[0].reason).toBe(`token expired; run: CODEX_HOME=${codex2Dir} codex login`);
-    expect(expiredAntigravity[0].reason).toBe("token expired; run: gemini");
   });
 
   it("names the exact fix for a live 401/403 (a well-formed token the vendor rejected), not the bare status message", async () => {
@@ -832,14 +396,6 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     // must still match the new, friendlier wording.
     expect(PROTECTED_STATUS_PATTERN.test(rejected401[0].reason ?? "")).toBe(true);
     expect(PROTECTED_STATUS_PATTERN.test(codexRejected403[0].reason ?? "")).toBe(true);
-  });
-
-  it("accepts Gemini CLI's top-level JSON token as the fallback credential format", () => {
-    expect(parseAntigravityCredential(JSON.stringify({ access_token: "token", expiry_date: at.getTime() + 60_000 }), at)).toMatchObject({ token: "token", expired: false });
-  });
-
-  it("does not mistake agy's session token record for Google OAuth", () => {
-    expect(() => parseAntigravityCredential(JSON.stringify({ auth_method: "oauth", token: "not-google-oauth" }), at)).toThrow("Gemini CLI OAuth credentials invalid");
   });
 
   it("reports response paths and value kinds without response values", async () => {

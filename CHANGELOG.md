@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Behaviour change: the Claude usage probe is now off by default (`claude_probe = false`). Claude is read from the statusline snapshot only, with no Keychain or network access; a missing or old snapshot shows as stale or unknown. Upgrade step: set the `statusLine` command in your Claude `settings.json` (each profile) to `headroom statusline`, or chain your existing one with `headroom statusline --chain '<your command>'`, or set `claude_probe = true` in `policy.toml` to keep the old token fallback. Until then Claude shows as unknown; `headroom status` and `headroom doctor` print this fix as one line. Headroom never edits your Claude settings.
+- Honest client identity: every vendor request (Claude probe, Codex, Grok, Kimi) now sends `User-Agent: headroomd/<version>`. The `claude-code/2.1.0`, `CodexBar`, `originator: Codex Desktop`, `x-xai-token-auth: xai-grok-cli` and `x-msh-platform: kimi_code_cli` headers and the Kimi web-gateway `Origin`/`Referer` are gone.
+- The Antigravity keepalive is opt-in on every platform: `antigravity_keepalive` now defaults to `false`.
+
+### Added
+- `claude_probe` in `policy.toml` (boolean). When `false`, the Claude collector never touches the Keychain or the network.
+
+### Removed
+- The opt-in Antigravity model catalog (it used the Gemini CLI OAuth token), the Google Code Assist client with its scraped OAuth client, and the unused remote Antigravity and Gemini quota readers. `antigravity_model_catalog` in an old `policy.toml` is accepted and ignored. The local `agy` quota path is unchanged.
+
+### Security
+- SECURITY.md: the rules are design goals, not a warranty; the Windows session-token description no longer claims mode 0600; states that the engine links SweetCookieKit but Headroom never reads browser cookies.
+
 ## [0.2.13] - 2026-10-22
 
 ### Added

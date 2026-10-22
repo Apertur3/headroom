@@ -147,7 +147,8 @@ describe("observeGrok", () => {
     expect(requests.map((request) => request.url).sort()).toEqual([GROK_BILLING_ENDPOINT, GROK_SETTINGS_ENDPOINT].sort());
     for (const request of requests) {
       expect(request.headers.get("authorization")).toBe("Bearer synthetic-oidc-value-not-a-real-credential");
-      expect(request.headers.get("x-xai-token-auth")).toBe("xai-grok-cli");
+      expect(request.headers.get("x-xai-token-auth")).toBeNull();
+      expect(request.headers.get("user-agent")).toMatch(/^headroomd\//);
       expect(request.headers.get("accept")).toBe("application/json");
     }
     expect(rows.find((row) => row.meter_id === "grok:main")).toMatchObject({ freshness: "fresh", metadata: { plan: "SuperGrok Heavy" } });

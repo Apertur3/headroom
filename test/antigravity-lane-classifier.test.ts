@@ -13,7 +13,6 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { observeAntigravity, observationsFromAntigravityQuota, antigravityPayloadFromQuota } from "../src/adapters/antigravity.js";
 import { antigravityLaneObservations, antigravityPayloadFromEngineRows, classifyAntigravityLanes, type AntigravityLaneState } from "../src/antigravity-lanes.js";
 import { findStaleLanes } from "../src/canary.js";
 import { pollAccounts } from "../src/collector.js";
@@ -23,7 +22,7 @@ import { canConsume, defaultPolicy, freshnessGate, isAcceptedLaneReading, paceDe
 import { formatMeters } from "../src/status-view.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation, ProviderAccount } from "../src/types.js";
-import { ENGINE_ERROR_TEXT, engineRowsFromRecord, loadRecord, remoteBodyFromRecord, type RecordPrincipal } from "./helpers/antigravity-fixtures.js";
+import { ENGINE_ERROR_TEXT, engineRowsFromRecord, loadRecord, type RecordPrincipal } from "./helpers/antigravity-fixtures.js";
 
 vi.mock("../src/engine/native/run.js", () => ({ NATIVE_ENGINE_TIMEOUT_MS: 90_000, nativeEnginePath: vi.fn(), runNativeEngine: vi.fn() }));
 
@@ -109,15 +108,6 @@ describe("09-29 weekly exhausted (recorded live fixture)", () => {
     expect(read).toMatchObject({ outcome: "fresh", payload_kind: "quota_summary", lanes: expected });
   });
 
-  it("remote path: the same payload classifies the same way", async () => {
-    const record = await principalFrom("2026-09-29-weekly-exhausted.json");
-    const rows = observationsFromAntigravityQuota(remoteBodyFromRecord(record), ACCOUNT, new Date(NOW));
-    expect(statesOf(classifyAntigravityLanes(antigravityPayloadFromQuota(remoteBodyFromRecord(record))))).toEqual(expected);
-    expectLaneRows(rows, expected);
-    // The disabled bucket's fraction of 1 was read as 100% remaining before.
-    expect(laneRow(rows, "gemini 5h")?.quantity).toBeNull();
-  });
-
   it("status names the block instead of a generic UNKNOWN, the canary accepts it, and gates fail closed for that lane only", async () => {
     const record = await principalFrom("2026-09-29-weekly-exhausted.json");
     const { rows } = await localPoll(record);
@@ -169,42 +159,10 @@ describe("09-03 availability-only reply before login (synthetic)", () => {
     expect(rows.every((row) => row.quantity === null)).toBe(true);
     expect(read).toMatchObject({ outcome: "failed", payload_kind: "availability_only" });
   });
-
-  it("remote path: the same answer is availability only", async () => {
-    const record = await principalFrom("2026-09-03-availability-only.synthetic.json");
-    const rows = observationsFromAntigravityQuota(remoteBodyFromRecord(record), ACCOUNT, new Date(NOW));
-    expectLaneRows(rows, expected);
-    expect(rows.every((row) => row.reason === "quota endpoint returned availability only")).toBe(true);
-  });
-});
-
-describe("09-04/05 remote path refused with HTTP 403 (synthetic)", () => {
-  it("every lane is an error that keeps the vendor's own refusal text", async () => {
-    const record = await principalFrom("2026-09-04-remote-403.synthetic.json");
-    expect(record).toMatchObject({ source: "remote", error: "api_error" });
-    const rows = await observeAntigravity(ACCOUNT, {
-      now: () => new Date(NOW), credentialPaths: () => ["gemini-oauth"],
-      readFile: async () => JSON.stringify({ access_token: "not-a-secret", expiry_date: "2026-09-29T21:20:00Z", project: "stored-project" }),
-      fetch: async () => new Response(JSON.stringify({ error: { reasonCode: "PERMISSION_DENIED", message: "The caller does not have permission" } }), { status: 403 }),
-    });
-    const expected: Expected = { "gemini 5h": "error", "gemini weekly": "error", "claude-gpt 5h": "error", "claude-gpt weekly": "error" };
-    expectLaneRows(rows, expected);
-    expect(rows.every((row) => row.reason?.startsWith("HTTP 403"))).toBe(true);
-    expect(statesOf(classifyAntigravityLanes({ kind: "error", error: rows[0].reason! }))).toEqual(expected);
-  });
 });
 
 describe("09-22 idle 5h bucket missing, issue #55 (synthetic)", () => {
   const expected: Expected = { "gemini 5h": "missing", "gemini weekly": "fresh", "claude-gpt 5h": "fresh", "claude-gpt weekly": "fresh" };
-
-  it("remote path: the missing 5h is an honest not_enforced gap and the other lanes stay fresh", async () => {
-    const record = await principalFrom("2026-09-22-idle-5h-missing.synthetic.json");
-    const payload = antigravityPayloadFromQuota(remoteBodyFromRecord(record));
-    const classification = classifyAntigravityLanes(payload);
-    expect(statesOf(classification)).toEqual(expected);
-    expect(classification.complete).toBe(false);
-    expectLaneRows(observationsFromAntigravityQuota(remoteBodyFromRecord(record), ACCOUNT, new Date(NOW)), expected);
-  });
 
   it("local path: the same answer reads the same way; the read is partial, not failed", async () => {
     const record = await principalFrom("2026-09-22-idle-5h-missing.synthetic.json");
@@ -226,12 +184,6 @@ describe("09-23 to 09-28 weekly lane still loading (synthetic)", () => {
     expectLaneRows(rows, expected);
     expect(laneRow(rows, "gemini weekly")?.reason).toBe("quota summary not ready: weekly lane still loading");
     expect(read).toMatchObject({ outcome: "partial", payload_kind: "quota_summary", lanes: expected });
-  });
-
-  it("remote path: a weekly bucket the vendor never sent is missing and fails; the 5h lanes stay fresh", async () => {
-    const record = await principalFrom("2026-09-23-weekly-loading.synthetic.json");
-    const rows = observationsFromAntigravityQuota(remoteBodyFromRecord(record), ACCOUNT, new Date(NOW));
-    expectLaneRows(rows, { "gemini 5h": "fresh", "gemini weekly": "missing", "claude-gpt 5h": "fresh", "claude-gpt weekly": "missing" });
   });
 });
 

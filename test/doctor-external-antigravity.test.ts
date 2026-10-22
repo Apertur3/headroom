@@ -25,6 +25,7 @@ async function keepaliveCheck(pids: number[]): Promise<{ level: string; detail: 
   const root = await mkdtemp(join(tmpdir(), "headroom-doctor-agy-ext-")); temporary.push(root);
   const fakeAgy = await writeFakeAgy(root, join(root, "agy-pid.txt"));
   await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "antigravity"', "enabled = true", 'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${fakeAgy}"`, ""].join("\n"), { mode: 0o600 });
+  await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
   const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
   external.pids = pids;
   const daemon = await HeadroomDaemon.create({ home: root, path: socketPath(root), poller: async () => ({ observations: [], failures: [] }) });

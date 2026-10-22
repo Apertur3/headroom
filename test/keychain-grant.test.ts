@@ -56,6 +56,7 @@ describe("collector gate for a Claude principal awaiting a Keychain grant", () =
   it("never attempts the probe for a gated principal, returning the synthetic grant-needed observations instead", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-collector-gate-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "claude-main"',
@@ -92,6 +93,7 @@ describe("collector gate for a Claude principal awaiting a Keychain grant", () =
     const root = await mkdtemp(join(tmpdir(), "headroom-collector-readable-")); temporary.push(root);
     const home = join(root, ".headroom");
     await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(home, "accounts.toml"), [
       "[[accounts]]",
       'name = "claude-main"',
@@ -219,6 +221,7 @@ describe("doctor home directory and keychain grant checks", () => {
     const home = join(root, ".headroom");
     await withHeadroomHome(home, async () => {
       await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
       await writeFile(join(home, "accounts.toml"), [
         "[[accounts]]",
         'name = "claude-main"',
@@ -262,6 +265,7 @@ describe("doctor home directory and keychain grant checks", () => {
     const home = join(root, ".headroom");
     await withHeadroomHome(home, async () => {
       await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
       await writeFile(join(home, "accounts.toml"), [
         "[[accounts]]",
         'name = "claude-main"',
@@ -300,6 +304,7 @@ describe("doctor home directory and keychain grant checks", () => {
     const home = join(root, ".headroom");
     await withHeadroomHome(home, async () => {
       await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
       await writeFile(join(home, "accounts.toml"), [
         "[[accounts]]",
         'name = "claude-main"',
@@ -336,6 +341,7 @@ describe("doctor home directory and keychain grant checks", () => {
     const home = join(root, ".headroom");
     await withHeadroomHome(home, async () => {
       await mkdir(home, { recursive: true, mode: 0o700 });
+      await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
       await writeFile(join(home, "accounts.toml"), [
         "[[accounts]]",
         'name = "claude-main"',

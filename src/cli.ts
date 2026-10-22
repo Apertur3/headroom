@@ -14,7 +14,7 @@ import { engineStatus, installEngine, installNativeEngine } from "./engine/codex
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCredentialReadable, probeBinaryHash, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
-import { formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { claudeStatuslineNotice, formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
@@ -1731,11 +1731,13 @@ export async function observe(argv: string[]): Promise<number> {
     // the update notice must never turn a routine status call into one.
     const updateNotice = await updateNoticeLine(policy).catch(() => undefined);
     if (updateNotice) console.log(updateNotice);
+    const statuslineNotice = await claudeStatuslineNotice(policy, (await readAccountsOrEmpty()).filter((item): item is ProviderAccount => !isLocalAccount(item))).catch(() => undefined);
+    if (statuslineNotice) console.log(statuslineNotice);
   }
   if (directCatalogAccounts?.length && directCatalogHome) {
     await (async () => {
       const catalogStore = await HeadroomStore.open(directCatalogHome!);
-      try { await checkModelAvailability(catalogStore, directCatalogAccounts!, { antigravityModelCatalog: policy.antigravity_model_catalog }); }
+      try { await checkModelAvailability(catalogStore, directCatalogAccounts!); }
       finally { catalogStore.close(); }
     })().catch(() => undefined);
   }

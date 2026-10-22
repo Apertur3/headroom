@@ -40,7 +40,7 @@ describe("daemon model catalog caller", () => {
         await internal.poll(undefined, true);
         expect(mocks.checkModelAvailability).toHaveBeenCalledTimes(1);
         // The Antigravity catalog opt-in follows policy.toml, which is absent here: off.
-        expect(mocks.checkModelAvailability).toHaveBeenCalledWith(expect.anything(), [expect.objectContaining({ name: "codex-live" })], { antigravityModelCatalog: false });
+        expect(mocks.checkModelAvailability).toHaveBeenCalledWith(expect.anything(), [expect.objectContaining({ name: "codex-live" })]);
       } finally { await daemon.stop(); }
     });
   });

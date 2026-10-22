@@ -3,8 +3,8 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { NATIVE_ENGINE_TIMEOUT_MS, nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
-import { claudeGrantNeededObservations, isClaudeProbeDenialReason, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
-import { freshStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
+import { claudeGrantNeededObservations, claudeProbeOffObservations, isClaudeProbeDenialReason, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
+import { freshStatuslineSnapshot, latestStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
 import { observeCodex } from "./adapters/codex.js";
 import { failedAntigravityObservations, noDaemonObservations } from "./adapters/antigravity.js";
@@ -35,7 +35,7 @@ export interface PollResult {
    * statusline snapshot path (see adapters/claude-statusline.ts): the probe
    * was never attempted because a fresh-enough snapshot already answered
    * this principal. */
-  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh">;
+  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off">;
 }
 export interface PollOptions {
   /** Overrides the platform's native-engine availability for controlled callers. */
@@ -187,17 +187,27 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // Claude always stays in the TypeScript adapter: on macOS it delegates the
   // credential read and request to the separately-granted Claude probe.
   const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
-  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh"> = {};
+  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off"> = {};
   const claudePrincipalsPresent = tsAccounts.some((account) => account.vendor === "claude");
   // Read once per poll, only when there is a Claude principal to check at
   // all: this is the sole reason the collector reads policy.toml.
-  const statuslineDirs = claudePrincipalsPresent ? statuslineSnapshotDirs((await readPolicy()).statusline_snapshot_dirs) : [];
+  const claudePolicy = claudePrincipalsPresent ? await readPolicy() : undefined;
+  const statuslineDirs = claudePolicy ? statuslineSnapshotDirs(claudePolicy.statusline_snapshot_dirs) : [];
   for (const account of tsAccounts) {
     // The statusline snapshot is the zero-auth fallback, never the preferred
     // source: it carries only the 5h and weekly account-wide figures, while
     // the granted probe also returns every model-scoped bucket (Fable,
     // Routines). Skipping a granted probe whenever a snapshot was fresh left
     // the scoped meters stale for as long as the snapshot kept arriving.
+    // claude_probe = false: the statusline snapshot is the only Claude source.
+    // No Keychain read, no network; an old or missing snapshot reads as
+    // stale/unknown rather than as an error.
+    if (account.vendor === "claude" && claudePolicy?.claude_probe === false) {
+      const latest = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
+      observations.push(...(latest ? observationsFromStatuslineSnapshot(latest, account.name, new Date()) : claudeProbeOffObservations(account)));
+      claudeProbeOutcomes[account.name] = "skipped: claude_probe off";
+      continue;
+    }
     const claudeSnapshot = account.vendor === "claude"
       ? await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date())
       : undefined;

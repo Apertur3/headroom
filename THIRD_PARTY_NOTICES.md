@@ -7,7 +7,7 @@ components are included in [LICENSE](LICENSE).
 | Component | Licence | Use in Headroom |
 |---|---|---|
 | [CodexBar / CodexBarCore](https://github.com/steipete/CodexBar) | MIT | Native quota sensing and optional upstream CLI |
-| [SweetCookieKit](https://github.com/steipete/SweetCookieKit) | MIT | CodexBarCore dependency |
+| [SweetCookieKit](https://github.com/steipete/SweetCookieKit) | MIT | CodexBarCore dependency; linked into the engine, but Headroom never reads browser cookies |
 | [QuickJS](https://github.com/steipete/CodexBar/tree/main/Sources/CQuickJS) | MIT | CodexBarCore dependency |
 | [Swift Crypto](https://github.com/apple/swift-crypto) | Apache-2.0 | CodexBarCore cryptography dependency; macOS uses system CryptoKit |
 | [Swift Log](https://github.com/apple/swift-log) | Apache-2.0 | CodexBarCore logging dependency |

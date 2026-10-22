@@ -59,6 +59,7 @@ describe("daemon JSON-RPC", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-response-clock-")); temporary.push(root);
     const requestedAt = new Date("2026-09-03T12:00:00Z");
     const responseAt = new Date("2026-09-03T12:02:00Z");
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "codex-main"',
@@ -143,6 +144,7 @@ describe("daemon JSON-RPC", () => {
     // this fixture's is, and an absent/non-antigravity accounts.toml would
     // otherwise stop this one out from under the assertions below before
     // they ever run.
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]", 'name = "antigravity"', "enabled = true",
       'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', 'agy_path = "/bin/true"', "",
@@ -171,6 +173,7 @@ describe("daemon JSON-RPC", () => {
   it("never spawns the Claude probe in the poll path once a keychain grant marker exists for the principal", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-grant-gate-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "claude-main"',
@@ -292,6 +295,7 @@ describe("daemon JSON-RPC", () => {
     // the filter drops every observation and this assertion sees `[]`), or a
     // real accounts.toml with a matching account on a dev machine that dogfoods
     // headroom, which only passes by accident. Pin it to this temp root instead.
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "codex-main"',
@@ -440,6 +444,7 @@ describe("MCP JSON-RPC", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-mcp-direct-can-lease-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
     await writeFile(join(root, "routing.toml"), '[consumes]\nreview = ["codex-main:main"]\n', { mode: 0o600 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), ['[[accounts]]', 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
     await withHeadroomHome(root, async () => {
       const store = await HeadroomStore.open(root);
@@ -458,6 +463,7 @@ describe("MCP JSON-RPC", () => {
   it("never spawns the Claude probe from a direct (no-daemon) MCP status read once a keychain grant marker exists", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-mcp-grant-gate-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "claude-main"',
@@ -587,6 +593,7 @@ describe("fill allowance through daemon RPC", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-fill-allowance-")); temporary.push(root);
     const home = join(root, ".headroom");
     await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(home, "accounts.toml"), "", { mode: 0o600 });
     await withHeadroomHome(home, async () => {
       const daemon = await HeadroomDaemon.create({ home, path: testSocketPath(root, "fill-allowance") });
@@ -613,6 +620,7 @@ describe("fill allowance through daemon RPC", () => {
     const root = await mkdtemp(join(tmpdir(), "h-c-f-")); temporary.push(root);
     const home = join(root, ".headroom");
     await mkdir(home, { recursive: true, mode: 0o700 });
+    await writeFile(join(home, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(home, "accounts.toml"), "", { mode: 0o600 });
     const path = socketPath(home);
     const daemon = await HeadroomDaemon.create({ home, path });
@@ -681,6 +689,7 @@ describe("can validates routing before ever answering", () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-can-unknown-meter-")); temporary.push(root);
     await mkdir(root, { recursive: true, mode: 0o700 });
     await writeFile(join(root, "routing.toml"), '[consumes]\nbuild = ["ghost-principal:main"]\n', { mode: 0o600 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
     await withHeadroomHome(root, async () => {
       const daemon = await HeadroomDaemon.create({ home: root, path: join(root, "headroom.sock") });
@@ -820,6 +829,7 @@ describe("Antigravity keepalive startup", () => {
     await mkdir(root, { recursive: true, mode: 0o700 });
     const agyPath = join(root, "fake-agy");
     await writeFile(agyPath, "#!/bin/sh\n", { mode: 0o700 });
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), [
       "[[accounts]]",
       'name = "antigravity"',
@@ -862,6 +872,7 @@ describe("Antigravity keepalive startup", () => {
 
   it("starts configured keepalive before the first poll", async () => {
     const { root } = await keepaliveTestHome();
+    await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     await withHeadroomHome(root, async () => {
       const started = vi.fn();
       const keepalive = { running: false, pid: undefined, uptimeMs: undefined, loginState: "unknown", start: started, stop() {} } as never;
@@ -896,6 +907,7 @@ describe("daemon status names the real backoff deadline on a live 429", () => {
     // masked this on a machine with a real "codex-main" account already
     // configured but left `row` (and its `.reason`) undefined everywhere
     // else, including CI.
+    await writeFile(join(root, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), ["[[accounts]]", 'name = "codex-main"', 'vendor = "codex"', 'location = "/nonexistent/.codex"', 'adapter = "native-ts"', ""].join("\n"), { mode: 0o600 });
     const failedAt = new Date().toISOString();
     const rateLimited: Observation = {

@@ -65,6 +65,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-policydisable-running-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
@@ -108,6 +109,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-policydisable-restartpending-")); temporary.push(root);
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
+    await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;

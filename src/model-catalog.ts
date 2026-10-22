@@ -18,11 +18,6 @@
  *    used; the newest by `fetchedAt` wins. No network call at all.
  *  - Antigravity local: the native probe's model list is carried on quota
  *    observations and folded by insertPoll through the same store catalog.
- *  - Antigravity additional remote source (opt-in, `antigravity_model_catalog = true` in policy.toml):
- *    `cloudcode-pa.googleapis.com`'s `fetchAvailableModels`, authenticated
- *    with the Gemini CLI's own OAuth file (`~/.gemini/oauth_creds.json`).
- *    That is a different credential from the one agy uses for quota, so it is
- *    off by default and nothing here opens that file unless the caller opts in.
  *
  * A vendor with no available source (Claude with no catalog cache yet,
  * Codex with no `models_cache.json`) is reported as `undefined`, never an
@@ -32,12 +27,6 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { vendorHome } from "./paths.js";
-import { vendorJson } from "./limits.js";
-import {
-  defaultCredentialPaths, discoverGeminiOAuthClient, loadCodeAssist,
-  modelsFromAvailableModels, postAvailableModels, readCredential, refreshCredential, resolveProjectId,
-  secureRead as secureCredentialRead, type CodeAssistDependencies,
-} from "./adapters/google-code-assist.js";
 import { isAccountEnabled, type ProviderAccount } from "./types.js";
 import type { HeadroomStore } from "./store.js";
 
@@ -124,42 +113,11 @@ export async function readClaudeModelCatalog(configDir: string, readDir: (path: 
   return catalog.length ? { models: catalog, fetchedAt: new Date(newest.fetchedAt!).toISOString() } : undefined;
 }
 
-/**
- * Antigravity's `fetchAvailableModels`, via the exact credential/project-id
- * resolution `observeAntigravity` already performs for
- * `loadCodeAssist`/`retrieveUserQuota` on the same host. Returns `undefined`
- * (never throws, never blocks a caller's quota poll) on anything short of a
- * successful parsed response: no credentials, an expired token this call
- * chose not to refresh-and-persist anywhere, no Code Assist project, or a
- * non-2xx response.
- */
-export async function fetchAntigravityModelCatalog(dependencies: CodeAssistDependencies = {}): Promise<CatalogModel[] | undefined> {
-  try {
-    const now = dependencies.now?.() ?? new Date();
-    const fetcher = dependencies.fetch ?? fetch;
-    const stored = await readCredential(dependencies.credentialPaths?.() ?? defaultCredentialPaths(), dependencies.readFile ?? secureCredentialRead, now);
-    const credentials = await refreshCredential(fetcher, stored, dependencies.oauthClient ?? discoverGeminiOAuthClient);
-    const codeAssist = await loadCodeAssist(fetcher, credentials.token, { ideType: "ANTIGRAVITY", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" }, "antigravity");
-    const projectId = resolveProjectId(credentials.projectId, codeAssist);
-    if (!projectId) return undefined;
-    const response = await postAvailableModels(fetcher, credentials.token, projectId, "antigravity");
-    if (!response.ok) return undefined;
-    return modelsFromAvailableModels(await vendorJson(response));
-  } catch {
-    // Never surfaced: a model-list miss must never fail a quota poll.
-    return undefined;
-  }
-}
-
 export interface ModelAvailabilityDependencies {
   now?: () => Date;
   fetch?: typeof fetch;
   readCodexModelCatalog?: typeof readCodexModelCatalog;
   readClaudeModelCatalog?: typeof readClaudeModelCatalog;
-  fetchAntigravityModelCatalog?: typeof fetchAntigravityModelCatalog;
-  /** `policy.antigravity_model_catalog`. Absent or false: Antigravity
-   * principals are skipped before any file read or network call. */
-  antigravityModelCatalog?: boolean;
 }
 
 /** Model lists change rarely; this is checked independently of the ordinary
@@ -172,15 +130,11 @@ function daemonStateKey(principalId: string): string { return `model_check:${pri
 async function catalogFor(account: ProviderAccount, dependencies: ModelAvailabilityDependencies, now: Date): Promise<CatalogSnapshot | undefined> {
   if (account.vendor === "codex") return (dependencies.readCodexModelCatalog ?? readCodexModelCatalog)(resolve(account.location || vendorHome("codex")), undefined, now);
   if (account.vendor === "claude") return (dependencies.readClaudeModelCatalog ?? readClaudeModelCatalog)(resolve(account.location || vendorHome("claude")), undefined, undefined, now);
-  if (account.vendor === "antigravity") {
-    const models = await (dependencies.fetchAntigravityModelCatalog ?? fetchAntigravityModelCatalog)({ now: dependencies.now, fetch: dependencies.fetch });
-    return models?.length ? { models, fetchedAt: now.toISOString() } : undefined;
-  }
   return undefined;
 }
 
 /**
- * Checks every codex/claude/antigravity principal's model catalog against
+ * Checks every codex/claude principal's model catalog against
  * `known_models`, at most once per `MODEL_CHECK_INTERVAL_MS` per principal
  * (tracked in `daemon_state`, so a restart does not reset the throttle).
  * Never throws: one vendor's read failing must never stop the others, and
@@ -192,10 +146,7 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
     // This is the credential and cache-read boundary. Callers filter too,
     // but this guard makes a parked principal safe even for a new caller.
     if (!isAccountEnabled(account)) continue;
-    if (account.vendor !== "codex" && account.vendor !== "claude" && account.vendor !== "antigravity") continue;
-    // Opt-in only: the Antigravity catalog call reads the Gemini CLI's OAuth
-    // file, so without explicit consent it is skipped before the claim below.
-    if (account.vendor === "antigravity" && dependencies.antigravityModelCatalog !== true) continue;
+    if (account.vendor !== "codex" && account.vendor !== "claude") continue;
     const key = daemonStateKey(account.name);
     // Claim before the reader's first await. This is a BEGIN IMMEDIATE
     // transaction in the store, so overlapping daemon polls and direct CLI
@@ -204,9 +155,7 @@ export async function checkModelAvailability(store: HeadroomStore, accounts: rea
     try {
       const catalog = await catalogFor(account, dependencies, now);
       if (!catalog?.models.length) continue;
-      // The optional remote Antigravity list can add models, but is not a
-      // complete local quota read and must never count toward retirement.
-      store.recordModelCatalog(account.name, account.vendor, catalog.models, now, { retireMissing: account.vendor !== "antigravity", fetchedAt: catalog.fetchedAt });
+      store.recordModelCatalog(account.name, account.vendor, catalog.models, now, { retireMissing: true, fetchedAt: catalog.fetchedAt });
     } catch { /* The pre-I/O claim remains: a broken source is not retried every poll. */ }
   }
 }

@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { credentialPath, vendorHome } from "../paths.js";
+import { userAgent } from "../version.js";
 import { outboundFetch, redact } from "../security.js";
 import { vendorJson } from "../limits.js";
 import { ProviderHTTPError } from "./claude.js";
@@ -229,7 +230,7 @@ export async function codexResponseShape(account: ProviderAccount, dependencies:
   if (!credits.ok) throw new ProviderHTTPError(credits.status, "Codex credits");
   return { usage: shape(await vendorJson(usage)), usage_headers: headerShape(usage), reset_credits: shape(await vendorJson(credits)), reset_credits_headers: headerShape(credits) };
 }
-function headers(token: string, accountId: string | undefined, credit = false): HeadersInit { return { Authorization: `Bearer ${token}`, "User-Agent": "CodexBar", Accept: "application/json", ...(accountId ? { [credit ? "ChatGPT-Account-ID" : "ChatGPT-Account-Id"]: accountId } : {}), ...(credit ? { "OpenAI-Beta": "codex-1", originator: "Codex Desktop" } : {}) }; }
+function headers(token: string, accountId: string | undefined, credit = false): HeadersInit { return { Authorization: `Bearer ${token}`, "User-Agent": userAgent(), Accept: "application/json", ...(accountId ? { [credit ? "ChatGPT-Account-ID" : "ChatGPT-Account-Id"]: accountId } : {}), ...(credit ? { "OpenAI-Beta": "codex-1" } : {}) }; }
 export async function observeCodex(account: ProviderAccount, dependencies: CodexDependencies = {}): Promise<Observation[]> {
   const now = dependencies.now?.() ?? new Date(); const timestamp = now.toISOString();
   try {
