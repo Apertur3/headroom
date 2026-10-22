@@ -1,8 +1,8 @@
-import { readdir } from "node:fs/promises";
+import { open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { headroomHome } from "../paths.js";
-import { assertSafeReadableDirectory, exceedsJsonDepth, readBoundedRegularFile, safeError } from "../security.js";
+import { assertSafeReadableDirectory, exceedsJsonDepth, readBoundedRegularFile, safeError, writeFileAtomic } from "../security.js";
 import { isAccountEnabled, type Observation, type ProviderAccount } from "../types.js";
 
 export const STATUSLINE_SOURCE = "native:claude-statusline";
@@ -109,7 +109,11 @@ export interface StatuslineSnapshot {
   /** Claude Code's session id and cumulative API time at the render that wrote this file; used only to tell a render that did API work from a replay. */
   session_id?: string;
   api_duration_ms?: number;
+  /** Last seen cumulative API time per session id (the most recent MAX_TRACKED_SESSIONS), so alternating idle sessions cannot pass as progress. */
+  sessions?: Record<string, number>;
 }
+
+const MAX_TRACKED_SESSIONS = 32;
 
 function readBucket(value: unknown): StatuslineBucket | undefined {
   if (!isObject(value)) return undefined;
@@ -164,7 +168,8 @@ export function parseStatuslineSnapshot(raw: string, now: Date = new Date()): St
   const alias = typeof root.alias === "string" ? root.alias : undefined;
   const sessionId = typeof root.session_id === "string" ? root.session_id : undefined;
   const apiDuration = finiteNumber(root.api_duration_ms);
-  return { ...(profile ? { profile } : {}), ...(alias ? { alias } : {}), observed_at: observedAt, five_hour: fiveHour, seven_day: sevenDay, extra, ...(sessionId ? { session_id: sessionId } : {}), ...(apiDuration !== undefined ? { api_duration_ms: apiDuration } : {}) };
+  const sessions = isObject(root.sessions) ? Object.fromEntries(Object.entries(root.sessions).filter((entry): entry is [string, number] => finiteNumber(entry[1]) !== undefined).slice(-MAX_TRACKED_SESSIONS)) : undefined;
+  return { ...(profile ? { profile } : {}), ...(alias ? { alias } : {}), observed_at: observedAt, five_hour: fiveHour, seven_day: sevenDay, extra, ...(sessionId ? { session_id: sessionId } : {}), ...(apiDuration !== undefined ? { api_duration_ms: apiDuration } : {}), ...(sessions ? { sessions } : {}) };
 }
 
 /**
@@ -204,11 +209,48 @@ export function snapshotFromStatuslinePayload(payload: unknown, profile: string,
  * lowers `used` while its `resets_at` is unchanged.
  */
 export function reconcileSnapshot(next: StatuslineSnapshot, previous: StatuslineSnapshot | undefined): StatuslineSnapshot {
-  if (!previous) return next;
-  const grew = next.session_id !== previous.session_id || (next.api_duration_ms ?? 0) > (previous.api_duration_ms ?? 0);
+  const id = next.session_id ?? "";
+  const duration = next.api_duration_ms ?? 0;
+  const known = previous?.sessions ?? (previous?.api_duration_ms !== undefined ? { [previous.session_id ?? ""]: previous.api_duration_ms } : {});
+  const { [id]: recorded = 0, ...others } = known;
+  const sessions = Object.fromEntries(Object.entries({ ...others, [id]: Math.max(duration, recorded) }).slice(-MAX_TRACKED_SESSIONS));
+  if (!previous) return { ...next, sessions };
+  // A session id alone is not progress: only that session's own API time growing past its record is.
+  const grew = duration > recorded;
   const keep = (value: StatuslineBucket | null, old: StatuslineBucket | null): StatuslineBucket | null =>
-    value && old && value.resets_at === old.resets_at && value.used_percent < old.used_percent ? { ...value, used_percent: old.used_percent } : value;
-  return { ...next, observed_at: grew ? next.observed_at : previous.observed_at, five_hour: keep(next.five_hour, previous.five_hour), seven_day: keep(next.seven_day, previous.seven_day) };
+    value && old && value.resets_at !== null && value.resets_at === old.resets_at && value.used_percent < old.used_percent ? { ...value, used_percent: old.used_percent } : value;
+  return { ...next, sessions, observed_at: grew ? next.observed_at : previous.observed_at, five_hour: keep(next.five_hour, previous.five_hour), seven_day: keep(next.seven_day, previous.seven_day) };
+}
+
+const LOCK_STALE_MS = 10_000;
+
+/**
+ * Reads the previous snapshot, reconciles and writes `next` under an exclusive
+ * lock file, so two renders cannot each reconcile against the same old value
+ * and commit out of order. A busy lock skips this write (the next render
+ * writes); a lock older than 10 s is stale and removed. Returns what the bar
+ * should show.
+ */
+export async function writeSnapshotLocked(path: string, next: StatuslineSnapshot, now: Date): Promise<StatuslineSnapshot> {
+  const lock = `${path}.lock`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  // ponytail: stale-lock removal can race another remover; the cost is one extra write, not a lost guard
+  for (let attempt = 0; attempt < 2 && !handle; attempt++) {
+    try { handle = await open(lock, "wx", 0o600); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const age = await stat(lock).then((info) => Date.now() - info.mtimeMs, () => 0);
+      if (age <= LOCK_STALE_MS) return next;
+      await unlink(lock).catch(() => undefined);
+    }
+  }
+  if (!handle) return next;
+  try {
+    const previous = await readFile(path, "utf8").then((text) => parseStatuslineSnapshot(text, now), () => undefined);
+    const reconciled = reconcileSnapshot(next, previous);
+    await writeFileAtomic(path, JSON.stringify(reconciled), 0o600);
+    return reconciled;
+  } finally { await handle.close(); await unlink(lock).catch(() => undefined); }
 }
 
 /**

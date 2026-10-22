@@ -15,7 +15,7 @@ import { engineStatus, installEngine, installNativeEngine } from "./engine/codex
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCredentialReadable, probeBinaryHash, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
-import { claudeStatuslineNotice, formatStatuslineBar, parseStatuslineSnapshot, reconcileSnapshot, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { claudeStatuslineNotice, formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile, writeSnapshotLocked } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
@@ -1753,6 +1753,7 @@ async function responseShape(argv: string[]): Promise<number> {
   if (!isAccountEnabled(account)) throw new Error(disabledPrincipalReason(account.name));
   if (account.vendor === "gemini") throw new Error(GEMINI_RETIRED_REASON);
   if (account.vendor === "antigravity") throw new Error("Antigravity uses agy local quota summaries; inspect headroom doctor and headroom --principal <id> --json instead");
+  if (account.vendor === "claude" && !(await readPolicy()).claude_probe) throw new Error("--shape for Claude uses the token probe, which is off; set claude_probe = true in policy.toml to opt in");
   const responses = account.vendor === "codex" ? await codexResponseShape(account)
     : account.vendor === "claude" ? { usage: await claudeResponseShape(account) }
     : undefined;
@@ -1934,9 +1935,7 @@ async function statusline(argv: string[]): Promise<number> {
       const home = await safeHeadroomDirectory();
       const dir = await safeOutputDirectory(join(home, "statusline"));
       const path = join(dir, `${profile}.json`);
-      const previous = await readFile(path, "utf8").then((text) => parseStatuslineSnapshot(text, now), () => undefined);
-      snapshot = reconcileSnapshot(snapshot, previous);
-      await writeFileAtomic(path, JSON.stringify(snapshot), 0o600);
+      snapshot = await writeSnapshotLocked(path, snapshot, now);
     }
   } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }
   if (chainCommand) {

@@ -471,7 +471,7 @@ async function observeMoonshotCredits(account: ProviderAccount, path: string, do
   try { key = await readKimiToken(path); }
   catch (error) { return failed(account, `${error instanceof Error ? error.message.replace("token file", "credits key file") : "Moonshot key unavailable"} (${path})`, now, ["credits"], CREDITS_SOURCE); }
   try {
-    const response = await outboundFetch(doFetch, new Request(MOONSHOT_BALANCE_URL, { headers: { Authorization: `Bearer ${key}`, Accept: "application/json" }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
+    const response = await outboundFetch(doFetch, new Request(MOONSHOT_BALANCE_URL, { headers: { Authorization: `Bearer ${key}`, Accept: "application/json", "User-Agent": userAgent() }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
     if (!response.ok) throw new ProviderHTTPError(response.status, "Moonshot balance");
     return [observationFromMoonshotBalance(await vendorJson(response), account, at)];
   } catch (error) {

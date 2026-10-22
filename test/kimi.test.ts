@@ -224,6 +224,7 @@ describe("observeKimi", () => {
     });
     const rows = await observeKimi(target, { fetch: fetcher, now: () => at });
     expect(requests.map((request) => new URL(request.url).hostname)).toContain("api.moonshot.ai");
+    for (const request of requests) expect(request.headers.get("user-agent")).toMatch(/^headroomd\/\S+$/);
     expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "fresh", quantity: expect.objectContaining({ remaining: 12.5, unit: "credits" }) });
     expect(JSON.stringify(rows)).not.toContain("synthetic-moonshot-key");
   });

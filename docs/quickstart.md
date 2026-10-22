@@ -438,8 +438,8 @@ headroom hook uninstall --agent claude # remove it again
 
 The hook is a small shell script in `~/.headroom/hooks/` that reads that file and appends its age: no
 Node, no network, a few milliseconds, and it never fails a prompt. Install adds one
-`UserPromptSubmit` entry to `settings.json` in `CLAUDE_CONFIG_DIR` (or `~/.claude`) and in
-`~/.claude2` when that exists, backs each file up once first, leaves every other setting alone, and
+`UserPromptSubmit` entry to `settings.json` in `CLAUDE_CONFIG_DIR` (or `~/.claude`),
+backs the file up once first, leaves every other setting alone, and
 refuses to edit a file that does not parse. It costs about 60 tokens per turn. `headroom setup` offers
 it (default yes); `setup --yes` installs it only with `--hook`. Not supported yet: Windows (the daemon
 still writes the line, and `headroom line` prints it), and Codex or Gemini hooks.

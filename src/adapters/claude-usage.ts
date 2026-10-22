@@ -1,15 +1,13 @@
 import { execFile } from "node:child_process";
-import { mkdir, stat, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, open, readdir, unlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { headroomHome } from "../paths.js";
 import { redact } from "../security.js";
 import type { Observation, ProviderAccount } from "../types.js";
 import { observationsFromClaudeUsage } from "./claude.js";
-import { statuslineProfile } from "./claude-statusline.js";
-
-const execFileAsync = promisify(execFile);
 
 /** Source label of a reading taken by running Claude Code's own `/usage`. */
 export const CLAUDE_USAGE_SOURCE = "native:claude-usage";
@@ -30,7 +28,25 @@ export interface ClaudeUsageDependencies { run?: ClaudeUsageRunner; now?: () => 
 /** `undefined`: ran recently, nothing to add. */
 export type ClaudeUsageResult = { rows: Observation[] } | { error: string } | undefined;
 
-const defaultRun: ClaudeUsageRunner = async (binary, args, options) => (await execFileAsync(binary, args, { ...options, maxBuffer: MAX_BUFFER, windowsHide: true })).stdout;
+/** Windows npm installs expose `claude.cmd`, which only a shell can start. Safe here: every argument is a constant and the only variable input travels in env. */
+export const needsShell = (binary: string, platform: string = process.platform): boolean => platform === "win32" && /\.(cmd|bat)$/i.test(binary);
+
+/** A bare `claude` on Windows is `claude.exe` or the npm `claude.cmd` shim; look both up on PATH. */
+export function resolveBinary(binary: string, platform: string = process.platform, pathVariable = process.env.PATH ?? "", exists = existsSync): string {
+  if (platform !== "win32" || /[\\/.]/.test(binary)) return binary;
+  for (const dir of pathVariable.split(";")) for (const extension of [".exe", ".cmd", ".bat"]) if (dir && exists(`${dir}\\${binary}${extension}`)) return `${dir}\\${binary}${extension}`;
+  return binary;
+}
+
+/** Own timer, SIGKILL: execFile's SIGTERM-only timeout leaves a child that ignores it (and the poll awaiting it) hanging. */
+export const defaultRun: ClaudeUsageRunner = (binary, args, options) => new Promise((resolvePromise, reject) => {
+  const shell = needsShell(binary);
+  const child = execFile(shell && binary.includes(" ") ? `"${binary}"` : binary, shell ? args.map((arg) => arg === "" ? '""' : arg) : args, { env: options.env, cwd: options.cwd, maxBuffer: MAX_BUFFER, windowsHide: true, shell }, (error, stdout) => {
+    clearTimeout(timer);
+    if (error) reject(error); else resolvePromise(stdout);
+  });
+  const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`timed out after ${options.timeout / 1000}s`)); }, options.timeout);
+});
 
 function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -41,23 +57,27 @@ function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
   return env;
 }
 
-/** Claims this profile's run slot by touching a stamp file; false while the last run is under the minimum interval. */
+/** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket; false when it already exists. */
 async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<boolean> {
   const dir = dependencies.stampDir ?? join(headroomHome(), "claude-usage");
-  const path = join(dir, `${statuslineProfile(account.location)}.stamp`);
+  const key = createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12);
+  // ponytail: bucket-aligned throttle, two runs can straddle a boundary
+  const name = `${key}.${Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS)}.stamp`;
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const last = await stat(path).then((info) => info.mtimeMs, () => undefined);
-    if (last !== undefined && now.getTime() - last < CLAUDE_USAGE_MIN_INTERVAL_MS) return false;
-    if (last === undefined) await writeFile(path, "", { mode: 0o600 });
-    await utimes(path, now, now);
+    await (await open(join(dir, name), "wx", 0o600)).close();
+    for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old !== name) await unlink(join(dir, old)).catch(() => undefined);
     return true;
-  } catch { return false; } // cannot record the claim: fail closed rather than run unthrottled
+  } catch { return false; } // already claimed, or cannot record the claim: fail closed rather than run unthrottled
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** The usage_report of the stream's assistant message, as an OAuth-usage-shaped body. Never parses the text. */
+const LIMIT_KINDS = ["session", "weekly_all", "weekly_scoped"];
+const validReset = (value: unknown): boolean => value === null || value === undefined || (typeof value === "number" && Number.isFinite(value)) || (typeof value === "string" && Number.isFinite(Date.parse(value)));
+
+/** The usage_report of the stream's assistant message, as an OAuth-usage-shaped body. Never parses the text.
+ * Throws when any limit entry is malformed: a partly readable report must fail closed, not drop a bucket. */
 export function usageBodyFromStream(stdout: string): Record<string, unknown> | undefined {
   for (const line of stdout.split("\n")) {
     let message: unknown;
@@ -67,11 +87,11 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
     if (!Array.isArray(limits)) continue;
     const body: Record<string, unknown> = { limits: [] };
     for (const limit of limits) {
-      if (!isObject(limit)) continue;
+      if (!isObject(limit) || typeof limit.kind !== "string" || !LIMIT_KINDS.includes(limit.kind) || typeof limit.percent !== "number" || !Number.isFinite(limit.percent) || !validReset(limit.resets_at)) throw new Error("claude /usage report has a malformed limit entry");
       const entry = { percent: limit.percent, resets_at: limit.resets_at };
       if (limit.kind === "session") body.five_hour = entry;
       else if (limit.kind === "weekly_all") body.seven_day = entry;
-      else if (limit.kind === "weekly_scoped") (body.limits as unknown[]).push({ ...entry, kind: "weekly_scoped", scope: limit.scope, is_active: limit.is_active });
+      else (body.limits as unknown[]).push({ ...entry, kind: "weekly_scoped", scope: limit.scope, is_active: limit.is_active });
     }
     return body;
   }
@@ -81,15 +101,14 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
 export async function observeClaudeUsage(account: ProviderAccount, dependencies: ClaudeUsageDependencies = {}): Promise<ClaudeUsageResult> {
   const now = dependencies.now?.() ?? new Date();
   if (!await claimSlot(account, dependencies, now)) return undefined;
-  let stdout: string;
   try {
-    stdout = await (dependencies.run ?? defaultRun)(dependencies.binary ?? process.env.HEADROOM_CLAUDE_BIN ?? "claude", ARGS, { env: childEnvironment(account), cwd: tmpdir(), timeout: TIMEOUT_MS });
+    const stdout = await (dependencies.run ?? defaultRun)(resolveBinary(dependencies.binary ?? process.env.HEADROOM_CLAUDE_BIN ?? "claude"), ARGS, { env: childEnvironment(account), cwd: tmpdir(), timeout: TIMEOUT_MS });
+    const body = usageBodyFromStream(stdout);
+    if (!body) return { error: "claude /usage returned no usage_report (API-key, setup-token or usage-billing session, or an older Claude Code)" };
+    const rows = observationsFromClaudeUsage(body, account, now).map((row) => ({ ...row, source: CLAUDE_USAGE_SOURCE }));
+    return rows.some((row) => row.freshness === "fresh") ? { rows } : { error: "claude /usage report carried no usable limits" };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     return { error: code === "ENOENT" ? "the claude command was not found on PATH" : `claude /usage failed: ${redact(error instanceof Error ? error.message : "unknown error").slice(0, 200)}` };
   }
-  const body = usageBodyFromStream(stdout);
-  if (!body) return { error: "claude /usage returned no usage_report (API-key, setup-token or usage-billing session, or an older Claude Code)" };
-  const rows = observationsFromClaudeUsage(body, account, now).map((row) => ({ ...row, source: CLAUDE_USAGE_SOURCE }));
-  return rows.some((row) => row.freshness === "fresh") ? { rows } : { error: "claude /usage report carried no usable limits" };
 }
