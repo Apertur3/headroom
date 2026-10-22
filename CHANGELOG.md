@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-10-22
+
 ### Changed
 - Claude usage is read through Claude Code by default: the statusline snapshot first, then Claude Code's own `/usage` (at most every 10 minutes per profile, run whether or not a snapshot is fresh, and the source of the scoped weekly meters). The direct usage request is opt-in with `claude_probe = true` in `policy.toml` and is used only when no other reading is available. To see live figures between `/usage` runs, set your Claude `statusLine` to `headroom statusline` (or chain an existing one with `--chain`); `headroom status` and `headroom doctor` show this as one line. Headroom never edits your Claude settings.
 - Requests to vendor services identify as `headroomd/<version>`.
