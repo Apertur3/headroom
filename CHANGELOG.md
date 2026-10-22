@@ -7,12 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- Behaviour change: the Claude usage probe is now off by default (`claude_probe = false`). Claude is read from the statusline snapshot only, with no Keychain or network access; a missing or old snapshot shows as stale or unknown. Upgrade step: set the `statusLine` command in your Claude `settings.json` (each profile) to `headroom statusline`, or chain your existing one with `headroom statusline --chain '<your command>'`, or set `claude_probe = true` in `policy.toml` to keep the old token fallback. Until then Claude shows as unknown; `headroom status` and `headroom doctor` print this fix as one line. Headroom never edits your Claude settings.
+- Behaviour change: the Claude usage probe is now off by default (`claude_probe = false`). Claude is read from the statusline snapshot only, with no Keychain or network access; a missing or old snapshot shows as stale or unknown. Upgrade step: set the `statusLine` command in your Claude `settings.json` (each profile) to `headroom statusline`, or chain your existing one with `headroom statusline --chain '<your command>'`, or set `claude_probe = true` in `policy.toml` to keep the old token fallback. Until then Headroom runs Claude Code's own `/usage` (at most every 10 minutes per profile); `headroom status` and `headroom doctor` print this fix as one line. Headroom never edits your Claude settings.
 - Honest client identity: every vendor request (Claude probe, Codex, Grok, Kimi) now sends `User-Agent: headroomd/<version>`. The `claude-code/2.1.0`, `CodexBar`, `originator: Codex Desktop`, `x-xai-token-auth: xai-grok-cli` and `x-msh-platform: kimi_code_cli` headers and the Kimi web-gateway `Origin`/`Referer` are gone.
 - The Antigravity keepalive is opt-in on every platform: `antigravity_keepalive` now defaults to `false`.
 
 ### Added
-- `claude_probe` in `policy.toml` (boolean). When `false`, the Claude collector never touches the Keychain or the network.
+- `claude_probe` in `policy.toml` (boolean). When `false`, the Claude collector never touches the Keychain or Anthropic's endpoint.
+- Claude source `native:claude-usage`: when no statusline snapshot is fresh, Headroom runs Claude Code's own `claude -p "/usage"` (at most every 10 minutes per profile, no shell, structured `usage_report` only, fails closed) and reads the 5h, weekly and scoped (Fable) meters from it.
+- `headroom statusline` restamps its snapshot only when the session's API time grew and never lowers a figure within one reset; a snapshot file whose `source` is not `statusline` is ignored.
 
 ### Removed
 - The opt-in Antigravity model catalog (it used the Gemini CLI OAuth token), the Google Code Assist client with its scraped OAuth client, and the unused remote Antigravity and Gemini quota readers. `antigravity_model_catalog` in an old `policy.toml` is accepted and ignored. The local `agy` quota path is unchanged.

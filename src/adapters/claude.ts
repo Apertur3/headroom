@@ -578,8 +578,8 @@ export function claudeGrantNeededObservations(account: ProviderAccount, now = ne
 }
 
 /** `claude_probe = false` and no statusline snapshot yet: unknown, shown stale (not failed). */
-export function claudeProbeOffObservations(account: ProviderAccount, now = new Date()): Observation[] {
-  return failed(account, "claude_probe is off and no statusline snapshot yet; run Claude Code with the Headroom statusline", now.toISOString()).map((row) => ({ ...row, freshness: "stale" as const }));
+export function claudeProbeOffObservations(account: ProviderAccount, now = new Date(), cause?: string): Observation[] {
+  return failed(account, `claude_probe is off and no statusline snapshot yet; set Claude Code's statusLine command to headroom statusline${cause ? ` (${cause})` : ""}`, now.toISOString()).map((row) => ({ ...row, freshness: "stale" as const }));
 }
 
 function window(account: ProviderAccount, meter: string, raw: unknown, minutes: number, now: string): Observation | undefined {

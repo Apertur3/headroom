@@ -1,7 +1,7 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { claudeRunWithDirectory } from "../src/adapters/claude.js";
 import { credentialCheck } from "../src/doctor.js";
 import { installService, serviceContents, serviceFileBytes } from "../src/service.js";
@@ -59,6 +59,12 @@ describe("claude sign-in hint per platform", () => {
 });
 
 describe("claude credential file without a login (issue seen on a fresh Windows user)", () => {
+  // The credential line is only the doctor's concern when the token probe is enabled.
+  beforeEach(async () => {
+    await mkdir(process.env.HEADROOM_HOME!, { recursive: true, mode: 0o700 });
+    await writeFile(join(process.env.HEADROOM_HOME!, "policy.toml"), "claude_probe = true\n", { mode: 0o600 });
+  });
+
   it("doctor does not call a credential file OK when it only holds MCP tokens", async () => {
     const dir = await mkdtemp(join(tmpdir(), "headroom-cred-"));
     temporary.push(dir);

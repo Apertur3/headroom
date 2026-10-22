@@ -115,7 +115,7 @@ Windows there is no Keychain at all: Headroom reads the token straight from
 
 ## 4b. Wire the statusline (the default Claude source): `headroom statusline`
 
-Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+Claude Code hands its `statusLine` command a JSON object when an interactive session renders its statusline (it never runs under `claude -p`), containing
 `rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`, `resets_at`) -- the exact
 numbers the vendor probe exists to fetch, already sitting on stdin for free.
 Register `headroom statusline` as that command and Headroom reads it as its zero-auth Claude source (no credential read):
@@ -185,11 +185,12 @@ to one poll interval old (`poll_interval_minutes`, five minutes by default). Not
 ever calls a vendor, so the line cannot delay your prompt.
 
 Every reading this way snapshots to `~/.headroom/statusline/<profile>.json` (0600); the collector
-is Headroom's only Claude source by default (`claude_probe = false`), and reads a Fable-scoped or other
+prefers a snapshot under 10 minutes old, and reads a Fable-scoped or other
 model-scoped bucket the same way if Claude Code ever includes one in `rate_limits`. **A profile
 set up this way is read without opening the Keychain item at all.** A profile whose statusline
-hasn't rendered yet (or has gone stale) shows as stale or unknown; `headroom doctor` says so. Set
-`claude_probe = true` in `policy.toml` to let a stale snapshot fall back to the probe.
+hasn't rendered yet (or has gone stale) is read by running Claude Code's own `/usage` at most every
+10 minutes; `headroom doctor` says so. Set `claude_probe = true` in `policy.toml` to add the older
+token probe as a last resort.
 
 ## 4c. When the meter is blocked, paste the panel
 

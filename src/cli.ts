@@ -2,6 +2,7 @@
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { existsSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join, basename, delimiter, dirname } from "node:path";
@@ -14,7 +15,7 @@ import { engineStatus, installEngine, installNativeEngine } from "./engine/codex
 import { observeLocal } from "./engine/local.js";
 import { nativeEnginePath } from "./engine/native/run.js";
 import { ClaudeProbeError, claudeGrantGate, claudeResponseShape, checkClaudeCredentialReadable, probeBinaryHash, resolveProbePath, syncClaudeProbeState } from "./adapters/claude.js";
-import { claudeStatuslineNotice, formatStatuslineBar, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
+import { claudeStatuslineNotice, formatStatuslineBar, parseStatuslineSnapshot, reconcileSnapshot, snapshotFromStatuslinePayload, statuslineProfile } from "./adapters/claude-statusline.js";
 import { parseRenderOptions, renderedStatusline } from "./statusline-render.js";
 import { clipboardCommand, observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
 import { usageImportCommand, usageImportStatusCommand, USAGE_IMPORT_HELP, USAGE_IMPORT_STATUS_HELP } from "./usage-import.js";
@@ -1933,6 +1934,8 @@ async function statusline(argv: string[]): Promise<number> {
       const home = await safeHeadroomDirectory();
       const dir = await safeOutputDirectory(join(home, "statusline"));
       const path = join(dir, `${profile}.json`);
+      const previous = await readFile(path, "utf8").then((text) => parseStatuslineSnapshot(text, now), () => undefined);
+      snapshot = reconcileSnapshot(snapshot, previous);
       await writeFileAtomic(path, JSON.stringify(snapshot), 0o600);
     }
   } catch { /* the bar must still print even if reading stdin or writing the snapshot fails */ }

@@ -62,7 +62,7 @@ export async function credentialCheck(account: Account, grantsNeeded: Map<string
     const fresh = await freshStatuslineSnapshot(statuslineSnapshotDirs(claudePolicy.statusline_snapshot_dirs), account as ProviderAccount, [account as ProviderAccount], new Date());
     return fresh
       ? check("OK", `principal ${account.name} credential`, "fresh statusline snapshot (claude_probe = false: Keychain and network not used)", "no action needed")
-      : check("WARN", `principal ${account.name} credential`, "no fresh statusline snapshot and claude_probe = false, so Claude usage reads unknown", "set Claude Code's statusLine command to `headroom statusline` (docs/quickstart.md), or set claude_probe = true in policy.toml");
+      : check("INFO", `principal ${account.name} credential`, "no fresh statusline snapshot; claude_probe = false, so Claude is read through `claude /usage` at most every 10 minutes", "set Claude Code's statusLine command to `headroom statusline` (docs/quickstart.md) for live readings; claude_probe = true opts into the token probe");
   }
   if (account.vendor === "claude" && process.platform === "darwin") {
     // A principal already marked grant-needed must never touch the Keychain

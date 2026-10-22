@@ -106,6 +106,9 @@ export interface StatuslineSnapshot {
    * live probe maps a scoped `limits[]` entry. Always empty for the
    * external collector shape, which does not carry these. */
   extra: Record<string, StatuslineBucket>;
+  /** Claude Code's session id and cumulative API time at the render that wrote this file; used only to tell a render that did API work from a replay. */
+  session_id?: string;
+  api_duration_ms?: number;
 }
 
 function readBucket(value: unknown): StatuslineBucket | undefined {
@@ -140,6 +143,8 @@ export function parseStatuslineSnapshot(raw: string, now: Date = new Date()): St
   // any real payload this module produces or consumes needs is treated the
   // same as unparseable JSON, not walked.
   if (exceedsJsonDepth(root, MAX_SNAPSHOT_JSON_DEPTH)) return undefined;
+  // A file the owner's collector filled from the OAuth endpoint ("live-poll") is not a statusline reading.
+  if (root.source !== undefined && root.source !== "statusline") return undefined;
   const observedAt = finiteNumber(root.observed_at);
   // A future-dated or out-of-Date-range observed_at is rejected here, at the
   // earliest possible point, rather than merely marked stale: a future
@@ -157,7 +162,9 @@ export function parseStatuslineSnapshot(raw: string, now: Date = new Date()): St
   if (!fiveHour && !sevenDay && !Object.keys(extra).length) return undefined;
   const profile = typeof root.profile === "string" ? root.profile : undefined;
   const alias = typeof root.alias === "string" ? root.alias : undefined;
-  return { ...(profile ? { profile } : {}), ...(alias ? { alias } : {}), observed_at: observedAt, five_hour: fiveHour, seven_day: sevenDay, extra };
+  const sessionId = typeof root.session_id === "string" ? root.session_id : undefined;
+  const apiDuration = finiteNumber(root.api_duration_ms);
+  return { ...(profile ? { profile } : {}), ...(alias ? { alias } : {}), observed_at: observedAt, five_hour: fiveHour, seven_day: sevenDay, extra, ...(sessionId ? { session_id: sessionId } : {}), ...(apiDuration !== undefined ? { api_duration_ms: apiDuration } : {}) };
 }
 
 /**
@@ -184,7 +191,24 @@ export function snapshotFromStatuslinePayload(payload: unknown, profile: string,
     if (bucket) extra[key] = bucket;
   }
   if (!fiveHour && !sevenDay && !Object.keys(extra).length) return undefined;
-  return { profile, observed_at: Math.floor(observedAt.getTime() / 1000), five_hour: fiveHour, seven_day: sevenDay, extra };
+  const sessionId = typeof payload.session_id === "string" ? payload.session_id : undefined;
+  const apiDuration = isObject(payload.cost) ? finiteNumber(payload.cost.total_api_duration_ms) : undefined;
+  return { profile, observed_at: Math.floor(observedAt.getTime() / 1000), five_hour: fiveHour, seven_day: sevenDay, extra, ...(sessionId ? { session_id: sessionId } : {}), ...(apiDuration !== undefined ? { api_duration_ms: apiDuration } : {}) };
+}
+
+/**
+ * Claude Code re-renders the statusline on idle events and replays cached
+ * rate limits, so a render is not proof the figures are current. The new
+ * snapshot keeps the previous `observed_at` unless this session's cumulative
+ * API time grew (a render that followed real API work), and a bucket never
+ * lowers `used` while its `resets_at` is unchanged.
+ */
+export function reconcileSnapshot(next: StatuslineSnapshot, previous: StatuslineSnapshot | undefined): StatuslineSnapshot {
+  if (!previous) return next;
+  const grew = next.session_id !== previous.session_id || (next.api_duration_ms ?? 0) > (previous.api_duration_ms ?? 0);
+  const keep = (value: StatuslineBucket | null, old: StatuslineBucket | null): StatuslineBucket | null =>
+    value && old && value.resets_at === old.resets_at && value.used_percent < old.used_percent ? { ...value, used_percent: old.used_percent } : value;
+  return { ...next, observed_at: grew ? next.observed_at : previous.observed_at, five_hour: keep(next.five_hour, previous.five_hour), seven_day: keep(next.seven_day, previous.seven_day) };
 }
 
 /**
@@ -353,7 +377,7 @@ export async function claudeStatuslineNotice(policy: { claude_probe: boolean; st
   const missing: string[] = [];
   for (const account of claude) if (!await freshStatuslineSnapshot(dirs, account, claude, now)) missing.push(account.name);
   return missing.length
-    ? `Claude has no fresh statusline snapshot for ${missing.join(", ")}: set Claude Code's statusLine command to \`headroom statusline\` (or \`headroom statusline --chain "<your current command>"\`), or set claude_probe = true in policy.toml to keep the token probe.`
+    ? `Claude has no fresh statusline snapshot for ${missing.join(", ")}; Headroom falls back to running \`claude /usage\` at most every 10 minutes. For live readings set Claude Code's statusLine command to \`headroom statusline\` (or \`headroom statusline --chain "<your current command>"\`); claude_probe = true in policy.toml opts into the older token probe.`
     : undefined;
 }
 

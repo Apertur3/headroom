@@ -64,10 +64,9 @@ Claude usage comes from Claude Code's statusline. Add this to `~/.claude/setting
 { "statusLine": { "type": "command", "command": "headroom statusline" } }
 ```
 
-Without it, Claude shows as unknown until you run it (`headroom doctor` and `headroom status` say
-so). The opt-in alternative is `claude_probe = true` in `~/.headroom/policy.toml`: see
-[Vendor endpoints and your accounts](#vendor-endpoints-and-your-accounts). Headroom never edits
-your Claude settings files.
+Without it, Headroom runs Claude Code's own `/usage` at most every 10 minutes (the statusline never
+runs under `claude -p`, so it can go stale). `headroom doctor` and `headroom status` say which is in
+use. Headroom never edits your Claude settings files.
 
 For Claude Code, install the plugin after installing headroomd with npm or Homebrew:
 
@@ -504,11 +503,12 @@ never writes to another tool's credential store. Use it only with accounts you o
 may restrict this kind of access, and a vendor can change or block an endpoint at any time; use it
 at your own risk. Headroom does not rotate credentials to get past a block or a limit. Use only accounts you own; Headroom does not help get around a vendor's limits.
 
-Every request identifies itself honestly as `headroomd/<version>`; none presents itself as a vendor's own client. With `claude_probe = false` in `policy.toml`, Headroom never reads Claude's Keychain item or calls the Claude endpoint: it reads only the statusline snapshot, and a missing or old snapshot shows as stale or unknown.
+Every request identifies itself honestly as `headroomd/<version>`; none presents itself as a vendor's own client. The default (`claude_probe = false`) needs no token and no undocumented endpoint: Headroom reads the statusline snapshot, or runs Claude Code's own `/usage`, and never reads Claude's Keychain item or calls Anthropic. Setting `claude_probe = true` opts into the older call: Headroom reads Claude Code's OAuth token and calls an undocumented Anthropic endpoint, and Anthropic's terms reserve that login for ordinary use of Claude Code.
 
 | Source | What Headroom calls | Credential | Documented by the vendor |
 |---|---|---|---|
-| Claude, statusline snapshot (default) | No network call: reads the JSON Claude Code passes to its `statusLine` command | None | Not applicable (local) |
+| Claude, statusline snapshot (default, preferred) | No network call: reads the JSON Claude Code passes to its `statusLine` command | None | Not applicable (local) |
+| Claude, `/usage` fallback (default) | Runs your own `claude -p "/usage"` at most every 10 minutes per profile when no statusline snapshot is fresh; no model turn, no cost | None handled by Headroom: Claude Code uses its own login | Yes, `usage_report` is in the Agent SDK reference (marked experimental) |
 | Claude, usage probe (opt-in: `claude_probe = true` in `policy.toml`) | `GET api.anthropic.com/api/oauth/usage` | Claude Code's OAuth token, from the macOS Keychain or `.credentials.json` | No. Sends `User-Agent: headroomd/<version>` |
 | Codex | `GET chatgpt.com/backend-api/wham/usage` and `.../wham/rate-limit-reset-credits`; also the Codex CLI's local session logs | ChatGPT token in `~/.codex/auth.json` | No. Sends `User-Agent: headroomd/<version>` |
 | Antigravity quota (experimental) | agy's local language server on 127.0.0.1 | agy's local CSRF token from its process command line, where present; not agy's OAuth or session credential | No (private local endpoint) |

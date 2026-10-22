@@ -127,7 +127,7 @@ async function stepDiscoverAccounts(options: SetupOptions): Promise<boolean> {
 
 async function stepDoctor(options: SetupOptions): Promise<boolean> {
   console.log("Step 2: run doctor");
-  console.log("  Claude: Headroom reads your usage from Claude Code's statusline. Set Claude Code's statusLine command to `headroom statusline` (see docs/quickstart.md). The Keychain/network probe is off unless you set claude_probe = true in policy.toml.");
+  console.log("  Claude: Headroom reads your usage from Claude Code's statusline. Set Claude Code's statusLine command to `headroom statusline` (see docs/quickstart.md); without it Headroom runs `claude /usage` at most every 10 minutes. The token probe is off unless you set claude_probe = true in policy.toml.");
   if (options.planOnly) {
     // doctor() opens (and so creates) the Headroom home database and, on
     // macOS, looks up Keychain item metadata for each configured Claude

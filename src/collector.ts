@@ -3,6 +3,7 @@ import { verifiedEnginePath } from "./engine/codexbar/install.js";
 import { runCodexBar } from "./engine/codexbar/run.js";
 import { normalizeObservations, observationsFromReading } from "./engine/observation.js";
 import { NATIVE_ENGINE_TIMEOUT_MS, nativeEnginePath, runNativeEngine } from "./engine/native/run.js";
+import { observeClaudeUsage, type ClaudeUsageDependencies } from "./adapters/claude-usage.js";
 import { claudeGrantNeededObservations, claudeProbeOffObservations, isClaudeProbeDenialReason, observeClaude, type ClaudeGrantGate } from "./adapters/claude.js";
 import { freshStatuslineSnapshot, latestStatuslineSnapshot, observationsFromStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { readPolicy } from "./config.js";
@@ -35,7 +36,7 @@ export interface PollResult {
    * statusline snapshot path (see adapters/claude-statusline.ts): the probe
    * was never attempted because a fresh-enough snapshot already answered
    * this principal. */
-  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off">;
+  claudeProbeOutcomes?: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off" | "skipped: claude usage">;
 }
 export interface PollOptions {
   /** Overrides the platform's native-engine availability for controlled callers. */
@@ -53,6 +54,8 @@ export interface PollOptions {
    * `headroom keychain grant` clears it. Absent for callers that do not
    * track grant state (e.g. --shape diagnostics). */
   claudeGrant?: ClaudeGrantGate;
+  /** Test seam for the `claude -p "/usage"` runner (adapters/claude-usage.ts). */
+  claudeUsage?: ClaudeUsageDependencies;
   /** Set only by the CLI's and MCP's no-daemon direct-read fallbacks (the
    * only callers that ever poll with no responding daemon at all -- the
    * daemon's own poll loop never sets this). Skips the deprecated remote
@@ -187,7 +190,7 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
   // Claude always stays in the TypeScript adapter: on macOS it delegates the
   // credential read and request to the separately-granted Claude probe.
   const tsAccounts = providerAccounts.filter((account) => account.vendor === "claude" || (account.adapter === "native-ts" && account.vendor === "codex"));
-  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off"> = {};
+  const claudeProbeOutcomes: Record<string, "called" | "skipped: grant needed" | "skipped: statusline fresh" | "skipped: claude_probe off" | "skipped: claude usage"> = {};
   const claudePrincipalsPresent = tsAccounts.some((account) => account.vendor === "claude");
   // Read once per poll, only when there is a Claude principal to check at
   // all: this is the sole reason the collector reads policy.toml.
@@ -199,18 +202,42 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
     // the granted probe also returns every model-scoped bucket (Fable,
     // Routines). Skipping a granted probe whenever a snapshot was fresh left
     // the scoped meters stale for as long as the snapshot kept arriving.
-    // claude_probe = false: the statusline snapshot is the only Claude source.
-    // No Keychain read, no network; an old or missing snapshot reads as
-    // stale/unknown rather than as an error.
-    if (account.vendor === "claude" && claudePolicy?.claude_probe === false) {
-      const latest = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
-      observations.push(...(latest ? observationsFromStatuslineSnapshot(latest, account.name, new Date()) : claudeProbeOffObservations(account)));
-      claudeProbeOutcomes[account.name] = "skipped: claude_probe off";
-      continue;
-    }
     const claudeSnapshot = account.vendor === "claude"
       ? await freshStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date())
       : undefined;
+    // Order: fresh statusline snapshot, then Claude Code's own `/usage` (at most
+    // every 10 minutes per profile), then the token probe only if claude_probe.
+    if (account.vendor === "claude") {
+      const probeOn = claudePolicy?.claude_probe === true;
+      if (claudeSnapshot && !probeOn) {
+        observations.push(...observationsFromStatuslineSnapshot(claudeSnapshot, account.name, new Date()));
+        claudeProbeOutcomes[account.name] = "skipped: statusline fresh";
+        continue;
+      }
+      let usageError: string | undefined;
+      if (!claudeSnapshot) {
+        const usage = await observeClaudeUsage(account, options.claudeUsage);
+        if (usage && "rows" in usage) {
+          observations.push(...usage.rows);
+          claudeProbeOutcomes[account.name] = "skipped: claude usage";
+          continue;
+        }
+        if (usage) usageError = usage.error;
+        else if (!probeOn) {
+          // Ran under 10 minutes ago: keep the last reading; only an old snapshot can add rows.
+          const old = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
+          if (old) observations.push(...observationsFromStatuslineSnapshot(old, account.name, new Date()));
+          claudeProbeOutcomes[account.name] = "skipped: claude usage";
+          continue;
+        }
+      }
+      if (!probeOn) {
+        const latest = await latestStatuslineSnapshot(statuslineDirs, account, providerAccounts.filter((item) => item.vendor === "claude"), new Date());
+        observations.push(...(latest ? observationsFromStatuslineSnapshot(latest, account.name, new Date()) : claudeProbeOffObservations(account, new Date(), usageError)));
+        claudeProbeOutcomes[account.name] = "skipped: claude_probe off";
+        continue;
+      }
+    }
     if (account.vendor === "claude" && options.claudeGrant?.needsGrant(account.name)) {
       if (claudeSnapshot) {
         // A principal blocked pending a grant still reads its account-wide

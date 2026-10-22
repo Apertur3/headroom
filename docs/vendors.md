@@ -21,15 +21,21 @@ A fresh build without network access to GitHub needs cached dependencies.
 
 ## Claude
 
-Headroom reads Claude Code usage from a zero-auth statusline snapshot by default. An optional
-vendor probe is available as a fallback; it is off unless you set `claude_probe = true`.
+Headroom reads Claude Code usage in this order: a fresh statusline snapshot, then Claude Code's own
+`/usage` (`claude -p "/usage" --output-format stream-json ...`, source `native:claude-usage`, at
+most once per 10 minutes per profile, no shell, no model turn, parsing only the structured
+`usage_report` and failing closed with a reason when it is absent), then, only if you set
+`claude_probe = true`, the vendor probe.
 
 ### The `claude_probe` switch
 
 `claude_probe` in `policy.toml` is a boolean, default `false`. With `false`, the Claude collector
-uses only the statusline snapshot and never touches the Keychain or the network for Claude; a
-missing or old snapshot shows as stale or unknown, not as an error, and `headroom doctor` says how
-to wire the statusline (set Claude Code's `statusLine` command to `headroom statusline`). With
+never touches the Keychain or Anthropic's endpoint for Claude: it uses the statusline snapshot and
+`claude /usage`; if both fail the reading shows as stale or unknown, not as an error, and
+`headroom doctor` says how to wire the statusline (set Claude Code's `statusLine` command to
+`headroom statusline`). The statusline only runs inside interactive sessions (never under
+`claude -p`), and a replayed render does not restamp the snapshot unless the session's API time
+grew. A file whose `source` is not `statusline` is ignored. With
 `true`, a stale snapshot is topped up by the probe below, which calls `GET
 api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth token as `User-Agent:
 headroomd/<version>`. Anthropic's terms restrict using Claude subscription OAuth tokens outside
@@ -37,7 +43,7 @@ Claude Code; read them before enabling.
 
 ### Zero-auth source: the statusline snapshot
 
-Claude Code hands its `statusLine` command a JSON object on every prompt render, containing
+Claude Code hands its `statusLine` command a JSON object when an interactive session renders its statusline (it never runs under `claude -p`), containing
 `rate_limits.five_hour`/`rate_limits.seven_day` (`used_percentage`, `resets_at`, epoch seconds) and
 possibly other model-scoped buckets. `headroom statusline`, registered as that command (see
 quickstart.md), snapshots it to `<HEADROOM_HOME>/statusline/<profile>.json` (0600; `<profile>` is

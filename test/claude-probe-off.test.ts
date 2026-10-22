@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const probe = vi.hoisted(() => ({ observeClaude: vi.fn() }));
@@ -24,9 +25,9 @@ async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none")
   return home;
 }
 
-async function poll(home: string) {
+async function poll(home: string, run?: () => Promise<string>) {
   const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
-  try { return await pollAccounts(undefined, {}); }
+  try { return await pollAccounts(undefined, run ? { claudeUsage: { run } } : {}); }
   finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
 }
 
@@ -52,5 +53,19 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
     probe.observeClaude.mockResolvedValue([]);
     await poll(home);
     expect(probe.observeClaude).toHaveBeenCalledTimes(1);
+  });
+
+  it("with no snapshot, Claude Code's /usage fills the meters (Fable too) from native:claude-usage; a fresh snapshot never runs it", async () => {
+    const run = vi.fn(async () => readFile(new URL("./fixtures/claude/usage-stream.synthetic.jsonl", import.meta.url), "utf8"));
+    const none = await poll(await setup(false, "none"), run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(none.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ meter_id: "claude-main:all", source: "native:claude-usage", freshness: "fresh", quantity: expect.objectContaining({ used: 7 }) }),
+      expect.objectContaining({ meter_id: "claude-main:fable", source: "native:claude-usage", freshness: "fresh" }),
+    ]));
+    run.mockClear();
+    const fresh = await poll(await setup(false, "fresh"), run);
+    expect(run).not.toHaveBeenCalled();
+    expect(fresh.observations.every((item) => item.source === "native:claude-statusline")).toBe(true);
   });
 });
