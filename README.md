@@ -34,10 +34,6 @@ claude plugin install headroom@headroom
 
 macOS, Linux, Windows (experimental). No telemetry. Zero runtime dependencies.
 
-Not a cost tracker: [ccusage](https://github.com/ccusage/ccusage) estimates spend from local logs; headroomd reads the limit the vendor enforces. They work side by side.
-
-Unofficial; some readers use undocumented vendor endpoints with your own login. See [Vendor endpoints and your accounts](#vendor-endpoints-and-your-accounts).
-
 Not related to headroomlabs-ai/headroom, the context-compression project.
 
 ---
@@ -491,6 +487,12 @@ See [`examples/`](examples) for the scripts and the starter `accounts.toml`, `po
 - [docs/mcp-and-agents.md](docs/mcp-and-agents.md): the MCP tools, example calls, and how an orchestrator should use them
 - [docs/json-contract.md](docs/json-contract.md): the versioned field-by-field shape of every `--json` output and MCP tool result, and its compatibility promise
 - [docs/vendors.md](docs/vendors.md): what Headroom reads per vendor, and its known live limitations
+
+## How it compares and what it reads
+
+Headroom is not a cost tracker: [ccusage](https://github.com/ccusage/ccusage) estimates spend from local logs, while headroomd reads the limit the vendor enforces. They work side by side.
+
+Headroom is unofficial. Claude is read through Claude Code itself by default; other readers use undocumented vendor endpoints with your own login. See [Vendor endpoints and your accounts](#vendor-endpoints-and-your-accounts).
 
 ## Vendor endpoints and your accounts
 
