@@ -287,6 +287,21 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
+  it("does not infer free_reset_used from a sub-point usage drop to zero", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-store-reset-noise-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const fiveHour = (used: number, fetched_at: string) => observation({
+        window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+        quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" },
+        resets_at: "2026-09-03T17:00:00Z", fetched_at, observed_at: fetched_at,
+      });
+      store.insert(fiveHour(0.006664, "2026-09-03T12:00:00Z"));
+      store.insert(fiveHour(0, "2026-09-03T12:05:00Z"));
+      expect(store.events("2026-09-03T00:00:00Z").filter((event) => event.kind === "free_reset_used")).toHaveLength(0);
+    } finally { store.close(); }
+  });
+
   it("flags the exact Codex incident as an unscheduled reset_seen (issue #20): 88% to 0% five days before the scheduled reset, no reset credit consumed", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-unscheduled-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
