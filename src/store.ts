@@ -104,13 +104,14 @@ function deliveryIdOf(row: Row): number | null {
 }
 
 /** True when `newUsed` is far enough below `oldUsed` to be a reset rather
- * than ordinary noise: a drop to zero, or a fall past half of what it was.
+ * than ordinary noise: a drop of at least one percentage point to zero,
+ * or past half of what it was.
  * classifyUsageDrop uses this to recognize a reset from raw usage alone
  * (before it even looks at resets_at); burnRateFor reuses the exact same
  * rule so a burn-rate sample window and the event log this produces never
  * disagree on where a reset falls. */
 function isUsageReset(oldUsed: number, newUsed: number): boolean {
-  return oldUsed > 0 && (newUsed === 0 || newUsed < oldUsed * 0.5);
+  return oldUsed > 0 && oldUsed - newUsed >= 1 && (newUsed === 0 || newUsed < oldUsed * 0.5);
 }
 
 function redactDeep(value: unknown): unknown {
