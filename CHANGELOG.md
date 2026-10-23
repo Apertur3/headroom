@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-23
+
+### Fixed
+- A usage change of less than one percentage point (for example 0.007% to 0% just after a scheduled rollover) is no longer reported as a free reset.
+
 ## [0.2.14] - 2026-10-22
 
 ### Changed
