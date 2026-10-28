@@ -1,0 +1,14 @@
+{
+  "src/antigravity-keepalive.ts": 1106,
+  "src/browser-report.ts": 1825,
+  "src/cli.ts": 2532,
+  "src/daemon.ts": 1942,
+  "src/notify.ts": 1210,
+  "src/store.ts": 3229,
+  "src/usage-store.ts": 1215,
+  "test/antigravity-keepalive-sweep.test.ts": 1314,
+  "test/daemon-mcp.test.ts": 1086,
+  "test/dashboard.test.ts": 1043,
+  "test/heartbeat.test.ts": 1326,
+  "test/store-policy.test.ts": 1213
+}
