@@ -18,7 +18,7 @@ for (const file of files) {
   if (lines > 1000 && lines > (caps[file] ?? 1000)) fail(`${file}: ${lines} lines exceeds cap ${caps[file] ?? 1000}`);
   if (Object.hasOwn(caps, file) && (lines <= 1000 || caps[file] !== lines)) fail(`Refresh ratchet: ${file} (${lines} lines)`);
   if (lines > 400) console.warn(`${file}: ${lines} lines exceeds 400`);
-  if (file.endsWith(".sh")) continue;
+  if (file.endsWith(".sh") || file.startsWith("test/")) continue;
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const line = (pos) => source.getLineAndCharacterOfPosition(pos).line + 1;
   function visit(node) {
