@@ -8,6 +8,8 @@ const files = [...new Set(execFileSync("git", ["ls-files", "-c", "-o", "-z", "--
   .filter((file) => /\.(?:ts|mjs|js|sh)$/.test(file) && !generated.has(file));
 let bad = false;
 const fail = (message) => { console.error(message); bad = true; };
+const warnings = [];
+const warn = (message) => warnings.push(message);
 
 for (const [file, cap] of Object.entries(caps)) {
   if (!Number.isSafeInteger(cap) || cap <= 1000 || !files.includes(file)) fail(`Invalid ratchet: ${file}`);
@@ -17,15 +19,17 @@ for (const file of files) {
   const lines = (text.match(/\n/g) ?? []).length + Number(!!text && !text.endsWith("\n"));
   if (lines > 1000 && lines > (caps[file] ?? 1000)) fail(`${file}: ${lines} lines exceeds cap ${caps[file] ?? 1000}`);
   if (Object.hasOwn(caps, file) && (lines <= 1000 || caps[file] !== lines)) fail(`Refresh ratchet: ${file} (${lines} lines)`);
-  if (lines > 400) console.warn(`${file}: ${lines} lines exceeds 400`);
+  if (lines > 400) warn(`${file}: ${lines} lines exceeds 400`);
   if (file.endsWith(".sh") || file.startsWith("test/")) continue;
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const line = (pos) => source.getLineAndCharacterOfPosition(pos).line + 1;
   function visit(node) {
     if (ts.isFunctionLike(node) && node.body && line(node.end) - line(node.getStart(source)) + 1 > 100)
-      console.warn(`${file}:${line(node.getStart(source))}: function exceeds 100 lines`);
+      warn(`${file}:${line(node.getStart(source))}: function exceeds 100 lines`);
     ts.forEachChild(node, visit);
   }
   visit(source);
 }
+if (process.argv.includes("--list")) warnings.forEach((message) => console.warn(message));
+else if (warnings.length) console.warn(`size: ${warnings.length} warnings (files over 400 lines, functions over 100); run npm run check:size -- --list`);
 process.exitCode = Number(bad);

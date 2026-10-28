@@ -15,7 +15,7 @@ function check(files: Record<string, string>, caps: Record<string, number> = {})
     mkdirSync(dirname(join(root, file)), { recursive: true });
     writeFileSync(join(root, file), text);
   }
-  return spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
+  return spawnSync(process.execPath, [script, "--list"], { cwd: root, encoding: "utf8" });
 }
 
 describe("size gate", () => {
