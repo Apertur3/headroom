@@ -447,7 +447,3 @@ export function applyCodexUsageSnapshot(state: CodexUsageAccumulatorState, snaps
   entries.set(snapshot.identityKey, { ...snapshot });
   return { entries, quarantined: state.quarantined };
 }
-
-export function applyCodexUsageSnapshots(state: CodexUsageAccumulatorState, snapshots: readonly CodexUsageSnapshot[]): CodexUsageAccumulatorState {
-  return snapshots.reduce(applyCodexUsageSnapshot, state);
-}

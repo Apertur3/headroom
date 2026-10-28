@@ -6,48 +6,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agyLoginStateFromLog, AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
 import { noDaemonObservations } from "../src/adapters/antigravity.js";
-import { antigravityFallbackNote, pollAccounts, selectAntigravitySource } from "../src/collector.js";
-import type { Observation, ProviderAccount } from "../src/types.js";
+import { pollAccounts } from "../src/collector.js";
+import type { ProviderAccount } from "../src/types.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function row(meter: "gemini" | "claude-gpt", minutes: 300 | 10_080, source: string, freshness: Observation["freshness"] = "fresh"): Observation {
-  return {
-    principal_id: "antigravity", meter_id: "antigravity:" + meter, window: { kind: minutes === 300 ? "rolling" : "fixed", minutes, enforcement: "hard" },
-    quantity: freshness === "fresh" ? { used: 16, limit: 100, remaining: 84, unit: "percent" } : null, resets_at: "2026-09-10T00:00:00Z",
-    observed_at: "2026-09-03T00:00:00Z", fetched_at: "2026-09-03T00:00:00Z", source, truth: freshness === "fresh" ? "official" : "estimated",
-    freshness, confidence: freshness === "fresh" ? 1 : 0, adapter_version: "test", upstream_schema_version: "test", ...(freshness === "fresh" ? {} : { reason: "quota summary not ready" }),
-  };
-}
-
-describe("Antigravity source order", () => {
-  it("uses the daemon-owned local source only once all four warm summary lanes are real", () => {
-    const remote = [row("gemini", 300, "remote:antigravity"), row("gemini", 10_080, "remote:antigravity"), row("claude-gpt", 300, "remote:antigravity"), row("claude-gpt", 10_080, "remote:antigravity")];
-    const warm = remote.map((item) => ({ ...item, source: "local:antigravity:warm", quantity: { used: 16, limit: 100, remaining: 84, unit: "percent" as const } }));
-    expect(selectAntigravitySource(warm, remote, "antigravity")).toBe(warm);
-    const cold = [...warm.slice(0, 2), row("claude-gpt", 10_080, "local:antigravity:warm", "failed")];
-    expect(selectAntigravitySource(cold, remote, "antigravity")).toBe(remote);
-  });
-});
-
-describe("Antigravity fallback reason: names both outcomes, remote and local", () => {
-  it("names 'agy keepalive not running' when the daemon never owns Antigravity at all", () => {
-    expect(antigravityFallbackNote(false, [], "unknown")).toBe("agy keepalive not running");
-    expect(antigravityFallbackNote(false, [], "not_logged_in")).toBe("agy keepalive not running");
-  });
-
-  it("names an unavailable warm read when the daemon owns it but produced nothing", () => {
-    expect(antigravityFallbackNote(true, [], "unknown")).toBe("agy warm read unavailable");
-  });
-
-  it("names agy's own login state ahead of a generic 'not ready' once rows exist", () => {
-    const rows = [row("gemini", 300, "local:antigravity:warm", "failed")];
-    expect(antigravityFallbackNote(true, rows, "not_logged_in")).toBe("agy not logged in");
-    expect(antigravityFallbackNote(true, rows, "logged_in")).toBe("agy quota summary not ready");
-    expect(antigravityFallbackNote(true, rows, "unknown")).toBe("agy quota summary not ready");
-  });
-});
 
 describe("Antigravity one-shot reads with no daemon", () => {
   it("noDaemonObservations names the daemon-kept agy fix, across every meter and window, without contacting a vendor", () => {

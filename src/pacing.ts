@@ -65,18 +65,6 @@ export function windowNeedLabel(minutes: number): string {
   if (minutes % 60 === 0) return `${minutes / 60}h`;
   return `${minutes}m`;
 }
-export interface GateUsage {
-  used5h: number | null;
-  usedWk: number | null;
-  weeklyResetsAt: string | null;
-  hoursPer5hWindow: number;
-  /** The vendor-confirmed freshness backing each window, when known. A
-   * `not_enforced` window has no cap at all -- its need is skipped rather
-   * than failed, so "usage unknown" stays reserved for a genuinely stale or
-   * failed read. */
-  freshness5h?: "fresh" | "stale" | "failed" | "not_enforced" | null;
-  freshnessWk?: "fresh" | "stale" | "failed" | "not_enforced" | null;
-}
 export interface GateResult {
   allowed: boolean;
   reason: string;
@@ -97,34 +85,6 @@ export interface GateResult {
    * render this the same way as status/rate/plan/fill's own UNKNOWN state,
    * rather than as a plain refusal. */
   unknown?: true;
-}
-
-/** Fail closed over every --need: the first one that does not fit stops the
- * check and names the reason. With usePlan, a 5h need must also fit under
- * the current plan line (its even share of the remaining weekly budget), a
- * stricter bar than just staying under the freeze reserve. */
-export function evaluateGate(needs: GateNeed[], usage: GateUsage, reservePercent: number, usePlan: boolean, now = new Date()): GateResult {
-  if (!needs.length) return { allowed: false, reason: "no --need given" };
-  const notEnforced: string[] = [];
-  for (const need of needs) {
-    const freshness = need.window === "5h" ? usage.freshness5h : usage.freshnessWk;
-    if (freshness === "not_enforced") { notEnforced.push(need.window); continue; }
-    const used = need.window === "5h" ? usage.used5h : usage.usedWk;
-    if (used === null) return { allowed: false, reason: `${need.window} usage unknown`, unknown: true };
-    const prospective = used + need.points;
-    const ceiling = 100 - reservePercent;
-    if (prospective > ceiling) {
-      const left = Math.max(0, ceiling - used);
-      return { allowed: false, reason: `${need.window} needs ${need.points} more but only ${left.toFixed(1)} left before the ${reservePercent}% reserve` };
-    }
-    if (usePlan && need.window === "5h" && usage.weeklyResetsAt && usage.usedWk !== null) {
-      const plan = computePlan(usage.usedWk, usage.weeklyResetsAt, usage.hoursPer5hWindow, reservePercent, now);
-      if (prospective > plan.points_per_5h_window) {
-        return { allowed: false, reason: `5h needs ${need.points} more but the plan line allows only ${plan.points_per_5h_window.toFixed(1)} points this window` };
-      }
-    }
-  }
-  return { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 }
 
 export interface FillResult {

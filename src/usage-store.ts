@@ -163,16 +163,6 @@ export interface GroupedTotal {
   totalTokens?: SafeSum;
 }
 
-/** Same shape as `GroupedTotal` with the Codex-only fields made mandatory,
- * for callers that already know they are looking at a Codex group. */
-export interface CodexGroupedTotal extends GroupedTotal {
-  vendor: "codex";
-  cachedInputTokens: SafeSum;
-  cacheWriteTokens: SafeSum;
-  reasoningTokens: SafeSum;
-  totalTokens: SafeSum;
-}
-
 /** A sum kept safe-integer-exact when possible. `total` is `null` both when
  * nothing was observed (`known === 0`) and when the exact total would exceed
  * `Number.MAX_SAFE_INTEGER` (`overflow`); the two are told apart by those

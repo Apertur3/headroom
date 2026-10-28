@@ -129,26 +129,15 @@ export function claudeSecurityToolFailureReason(detail: string | undefined): str
 
 /** Static prefix of claudeKeychainLapseReason()'s formatted text (below), so
  * a caller can recognize a lapse reason -- as opposed to a plain denial --
- * without reconstructing the exact timestamp: collector.ts's grant gate
- * (isClaudeGrantIssue) and store.ts's grant_lapsed notifier event both key
- * off this. */
+ * without reconstructing the exact timestamp: store.ts's grant_lapsed
+ * notifier event keys off this. */
 export const CLAUDE_GRANT_LAPSED_PREFIX = "Keychain grant lapsed;";
-
-/** True for any reason string that means "this Claude principal needs
- * `headroom keychain grant` run again", whether from a plain denial
- * (claudeGrantNeededReason) or a detected ACL lapse
- * (claudeKeychainLapseReason). Shared so collector.ts's gate recognizes both
- * by construction instead of restating either prefix. */
-export function isClaudeGrantIssue(reason: string | null | undefined): boolean {
-  return typeof reason === "string" && (reason.startsWith(CLAUDE_GRANT_NEEDED_PREFIX) || reason.startsWith(CLAUDE_GRANT_LAPSED_PREFIX));
-}
 
 /** The single wording for "the Keychain item exists but its JSON carries no
  * usable OAuth access token" (issue #11: HEADROOM_PROBE_LOGGED_OUT, distinct
  * from HEADROOM_PROBE_NO_CREDENTIALS -- an absent item entirely). Signing
  * back in fixes this on its own, so it is never a Keychain grant issue: see
- * CLAUDE_LOGGED_OUT_PREFIX and isClaudeLoggedOutReason below, which
- * isClaudeGrantIssue above must never match. */
+ * CLAUDE_LOGGED_OUT_PREFIX and isClaudeLoggedOutReason below. */
 export function claudeLoggedOutFix(configDir: string): string {
   const directory = resolve(configDir);
   return directory === resolve(homedir(), ".claude") ? "run: claude and sign in" : `${claudeRunWithDirectory(directory)} and sign in`;
@@ -286,9 +275,7 @@ async function claudeProbe(configDir: string, pinnedPath?: string): Promise<stri
     // The Keychain item exists (unlike HEADROOM_PROBE_NO_CREDENTIALS below)
     // but its JSON carries no usable OAuth access token: Claude Code is
     // logged out locally for this config dir (issue #11), not a Keychain
-    // grant issue -- claudeLoggedOutReason()'s wording never matches
-    // isClaudeGrantIssue, so the collector never marks this principal as
-    // needing `headroom keychain grant`; signing back in fixes it on its own.
+    // grant issue; signing back in fixes it on its own.
     if (stderr.includes("HEADROOM_PROBE_LOGGED_OUT")) throw new ClaudeProbeError("missing", claudeLoggedOutReason(configDir));
     if (stderr.includes("HEADROOM_PROBE_NO_CREDENTIALS")) throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
     throw new ClaudeProbeError("missing", "no credentials in Keychain for this config dir");
