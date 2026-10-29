@@ -188,8 +188,9 @@ async function events(argv: string[]): Promise<number> {
   } finally { store.close(); }
 }
 
-/** Default output is a JSON array, including empty periods; --table selects
- * the human-readable rendering. */
+/** The default output is always a JSON array, empty allowed, so a scripted
+ * caller never has to special-case a quiet period. --table is the only path
+ * to the human-readable rendering. */
 export function printEventsOutput(items: HeadroomEvent[], table: boolean): void {
   if (!table) { console.log(JSON.stringify(items)); return; }
   printEvents(items);

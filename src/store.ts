@@ -1351,8 +1351,8 @@ export class HeadroomStore {
    * about as much real time as passed between the two readings (a rolling
    * window recomputes it as fetch time plus duration on every poll); a jump
    * bigger than that elapsed time is a real reset, while a timestamp that
-   * held still indicates an early free reset to zero, or a partial reset or
-   * raised limit otherwise. A baseline older than 24h lowers confidence: the
+   * held still indicates an early free reset (usage back at 5% or less), or a
+   * partial reset or raised limit otherwise. A baseline older than 24h lowers confidence: the
    * gap could hide more than one reset.
    *
    * When the baseline and current are separated by a gap of failed readings
@@ -1387,8 +1387,8 @@ export class HeadroomStore {
     const stale = elapsedMs > 24 * 3_600_000;
     const staleHours = Math.floor(elapsedMs / 3_600_000);
     const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
-    const freeReset = (): void => this.addEvent(newUsed === 0 ? "free_reset_used" : "usage_dropped", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt,
-      newUsed > 0 ? { used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : undefined);
+    const freeReset = (): void => this.addEvent(newUsed <= 5 ? "free_reset_used" : "usage_dropped", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt,
+      newUsed > 5 ? { used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : undefined);
     const windowMinutes = current.window?.minutes ?? null;
     if (this.failedGapBetween(current.meter_id, current.window, baseline.id, current.id)) {
       if (previousReset > Date.parse(baseline.fetched_at) && previousReset <= Date.parse(current.fetched_at)) {
