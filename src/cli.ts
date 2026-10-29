@@ -188,9 +188,8 @@ async function events(argv: string[]): Promise<number> {
   } finally { store.close(); }
 }
 
-/** The default output is always a JSON array, empty allowed, so a scripted
- * caller never has to special-case a quiet period. --table is the only path
- * to the human-readable rendering. */
+/** Default output is a JSON array, including empty periods; --table selects
+ * the human-readable rendering. */
 export function printEventsOutput(items: HeadroomEvent[], table: boolean): void {
   if (!table) { console.log(JSON.stringify(items)); return; }
   printEvents(items);
@@ -200,7 +199,7 @@ function printEvents(items: HeadroomEvent[]): void {
   for (const item of items) {
     const subject = item.meter_id ?? item.principal_id ?? "-";
     const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}`
-      : item.kind === "free_reset_used" ? `free reset used ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
+      : item.kind === "free_reset_used" || item.kind === "usage_dropped" ? `${item.kind === "usage_dropped" ? "usage dropped" : "free reset used"} ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
       : item.kind;
     console.log(`${subject}  ${event} (${item.origin}, ${Math.round(item.confidence * 100)}%)`);
   }

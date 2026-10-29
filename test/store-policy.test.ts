@@ -82,9 +82,8 @@ describe("SQLite observations and event detector", () => {
       store.insert(observation({ quantity: { used: 11, limit: 100, remaining: 89, unit: "percent" }, metadata: { free_resets_available: 0 } }));
       const events = store.events("2026-09-03T00:00:00Z");
       expect(events).toEqual(expect.arrayContaining([
-        // 80% to 20% with resets_at unchanged and now before that reset time is a
-        // free reset fired ahead of schedule, not a vendor-scheduled reset.
-        expect.objectContaining({ kind: "free_reset_used", origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 20% before the scheduled reset" }),
+        // 80% to 20% with resets_at unchanged: a partial reset or raised limit.
+        expect.objectContaining({ kind: "usage_dropped", origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 20% before the scheduled reset" }),
         expect.objectContaining({ kind: "free_reset_used", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "free_reset_granted", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "credits_changed", origin: "vendor_reported" }),
@@ -115,7 +114,7 @@ describe("SQLite observations and event detector", () => {
     } finally { store.close(); }
   });
 
-  it("detects a reset that happened while the principal was failing, using the last fresh baseline", async () => {
+  it("detects a usage drop while the principal was failing, using the last fresh baseline", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-baseline-gap-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
@@ -130,11 +129,11 @@ describe("SQLite observations and event detector", () => {
       const events = store.events("2026-09-03T00:00:00Z");
       expect(events).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "source_recovered", meter_id: "claude-main:all" }),
-        expect.objectContaining({ kind: "free_reset_used", meter_id: "claude-main:all", origin: "inferred", confidence: 0.8, reason: "usage dropped from 68% to 2% before the scheduled reset" }),
+        expect.objectContaining({ kind: "usage_dropped", meter_id: "claude-main:all", origin: "inferred", confidence: 0.8, reason: "usage dropped from 68% to 2% before the scheduled reset" }),
       ]));
       // Comparing against the immediately prior row (a failed one) instead of
       // the baseline would have missed this drop entirely.
-      expect(events.filter((event) => event.kind === "free_reset_used")).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "usage_dropped")).toHaveLength(1);
     } finally { store.close(); }
   });
 
@@ -262,7 +261,7 @@ describe("SQLite observations and event detector", () => {
     } finally { withoutStore.close(); }
   });
 
-  it("classifies an advanced reset timestamp as reset_seen and an unchanged one before schedule as free_reset_used", async () => {
+  it("classifies an advanced reset timestamp as reset_seen and an unchanged one before schedule as usage_dropped", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-store-classify-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
@@ -280,10 +279,10 @@ describe("SQLite observations and event detector", () => {
 
       store.insert(weekly(80, "2026-09-04T12:00:00Z", "2026-09-13T13:59:00Z"));
       // resets_at held still while usage already collapsed, well before that
-      // scheduled reset: a free reset was fired ahead of it.
+      // scheduled reset: a partial reset or raised limit appeared ahead of it.
       store.insert(weekly(4, "2026-09-04T12:05:00Z", "2026-09-13T13:59:00Z"));
-      const freeReset = store.events("2026-09-04T00:00:00Z").find((event) => event.kind === "free_reset_used" && event.created_at === "2026-09-04T12:05:00Z");
-      expect(freeReset).toMatchObject({ origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 4% before the scheduled reset" });
+      const usageDrop = store.events("2026-09-04T00:00:00Z").find((event) => event.kind === "usage_dropped" && event.created_at === "2026-09-04T12:05:00Z");
+      expect(usageDrop).toMatchObject({ origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 4% before the scheduled reset" });
     } finally { store.close(); }
   });
 
@@ -380,7 +379,7 @@ describe("SQLite observations and event detector", () => {
       });
       store.insert(weekly(70, "2026-09-01T12:00:00Z", "2026-09-06T13:59:00Z"));
       store.insert(weekly(5, "2026-09-03T14:00:00Z", "2026-09-06T13:59:00Z")); // 50h later, resets_at unchanged
-      const event = store.events("2026-09-01T00:00:00Z").find((item) => item.kind === "free_reset_used");
+      const event = store.events("2026-09-01T00:00:00Z").find((item) => item.kind === "usage_dropped");
       expect(event).toMatchObject({ confidence: 0.5, reason: "usage dropped from 70% to 5% before the scheduled reset; baseline 50h old" });
     } finally { store.close(); }
   });
@@ -401,7 +400,7 @@ describe("SQLite observations and event detector", () => {
         fetched_at: "2026-09-03T20:15:00Z", observed_at: "2026-09-03T20:15:00Z",
       }));
       expect(store.events("2026-09-03T00:00:00Z")).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "free_reset_used", meter_id: "claude-main:all" }),
+        expect.objectContaining({ kind: "usage_dropped", meter_id: "claude-main:all" }),
       ]));
     } finally { store.close(); }
   });
@@ -510,7 +509,7 @@ describe("SQLite observations and event detector", () => {
     } finally { reopened.close(); }
   });
 
-  it("backfills a missing reset event across a failure gap and removes false local-pool reset events, once per database", async () => {
+  it("backfills a missing usage-drop event across a failure gap and removes false local-pool reset events, once per database", async () => {
     // The backfill deliberately only replays its latest seven days. Keep this
     // fixture inside that window rather than letting its fixed dates age out.
     vi.useFakeTimers();
@@ -539,7 +538,7 @@ describe("SQLite observations and event detector", () => {
     // The live insert above already classifies this correctly (item 1). Delete
     // its event and plant a bogus local-pool one to model a database written
     // by a version of this code that predates both fixes.
-    seedDb.prepare("DELETE FROM events WHERE meter_id = 'claude-main:all' AND kind = 'free_reset_used'").run();
+    seedDb.prepare("DELETE FROM events WHERE meter_id = 'claude-main:all' AND kind = 'usage_dropped'").run();
     seedDb.prepare("INSERT INTO events (id,kind,origin,confidence,evidence_observation_ids,created_at,corrected_by,meter_id,principal_id,reason) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .run("reset_seen:planted", "reset_seen", "inferred", 0.5, JSON.stringify([local1.id, local2.id]), local2.fetched_at, null, "workstation:capacity", "workstation", null);
     seed.close();
@@ -554,7 +553,7 @@ describe("SQLite observations and event detector", () => {
     try {
       const events = reopened.events("2000-01-01T00:00:00Z");
       expect(events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "free_reset_used", meter_id: "claude-main:all", origin: "inferred" }),
+        expect.objectContaining({ kind: "usage_dropped", meter_id: "claude-main:all", origin: "inferred" }),
       ]));
       expect(events.some((event) => event.meter_id === "workstation:capacity")).toBe(false);
       await expect(readFile(join(home, "logs", "daemon.log"), "utf8")).resolves.toContain("reset detection backfill");
@@ -562,7 +561,7 @@ describe("SQLite observations and event detector", () => {
       // Reopening again must not error or duplicate the event: the migration
       // marker is now set, so this is a no-op.
       const third = await HeadroomStore.open(home);
-      try { expect(third.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "free_reset_used" && event.meter_id === "claude-main:all")).toHaveLength(1); }
+      try { expect(third.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "usage_dropped" && event.meter_id === "claude-main:all")).toHaveLength(1); }
       finally { third.close(); }
     } finally { reopened.close(); }
   });
@@ -977,7 +976,7 @@ describe("pace and consumes", () => {
     } finally { store.close(); }
   });
 
-  it("shows a free reset beside the matching current window", async () => {
+  it("does not label a partway usage drop as a free reset beside the current window", async () => {
     const root = await mkdtemp(join(tmpdir(), "headroom-free-reset-label-")); temporary.push(root);
     const store = await HeadroomStore.open(join(root, ".headroom"));
     try {
@@ -988,8 +987,8 @@ describe("pace and consumes", () => {
       store.insert(current);
       const latest = store.latestPerWindow();
       const seen = store.freeResetUsedFor(latest, new Date("2026-09-03T20:15:00Z"));
-      expect(seen.get("claude-main:all:10080")).toBe("2026-09-03T20:15:00Z");
-      expect(formatMeters(latest, defaultPolicy, undefined, undefined, seen)[0]).toContain("free reset");
+      expect(seen.get("claude-main:all:10080")).toBeUndefined();
+      expect(formatMeters(latest, defaultPolicy, undefined, undefined, seen)[0]).not.toContain("free reset");
     } finally { store.close(); }
   });
 });
@@ -1005,9 +1004,9 @@ describe("events output", () => {
       expect(JSON.parse(logs[0])).toEqual([]);
       expect(JSON.parse(logs[1])).toEqual([expect.objectContaining({ kind: "reset_seen" })]);
       logs.length = 0;
-      printEventsOutput([{ id: "free_reset_used:2", kind: "free_reset_used", origin: "inferred", confidence: 0.8, evidence_observation_ids: [1, 2], created_at: "2026-09-03T20:15:00.000Z", corrected_by: null, last_seen_at: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: "usage dropped from 68% to 2% before the scheduled reset" }], true);
+      printEventsOutput([{ id: "usage_dropped:2", kind: "usage_dropped", origin: "inferred", confidence: 0.8, evidence_observation_ids: [1, 2], created_at: "2026-09-03T20:15:00.000Z", corrected_by: null, last_seen_at: null, meter_id: "claude-main:all", principal_id: "claude-main", reason: "usage dropped from 68% to 2% before the scheduled reset" }], true);
       expect(logs[0]).toContain("claude-main:all");
-      expect(logs[0]).toContain("free reset used");
+      expect(logs[0]).toContain("usage dropped");
       expect(() => JSON.parse(logs[0])).toThrow();
     } finally { console.log = original; }
   });

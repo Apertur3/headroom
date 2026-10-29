@@ -35,6 +35,30 @@ function windowless(meterId: string, fetchedAt: string, reason = "Keychain grant
   };
 }
 
+describe("early usage drops", () => {
+  it.each([
+    [93, 47, "usage_dropped"], [98, 0, "free_reset_used"], [60, 50, null],
+    [60, 40, "usage_dropped"], [60, 41, null], [20, 9, "usage_dropped"],
+    [0.9, 0, null], [1, 0, "free_reset_used"], [93.4, 47.2, "usage_dropped"],
+  ])("classifies %s%% to %s%% with an unchanged reset as %s", async (before, after, kind) => {
+    const store = await open();
+    try {
+      const overrides = { principal_id: "codex-main", meter_id: "codex-main:main" };
+      const resetsAt = "2026-09-08T12:00:00Z";
+      const baseline = store.insert(weekly(before, "2026-09-03T12:00:00Z", resetsAt, overrides));
+      const current = store.insert(weekly(after, "2026-09-03T12:06:00Z", resetsAt, overrides));
+      const events = store.events("2026-09-03T00:00:00Z");
+      expect(events.filter((event) => event.kind === "free_reset_used")).toHaveLength(kind === "free_reset_used" ? 1 : 0);
+      if (kind === null) expect(events).toEqual([]);
+      else expect(events).toEqual([expect.objectContaining({
+        kind, origin: "inferred", confidence: 0.8, evidence_observation_ids: [baseline.id, current.id],
+        reason: `usage dropped from ${Math.round(before)}% to ${Math.round(after)}% before the scheduled reset`,
+        metadata: kind === "usage_dropped" ? { used_percent: Math.round(after), previous_used_percent: Math.round(before) } : undefined,
+      })]);
+    } finally { store.close(); }
+  });
+});
+
 describe("store.burnRateFor", () => {
   it("is null for a window with fewer than two fresh samples in the lookback", async () => {
     const store = await open();
@@ -99,6 +123,22 @@ describe("store.burnRateFor", () => {
       // Only the two post-reset samples (10% at 12:00, 30% at 12:30) count:
       // (30 - 10) / 0.5h = 40%/h, not a negative slope back to the 90% peak.
       expect(burn!.burn_percent_per_hour).toBeCloseTo(40, 6);
+    } finally { store.close(); }
+  });
+
+  it("restarts burn and empty-in at a 93% to 47% drop with the reset unchanged", async () => {
+    const store = await open();
+    try {
+      const resetsAt = "2026-09-08T12:00:00Z";
+      store.insert(weekly(91, "2026-09-03T11:54:00Z", resetsAt));
+      const before = store.insert(weekly(93, "2026-09-03T12:00:00Z", resetsAt));
+      expect(store.burnRateFor([before], new Date(before.fetched_at)).get("claude-main:all:10080")!.burn_percent_per_hour).toBeCloseTo(20);
+      const drop = store.insert(weekly(47, "2026-09-03T12:06:00Z", resetsAt));
+      expect(store.burnRateFor([drop], new Date(drop.fetched_at)).get("claude-main:all:10080")).toEqual({ burn_percent_per_hour: null, empty_in_seconds: null });
+      const current = store.insert(weekly(48, "2026-09-03T12:12:00Z", resetsAt));
+      const burn = store.burnRateFor([current], new Date(current.fetched_at)).get("claude-main:all:10080")!;
+      expect(burn.burn_percent_per_hour).toBeCloseTo(10);
+      expect(burn.empty_in_seconds).toBeCloseTo(52 / 10 * 3600);
     } finally { store.close(); }
   });
 

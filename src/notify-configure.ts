@@ -24,7 +24,7 @@ export const PRESET_DESCRIPTIONS: Record<NotifyPreset, string> = {
 const EVENT_LABELS: Record<string, string> = {
   reset_unscheduled: "Unscheduled resets (any window)", reset_scheduled_weekly: "Weekly resets",
   reset_scheduled_short: "Scheduled 5h resets", free_reset_granted: "Free reset credits granted",
-  free_reset_used: "Free resets used", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
+  free_reset_used: "Free resets used", usage_dropped: "Early usage drops", credits_changed: "Credit balance changes", plan_changed: "Plan changes",
   source_failed: "Source failures", source_recovered: "Source recoveries", threshold: "Threshold crossings",
   pace_projection_conserve: "Projected stalls (once per window, plus one escalation)", model_new: "New model buckets", grant_lapsed: "Keychain grant lapses",
   model_available: "New models available (vendor model catalog)", model_retired: "Models no longer listed",

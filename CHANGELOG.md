@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A drop of 20 points or more partway through a window, with the reset time unchanged, is now reported as "usage dropped early" (a partial reset or a raised limit) rather than missed or counted as a free reset, and the burn rate restarts from it.
+
 ## [0.2.15] - 2026-10-23
 
 ### Fixed

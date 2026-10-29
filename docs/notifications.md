@@ -14,7 +14,7 @@ Queueing and recording discovery commit together; the ledger prevents repeated d
 
 | Preset | What reaches your phone |
 | --- | --- |
-| `calm` (default) | Unscheduled resets on any window, weekly resets, free reset credits granted, vendor-inconsistent readings, source failures and recoveries, threshold crossings, new models available. |
+| `calm` (default) | Unscheduled resets on any window, weekly resets, early usage drops, free reset credits granted, vendor-inconsistent readings, source failures and recoveries, threshold crossings, new models available. |
 | `quiet` | Unscheduled resets, source failures, threshold crossings, new models available. |
 | `everything` | All event kinds, including vendor-inconsistent readings, scheduled 5h resets, projected stalls, new model buckets, models retired from a vendor's catalog, historical Keychain grant-lapse events, credit and plan changes, and leases. |
 
@@ -72,6 +72,7 @@ name appears in both. Supported names:
 | `reset_scheduled_weekly` | A scheduled weekly reset. |
 | `reset_scheduled_short` | A scheduled 5h reset. |
 | `reset_seen` | All resets, subject to the short-window rule below. Turning it off disables all resets. |
+| `usage_dropped` | An early partway usage drop with the reset time unchanged: a partial reset or a raised limit. On in `calm`. |
 | `free_reset_granted`, `free_reset_used` | Reset credits granted or consumed. |
 | `vendor_inconsistent` | Vendor readings flipped between two window identities; Headroom is holding the earlier reading. |
 | `credits_changed`, `plan_changed` | Credit balance or subscription plan changes. |

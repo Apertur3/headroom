@@ -654,7 +654,7 @@ to_plan?: string; downgrade?: boolean; restored?: boolean;
 credit_spent_on_free_plan?: boolean; resets_at?: string; model_id?: string;
 model_name?: string | null; shares_pool?: boolean } | null }`.
 `EventKind` is `"reset_seen" | "free_reset_granted" |
-"free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" |
+"free_reset_used" | "usage_dropped" | "credits_changed" | "plan_changed" | "exhausted_reported" |
 "window_retired" | "source_failed" |
 "source_recovered" | "lease_started" | "lease_ended" |
 "pace_projection_conserve" | "model_new" | "grant_lapsed" | "model_available" |
@@ -664,7 +664,9 @@ under the compatibility promise below. `last_seen_at` is set only on an open
 failure); `null` on every other kind. On a `reset_seen`, `window_minutes`
 names the window and `unscheduled: true` marks a reset before its scheduled
 instant; `used_percent`/`previous_used_percent` are then the percentages
-after and before it. On a `plan_changed`, `from_plan`, `to_plan`, `downgrade`,
+after and before it. On a `usage_dropped`, those percentages describe an early
+partway drop with the reset time unchanged: a partial reset or a raised limit,
+not evidence of a reset credit spent. On a `plan_changed`, `from_plan`, `to_plan`, `downgrade`,
 or `restored` explain the vendor-reported change. `credit_spent_on_free_plan`
 marks a free-plan reset-credit use. `resets_at` may accompany an exhausted
 report. On a `model_available`/`model_retired`, `model_id` and `model_name`

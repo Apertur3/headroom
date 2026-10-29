@@ -14,6 +14,7 @@ describe("resetHistory", () => {
     event("reset_seen", ago(20), "acme:main", "acme", { window_minutes: 10_080 }),
     event("reset_seen", ago(10), "acme:main", "acme", { unscheduled: true, previous_used_percent: 40 }),
     event("reset_seen", ago(5), "acme:main", "acme", { unscheduled: true, previous_used_percent: 70 }),
+    event("usage_dropped", ago(4), "acme:main", "acme", { previous_used_percent: 93, used_percent: 47 }),
     // one banked reset recorded on two meters of the same principal
     event("free_reset_used", ago(5, 2), "acme:credits", "acme"),
     event("free_reset_used", ago(5, 1), "acme:main", "acme"),

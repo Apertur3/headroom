@@ -207,7 +207,7 @@ export interface StoredObservation extends Observation {
   id: number;
 }
 
-export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired" | "heartbeat_lapsed" | "heartbeat_restored" | "timer_missed";
+export type EventKind = "reset_seen" | "free_reset_granted" | "free_reset_used" | "usage_dropped" | "credits_changed" | "plan_changed" | "exhausted_reported" | "exhausted_cleared" | "window_retired" | "source_failed" | "source_recovered" | "lease_started" | "lease_ended" | "pace_projection_conserve" | "model_new" | "grant_lapsed" | "vendor_inconsistent" | "model_available" | "model_retired" | "heartbeat_lapsed" | "heartbeat_restored" | "timer_missed";
 
 /** One vendor model id known to Headroom for a principal, as read from that
  * vendor's own local model catalog (never fabricated, never inferred from

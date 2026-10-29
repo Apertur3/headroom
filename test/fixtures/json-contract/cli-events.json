@@ -12,7 +12,9 @@
     "metadata": {
       "model_id": "string",
       "model_name": "string",
-      "shares_pool": "boolean"
+      "previous_used_percent": "number",
+      "shares_pool": "boolean",
+      "used_percent": "number"
     },
     "meter_id": "null | string",
     "origin": "string",

@@ -103,15 +103,12 @@ function deliveryIdOf(row: Row): number | null {
   return typeof value === "number" ? value : null;
 }
 
-/** True when `newUsed` is far enough below `oldUsed` to be a reset rather
- * than ordinary noise: a drop of at least one percentage point to zero,
- * or past half of what it was.
- * classifyUsageDrop uses this to recognize a reset from raw usage alone
- * (before it even looks at resets_at); burnRateFor reuses the exact same
- * rule so a burn-rate sample window and the event log this produces never
- * disagree on where a reset falls. */
+/** A drop of at least one percentage point to zero, below half the previous
+ * usage, or by at least 20 points: a reset or raised limit rather than noise.
+ * Shared by classifyUsageDrop and burnRateFor so event detection and the
+ * burn-rate sample boundary agree on where usage dropped. */
 function isUsageReset(oldUsed: number, newUsed: number): boolean {
-  return oldUsed > 0 && oldUsed - newUsed >= 1 && (newUsed === 0 || newUsed < oldUsed * 0.5);
+  return oldUsed > 0 && oldUsed - newUsed >= 1 && (newUsed === 0 || newUsed < oldUsed * 0.5 || oldUsed - newUsed >= 20);
 }
 
 function redactDeep(value: unknown): unknown {
@@ -1347,15 +1344,15 @@ export class HeadroomStore {
     return row !== undefined;
   }
 
-  /** Classify a usage drop of more than 50%, or non-zero to zero, against its
-   * fresh baseline. Local pools (window kind `state`) and credit counts (kind
+  /** Classify a significant usage drop against its fresh baseline using
+   * isUsageReset. Local pools (window kind `state`) and credit counts (kind
    * `count`, handled by the vendor-reported credits path below) never carry
    * reset evidence. A window's reset timestamp normally moves forward by
    * about as much real time as passed between the two readings (a rolling
    * window recomputes it as fetch time plus duration on every poll); a jump
    * bigger than that elapsed time is a real reset, while a timestamp that
-   * held still even though usage already fell is a free reset fired ahead of
-   * the scheduled one. A baseline older than 24h lowers confidence, since the
+   * held still indicates an early free reset to zero, or a partial reset or
+   * raised limit otherwise. A baseline older than 24h lowers confidence: the
    * gap could hide more than one reset.
    *
    * When the baseline and current are separated by a gap of failed readings
@@ -1390,7 +1387,8 @@ export class HeadroomStore {
     const stale = elapsedMs > 24 * 3_600_000;
     const staleHours = Math.floor(elapsedMs / 3_600_000);
     const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
-    const freeReset = (): void => this.addEvent("free_reset_used", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt);
+    const freeReset = (): void => this.addEvent(newUsed === 0 ? "free_reset_used" : "usage_dropped", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt,
+      newUsed > 0 ? { used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : undefined);
     const windowMinutes = current.window?.minutes ?? null;
     if (this.failedGapBetween(current.meter_id, current.window, baseline.id, current.id)) {
       if (previousReset > Date.parse(baseline.fetched_at) && previousReset <= Date.parse(current.fetched_at)) {
