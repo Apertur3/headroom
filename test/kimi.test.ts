@@ -1,9 +1,9 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  isKimiCliCredential, kimiCliCredentialPath, kimiCodePlanName, kimiCreditsPath, kimiPlanName,
+  findKimiCliCredential, isKimiCliCredential, kimiCliCredentialPath, kimiCodePlanName, kimiCreditsPath, kimiPlanName,
   kimiTokenExpired, kimiTokenPath, kimiWindowMinutes, observationFromMoonshotBalance,
   observationsFromKimiCodeUsage, observationsFromKimiUsage, observeKimi, readKimiCliCredential,
   readKimiToken,
@@ -420,6 +420,24 @@ describe("Kimi Code CLI credential source", () => {
     expect(kimiCliCredentialPath("/Users/test", { KIMI_CODE_HOME: "/elsewhere/kimi-code" })).toBe(join("/elsewhere/kimi-code", "credentials", "kimi-code.json"));
     expect(() => allowedOutbound("https://api.kimi.com/coding/v1/usages")).not.toThrow();
     expect(() => allowedOutbound("https://api.kimi.cn/coding/v1/usages")).toThrow(/not allowed/);
+  });
+
+  it("finds a suffixed CLI credential, prefers the newest, and reads it through the CLI endpoint", async () => {
+    const { home, path: plain } = await cliHome(credential());
+    const suffixed = join(home, ".kimi-code", "credentials", "kimi-code-env-0a1b2c.json");
+    await writeFile(suffixed, JSON.stringify(credential()), "utf8");
+    await chmod(suffixed, 0o600);
+    await writeFile(join(home, ".kimi-code", "credentials", "other-tool.json"), "{}", "utf8");
+    await utimes(plain, new Date("2026-10-01T00:00:00Z"), new Date("2026-10-01T00:00:00Z"));
+    expect(await findKimiCliCredential(home, {})).toBe(suffixed);
+    expect(isKimiCliCredential(suffixed)).toBe(true);
+    expect((await discoverAccounts(home, { PATH: "" })).filter((item) => item.name === "kimi"))
+      .toEqual([expect.objectContaining({ location: suffixed })]);
+    const { fetch: fetcher, requests } = gateway({ "coding/v1/usages": await fixture("code-usages") });
+    await observeKimi(cliAccount(suffixed), { fetch: fetcher, now: () => at, home });
+    expect(requests.map((request) => new URL(request.url).hostname)).toEqual(["api.kimi.com"]);
+    await rm(join(home, ".kimi-code"), { recursive: true });
+    expect(await findKimiCliCredential(home, {})).toBeNull();
   });
 });
 

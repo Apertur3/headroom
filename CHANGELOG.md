@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Kimi Code CLI credentials saved as `kimi-code-<suffix>.json` (newer CLI versions) are now found by `headroom accounts discover` and read by the Kimi adapter; the most recently written one is used.
+
 ## [0.2.15] - 2026-10-23
 
 ### Fixed
