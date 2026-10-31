@@ -111,6 +111,13 @@ describe("statusline reader and writer guards", () => {
     expect(reconcileSnapshot(snap(5, 500, 1_800_000_900, "s2"), first).observed_at).toBe(1_800_000_900);
   });
 
+  it("a session whose API time restarted from zero restamps again once it does new work", () => {
+    const before = snap(30, 28_000_000, 1_800_000_000);
+    const resumed = reconcileSnapshot(snap(31, 800_000, 1_800_000_900), before);
+    expect(resumed.observed_at).toBe(1_800_000_000);
+    expect(reconcileSnapshot(snap(32, 900_000, 1_800_001_800), resumed).observed_at).toBe(1_800_001_800);
+  });
+
   it("alternating idle sessions never restamp a snapshot", () => {
     let current = reconcileSnapshot(snap(30, 1000, 1_800_000_000, "s1"), undefined);
     current = reconcileSnapshot(snap(30, 400, 1_800_000_100, "s2"), current);
