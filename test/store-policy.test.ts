@@ -82,9 +82,8 @@ describe("SQLite observations and event detector", () => {
       store.insert(observation({ quantity: { used: 11, limit: 100, remaining: 89, unit: "percent" }, metadata: { free_resets_available: 0 } }));
       const events = store.events("2026-09-03T00:00:00Z");
       expect(events).toEqual(expect.arrayContaining([
-        // 80% to 20% with resets_at unchanged and now before that reset time is a
-        // free reset fired ahead of schedule, not a vendor-scheduled reset.
-        expect.objectContaining({ kind: "free_reset_used", origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 20% before the scheduled reset" }),
+        // 80% to 20% with resets_at unchanged: a partial reset or raised limit.
+        expect.objectContaining({ kind: "usage_dropped", origin: "inferred", confidence: 0.8, reason: "usage dropped from 80% to 20% before the scheduled reset" }),
         expect.objectContaining({ kind: "free_reset_used", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "free_reset_granted", origin: "vendor_reported" }),
         expect.objectContaining({ kind: "credits_changed", origin: "vendor_reported" }),

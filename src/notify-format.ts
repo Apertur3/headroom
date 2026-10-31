@@ -96,6 +96,9 @@ export function eventText(event: HeadroomEvent, evidence: Observation[] = [], si
     case "free_reset_used": return event.metadata?.credit_spent_on_free_plan === true
       ? "🚨 A reset credit was just spent on the free plan"
       : message("🎟️ Free reset used", `${name}${count == null ? " used a reset" : ` now has ${Math.round(count)} reset credits left`}.`, "Check the refreshed allowance before planning more work.");
+    case "usage_dropped": return message("⬇️ Usage dropped early",
+      `${meter} went from ${Math.round(event.metadata?.previous_used_percent ?? previous?.quantity?.used ?? 0)}% to ${Math.round(event.metadata?.used_percent ?? current?.quantity?.used ?? 0)}% with its reset time unchanged: part of the window was reset or the limit was raised.`,
+      "Plan with the new headroom before spending a reset credit.");
     case "credits_changed": return message("🪙 Credits changed", count == null ? `${principal}'s credit balance changed.` : `${principal} now has ${Math.round(count)} reset credits.`, "Check the balance before using another credit.");
     case "plan_changed": {
       const from = typeof event.metadata?.from_plan === "string" ? clean(event.metadata.from_plan) : previous?.metadata?.plan ? clean(previous.metadata.plan) : "previous plan";

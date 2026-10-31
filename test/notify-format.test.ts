@@ -23,6 +23,7 @@ describe("phone notification text", () => {
       reset_seen: eventText(event("reset_seen", { metadata: { unscheduled: true, window_minutes: 10_080, used_percent: 0.2, previous_used_percent: 88.4 } }), evidence),
       free_reset_granted: eventText(event("free_reset_granted"), evidence),
       free_reset_used: eventText(event("free_reset_used"), evidence),
+      usage_dropped: eventText(event("usage_dropped", { metadata: { previous_used_percent: 93, used_percent: 47 } }), evidence),
       credits_changed: eventText(event("credits_changed"), evidence),
       plan_changed: eventText(event("plan_changed"), evidence),
       source_failed: eventText(event("source_failed", { principal_id: "antigravity", meter_id: "antigravity:main", reason: "HTTP 403", last_seen_at: new Date(Date.parse(at) + 25 * 60_000).toISOString() }), evidence),
@@ -92,6 +93,9 @@ describe("phone notification text", () => {
       Fresh readings are available for planning.",
         "timer_missed": "⏰ Timer fired while claude-main is unattended
       "timer" was due and delivered to its inbox, but claude-main's heartbeat is lapsed.",
+        "usage_dropped": "⬇️ Usage dropped early
+      Claude main weekly went from 93% to 47% with its reset time unchanged: part of the window was reset or the limit was raised.
+      Plan with the new headroom before spending a reset credit.",
         "vendor_inconsistent": "⚠️ Claude main readings flip-flopped between two windows; holding the earlier one",
         "window_retired": "🧹 Window retired
       Claude main is no longer reported by the vendor.

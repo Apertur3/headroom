@@ -200,7 +200,7 @@ function printEvents(items: HeadroomEvent[]): void {
   for (const item of items) {
     const subject = item.meter_id ?? item.principal_id ?? "-";
     const event = item.kind === "reset_seen" ? `reset seen ${formatReset(item.created_at)}`
-      : item.kind === "free_reset_used" ? `free reset used ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
+      : item.kind === "free_reset_used" || item.kind === "usage_dropped" ? `${item.kind === "usage_dropped" ? "usage dropped" : "free reset used"} ${formatReset(item.created_at)}${item.reason ? ` (${item.reason})` : ""}`
       : item.kind;
     console.log(`${subject}  ${event} (${item.origin}, ${Math.round(item.confidence * 100)}%)`);
   }

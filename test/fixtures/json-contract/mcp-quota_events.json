@@ -1,7 +1,25 @@
 {
   "contract": "string",
   "events": [
-    "unknown (empty array in the fixture data)"
+    {
+      "confidence": "number",
+      "corrected_by": "null",
+      "created_at": "string",
+      "evidence_observation_ids": [
+        "number"
+      ],
+      "id": "string",
+      "kind": "string",
+      "last_seen_at": "null",
+      "metadata": {
+        "previous_used_percent": "number",
+        "used_percent": "number"
+      },
+      "meter_id": "string",
+      "origin": "string",
+      "principal_id": "string",
+      "reason": "string"
+    }
   ],
   "generated_at": "string",
   "source": "string"

@@ -406,7 +406,8 @@ describe("CLI --json field shapes", () => {
       metadata: { model_id: "gpt-6-astra", model_name: "GPT-6-Astra", shares_pool: false },
     };
     const { logs, restore } = captureLog();
-    try { printEventsOutput([event, modelAvailable], false); } finally { restore(); }
+    try { printEventsOutput([event, modelAvailable, { ...event, id: "usage_dropped:2", kind: "usage_dropped", metadata: { used_percent: 47, previous_used_percent: 93 } }], false); } finally { restore(); }
+    expect(JSON.parse(logs[0])).toContainEqual(expect.objectContaining({ kind: "usage_dropped", metadata: { used_percent: 47, previous_used_percent: 93 } }));
     return compareToFixture("cli-events", JSON.parse(logs[0]));
   });
 
@@ -481,7 +482,14 @@ describe("MCP tool result field shapes (direct, no daemon)", () => {
 
   it("quota_events", async () => {
     const home = await newHome("mcp-events");
+    const store = await HeadroomStore.open(home);
+    try {
+      const now = new Date();
+      store.insert(fiveHour(93, -6 * 60_000, 4 * 3_600_000, now));
+      store.insert(fiveHour(47, 0, 4 * 3_600_000, now));
+    } finally { store.close(); }
     const result = await withHeadroomHome(home, () => call("quota_events", {}));
+    expect((result as { events: HeadroomEvent[] }).events).toEqual([expect.objectContaining({ kind: "usage_dropped", metadata: { used_percent: 47, previous_used_percent: 93 } })]);
     await compareToFixture("mcp-quota_events", result);
   });
 

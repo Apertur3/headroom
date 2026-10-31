@@ -49,6 +49,7 @@ describe("notify config", () => {
     // not in the default list (the same observation already trips
     // source_failed, which is default).
     expect(DEFAULT_NOTIFY_EVENTS).not.toContain("grant_lapsed");
+    expect(DEFAULT_NOTIFY_EVENTS).toContain("usage_dropped");
   });
 
   it("accepts grant_lapsed as a configured event", () => {
