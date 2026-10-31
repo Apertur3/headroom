@@ -209,9 +209,11 @@ export function reconcileSnapshot(next: StatuslineSnapshot, previous: Statusline
   const duration = next.api_duration_ms ?? 0;
   const known = previous?.sessions ?? (previous?.api_duration_ms !== undefined ? { [previous.session_id ?? ""]: previous.api_duration_ms } : {});
   const { [id]: recorded = 0, ...others } = known;
-  const sessions = Object.fromEntries(Object.entries({ ...others, [id]: Math.max(duration, recorded) }).slice(-MAX_TRACKED_SESSIONS));
+  // The latest API time is the new baseline, even when it went down: a resumed
+  // session counts from zero again, and a stored maximum would block it for good.
+  const sessions = Object.fromEntries(Object.entries({ ...others, [id]: next.api_duration_ms !== undefined ? duration : recorded }).slice(-MAX_TRACKED_SESSIONS));
   if (!previous) return { ...next, sessions };
-  // A session id alone is not progress: only that session's own API time growing past its record is.
+  // A session id alone is not progress: only that session's own API time growing past its last value is.
   const grew = duration > recorded;
   const keep = (value: StatuslineBucket | null, old: StatuslineBucket | null): StatuslineBucket | null =>
     value && old && value.resets_at !== null && value.resets_at === old.resets_at && value.used_percent < old.used_percent ? { ...value, used_percent: old.used_percent } : value;
