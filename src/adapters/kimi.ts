@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { vendorJson } from "../limits.js";
 import { expandHome } from "../paths.js";
 import { userAgent } from "../version.js";
+import { systemRunner, type CommandRunner } from "../notify.js";
 import { outboundFetch, readBoundedRegularFile, redact } from "../security.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
@@ -11,8 +12,13 @@ import type { Observation, ProviderAccount } from "../types.js";
 /**
  * Kimi (Moonshot's Kimi app and CLI).
  *
- * Two credential sources, in this order of preference:
+ * Three credential sources, in this order of preference:
  *
+ * 0. A Kimi Code console API key in the macOS Keychain (`keychain_service` in
+ *    accounts.toml), read per poll against the same `api.kimi.com` usages
+ *    endpoint. It does not expire in 15 minutes, so it is the unattended
+ *    source; where no Keychain is available it is a failed reading, never a
+ *    fallback that sends the key anywhere else.
  * 1. The Kimi Code CLI's own OAuth credential at
  *    `~/.kimi-code/credentials/kimi-code.json`, or `kimi-code-<suffix>.json`
  *    in newer CLI versions (`KIMI_CODE_HOME` when the
@@ -90,6 +96,9 @@ export interface KimiDependencies {
   /** Only used to resolve the default token path when the account carries no
    * explicit `location`; tests point it at a fake home. */
   home?: string;
+  /** Tests inject these; production uses the host platform and `security`. */
+  platform?: NodeJS.Platform;
+  run?: CommandRunner;
 }
 
 /** `location` is the credential file itself, not a config directory: either
@@ -324,15 +333,17 @@ function slug(value: string): string | undefined {
  * ratio, so this path emits neither meter; those stay on the gateway path.
  */
 export function observationsFromKimiCodeUsage(body: unknown, account: ProviderAccount, at = new Date()): Observation[] {
-  if (!object(body) || !object(body.usage)) throw new Error("Kimi usage response invalid");
+  if (!object(body) || (!object(body.usage) && !object(body.usages))) throw new Error("Kimi usage response invalid");
   const now = at.toISOString();
   const tagged = tagger(kimiCodePlanName(body));
-  const allowance = counts(body.usage);
-  const allowanceReset = resetOf(body.usage);
+  // The newer response has no `usage` allowance object, only `limits` and
+  // the `usages` ratio pools handled below.
+  const allowance = object(body.usage) ? counts(body.usage) : undefined;
+  const allowanceReset = object(body.usage) ? resetOf(body.usage) : null;
   // The allowance bucket carries no window of its own here either, so it keeps
   // the vendor's documented 7-day allowance period.
-  const allowanceMinutes = kimiWindowMinutes(body.usage.window) ?? WEEKLY_MINUTES;
-  const output: Observation[] = [tagged(bucketRow(account, "main", allowance, allowanceMinutes, allowanceReset, now, "vendor returned no usable allowance counters"))];
+  const allowanceMinutes = object(body.usage) ? kimiWindowMinutes(body.usage.window) ?? WEEKLY_MINUTES : WEEKLY_MINUTES;
+  const output: Observation[] = object(body.usage) ? [tagged(bucketRow(account, "main", allowance, allowanceMinutes, allowanceReset, now, "vendor returned no usable allowance counters"))] : [];
 
   if (Array.isArray(body.limits)) for (const entry of body.limits) {
     if (!object(entry)) continue;
@@ -345,6 +356,21 @@ export function observationsFromKimiCodeUsage(body: unknown, account: ProviderAc
     if (!rate || minutes === undefined || (!named && minutes === allowanceMinutes)) continue;
     const reset = resetOf(entry.detail);
     output.push(tagged({ ...base(account, named ?? "main", now), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: percentQuantity(rate.percent), resets_at: reset, freshness: "fresh" }));
+  }
+
+  // Ratio pools: the 5-hour window and the monthly pool that blocks (the
+  // `limit_month_code` share of it is skipped). A 5-hour window the `limits`
+  // list already described is one window: the more-used reading wins.
+  const pools = object(body.usages) ? body.usages : {};
+  for (const [key, minutes] of [["limit_5h", 300], ["limit_month_total", null]] as const) {
+    const pool = pools[key];
+    const ratio = object(pool) ? number(pool.used_ratio) : undefined;
+    if (ratio === undefined || ratio < 0) continue;
+    const reset = resetOf(pool);
+    const row = tagged({ ...base(account, "main", now), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: percentQuantity(ratio * 100), resets_at: reset, freshness: "fresh" });
+    const same = minutes === null ? -1 : output.findIndex((item) => item.meter_id === row.meter_id && item.window?.minutes === minutes && item.freshness === "fresh");
+    if (same < 0) output.push(row);
+    else if ((row.quantity?.used ?? 0) > (output[same].quantity?.used ?? 0)) output[same] = row;
   }
   return output;
 }
@@ -505,22 +531,40 @@ async function observeMoonshotCredits(account: ProviderAccount, path: string, do
  * file is only ever read -- an expired token is a failed reading naming the
  * CLI's login command, never a refresh against a credential another tool owns.
  */
+async function fetchKimiCodeUsage(account: ProviderAccount, token: string, doFetch: typeof fetch, at: Date, reason: (error: unknown) => string): Promise<Observation[]> {
+  try {
+    const response = await outboundFetch(doFetch, new Request(CODE_USAGES_URL, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "User-Agent": userAgent() },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }));
+    if (!response.ok) throw new ProviderHTTPError(response.status, "Kimi");
+    return observationsFromKimiCodeUsage(await vendorJson(response), account, at);
+  } catch (error) {
+    return failed(account, reason(error), at.toISOString(), CODE_METERS);
+  }
+}
+
 async function observeKimiCodeCli(account: ProviderAccount, path: string, doFetch: typeof fetch, at: Date): Promise<Observation[]> {
   const timestamp = at.toISOString();
   let credential: KimiCliCredential;
   try { credential = await readKimiCliCredential(path); }
   catch (error) { return failed(account, cliCredentialReason(error, path), timestamp, CODE_METERS); }
   if (kimiCliCredentialExpired(credential, at)) return failed(account, `Kimi CLI credential expired; ${CLI_LOGIN_STEP} (Headroom never refreshes it)`, timestamp, CODE_METERS);
-  try {
-    const response = await outboundFetch(doFetch, new Request(CODE_USAGES_URL, {
-      headers: { Authorization: `Bearer ${credential.token}`, Accept: "application/json", "User-Agent": userAgent() },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    }));
-    if (!response.ok) throw new ProviderHTTPError(response.status, "Kimi");
-    return observationsFromKimiCodeUsage(await vendorJson(response), account, at);
-  } catch (error) {
-    return failed(account, cliUsageReason(error), timestamp, CODE_METERS);
-  }
+  return fetchKimiCodeUsage(account, credential.token, doFetch, at, cliUsageReason);
+}
+
+/** The Keychain API key, read per poll and held only in this call. Every
+ * failure reason is built from constants: the store command's own output and
+ * errors are never repeated. */
+async function observeKimiKeychain(account: ProviderAccount, service: string, doFetch: typeof fetch, at: Date, dependencies: KimiDependencies): Promise<Observation[]> {
+  const timestamp = at.toISOString();
+  if ((dependencies.platform ?? process.platform) !== "darwin") return failed(account, `Kimi API key not readable: the Keychain is macOS only (service ${service})`, timestamp, CODE_METERS);
+  let key: string;
+  try { key = (await (dependencies.run ?? systemRunner)("security", ["find-generic-password", "-a", account.keychain_account ?? "headroom", "-s", service, "-w"])).trim(); }
+  catch { return failed(account, `Kimi API key not readable from the Keychain (service ${service})`, timestamp, CODE_METERS); }
+  if (!key || /\s/.test(key)) return failed(account, `Kimi API key not readable from the Keychain (service ${service})`, timestamp, CODE_METERS);
+  return fetchKimiCodeUsage(account, key, doFetch, at, (error) => error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403)
+    ? `Kimi rejected the API key (${error.status}); replace the Keychain item ${service}` : cliUsageReason(error));
 }
 
 async function observeKimiGateway(account: ProviderAccount, path: string, doFetch: typeof fetch, now: Date): Promise<Observation[]> {
@@ -548,6 +592,7 @@ export async function observeKimi(account: ProviderAccount, dependencies: KimiDe
   const now = dependencies.now?.() ?? new Date();
   const path = kimiTokenPath(account.location, dependencies.home);
   const doFetch = dependencies.fetch ?? fetch;
+  if (account.keychain_service) return observeKimiKeychain(account, account.keychain_service, doFetch, now, dependencies);
   const output = isKimiCliCredential(path)
     ? await observeKimiCodeCli(account, path, doFetch, now)
     : await observeKimiGateway(account, path, doFetch, now);
