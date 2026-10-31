@@ -1,4 +1,4 @@
-import { lstat } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { vendorJson } from "../limits.js";
@@ -14,7 +14,8 @@ import type { Observation, ProviderAccount } from "../types.js";
  * Two credential sources, in this order of preference:
  *
  * 1. The Kimi Code CLI's own OAuth credential at
- *    `~/.kimi-code/credentials/kimi-code.json` (`KIMI_CODE_HOME` when the
+ *    `~/.kimi-code/credentials/kimi-code.json`, or `kimi-code-<suffix>.json`
+ *    in newer CLI versions (`KIMI_CODE_HOME` when the
  *    operator moved that home), read against `api.kimi.com/coding/v1/usages`.
  *    This is a real credential file the CLI wrote for itself, so there is
  *    nothing for the operator to copy by hand. Headroom reads it and never
@@ -104,11 +105,27 @@ export function kimiCliCredentialPath(home = homedir(), environment: NodeJS.Proc
   return join(codeHome, "credentials", KIMI_CLI_CREDENTIAL_FILENAME);
 }
 
-/** Which of the two sources a principal's `location` names. The CLI writes one
- * file under one name, so the file name is the whole test; a manual token file
- * is anything else. */
+/** `kimi-code.json`, or `kimi-code-<suffix>.json` as newer CLI versions name it. */
+const KIMI_CLI_CREDENTIAL_NAME = /^kimi-code(?:-[^/\\]+)?\.json$/;
+
+/** The CLI credential to read: the most recently written file with a CLI
+ * credential name in the credentials folder, or null when there is none. */
+export async function findKimiCliCredential(home = homedir(), environment: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+  const directory = dirname(kimiCliCredentialPath(home, environment));
+  const names = await readdir(directory).catch(() => [] as string[]);
+  let newest: { path: string; mtime: number } | null = null;
+  for (const name of names.filter((item) => KIMI_CLI_CREDENTIAL_NAME.test(item))) {
+    const path = join(directory, name);
+    const info = await lstat(path).catch(() => null);
+    if (info?.isFile() && (!newest || info.mtimeMs > newest.mtime)) newest = { path, mtime: info.mtimeMs };
+  }
+  return newest?.path ?? null;
+}
+
+/** Which of the two sources a principal's `location` names: a CLI credential
+ * by its file name, a manual token file otherwise. */
 export function isKimiCliCredential(path: string): boolean {
-  return basename(path) === KIMI_CLI_CREDENTIAL_FILENAME;
+  return KIMI_CLI_CREDENTIAL_NAME.test(basename(path));
 }
 
 /** The optional second location: the Moonshot platform API key, in a file

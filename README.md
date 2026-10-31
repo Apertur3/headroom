@@ -515,7 +515,7 @@ Every request identifies itself as `headroomd/<version>`. The default (`claude_p
 | Codex | `GET chatgpt.com/backend-api/wham/usage` and `.../wham/rate-limit-reset-credits`; also the Codex CLI's local session logs | ChatGPT token in `~/.codex/auth.json` | No. Sends `User-Agent: headroomd/<version>` |
 | Antigravity quota (experimental) | agy's local language server on 127.0.0.1 | agy's local CSRF token from its process command line, where present; not agy's OAuth or session credential | No (private local endpoint) |
 | Grok (experimental) | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` and `/v1/settings` | Bearer token from `~/.grok/auth.json` (written by `grok login`) | No. Sends `User-Agent: headroomd/<version>` |
-| Kimi, CLI credential | `GET api.kimi.com/coding/v1/usages` | Access token from `~/.kimi-code/credentials/kimi-code.json` | No. Sends `User-Agent: headroomd/<version>` |
+| Kimi, CLI credential | `GET api.kimi.com/coding/v1/usages` | Access token from `~/.kimi-code/credentials/kimi-code*.json` | No. Sends `User-Agent: headroomd/<version>` |
 | Kimi, manual token | The `www.kimi.com/apiv2` web gateway | A `kimi-auth` web session token you save yourself to a 0600 file (default `~/.kimi/auth.token`) | No |
 | Kimi, optional balance | `GET api.moonshot.ai/v1/users/me/balance` | A Moonshot API key you save to a 0600 `moonshot.key` file | Yes (Moonshot platform API) |
 | Local vLLM, llama.cpp | Your own server at the `base_url` you configure | None from a vendor | Not applicable |

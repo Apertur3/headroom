@@ -5,7 +5,7 @@ import { isLocalAccount, type Account, type LocalAccount, type ProviderAccount }
 import { assertSafeAncestry, expandHome, headroomHome, vendorHome } from "./paths.js";
 import { readBoundedRegularFile, withAccountsLock, writeFileAtomic } from "./security.js";
 import { grokAuthPath } from "./adapters/grok.js";
-import { kimiCliCredentialPath, kimiTokenPath } from "./adapters/kimi.js";
+import { findKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
 
 export function accountsPath(): string { return join(headroomHome(), "accounts.toml"); }
 
@@ -61,9 +61,9 @@ export async function discoverAccounts(home = homedir(), environment = process.e
   // whose session token lives in a browser cookie store this project does not
   // open. Whichever exists names the principal's `location`; the CLI credential
   // wins when both do (see docs/vendors.md).
-  const kimiCredentials = [kimiCliCredentialPath(home, environment), kimiTokenPath(undefined, home)];
+  const kimiCredentials = [await findKimiCliCredential(home, environment), kimiTokenPath(undefined, home)];
   for (const credential of kimiCredentials) {
-    if (!await exists(credential)) continue;
+    if (!credential || !await exists(credential)) continue;
     accounts.push({ name: "kimi", vendor: "kimi", location: credential, adapter: "native-ts" });
     break;
   }
