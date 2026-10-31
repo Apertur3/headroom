@@ -249,8 +249,6 @@ export function parsePolicy(text: string, now: Date = new Date()): Policy {
     if (updateCheckMatch) { updateCheck = updateCheckMatch[1] === "true"; continue; }
     const claudeProbeMatch = /^claude_probe\s*=\s*(true|false)\s*$/.exec(line);
     if (claudeProbeMatch) { claudeProbe = claudeProbeMatch[1] === "true"; continue; }
-    // Retired option (the Google model catalog is gone): accepted and ignored so old files still load.
-    if (/^antigravity_model_catalog\s*=/.test(line)) continue;
     const pacingMatch = /^pacing\s*=\s*"(even|none)"\s*$/.exec(line);
     if (pacingMatch) { pacing = pacingMatch[1] as Policy["pacing"]; continue; }
     if (/^pacing\s*=/.test(line)) throw new Error("Invalid Headroom policy");

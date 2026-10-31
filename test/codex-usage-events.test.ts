@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   applyCodexUsageSnapshot,
-  applyCodexUsageSnapshots,
   createCodexUsageAccumulator,
   normalizePercent,
   parseCodexUsageLine,
   type CodexLineOutcome,
   type CodexUsageSnapshot,
+  type CodexUsageAccumulatorState,
   type UsageLineInput,
 } from "../src/codex-usage-events.js";
+
+function applyCodexUsageSnapshots(state: CodexUsageAccumulatorState, snapshots: readonly CodexUsageSnapshot[]): CodexUsageAccumulatorState {
+  return snapshots.reduce(applyCodexUsageSnapshot, state);
+}
 
 // SYNTHETIC FIXTURE: every id, session, response and rate-limit value below is
 // hand-written and never a real Codex account/session. Shapes follow the

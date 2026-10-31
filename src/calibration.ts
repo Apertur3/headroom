@@ -7,9 +7,6 @@
  * running together burn about 22 weekly points per hour.
  */
 export const WEEKLY_POINTS_PER_FULL_5H_WINDOW = 22;
-export const MEASURED_PARALLEL_LANES = 8;
-export const WEEKLY_POINTS_PER_HOUR_AT_MEASURED_PARALLELISM = 22;
-export const WEEKLY_POINTS_PER_LANE_PER_HOUR = WEEKLY_POINTS_PER_HOUR_AT_MEASURED_PARALLELISM / MEASURED_PARALLEL_LANES;
 
 /** Convert a 5-hour-window percent cost into the weekly percent it costs,
  * using the measured ratio: fully spending a 5h window (100%) costs about

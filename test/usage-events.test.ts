@@ -1,14 +1,29 @@
 import { describe, expect, it } from "vitest";
 import {
   applyUsageSnapshot,
-  applyUsageSnapshots,
   createUsageAccumulator,
-  ingestUsageLines,
   normalizeUsageCounter,
   parseUsageLine,
   type ClaudeUsageSnapshot,
+  type UsageAccumulatorState,
+  type LineOutcome,
   type UsageLineInput,
 } from "../src/usage-events.js";
+
+/** Applies a batch in order; a pure array merge, safe to re-run on
+ * previously-seen input. */
+function applyUsageSnapshots(state: UsageAccumulatorState, snapshots: readonly ClaudeUsageSnapshot[]): UsageAccumulatorState {
+  return snapshots.reduce(applyUsageSnapshot, state);
+}
+
+/** Convenience entry point for a batch of raw lines: parses each, folds
+ * accepted snapshots into `state`, and returns every per-line outcome so a
+ * caller can log/skip/reject without re-deriving parse results. */
+function ingestUsageLines(state: UsageAccumulatorState, inputs: readonly UsageLineInput[]): { state: UsageAccumulatorState; outcomes: LineOutcome[] } {
+  const outcomes = inputs.map(parseUsageLine);
+  const accepted = outcomes.filter((outcome): outcome is { kind: "accepted"; snapshot: ClaudeUsageSnapshot } => outcome.kind === "accepted");
+  return { state: applyUsageSnapshots(state, accepted.map((outcome) => outcome.snapshot)), outcomes };
+}
 
 // SYNTHETIC FIXTURE: A synthetic, never-real example canary shaped like a vendor key, assembled
 // at runtime so no contiguous secret-shaped literal sits in this file's own

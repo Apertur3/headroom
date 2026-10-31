@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateGate, evaluateProRataLine, fillClassFits, parseGateNeed, waitForReset } from "../src/pacing.js";
+import { computeFill, computePlan, evaluateBurst, evaluateFillAllowance, evaluateProRataLine, fillClassFits, parseGateNeed, waitForReset } from "../src/pacing.js";
 
 describe("evaluateProRataLine", () => {
   it("allows spend that stays under the elapsed-fraction line plus tolerance", () => {
@@ -118,63 +118,6 @@ describe("parseGateNeed", () => {
     expect(() => parseGateNeed("sometime:15")).toThrow("Invalid --need value");
     expect(() => parseGateNeed("5h:-1")).toThrow("Invalid --need value");
     expect(() => parseGateNeed("5h")).toThrow("Invalid --need value");
-  });
-});
-
-describe("evaluateGate", () => {
-  const usage = { used5h: 80, usedWk: 50, weeklyResetsAt: "2026-09-10T12:00:00Z", hoursPer5hWindow: 5 };
-  const now = new Date("2026-09-03T12:00:00Z");
-
-  it("fails closed with no needs given", () => {
-    expect(evaluateGate([], usage, 10, false, now)).toMatchObject({ allowed: false });
-  });
-
-  it("allows a need that stays under the freeze reserve", () => {
-    expect(evaluateGate([{ window: "5h", points: 5 }], usage, 10, false, now)).toMatchObject({ allowed: true });
-  });
-
-  it("refuses a need that would cross the freeze reserve, naming the window and the shortfall", () => {
-    const result = evaluateGate([{ window: "5h", points: 15 }], usage, 10, false, now);
-    expect(result.allowed).toBe(false);
-    expect(result.reason).toContain("5h needs 15 more");
-    expect(result.reason).toContain("10% reserve");
-  });
-
-  it("refuses when the deciding window's usage is unknown", () => {
-    expect(evaluateGate([{ window: "wk", points: 5 }], { ...usage, usedWk: null }, 10, false, now)).toMatchObject({ allowed: false, reason: "wk usage unknown" });
-  });
-
-  it("checks every need in order, failing on the first that does not fit", () => {
-    const result = evaluateGate([{ window: "5h", points: 1 }, { window: "wk", points: 60 }], usage, 10, false, now);
-    expect(result.allowed).toBe(false);
-    expect(result.reason).toContain("wk needs 60 more");
-  });
-
-  it("skips a need on a not_enforced window instead of failing with 'usage unknown'", () => {
-    const notEnforced = { ...usage, used5h: null, freshness5h: "not_enforced" as const };
-    const result = evaluateGate([{ window: "5h", points: 50 }], notEnforced, 10, false, now);
-    expect(result).toMatchObject({ allowed: true, not_enforced: ["5h"] });
-  });
-
-  it("evaluates the remaining need normally when only one of two windows is not enforced", () => {
-    const notEnforced = { ...usage, used5h: null, freshness5h: "not_enforced" as const };
-    // used5h is null (would refuse as "5h usage unknown" without the skip
-    // above), but the wk need still gets checked against real usage.
-    const passes = evaluateGate([{ window: "5h", points: 50 }, { window: "wk", points: 5 }], notEnforced, 10, false, now);
-    expect(passes).toMatchObject({ allowed: true, not_enforced: ["5h"] });
-    const refuses = evaluateGate([{ window: "5h", points: 50 }, { window: "wk", points: 60 }], notEnforced, 10, false, now);
-    expect(refuses).toMatchObject({ allowed: false, reason: expect.stringContaining("wk needs 60 more") });
-  });
-
-  it("with --plan, a 5h need must also fit under the plan line, a stricter bar than the reserve alone", () => {
-    // Plan line: 50% weekly remaining - 10 reserve = 40 budget over
-    // ceil(168h/5h)=34 windows -> ~1.18 points/window. A 5h need of 5 fits
-    // the raw reserve (leaves headroom to 90%) but blows the plan line.
-    const weekly = evaluateGate([{ window: "5h", points: 5 }], usage, 10, false, now);
-    expect(weekly.allowed).toBe(true);
-    const planned = evaluateGate([{ window: "5h", points: 5 }], usage, 10, true, now);
-    expect(planned.allowed).toBe(false);
-    expect(planned.reason).toContain("plan line allows only");
   });
 });
 

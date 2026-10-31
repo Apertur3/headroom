@@ -164,7 +164,7 @@ describe("daemon JSON-RPC", () => {
       const internal = daemon as unknown as { backoff: Map<string, { failures: number; until: number }>; poll(principal: string | undefined, forced: boolean): Promise<unknown>; antigravityLocal: Map<string, unknown> };
       internal.backoff.set("all", { failures: 1, until: Date.now() + 60_000 });
       await internal.poll(undefined, false);
-      expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true, skipRemoteAntigravity: true })]);
+      expect(options).toEqual([expect.objectContaining({ daemonOwnsAntigravity: true })]);
       expect(internal.antigravityLocal.get("antigravity")).toMatchObject({ outcome: "failed", payload_kind: "none" });
       await daemon.stop();
     });
