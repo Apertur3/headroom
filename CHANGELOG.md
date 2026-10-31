@@ -6,7 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A Kimi account can read a Kimi Code console API key from the macOS Keychain (`keychain_service`, optional `keychain_account` in `accounts.toml`), so the 5-hour window is metered without a login that expires.
+
 ### Fixed
+- The Kimi usage reading accepts the newer `usages` response shape (5-hour and monthly ratios) that has no `usage` object.
 - A Claude Code session resumed after a restart counts its API time from zero again; its statusline readings are now treated as current once it does new work, instead of staying stuck at the time before the restart.
 
 ## [0.2.16] - 2026-10-31
