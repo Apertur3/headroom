@@ -438,8 +438,7 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
     // or wk need, or the weekly reading usePlan folds into a 5h check) that
     // is stale, failed, or older than the policy staleness threshold --
     // the same rule paceDecision applies before computing a pace state. A
-    // vendor-confirmed not_enforced window is never rejected here;
-    // evaluateGate below already skips its need instead of failing it.
+    // vendor-confirmed not_enforced window is skipped below instead of failed.
     const reported = knownPercentWindows(store, id);
     const notEnforced: string[] = [];
     // The exact 300-minute row matched for a 5h need below -- never the

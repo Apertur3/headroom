@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ClaudeProbeError, checkClaudeCredentialReadable, claudeKeychainMetadata, claudeLoggedOutReason, claudeSecurityToolFailureReason, isClaudeGrantIssue, isClaudeProbeDenialReason, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
+import { ClaudeProbeError, checkClaudeCredentialReadable, claudeKeychainMetadata, claudeLoggedOutReason, claudeSecurityToolFailureReason, isClaudeProbeDenialReason, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 
 const temporary: string[] = [];
@@ -87,7 +87,6 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
       // Nothing here asks anyone to grant anything: the item's access list
       // already admits the tool, so a failure is a broken tool, not a
       // permission.
-      expect(isClaudeGrantIssue(message)).toBe(false);
       expect(isClaudeProbeDenialReason(message)).toBe(false);
     });
   });
@@ -123,7 +122,6 @@ describe.skipIf(process.platform === "win32")("claude probe: fake exit-code/mark
       const message = (error as ClaudeProbeError).message;
       expect(message).toBe(claudeLoggedOutReason("/nonexistent/.claude"));
       expect(message).toContain("run: CLAUDE_CONFIG_DIR=/nonexistent/.claude claude and sign in");
-      expect(isClaudeGrantIssue(message)).toBe(false);
     });
   });
 });

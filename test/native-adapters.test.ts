@@ -4,7 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CLAUDE_GRANT_LAPSED_PREFIX, ClaudeProbeError, claudeGrantGate, claudeGrantNeededObservations, claudeGrantNeededReason,
-  claudeLoggedOutFix, claudeLoggedOutReason, claudeRunWithDirectory, claudeResponseShape, claudeServiceName, isClaudeGrantIssue,
+  claudeLoggedOutFix, claudeLoggedOutReason, claudeRunWithDirectory, claudeResponseShape, claudeServiceName,
   isClaudeLoggedOutReason, logUnknownClaudeTopLevelKeys, observationsFromClaudeUsage, observeClaude, parseKeychainModifiedAt, syncClaudeProbeState,
 } from "../src/adapters/claude.js";
 import { codexResponseShape, observationsFromCodexRateLimitEvents, observationsFromCodexUsage, observeCodex, readCodexRateLimitEvents } from "../src/adapters/codex.js";
@@ -455,15 +455,6 @@ describe("Claude Keychain grant gate", () => {
     expect(parseKeychainModifiedAt("")).toBeUndefined();
   });
 
-  it("isClaudeGrantIssue recognizes a plain denial and a detected lapse, and nothing else", () => {
-    expect(isClaudeGrantIssue(claudeGrantNeededReason("claude-main"))).toBe(true);
-    expect(isClaudeGrantIssue(`${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at 2026-09-07 05:24:43; run: headroom keychain grant --principal claude-main`)).toBe(true);
-    expect(isClaudeGrantIssue("no credentials in Keychain for this config dir")).toBe(false);
-    expect(isClaudeGrantIssue("token expired; run: claude")).toBe(false);
-    expect(isClaudeGrantIssue(null)).toBe(false);
-    expect(isClaudeGrantIssue(undefined)).toBe(false);
-  });
-
   it("a probe's 'no credentials' becomes a Keychain-lapsed reason, naming the local rewrite time and the fix, when a metadata-only lookup still finds the item (issue #9)", async () => {
     const modifiedAt = new Date("2026-09-07T05:24:43Z");
     const rows = await observeClaude(claude, {
@@ -474,7 +465,6 @@ describe("Claude Keychain grant gate", () => {
     });
     expect(rows.every((row) => row.freshness === "failed")).toBe(true);
     expect(rows[0].reason).toMatch(new RegExp(`^${CLAUDE_GRANT_LAPSED_PREFIX} Claude Code rewrote its credentials at \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}; run: headroom keychain grant --principal claude-main$`));
-    expect(isClaudeGrantIssue(rows[0].reason)).toBe(true);
   });
 
   it("says 'an unknown time' rather than fabricating one when the item is found but its mdat could not be parsed", async () => {
@@ -496,7 +486,6 @@ describe("Claude Keychain grant gate", () => {
     });
     expect(rows.every((row) => row.freshness === "failed")).toBe(true);
     expect(rows[0].reason).toBe(`Claude Code is logged out for ${resolve(claude.location)}; ${claudeRunWithDirectory(resolve(claude.location))} and sign in`);
-    expect(isClaudeGrantIssue(rows[0].reason)).toBe(false);
     expect(isClaudeLoggedOutReason(rows[0].reason)).toBe(true);
   });
 

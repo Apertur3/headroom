@@ -322,18 +322,3 @@ function quarantine(state: UsageAccumulatorState, identityKey: string, reason: Q
   quarantined.set(identityKey, { identityKey, reason });
   return { entries, quarantined };
 }
-
-/** Applies a batch in order; a pure array merge, safe to re-run on
- * previously-seen input. */
-export function applyUsageSnapshots(state: UsageAccumulatorState, snapshots: readonly ClaudeUsageSnapshot[]): UsageAccumulatorState {
-  return snapshots.reduce(applyUsageSnapshot, state);
-}
-
-/** Convenience entry point for a batch of raw lines: parses each, folds
- * accepted snapshots into `state`, and returns every per-line outcome so a
- * caller can log/skip/reject without re-deriving parse results. */
-export function ingestUsageLines(state: UsageAccumulatorState, inputs: readonly UsageLineInput[]): { state: UsageAccumulatorState; outcomes: LineOutcome[] } {
-  const outcomes = inputs.map(parseUsageLine);
-  const accepted = outcomes.filter((outcome): outcome is { kind: "accepted"; snapshot: ClaudeUsageSnapshot } => outcome.kind === "accepted");
-  return { state: applyUsageSnapshots(state, accepted.map((outcome) => outcome.snapshot)), outcomes };
-}
