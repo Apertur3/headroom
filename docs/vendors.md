@@ -397,8 +397,33 @@ there is no Grok reading.
 
 ## Kimi
 
-Kimi is Moonshot's subscription (the Kimi app and the Kimi Code CLI). There are two credential
-sources, and Headroom prefers the first:
+Kimi is Moonshot's subscription (the Kimi app and the Kimi Code CLI). Headroom has three credential
+sources. On macOS the recommended unattended one is a Kimi Code console API key in the Keychain:
+
+0. **A Kimi Code console API key in the macOS Keychain.** Create a key in the Kimi Code console and
+   store it once (the prompt is hidden, nothing lands in shell history or on disk):
+   `security add-generic-password -U -a headroom -s headroom-kimi -w`. Then name the item on the
+   account in `accounts.toml`:
+
+   ```toml
+   [[accounts]]
+   name = "kimi"
+   vendor = "kimi"
+   location = "~/.kimi-code/credentials/kimi-code.json"
+   adapter = "native-ts"
+   keychain_service = "headroom-kimi"
+   # keychain_account = "headroom"   # optional, this is the default
+   ```
+
+   Each poll runs `security find-generic-password -a <account> -s <service> -w` and calls
+   `GET https://api.kimi.com/coding/v1/usages` with the key. This source wins over `location`
+   (which stays only because every account carries one). The key is never logged or stored. Off
+   macOS, or when the item is missing or unreadable, the reading fails with "Kimi API key not
+   readable from the Keychain (service <service>)"; the key is never sent anywhere else and no
+   other source is tried. Unlike the CLI's 15 minute access token, an API key does not go stale
+   between polls.
+
+The other two sources, in order of preference:
 
 1. **The Kimi Code CLI's own OAuth credential**, at `~/.kimi-code/credentials/kimi-code.json`
    (newer CLI versions name it `kimi-code-<suffix>.json`; the most recently written one is used), or

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -463,5 +464,47 @@ describe("collector dispatch", () => {
     } finally {
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
+  });
+});
+
+describe("Kimi Keychain API key and the usages ratio shape", () => {
+  const recorded = JSON.parse(readFileSync(new URL("./fixtures/kimi/code-usages-v2.recorded.json", import.meta.url), "utf8")) as unknown;
+  const keyed = { ...kimi, keychain_service: "headroom-kimi" };
+
+  it("maps the recorded response to one 5-hour window and the monthly pool", () => {
+    const rows = observationsFromKimiCodeUsage(recorded, kimi, at);
+    expect(rows.map((row) => [row.meter_id, row.window?.minutes, row.quantity?.used])).toEqual([["kimi:main", 300, 4.18], ["kimi:main", null, 0.23]]);
+    expect(rows[0]).toMatchObject({ resets_at: "2026-10-31T14:41:03.000Z", window: expect.objectContaining({ kind: "fixed" }) });
+    expect(rows[1].resets_at).toBe("2026-12-01T00:00:00.000Z");
+  });
+
+  it("reads the key from the Keychain per poll, sends it to api.kimi.com only, and never leaks it", async () => {
+    const { fetch: fetcher, requests } = gateway({ "coding/v1/usages": recorded });
+    const calls: string[][] = [];
+    const run = async (command: string, args: string[]): Promise<string> => { calls.push([command, ...args]); return "synthetic-keychain-key\n"; };
+    const rows = await observeKimi({ ...keyed, keychain_account: "someone" }, { fetch: fetcher, now: () => at, platform: "darwin", run });
+    expect(calls).toEqual([["security", "find-generic-password", "-a", "someone", "-s", "headroom-kimi", "-w"]]);
+    expect(requests.map((request) => request.url)).toEqual(["https://api.kimi.com/coding/v1/usages"]);
+    expect(requests[0].headers.get("authorization")).toBe("Bearer synthetic-keychain-key");
+    expect(rows.every((row) => row.freshness === "fresh")).toBe(true);
+    // Key canary: it appears in no meter id, reason, metadata or other field.
+    expect(JSON.stringify(rows)).not.toContain("synthetic-keychain-key");
+  });
+
+  it("fails with a redacted reason, and sends nothing, when the key is unreadable", async () => {
+    let called = 0;
+    const fetcher = (async () => { called += 1; return json({}); }) as unknown as typeof fetch;
+    const missing = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "darwin", run: async () => { throw new Error("synthetic-keychain-key could not be found"); } });
+    expect(missing[0]).toMatchObject({ freshness: "failed", reason: "Kimi API key not readable from the Keychain (service headroom-kimi)" });
+    const other = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "linux", run: async () => "synthetic-keychain-key" });
+    expect(other[0].freshness).toBe("failed");
+    expect(JSON.stringify([missing, other])).not.toContain("synthetic-keychain-key");
+    expect(called).toBe(0);
+  });
+
+  it("keeps the more-used reading when limits and a ratio pool describe the same window", () => {
+    const body = { limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", used: "50" } }], usages: { limit_5h: { used_ratio: 0.1, reset_time: "2026-10-31T14:41:03Z" } } };
+    const rows = observationsFromKimiCodeUsage(body, kimi, at);
+    expect(rows.map((row) => row.quantity?.used)).toEqual([50]);
   });
 });

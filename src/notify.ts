@@ -275,7 +275,7 @@ export async function readNotifyConfig(home = headroomHome()): Promise<NotifyCon
 export type CommandRunner = (command: string, args: string[]) => Promise<string>;
 
 const execFileAsync = promisify(execFile);
-const systemRunner: CommandRunner = async (command, args) => {
+export const systemRunner: CommandRunner = async (command, args) => {
   const { stdout } = await execFileAsync(command, args, { timeout: TIMEOUT_MS, maxBuffer: 64 * 1024, windowsHide: true });
   return stdout;
 };

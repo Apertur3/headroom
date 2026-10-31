@@ -42,6 +42,11 @@ export interface ProviderAccount {
    * adapter can match its file to this principal when the collector's own
    * naming does not follow headroom's config-dir-basename convention. */
   alias?: string;
+  /** Kimi only: read a Kimi Code console API key from the macOS Keychain
+   * item with this service name (account `keychain_account`, default
+   * `headroom`). Wins over `location`. */
+  keychain_service?: string;
+  keychain_account?: string;
 }
 
 /** A local pool is a probed OpenAI-compatible capacity source. */

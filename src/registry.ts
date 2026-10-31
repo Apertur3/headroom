@@ -14,7 +14,7 @@ function quoted(value: string): string { return JSON.stringify(value); }
 export function accountsToml(accounts: Account[]): string {
   return accounts.map((account) => isLocalAccount(account)
     ? ["[[accounts]]", `name = ${quoted(account.name)}`, ...(account.enabled === false ? ["enabled = false"] : []), 'kind = "local"', `base_url = ${quoted(account.base_url)}`, ...(account.wake ? [`wake = ${quoted(account.wake)}`] : []), 'adapter = "native"', ""].join("\n")
-    : ["[[accounts]]", `name = ${quoted(account.name)}`, ...(account.enabled === false ? ["enabled = false"] : []), `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ...(account.alias ? [`alias = ${quoted(account.alias)}`] : []), ""].join("\n")).join("\n");
+    : ["[[accounts]]", `name = ${quoted(account.name)}`, ...(account.enabled === false ? ["enabled = false"] : []), `vendor = ${quoted(account.vendor)}`, `location = ${quoted(account.location)}`, `adapter = ${quoted(account.adapter)}`, ...(account.agy_path ? [`agy_path = ${quoted(account.agy_path)}`] : []), ...(account.alias ? [`alias = ${quoted(account.alias)}`] : []), ...(account.keychain_service ? [`keychain_service = ${quoted(account.keychain_service)}`] : []), ...(account.keychain_account ? [`keychain_account = ${quoted(account.keychain_account)}`] : []), ""].join("\n")).join("\n");
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -98,8 +98,14 @@ export async function writeDiscoveredAccounts(accounts: Account[]): Promise<void
     // replaces the account file" -- it must stop being polled forever. Local
     // accounts (`kind: "local"`) are never produced by discovery at all and
     // are preserved untouched.
-    const priorEnabled = new Map(existing.map((account) => [account.name, account.enabled]));
-    const discovered = accounts.map((account) => priorEnabled.get(account.name) === false ? ({ ...account, enabled: false } as Account) : account);
+    // The Kimi Keychain selection is operator configuration too, not a thing a
+    // scan can rediscover, so it survives the same way.
+    const prior = new Map(existing.map((account) => [account.name, account]));
+    const discovered = accounts.map((account) => {
+      const old = prior.get(account.name);
+      const kept = old && !isLocalAccount(old) && old.keychain_service ? { keychain_service: old.keychain_service, ...(old.keychain_account ? { keychain_account: old.keychain_account } : {}) } : {};
+      return { ...account, ...kept, ...(old?.enabled === false ? { enabled: false } : {}) } as Account;
+    });
     const localAccounts = existing.filter(isLocalAccount);
     const merged = [...discovered, ...localAccounts];
     // Atomic (temp file + rename) on every platform, and 0600 on POSIX (mode
@@ -143,7 +149,7 @@ export async function readAccounts(): Promise<Account[]> {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     if (/^\[\[accounts\]\]\s*(?:#.*)?$/.test(line)) { if (current) accounts.push(validate(current)); current = {}; continue; }
-    const stringMatch = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path|alias)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(line);
+    const stringMatch = /^(name|vendor|location|adapter|kind|base_url|wake|agy_path|alias|keychain_service|keychain_account)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(line);
     const enabledMatch = /^enabled\s*=\s*(true|false)\s*(?:#.*)?$/.exec(line);
     if (!current || (!stringMatch && !enabledMatch)) throw new Error(`Invalid accounts.toml line: ${line}`);
     if (stringMatch) current[stringMatch[1]] = JSON.parse(`"${stringMatch[2]}"`) as string;
@@ -179,7 +185,7 @@ function validate(value: Record<string, string>): Account {
   // `native` was the old Swift-first spelling. Preserve existing configs while
   // making the new registry default unambiguous.
   const adapter = value.adapter === "native" ? (value.vendor === "antigravity" ? "engine" : "native-ts") : value.adapter;
-  return { name: value.name, ...(value.enabled === "false" ? { enabled: false } : {}), vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}), ...(value.alias ? { alias: value.alias } : {}) } as ProviderAccount;
+  return { name: value.name, ...(value.enabled === "false" ? { enabled: false } : {}), vendor: value.vendor, location: value.location, adapter, ...(value.agy_path ? { agy_path: expandHome(value.agy_path) } : {}), ...(value.alias ? { alias: value.alias } : {}), ...(value.keychain_service ? { keychain_service: value.keychain_service } : {}), ...(value.keychain_account ? { keychain_account: value.keychain_account } : {}) } as ProviderAccount;
 }
 
 /** Changes only one entry's enabled line. This avoids a serialize/parse round
