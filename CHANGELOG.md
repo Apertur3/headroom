@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-10-31
+
 ### Added
 - A Kimi account can read a Kimi Code console API key from the macOS Keychain (`keychain_service`, optional `keychain_account` in `accounts.toml`), so the 5-hour window is metered without a login that expires.
 

@@ -9,7 +9,7 @@
       "name": "headroom",
       "source": "./",
       "description": "Check subscription limits before work, with MCP tools, a quota line and the Headroom skill.",
-      "version": "0.2.16",
+      "version": "0.2.17",
       "category": "productivity",
       "tags": [
         "quota",
