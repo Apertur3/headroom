@@ -45,8 +45,6 @@ export interface PollOptions {
    * its own warmed `agy` PTY, or a server it discovered but did not start
    * (the IDE's language server, the user's agy). */
   daemonOwnsAntigravity?: boolean;
-  /** Remote quota failures are backed off independently from the warm local probe. */
-  skipRemoteAntigravity?: boolean;
   /** Auth state sampled from the daemon-owned agy log, for actionable local failures. */
   antigravityLoginState?: AgyLoginState;
   /** Consulted before every Claude probe attempt so a principal denied or
@@ -155,26 +153,6 @@ function localReadSummary(classified: ClassifiedLocalRead, at: string): Antigrav
     lanes: Object.fromEntries(classification.lanes.map((lane) => [`${lane.meter} ${lane.minutes === 300 ? "5h" : "weekly"}`, lane.state])),
     at,
   };
-}
-
-/** Called only once remote has already failed to answer: picks the
- * daemon-owned agy summary in preference to remote's own failed/estimated
- * rows, but only once the shared lane classifier calls the local read
- * complete -- a partial warm read is worse than remote's own honest failure
- * reason. */
-export function selectAntigravitySource(local: Observation[], remote: Observation[], principal: string): Observation[] {
-  const own = local.filter((row) => row.principal_id === principal && row.source === LOCAL_ANTIGRAVITY_SOURCE);
-  return own.length && classifyLocalAntigravity(own, principal).classification.complete ? local : remote;
-}
-
-/** Explains, alongside remote's own failure reason, why the daemon-kept agy
- * couldn't rescue this read either -- so a failed Antigravity observation
- * always names both outcomes, never just the remote one. */
-export function antigravityFallbackNote(daemonOwnsAntigravity: boolean, local: Observation[], loginState: AgyLoginState | undefined): string {
-  if (!daemonOwnsAntigravity) return "agy keepalive not running";
-  if (!local.length) return "agy warm read unavailable";
-  if (loginState === "not_logged_in") return "agy not logged in";
-  return "agy quota summary not ready";
 }
 
 /** One credential-backed collection pass. The daemon supplies serialization/rate limits. */

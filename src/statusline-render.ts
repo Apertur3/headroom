@@ -23,6 +23,7 @@ import { defaultPolicy, paceDecision, reserveFor, type Policy } from "./policy.j
 import { readAccountsOrEmpty } from "./registry.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, type ResetsIn } from "./resets.js";
 import { HeadroomStore } from "./store.js";
+import { formatRatePercent, labelForMinutes } from "./status-view.js";
 import { isAccountEnabled, isLocalAccount, type Lease, type Observation, type PaceState } from "./types.js";
 import { formatStatuslineBar, statuslineMeterName, statuslineProfile, type StatuslineSnapshot } from "./adapters/claude-statusline.js";
 
@@ -74,25 +75,8 @@ function stateColor(state: PaceState): string | undefined {
   return undefined;
 }
 
-/** Mirrors cli.ts's own window labels so a segment here reads the same as the
- * same window on `headroom status`. */
-function windowLabel(minutes: number | null | undefined): string {
-  if (minutes === 300) return "5h";
-  if (minutes === 10_080) return "wk";
-  if (minutes && minutes % 1440 === 0) return `${minutes / 1440}d`;
-  if (minutes && minutes % 60 === 0) return `${minutes / 60}h`;
-  return minutes ? `${minutes}m` : "-";
-}
-
 /** Whole percent, the same rounding `headroom status` prints. */
 function percent(used: number): string { return `${Math.round(used)}%`; }
-
-/** Mirrors cli.ts's formatRatePercent: whole percent normally, one decimal
- * below 1%/h so a slow burn does not collapse to a bare "0%/h". */
-function ratePercent(value: number): string {
-  const text = value !== 0 && Math.abs(value) < 1 ? value.toFixed(1) : String(Math.round(value));
-  return `${text}%/h`;
-}
 
 /** JavaScript's own Date range in seconds, the same bound the snapshot
  * adapter applies before letting an epoch reach `new Date()`. */
@@ -147,7 +131,7 @@ function burnTail(row: Observation | undefined, style: StatuslineStyle): string 
   if (burn === null || burn === undefined) return "";
   const stall = row.empty_in_seconds;
   const stallText = stall === null || stall === undefined ? "" : `, stall in ${formatResetsIn(stall)}`;
-  return ` burn ${ratePercent(burn)}${stallText}`;
+  return ` burn ${formatRatePercent(burn)}${stallText}`;
 }
 
 function lastDroppableIndex(segments: Segment[]): number {
@@ -269,7 +253,7 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
   for (const [id, list] of others) {
     const row = decidingRow(list) ?? list[0];
     if (!row) continue;
-    if (!selected(options.meters, row.meter_id, id, windowLabel(row.window?.minutes))) continue;
+    if (!selected(options.meters, row.meter_id, id, labelForMinutes(row.window?.minutes))) continue;
     const state = paceDecision(row, policy, now).state;
     if (!enforcedPercent(row)) {
       // A local pool (or a window with no percentage at all) has a state and
@@ -278,7 +262,7 @@ export function renderStatusline(snapshot: StatuslineSnapshot | undefined, conte
       otherSegments.push({ used: -1, segment: { plain: `${id} ${state}`, colored: `${id} ${paint(state, stateColor(state), color)}`, droppable: true } });
       continue;
     }
-    const body = `${id} ${windowLabel(row.window?.minutes)} ${percent(row.quantity!.used)}${burnTail(row, style)}`;
+    const body = `${id} ${labelForMinutes(row.window?.minutes)} ${percent(row.quantity!.used)}${burnTail(row, style)}`;
     otherSegments.push({ used: row.quantity!.used, segment: segment(body, state, color, true) });
   }
   for (const item of otherSegments.sort((a, b) => b.used - a.used)) segments.push(item.segment);
@@ -318,15 +302,6 @@ export async function daemonRows(path: string, budgetMs = DAEMON_BUDGET_MS, requ
     return { observations, leases: Array.isArray(leases) ? leases as Lease[] : [] };
   })();
   return Promise.race([work, deadline]).catch(() => undefined);
-}
-
-/** Headroom's principal name for one Claude profile, from accounts.toml.
- * Undefined when the file is missing or names no account for this profile;
- * the line then simply has no session-scoped half to attribute. */
-export async function sessionPrincipal(profile: string): Promise<string | undefined> {
-  const accounts = await readAccountsOrEmpty();
-  const match = accounts.find((account) => isAccountEnabled(account) && !isLocalAccount(account) && account.vendor === "claude" && statuslineProfile(account.location) === profile);
-  return match?.name;
 }
 
 /**

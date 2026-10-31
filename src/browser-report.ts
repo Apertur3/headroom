@@ -3,6 +3,7 @@ import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { SOURCE_SERIF_WOFF2_BASE64, SPLINE_MONO_WOFF2_BASE64 } from "./browser-report-fonts.js";
 import { gatherDashboard, type DashboardModel } from "./dashboard.js";
+import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { withEffectiveFreshness } from "./pace.js";
 import { paceDecision, reserveFor } from "./policy.js";
 import { formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
@@ -10,8 +11,6 @@ import { redact, writeFileAtomic } from "./security.js";
 import { formatReset, label, planDowngradeLine } from "./status-view.js";
 import { renderResetsSection } from "./reset-history.js";
 import { type HeadroomEvent, type Observation, type PaceState } from "./types.js";
-
-export const IDLE_WINDOW_REASON = "vendor reports an idle window; reset equals fetch time plus window length, so this may be a placeholder";
 
 /** Safely escape strings for HTML text and attributes to prevent XSS. */
 export function escapeHtml(value: unknown): string {

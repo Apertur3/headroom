@@ -1528,7 +1528,6 @@ export class HeadroomDaemon {
       // "May probe a local Antigravity server": our keepalive, or one the
       // discovery found that Headroom did not start (the IDE's).
       daemonOwnsAntigravity: this.localAntigravityServerAvailable(policy),
-      skipRemoteAntigravity: warmOnly,
       antigravityLoginState: this.keepalive?.loginState ?? "unknown",
       claudeGrant: claudeGrantGate(this.store),
     }).then((rawResult) => {

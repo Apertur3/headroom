@@ -77,10 +77,6 @@ export function statuslineProfile(configDir: string, home = homedir()): string {
   return directory === resolve(home, ".claude") ? "default" : basename(directory);
 }
 
-export function statuslineSnapshotPath(dir: string, configDir: string, home = homedir()): string {
-  return join(dir, `${statuslineProfile(configDir, home)}.json`);
-}
-
 /** One vendor-reported bucket: a percent used and when it resets. `is_active`
  * is only ever present on a model-scoped bucket (see claude.ts's `scoped()`);
  * a plain five_hour/seven_day bucket never carries it. */

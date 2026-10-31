@@ -21,13 +21,11 @@ it("keeps every Antigravity window UNKNOWN when its reader is missing, even duri
   process.env.HEADROOM_HOME = root;
   vi.mocked(nativeEnginePath).mockResolvedValue(undefined);
   const network = vi.spyOn(globalThis, "fetch");
-  for (const skipRemoteAntigravity of [false, true]) {
-    const result = await pollAccounts(undefined, { daemonOwnsAntigravity: true, skipRemoteAntigravity, antigravityLoginState: "logged_in" });
-    expect(result.observations).toHaveLength(4);
-    expect(result.observations.every((row) => row.freshness === "failed" && row.quantity === null)).toBe(true);
-    expect(result.observations[0].reason).toContain(process.platform !== "darwin" ? "not available on this platform" : "native reader missing");
-    expect(result.antigravityLocal?.antigravity.outcome).toBe("failed");
-  }
+  const result = await pollAccounts(undefined, { daemonOwnsAntigravity: true, antigravityLoginState: "logged_in" });
+  expect(result.observations).toHaveLength(4);
+  expect(result.observations.every((row) => row.freshness === "failed" && row.quantity === null)).toBe(true);
+  expect(result.observations[0].reason).toContain(process.platform !== "darwin" ? "not available on this platform" : "native reader missing");
+  expect(result.antigravityLocal?.antigravity.outcome).toBe("failed");
   expect(network).not.toHaveBeenCalled();
   expect(runNativeEngine).not.toHaveBeenCalled();
 });

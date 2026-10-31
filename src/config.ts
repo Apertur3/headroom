@@ -72,12 +72,6 @@ export function parseRouting(text: string): Routing {
   return { consumes, local_preference: localPreference, costs };
 }
 
-export function parseConsumes(text: string): Record<string, string[]> { return parseRouting(text).consumes; }
-
-export async function readConsumes(): Promise<Record<string, string[]>> {
-  return (await readRouting()).consumes;
-}
-
 export async function readRouting(): Promise<Routing> {
   const path = process.env.HEADROOM_ROUTING ?? join(headroomHome(), "routing.toml");
   const text = await optionalText(path);
