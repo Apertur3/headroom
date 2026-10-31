@@ -400,8 +400,9 @@ there is no Grok reading.
 Kimi is Moonshot's subscription (the Kimi app and the Kimi Code CLI). There are two credential
 sources, and Headroom prefers the first:
 
-1. **The Kimi Code CLI's own OAuth credential**, at `~/.kimi-code/credentials/kimi-code.json` (or
-   the same path under `KIMI_CODE_HOME`). If you are signed in with the CLI, there is nothing to
+1. **The Kimi Code CLI's own OAuth credential**, at `~/.kimi-code/credentials/kimi-code.json`
+   (newer CLI versions name it `kimi-code-<suffix>.json`; the most recently written one is used), or
+   the same path under `KIMI_CODE_HOME`. If you are signed in with the CLI, there is nothing to
    copy by hand. Headroom reads the `access_token` out of that file and calls
    `GET https://api.kimi.com/coding/v1/usages` with it. To create or replace it, run `kimi login`.
 2. **A token file you write yourself**, for anyone who only has the desktop app, read against the
@@ -449,7 +450,7 @@ refuses a symlink, a file owned by someone else, a file readable by group or oth
 
 Either credential is held in memory for the length of one poll and is never logged, stored, or
 written anywhere; every failure reason is redacted before it is recorded. `location` decides which
-source is used: a file named `kimi-code.json` is read as the CLI credential, anything else as a
+source is used: a file named `kimi-code.json` or `kimi-code-<suffix>.json` is read as the CLI credential, anything else as a
 manual token file. `headroom accounts discover` adds one `kimi` principal pointing at whichever
 exists, the CLI credential first, and `headroom doctor` reports whether that file is present and
 still 0600 (its fix is `kimi login` for the CLI credential, a fresh paste for the token file).
