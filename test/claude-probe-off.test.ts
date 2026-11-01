@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CLAUDE_USAGE_MIN_INTERVAL_MS } from "../src/adapters/claude-usage.js";
 
 const probe = vi.hoisted(() => ({ observeClaude: vi.fn() }));
 vi.mock("../src/adapters/claude.js", async (original) => ({ ...await original<typeof import("../src/adapters/claude.js")>(), observeClaude: probe.observeClaude }));
@@ -19,14 +20,16 @@ async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none")
   await writeFile(join(home, "policy.toml"), `claude_probe = ${claudeProbe}\nstatusline_snapshot_dirs = [${JSON.stringify(state)}]\n`, { mode: 0o600 });
   // The collector-shaped file the owner's fleet writes: alias "main", epoch observed_at, used_pct.
   if (snapshot !== "none") await writeFile(join(state, "main.json"), JSON.stringify({
-    alias: "main", observed_at: Math.floor(Date.now() / 1000) - (snapshot === "fresh" ? 5 : 3600),
-    five_hour: { used_pct: 4, resets_at: Math.floor(Date.now() / 1000) + 3600 }, seven_day: { used_pct: 60, resets_at: Math.floor(Date.now() / 1000) + 86_400 }, source: "statusline",
+    alias: "main", observed_at: Math.floor(t0.getTime() / 1000) - (snapshot === "fresh" ? 5 : 3600),
+    five_hour: { used_pct: 4, resets_at: Math.floor(t0.getTime() / 1000) + 3600 }, seven_day: { used_pct: 60, resets_at: Math.floor(t0.getTime() / 1000) + 86_400 }, source: "statusline",
   }), { mode: 0o600 });
   return home;
 }
 
 const stream = () => readFile(new URL("./fixtures/claude/usage-stream.synthetic.jsonl", import.meta.url), "utf8");
-const t0 = new Date();
+// The /usage throttle counts in fixed 10-minute buckets of the clock, so the
+// test starts at the beginning of one: a poll a minute later then stays in it.
+const t0 = new Date(Math.floor(Date.now() / CLAUDE_USAGE_MIN_INTERVAL_MS) * CLAUDE_USAGE_MIN_INTERVAL_MS + 1000);
 
 async function poll(home: string, run?: () => Promise<string>, now: () => Date = () => t0) {
   const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
