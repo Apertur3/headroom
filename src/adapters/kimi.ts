@@ -319,6 +319,14 @@ function slug(value: string): string | undefined {
   return cleaned || undefined;
 }
 
+/** Minutes in the calendar month that ends at `reset` (30 days without one). */
+function monthMinutesEndingAt(reset: string | null): number {
+  if (!reset) return 30 * 24 * 60;
+  const end = new Date(reset), start = new Date(reset);
+  start.setUTCMonth(start.getUTCMonth() - 1);
+  return Math.round((end.getTime() - start.getTime()) / 60_000);
+}
+
 /**
  * Maps one `api.kimi.com/coding/v1/usages` body (the Kimi Code CLI credential's
  * own endpoint) onto the same meters the gateway path emits:
@@ -361,14 +369,17 @@ export function observationsFromKimiCodeUsage(body: unknown, account: ProviderAc
   // Ratio pools: the 5-hour window and the monthly pool that blocks (the
   // `limit_month_code` share of it is skipped). A 5-hour window the `limits`
   // list already described is one window: the more-used reading wins.
+  // The monthly pool's window is the calendar month that ends at its reset;
+  // a window needs a length for pacing and admission.
   const pools = object(body.usages) ? body.usages : {};
-  for (const [key, minutes] of [["limit_5h", 300], ["limit_month_total", null]] as const) {
+  for (const key of ["limit_5h", "limit_month_total"] as const) {
     const pool = pools[key];
     const ratio = object(pool) ? number(pool.used_ratio) : undefined;
     if (ratio === undefined || ratio < 0) continue;
     const reset = resetOf(pool);
+    const minutes = key === "limit_5h" ? 300 : monthMinutesEndingAt(reset);
     const row = tagged({ ...base(account, "main", now), window: { kind: reset ? "fixed" : "rolling", minutes, enforcement: "hard" }, quantity: percentQuantity(ratio * 100), resets_at: reset, freshness: "fresh" });
-    const same = minutes === null ? -1 : output.findIndex((item) => item.meter_id === row.meter_id && item.window?.minutes === minutes && item.freshness === "fresh");
+    const same = key !== "limit_5h" ? -1 : output.findIndex((item) => item.meter_id === row.meter_id && item.window?.minutes === minutes && item.freshness === "fresh");
     if (same < 0) output.push(row);
     else if ((row.quantity?.used ?? 0) > (output[same].quantity?.used ?? 0)) output[same] = row;
   }

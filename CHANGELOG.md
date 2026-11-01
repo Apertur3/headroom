@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-11-02
+
+### Fixed
+- The Kimi monthly usage pool now has the length of its calendar month, so it is paced and gated like any other window instead of reading as UNKNOWN and making the whole Kimi account UNKNOWN.
+
 ## [0.2.17] - 2026-10-31
 
 ### Added

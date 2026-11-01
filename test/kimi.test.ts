@@ -11,6 +11,7 @@ import {
 } from "../src/adapters/kimi.js";
 import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
 import { allowedOutbound } from "../src/security.js";
+import { defaultPolicy, paceState } from "../src/policy.js";
 import { discoverAccounts } from "../src/registry.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
 
@@ -473,9 +474,11 @@ describe("Kimi Keychain API key and the usages ratio shape", () => {
 
   it("maps the recorded response to one 5-hour window and the monthly pool", () => {
     const rows = observationsFromKimiCodeUsage(recorded, kimi, at);
-    expect(rows.map((row) => [row.meter_id, row.window?.minutes, row.quantity?.used])).toEqual([["kimi:main", 300, 4.18], ["kimi:main", null, 0.23]]);
+    expect(rows.map((row) => [row.meter_id, row.window?.minutes, row.quantity?.used])).toEqual([["kimi:main", 300, 4.18], ["kimi:main", 30 * 24 * 60, 0.23]]);
     expect(rows[0]).toMatchObject({ resets_at: "2026-10-31T14:41:03.000Z", window: expect.objectContaining({ kind: "fixed" }) });
     expect(rows[1].resets_at).toBe("2026-12-01T00:00:00.000Z");
+    // Both windows have a length, so neither reads as UNKNOWN.
+    expect(rows.map((row) => paceState(row, defaultPolicy, at))).not.toContain("UNKNOWN");
   });
 
   it("reads the key from the Keychain per poll, sends it to api.kimi.com only, and never leaks it", async () => {
