@@ -97,9 +97,14 @@ export function observationsFromCodexUsage(usage: unknown, credits: unknown, acc
   const metadata = { ...(plan ? { plan } : {}), ...(object(credits) && number(credits.available_count) !== undefined ? { free_resets_available: number(credits.available_count)! } : {}) };
   const tagged = (observation: Observation): Observation => ({ ...observation, metadata: { ...observation.metadata, ...metadata } });
   const output: Observation[] = [];
-  const primary = rate(account, "main", rateLimit.primary_window ?? rateLimit.primary, 300, now, SOURCE, "fresh", true);
+  // Windows are told apart by their length, not their slot: once the 5-hour
+  // window is gone the vendor sends the weekly one as `primary_window` with a
+  // null `secondary_window` (seen 2 Nov 2026).
+  const windows = [rate(account, "main", rateLimit.primary_window ?? rateLimit.primary, 300, now, SOURCE, "fresh", true),
+    rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now, SOURCE, "fresh", true)];
+  const primary = windows.find((item) => item && item.window!.minutes! <= 300);
+  const weekly = windows.find((item) => item && item.window!.minutes! > 300);
   output.push(primary ? tagged(primary) : tagged({ ...base(account, "main", now), window: { kind: "rolling", minutes: 300, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "not_enforced", reason: "no 5-hour window from endpoint or session logs" }));
-  const weekly = rate(account, "main", rateLimit.secondary_window ?? rateLimit.secondary, 10_080, now, SOURCE, "fresh", true);
   output.push(tagged(weekly ?? { ...base(account, "main", now), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, quantity: null, resets_at: null, freshness: "failed", truth: "estimated", confidence: 0, reason: "vendor returned no weekly window" }));
   // Spark rows are emitted on every successful reply. This is the only call
   // that reads Spark, so a reply with no `additional_rate_limits` at all (the

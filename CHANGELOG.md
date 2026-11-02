@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-11-02
+
+### Added
+- A principal at 99% or more of a window while a free or banked reset is available gets an alert, repeated every two hours with the time it has been blocked, until the reading drops or no reset is left. Quiet hours pause it.
+
+### Fixed
+- Codex windows are told apart by their length, not their position: a weekly window the vendor sends as the primary window (with no secondary window) is read as the weekly allowance again.
+- A window whose newest poll failed now shows as UNKNOWN with its reason instead of disappearing from status.
+
 ## [0.2.18] - 2026-11-02
 
 ### Fixed

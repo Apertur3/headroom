@@ -1663,7 +1663,7 @@ export class HeadroomStore {
    * DESC either way.
    */
   /** Whether this meter has ever reported a window at least `minutes` long.
-   * latestPerWindow() drops a window whose newest poll failed, so a caller
+   * latestPerWindow() has no row for a window a newer windowless failure replaced, so a caller
    * that must fail closed on a missing window uses this to tell "failed
    * right now" apart from "this meter has no such window". */
   hasReportedWindow(meterId: string, minutes: number): boolean {
@@ -1685,12 +1685,12 @@ export class HeadroomStore {
         -- A cleared/expired manual fact does not hide a newer failed poll:
         -- rank it beside that failure so the newer row can explain the live
         -- state rather than leaving this meter blank after filtering.
-        -- A blocked_by_weekly lane is a failed row that is still a vendor
-        -- answer (see blockedLaneReason): it ranks with fresh, so an older
-        -- fresh row for the same window cannot outrank it and then be hidden
-        -- by it below, which left the window missing from status. A newer row of
-        -- any freshness outranks it, so a later ordinary failure is not hidden.
-        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(metadata_json, '$.lane_state') = 'blocked_by_weekly'
+        -- A window's newest failed row ranks with fresh, so an older fresh
+        -- row for the same window cannot outrank it and then be hidden by it
+        -- below, which left the window missing from status: a failed weekly
+        -- must read as UNKNOWN, never vanish. A newer row of any freshness
+        -- outranks it again. A windowless failure (it shares its partition with count meters) keeps the lower rank.
+        ORDER BY (CASE WHEN (freshness = 'fresh' OR freshness = 'not_enforced' OR (freshness = 'failed' AND json_extract(window_json, '$.minutes') IS NOT NULL
                            -- ...but only while no newer row of any freshness exists for the window.
                            AND NOT EXISTS (
                              SELECT 1 FROM observations AS newer_any

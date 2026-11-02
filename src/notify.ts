@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { markHumanAlertSent, pendingHumanAlerts, runLaneCanary, type HumanStaleAlert } from "./canary.js";
 import { readPolicy } from "./config.js";
 import { appendDaemonLog } from "./logs.js";
+import { blockedWithResetItems } from "./notify-blocked.js";
 import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
@@ -20,8 +21,7 @@ const TIMEOUT_MS = 5_000;
 const RESPONSE_CAP_BYTES = 8 * 1024;
 /** Attempts per event per channel before the ledger row stops being retried. */
 export const MAX_ATTEMPTS = 3;
-const TELEGRAM_ORIGIN = "https://api.telegram.org";
-const DEFAULT_NTFY_SERVER = "https://ntfy.sh";
+const TELEGRAM_ORIGIN = "https://api.telegram.org", DEFAULT_NTFY_SERVER = "https://ntfy.sh";
 
 export type ChannelName = "telegram" | "ntfy" | "webhook";
 const CHANNEL_NAMES: readonly ChannelName[] = ["telegram", "ntfy", "webhook"];
@@ -1043,7 +1043,7 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
     markHumanAlertSent(store, alert, now);
   }
   const queued = store.enqueueNotificationEvents((events) => {
-    const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now)];
+    const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now), ...(inQuietHours(config, now) ? [] : blockedWithResetItems(store, now))];
     // Source-health hysteresis runs every pass, not just when this poll
     // discovered something new: a held source_failed is promoted (or a stuck
     // marker retired) purely by elapsed polls/time, independent of discovery.
