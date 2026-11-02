@@ -810,7 +810,7 @@ export class HeadroomStore {
       // answered for (failed, blocked, loading) is present, only a lane the
       // poll never mentioned may be retired.
       const explicit = new Map<string, Set<number>>();
-      for (const row of stored) if (row.window?.minutes) explicit.set(row.meter_id, (explicit.get(row.meter_id) ?? new Set<number>()).add(row.window.minutes));
+      for (const row of stored) if (row.window) explicit.set(row.meter_id, (explicit.get(row.meter_id) ?? new Set<number>()).add(row.window.minutes ?? 0));
       for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
       for (const [meter, rows] of byMeter) {
         // An incomplete vendor picture must not retire a sibling window while
@@ -818,8 +818,8 @@ export class HeadroomStore {
         if (rows.some((row) => this.vendorWindowSuspect(row))) continue;
         const present = explicit.get(meter)!;
         for (const old of this.latestPerWindow(meter)) {
-          const minutes = old.window?.minutes;
-          if (!minutes || present.has(minutes) || old.metadata?.retired) continue;
+          // A window without a length (an older parser's reading) is retired too.
+          if (!old.window || present.has(old.window.minutes ?? 0) || old.metadata?.retired) continue;
           const at = rows.reduce((latest, row) => Date.parse(row.fetched_at) > Date.parse(latest.fetched_at) ? row : latest);
           const { id: _id, ...oldObservation } = old;
           const retired = this.insert({ ...oldObservation, observed_at: at.observed_at, fetched_at: at.fetched_at, freshness: "stale", confidence: 1, reason: "vendor no longer reports this window", metadata: { ...old.metadata, retired: true } });

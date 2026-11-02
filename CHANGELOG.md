@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-11-02
+
+### Fixed
+- A reading stored without a window length (the Kimi monthly pool before 0.2.18) is retired once a newer poll no longer reports it, instead of staying current and keeping the account UNKNOWN.
+
 ## [0.2.19] - 2026-11-02
 
 ### Added
