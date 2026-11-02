@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A principal at 99% or more of a window while a free or banked reset is available gets an alert, repeated every two hours with the time it has been blocked, until the reading drops or no reset is left. It is held during quiet hours.
+
 ## [0.2.18] - 2026-11-02
 
 ### Fixed
