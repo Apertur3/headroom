@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Codex windows are told apart by their length, not their position: a weekly window the vendor sends as the primary window (with no secondary window) is read as the weekly allowance again.
+- A window whose newest poll failed now shows as UNKNOWN with its reason instead of disappearing from status.
+
 ## [0.2.18] - 2026-11-02
 
 ### Fixed
