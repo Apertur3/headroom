@@ -266,6 +266,26 @@ describe("native TypeScript adapter conformance (synthetic until recorder captur
     expect(rows).toContainEqual(expect.objectContaining({ meter_id: "codex-main:main", window: { kind: "fixed", minutes: 10_080, enforcement: "hard" }, freshness: "failed", reason: "vendor returned no weekly window" }));
   });
 
+  it("reads a weekly window sent as primary_window once the 5-hour window is gone", () => {
+    const rows = observationsFromCodexUsage({ rate_limit: { primary_window: { used_percent: 100, limit_window_seconds: 604_800, reset_at: 1_788_802_800 }, secondary_window: null } }, {}, codex, at)
+      .filter((row) => row.meter_id === "codex-main:main");
+    expect(rows).toHaveLength(2);
+    expect(rows).toContainEqual(expect.objectContaining({ window: expect.objectContaining({ minutes: 10_080 }), freshness: "fresh", quantity: expect.objectContaining({ used: 100 }) }));
+    expect(rows).toContainEqual(expect.objectContaining({ window: expect.objectContaining({ minutes: 300 }), freshness: "not_enforced" }));
+  });
+
+  it("shows a weekly window whose newest poll failed as a failed row instead of dropping it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-codex-weekly-"));
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const five = { used_percent: 12, limit_window_seconds: 18_000, reset_at: 1_788_802_800 };
+      store.insertPoll(observationsFromCodexUsage({ rate_limit: { primary_window: five, secondary_window: { used_percent: 90, limit_window_seconds: 604_800, reset_at: 1_788_968_897 } } }, {}, codex, new Date(at.getTime() - 600_000)));
+      store.insertPoll(observationsFromCodexUsage({ rate_limit: { primary_window: five } }, {}, codex, at));
+      const weekly = store.latestPerWindow("codex-main:main").filter((row) => row.window?.minutes === 10_080);
+      expect(weekly).toEqual([expect.objectContaining({ freshness: "failed", reason: "vendor returned no weekly window" })]);
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("maps the recorded primary and secondary response shape after the upstream field rename", async () => {
     const usage = JSON.parse(await readFile(new URL("../fixtures/http/codex/usage.real.redacted.json", import.meta.url), "utf8"));
     const rows = observationsFromCodexUsage(usage, {}, codex, at);
