@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-11-03
+
 ### Changed
 
 - The agent quota line now says `10% used` instead of a bare `10%`, so an agent cannot read it as 10% left.
