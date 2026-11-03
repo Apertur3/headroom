@@ -109,7 +109,7 @@ describe("a visibility-only meter (soft + unconfirmed)", () => {
     expect(plain).not.toMatch(/HARVEST|NORMAL|CONSERVE|FREEZE/);
     expect(renderStatus({ observations: rows, policy: defaultPolicy, now: NOW }, { form: "grouped", color: false } as never).join("\n")).toContain("(unconfirmed)");
     const line = buildAgentLine(rows, defaultPolicy, ["claude-main"], NOW);
-    expect(line.line).toContain("claude-main:fable wk 41% (unconfirmed)");
+    expect(line.line).toContain("claude-main:fable wk 41% used (unconfirmed)");
     expect(line.accounts.every((account) => account.meter !== "claude-main:fable")).toBe(true);
   });
 

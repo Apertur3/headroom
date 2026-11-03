@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-11-03
+
+### Changed
+
+- The agent quota line now says `10% used` instead of a bare `10%`, so an agent cannot read it as 10% left.
+- One agent read `wk 10%` as nearly empty and started rationing. It was 90% full. The line now spells it out, the way a fuel gauge should.
+
 ## [0.2.20] - 2026-11-02
 
 ### Fixed
