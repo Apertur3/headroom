@@ -13,6 +13,7 @@ import { PROTECTED_STATUS_PATTERN } from "../src/collector.js";
 import { allowedOutbound } from "../src/security.js";
 import { defaultPolicy, paceState } from "../src/policy.js";
 import { discoverAccounts } from "../src/registry.js";
+import { HeadroomStore } from "../src/store.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
 
 const posix = process.platform !== "win32";
@@ -509,5 +510,16 @@ describe("Kimi Keychain API key and the usages ratio shape", () => {
     const body = { limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", used: "50" } }], usages: { limit_5h: { used_ratio: 0.1, reset_time: "2026-10-31T14:41:03Z" } } };
     const rows = observationsFromKimiCodeUsage(body, kimi, at);
     expect(rows.map((row) => row.quantity?.used)).toEqual([50]);
+  });
+  it("retires a monthly reading an older version stored without a window length", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-kimi-retire-"));
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const body = { usages: { limit_5h: { used_ratio: 0.1, reset_time: "2026-09-06T14:41:03Z" }, limit_month_total: { used_ratio: 0.23, reset_time: "2026-10-01T00:00:00Z" } } };
+      const earlier = new Date(at.getTime() - 600_000);
+      store.insertPoll(observationsFromKimiCodeUsage(body, kimi, earlier).map((row) => row.window?.minutes === 300 ? row : { ...row, window: { ...row.window!, minutes: null } }));
+      store.insertPoll(observationsFromKimiCodeUsage(body, kimi, at));
+      expect(store.latestPerWindow("kimi:main").map((row) => row.window?.minutes).sort()).toEqual([300, 30 * 24 * 60].sort());
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
   });
 });
