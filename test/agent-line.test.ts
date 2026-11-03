@@ -57,7 +57,7 @@ describe("buildAgentLine", () => {
     const severity = { HARVEST: 1, NORMAL: 2, CONSERVE: 3, FREEZE: 4 } as Record<string, number>;
     expect(claude.window).toBe(severity[weekState] > severity[fiveState] || (severity[weekState] === severity[fiveState] && 4 > 6) ? "wk" : "5h");
     expect(line.line).toMatch(/^\[Headroom\] /);
-    expect(line.line).toContain(`codex-main wk 17% (+4%/h) ${paceDecision(codexWeek, defaultPolicy, NOW).state}, resets in 6d 15h, 1 free reset (expires Oct 29)`);
+    expect(line.line).toContain(`codex-main wk 17% used (+4%/h) ${paceDecision(codexWeek, defaultPolicy, NOW).state}, resets in 6d 15h, 1 free reset (expires Oct 29)`);
     expect(line.line.length).toBeLessThanOrEqual(220);
     expect(line.observed_at).toBe(NOW.toISOString());
     expect(line.accounts.find((item) => item.name === "codex-main")?.free_resets).toEqual({ available: 1, expires_at: "2026-10-29T00:00:00.000Z" });
@@ -93,7 +93,7 @@ describe("buildAgentLine", () => {
     for (const other of [staleClaude, heldClaude]) {
       const line = buildAgentLine([other, gemini], defaultPolicy, ["antigravity"], NOW);
       expect(line.accounts.map((item) => item.name)).toEqual(["antigravity:gemini"]);
-      expect(line.line).toContain("antigravity:gemini wk 15%");
+      expect(line.line).toContain("antigravity:gemini wk 15% used");
       expect(line.line).not.toContain("UNKNOWN");
     }
     const both = buildAgentLine([reading("antigravity", "claude-gpt", 10_080, 30), gemini], defaultPolicy, ["antigravity"], NOW);
@@ -207,7 +207,7 @@ describe("daemon writes the line after a poll", () => {
       if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous;
     }
     const text = await readFile(join(home, "line.txt"), "utf8");
-    expect(text).toMatch(/^\[Headroom\] claude-main wk 23% [A-Z]+, resets in 3d\n$/);
+    expect(text).toMatch(/^\[Headroom\] claude-main wk 23% used [A-Z]+, resets in 3d\n$/);
     expect(text).not.toContain("claude-off");
     const json = JSON.parse(await readFile(join(home, "line.json"), "utf8"));
     expect(json).toMatchObject({ schema: 1, line: text.trim(), accounts: [{ name: "claude-main", window: "wk", used_percent: 23 }] });
@@ -227,22 +227,22 @@ async function captured(run: () => Promise<number>): Promise<{ code: number; out
 describe("headroom line", () => {
   it("prints a fresh line as is", async () => {
     const home = await tempDir("headroom-line-cli-");
-    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% NORMAL\n");
+    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% used NORMAL\n");
     const result = await captured(() => lineCommand([], home));
-    expect(result).toMatchObject({ code: 0, out: ["[Headroom] claude-main wk 4% NORMAL"] });
+    expect(result).toMatchObject({ code: 0, out: ["[Headroom] claude-main wk 4% used NORMAL"] });
   });
 
   it("marks an old line STALE with its age, by default past two poll intervals", async () => {
     const home = await tempDir("headroom-line-cli-");
-    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% NORMAL\n");
+    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% used NORMAL\n");
     const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000 - 5_000);
     await utimes(join(home, "line.txt"), twoHoursAgo, twoHoursAgo);
-    expect((await captured(() => lineCommand([], home))).out).toEqual(["STALE (2h ago) [Headroom] claude-main wk 4% NORMAL"]);
+    expect((await captured(() => lineCommand([], home))).out).toEqual(["STALE (2h ago) [Headroom] claude-main wk 4% used NORMAL"]);
     // Six minutes: fresh under the 10-minute default, stale under --max-age 300.
     const sixMinutesAgo = new Date(Date.now() - 6 * 60_000);
     await utimes(join(home, "line.txt"), sixMinutesAgo, sixMinutesAgo);
-    expect((await captured(() => lineCommand([], home))).out).toEqual(["[Headroom] claude-main wk 4% NORMAL"]);
-    expect((await captured(() => lineCommand(["--max-age", "300"], home))).out).toEqual(["STALE (6m ago) [Headroom] claude-main wk 4% NORMAL"]);
+    expect((await captured(() => lineCommand([], home))).out).toEqual(["[Headroom] claude-main wk 4% used NORMAL"]);
+    expect((await captured(() => lineCommand(["--max-age", "300"], home))).out).toEqual(["STALE (6m ago) [Headroom] claude-main wk 4% used NORMAL"]);
   });
 
   it("says there is no fresh reading when the file is missing, and still exits 0", async () => {
@@ -282,11 +282,11 @@ describe.skipIf(process.platform === "win32")("hook script", () => {
 
   it("prints the line with its age from the file mtime", async () => {
     const home = await tempDir("headroom-hook-script-");
-    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% (+0.5%/h) NORMAL, resets in 6d 15h\n");
+    await writeFile(join(home, "line.txt"), "[Headroom] claude-main wk 4% used (+0.5%/h) NORMAL, resets in 6d 15h\n");
     const old = new Date(Date.now() - 125_000);
     await utimes(join(home, "line.txt"), old, old);
     const { stdout } = await runScript(home);
-    const match = /^\[Headroom\] claude-main wk 4% \(\+0\.5%\/h\) NORMAL, resets in 6d 15h \(as of (\d+)s ago\)\n$/.exec(stdout);
+    const match = /^\[Headroom\] claude-main wk 4% used \(\+0\.5%\/h\) NORMAL, resets in 6d 15h \(as of (\d+)s ago\)\n$/.exec(stdout);
     expect(match).not.toBeNull();
     expect(Number(match![1])).toBeGreaterThanOrEqual(125);
     expect(Number(match![1])).toBeLessThan(140);

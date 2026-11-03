@@ -144,14 +144,14 @@ function expiryDay(value: string | null): string | undefined {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(date);
 }
 
-/** "claude-main:fable wk 41% (unconfirmed)": a fresh reading with no pace state,
+/** "claude-main:fable wk 41% used (unconfirmed)": a fresh reading with no pace state,
  * never ranked. Stale or failed readings are left out. */
 function unconfirmedSegments(rows: Observation[]): { name: string; text: string }[] {
   return rows
     .filter((item) => isVisibilityOnly(item) && item.freshness === "fresh" && item.quantity?.unit === "percent")
     .map((item) => {
       const name = sanitizeName(item.meter_id);
-      return { name, text: `${name} ${labelForMinutes(item.window?.minutes)} ${Math.round(item.quantity!.used)}% (unconfirmed)` };
+      return { name, text: `${name} ${labelForMinutes(item.window?.minutes)} ${Math.round(item.quantity!.used)}% used (unconfirmed)` };
     })
     .sort((a, b) => a.text.localeCompare(b.text));
 }
@@ -164,7 +164,7 @@ function segment(account: AgentLineAccount): string {
   const free = account.free_resets;
   const expiry = free ? expiryDay(free.expires_at) : undefined;
   const freeText = free ? `, ${free.available} free reset${free.available === 1 ? "" : "s"}${expiry ? ` (expires ${expiry})` : ""}` : "";
-  return `${account.name} ${account.window} ${Math.round(account.used_percent ?? 0)}%${burnText} ${account.state}${resetText}${freeText}`;
+  return `${account.name} ${account.window} ${Math.round(account.used_percent ?? 0)}% used${burnText} ${account.state}${resetText}${freeText}`;
 }
 
 /** Joins the account segments, most constrained first, dropping from the end
