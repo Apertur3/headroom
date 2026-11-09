@@ -3,7 +3,7 @@ message: "If you use this software, please cite it as below."
 title: "Headroom"
 abstract: "Headroom is a local daemon, CLI and MCP server that reads AI subscription quota meters and tells coding agents whether to go, wait or reroute before they start work."
 version: 0.2.21
-date-released: 2026-11-03
+date-released: 2026-11-09
 license: MIT
 repository-code: "https://github.com/Apertur3/headroom"
 authors:

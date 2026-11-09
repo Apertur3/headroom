@@ -189,7 +189,7 @@ function rank(account: AgentLineAccount): number {
  * shape). `principals` names every enabled, non-local account so one that has
  * never been read still shows up as UNKNOWN instead of vanishing.
  */
-export function buildAgentLine(observations: Observation[], policy: Policy, principals: string[], now = new Date()): AgentLine {
+export function buildAgentLine(observations: Observation[], policy: Policy, principals: string[], now = new Date(), marks: string[] = []): AgentLine {
   const byPrincipal = new Map<string, Observation[]>();
   for (const name of principals) byPrincipal.set(name, []);
   for (const item of observations) {
@@ -204,7 +204,7 @@ export function buildAgentLine(observations: Observation[], policy: Policy, prin
   }
   const unconfirmed = [...byPrincipal.values()].flatMap((rows) => unconfirmedSegments(rows));
   accounts.sort((a, b) => rank(b) - rank(a) || (b.used_percent ?? 0) - (a.used_percent ?? 0) || a.name.localeCompare(b.name));
-  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts, unconfirmed.map((item) => item.text)), accounts, ...(unconfirmed.length ? { unconfirmed } : {}) };
+  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts, [...marks, ...unconfirmed.map((item) => item.text)]), accounts, ...(unconfirmed.length ? { unconfirmed } : {}) };
 }
 
 /** temp file in the same directory, fsync, rename: a reader sees the old line

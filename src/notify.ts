@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { markHumanAlertSent, pendingHumanAlerts, runLaneCanary, type HumanStaleAlert } from "./canary.js";
 import { readPolicy } from "./config.js";
 import { appendDaemonLog } from "./logs.js";
-import { blockedWithResetItems } from "./notify-blocked.js";
+import { blockedWithResetItems } from "./notify-blocked.js"; import { experimentItems } from "./experiment-watch.js";
 import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
 import { outboundFetch, redact } from "./security.js";
@@ -1043,7 +1043,7 @@ async function runDelivery(store: HeadroomStore, options: NotifyOptions): Promis
     markHumanAlertSent(store, alert, now);
   }
   const queued = store.enqueueNotificationEvents((events) => {
-    const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now), ...(inQuietHours(config, now) ? [] : blockedWithResetItems(store, now))];
+    const items = events === undefined ? [] : [...collectItems(store, config, events), ...downgradeReminderItems(store, now), ...(inQuietHours(config, now) ? [] : [...blockedWithResetItems(store, now), ...experimentItems(store, now)])];
     // Source-health hysteresis runs every pass, not just when this poll
     // discovered something new: a held source_failed is promoted (or a stuck
     // marker retired) purely by elapsed polls/time, independent of discovery.
