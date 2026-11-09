@@ -138,7 +138,7 @@ inactive: Headroom emits it as a real, fresh window (enforcement `soft` rather t
 `metadata.vendor_active: false`, `metadata.unconfirmed: true`, reason "separate weekly limit,
 unconfirmed: shown for visibility only"). Whether this pool really sits outside the account-wide
 weekly is not confirmed, so it is visibility only: `status` and `line` show it as
-`claude-main:fable wk 41% (unconfirmed)` with no pace state. A targeted `can`, `gate`, `route` or
+`claude-main:fable wk 41% used (unconfirmed)` with no pace state. A targeted `can`, `gate`, `route` or
 `run` on it is refused (UNKNOWN, never dispatchable, `--allow-unknown` included) with "claude-main:fable
 is visibility-only (unconfirmed); check claude-main:all instead"; global scans and `plan` skip it.
 Promoting it to a hard window is a one-line change in `scoped()` once confirmed.

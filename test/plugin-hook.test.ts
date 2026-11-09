@@ -37,15 +37,15 @@ async function sandbox(): Promise<{ user: string; home: string; config: string; 
 describe.skipIf(process.platform === "win32")("plugin quota line", () => {
   it("prints only the first cached line once, with its age", async () => {
     const { home, run } = await sandbox();
-    await writeFile(join(home, "line.txt"), "Claude 5h 20% NORMAL\nignored second line\n");
-    expect(run()).toMatch(/^Claude 5h 20% NORMAL \(as of \d+s ago\)\n$/);
+    await writeFile(join(home, "line.txt"), "Claude 5h 20% used NORMAL\nignored second line\n");
+    expect(run()).toMatch(/^Claude 5h 20% used NORMAL \(as of \d+s ago\)\n$/);
   });
 
   it.each(["config", ".claude"])("defers to an installed hook in %s", async (dir) => {
     const { user, home, run } = await sandbox();
     await mkdir(join(user, dir), { recursive: true });
     await writeFile(join(user, dir, "settings.json"), JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "sh hooks/claude-line.sh" }] }] } }));
-    await writeFile(join(home, "line.txt"), "Claude 5h 20% NORMAL\n");
+    await writeFile(join(home, "line.txt"), "Claude 5h 20% used NORMAL\n");
     expect(run()).toBe("");
   });
 

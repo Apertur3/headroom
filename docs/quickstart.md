@@ -281,7 +281,7 @@ This is separate from `freeze_reserve_pct`, which changes a window to FREEZE nea
 
 Every window's countdown (`resets_in_seconds`/`resets_in` in `--json`, the daemon status, and the
 MCP `quota_status` result) is computed fresh at response time, not stored. `headroom can` reasons
-carry the same information, more tersely: `wk 61% CONSERVE, resets in 26h`.
+carry the same information, more tersely: `wk 61% used CONSERVE, resets in 26h`.
 For an overdue schedule, those two compatibility fields remain `0` and `"0m"`;
 agents check the additive `reset_overdue: true` and `reset_overdue_seconds`
 instead, while human output says `overdue <age>`.
@@ -432,7 +432,7 @@ headroom hook uninstall --agent claude # remove it again
 ```
 
 ```text
-[Headroom] codex-main wk 18% (+4%/h) CONSERVE, resets in 5d 11h, 1 free reset (expires Oct 29) · claude-main wk 5% (+0.4%/h) NORMAL, resets in 6d 15h (as of 42s ago)
+[Headroom] codex-main wk 18% used (+4%/h) CONSERVE, resets in 5d 11h, 1 free reset (expires Oct 29) · claude-main wk 5% used (+0.4%/h) NORMAL, resets in 6d 15h (as of 42s ago)
 ```
 
 The hook is a small shell script in `~/.headroom/hooks/` that reads that file and appends its age: no

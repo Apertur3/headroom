@@ -144,14 +144,14 @@ function expiryDay(value: string | null): string | undefined {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" }).format(date);
 }
 
-/** "claude-main:fable wk 41% (unconfirmed)": a fresh reading with no pace state,
+/** "claude-main:fable wk 41% used (unconfirmed)": a fresh reading with no pace state,
  * never ranked. Stale or failed readings are left out. */
 function unconfirmedSegments(rows: Observation[]): { name: string; text: string }[] {
   return rows
     .filter((item) => isVisibilityOnly(item) && item.freshness === "fresh" && item.quantity?.unit === "percent")
     .map((item) => {
       const name = sanitizeName(item.meter_id);
-      return { name, text: `${name} ${labelForMinutes(item.window?.minutes)} ${Math.round(item.quantity!.used)}% (unconfirmed)` };
+      return { name, text: `${name} ${labelForMinutes(item.window?.minutes)} ${Math.round(item.quantity!.used)}% used (unconfirmed)` };
     })
     .sort((a, b) => a.text.localeCompare(b.text));
 }
@@ -164,7 +164,7 @@ function segment(account: AgentLineAccount): string {
   const free = account.free_resets;
   const expiry = free ? expiryDay(free.expires_at) : undefined;
   const freeText = free ? `, ${free.available} free reset${free.available === 1 ? "" : "s"}${expiry ? ` (expires ${expiry})` : ""}` : "";
-  return `${account.name} ${account.window} ${Math.round(account.used_percent ?? 0)}%${burnText} ${account.state}${resetText}${freeText}`;
+  return `${account.name} ${account.window} ${Math.round(account.used_percent ?? 0)}% used${burnText} ${account.state}${resetText}${freeText}`;
 }
 
 /** Joins the account segments, most constrained first, dropping from the end
@@ -189,7 +189,7 @@ function rank(account: AgentLineAccount): number {
  * shape). `principals` names every enabled, non-local account so one that has
  * never been read still shows up as UNKNOWN instead of vanishing.
  */
-export function buildAgentLine(observations: Observation[], policy: Policy, principals: string[], now = new Date()): AgentLine {
+export function buildAgentLine(observations: Observation[], policy: Policy, principals: string[], now = new Date(), marks: string[] = []): AgentLine {
   const byPrincipal = new Map<string, Observation[]>();
   for (const name of principals) byPrincipal.set(name, []);
   for (const item of observations) {
@@ -204,7 +204,7 @@ export function buildAgentLine(observations: Observation[], policy: Policy, prin
   }
   const unconfirmed = [...byPrincipal.values()].flatMap((rows) => unconfirmedSegments(rows));
   accounts.sort((a, b) => rank(b) - rank(a) || (b.used_percent ?? 0) - (a.used_percent ?? 0) || a.name.localeCompare(b.name));
-  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts, unconfirmed.map((item) => item.text)), accounts, ...(unconfirmed.length ? { unconfirmed } : {}) };
+  return { schema: LINE_SCHEMA, observed_at: now.toISOString(), line: joinLine(accounts, [...marks, ...unconfirmed.map((item) => item.text)]), accounts, ...(unconfirmed.length ? { unconfirmed } : {}) };
 }
 
 /** temp file in the same directory, fsync, rename: a reader sees the old line

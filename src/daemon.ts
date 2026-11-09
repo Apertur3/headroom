@@ -17,7 +17,7 @@ import { canonicalizeHomeForPipe, executablePath, headroomHome, joinForPlatform 
 import { canRouteWithLeases, unknownMeterPrincipals, type CanDecision, type Policy } from "./policy.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
 import { withPaceInfo, withStatusInfo } from "./pace.js";
-import { buildAgentLine, writeAgentLine } from "./agent-line.js";
+import { buildAgentLine, writeAgentLine } from "./agent-line.js"; import { experimentMarks } from "./experiment-watch.js";
 import { admitCanCost, fillFor, gateFor, planFor, rateLines, type GateOutcome, type RateLine } from "./orchestrator-reads.js";
 import { windowNeedMinutes, type GateNeed } from "./pacing.js";
 import { deliverNotifications, readNotifyConfig } from "./notify.js";
@@ -1472,7 +1472,7 @@ export class HeadroomDaemon {
     try {
       const now = new Date();
       const principals = this.accounts.filter((account) => isAccountEnabled(account) && !isLocalAccount(account)).map((account) => account.name);
-      const line = buildAgentLine(this.servedStatus(policy, now), policy, principals, now);
+      const line = buildAgentLine(this.servedStatus(policy, now), policy, principals, now, experimentMarks(this.storeWhileDraining));
       this.trackNotify(writeAgentLine(this.home, line)
         .catch((error: unknown) => appendDaemonLog(`agent line write failed: ${safeError(error)}`, this.home)));
     } catch (error) {
