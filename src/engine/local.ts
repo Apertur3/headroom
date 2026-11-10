@@ -33,6 +33,14 @@ export function vllmQueue(metrics: string): { running: number; waiting: number }
   return running === undefined && waiting === undefined ? undefined : { running: running ?? 0, waiting: waiting ?? 0 };
 }
 
+/** llama.cpp-style `/slots`: one entry per stream, each with `is_processing`.
+ * A pool whose every slot is processing has no free stream: BUSY. */
+export function slotUse(body: unknown): { running: number; free: number } | undefined {
+  if (!Array.isArray(body) || !body.length || !body.every((slot) => typeof (slot as { is_processing?: unknown } | null)?.is_processing === "boolean")) return undefined;
+  const running = body.filter((slot) => (slot as { is_processing: boolean }).is_processing).length;
+  return { running, free: body.length - running };
+}
+
 function down(account: LocalAccount, error: unknown): Observation {
   const now = new Date().toISOString();
   const wake = account.wake ? `; wake: ${account.wake}` : "";
@@ -45,19 +53,19 @@ function down(account: LocalAccount, error: unknown): Observation {
 }
 
 /** Probe an OpenAI-compatible local pool. /v1/models is the liveness contract;
- * /metrics and /health are optional implementation-specific enrichments. */
+ * /metrics (vLLM) and /slots (llama.cpp style) are optional enrichments. */
 export async function observeLocal(account: LocalAccount): Promise<Observation> {
   try {
     const modelsResponse = await get(account.base_url, "v1/models");
     if (!modelsResponse.ok) throw new Error(`models HTTP ${modelsResponse.status}`);
     const models = modelIds(await vendorJson(modelsResponse));
-    const [metrics, health] = await Promise.all([
+    const [metrics, slots] = await Promise.all([
       get(account.base_url, "metrics").then(async (response) => response.ok ? vllmQueue(await vendorText(response)) : undefined).catch(() => undefined),
-      get(account.base_url, "health").then(() => undefined).catch(() => undefined),
+      get(account.base_url, "slots").then(async (response) => response.ok ? slotUse(await vendorJson(response)) : undefined).catch(() => undefined),
     ]);
-    const running = metrics?.running ?? 0;
+    const running = metrics?.running ?? slots?.running ?? 0;
     const waiting = metrics?.waiting ?? 0;
-    const state = waiting > 0 ? "BUSY" : "UP";
+    const state = waiting > 0 || slots?.free === 0 ? "BUSY" : "UP";
     const now = new Date().toISOString();
     return {
       principal_id: account.name, meter_id: `${account.name}:capacity`, window: { kind: "state", minutes: null, enforcement: "soft" },

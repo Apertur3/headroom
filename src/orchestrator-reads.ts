@@ -959,6 +959,12 @@ export function routeFor(store: HeadroomStore, meters: string[], accounts: Accou
     decidingMeterByPrincipal.set(principal, deciding?.meter_id);
     return { principal, state: decision.state, reason: decision.reason, remaining_percent: usable, reserve_percent: reserve, window_minutes: deciding?.window?.minutes ?? null };
   });
+  // An idle local pool the class lists wins outright: it has no percent to
+  // rank, costs no subscription quota, and runs one job per free stream, so
+  // another owner's active lease on it means it is taken.
+  const idleLocal = candidates.find((item) => item.state === "UP" && accounts.some((a) => a.name === item.principal && isLocalAccount(a))
+    && !leases.some((lease) => lease.meter_id.startsWith(`${item.principal}:`) && lease.owner !== owner));
+  if (idleLocal) return { principal: idleLocal.principal, environment: {}, reason: "local pool up and idle", candidates };
   // A meter whose whole remainder is inside its reserve has nothing to
   // route to, whatever its pace state says.
   const eligible = candidates.filter((item) => routeFits(item.state, allowUnknown) && item.remaining_percent !== null && (item.reserve_percent <= 0 || item.remaining_percent > 0));
