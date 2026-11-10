@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-11-10
+
+### Added
+
+- `route` and `quota_route` send a class to an idle local pool first. List `<pool>:capacity` in the class's `[consumes]` entry; while that pool is UP and no other owner holds a lease on it, it wins, and subscriptions are ranked as before otherwise. Hold a lease for the run so the next caller sees the pool as taken.
+- Local pools that expose llama.cpp-style `/slots` report BUSY once every slot is processing, so a server that runs one stream at a time is not handed a second job.
+
+### Changed
+
+- A failed MCP tool call says when the MCP server is older than the installed Headroom: "Headroom X is installed but this MCP server still runs Y; reconnect it with /mcp". Before this, a session that outlived an upgrade failed on new config with no hint why.
+- The MCP `serverInfo` reports the real version instead of 0.1.0.
+- The local pool probe no longer requests `/health`; its answer was never used.
+
 ## [0.2.21] - 2026-11-09
 
 ### Added

@@ -137,7 +137,7 @@ describe("routeFor with a local pool", () => {
         quantity: { used: 0, limit: null, remaining: null, unit: "requests" }, resets_at: null, metadata: { state: "UP", model_ids: ["local-27b"], running: 0, waiting: 0, cost_model: "marginal" } });
       const accounts: Account[] = [
         { name: "claude-2", vendor: "claude", location: claude2Location, adapter: "native-ts" },
-        { name: "gpu-box", kind: "local", base_url: "http://10.0.0.20:8000", adapter: "native" },
+        { name: "gpu-box", kind: "local", base_url: "http://192.0.2.20:8000", adapter: "native" },
       ];
       const meters = ["gpu-box:capacity", "claude-2:all"];
       expect(routeFor(store, meters, accounts, defaultPolicy, false, now, "summarise").principal).toBe("gpu-box");
