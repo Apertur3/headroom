@@ -19,6 +19,10 @@ All notable changes to this project are documented here. The format follows
 - The MCP `serverInfo` reports the real version instead of 0.1.0.
 - The local pool probe no longer requests `/health`; its answer was never used.
 
+### Fixed
+
+- The daemon spent about 12% CPU, in bursts of 1 to 3 seconds at full load. One read (the latest reading per window, over every stored observation; about 0.6 s on a large history) ran several times per notify round. It is now reused until the observations change, or for 30 seconds at most.
+
 ## [0.2.21] - 2026-11-09
 
 ### Added
