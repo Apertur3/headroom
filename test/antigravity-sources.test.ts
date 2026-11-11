@@ -64,7 +64,7 @@ describe("agy keepalive", () => {
     const spawn = vi.fn(() => child);
     const supervisor = new AgyKeepaliveSupervisor({ binary: "/tmp/fake agy", platform: "darwin", spawn: spawn as never });
     supervisor.start();
-    expect(spawn).toHaveBeenCalledWith("/usr/bin/script", ["-q", "/dev/null", "/tmp/fake agy"], expect.objectContaining({ stdio: "ignore" }));
+    expect(spawn).toHaveBeenCalledWith("/usr/bin/script", ["-q", "/dev/null", "/tmp/fake agy", expect.stringMatching(/^--csrf_token=[0-9a-f-]{36}$/)], expect.objectContaining({ stdio: "ignore" }));
     const environment = (spawn.mock.calls[0] as unknown as [string, string[], { env: NodeJS.ProcessEnv }])[2].env;
     expect(environment.HEADROOM_ROUTING).toBeUndefined();
     expect(environment.HTTP_PROXY).toBeUndefined();
