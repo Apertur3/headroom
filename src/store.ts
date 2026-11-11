@@ -380,6 +380,7 @@ export class HeadroomStore {
    * cache is never cleared or capped.
    */
   private readonly statements = new Map<string, ReturnType<Database["prepare"]>>();
+  private latestCache?: { key: string; at: number; rows: StoredObservation[] };
   private prepared(sql: string): ReturnType<Database["prepare"]> {
     let statement = this.statements.get(sql);
     if (!statement) { statement = this.db.prepare(sql); this.statements.set(sql, statement); }
@@ -976,9 +977,7 @@ export class HeadroomStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  private vendorWindowStateKey(meterId: string, minutes: number): string {
-    return `vendor_window_suspect:${meterId}:${minutes}`;
-  }
+  private vendorWindowStateKey(meterId: string, minutes: number): string { return `vendor_window_suspect:${meterId}:${minutes}`; }
 
   private vendorWindowSuspect(observation: Observation): VendorWindowSuspect | undefined {
     const minutes = observation.window?.minutes;
@@ -1133,13 +1132,8 @@ export class HeadroomStore {
     return row ? observationFromRow(row) : undefined;
   }
 
-  private markVendorInconsistent(id: number): void {
-    this.prepared("UPDATE observations SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent', json('true')) WHERE id = ?").run(id);
-  }
-
-  private clearVendorInconsistent(id: number): void {
-    this.prepared("UPDATE observations SET metadata_json = json_remove(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent') WHERE id = ?").run(id);
-  }
+  private markVendorInconsistent(id: number): void { this.prepared("UPDATE observations SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent', json('true')) WHERE id = ?").run(id); }
+  private clearVendorInconsistent(id: number): void { this.prepared("UPDATE observations SET metadata_json = json_remove(COALESCE(metadata_json, '{}'), '$.vendor_inconsistent') WHERE id = ?").run(id); }
 
   private recentVendorInconsistent(meterId: string, fetchedAt: string): boolean {
     const since = new Date(Date.parse(fetchedAt) - 6 * 3_600_000).toISOString();
@@ -1672,13 +1666,17 @@ export class HeadroomStore {
   }
 
   latestPerWindow(meterId?: string): StoredObservation[] {
+    // The unfiltered read ranks every observation (~0.6 s at 200k rows) and one notify round asks several times: reuse it until
+    // any write here (total_changes), a write by another process (data_version), or 30 s, since its SQL reads the clock.
+    const key = meterId === undefined ? JSON.stringify([this.prepared("SELECT total_changes()").get(), this.prepared("PRAGMA data_version").get()]) : undefined;
+    if (key && this.latestCache?.key === key && Date.now() - this.latestCache.at < 30_000) return structuredClone(this.latestCache.rows);
     const filter = meterId === undefined
       ? "WHERE COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0"
       : "WHERE meter_id = ? AND COALESCE(json_extract(metadata_json, '$.exhausted_ignored'), 0) = 0";
     // Ranks ids only and joins the winners' full rows back: sorting every
     // observation's JSON columns through the window function made this the
     // daemon's slowest synchronous read, long enough to stall health replies.
-    return this.prepared(`WITH ranked AS (
+    const rows = this.prepared(`WITH ranked AS (
       SELECT id, ROW_NUMBER() OVER (
         PARTITION BY meter_id, COALESCE(CAST(json_extract(window_json, '$.minutes') AS TEXT), 'none')
         -- A later manual entry supersedes an earlier one, including a clear.
@@ -1768,6 +1766,8 @@ export class HeadroomStore {
         const earlier = this.observationById(state.baseline_id);
         return earlier ? { ...earlier, metadata: { ...earlier.metadata, vendor_window_held: true } } : current;
       });
+    if (key) this.latestCache = { key, at: Date.now(), rows: structuredClone(rows) };
+    return rows;
   }
 
   /**
@@ -2450,9 +2450,7 @@ export class HeadroomStore {
    * queried by `heartbeats()`/`timers()` below so the cached-status path
    * (mcp.ts's `cacheStatus`, cli.ts's `observe()`) reads that compatibility
    * gap as "none registered" instead of throwing "no such table". */
-  private hasHeartbeatSchema(): boolean {
-    return this.schemaVersion() >= HEARTBEATS_SCHEMA_VERSION;
-  }
+  private hasHeartbeatSchema(): boolean { return this.schemaVersion() >= HEARTBEATS_SCHEMA_VERSION; }
 
   private addHeartbeatEvent(kind: Extract<EventKind, "heartbeat_lapsed" | "heartbeat_restored">, heartbeat: Heartbeat, at: string): void {
     const metadata: NonNullable<HeadroomEvent["metadata"]> = { owner: heartbeat.owner, interval_ms: heartbeat.interval_ms, last_beat_at: heartbeat.last_beat_at, ...(kind === "heartbeat_lapsed" ? { resume_sentence: heartbeat.resume_sentence } : {}) };

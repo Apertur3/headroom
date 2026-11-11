@@ -15,6 +15,7 @@ import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } f
 import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
+import { headroomVersion, staleProcessHint } from "./version.js";
 import { readInbox } from "./inbox.js";
 import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract } from "./json-contract.js";
 import { checkHostHealth, readHostGuardPolicy } from "./host-health.js";
@@ -134,6 +135,7 @@ let inFlightMcpCalls = 0;
 
 /** Minimal MCP stdio transport; deliberately dependency-free for offline installs. */
 export function serveMcp(): void {
+  void headroomVersion(); // pin the version this process runs, for staleProcessHint
   process.stdin.setEncoding("utf8");
   let buffer = "";
   process.stdin.on("data", (part: string) => {
@@ -802,7 +804,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     const clientInfo = request.params && typeof request.params === "object" ? (request.params as Record<string, unknown>).clientInfo : undefined;
     const declaredName = clientInfo && typeof clientInfo === "object" ? (clientInfo as Record<string, unknown>).name : undefined;
     mcpClientName = typeof declaredName === "string" && declaredName.trim() ? declaredName.trim().slice(0, 80) : "mcp-client";
-    return response(request.id, { protocolVersion: negotiatedProtocolVersion(request.params), capabilities: { tools: {} }, serverInfo: { name: "headroom", version: "0.1.0" } });
+    return response(request.id, { protocolVersion: negotiatedProtocolVersion(request.params), capabilities: { tools: {} }, serverInfo: { name: "headroom", version: await headroomVersion() } });
   }
   if (request.method === "notifications/initialized") return undefined;
   if (request.method === "ping") return response(request.id, {});
@@ -952,7 +954,7 @@ export async function handleMcp(line: string, call = daemonCall, fallback = dire
     const envelopedResult = isEnvelopable(finalResult) ? withContract(finalResult) : finalResult;
     return response(request.id, { content: [{ type: "text", text: JSON.stringify(envelopedResult) }], structuredContent: envelopedResult });
   } catch (error) {
-    return failure(request.id, -32000, safeError(error));
+    return failure(request.id, -32000, safeError(error) + await staleProcessHint());
   }
 }
 

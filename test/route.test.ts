@@ -7,7 +7,7 @@ import { handleMcp } from "../src/mcp.js";
 import { launchEnvironment, routeFor } from "../src/orchestrator-reads.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
-import type { Observation, ProviderAccount } from "../src/types.js";
+import type { Account, Observation, ProviderAccount } from "../src/types.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -122,6 +122,27 @@ describe("routeFor", () => {
       const after = routeFor(store, ["claude-2:all"], accounts, defaultPolicy, false, now, "review");
       expect(after.candidates[0].state).toBe("FREEZE");
       expect(after.principal).toBeNull();
+    } finally { store.close(); }
+  });
+});
+
+describe("routeFor with a local pool", () => {
+  it("sends the class to an idle local pool first, and to the subscription once another owner holds it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-route-local-")); temporary.push(root);
+    const store = await HeadroomStore.open(join(root, ".headroom"));
+    try {
+      const now = new Date();
+      store.insert(meter("claude-2", "all", 20, now.toISOString()));
+      store.insert({ ...meter("gpu-box", "capacity", 0, now.toISOString()), window: { kind: "state", minutes: null, enforcement: "soft" },
+        quantity: { used: 0, limit: null, remaining: null, unit: "requests" }, resets_at: null, metadata: { state: "UP", model_ids: ["local-27b"], running: 0, waiting: 0, cost_model: "marginal" } });
+      const accounts: Account[] = [
+        { name: "claude-2", vendor: "claude", location: claude2Location, adapter: "native-ts" },
+        { name: "gpu-box", kind: "local", base_url: "http://192.0.2.20:8000", adapter: "native" },
+      ];
+      const meters = ["gpu-box:capacity", "claude-2:all"];
+      expect(routeFor(store, meters, accounts, defaultPolicy, false, now, "summarise").principal).toBe("gpu-box");
+      store.startLease("other-agent", "gpu-box:capacity", null, 3_600_000, null, now);
+      expect(routeFor(store, meters, accounts, defaultPolicy, false, now, "summarise").principal).toBe("claude-2");
     } finally { store.close(); }
   });
 });

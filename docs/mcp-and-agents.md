@@ -397,7 +397,10 @@ that action class allows, picks the one with the most remaining headroom on its 
 window, and returns its launch environment (for example `CLAUDE_CONFIG_DIR`). `owner` reserves
 every OTHER owner's active lease against these same meters before scoring and ranking each
 candidate, the same reservation `quota_can` applies. `null` when none fits; UNKNOWN rows never win
-unless `allow_unknown` is set. CLI: `headroom route`.
+unless `allow_unknown` is set. A local pool listed for the class (`<pool>:capacity`) wins first
+while it is UP and no other owner holds a lease on it: it has no percent to rank and spends no
+subscription quota, and one lease per pool keeps it to one job at a time; hold a lease
+(`quota_lease_start`) for the run. CLI: `headroom route`.
 
 ### `quota_usage_paste`
 

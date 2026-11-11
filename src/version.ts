@@ -28,8 +28,20 @@ export async function headroomVersion(): Promise<string> {
   return cached;
 }
 
+/** package.json's version as it is on disk NOW (uncached): differs from
+ * headroomVersion() once an upgrade replaced the package under this process. */
+function installedVersion(): string {
+  try { return (JSON.parse(readFileSync(join(packageRoot(), "package.json"), "utf8")) as { version?: string }).version ?? "unknown"; }
+  catch { return "unknown"; }
+}
+
 /** The honest client identity every vendor request carries: `headroomd/<version>`. */
-export function userAgent(): string {
-  try { return `headroomd/${(JSON.parse(readFileSync(join(packageRoot(), "package.json"), "utf8")) as { version?: string }).version ?? "unknown"}`; }
-  catch { return "headroomd/unknown"; }
+export function userAgent(): string { return `headroomd/${installedVersion()}`; }
+
+/** Appended to an MCP tool error when a different Headroom was installed after
+ * this long-lived MCP process started: its old code may reject the new config,
+ * and only a reconnect loads the new code. Empty when the versions match. */
+export async function staleProcessHint(installed = installedVersion()): Promise<string> {
+  const running = await headroomVersion();
+  return installed === running || installed === "unknown" ? "" : ` (Headroom ${installed} is installed but this MCP server still runs ${running}; reconnect it with /mcp)`;
 }

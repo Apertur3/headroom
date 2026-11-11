@@ -523,7 +523,8 @@ Known limitations:
 
 Headroom probes an OpenAI-compatible `/v1/models` endpoint for liveness at the account's
 `base_url`, plus best-effort `/metrics` (reading vLLM's Prometheus gauges
-`vllm:num_requests_running` and `vllm:num_requests_waiting`) and `/health`. There is no
+`vllm:num_requests_running` and `vllm:num_requests_waiting`) and llama.cpp-style `/slots` (BUSY
+once every slot reports `is_processing`). There is no
 credential: `base_url` and an optional `wake` command live in `accounts.toml`, and Headroom only
 ever reports that command, never runs it.
 
