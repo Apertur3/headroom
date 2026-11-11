@@ -5,9 +5,9 @@
   </picture>
 </p>
 
-**Your coding agents check their Claude and Codex limits before they start a job.**
+**Your coding agents check their subscription limits before they start a job.**
 
-headroomd reads the 5-hour and weekly limits your subscriptions report and answers go, wait or reroute, over the CLI or MCP.
+headroomd reads the 5-hour, weekly and monthly limits that Claude, Codex and Kimi report (Antigravity and Grok are experimental), plus whether your local vLLM or llama.cpp servers are free. It answers go, wait or reroute, over the CLI or MCP.
 
 <p align="center">
   <img alt="Terminal demo: Headroom checks Claude and Codex quota, waits or reroutes when needed, and reserves capacity before a job" src="docs/assets/headroom-demo.gif" width="720">
@@ -292,7 +292,7 @@ runs the command, and releases the reservation. Runnable examples against synthe
 <tr>
 <td width="33%" valign="top"><b>Reads real limits</b><br>Subscription usage and limits as Claude, Codex, Antigravity, Grok and Kimi report them, plus availability and load for local vLLM or llama.cpp pools.</td>
 <td width="33%" valign="top"><b>Pace, not just percent</b><br>HARVEST, NORMAL, CONSERVE, FREEZE or UNKNOWN per window, from a straight line burn with a grace period after each reset.</td>
-<td width="33%" valign="top"><b>Go, wait or reroute</b><br><code>can</code>, <code>gate</code>, <code>route</code>, <code>plan</code>, <code>fill</code> and <code>wait</code> answer before the job starts.</td>
+<td width="33%" valign="top"><b>Go, wait or reroute</b><br><code>can</code>, <code>gate</code>, <code>route</code>, <code>plan</code>, <code>fill</code> and <code>wait</code> answer before the job starts. <code>route</code> can send cheap work to an idle local server first.</td>
 </tr>
 <tr>
 <td valign="top"><b>Reservations</b><br>Leases and per-meter reserves coordinate capacity among agents that use Headroom (<code>run</code>, <code>can --lease</code>).</td>
