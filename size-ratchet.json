@@ -4,7 +4,7 @@
   "src/cli.ts": 2532,
   "src/daemon.ts": 1941,
   "src/notify.ts": 1210,
-  "src/store.ts": 3227,
+  "src/store.ts": 3225,
   "src/usage-store.ts": 1205,
   "test/antigravity-keepalive-sweep.test.ts": 1314,
   "test/daemon-mcp.test.ts": 1086,

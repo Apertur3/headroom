@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
-import { observeLocal, vllmQueue } from "../src/engine/local.js";
+import { observeLocal, slotUse, vllmQueue } from "../src/engine/local.js";
 import { formatMeters } from "../src/cli.js";
 import { canRoute, defaultPolicy, paceDecision } from "../src/policy.js";
 import { parseRouting } from "../src/config.js";
@@ -39,6 +39,13 @@ describe("native:local adapter", () => {
     expect(observation).toMatchObject({ meter_id: "gpu-box:capacity", source: "native:local", window: { kind: "state" }, quantity: { used: 0, limit: null, unit: "requests" }, freshness: "fresh", metadata: { state: "UP", model_ids: ["local-27b"], running: 0, waiting: 0, cost_model: "marginal" } });
     expect(formatMeters([observation], defaultPolicy)).toEqual(["gpu-box:capacity  UP model=local-27b running=0 waiting=0"]);
     expect(paceDecision(observation, defaultPolicy).state).toBe("UP");
+  });
+
+  it("reads llama.cpp-style /slots: BUSY once every stream is processing", () => {
+    expect(slotUse([{ id: 0, is_processing: false }])).toEqual({ running: 0, free: 1 });
+    expect(slotUse([{ id: 0, is_processing: true }])).toEqual({ running: 1, free: 0 });
+    expect(slotUse({ engine: {} })).toBeUndefined();
+    expect(slotUse([])).toBeUndefined();
   });
 
   it("reports BUSY from the recorded metrics fixture", async () => {
