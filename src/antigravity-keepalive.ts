@@ -98,9 +98,7 @@ function launchAgyPidFilePath(directory: string): string { return join(directory
  * would reopen exactly the race it exists to close (see recordState's own
  * comment: an older launch's write landing, via the fs layer's own timing,
  * after a newer launch's synchronous provisional record). */
-function writeKeepaliveStateSync(path: string, state: KeepaliveState): void {
-  writeFileSync(path, JSON.stringify(state), { mode: 0o600 });
-}
+function writeKeepaliveStateSync(path: string, state: KeepaliveState): void { writeFileSync(path, JSON.stringify(state), { mode: 0o600 }); }
 
 /** Thrown by readKeepaliveState()/readAgyPidFile() when evidence PRESENT on
  * disk cannot be trusted -- a symlink, a non-regular file, unreadable
@@ -129,9 +127,7 @@ const MAX_PID = 4_194_304;
  * everywhere a pid is read back from disk, so a corrupt or out-of-range
  * value is rejected the same rigorous way regardless of which reader saw it
  * first. */
-function isPlausiblePid(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 1 && value <= MAX_PID;
-}
+function isPlausiblePid(value: unknown): value is number { return typeof value === "number" && Number.isInteger(value) && value > 1 && value <= MAX_PID; }
 
 /** The state writer uses Date#toISOString(), but accept any complete,
  * timezone-qualified ISO 8601 instant that Date can parse. Never let a
@@ -1080,7 +1076,7 @@ export class AgyKeepaliveSupervisor {
     this.loginWatchStartedAt = undefined;
   }
 
-  private ptyCommand(): [string, string[]] { return agyPtyCommand(this.binary, this.platform, this.agyPidFile); }
+  private ptyCommand(): [string, string[]] { return agyPtyCommand(this.binary, this.platform, this.agyPidFile, randomUUID()); }
 }
 
 /**
@@ -1091,10 +1087,13 @@ export class AgyKeepaliveSupervisor {
  * including the PTY session-leader behavior issue #56 is about -- instead
  * of duplicating (and risking drifting from) this logic.
  */
-export function agyPtyCommand(binary: string, platform: NodeJS.Platform, pidFile?: string): [string, string[]] {
+export function agyPtyCommand(binary: string, platform: NodeJS.Platform, pidFile?: string, csrfToken?: string): [string, string[]] {
+  // agy 1.5 refuses local quota reads without its CSRF token and publishes none. Started with
+  // --csrf_token, it uses ours, and the quota reader finds it on agy's command line, as for the app.
+  const agy = csrfToken ? [binary, `--csrf_token=${csrfToken}`] : [binary];
   // With a pid file, a tiny sh wrapper records its own pid and then execs
   // agy, which keeps that pid: the supervisor learns agy's pid without `ps`.
-  const wrapped = pidFile ? ["/bin/sh", "-c", 'echo $$ > "$0" && exec "$1"', pidFile, binary] : [binary];
+  const wrapped = pidFile ? ["/bin/sh", "-c", 'echo $$ > "$0" && exec "$@"', pidFile, ...agy] : agy;
   if (platform === "darwin") return ["/usr/bin/script", ["-q", "/dev/null", ...wrapped]];
   return ["script", ["-qefc", wrapped.map(shellQuote).join(" "), "/dev/null"]];
 }

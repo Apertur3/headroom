@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-11-11
+
+### Fixed
+
+- Antigravity readings work again with agy 1.5. Its local server now refuses quota reads without a CSRF token and publishes none, so every read failed (reported as a TLS error, the last of the failed attempts). Headroom now starts its background agy with its own random token per launch, which the quota reader picks up from agy's command line, the same way it reads the desktop app's token.
+
 ## [0.2.22] - 2026-11-10
 
 ### Added
