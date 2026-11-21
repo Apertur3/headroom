@@ -108,7 +108,9 @@ export interface ServerDiscoveryOptions {
   list?: () => Promise<ProcessCommand[]>;
 }
 
-/** Pids of Antigravity servers that are NOT Headroom's own. */
+/** Pids of readable Antigravity servers that are NOT Headroom's own. Since
+ * agy 1.5 a server launched without `--csrf_token` (a plain `agy` session)
+ * refuses local quota reads, so it is no reason to stand our keepalive down. */
 export async function externalAntigravityServerPids(options: ServerDiscoveryOptions = {}): Promise<number[]> {
   const processes = await (options.list ?? listCommands)();
   const entries: ProcessEntry[] = processes.map((row) => ({ pid: row.pid, ppid: row.ppid, rssKb: 0, command: row.command }));
@@ -118,6 +120,6 @@ export async function externalAntigravityServerPids(options: ServerDiscoveryOpti
     for (const child of descendantsOf(root, entries)) owned.add(child.pid);
   }
   return processes
-    .filter((row) => row.pid !== process.pid && !owned.has(row.pid) && isAntigravityServerCommand(row.command, row.executable))
+    .filter((row) => row.pid !== process.pid && !owned.has(row.pid) && isAntigravityServerCommand(row.command, row.executable) && /\s--csrf_token[=\s]\S/.test(row.command))
     .map((row) => row.pid);
 }

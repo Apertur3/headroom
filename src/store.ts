@@ -1097,7 +1097,7 @@ export class HeadroomStore {
     // A missing previous reset cannot prove the old window still had time.
     if (baseline && !this.sameReset(observation.resets_at, baseline.resets_at) && this.windowHasEnded(baseline, observation)) return { kind: "rollover", baseline };
     if (state) {
-      if (this.sameReset(observation.resets_at, state.suspect_resets_at)) return { kind: "accepted", suspect: state };
+      if (this.sameReset(observation.resets_at, state.suspect_resets_at) || (!observation.resets_at && !state.suspect_resets_at)) return { kind: "accepted", suspect: state }; // two reset-less polls (idle pool) confirm too; engine rows omit the field, saved state reads back null
       if (this.sameReset(observation.resets_at, state.baseline_resets_at)) return { kind: "flip", suspect: state };
       return baseline ? { kind: "suspect", baseline } : { kind: "normal" };
     }
