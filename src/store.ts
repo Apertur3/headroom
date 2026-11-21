@@ -814,10 +814,10 @@ export class HeadroomStore {
       for (const row of stored) if (row.window) explicit.set(row.meter_id, (explicit.get(row.meter_id) ?? new Set<number>()).add(row.window.minutes ?? 0));
       for (const row of stored) if ((row.freshness === "fresh" || row.freshness === "not_enforced") && row.window?.minutes) byMeter.set(row.meter_id, [...(byMeter.get(row.meter_id) ?? []), row]);
       for (const [meter, rows] of byMeter) {
-        // An incomplete vendor picture must not retire a sibling window while
-        // this meter is already being held for inconsistent reset identities.
+        // An incomplete vendor picture must not retire a sibling window while this meter is held for inconsistent reset identities.
         if (rows.some((row) => this.vendorWindowSuspect(row))) continue;
-        const present = explicit.get(meter)!;
+        const present = explicit.get(meter)!; // The full latest read below is costly; skip it when no window outside this poll was ever seen.
+        if (!this.prepared("SELECT 1 FROM observations WHERE meter_id = ? AND window_json IS NOT NULL AND window_json <> 'null' AND COALESCE(json_extract(window_json, '$.minutes'), 0) NOT IN (SELECT value FROM json_each(?)) LIMIT 1").get(meter, JSON.stringify([...present]))) continue;
         for (const old of this.latestPerWindow(meter)) {
           // A window without a length (an older parser's reading) is retired too.
           if (!old.window || present.has(old.window.minutes ?? 0) || old.metadata?.retired) continue;
