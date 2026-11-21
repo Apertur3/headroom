@@ -1,5 +1,9 @@
 import { configDefaults, defineConfig } from "vitest/config";
 
+// Status text uses the default Intl locale; pin it so a non-US dev box (en_NZ
+// prints "7 Sept") runs the same suite as CI. Workers inherit this at start.
+process.env.LC_ALL = "en_US.UTF-8";
+
 // The suite opens hundreds of SQLite stores and shells out to scripts; the
 // shared CI runners, Windows in particular, need more than the 5 s default
 // before a slow test counts as a hang.
