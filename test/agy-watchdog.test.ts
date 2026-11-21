@@ -236,7 +236,8 @@ describe("Antigravity server discovery: the executable decides, never an argumen
       // A path with a space: the listing supplies the executable separately.
       { pid: 33, ppid: 1, command: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos --csrf_token t", executable: "/Applications/Antigravity IDE.app/Contents/x/language_server_macos" },
     ];
-    expect(await externalAntigravityServerPids({ list })).toEqual([32, 33]);
+    // 32 is a plain agy: no --csrf_token, so not readable and not counted.
+    expect(await externalAntigravityServerPids({ list })).toEqual([33]);
   });
 
   it("parses the joined ps listings into executable and arguments", () => {

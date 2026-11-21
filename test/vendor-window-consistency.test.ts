@@ -102,6 +102,20 @@ describe("vendor window consistency hold (issue #29)", () => {
     } finally { store.close(); }
   });
 
+  it("confirms an idle pool that stops reporting a reset on the second reset-less poll", async () => {
+    const store = await open();
+    try {
+      store.insert(weekly(0, "2026-09-09T16:00:00Z", "2026-09-16T16:00:00Z"));
+      // The engine omits the field entirely (undefined), as a live idle agy pool does.
+      store.insert({ ...window(10_080, 0, "2026-09-10T16:00:00Z", null), resets_at: undefined as unknown as null });
+      expect(store.latestPerWindow("codex-main:main")[0]!.metadata?.vendor_window_held).toBe(true);
+      store.insert({ ...window(10_080, 0, "2026-09-10T16:05:00Z", null), resets_at: undefined as unknown as null });
+      const current = store.latestPerWindow("codex-main:main")[0]!;
+      expect(current).toMatchObject({ quantity: { used: 0 }, fetched_at: "2026-09-10T16:05:00Z" });
+      expect(current.metadata?.vendor_window_held).toBeUndefined();
+    } finally { store.close(); }
+  });
+
   it("excludes flagged raw rows from burn-rate samples", async () => {
     const store = await open();
     try {

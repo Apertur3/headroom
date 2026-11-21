@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-11-21
+
+### Fixed
+
+- An idle Antigravity pool now reads as fresh. When nobody uses a pool, agy reports 0% with no reset time. Headroom held each such reading as an unconfirmed new window and never confirmed it, so the lane showed STALE and the doctor and the stale-lane alert fired every day. Two polls in a row without a reset now confirm it.
+- Antigravity reads no longer fail while another agy session runs. Headroom used to stop its own background agy whenever it found another Antigravity server, then tried to read that one. A plain `agy` started without `--csrf_token` refuses those reads (shown as a TLS error). Headroom now steps aside only for a server it can read, such as the desktop app.
+- Saving a poll is faster. Each meter used to run the full latest-reading query to look for windows the vendor stopped reporting; a cheap indexed check now skips it when there are none (about 60 ms down to 26 ms per meter on a long history).
+
 ## [0.2.23] - 2026-11-11
 
 ### Fixed

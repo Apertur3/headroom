@@ -79,10 +79,12 @@ describe("store.insertPoll event-loop cost (the poll-cycle stall)", () => {
       // assert on the median against the 2s health budget, with the worst
       // sample under a looser documented ceiling so one descheduled slice on a
       // shared runner cannot fail the run (issue #135).
-      store.insertPoll(manyFreshObservations(100, new Date(), "warm"));
+      // Rounds reuse the warmed meters, as a real poll does: a brand-new
+      // account pays a one-off lookup that is not the per-poll stall.
+      store.insertPoll(manyFreshObservations(2_000, new Date(), "poll"));
       const samples: number[] = [];
       for (let round = 0; round < 5; round += 1) {
-        const observations = manyFreshObservations(2_000, new Date(), `round${round}`);
+        const observations = manyFreshObservations(2_000, new Date(Date.now() + (round + 1) * 60_000), "poll");
         const start = Date.now();
         const stored = store.insertPoll(observations);
         samples.push(Date.now() - start);
