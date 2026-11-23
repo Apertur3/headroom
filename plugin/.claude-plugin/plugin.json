@@ -1,0 +1,18 @@
+{
+  "name": "headroom",
+  "version": "0.2.24",
+  "description": "Check how much of each AI subscription is left before Claude starts a job, using the Headroom command.",
+  "author": {
+    "name": "Apertur3"
+  },
+  "homepage": "https://github.com/Apertur3/headroom#readme",
+  "repository": "https://github.com/Apertur3/headroom",
+  "license": "MIT",
+  "keywords": [
+    "quota",
+    "claude-code",
+    "codex",
+    "usage-limits"
+  ],
+  "privacyPolicyUrl": "https://github.com/Apertur3/headroom/blob/master/plugin/README.md#privacy"
+}
