@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-11-23
+
+### Fixed
+
+- Antigravity readings recover on their own after agy updates itself. agy's updater renames the running binary and writes the new version in its place; the quota reader then no longer recognised Headroom's background agy, and every read failed with "language server not detected" until the daemon was restarted. Before each poll, Headroom now checks whether the agy file changed since launch and, if so, restarts its background agy on the new binary.
+
 ## [0.2.24] - 2026-11-21
 
 ### Fixed
