@@ -13,5 +13,6 @@
     "claude-code",
     "codex",
     "usage-limits"
-  ]
+  ],
+  "privacyPolicyUrl": "https://github.com/Apertur3/headroom/blob/master/plugin/README.md#privacy"
 }

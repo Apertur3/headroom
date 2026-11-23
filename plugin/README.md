@@ -15,3 +15,21 @@ The full plugin, with the quota line before each prompt and the MCP tools, insta
 marketplace: `/plugin marketplace add Apertur3/headroom`.
 
 MIT licensed.
+
+## Privacy
+
+This plugin is a skill: it sends nothing anywhere itself. It runs the `headroom` command on your computer and reads
+its output. What Headroom handles:
+
+- **Reads:** your usage and plan limits (percent used, reset times, plan name) from the AI tools you are signed in to
+  on this computer. It uses each tool's own existing login at the moment of the request and drops it afterwards; it
+  keeps no credentials of its own and redacts tokens, cookies and, by default, email addresses from its output.
+- **Sends:** read-only usage requests to the vendors you configured (for example Anthropic, OpenAI, Google), with your
+  own login, identified as `headroomd/<version>`. No prompts, no files, no account changes. Notifications go only to
+  channels you set up yourself. A once-a-day npm version check carries no account data (`update_check = false` turns
+  it off). No telemetry, no analytics, and nothing goes to a server run by the Headroom project.
+- **Keeps:** a history of usage readings in a local database on your computer (under `~/.headroom` by default), so it can show
+  trends and pace. You can delete it at any time. Nothing is kept anywhere else.
+
+Full details: https://github.com/Apertur3/headroom#vendor-endpoints-and-your-accounts and
+https://github.com/Apertur3/headroom/blob/master/SECURITY.md.
