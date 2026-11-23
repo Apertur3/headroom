@@ -65,10 +65,11 @@ describe.skipIf(process.platform === "win32")("plugin quota line", () => {
 
 describe("plugin and registry versions", () => {
   it("keeps all published metadata in sync with the npm package", async () => {
-    const [pkg, plugin, marketplace, server] = await Promise.all([
-      "package.json", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "server.json",
+    const [pkg, plugin, marketplace, server, directoryPlugin] = await Promise.all([
+      "package.json", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "server.json", "plugin/.claude-plugin/plugin.json",
     ].map(async (path) => JSON.parse(await readFile(join(root, path), "utf8"))));
     expect(plugin.version).toBe(pkg.version);
+    expect(directoryPlugin.version).toBe(pkg.version);
     expect(marketplace.plugins[0].version).toBe(pkg.version);
     expect(server.version).toBe(pkg.version);
     expect(server.packages[0].version).toBe(pkg.version);
