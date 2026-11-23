@@ -1,15 +1,16 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-// plugin/ is the code-free plugin submitted to the Claude plugin directory. Its skill is the root skill with only the
-// setup section swapped (it may not install anything), so the rest must not drift from skills/headroom/SKILL.md.
-const outsideSetup = (path: string) => readFileSync(path, "utf8").replace(/## Setting Headroom up[\s\S]*?(?=## Keep the budget in sight)/, "");
+// plugin/ is the code-free plugin listed in the Claude plugin directory. The directory refuses text that installs
+// software or tells Claude or the user to add an MCP server the plugin does not declare, so plugin/ must use the
+// headroom CLI only.
+const texts = (dir: string): string[] => readdirSync(dir, { withFileTypes: true, recursive: true })
+  .filter((entry) => entry.isFile() && /\.(md|json)$/.test(entry.name))
+  .map((entry) => readFileSync(join(entry.parentPath, entry.name), "utf8"));
 
 describe("directory plugin", () => {
-  it("keeps its skill in step with the root skill apart from setup", () => {
-    expect(outsideSetup("plugin/skills/headroom/SKILL.md")).toBe(outsideSetup("skills/headroom/SKILL.md"));
-  });
-  it("never tells the agent to install anything", () => {
-    expect(readFileSync("plugin/skills/headroom/SKILL.md", "utf8")).not.toMatch(/npm install|brew install|curl /);
+  it("never mentions MCP or tells anyone to install something", () => {
+    for (const text of texts("plugin")) expect(text).not.toMatch(/\bmcp\b|quota_|npm install|brew install|curl /i);
   });
 });

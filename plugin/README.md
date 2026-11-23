@@ -11,9 +11,6 @@ What the skill runs: `headroom` read commands (`headroom --json`, `can`, `gate`,
 with your own logged-in tools; it keeps no credentials of its own and sends nothing to a server of ours. See
 https://github.com/Apertur3/headroom/blob/master/SECURITY.md.
 
-The full plugin, with the quota line before each prompt and the MCP tools, installs from the repository's own
-marketplace: `/plugin marketplace add Apertur3/headroom`.
-
 MIT licensed.
 
 ## Privacy
