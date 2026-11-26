@@ -1524,6 +1524,7 @@ export class HeadroomDaemon {
     // would fire a second, duplicate vendor poll. Same await-free step as
     // the inFlight check and set, so nothing can slip in between.
     if (!forced && !warmOnly && (this.lastPoll.get(key) ?? 0) + interval > Date.now()) return { observations: [], failures: [] };
+    if (this.keepalive?.restartIfBinaryReplaced?.()) void appendDaemonLog("antigravity keepalive: agy updated itself; restarting it on the new binary", this.home);
     const task = this.poller(principal, {
       // "May probe a local Antigravity server": our keepalive, or one the
       // discovery found that Headroom did not start (the IDE's).
@@ -1566,11 +1567,8 @@ export class HeadroomDaemon {
         void appendDaemonLog(`antigravity local ${principalId}: ${read.outcome} (${read.payload_kind}${unsettled.length ? `; ${unsettled.join(", ")}` : ""})`, this.home);
       }
       if (this.schedulingStarted && enabledAccounts.some((account) => !isLocalAccount(account) && account.vendor === "antigravity")) {
-        // maybeStartKeepalive() itself never rejects (see its own doc
-        // comment), but this detached call is guarded again here anyway --
-        // defense in depth, not reliance on that guarantee alone -- so a
-        // future change to that method can never turn this fire-and-forget
-        // call into an unhandled rejection by accident.
+        // maybeStartKeepalive() never rejects, but this detached call is guarded again anyway (defense in
+        // depth), so a future change can never turn it into an unhandled rejection by accident.
         void this.maybeStartKeepalive(enabledAccounts, policy)
           .catch((error: unknown) => appendDaemonLog(`antigravity keepalive: unexpected error from a poll-triggered start attempt: ${safeError(error)}`, this.home));
       }

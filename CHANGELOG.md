@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-11-26
+
+### Fixed
+
+- The Claude weekly reading follows a free reset. After a reset, the usage figures Claude Code hands its status line kept the old number (99% used where Claude Code's `/usage` showed 3%), and Headroom preferred the status line, so the weekly limit read as full. Claude Code's `/usage` now wins for every limit it reports; between its runs (at most every 10 minutes) Headroom reuses its last reading, and the status line only fills in limits `/usage` does not show.
+- Antigravity readings recover on their own after agy updates itself. agy's updater renames the running binary and writes the new version in its place; the quota reader then no longer recognised Headroom's background agy, and every read failed with "language server not detected" until the daemon was restarted. Before each poll, Headroom now checks whether the agy file changed since launch and, if so, restarts its background agy on the new binary.
+
 ## [0.2.24] - 2026-11-21
 
 ### Fixed

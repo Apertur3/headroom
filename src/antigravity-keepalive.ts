@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { lstat, open, readdir, readFile, rmdir, unlink } from "node:fs/promises";
 import { homedir, uptime } from "node:os";
 import { join } from "node:path";
@@ -424,11 +424,9 @@ async function reconcileEvidence(location: EvidenceLocation, options: SweepOptio
 
   const verified: Array<{ pid: number; tier: "ps" | "ps-free"; command?: string; startedAt?: string }> = [];
   const unverified = new Set<number>();
-  // The ps-free tier exists for hosts where the process table cannot be read.
-  // Where it can, a pid without a recorded ps signature is never signalled on
-  // pid-file evidence alone: a recycled pid can pass a freshness and
-  // group-alive check, and killing a stranger is worse than an orphan that is
-  // reported and blocks the next launch.
+  // The ps-free tier exists for hosts where the process table cannot be read. Where it can, a pid without a recorded ps signature is never
+  // signalled on pid-file evidence alone: a recycled pid can pass a freshness and group-alive check, and killing a stranger is worse than
+  // an orphan that is reported and blocks the next launch.
   const psAvailable = (await processSignature(process.pid, options.execImpl)) !== undefined;
   for (const [pid, recorded] of candidates) {
     if (recorded.command && recorded.startedAt) {
@@ -539,7 +537,10 @@ function argsRunBinary(args: string, binary: string): boolean {
 }
 
 /** Owns only the `script` PTY it starts, so daemon shutdown cannot kill a user-launched agy. */
+/** Inode and mtime: agy updates itself by renaming the running file away and writing a new one. */
+const fileIdentity = (path: string): string | undefined => { try { const stat = statSync(path); return `${stat.ino}:${stat.mtimeMs}`; } catch { return undefined; } };
 export class AgyKeepaliveSupervisor {
+  private binaryIdentity: string | undefined;
   private child: ChildProcess | undefined;
   private restart: NodeJS.Timeout | undefined;
   private stopping = false;
@@ -668,10 +669,8 @@ export class AgyKeepaliveSupervisor {
       const pid = child.pid;
       if (typeof pid === "number") await this.killScriptVerified(pid, child);
       else child.kill("SIGTERM");
-      // killTree's descendant snapshot can be unavailable when ps is denied.
-      // This is still this launch's private wrapper file, captured while its
-      // script was alive, so its group is safe to reap directly. Confirm the
-      // result before considering its directory clearable.
+      // killTree's descendant snapshot can be unavailable when ps is denied. This is still this launch's private wrapper file, captured
+      // while its script was alive, so its group is safe to reap directly. Confirm the result before considering its directory clearable.
       if (agyPid === undefined) { const detailed = this.readAgyPidDetailed(); if (detailed.kind === "found") agyPid = detailed.pid; }
       if (agyPid === undefined && this.agyPidFile) {
         try { pidFileNeverAppeared = (await readKeepaliveState(this.stateFilePath!))?.agyPid === undefined; }
@@ -689,10 +688,9 @@ export class AgyKeepaliveSupervisor {
         if (!(await waitUntilGroupGone(agyPid))) return;
       }
     }
-    // A wrapper that never left a pid file and whose state never learned agy
-    // remains unresolved even if killTree happened to reap it. Discarding
-    // that directory would turn a missed descendant into an unrecoverable
-    // orphan; a later sweep can make the same conservative decision again.
+    // A wrapper that never left a pid file and whose state never learned agy remains unresolved even if killTree happened to reap it.
+    // Discarding that directory would turn a missed descendant into an unrecoverable orphan; a later sweep can make the same conservative
+    // decision again.
     if (pidFileNeverAppeared) return;
     if (await this.reconcileOwnLaunchDirectory()) this.forgetLaunchDirectory();
   }
@@ -707,16 +705,14 @@ export class AgyKeepaliveSupervisor {
       const child = this.startChild(command, args, { stdio: "ignore", env: inheritedAgyEnvironment(), detached: this.platform !== "win32" });
       this.child = child;
       this.startedAt = Date.now();
-      // Bumped synchronously, before anything else about this launch is
-      // recorded: recordState()'s eventual write checks this is still the
-      // current generation, immediately before writing, so it can never
-      // clobber a newer launch's record (see the field's own doc comment).
+      this.binaryIdentity = fileIdentity(this.binary);
+      // Bumped synchronously, before anything else about this launch is recorded: recordState()'s eventual write checks this is still the
+      // current generation, immediately before writing, so it can never clobber a newer launch's record (see the field's own doc comment).
       this.launchGeneration += 1;
       const generation = this.launchGeneration;
-      // Synchronous and ps-free, in the same tick as spawn(): a crash at ANY
-      // point from here on -- even before this method's own next line, let
-      // alone recordState()'s first `await` -- still leaves durable evidence
-      // of this launch behind for the next daemon start's sweep to find.
+      // Synchronous and ps-free, in the same tick as spawn(): a crash at ANY point from here on -- even before this method's own next line,
+      // let alone recordState()'s first `await` -- still leaves durable evidence of this launch behind for the next daemon start's sweep to
+      // find.
       const statePath = this.stateFilePath;
       this.recordProvisionalState(child, launchId, statePath);
       this.startLoginWatch();
@@ -829,10 +825,8 @@ export class AgyKeepaliveSupervisor {
         launchedAt, recordedAt: new Date().toISOString(), verified: true, launchId,
       };
       if (agyPid !== undefined && agySignature) { state.agyPid = agyPid; state.agyCommand = agySignature.command; state.agyStartedAt = agySignature.startedAt; }
-      // The awaits above can outlive this launch: never write a stopped,
-      // replaced, or superseded launch's pids over the state a newer one (or
-      // stop) left. Checked and written synchronously together -- see this
-      // method's own doc comment for why the generation check alone,
+      // The awaits above can outlive this launch: never write a stopped, replaced, or superseded launch's pids over the state a newer one
+      // (or stop) left. Checked and written synchronously together -- see this method's own doc comment for why the generation check alone,
       // followed by an async write, would not be enough.
       if (this.launchGeneration !== generation || this.child !== child || !isAlive(child)) return;
       this.scriptEvidence = { pid: scriptPid, command: scriptSignature.command, startedAt: scriptSignature.startedAt };
@@ -967,11 +961,9 @@ export class AgyKeepaliveSupervisor {
     if (!location || detailed.kind === "absent") return true;
     if (detailed.kind === "invalid") return false;
     try {
-      // Signal only on positive agreement: the state learned this same pid as
-      // a descendant of this launch's own script, or, when script exited
-      // before recordState() got that far, ps identifies the pid as this
-      // launch's agy. Without either, defer to the full reconciliation, which
-      // never signals unverifiable evidence.
+      // Signal only on positive agreement: the state learned this same pid as a descendant of this launch's own script, or, when script
+      // exited before recordState() got that far, ps identifies the pid as this launch's agy. Without either, defer to the full
+      // reconciliation, which never signals unverifiable evidence.
       const state = await readKeepaliveState(location.statePath);
       const agrees = state?.agyPid !== undefined
         ? state.agyPid === detailed.pid
@@ -1074,6 +1066,14 @@ export class AgyKeepaliveSupervisor {
     if (this.loginWatch) clearInterval(this.loginWatch);
     this.loginWatch = undefined;
     this.loginWatchStartedAt = undefined;
+  }
+
+  /** After an agy self-update the running agy's executable is the renamed old file, which the quota reader does not
+   * recognise as agy. Ends this launch so the normal exit path reaps it and relaunches the new binary; true when it did. */
+  restartIfBinaryReplaced(): boolean {
+    const current = fileIdentity(this.binary);
+    if (!this.child || this.stopping || !this.binaryIdentity || !current || current === this.binaryIdentity) return false;
+    this.binaryIdentity = undefined; this.child.kill("SIGTERM"); return true;
   }
 
   private ptyCommand(): [string, string[]] { return agyPtyCommand(this.binary, this.platform, this.agyPidFile, randomUUID()); }

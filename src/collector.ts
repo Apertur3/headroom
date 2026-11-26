@@ -187,12 +187,15 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       const usageError = "error" in usage ? usage.error : "throttled" in usage ? usage.throttled.error : undefined;
       const fromSnapshot = snapshot ? observationsFromStatuslineSnapshot(snapshot, account.name, new Date()) : [];
       if (snapshot || !usageError) {
-        // Account-wide windows come from the snapshot (live); /usage adds what it does not carry.
-        const covered = new Set(fromSnapshot.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
-        const rows = "rows" in usage ? usage.rows.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`)) : [];
-        // Throttled after a good run: keep the last reading; only an old snapshot can add rows.
-        const old = snapshot || "rows" in usage ? undefined : await latestStatuslineSnapshot(statuslineDirs, account, claudeAccounts, new Date());
-        observations.push(...fromSnapshot, ...rows, ...(old ? observationsFromStatuslineSnapshot(old, account.name, new Date()) : []));
+        // /usage wins for every meter it reports: the statusline's rate_limits can stay
+        // at the old figure after a free reset (99% shown, 3% real). The snapshot adds
+        // only what /usage does not carry. ponytail: /usage lags up to 10 min.
+        const rows = "rows" in usage ? usage.rows : "throttled" in usage ? usage.throttled.rows ?? [] : [];
+        const covered = new Set(rows.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
+        const live = fromSnapshot.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`));
+        // Neither a fresh snapshot nor a /usage reading: only an old snapshot can add rows.
+        const old = snapshot || rows.length ? undefined : await latestStatuslineSnapshot(statuslineDirs, account, claudeAccounts, new Date());
+        observations.push(...rows, ...live, ...(old ? observationsFromStatuslineSnapshot(old, account.name, new Date()) : []));
         claudeProbeOutcomes[account.name] = snapshot ? "skipped: statusline fresh" : "skipped: claude usage";
         continue;
       }
