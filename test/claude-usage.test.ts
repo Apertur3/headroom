@@ -36,7 +36,8 @@ describe("claude /usage runner", () => {
     const dir = await stampDir();
     const run = vi.fn(async () => stream());
     expect(await observeClaudeUsage(account, { run, now: () => at, stampDir: dir })).toHaveProperty("rows");
-    expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + 60_000), stampDir: dir })).toEqual({ throttled: {} });
+    const throttled = await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + 60_000), stampDir: dir });
+    expect(throttled).toEqual({ throttled: { rows: expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", quantity: expect.objectContaining({ used: 61 }) })]) } }); // the last reading, reused
     expect(run).toHaveBeenCalledTimes(1);
     expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS + 1000), stampDir: dir })).toHaveProperty("rows");
     expect(run).toHaveBeenCalledTimes(2);

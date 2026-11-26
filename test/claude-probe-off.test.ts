@@ -89,16 +89,19 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
     expect(probe.observeClaude).toHaveBeenCalledTimes(3);
   });
 
-  it("probe off + fresh snapshot: /usage refreshes the Fable row at most every 10 minutes", async () => {
+  it("probe off + fresh snapshot: /usage wins for its meters, runs at most every 10 minutes", async () => {
+    // The snapshot says 60% weekly, /usage 61%: after a free reset the statusline kept the old figure.
     const home = await setup(false, "fresh");
     const run = vi.fn(async () => stream());
     let clock = t0.getTime();
+    const weekly = (result: Awaited<ReturnType<typeof poll>>) => result.observations.filter((item) => item.meter_id === "claude-main:all" && item.window?.minutes === 10_080);
     const first = await poll(home, run, () => new Date(clock));
     expect(first.observations).toContainEqual(expect.objectContaining({ meter_id: "claude-main:fable", source: "native:claude-usage", freshness: "fresh" }));
-    expect(first.observations.filter((item) => item.meter_id === "claude-main:all").every((item) => item.source === "native:claude-statusline")).toBe(true);
+    expect(weekly(first)).toEqual([expect.objectContaining({ source: "native:claude-usage", quantity: expect.objectContaining({ used: 61 }) })]);
     clock += 60_000;
-    await poll(home, run, () => new Date(clock));
+    const throttled = await poll(home, run, () => new Date(clock));
     expect(run).toHaveBeenCalledTimes(1);
+    expect(weekly(throttled)).toEqual([expect.objectContaining({ source: "native:claude-usage", quantity: expect.objectContaining({ used: 61 }) })]);
     clock += 11 * 60_000;
     await poll(home, run, () => new Date(clock));
     expect(run).toHaveBeenCalledTimes(2);
