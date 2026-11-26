@@ -11,6 +11,7 @@ import type { ProviderAccount } from "../src/types.js";
 import { processesMentioning, writeCountingEngine, writeGrandchildEngine } from "./helpers/fake-engine.js";
 import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
+import { agyAccountsToml } from "./helpers/common.js";
 
 // The suite-wide setup mocks discovery to "nothing running"; this file needs
 // to decide, per step, whether someone else's Antigravity server is reachable.
@@ -26,11 +27,6 @@ afterEach(async () => {
   external.pids = [];
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-const accountsToml = (agyPath: string): string => [
-  "[[accounts]]", 'name = "antigravity"', "enabled = true",
-  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
-].join("\n");
 
 type Internal = { keepalive: { running: boolean } | undefined; poll(principal: string | undefined, forced: boolean): Promise<unknown>; maybeStartKeepalive(accounts: unknown[], policy: unknown): Promise<void> };
 // poll() is rate-limited per principal; the keepalive attempt it triggers is what these steps exercise.
@@ -51,7 +47,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     external.pids = [4_000_000]; // somebody else's IDE language server
     const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async () => ({ observations: [], failures: [] }) });
@@ -83,7 +79,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     external.pids = [4_000_000]; // somebody else's IDE language server
     const seen: PollOptions[] = [];
@@ -155,7 +151,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
     try {
       if (!await startDaemon(daemon)) return;
       await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-      await writeFile(join(root, "accounts.toml"), accountsToml(engine), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, engine), { mode: 0o600 });
       const polling = (daemon as unknown as Internal).poll(undefined, true).catch(() => undefined);
       track(Number(await waitForFile(grandchildPidFile)), root);
       enginePid = track(Number(await waitForFile(enginePidFile)), root) as number;

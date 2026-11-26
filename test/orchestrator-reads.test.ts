@@ -6,7 +6,7 @@ import { admitCanCost, fillFor, gateFor, planFor, rateLines } from "../src/orche
 import { defaultPolicy, type ReserveEntry } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
-import { useTemporary } from "./helpers/common.js";
+import { fiveHour, useTemporary, weekly } from "./helpers/common.js";
 
 const temporary = useTemporary();
 
@@ -14,24 +14,6 @@ async function open(): Promise<HeadroomStore> {
   const root = await mkdtemp(join(tmpdir(), "headroom-orchestrator-reads-"));
   temporary.push(root);
   return HeadroomStore.open(join(root, ".headroom"));
-}
-
-function fiveHour(used: number, fetchedAt: string, resetsAt: string, meterId = "claude-main:all"): Observation {
-  return {
-    principal_id: "claude-main", meter_id: meterId, window: { kind: "rolling", minutes: 300, enforcement: "hard" },
-    quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: resetsAt,
-    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
-    confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
-  };
-}
-
-function weekly(used: number, fetchedAt: string, resetsAt: string, meterId = "claude-main:all"): Observation {
-  return {
-    principal_id: "claude-main", meter_id: meterId, window: { kind: "fixed", minutes: 10_080, enforcement: "hard" },
-    quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: resetsAt,
-    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
-    confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
-  };
 }
 
 /** The exact shape Codex's adapter emits for its 5h window when the vendor

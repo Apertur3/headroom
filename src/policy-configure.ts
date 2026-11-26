@@ -33,10 +33,7 @@ const ANY_HEADER_RE = /^\s*\[[^\]]+\]\s*(?:#.*)?$/;
 
 interface SectionRange { header: number; bodyStart: number; bodyEnd: number; }
 
-/** Locates a section by its EXACT rendered name (`"reserve"`,
- * `"freeze_reserve"`) -- body runs until the next `[...]` header or EOF. */
-function findNamedSection(lines: string[], name: string): SectionRange | undefined {
-  const headerRe = new RegExp(`^\\s*\\[${escapeRegExp(name)}\\]\\s*(?:#.*)?$`);
+function findSection(lines: string[], headerRe: RegExp): SectionRange | undefined {
   for (let i = 0; i < lines.length; i += 1) {
     if (!headerRe.test(lines[i])) continue;
     let end = i + 1;
@@ -46,18 +43,17 @@ function findNamedSection(lines: string[], name: string): SectionRange | undefin
   return undefined;
 }
 
+/** Locates a section by its EXACT rendered name (`"reserve"`,
+ * `"freeze_reserve"`) -- body runs until the next `[...]` header or EOF. */
+function findNamedSection(lines: string[], name: string): SectionRange | undefined {
+  return findSection(lines, new RegExp(`^\\s*\\[${escapeRegExp(name)}\\]\\s*(?:#.*)?$`));
+}
+
 /** Locates `[reserve."<meter>"]` (or the bare-word form, when the meter id
  * happens to be a plain word) -- a sibling of `[reserve]`, never nested in it. */
 function findReserveEntrySection(lines: string[], meter: string): SectionRange | undefined {
   const escaped = escapeRegExp(meter);
-  const headerRe = new RegExp(`^\\s*\\[reserve\\.(?:"${escaped}"|${escaped})\\]\\s*(?:#.*)?$`);
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!headerRe.test(lines[i])) continue;
-    let end = i + 1;
-    while (end < lines.length && !ANY_HEADER_RE.test(lines[end])) end += 1;
-    return { header: i, bodyStart: i + 1, bodyEnd: end };
-  }
-  return undefined;
+  return findSection(lines, new RegExp(`^\\s*\\[reserve\\.(?:"${escaped}"|${escaped})\\]\\s*(?:#.*)?$`));
 }
 
 /** Removes this meter's own plain `"<meter>" = N` line from inside `[reserve]`

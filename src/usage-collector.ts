@@ -443,25 +443,7 @@ async function rehashRange(handle: FileHandle, start: number, end: number): Prom
   return hash.digest("hex");
 }
 
-function interrupted(cursorKey: string, existing: CursorRow | undefined, reason: InterruptReason): CollectResult {
-  return {
-    kind: "interrupted",
-    cursorKey,
-    generation: existing?.generation ?? 0,
-    byteOffset: existing?.byteOffset ?? 0,
-    bytesReadThisRun: 0,
-    atEof: false,
-    pendingPartial: existing?.pendingPartial ?? false,
-    budgetExhausted: false,
-    discardPending: existing?.discardPending ?? false,
-    jobConflict: existing?.jobConflict ?? false,
-    jobConflictIdentities: 0,
-    interruptReason: reason,
-    counters: {},
-  };
-}
-
-function conflict(kind: "principal_conflict" | "source_conflict", cursorKey: string, existing: CursorRow | undefined): CollectResult {
+function stoppedResult(kind: "interrupted" | "principal_conflict" | "source_conflict", cursorKey: string, existing: CursorRow | undefined, interruptReason: InterruptReason | null): CollectResult {
   return {
     kind,
     cursorKey,
@@ -474,9 +456,17 @@ function conflict(kind: "principal_conflict" | "source_conflict", cursorKey: str
     discardPending: existing?.discardPending ?? false,
     jobConflict: existing?.jobConflict ?? false,
     jobConflictIdentities: 0,
-    interruptReason: null,
+    interruptReason,
     counters: {},
   };
+}
+
+function interrupted(cursorKey: string, existing: CursorRow | undefined, reason: InterruptReason): CollectResult {
+  return stoppedResult("interrupted", cursorKey, existing, reason);
+}
+
+function conflict(kind: "principal_conflict" | "source_conflict", cursorKey: string, existing: CursorRow | undefined): CollectResult {
+  return stoppedResult(kind, cursorKey, existing, null);
 }
 
 export async function collectUsageFile(store: UsageStore, request: CollectRequest): Promise<CollectResult> {

@@ -1,6 +1,7 @@
 import { access, readFile, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { afterEach, vi } from "vitest";
+import type { Observation } from "../../src/types.js";
 import { alive } from "./mortal-process.js";
 
 export async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
@@ -88,3 +89,16 @@ export const agyAccountsToml = (enabled: boolean, agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
   'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
 ].join("\n");
+
+export function fiveHour(used: number, fetchedAt: string, resetsAt: string, meterId = "claude-main:all"): Observation {
+  return {
+    principal_id: "claude-main", meter_id: meterId, window: { kind: "rolling", minutes: 300, enforcement: "hard" },
+    quantity: { used, limit: 100, remaining: 100 - used, unit: "percent" }, resets_at: resetsAt,
+    observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
+    confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
+  };
+}
+
+export function weekly(used: number, fetchedAt: string, resetsAt: string, meterId = "claude-main:all"): Observation {
+  return { ...fiveHour(used, fetchedAt, resetsAt, meterId), window: { kind: "fixed", minutes: 10_080, enforcement: "hard" } };
+}
