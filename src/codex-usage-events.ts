@@ -25,7 +25,7 @@
  * own; it is parsed independently and never linked to any token count.
  */
 import { createHash } from "node:crypto";
-import { MAX_LINE_BYTES, normalizeUsageCounter, type NumericField, type SourceContext, type UsageLineInput } from "./usage-events.js";
+import { isTruncatedJson, MAX_LINE_BYTES, normalizeUsageCounter, type NumericField, type SourceContext, type UsageLineInput } from "./usage-events.js";
 
 export { MAX_LINE_BYTES } from "./usage-events.js";
 export type { NumericField, SourceContext, UsageLineInput } from "./usage-events.js";
@@ -171,18 +171,6 @@ function rateLimitIdentityKeyFor(principalKey: string, sourceKey: string, observ
 function record(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
-}
-
-/** Same heuristic as usage-events.ts's `isTruncatedJson`, duplicated rather
- * than imported: both modules must stay independently reviewable, and this
- * is a small pure function with no shared state to drift out of sync. */
-function isTruncatedJson(error: unknown, lineLength: number): boolean {
-  if (!(error instanceof SyntaxError)) return false;
-  if (/unexpected end of/i.test(error.message)) return true;
-  const match = /position (\d+)/.exec(error.message);
-  if (!match) return false;
-  const position = Number(match[1]);
-  return position >= lineLength - 1;
 }
 
 type TimestampOutcome = { kind: "ok"; observedAtMs: number } | { kind: "rejected"; reason: "missing_timestamp" | "invalid_timestamp" };

@@ -402,7 +402,7 @@ function planOf(observations: Observation[]): string | undefined {
   return undefined;
 }
 
-function shortMeter(observation: Observation): string {
+export function shortMeter(observation: Observation): string {
   const prefix = `${observation.principal_id}:`;
   return observation.meter_id.startsWith(prefix) ? observation.meter_id.slice(prefix.length) : observation.meter_id;
 }

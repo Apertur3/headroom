@@ -1,6 +1,6 @@
 import { readFile, mkdir, lstat, open, stat, unlink, type FileHandle } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { packageRoot } from "./version.js";
+import { dirname, join } from "node:path";
 import { headroomHome } from "./paths.js";
 import { defaultPolicy, parsePolicy, type Policy } from "./policy.js";
 import { withPolicyLock } from "./security.js";
@@ -76,13 +76,6 @@ export async function readRouting(): Promise<Routing> {
   const path = process.env.HEADROOM_ROUTING ?? join(headroomHome(), "routing.toml");
   const text = await optionalText(path);
   return text === undefined ? { consumes: {}, local_preference: "fallback", costs: {}, present: false } : { ...parseRouting(text), present: true };
-}
-
-/** Resolves to the package root both from a repo checkout (src/config.ts, one
- * level down) and from the compiled npm package (dist/config.js, also one
- * level down): examples/ ships in both, per package.json's `files`. */
-function packageRoot(): string {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
 /**

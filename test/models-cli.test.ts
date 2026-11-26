@@ -4,14 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { assistantLine, withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function assistantLine(model: string, timestamp: string, inputTokens: number, outputTokens: number): string {
-  return JSON.stringify({ type: "assistant", timestamp, message: { model, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
-}
 
 async function captureLog(): Promise<{ logs: string[]; restore: () => void }> {
   const logs: string[] = [];

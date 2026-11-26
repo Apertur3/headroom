@@ -4,14 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main, runCli } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
-  try { return await run(); } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 const DISABLED_ACCOUNTS_TOML = ['[[accounts]]', 'name = "claude-2"', 'enabled = false', 'vendor = "claude"', 'location = "/fixture/.claude2"', 'adapter = "native-ts"', ''].join("\n");
 
@@ -23,7 +19,7 @@ describe("disabled meter decisions", () => {
     const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
     const errors: string[] = []; const err = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(line); });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         // These are dispatch/capacity decisions: refusing a disabled
         // principal is a normal "no", exit 2 -- the same code any other
         // refusal from these commands already uses.
@@ -45,7 +41,7 @@ describe("disabled meter decisions", () => {
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     const errors: string[] = []; const err = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(line); });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         // Neither command has its own "UNKNOWN reading" convention (they are
         // writes, not reads): a disabled refusal here is an ordinary thrown
         // error, caught by runCli exactly like any other CLI failure (exit
@@ -61,7 +57,7 @@ describe("disabled meter decisions", () => {
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         expect(await main(["rate", "--meter", "claude-2:all", "--json"])).toBe(0);
         expect(await main(["plan", "--meter", "claude-2:all", "--until", "reset", "--json"])).toBe(0);
         expect(await main(["wait", "--meter", "claude-2:all", "--until-reset"])).toBe(0);
@@ -94,7 +90,7 @@ describe("disabled meter decisions", () => {
     const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
     const errors: string[] = []; const err = vi.spyOn(console, "error").mockImplementation((line: string) => { errors.push(line); });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         expect(await main(["rate", "--json"])).toBe(0);
         expect(await main(["credits", "--json"])).toBe(0);
         expect(await runCli(["credits", "set", "--principal", "claude-2", "--available", "1", "--expires", "2026-10-01"])).toBe(1);
@@ -115,7 +111,7 @@ describe("disabled meter decisions", () => {
     } finally { store.close(); }
     const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
     try {
-      await withHome(home, async () => { expect(await main(["history", "claude-2:all"])).toBe(0); });
+      await withHeadroomHome(home, async () => { expect(await main(["history", "claude-2:all"])).toBe(0); });
     } finally { log.mockRestore(); }
     const rows = JSON.parse(output[0]) as Array<{ principal_id: string }>;
     expect(rows).toEqual(expect.arrayContaining([expect.objectContaining({ principal_id: "claude-2" })]));
@@ -134,7 +130,7 @@ describe("disabled meter decisions", () => {
     } finally { store.close(); }
     const output: string[] = []; const log = vi.spyOn(console, "log").mockImplementation((line: string) => { output.push(line); });
     try {
-      await withHome(home, async () => { expect(await main(["status", "--json"])).toBe(0); });
+      await withHeadroomHome(home, async () => { expect(await main(["status", "--json"])).toBe(0); });
     } finally { log.mockRestore(); }
     const result = JSON.parse(output[0]) as { observations: Array<{ principal_id: string }>; disabled_principals: string[] };
     expect(result.disabled_principals).toEqual(["claude-2"]);

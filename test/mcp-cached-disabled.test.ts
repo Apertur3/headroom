@@ -4,16 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cacheCan, cacheRate } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function seed(home: string): Promise<void> {
   await writeFile(join(home, "routing.toml"), ['local_preference = "prefer"', "[consumes]", 'review = ["codex-live:main"]', ""].join("\n"), { mode: 0o600 });
@@ -46,7 +40,7 @@ describe("MCP cached disabled-principal boundary", () => {
     const home = await mkdtemp(join(tmpdir(), "headroom-mcp-cached-disabled-"));
     temporary.push(home);
     await seed(home);
-    await withHome(home, async () => {
+    await withHeadroomHome(home, async () => {
       const can = await cacheCan("review", false, "tester", null) as { source: string; daemon: string; decision: { meter: string } };
       expect(can).toMatchObject({ source: "cache", daemon: "unresponsive", decision: { meter: "codex-live:main" } });
       expect(can.decision.meter).not.toBe("local-parked:capacity");

@@ -23,7 +23,7 @@ import { pollAccounts } from "./collector.js";
 import { checkModelAvailability } from "./model-catalog.js";
 import { formatMeters, formatRatePercent, formatReset, label, renderStatus, statusViewOptions, STATUS_VIEW_FLAGS } from "./status-view.js";
 import { daemonRequest, socketPath, socketPathProblem, HeadroomDaemon } from "./daemon.js";
-import { serveMcp } from "./mcp.js";
+import { disabledMeterReason, serveMcp } from "./mcp.js";
 import { NOTIFY_USAGE, notifyCommand } from "./notify.js";
 import { runSetup } from "./setup.js";
 import { LINE_USAGE, lineCommand } from "./agent-line.js";
@@ -441,11 +441,6 @@ function boundedNumberOption(value: string | undefined, flag: string, minimum: n
 // runCli's own error handling or folds into its own existing failure shape)
 // rather than silently reporting "nothing disabled" and risking admission of
 // a parked principal's stored capacity.
-async function disabledMeterReason(meter: string): Promise<string | undefined> {
-  const principal = disabledPrincipalForMeter(await readAccountsOrEmpty(), meter);
-  return principal ? disabledPrincipalReason(principal) : undefined;
-}
-
 /** Like disabledMeterReason, but for an action class's resolved list of
  * meters: names which specific meter is disabled (never just meters[0]),
  * since a decision built from this must report the actual deciding meter. */

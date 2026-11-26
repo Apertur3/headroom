@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { rpc, daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
-import { testSocketPath } from "./helpers/common.js";
+import { testSocketPath, withFakePlatform } from "./helpers/common.js";
 
 const temporary: string[] = [];
 // maxRetries/retryDelay: this file's client-side test spins up a raw
@@ -36,13 +36,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
  * rpc()/daemonRequest() wire construction (tested against a plain
  * TCP-shaped fake server that speaks the same nonce-then-request protocol).
  */
-async function withFakePlatform<T>(platform: NodeJS.Platform, run: () => T): Promise<T> {
-  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-  Object.defineProperty(process, "platform", { value: platform, configurable: true });
-  try { return await run(); }
-  finally { Object.defineProperty(process, "platform", descriptor); }
-}
-
 function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 function pipeAuthProof(token: string, nonce: string): string {
   return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");

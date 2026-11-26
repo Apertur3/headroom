@@ -138,7 +138,7 @@ function cacheBreakdownOf(usage: Record<string, unknown>): CacheCreationBreakdow
  * failed on a token found earlier in otherwise-complete-looking input. This
  * reads only the numeric position out of the engine's message, never the
  * message text itself, so no line content ever surfaces through it. */
-function isTruncatedJson(error: unknown, lineLength: number): boolean {
+export function isTruncatedJson(error: unknown, lineLength: number): boolean {
   if (!(error instanceof SyntaxError)) return false;
   if (/unexpected end of/i.test(error.message)) return true;
   const match = /position (\d+)/.exec(error.message);

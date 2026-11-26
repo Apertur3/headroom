@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,23 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { descendantsOf, isProcessGroupAlive, killTree, listProcesses, processSignature, type ProcessEntry } from "../src/process-tree.js";
 import { agyPtyCommand } from "../src/antigravity-keepalive.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
-import { waitUntilDead } from "./helpers/common.js";
+import { waitForFile, waitUntilDead } from "./helpers/common.js";
 
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try {
-      const text = await readFile(path, "utf8");
-      if (text.trim()) return text.trim();
-    } catch { /* not written yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 /** A delivered SIGKILL is not instantaneous: the kernel still has to
  * schedule the target and its parent gets to reap it, typically within a

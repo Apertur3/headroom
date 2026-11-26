@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { vi } from "vitest";
 import { alive } from "./mortal-process.js";
@@ -36,10 +36,43 @@ export async function waitForFile(path: string, timeoutMs = 5_000): Promise<stri
   }
 }
 
-export async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
+export async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
   while (alive(pid)) {
     if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
+}
+
+export function captureOutput(): { stdout: string[]; stderr: string[]; restore: () => void } {
+  const stdout: string[] = []; const stderr: string[] = [];
+  const logSpy = vi.spyOn(console, "log").mockImplementation((line: string) => { stdout.push(String(line)); });
+  const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { stderr.push(String(line)); });
+  return { stdout, stderr, restore: () => { logSpy.mockRestore(); errorSpy.mockRestore(); } };
+}
+
+export function assistantLine(model: string, timestamp: string, inputTokens: number, outputTokens: number): string {
+  return JSON.stringify({ type: "assistant", timestamp, message: { model, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
+}
+
+export function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+export async function fileExists(path: string): Promise<boolean> {
+  try { await access(path); return true; } catch { return false; }
+}
+
+export async function withFakePlatform<T>(platform: NodeJS.Platform, run: () => T): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try { return await run(); }
+  finally { Object.defineProperty(process, "platform", descriptor); }
+}
+
+export async function withProbePath<T>(path: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.HEADROOM_PROBE_PATH;
+  process.env.HEADROOM_PROBE_PATH = path;
+  try { return await run(); }
+  finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
 }

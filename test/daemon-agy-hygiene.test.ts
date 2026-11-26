@@ -9,8 +9,8 @@ import { runNativeEngine } from "../src/engine/native/run.js";
 import { isProcessGroupAlive } from "../src/process-tree.js";
 import type { ProviderAccount } from "../src/types.js";
 import { processesMentioning, writeCountingEngine, writeGrandchildEngine } from "./helpers/fake-engine.js";
-import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath, waitForFile } from "./helpers/common.js";
+import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
 
 // The suite-wide setup mocks discovery to "nothing running"; this file needs
 // to decide, per step, whether someone else's Antigravity server is reachable.
@@ -26,14 +26,6 @@ afterEach(async () => {
   external.pids = [];
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 const accountsToml = (agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', "enabled = true",

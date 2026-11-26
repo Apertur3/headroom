@@ -4,7 +4,7 @@ import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClaudeProbeError, checkClaudeCredentialReadable, claudeKeychainMetadata, claudeLoggedOutReason, claudeSecurityToolFailureReason, isClaudeProbeDenialReason, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { withHeadroomHome, withProbePath } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -14,13 +14,6 @@ async function fakeProbe(root: string, name: string, marker: string, exitCode: n
   await writeFile(path, `#!/bin/sh\necho ${marker} 1>&2\nexit ${exitCode}\n`, { mode: 0o755 });
   await chmod(path, 0o755);
   return path;
-}
-
-async function withProbePath<T>(path: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_PROBE_PATH;
-  process.env.HEADROOM_PROBE_PATH = path;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
 }
 
 // The probe binary is macOS-only in real use (Keychain access); this table

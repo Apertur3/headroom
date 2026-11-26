@@ -8,6 +8,7 @@ import { assertSessionId, readInbox, sendInboxMessage, sendInboxMessageAt, sessi
 import { handleMcp } from "../src/mcp.js";
 import * as securityModule from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -16,13 +17,6 @@ async function home(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-inbox-"));
   temporary.push(root);
   return join(root, ".headroom");
-}
-
-async function withHeadroomHome<T>(path: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = path;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
 }
 
 async function capture(run: () => Promise<void>): Promise<string[]> {

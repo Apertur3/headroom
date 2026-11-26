@@ -19,7 +19,7 @@ import { creditsLapsed, isCurrentBankedResetObservation } from "./credits.js";
 import { headroomHome } from "./paths.js";
 import { blockedLaneReason, defaultPolicy, isVisibilityOnly, paceDecision, type Policy } from "./policy.js";
 import { formatResetsIn, servedResetsIn } from "./resets.js";
-import { formatRatePercent, labelForMinutes } from "./status-view.js";
+import { formatRatePercent, labelForMinutes, shortMeter } from "./status-view.js";
 import type { Observation, PaceState } from "./types.js";
 
 export const LINE_TEXT_FILE = "line.txt";
@@ -82,11 +82,6 @@ function unknownReason(item: Observation): LineUnknownReason {
   if (item.freshness === "failed") return "failed";
   if (item.metadata?.vendor_window_held || item.metadata?.vendor_inconsistent) return "held";
   return "none";
-}
-
-function shortMeter(item: Observation): string {
-  const prefix = `${item.principal_id}:`;
-  return item.meter_id.startsWith(prefix) ? item.meter_id.slice(prefix.length) : item.meter_id;
 }
 
 function round1(value: number): number { return Math.round(value * 10) / 10; }

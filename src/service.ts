@@ -96,7 +96,7 @@ async function defaultDaemonProbe(): Promise<boolean> {
   return (await daemonRequest(socketPath(), "health", {}, 500, 500)).status === "available";
 }
 
-async function defaultRequestShutdown(): Promise<ShutdownOutcome> {
+export async function defaultRequestShutdown(): Promise<ShutdownOutcome> {
   const { requestDaemonShutdown, socketPath } = await import("./daemon.js");
   return requestDaemonShutdown(socketPath());
 }

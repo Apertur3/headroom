@@ -7,14 +7,10 @@ import { cacheCan, handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = home;
-  try { return await run(); } finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 /**
  * Routes an MCP `call` straight through a real (unstarted -- no socket, no
@@ -72,7 +68,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     await seedReading(home, "claude-2");
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const rateLine = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_rate", arguments: {} } });
         const daemonRate = stableFields(structuredContentOf(await handleMcp(rateLine, daemonCallVia(daemon))));
         const directRate = stableFields(structuredContentOf(await handleMcp(rateLine, async () => undefined)));
@@ -93,7 +89,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_rate", arguments: { meter: "claude-2:all" } } });
         const daemonShape = stableFields(structuredContentOf(await handleMcp(line, daemonCallVia(daemon))));
         const directShape = stableFields(structuredContentOf(await handleMcp(line, async () => undefined)));
@@ -108,7 +104,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_plan", arguments: { meter: "claude-2:all" } } });
         const daemonShape = stableFields(structuredContentOf(await handleMcp(line, daemonCallVia(daemon))));
         const directShape = stableFields(structuredContentOf(await handleMcp(line, async () => undefined)));
@@ -123,7 +119,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     await writeFile(join(home, "accounts.toml"), DISABLED_ACCOUNTS_TOML, { mode: 0o600 });
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_fill", arguments: { meter: "claude-2:all" } } });
         const daemonShape = stableFields(structuredContentOf(await handleMcp(line, daemonCallVia(daemon))));
         const directShape = stableFields(structuredContentOf(await handleMcp(line, async () => undefined)));
@@ -139,7 +135,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     await writeFile(join(home, "routing.toml"), ROUTING_TOML, { mode: 0o600 });
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_gate", arguments: { needs: ["5h:1"], meter: "claude-2:all", owner: "test" } } });
         const daemonResponse = structuredContentOf(await handleMcp(line, daemonCallVia(daemon)));
         const directResponse = structuredContentOf(await handleMcp(line, async () => undefined));
@@ -167,7 +163,7 @@ describe("daemon RPC and direct MCP path agree on a disabled meter", () => {
     } finally { store.close(); }
     const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
     try {
-      await withHome(home, async () => {
+      await withHeadroomHome(home, async () => {
         const line = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "quota_can", arguments: { action_class: "parked", owner: "test" } } });
         const daemonResult = stableFields(structuredContentOf(await handleMcp(line, daemonCallVia(daemon))));
         const directResult = stableFields(structuredContentOf(await handleMcp(line, async () => undefined)));

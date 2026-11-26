@@ -5,10 +5,10 @@ import { fileURLToPath } from "node:url";
 
 /** Resolves to the package root both from a repo checkout (src/version.ts,
  * one level down) and from the compiled npm package (dist/version.js, also
- * one level down) -- the same resolution config.ts's own packageRoot() uses
+ * one level down) -- shared by config.ts
  * for examples/. package.json itself always ships in the npm tarball; npm
  * includes it regardless of the "files" allowlist. */
-function packageRoot(): string {
+export function packageRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 

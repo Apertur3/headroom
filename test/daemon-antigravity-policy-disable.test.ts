@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { setProcIdentityDeniedForTest } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath, waitUntilDead } from "./helpers/common.js";
+import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
 
 /**
  * Proves that a policy-level `antigravity_keepalive = false`
@@ -21,18 +21,6 @@ import { testSocketPath, waitUntilDead } from "./helpers/common.js";
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try {
-      const text = await readFile(path, "utf8");
-      if (text.trim()) return text.trim();
-    } catch { /* not written yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 const accountsToml = (enabled: boolean, agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,

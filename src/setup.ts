@@ -48,7 +48,7 @@ interface SetupOptions {
   rl: Pick<Interface, "question"> | undefined;
 }
 
-async function defaultClaudeOnPath(): Promise<boolean> {
+export async function defaultClaudeOnPath(): Promise<boolean> {
   try {
     await execFileAsync(process.platform === "win32" ? "where" : "which", ["claude"]);
     return true;

@@ -6,6 +6,7 @@ import { delimiter, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runNpmInstall, runUpdate, type SpawnResult } from "../src/update.js";
 import { headroomVersion } from "../src/version.js";
+import { json } from "./helpers/common.js";
 
 // The executable name the platform under test resolves: npm.cmd on Windows.
 const npmName = process.platform === "win32" ? "npm.cmd" : "npm";
@@ -19,10 +20,6 @@ async function seededHome(prefix = "headroom-update-install-"): Promise<string> 
   const home = join(root, ".headroom");
   await mkdir(home, { recursive: true, mode: 0o700 });
   return home;
-}
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 function registryFetch(version: string): typeof fetch {

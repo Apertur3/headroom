@@ -10,17 +10,10 @@ import { doctorChecks, homeCheck, keychainGrantCheck } from "../src/doctor.js";
 import { credentialPath } from "../src/paths.js";
 import { HeadroomStore } from "../src/store.js";
 import { isMainModule, supportsBuiltinSqlite, warningSuppressionFlag } from "../bin/headroom.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { withHeadroomHome, withProbePath } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withProbePath<T>(path: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_PROBE_PATH;
-  process.env.HEADROOM_PROBE_PATH = path;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
-}
 
 /** A fake `security` earlier on PATH than /usr/bin/security, so doctor's
  * metadata-only lookup answers from a synthetic attribute dump instead of the

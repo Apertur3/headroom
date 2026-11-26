@@ -3,13 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { modelTokenShare } from "../src/session-logs.js";
+import { assistantLine } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function assistantLine(model: string, timestamp: string, inputTokens: number, outputTokens: number): string {
-  return JSON.stringify({ type: "assistant", timestamp, message: { model, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
-}
 
 async function configDir(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-session-logs-")); temporary.push(root);

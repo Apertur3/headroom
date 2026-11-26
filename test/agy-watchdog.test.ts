@@ -9,7 +9,7 @@ import * as discovery from "../src/antigravity-discovery.js";
 import { parsePolicy } from "../src/policy.js";
 import type { ExecFile } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { waitForFile } from "./helpers/common.js";
+import { waitForFile, waitUntilDead } from "./helpers/common.js";
 
 const { externalAntigravityServerPids, isAntigravityServerCommand } = discovery;
 /** Added with the executable-only matching fix; read lazily so its absence
@@ -22,14 +22,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 
 async function fixture(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix)); temporary.push(root); return root;
-}
-
-async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 /** A real keepalive launch (fake agy under script) whose ps-verified state is on disk. */

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { waitUntilDead } from "./helpers/common.js";
+import { waitForFile, waitUntilDead } from "./helpers/common.js";
 
 const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
 
@@ -37,18 +37,6 @@ afterEach(async () => {
   groupKillCalls.splice(0);
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try {
-      const text = await readFile(path, "utf8");
-      if (text.trim()) return text.trim();
-    } catch { /* not written yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 describe.skipIf(process.platform === "win32")("AgyKeepaliveSupervisor: confirming a kill worked before trusting or acting on it", () => {
   it("stop() does not clear the recorded state when the confirmation check keeps reporting the target alive after signalling", async () => {

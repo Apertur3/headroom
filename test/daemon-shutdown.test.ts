@@ -12,19 +12,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { HeadroomDaemon, requestDaemonShutdown } from "../src/daemon.js";
 import { headroomVersion } from "../src/version.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
-import { testSocketPath } from "./helpers/common.js";
+import { testSocketPath, withFakePlatform } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))); });
 
 const poller = async () => ({ observations: [], failures: [] });
-
-async function withFakePlatform<T>(platform: NodeJS.Platform, run: () => T): Promise<T> {
-  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-  Object.defineProperty(process, "platform", { value: platform, configurable: true });
-  try { return await run(); }
-  finally { Object.defineProperty(process, "platform", descriptor); }
-}
 
 /** Whether the daemon's shutdownRequested promise has resolved, without waiting on it. */
 async function requested(daemon: HeadroomDaemon): Promise<boolean> {

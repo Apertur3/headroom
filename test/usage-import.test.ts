@@ -1,19 +1,12 @@
 import { mkdir, mkdtemp, rm, writeFile, chmod, lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { main, COMMAND_HELP } from "../src/cli.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { captureOutput, withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function captureOutput(): { stdout: string[]; stderr: string[]; restore: () => void } {
-  const stdout: string[] = []; const stderr: string[] = [];
-  const logSpy = vi.spyOn(console, "log").mockImplementation((line: string) => { stdout.push(String(line)); });
-  const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { stderr.push(String(line)); });
-  return { stdout, stderr, restore: () => { logSpy.mockRestore(); errorSpy.mockRestore(); } };
-}
 
 /** Synthetic assistant transcript line: hand written to match the shape
  * usage-events.ts's parser accepts, never a capture of a real transcript. */

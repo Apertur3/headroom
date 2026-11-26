@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({ checkModelAvailability: vi.fn() }));
 vi.mock("../src/model-catalog.js", () => ({ checkModelAvailability: mocks.checkModelAvailability }));
 
 import { HeadroomDaemon } from "../src/daemon.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -14,13 +15,6 @@ afterEach(async () => {
   mocks.checkModelAvailability.mockReset();
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function withHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 const accountsToml = [
   "[[accounts]]", 'name = "codex-parked"', "enabled = false", 'vendor = "codex"', 'location = "/fixture/codex-parked"', 'adapter = "native-ts"', "",
@@ -33,7 +27,7 @@ describe("daemon model catalog caller", () => {
     temporary.push(home);
     await writeFile(join(home, "accounts.toml"), accountsToml, { mode: 0o600 });
     mocks.checkModelAvailability.mockResolvedValue(undefined);
-    await withHome(home, async () => {
+    await withHeadroomHome(home, async () => {
       const daemon = await HeadroomDaemon.create({ home, path: join(home, "headroom.sock"), poller: async () => ({ observations: [], failures: [] }) });
       const internal = daemon as unknown as { poll(principal: string | undefined, forced: boolean): Promise<unknown> };
       try {

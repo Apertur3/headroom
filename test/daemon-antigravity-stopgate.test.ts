@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath, waitUntilDead } from "./helpers/common.js";
+import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
 
 /**
  * Isolated from the other daemon tests on purpose: this file gates
@@ -28,18 +28,6 @@ vi.mock("../src/process-tree.js", async (importOriginal) => {
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try {
-      const text = await readFile(path, "utf8");
-      if (text.trim()) return text.trim();
-    } catch { /* not written yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 const accountsToml = (enabled: boolean, agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,

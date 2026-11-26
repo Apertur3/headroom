@@ -1,4 +1,4 @@
-import { exec, execFile, spawn } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import { lstat, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,14 +11,13 @@ import { launchEnvironment } from "./orchestrator-reads.js";
 import { headroomHome } from "./paths.js";
 import { readAccounts } from "./registry.js";
 import { safeError } from "./security.js";
-import { servicePath, stopWindowsDaemon, uninstallService, waitForDaemonExit, windowsStopFailure } from "./service.js";
+import { defaultRequestShutdown, servicePath, stopWindowsDaemon, uninstallService, waitForDaemonExit, windowsStopFailure } from "./service.js";
 import type { ShutdownOutcome } from "./daemon.js";
 import { DAEMON_STOP_WAIT_MS } from "./daemon-stop.js";
-import { isYes } from "./setup.js";
+import { defaultClaudeOnPath, isYes } from "./setup.js";
 import { isLocalAccount, type Account, type ProviderAccount } from "./types.js";
 
 const execAsync = promisify(exec);
-const execFileAsync = promisify(execFile);
 
 export interface UninstallOverrides {
   /** Checks PATH for the `claude` command; overridden in tests to avoid depending on the machine. */
@@ -71,13 +70,6 @@ async function directoryExists(path: string): Promise<boolean> {
   try { return (await stat(path)).isDirectory(); } catch { return false; }
 }
 
-async function defaultClaudeOnPath(): Promise<boolean> {
-  try {
-    await execFileAsync(process.platform === "win32" ? "where" : "which", ["claude"]);
-    return true;
-  } catch { return false; }
-}
-
 function defaultRunClaudeMcpRemove(env: NodeJS.ProcessEnv, scope: "user" | "local", cwd?: string): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn("claude", ["mcp", "remove", "--scope", scope, "headroom"], { stdio: "inherit", env, cwd });
@@ -102,11 +94,6 @@ async function defaultProbeDaemon(): Promise<boolean> {
   // falls back to the legacy one, so a daemon an older version started is seen too.
   const { daemonRequest, socketPath } = await import("./daemon.js");
   return (await daemonRequest(socketPath(), "health", {}, 500, 500)).status === "available";
-}
-
-async function defaultRequestShutdown(): Promise<ShutdownOutcome> {
-  const { requestDaemonShutdown, socketPath } = await import("./daemon.js");
-  return requestDaemonShutdown(socketPath());
 }
 
 /** Printed when the Windows daemon outlives the wait. Headroom has no way to verify a Windows process's

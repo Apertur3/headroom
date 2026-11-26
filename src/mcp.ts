@@ -191,7 +191,7 @@ function heartbeatFields(store: HeadroomStore, now: Date): { heartbeats: Heartbe
 // the outer handleMcp try/catch turns into an MCP tool error -- never
 // silently reported as "no disabled accounts," which could admit a parked
 // principal's stored capacity as current.
-async function disabledMeterReason(meter: string): Promise<string | undefined> {
+export async function disabledMeterReason(meter: string): Promise<string | undefined> {
   const principal = disabledPrincipalForMeter(await readAccountsOrEmpty(), meter);
   return principal ? disabledPrincipalReason(principal) : undefined;
 }

@@ -15,6 +15,7 @@ import { defaultPolicy, paceState } from "../src/policy.js";
 import { discoverAccounts } from "../src/registry.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
+import { json } from "./helpers/common.js";
 
 const posix = process.platform !== "win32";
 const kimi = { name: "kimi", vendor: "kimi", location: "/Users/test/.kimi/auth.token", adapter: "native-ts" } as const;
@@ -35,10 +36,6 @@ async function tokenFile(contents: string, mode = 0o600, name = "auth.token"): P
   await writeFile(path, contents, "utf8");
   await chmod(path, mode);
   return path;
-}
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 /** Answers each gateway path from the synthetic fixtures and records every

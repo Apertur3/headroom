@@ -2,13 +2,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { main, usagePasteLine } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { clipboardCommand, observationsFromUsagePaste, parseResetAt, parseUsagePanel, resolveClaudePrincipal, scopeMeter } from "../src/adapters/claude-usage-paste.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation } from "../src/types.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { captureOutput, withHeadroomHome } from "./helpers/common.js";
 
 /** Every panel under test/fixtures/usage-paste is synthetic: hand written for
  * these tests against the shapes the parser is documented to tolerate, never
@@ -27,13 +27,6 @@ async function claudeHome(prefix: string, principals: string[] = ["claude-main"]
     "[[accounts]]", `name = ${JSON.stringify(name)}`, 'vendor = "claude"', `location = ${JSON.stringify(join(root, `.${name}`))}`, 'adapter = "native-ts"', "",
   ]).join("\n"), { mode: 0o600 });
   return home;
-}
-
-function captureOutput(): { stdout: string[]; stderr: string[]; restore: () => void } {
-  const stdout: string[] = []; const stderr: string[] = [];
-  const logSpy = vi.spyOn(console, "log").mockImplementation((line: string) => { stdout.push(String(line)); });
-  const errorSpy = vi.spyOn(console, "error").mockImplementation((line: string) => { stderr.push(String(line)); });
-  return { stdout, stderr, restore: () => { logSpy.mockRestore(); errorSpy.mockRestore(); } };
 }
 
 /** main(["usage", "--paste", ...]) resolves the principal (reading

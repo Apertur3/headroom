@@ -10,6 +10,7 @@ import { allowedOutbound } from "../src/security.js";
 import { defaultPolicy, parsePolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { tailDaemonLog } from "../src/logs.js";
+import { json } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -20,10 +21,6 @@ async function seededHome(prefix = "headroom-update-"): Promise<string> {
   const home = join(root, ".headroom");
   await mkdir(home, { recursive: true, mode: 0o700 });
   return home;
-}
-
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 /** Records every request URL it was called with; the outbound allowlist
