@@ -66,7 +66,7 @@ describe.skipIf(process.platform === "win32")("daemon agy process hygiene", () =
 
       external.pids = [4_000_000];
       await attempt(daemon);
-      await waitUntilDead(agyPid);
+      await waitUntilDead(agyPid, 4_000);
       expect(internal.keepalive).toBeUndefined();
     } finally {
       await daemon.stop();

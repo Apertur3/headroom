@@ -37,7 +37,7 @@ export async function waitForFile(path: string, timeoutMs = 5_000): Promise<stri
   }
 }
 
-export async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {
+export async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
   const start = Date.now();
   while (alive(pid)) {
     if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);

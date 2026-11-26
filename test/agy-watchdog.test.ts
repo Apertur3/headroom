@@ -54,8 +54,8 @@ describe.skipIf(process.platform === "win32")("agy age watchdog", () => {
       // Not exempt: this launch stands in for one a previous daemon left behind.
       const killed = await runAgyWatchdog({ home: root, maxAgeMs: 0, log: async (message) => { logged.push(message); } });
       expect(killed.map((item) => item.pid)).toContain(agyPid);
-      await waitUntilDead(agyPid);
-      await waitUntilDead(scriptPid);
+      await waitUntilDead(agyPid, 4_000);
+      await waitUntilDead(scriptPid, 4_000);
       expect(logged.join("\n")).toContain(`pid ${agyPid}`);
       const inbox = (await inboxTexts(root)).join("\n");
       expect(inbox).toContain(`pid ${agyPid}`);
@@ -78,7 +78,7 @@ describe.skipIf(process.platform === "win32")("agy age watchdog", () => {
       const killed = await runAgyWatchdog({ home: root, maxAgeMs: 0, log: async () => undefined });
       expect(killed.map((item) => item.pid)).toContain(agyPid);
       expect(killed.map((item) => item.pid)).not.toContain(strangerPid);
-      await waitUntilDead(agyPid);
+      await waitUntilDead(agyPid, 4_000);
       expect(alive(strangerPid)).toBe(true);
     } finally { await supervisor.stop(); }
   }, 20_000);
