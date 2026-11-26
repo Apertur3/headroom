@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeUnmarkedDaemonStatus } from "../src/status-normalization.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 // node:sqlite has no published types in this codebase's target lib; a
 // structural minimum is all this file needs to poke at PRAGMA user_version
@@ -23,13 +24,6 @@ afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 function observation(overrides: Partial<Observation> = {}): Observation {
   return {

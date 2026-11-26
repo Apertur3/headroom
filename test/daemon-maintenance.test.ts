@@ -22,7 +22,7 @@
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import * as configModule from "../src/config.js";
@@ -33,6 +33,7 @@ import * as notifyModule from "../src/notify.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
+import { testSocketPath } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -40,10 +41,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 // A Unix socket on POSIX; a named pipe on win32 (see daemon-mcp.test.ts's
 // identical helper -- a real Windows daemon never listens on a bare
 // filesystem path).
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
-
 /**
  * Bounded, short real-time polling -- not a fake clock. A real
  * HeadroomDaemon.start()/stop() does real async I/O the daemon-owned

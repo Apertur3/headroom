@@ -1,6 +1,6 @@
 import { paceCore } from "./pace-core.js";
 import { expandHome } from "./paths.js";
-import { formatClockTime, formatResetsIn, formatResetsInCoarse, resetSecondsRemaining } from "./resets.js";
+import { formatClockTime, formatResetsInCoarse, resetSecondsRemaining } from "./resets.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
 /** One `[reserve."<meter>"]` (or the top-level `freeze_reserve_pct`'s own

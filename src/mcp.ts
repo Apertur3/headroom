@@ -12,7 +12,7 @@ import { parseGateNeed, type GateNeed } from "./pacing.js";
 import { admitCanCost, fillFor, gateFor, pickDecidingObservation, planFor, rateLines, routeFor } from "./orchestrator-reads.js";
 import { readAccounts, readAccountsOrEmpty } from "./registry.js";
 import { observationsFromUsagePaste, parseUsagePanel, resolveClaudePrincipal } from "./adapters/claude-usage-paste.js";
-import { resetSecondsRemaining, resetsIn, withResetsIn } from "./resets.js";
+import { resetSecondsRemaining, withResetsIn } from "./resets.js";
 import { withCreditsLapsed } from "./credits.js";
 import { safeError } from "./security.js";
 import { headroomVersion, staleProcessHint } from "./version.js";

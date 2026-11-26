@@ -9,6 +9,7 @@ import * as discovery from "../src/antigravity-discovery.js";
 import { parsePolicy } from "../src/policy.js";
 import type { ExecFile } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { waitForFile } from "./helpers/common.js";
 
 const { externalAntigravityServerPids, isAntigravityServerCommand } = discovery;
 /** Added with the executable-only matching fix; read lazily so its absence
@@ -21,15 +22,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 
 async function fixture(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix)); temporary.push(root); return root;
-}
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try { const text = (await readFile(path, "utf8")).trim(); if (text) return text; } catch { /* not yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {

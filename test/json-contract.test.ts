@@ -27,6 +27,7 @@ import { main, printEventsOutput, printModelsOutput } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
 import type { HeadroomEvent, KnownModel, Observation } from "../src/types.js";
+import { captureLog, withHeadroomHome } from "./helpers/common.js";
 
 // Host pressure is a live reading of whatever machine runs the suite, and
 // its measurements are null where a probe does not exist (Windows has no
@@ -90,13 +91,6 @@ async function compareToFixture(name: string, actual: unknown): Promise<void> {
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
-
 async function newHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), `headroom-json-contract-${prefix}-`));
   temporary.push(root);
@@ -144,12 +138,6 @@ async function seedBasic(home: string, now = new Date()): Promise<void> {
     store.insert(fiveHour(35, 5 * 60_000, 4 * 3_600_000, now));
     store.endLease(lease.id, "cadence", false, new Date(now.getTime() + 5 * 60_000));
   } finally { store.close(); }
-}
-
-function captureLog(): { logs: string[]; restore: () => void } {
-  const logs: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
-  return { logs, restore: () => spy.mockRestore() };
 }
 
 // ---- CLI --json outputs ---------------------------------------------------

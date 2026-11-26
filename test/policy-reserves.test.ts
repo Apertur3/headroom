@@ -9,28 +9,16 @@ import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry 
 import { policyLockPath } from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { captureLog, withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function tempHome(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-reserves-")); temporary.push(root);
   const home = join(root, ".headroom");
   await mkdir(home, { recursive: true, mode: 0o700 });
   return home;
-}
-
-function captureLog(): { logs: string[]; restore: () => void } {
-  const logs: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
-  return { logs, restore: () => spy.mockRestore() };
 }
 
 function fiveHour(meterId: string, used: number, resetsAtMs = Date.now() + 4 * 3_600_000): Observation {

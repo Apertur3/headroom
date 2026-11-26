@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 // Fake probe binaries (temporary shell scripts standing in for
 // headroom-claude-probe) and HEADROOM_PROBE_PATH stand in for a real
@@ -21,13 +22,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 async function realTmpDir(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   return realpath(root);
-}
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
 }
 
 async function withProbePath<T>(path: string | undefined, run: () => Promise<T>): Promise<T> {

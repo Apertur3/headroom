@@ -1,8 +1,9 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { testSocketPath } from "./helpers/common.js";
 
 /**
  * Proves that currentAccounts()/readPolicy() inside
@@ -20,10 +21,6 @@ import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
 
 const accountsToml = (enabled: boolean, agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,

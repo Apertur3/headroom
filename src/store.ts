@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { randomInt, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { assertSafeAncestry, headroomHome, migrateLegacyHome } from "./paths.js";
-import { decodeResetSeen, encodeResetSeen } from "./resets.js";
+import { encodeResetSeen } from "./resets.js";
 import type { EventKind, Heartbeat, KnownModel, LastKnownReading, Lease, LeaseSpendWindow, NotifyDelivery, Observation, SpendRow, StoredObservation, Timer, HeadroomEvent } from "./types.js";
 import { IDLE_WINDOW_REASON, idleContradictionReason, isInferredFailureReason, normalizeObservations } from "./engine/observation.js";
 import { appendDaemonLog } from "./logs.js";

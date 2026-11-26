@@ -7,6 +7,7 @@ import {
   parseHostGuardPolicy, readHostGuardPolicy, type HostHealth, type HostMeasurements,
 } from "../src/host-health.js";
 import type { ProcessEntry } from "../src/process-tree.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -215,13 +216,6 @@ describe("parseHostGuardPolicy", () => {
     expect(() => parseHostGuardPolicy('[host_guard]\nrefuse_pty_percent = 150\n')).toThrow();
   });
 });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 describe("readHostGuardPolicy", () => {
   it("returns the defaults when policy.toml does not exist at all", async () => {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { descendantsOf, isProcessGroupAlive, killTree, listProcesses, processSignature, type ProcessEntry } from "../src/process-tree.js";
 import { agyPtyCommand } from "../src/antigravity-keepalive.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
+import { waitUntilDead } from "./helpers/common.js";
 
 const temporary: string[] = [];
 useProcessReaper();
@@ -28,14 +29,6 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
  * handful of milliseconds but not synchronously with the syscall that sent
  * it. Every assertion below waits this out instead of checking `alive()`
  * the instant a kill call returns. */
-async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
 describe("listProcesses", () => {
   it("parses pid/ppid/rss/comm, keeping a command that itself contains spaces intact as the trailing field", async () => {
     const fakePs = async () => ({

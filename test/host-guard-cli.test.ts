@@ -6,6 +6,7 @@ import { useProcessReaper } from "./helpers/mortal-process.js";
 import { checkHostHealth, defaultHostGuardPolicy, readHostGuardPolicy, type HostGuardPolicy, type HostHealth } from "../src/host-health.js";
 import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
+import { captureLog, withHeadroomHome } from "./helpers/common.js";
 
 // The exact pattern test/doctor-freshrun.test.ts uses to fake one export
 // while keeping the rest of a module real (vi.mock calls are hoisted above
@@ -24,13 +25,6 @@ vi.mock("../src/host-health.js", async (original) => ({
 useProcessReaper();
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); vi.clearAllMocks(); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function newHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), `headroom-hostguard-cli-${prefix}-`));
@@ -51,12 +45,6 @@ function policy(overrides: Partial<HostGuardPolicy> = {}): HostGuardPolicy {
 function mockHealthAndPolicy(healthValue: HostHealth, policyValue: HostGuardPolicy): void {
   vi.mocked(checkHostHealth).mockResolvedValue(healthValue);
   vi.mocked(readHostGuardPolicy).mockResolvedValue(policyValue);
-}
-
-function captureLog(): { logs: string[]; restore: () => void } {
-  const logs: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
-  return { logs, restore: () => spy.mockRestore() };
 }
 
 function captureError(): { lines: string[]; restore: () => void } {

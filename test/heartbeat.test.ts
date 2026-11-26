@@ -17,16 +17,10 @@ import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
 import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS, TIMER_CLAIM_STALE_MS } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function tempHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));

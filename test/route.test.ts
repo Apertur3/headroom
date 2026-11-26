@@ -8,16 +8,10 @@ import { launchEnvironment, routeFor } from "../src/orchestrator-reads.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation, ProviderAccount } from "../src/types.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 const claudeMainLocation = join(homedir(), ".claude"); // the real default profile
 const claude2Location = join(homedir(), ".claude2");

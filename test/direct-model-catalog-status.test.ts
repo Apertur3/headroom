@@ -17,6 +17,7 @@ vi.mock("../src/registry.js", async (importOriginal) => ({ ...await importOrigin
 vi.mock("../src/daemon.js", async (importOriginal) => ({ ...await importOriginal<typeof import("../src/daemon.js")>(), daemonRequest: mocks.daemonRequest }));
 
 import { main } from "../src/cli.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -27,13 +28,6 @@ afterEach(async () => {
   mocks.daemonRequest.mockReset();
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 describe("direct status model catalog check", () => {
   it("prints quota output before waiting for an independent catalog-store lifetime", async () => {

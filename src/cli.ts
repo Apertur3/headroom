@@ -2,7 +2,6 @@
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { readPolicy, readRouting, seedExampleConfig } from "./config.js";
 import { existsSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { execFile, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join, basename, delimiter, dirname } from "node:path";
@@ -49,7 +48,7 @@ import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientPro
 import { describeServiceStart, installAndStartService, installService, uninstallService } from "./service.js";
 import { DAEMON_POST_STOP_EXIT_MS, DAEMON_STOP_DEADLINE_MS } from "./daemon-stop.js";
 import { modelTokenShare } from "./session-logs.js";
-import { isEnvelopable, normalizeDaemonTimers, validateDaemonHeartbeats, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
+import { normalizeDaemonTimers, validateDaemonHeartbeats, withContract, JSON_CONTRACT_VERSION, JSON_CONTRACT_DOC_PATH } from "./json-contract.js";
 import { HeadroomStore, safeHeadroomDirectory, type CreditBalance, type PlanDowngrade } from "./store.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Heartbeat, type KnownModel, type Lease, type Observation, type HeadroomEvent, type ProviderAccount, type SpendRow, type Timer } from "./types.js";
 import { runUpdate, updateNoticeLine } from "./update.js";

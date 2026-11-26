@@ -7,20 +7,17 @@
 import { createServer, type Server } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { HeadroomDaemon, requestDaemonShutdown } from "../src/daemon.js";
 import { headroomVersion } from "../src/version.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
+import { testSocketPath } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))); });
 
 const poller = async () => ({ observations: [], failures: [] });
-
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
 
 async function withFakePlatform<T>(platform: NodeJS.Platform, run: () => T): Promise<T> {
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;

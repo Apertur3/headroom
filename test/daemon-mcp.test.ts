@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
@@ -15,16 +15,10 @@ import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 import type { Observation } from "../src/types.js";
+import { testSocketPath, withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 function fixture(): Observation {
   return {
@@ -38,10 +32,6 @@ function fixture(): Observation {
  * filesystem path -- net.Server#listen() on a bare temp-dir path fails with
  * EACCES on a real win32 host. root is already unique (mkdtemp), so folding
  * its basename into the pipe name keeps concurrent tests from colliding. */
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
-
 function sha256Hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 function pipeAuthProof(token: string, nonce: string): string {
   return createHmac("sha256", token).update(`headroom-pipe-auth-v1:${nonce}`).digest("hex");

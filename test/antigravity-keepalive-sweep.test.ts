@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgyKeepaliveSupervisor, InvalidKeepaliveEvidenceError, keepaliveLaunchAgyPidFilePath, keepaliveLaunchStateFilePath, keepaliveStateFilePath, sweepPreviousKeepalive } from "../src/antigravity-keepalive.js";
 import { killTree, processSignature, setProcIdentityDeniedForTest } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy, writeMortalShim } from "./helpers/mortal-process.js";
+import { waitUntilDead } from "./helpers/common.js";
 
 const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
 vi.mock("node:os", async (importOriginal) => {
@@ -30,14 +31,6 @@ afterEach(async () => {
   groupKillCalls.splice(0);
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
   const start = Date.now();

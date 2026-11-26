@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, lstat, open, stat, unlink, type FileHandle } from "node:fs/promises";
+import { readFile, mkdir, lstat, open, stat, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { headroomHome } from "./paths.js";

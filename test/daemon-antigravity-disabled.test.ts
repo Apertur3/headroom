@@ -1,18 +1,15 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { keepaliveLaunchAgyPidFilePath, keepaliveLaunchStateFilePath } from "../src/antigravity-keepalive.js";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { testSocketPath, waitUntilDead } from "./helpers/common.js";
 
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
 
 async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
   const start = Date.now();
@@ -22,14 +19,6 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
       if (text.trim()) return text.trim();
     } catch { /* not written yet */ }
     if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
-async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }

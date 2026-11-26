@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { waitUntilDead } from "./helpers/common.js";
 
 const groupKillCalls = vi.hoisted(() => [] as Array<{ pid: number; options: { groupOnly?: boolean } | undefined }>);
 
@@ -45,14 +46,6 @@ async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
       if (text.trim()) return text.trim();
     } catch { /* not written yet */ }
     if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
-
-async function waitUntilDead(pid: number, timeoutMs = 3_000): Promise<void> {
-  const start = Date.now();
-  while (alive(pid)) {
-    if (Date.now() - start > timeoutMs) throw new Error(`pid ${pid} still alive after ${timeoutMs}ms`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }

@@ -1,15 +1,16 @@
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { COMMAND_LIST, main } from "../src/cli.js";
 import { completionCommand, completionMeterIds, generateBashScript, generateFishScript, generatePwshScript, generateZshScript } from "../src/completion.js";
 import { socketPath } from "../src/daemon.js";
 import { HeadroomStore } from "../src/store.js";
 import { writeDiscoveredAccounts } from "../src/registry.js";
 import type { Observation } from "../src/types.js";
+import { captureLog } from "./helpers/common.js";
 
 const TOP_LEVEL_COMMANDS = [...new Set(COMMAND_LIST.map(([name]) => name.split(/\s+/)[0]))];
 const GATE_FLAGS = ["--need", "--meter", "--class", "--model", "--owner", "--plan", "--plan-share", "--json"];
@@ -17,12 +18,6 @@ const GATE_FLAGS = ["--need", "--meter", "--class", "--model", "--owner", "--pla
 function escapeRegExp(text: string): string { return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
 function mentionsWord(script: string, word: string): boolean { return new RegExp(`\\b${escapeRegExp(word)}\\b`).test(script); }
-
-function captureLog(): { logs: string[]; restore: () => void } {
-  const logs: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
-  return { logs, restore: () => spy.mockRestore() };
-}
 
 function hasBinary(name: string): boolean {
   return spawnSync("which", [name]).status === 0;

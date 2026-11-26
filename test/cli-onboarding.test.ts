@@ -4,16 +4,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMAND_HELP, COMMAND_LIST, helpText, isAccountsMissingError, main, noKeychainItemMessage } from "../src/cli.js";
 import { accountsPath } from "../src/registry.js";
+import { withEnv } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withEnv<T>(overrides: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
-  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
-  for (const [key, value] of Object.entries(overrides)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-  try { return await run(); }
-  finally { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
-}
 
 describe("headroom with no registry", () => {
   it("classifies the fresh-install ENOENT on accounts.toml, and only that exact error", async () => {

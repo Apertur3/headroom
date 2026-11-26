@@ -1,8 +1,9 @@
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { testSocketPath } from "./helpers/common.js";
 
 /**
  * Isolated from the other daemon tests on purpose: this file gates
@@ -40,10 +41,6 @@ vi.mock("../src/paths.js", async (importOriginal) => {
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
 
 const accountsToml = (enabled: boolean, agyPath: string): string => [
   "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,

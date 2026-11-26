@@ -8,16 +8,10 @@ import { servicePath } from "../src/service.js";
 import { DAEMON_STOP_BUDGET_MS, DAEMON_STOP_WAIT_MS } from "../src/daemon-stop.js";
 import { runUninstall, type UninstallOverrides } from "../src/uninstall.js";
 import type { ProviderAccount } from "../src/types.js";
+import { withEnv } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withEnv<T>(overrides: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
-  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
-  for (const [key, value] of Object.entries(overrides)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
-  try { return await run(); }
-  finally { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
-}
 
 async function fileExists(path: string): Promise<boolean> {
   try { await access(path); return true; } catch { return false; }

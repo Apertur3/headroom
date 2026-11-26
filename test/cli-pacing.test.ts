@@ -1,23 +1,17 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { formatMeters, main } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { defaultPolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { captureLog, withHeadroomHome } from "./helpers/common.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function seededHome(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-cli-pacing-"));
@@ -51,12 +45,6 @@ function weekly(used: number, fetchedAtOffsetMs: number, resetsAtOffsetMs: numbe
     observed_at: fetchedAt, fetched_at: fetchedAt, source: "fixture", truth: "official", freshness: "fresh",
     confidence: 1, adapter_version: "fixture", upstream_schema_version: "fixture",
   };
-}
-
-function captureLog(): { logs: string[]; restore: () => void } {
-  const logs: string[] = [];
-  const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { logs.push(line); });
-  return { logs, restore: () => spy.mockRestore() };
 }
 
 /** The exact shape a pending Keychain grant leaves behind (see

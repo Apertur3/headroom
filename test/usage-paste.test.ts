@@ -8,6 +8,7 @@ import { handleMcp } from "../src/mcp.js";
 import { clipboardCommand, observationsFromUsagePaste, parseResetAt, parseUsagePanel, resolveClaudePrincipal, scopeMeter } from "../src/adapters/claude-usage-paste.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation } from "../src/types.js";
+import { withHeadroomHome } from "./helpers/common.js";
 
 /** Every panel under test/fixtures/usage-paste is synthetic: hand written for
  * these tests against the shapes the parser is documented to tolerate, never
@@ -17,13 +18,6 @@ const fixture = (name: string): Promise<string> => readFile(join(fixtures, `${na
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.HEADROOM_HOME;
-  process.env.HEADROOM_HOME = home;
-  try { return await run(); }
-  finally { if (previous === undefined) delete process.env.HEADROOM_HOME; else process.env.HEADROOM_HOME = previous; }
-}
 
 async function claudeHome(prefix: string, principals: string[] = ["claude-main"]): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix)); temporary.push(root);

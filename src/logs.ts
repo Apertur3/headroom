@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { headroomHome, joinForPlatform } from "./paths.js";
 
 export const DAEMON_LOG_MAX_BYTES = 5 * 1024 * 1024;

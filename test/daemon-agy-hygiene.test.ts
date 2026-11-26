@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import type { PollOptions } from "../src/collector.js";
@@ -10,6 +10,7 @@ import { isProcessGroupAlive } from "../src/process-tree.js";
 import type { ProviderAccount } from "../src/types.js";
 import { processesMentioning, writeCountingEngine, writeGrandchildEngine } from "./helpers/fake-engine.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
+import { testSocketPath, waitForFile } from "./helpers/common.js";
 
 // The suite-wide setup mocks discovery to "nothing running"; this file needs
 // to decide, per step, whether someone else's Antigravity server is reachable.
@@ -25,19 +26,6 @@ afterEach(async () => {
   external.pids = [];
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
-
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
-
-async function waitForFile(path: string, timeoutMs = 5_000): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    try { const text = (await readFile(path, "utf8")).trim(); if (text) return text; } catch { /* not yet */ }
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${path}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
 
 async function waitUntilDead(pid: number, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();

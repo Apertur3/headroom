@@ -3,9 +3,10 @@ import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
 import { mkdir, mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { rpc, daemonRequest, HeadroomDaemon, socketPath } from "../src/daemon.js";
+import { testSocketPath } from "./helpers/common.js";
 
 const temporary: string[] = [];
 // maxRetries/retryDelay: this file's client-side test spins up a raw
@@ -20,10 +21,6 @@ afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(p
 /** A real Windows host has no filesystem-backed Unix-domain-socket
  * equivalent: net.Server#listen() on a plain temp-dir path fails with
  * EACCES there. A `\\.\pipe\...` name is the only thing that actually binds. */
-function testSocketPath(root: string, label: string): string {
-  return process.platform === "win32" ? `\\\\.\\pipe\\${basename(root)}-${label}` : join(root, `${label}.sock`);
-}
-
 /**
  * The Windows pipe session-token handshake only runs when process.platform
  * is "win32". On a real Windows CI runner this is a harmless no-op (the

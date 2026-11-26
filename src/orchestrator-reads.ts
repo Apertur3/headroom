@@ -512,13 +512,6 @@ function gateForCore(store: HeadroomStore, needs: GateNeed[], meter: string | st
         if (used + need.points > plan.points_per_5h_window) return { allowed: false, reason: `5h needs ${need.points} more but the plan line allows only ${plan.points_per_5h_window.toFixed(1)} points this window`, meters_checked: checked };
       }
     }
-    // The meter's own protected reserve (policy.toml [reserve]) is checked
-    // before the plain ceiling so the refusal can name it: a caller reading
-    // "would use the 10% reserve on claude-main:fable" knows to stop
-    // dispatching that model rather than to retry with fewer points. The
-    // larger of the two reserves then applies to everything else the gate
-    // checks, including the plan line.
-    const meterReserve = suspended ? 0 : reserveFor(options.reserves ?? {}, id);
     lastResult = { allowed: true, reason: "fits", ...(notEnforced.length ? { not_enforced: notEnforced } : {}) };
 
     const fiveHourNeed = needs.find((need) => windowNeedMinutes(need.window) === 300);
