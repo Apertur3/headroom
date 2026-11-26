@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { doctor, doctorChecks, isFreshInstall, nextSteps } from "../src/doctor.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
 // These tests model a fresh installation with no optional native reader.
 // Packaged reader availability and integrity have separate artifact tests.
@@ -12,8 +12,7 @@ vi.mock("../src/engine/native/run.js", async (original) => ({
   nativeEnginePath: vi.fn(async () => undefined),
 }));
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("nextSteps", () => {
   it("orders install-service then mcp add, with no Keychain grant step on any platform", () => {

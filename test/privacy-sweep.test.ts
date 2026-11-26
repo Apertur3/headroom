@@ -1,15 +1,15 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = join(__dirname, "..", "scripts", "privacy-sweep.sh");
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function checkFile(contents: string, opts: { denylist?: string; filename?: string } = {}): Promise<{ code: number; stdout: string }> {
   const root = await mkdtemp(join(tmpdir(), "headroom-privacy-sweep-"));

@@ -1,6 +1,6 @@
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import { alive } from "./mortal-process.js";
 
 export async function withHeadroomHome<T>(home: string, run: () => Promise<T>): Promise<T> {
@@ -76,3 +76,15 @@ export async function withProbePath<T>(path: string, run: () => Promise<T>): Pro
   try { return await run(); }
   finally { if (previous === undefined) delete process.env.HEADROOM_PROBE_PATH; else process.env.HEADROOM_PROBE_PATH = previous; }
 }
+
+/** Paths pushed here are removed after each test. */
+export function useTemporary(): string[] {
+  const temporary: string[] = [];
+  afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+  return temporary;
+}
+
+export const agyAccountsToml = (enabled: boolean, agyPath: string): string => [
+  "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
+  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
+].join("\n");

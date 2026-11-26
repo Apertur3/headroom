@@ -1,11 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { describeServiceStart, installAndStartService, serviceContents, serviceLoadSteps, servicePath, staleDaemonReason, type DaemonIdentity, type ServiceRunner } from "../src/service.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 // Every call goes through an injected runner and probe, so launchctl, systemctl and schtasks are
 // never run and no daemon socket is opened. HEADROOM_HOME is set by the test worker's isolation.

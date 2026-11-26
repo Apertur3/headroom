@@ -1,15 +1,15 @@
 /** Synthetic Swift source anchors and fake tools; no dependency fetch or live data. */
 import { execFile } from "node:child_process";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { patchSource } from "../scripts/patch-engine-model-catalog.mjs";
+import { useTemporary } from "./helpers/common.js";
 
 const exec = promisify(execFile);
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 const source = `
     public let modelQuotas: [AntigravityModelQuota]
         source: AntigravityModelQuotaSource = .remote)

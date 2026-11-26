@@ -1,12 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { experimentItems, experimentMarks } from "../src/experiment-watch.js";
 import { HeadroomStore } from "../src/store.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 // Synthetic IDs and a fake token: the watch must never echo more than three hex characters.
 const slots = (atis: string) => JSON.stringify({ oauthAccount: { token: "secret-token" }, clientDataCacheSlots: { a: { model: "claude-opus-5-5", entrypoint: "cli", at: Date.parse("2026-11-09T13:20:00Z"), org: "org-x", data: { atis } } } });

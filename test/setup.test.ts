@@ -1,14 +1,13 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsPath } from "../src/registry.js";
 import { isYes, runSetup, stepNotifications } from "../src/setup.js";
-import { fileExists, withEnv } from "./helpers/common.js";
+import { fileExists, useTemporary, withEnv } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function captureLog<T>(run: () => Promise<T>): Promise<{ result: T; logs: string[] }> {
   const logs: string[] = [];

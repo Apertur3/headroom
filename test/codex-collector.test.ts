@@ -10,14 +10,14 @@
  * token counts are invented for the test and correspond to no real Codex or
  * Claude Code session.
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { describe, it, expect, vi } from "vitest";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { main } from "../src/cli.js";
 import { UsageStore, CURRENT_USAGE_SCHEMA_VERSION, CODEX_UNAVAILABLE_MODEL } from "../src/usage-store.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
 const require_ = createRequire(import.meta.url);
 const { DatabaseSync } = require_("node:sqlite") as {
@@ -32,8 +32,7 @@ const { DatabaseSync } = require_("node:sqlite") as {
   };
 };
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 function captureOutput(): { stdout: string[]; restore: () => void } {
   const stdout: string[] = [];

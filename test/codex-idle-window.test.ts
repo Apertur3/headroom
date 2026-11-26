@@ -1,14 +1,14 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { observationsFromCodexUsage } from "../src/adapters/codex.js";
 import { paceDecision } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 const account: ProviderAccount = { name: "codex-main", vendor: "codex", adapter: "native-ts", location: "/synthetic/codex" };
 

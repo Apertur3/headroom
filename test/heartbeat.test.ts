@@ -6,10 +6,10 @@
  * picks up every other event kind (quiet hours, one-message-per-lapse
  * dedupe).
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { fireDueTimers, parseTimerAt } from "../src/heartbeat.js";
 import { readInbox, sendInboxMessage, sendInboxMessageAt } from "../src/inbox.js";
@@ -17,10 +17,9 @@ import { handleMcp } from "../src/mcp.js";
 import { deliverNotifications, parseNotifyConfig, type CommandRunner, type NotifyConfig, type NotifyOptions } from "../src/notify.js";
 import { HeadroomStore, MAX_TIMER_DELIVERY_ATTEMPTS, TIMER_CLAIM_STALE_MS } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));

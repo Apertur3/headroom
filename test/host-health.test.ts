@@ -1,16 +1,15 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   checkHostHealth, classifyHostHealth, defaultHostGuardPolicy, hostGuardRefusal, hostGuardWarning,
   parseHostGuardPolicy, readHostGuardPolicy, type HostHealth, type HostMeasurements,
 } from "../src/host-health.js";
 import type { ProcessEntry } from "../src/process-tree.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 const allUnknown: HostMeasurements = { load_ratio: null, pty_used: null, pty_max: null, orphans: null };
 

@@ -1,17 +1,16 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { accountsToml } from "../src/registry.js";
 import { servicePath } from "../src/service.js";
 import { DAEMON_STOP_BUDGET_MS, DAEMON_STOP_WAIT_MS } from "../src/daemon-stop.js";
 import { runUninstall, type UninstallOverrides } from "../src/uninstall.js";
 import type { ProviderAccount } from "../src/types.js";
-import { fileExists, withEnv } from "./helpers/common.js";
+import { fileExists, useTemporary, withEnv } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function captureLog<T>(run: () => Promise<T>): Promise<{ result: T; logs: string[] }> {
   const logs: string[] = [];

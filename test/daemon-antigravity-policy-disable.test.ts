@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { setProcIdentityDeniedForTest } from "../src/process-tree.js";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
+import { agyAccountsToml, testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
 
 /**
  * Proves that a policy-level `antigravity_keepalive = false`
@@ -21,11 +21,6 @@ import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js"
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-const accountsToml = (enabled: boolean, agyPath: string): string => [
-  "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
-  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
-].join("\n");
 
 async function withoutPs<T>(root: string, body: () => Promise<T>): Promise<T> {
   const bin = join(root, "no-ps-bin");
@@ -43,7 +38,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
@@ -87,7 +82,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a policy-level di
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });

@@ -1,7 +1,7 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildAgentLine } from "../src/agent-line.js";
 import { main } from "../src/cli.js";
 import { gateFor } from "../src/orchestrator-reads.js";
@@ -9,10 +9,10 @@ import { canConsume, defaultPolicy } from "../src/policy.js";
 import { formatMeters, renderStatus } from "../src/status-view.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
 const NOW = new Date("2026-10-18T12:00:00.000Z");
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 const base = {
   observed_at: NOW.toISOString(), fetched_at: NOW.toISOString(), source: "fixture", truth: "official", freshness: "fresh", confidence: 1,

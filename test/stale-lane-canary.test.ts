@@ -1,7 +1,7 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { findStaleLanes } from "../src/canary.js";
 import { doctorChecks } from "../src/doctor.js";
 import { readInbox } from "../src/inbox.js";
@@ -10,9 +10,9 @@ import { parsePolicy } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation } from "../src/types.js";
 import { withStatusInfo } from "../src/pace.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 const HOUR = 3_600_000;
 const T0 = new Date("2026-09-25T00:00:00Z");

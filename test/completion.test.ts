@@ -1,16 +1,16 @@
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { COMMAND_LIST, main } from "../src/cli.js";
 import { completionCommand, completionMeterIds, generateBashScript, generateFishScript, generatePwshScript, generateZshScript } from "../src/completion.js";
 import { socketPath } from "../src/daemon.js";
 import { HeadroomStore } from "../src/store.js";
 import { writeDiscoveredAccounts } from "../src/registry.js";
 import type { Observation } from "../src/types.js";
-import { captureLog } from "./helpers/common.js";
+import { captureLog, useTemporary } from "./helpers/common.js";
 
 const TOP_LEVEL_COMMANDS = [...new Set(COMMAND_LIST.map(([name]) => name.split(/\s+/)[0]))];
 const GATE_FLAGS = ["--need", "--meter", "--class", "--model", "--owner", "--plan", "--plan-share", "--json"];
@@ -23,8 +23,7 @@ function hasBinary(name: string): boolean {
   return spawnSync("which", [name]).status === 0;
 }
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function withHeadroomHome<T>(run: (home: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "headroom-completion-"));

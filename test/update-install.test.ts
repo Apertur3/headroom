@@ -1,18 +1,17 @@
 import { EventEmitter } from "node:events";
 import type { spawn } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runNpmInstall, runUpdate, type SpawnResult } from "../src/update.js";
 import { headroomVersion } from "../src/version.js";
-import { json } from "./helpers/common.js";
+import { json, useTemporary } from "./helpers/common.js";
 
 // The executable name the platform under test resolves: npm.cmd on Windows.
 const npmName = process.platform === "win32" ? "npm.cmd" : "npm";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function seededHome(prefix = "headroom-update-install-"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));

@@ -18,16 +18,16 @@
  * inspect the diff under test/fixtures/json-contract/, and commit it
  * alongside the doc update it should come with.
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main, printEventsOutput, printModelsOutput } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore } from "../src/store.js";
 import type { HeadroomEvent, KnownModel, Observation } from "../src/types.js";
-import { captureLog, withHeadroomHome } from "./helpers/common.js";
+import { captureLog, useTemporary, withHeadroomHome } from "./helpers/common.js";
 
 // Host pressure is a live reading of whatever machine runs the suite, and
 // its measurements are null where a probe does not exist (Windows has no
@@ -88,8 +88,7 @@ async function compareToFixture(name: string, actual: unknown): Promise<void> {
 
 // ---- fixtures -----------------------------------------------------------
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function newHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), `headroom-json-contract-${prefix}-`));

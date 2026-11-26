@@ -1,13 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { pollAccounts } from "../src/collector.js";
 import { claudeStatuslineNotice } from "../src/adapters/claude-statusline.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function accountsHome(root: string, location: string): Promise<string> {
   const home = join(root, ".headroom");

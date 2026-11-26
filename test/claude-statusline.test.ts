@@ -1,15 +1,15 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   formatStatuslineBar, freshStatuslineSnapshot, latestStatuslineSnapshot, observationsFromStatuslineSnapshot,
   parseStatuslineSnapshot, snapshotFromStatuslinePayload, statuslineProfile, statuslineSnapshotDirs,
 } from "../src/adapters/claude-statusline.js";
 import type { ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 // statuslineProfile()'s default-vs-named split (matchAccount's own call, with
 // no home override) always resolves against the REAL homedir(), the same way

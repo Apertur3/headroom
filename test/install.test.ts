@@ -1,13 +1,13 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { installNativeEngine, nativePlatformAssetName, platformAssetName, readEngineLock, verifiedEnginePath, type EngineLock } from "../src/engine/codexbar/install.js";
 import { nativeEnginePath } from "../src/engine/native/run.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("engine asset selection", () => {
   it("uses release asset names that match CodexBar's platform convention", () => {

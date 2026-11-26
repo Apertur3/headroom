@@ -1,12 +1,11 @@
-import { mkdir, mkdtemp, rm, writeFile, chmod, lstat } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, chmod, lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { main, COMMAND_HELP } from "../src/cli.js";
-import { captureOutput, withHeadroomHome } from "./helpers/common.js";
+import { captureOutput, useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 /** Synthetic assistant transcript line: hand written to match the shape
  * usage-events.ts's parser accepts, never a capture of a real transcript. */

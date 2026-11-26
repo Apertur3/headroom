@@ -1,17 +1,16 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main, spendLines } from "../src/cli.js";
 import { attributeSpend, UNATTRIBUTED_OWNER } from "../src/cost.js";
 import { handleMcp } from "../src/mcp.js";
 import { HeadroomStore, SPEND_LEDGER_RETENTION_DAYS } from "../src/store.js";
 import { rateLines } from "../src/orchestrator-reads.js";
 import type { Observation } from "../src/types.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function home(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-spend-"));

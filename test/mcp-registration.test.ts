@@ -1,14 +1,14 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { CLAUDE_KEYCHAIN_INACCESSIBLE_REASON, claudeSecurityToolFailureReason, isClaudeKeychainInaccessibleReason } from "../src/adapters/claude.js";
 import { credentialCheck, mcpRegistrationCheck, mcpRegistrationFor } from "../src/doctor.js";
 import { CLAUDE_MCP_ADD_ARGS, MCP_ADD_COMMAND } from "../src/mcp-registration.js";
 import type { Account, ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 // A non-default profile directory keeps every read inside the temp dir: its .claude.json sits
 // inside it, so the real ~/.claude.json is never opened.

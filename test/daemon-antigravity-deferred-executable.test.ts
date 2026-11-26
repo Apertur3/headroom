@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath } from "./helpers/common.js";
+import { agyAccountsToml, testSocketPath } from "./helpers/common.js";
 
 /**
  * Isolated from the other daemon tests on purpose: this file gates
@@ -42,11 +42,6 @@ const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-const accountsToml = (enabled: boolean, agyPath: string): string => [
-  "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
-  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
-].join("\n");
-
 async function trackPidIfWritten(path: string, root: string, timeoutMs = 300): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -67,7 +62,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     // Disabled at daemon start: start()'s own maybeStartKeepalive() call
     // must return immediately, before ever reaching executablePath(), so
     // the gate armed below applies only to the call this test drives.
-    await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
@@ -85,7 +80,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       expect(internal.keepalive).toBeUndefined();
 
       // Real re-enable, exactly like a live accounts.toml edit.
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
       const enabledAccounts = await internal.currentAccounts();
 
       gate.armed = true;
@@ -100,7 +95,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       // Disable for real WHILE executablePath() is held open.
-      await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, fakeAgy), { mode: 0o600 });
 
       // Release the gate: executablePath() now actually resolves.
       gate.release();
@@ -132,7 +127,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const firstAgy = await writeFakeAgy(join(root, "first"), firstInfoFile);
     const secondAgy = await writeFakeAgy(join(root, "second"), secondInfoFile);
     expect(firstAgy).not.toBe(secondAgy);
-    await writeFile(join(root, "accounts.toml"), accountsToml(false, firstAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, firstAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
@@ -152,14 +147,14 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       // gated executable lookup as this test's direct attempt.
       gate.armed = true;
       gate.sticky = true;
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, firstAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, firstAgy), { mode: 0o600 });
       const enabledAccounts = await internal.currentAccounts();
       const attempt = internal.maybeStartKeepalive(enabledAccounts, {});
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       // The selected account remains enabled, but its executable changes
       // while the old path is still being validated.
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, secondAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, secondAgy), { mode: 0o600 });
       gate.release();
       await attempt;
       // Let any background (poll-path) attempt that was held at the gate settle too.

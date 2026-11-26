@@ -1,13 +1,12 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ClaudeProbeError, checkClaudeCredentialReadable, claudeKeychainMetadata, claudeLoggedOutReason, claudeSecurityToolFailureReason, isClaudeProbeDenialReason, KEYCHAIN_INTERACTION_BLOCKED_MESSAGE } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
-import { withHeadroomHome, withProbePath } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome, withProbePath } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function fakeProbe(root: string, name: string, marker: string, exitCode: number): Promise<string> {
   const path = join(root, name);

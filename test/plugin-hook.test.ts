@@ -1,14 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const script = join(root, "hooks", "quota-line.sh");
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function sandbox(): Promise<{ user: string; home: string; config: string; bin: string; run: () => string }> {
   const user = await mkdtemp(join(tmpdir(), "headroom-plugin-"));

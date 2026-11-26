@@ -1,15 +1,15 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = join(__dirname, "..", "scripts", "public-audit.sh");
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 // A throwaway git repository, distinct from this project's own, so the
 // audit's tracked-file and full-history checks run against fixture content

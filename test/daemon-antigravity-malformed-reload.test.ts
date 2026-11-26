@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath } from "./helpers/common.js";
+import { agyAccountsToml, testSocketPath } from "./helpers/common.js";
 
 /**
  * Proves that currentAccounts()/readPolicy() inside
@@ -21,11 +21,6 @@ import { testSocketPath } from "./helpers/common.js";
 const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
-
-const accountsToml = (enabled: boolean, agyPath: string): string => [
-  "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
-  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
-].join("\n");
 
 async function withUnhandledRejectionCapture<T>(run: () => Promise<T>): Promise<{ result: T; rejections: unknown[] }> {
   const rejections: unknown[] = [];
@@ -51,7 +46,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a malformed confi
     // Disabled at start: daemon.start()'s own maybeStartKeepalive() call
     // must not construct a supervisor yet, so this test's poll() call
     // below is the one actually exercising the race.
-    await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemonFor(root, path, async () => {
@@ -72,7 +67,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a malformed confi
       // Real re-enable, exactly like a live accounts.toml edit -- now
       // poll() itself will see an enabled antigravity account and decide
       // an attempt is warranted.
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
       const { rejections } = await withUnhandledRejectionCapture(() => internal.poll(undefined, true));
       expect(rejections).toEqual([]);
       // The malformed file means the fresh re-read inside maybeStartKeepalive()
@@ -92,7 +87,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a malformed confi
     // Disabled at start, same reason as the accounts.toml test above:
     // daemon.start() must not already own a supervisor by the time this
     // test's own poll() call runs.
-    await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, fakeAgy), { mode: 0o600 });
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
@@ -113,7 +108,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: a malformed confi
       };
       await daemon.start();
       expect(internal.keepalive).toBeUndefined();
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
       const { rejections } = await withUnhandledRejectionCapture(() => internal.poll(undefined, true));
       expect(rejections).toEqual([]);
       expect(internal.keepalive).toBeUndefined();

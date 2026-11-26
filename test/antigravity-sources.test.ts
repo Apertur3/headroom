@@ -1,16 +1,16 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { agyLoginStateFromLog, AgyKeepaliveSupervisor, resolveAgyBinary } from "../src/antigravity-keepalive.js";
 import { noDaemonObservations } from "../src/adapters/antigravity.js";
 import { pollAccounts } from "../src/collector.js";
 import type { ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("Antigravity one-shot reads with no daemon", () => {
   it("noDaemonObservations names the daemon-kept agy fix, across every meter and window, without contacting a vendor", () => {

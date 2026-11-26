@@ -1,14 +1,14 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { main, usagePasteLine } from "../src/cli.js";
 import { handleMcp } from "../src/mcp.js";
 import { clipboardCommand, observationsFromUsagePaste, parseResetAt, parseUsagePanel, resolveClaudePrincipal, scopeMeter } from "../src/adapters/claude-usage-paste.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Account, Observation } from "../src/types.js";
-import { captureOutput, withHeadroomHome } from "./helpers/common.js";
+import { captureOutput, useTemporary, withHeadroomHome } from "./helpers/common.js";
 
 /** Every panel under test/fixtures/usage-paste is synthetic: hand written for
  * these tests against the shapes the parser is documented to tolerate, never
@@ -16,8 +16,7 @@ import { captureOutput, withHeadroomHome } from "./helpers/common.js";
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "usage-paste");
 const fixture = (name: string): Promise<string> => readFile(join(fixtures, `${name}.txt`), "utf8");
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function claudeHome(prefix: string, principals: string[] = ["claude-main"]): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix)); temporary.push(root);

@@ -1,14 +1,14 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { configureNotifications, notifyTable, pickNotifications, rewriteNotifyTable } from "../src/notify-configure.js";
 import { NOTIFY_EVENT_NAMES, parseNotifyConfig, resolveNotifyEvents, wantsEvent } from "../src/notify.js";
 import { policyLockPath, withExclusiveLock } from "../src/security.js";
 import type { HeadroomEvent } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 const config = (lines = "") => parseNotifyConfig(`[notify]\n${lines}`)!;
 const reset = (minutes: number | null, unscheduled = false) => ({ kind: "reset_seen", metadata: { window_minutes: minutes, unscheduled } }) as HeadroomEvent;
 const failed = { kind: "source_failed" } as HeadroomEvent;

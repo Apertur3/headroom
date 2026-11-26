@@ -1,15 +1,16 @@
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli.js";
 import { socketPath } from "../src/daemon.js";
 import { handleMcp } from "../src/mcp.js";
 import { HEARTBEATS_SCHEMA_VERSION } from "../src/migrations.js";
 import { HeadroomStore } from "../src/store.js";
 import { track, useProcessReaper } from "./helpers/mortal-process.js";
+import { useTemporary } from "./helpers/common.js";
 
 const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlite") as {
   DatabaseSync: new (path: string) => { exec(sql: string): void; close(): void };
@@ -61,8 +62,7 @@ function rollBackToSchema4(root: string): void {
  */
 
 useProcessReaper();
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempRoot(label: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), `hrs-${label}-`));

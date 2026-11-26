@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   findKimiCliCredential, isKimiCliCredential, kimiCliCredentialPath, kimiCodePlanName, kimiCreditsPath, kimiPlanName,
   kimiTokenExpired, kimiTokenPath, kimiWindowMinutes, observationFromMoonshotBalance,
@@ -15,7 +15,7 @@ import { defaultPolicy, paceState } from "../src/policy.js";
 import { discoverAccounts } from "../src/registry.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation, ProviderAccount } from "../src/types.js";
-import { json } from "./helpers/common.js";
+import { json, useTemporary } from "./helpers/common.js";
 
 const posix = process.platform !== "win32";
 const kimi = { name: "kimi", vendor: "kimi", location: "/Users/test/.kimi/auth.token", adapter: "native-ts" } as const;
@@ -26,8 +26,7 @@ const at = new Date("2026-09-06T12:00:00Z");
 // live capture, so no real token, account or balance is in the repository.
 const fixture = async (name: string): Promise<unknown> => JSON.parse(await readFile(new URL(`./fixtures/kimi/${name}.synthetic.json`, import.meta.url), "utf8"));
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tokenFile(contents: string, mode = 0o600, name = "auth.token"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-kimi-"));

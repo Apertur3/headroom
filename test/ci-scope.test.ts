@@ -3,7 +3,8 @@ import { copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 // Builds throwaway git repos and shells out to bash; Git Bash on Windows is slow.
 vi.setConfig({ testTimeout: 60_000 });
@@ -13,8 +14,7 @@ const realScript = join(__dirname, "..", "scripts", "ci-scope.sh");
 const EMAIL = "dev@example.com";
 const PR_ENV = { GITHUB_EVENT_NAME: "pull_request", GITHUB_REF: "refs/pull/7/merge" };
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {

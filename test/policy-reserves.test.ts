@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { fillFor, gateFor, planFor } from "../src/orchestrator-reads.js";
 import { defaultPolicy, parsePolicy, reserveFor } from "../src/policy.js";
@@ -9,10 +9,9 @@ import { clearReserveEntry, parseUntil, setFreezeReservePct, upsertReserveEntry 
 import { policyLockPath } from "../src/security.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
-import { captureLog, withHeadroomHome } from "./helpers/common.js";
+import { captureLog, useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempHome(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-reserves-")); temporary.push(root);

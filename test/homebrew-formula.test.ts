@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 // Shells out to bash and a sha256 tool; Git Bash on a Windows runner needs more than 5s.
 vi.setConfig({ testTimeout: 30_000 });
@@ -26,8 +27,7 @@ const SYNTHETIC = {
   sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 };
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function generate(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   try {

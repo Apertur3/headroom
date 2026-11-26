@@ -1,13 +1,13 @@
 import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { socketPath } from "../src/daemon.js";
 import { assertSafeAncestry, canonicalizeHomeForPipe, credentialPath, headroomHome, vendorHome } from "../src/paths.js";
 import { installService, serviceContents, servicePath, uninstallService, windowsTaskXml } from "../src/service.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("cross-platform paths", () => {
   it("resolves Headroom and vendor locations for macOS, Linux, and Windows", () => {

@@ -3,16 +3,16 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildAgentLine, lineCommand, MAX_LINE_CHARS, NO_READING_MESSAGE, sanitizeName, writeAgentLine } from "../src/agent-line.js";
 import { hookScript } from "../src/agent-hook.js";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { defaultPolicy, paceDecision } from "../src/policy.js";
 import type { Observation } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
 const execFileAsync = promisify(execFile);
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempDir(prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));

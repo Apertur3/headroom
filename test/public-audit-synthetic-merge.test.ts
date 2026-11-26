@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -12,8 +13,7 @@ const realScript = join(__dirname, "..", "scripts", "public-audit.sh");
 const NOREPLY = "1+dev@users.noreply.github.com";
 const PERSONAL = "someone@example.com";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function git(cwd: string, email: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {

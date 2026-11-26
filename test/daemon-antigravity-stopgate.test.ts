@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { alive, track, useProcessReaper, writeFakeAgy } from "./helpers/mortal-process.js";
-import { testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
+import { agyAccountsToml, testSocketPath, waitForFile, waitUntilDead } from "./helpers/common.js";
 
 /**
  * Isolated from the other daemon tests on purpose: this file gates
@@ -29,17 +29,12 @@ const temporary: string[] = [];
 useProcessReaper();
 afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-const accountsToml = (enabled: boolean, agyPath: string): string => [
-  "[[accounts]]", 'name = "antigravity"', `enabled = ${enabled}`,
-  'vendor = "antigravity"', 'location = "agy"', 'adapter = "native-ts"', `agy_path = "${agyPath}"`, "",
-].join("\n");
-
 describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepalive() waits for a real stop() held open by a gated confirmation check", () => {
   it("leaves a justified non-running supervisor to finish its own reap/restart lifecycle", async () => {
     const { HeadroomDaemon } = await import("../src/daemon.js");
     const root = await mkdtemp(join(tmpdir(), "headroom-daemon-agy-existing-reap-")); temporary.push(root);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(true, "/not-used"), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, "/not-used"), { mode: 0o600 });
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const reapingSupervisor = { running: false, managingLifecycle: true, start: vi.fn(), stop: vi.fn(async () => undefined) };
     const daemon = await HeadroomDaemon.create({ home: root, path: testSocketPath(root, "headroom"), poller: async () => ({ observations: [], failures: [] }), keepalive: reapingSupervisor as never });
@@ -67,7 +62,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
@@ -118,7 +113,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
     const infoFile = join(root, "agy-pid.txt");
     const fakeAgy = await writeFakeAgy(root, infoFile);
     await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-    await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+    await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
     const path = testSocketPath(root, "headroom");
     const previous = process.env.HEADROOM_HOME; process.env.HEADROOM_HOME = root;
     const daemon = await HeadroomDaemon.create({ home: root, path, poller: async () => ({ observations: [], failures: [] }) });
@@ -146,7 +141,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       // polling the gated isProcessGroupAlive) that this test controls.
       gate.open = true;
       await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-      await writeFile(join(root, "accounts.toml"), accountsToml(false, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(false, fakeAgy), { mode: 0o600 });
       await internal.currentAccounts();
       expect(internal.keepalive).toBeUndefined(); // dropped synchronously, before the real stop() settles
       expect(internal.keepaliveStopPending).toBeDefined();
@@ -155,7 +150,7 @@ describe.skipIf(process.platform === "win32")("HeadroomDaemon: maybeStartKeepali
       // Re-enable immediately, while that real stop() is held open by the
       // gate: maybeStartKeepalive() must block on it, not race past it.
       await writeFile(join(root, "policy.toml"), "antigravity_keepalive = true\n", { mode: 0o600 });
-      await writeFile(join(root, "accounts.toml"), accountsToml(true, fakeAgy), { mode: 0o600 });
+      await writeFile(join(root, "accounts.toml"), agyAccountsToml(true, fakeAgy), { mode: 0o600 });
       let resolved = false;
       const attempt = internal.maybeStartKeepalive([], {}).then(() => { resolved = true; });
 

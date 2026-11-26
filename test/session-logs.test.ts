@@ -1,12 +1,11 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { modelTokenShare } from "../src/session-logs.js";
-import { assistantLine } from "./helpers/common.js";
+import { assistantLine, useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function configDir(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-session-logs-")); temporary.push(root);

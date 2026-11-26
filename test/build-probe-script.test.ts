@@ -3,7 +3,8 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { useTemporary } from "./helpers/common.js";
 
 // Shells out to swiftc and openssl; under parallel load the default 5s per test is too tight.
 vi.setConfig({ testTimeout: 60_000 });
@@ -11,8 +12,7 @@ vi.setConfig({ testTimeout: 60_000 });
 const execFileAsync = promisify(execFile);
 const realScript = join(__dirname, "..", "scripts", "build-probe.sh");
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 /**
  * A self-contained fake repo: the real build-probe.sh script (copied

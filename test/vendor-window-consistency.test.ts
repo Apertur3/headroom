@@ -1,15 +1,15 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { eventText } from "../src/notify-format.js";
 import { defaultPolicy } from "../src/policy.js";
 import { formatMeters } from "../src/status-view.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 function weekly(used: number, fetchedAt: string, resetsAt: string, metadata?: Observation["metadata"]): Observation {
   return window(10_080, used, fetchedAt, resetsAt, metadata);

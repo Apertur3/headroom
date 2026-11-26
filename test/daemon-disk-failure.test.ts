@@ -1,10 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HeadroomDaemon } from "../src/daemon.js";
 import { appendDaemonLog } from "../src/logs.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
+import { useTemporary } from "./helpers/common.js";
 
 /**
  * A full or read-only disk makes both the daemon log and the store's audit
@@ -12,8 +13,7 @@ import { authedHandleLine } from "./helpers/daemon-rpc.js";
  * from detached promises, so either failure used to surface as an unhandled
  * rejection, which ends a Node 22 process.
  */
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("a disk that cannot be written never ends the daemon", () => {
   it("appendDaemonLog resolves when the log cannot be written", async () => {

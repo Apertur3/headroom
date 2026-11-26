@@ -1,9 +1,10 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HeadroomDaemon, daemonRequest } from "../src/daemon.js";
+import { useTemporary } from "./helpers/common.js";
 
 // Issue #62: after a reboot (or a `kill -9`), the daemon's POSIX socket
 // *file* survives even though nothing is listening on it anymore -- a
@@ -14,8 +15,7 @@ import { HeadroomDaemon, daemonRequest } from "../src/daemon.js";
 // startup sequence directly against real sockets, never the real
 // ~/.headroom.
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempRoot(label: string): Promise<string> {
   // Short prefix, deliberately: a Unix domain socket path is bounded by

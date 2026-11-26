@@ -1,10 +1,11 @@
 import { createRequire } from "node:module";
-import { chmod, lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HeadroomStore } from "../src/store.js";
 import { CURRENT_SCHEMA_VERSION, NewerSchemaError, runMigrations, schemaVersion, type Migration, type MigrationDatabase } from "../src/migrations.js";
+import { useTemporary } from "./helpers/common.js";
 
 const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlite") as {
   DatabaseSync: new (path: string) => {
@@ -14,8 +15,7 @@ const { DatabaseSync: RawDatabase } = createRequire(import.meta.url)("node:sqlit
   };
 };
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempHome(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));

@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { claudeGrantNeededReason } from "../src/adapters/claude.js";
 import { main } from "../src/cli.js";
 import * as config from "../src/config.js";
@@ -15,10 +15,9 @@ import { canConsume, defaultPolicy, paceState } from "../src/policy.js";
 import { HeadroomStore } from "../src/store.js";
 import { authedHandleLine } from "./helpers/daemon-rpc.js";
 import type { Observation } from "../src/types.js";
-import { testSocketPath, withHeadroomHome } from "./helpers/common.js";
+import { testSocketPath, useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 function fixture(): Observation {
   return {

@@ -1,16 +1,16 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   checkModelAvailability, MODEL_CATALOG_MAX_AGE_MS, MODEL_CHECK_INTERVAL_MS,
   readClaudeModelCatalog, readCodexModelCatalog,
 } from "../src/model-catalog.js";
 import { HeadroomStore } from "../src/store.js";
 import type { ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempDir(prefix: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), prefix));

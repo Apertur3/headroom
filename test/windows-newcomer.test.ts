@@ -1,13 +1,13 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { claudeRunWithDirectory } from "../src/adapters/claude.js";
 import { credentialCheck } from "../src/doctor.js";
 import { installService, serviceContents, serviceFileBytes } from "../src/service.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("windows service file: schtasks only accepts UTF-16 task XML", () => {
   it("declares and writes UTF-16LE with a byte-order mark on win32, plain UTF-8 elsewhere", () => {

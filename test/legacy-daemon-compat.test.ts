@@ -15,18 +15,18 @@
  * silently folded into "no heartbeats/timers" alongside the compatibility
  * case.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import * as daemonModule from "../src/daemon.js";
 import { normalizeDaemonTimer } from "../src/json-contract.js";
 import { handleMcp } from "../src/mcp.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 /** A minimal stand-in for a daemon: answers `health` and `status` (and the
  * other fields `observe()` unconditionally requests once `status` succeeds)

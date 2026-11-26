@@ -1,13 +1,13 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { claudeConfigDirs, hookCommand, hookCommandMain, hookScriptPath, hookState, installHook, isHeadroomCommand, uninstallHook, type HookOptions } from "../src/agent-hook.js";
 import { main } from "../src/cli.js";
 import { stepAgentHook } from "../src/setup.js";
+import { useTemporary } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 /** A fake user home with its own Claude config dirs and Headroom home: the
  * real ~/.claude, ~/.claude2 and ~/.headroom are never touched. */

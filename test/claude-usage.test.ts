@@ -1,14 +1,14 @@
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CLAUDE_USAGE_MIN_INTERVAL_MS, CLAUDE_USAGE_SOURCE, defaultRun, needsShell, observeClaudeUsage, resolveBinary } from "../src/adapters/claude-usage.js";
 import { parseStatuslineSnapshot, reconcileSnapshot, snapshotFromStatuslinePayload, writeSnapshotLocked } from "../src/adapters/claude-statusline.js";
+import { useTemporary } from "./helpers/common.js";
 
 const account = { name: "claude-work", vendor: "claude", location: "/nonexistent/.claude-work", adapter: "native-ts" } as const;
 const at = new Date("2026-10-22T09:00:00Z");
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 const stampDir = async (): Promise<string> => { const dir = await mkdtemp(join(tmpdir(), "headroom-usage-stamp-")); temporary.push(dir); return dir; };
 const stream = (): Promise<string> => readFile(new URL("./fixtures/claude/usage-stream.synthetic.jsonl", import.meta.url), "utf8");
 

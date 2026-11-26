@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   GROK_BILLING_ENDPOINT, GROK_SETTINGS_ENDPOINT, grokAuthPath, grokLoginCommand, grokPlanName,
   grokWindowMinutes, observationsFromGrokBilling, observeGrok, parseGrokCredential,
@@ -11,6 +11,7 @@ import { pollAccounts } from "../src/collector.js";
 import { discoverAccounts } from "../src/registry.js";
 import { allowedOutbound } from "../src/security.js";
 import type { ProviderAccount } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
 const grok = { name: "grok", vendor: "grok", location: "/Users/test/.grok", adapter: "native-ts" } as const satisfies ProviderAccount;
 const at = new Date("2026-09-03T17:26:36Z");
@@ -22,8 +23,7 @@ const grok2Dir = resolve("/Users/test/.grok2");
 // unit test can pass a home and see the plain "run: grok login" wording.
 const grokDir = resolve("/Users/test/.grok");
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function fixture(name: string): Promise<unknown> {
   return JSON.parse(await readFile(new URL(`./fixtures/grok/${name}`, import.meta.url), "utf8"));

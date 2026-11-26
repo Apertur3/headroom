@@ -1,10 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { HeadroomDaemon, daemonRequest, socketPath } from "../src/daemon.js";
 import { HeadroomStore } from "../src/store.js";
 import type { Observation } from "../src/types.js";
+import { useTemporary } from "./helpers/common.js";
 
 /**
  * P0 (cached-reads brief): under host load, a poll cycle's own synchronous
@@ -29,8 +30,7 @@ import type { Observation } from "../src/types.js";
  * autocommit. Neither changes any timeout.
  */
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 async function tempRoot(label: string): Promise<string> {
   // Short prefix: see stale-socket.test.ts's identical comment -- a Unix

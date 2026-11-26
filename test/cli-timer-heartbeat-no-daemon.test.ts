@@ -6,16 +6,15 @@
  * lapse or fire the timer until a daemon actually starts. Both commands now
  * print an explicit, specific warning instead.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { main } from "../src/cli.js";
 import { HeadroomStore } from "../src/store.js";
-import { withHeadroomHome } from "./helpers/common.js";
+import { useTemporary, withHeadroomHome } from "./helpers/common.js";
 
-const temporary: string[] = [];
-afterEach(async () => { await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
+const temporary = useTemporary();
 
 describe("timer set / heartbeat with no daemon running", () => {
   it("still stores the timer directly, but warns it will not be delivered until a daemon starts", async () => {
