@@ -46,11 +46,13 @@ export function outboundEnvironment(proxy?: string, env: NodeJS.ProcessEnv = pro
 
 type ProxyInstaller = (proxyEnv: Record<string, string>) => void;
 
-/** The hosts Headroom treats as this machine, for both the webhook bearer
- * check and the proxy bypass. Exact names only: Node's NO_PROXY matches exact
- * hosts, not the 127.0.0.0/8 range, and both uses must agree. */
+/** This machine, which the configured proxy never carries. Exact names only:
+ * Node's no_proxy matches exact hosts, not the 127.0.0.0/8 range. */
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1"];
-export function isLoopbackHost(hostname: string): boolean { return LOOPBACK_HOSTS.includes(hostname.replace(/^\[(.*)\]$/, "$1")); }
+/** Hosts a webhook bearer may reach over plain http: loopback names every
+ * supported Node keeps off the proxy. Not `::1`, which the no_proxy parsing
+ * in Node 24.14 and 25.4 reads wrongly, so it could still go through it. */
+export function isLoopbackHost(hostname: string): boolean { return hostname === "localhost" || hostname === "127.0.0.1"; }
 
 /**
  * Call once at daemon and CLI process start, before any fetch happens. The
@@ -61,21 +63,24 @@ export function isLoopbackHost(hostname: string): boolean { return LOOPBACK_HOST
  * in the operator's own no_proxy (lowercase first, as Node reads it), stay
  * direct. When Node already installed a proxy from the environment at start
  * (NODE_USE_ENV_PROXY, --use-env-proxy) and none is configured, every host is
- * routed around a placeholder that is never contacted, which undoes it.
- * Returns false when this Node cannot do what the policy asks.
+ * routed around a placeholder that is never contacted, which undoes it; a
+ * Node that cannot undo it throws, rather than let that proxy carry requests.
+ * Returns false when a configured proxy cannot reach in-process requests.
  */
 export function applyProxyPolicy(proxy: string | undefined, env: NodeJS.ProcessEnv = process.env, install: ProxyInstaller | null | undefined = (http as { setGlobalProxyFromEnv?: ProxyInstaller }).setGlobalProxyFromEnv, execArgv: string[] = process.execArgv): boolean {
   const noProxy = [env.no_proxy || env.NO_PROXY, ...LOOPBACK_HOSTS].filter(Boolean).join(",");
-  const startupProxy = Boolean(env.NODE_USE_ENV_PROXY) || /--use-env-proxy\b/.test([env.NODE_OPTIONS ?? "", ...execArgv].join(" "));
+  const startupProxy = Boolean(env.NODE_USE_ENV_PROXY) || /--use-env-proxy\b/.test([env.NODE_OPTIONS ?? "", ...execArgv].join(" ").replace(/_/g, "-"));
   for (const key of AMBIENT_PROXY_ENV_KEYS) delete env[key];
   if (!proxy && !startupProxy) return true;
+  if (!install && startupProxy) throw new Error(PROXY_STARTUP_ERROR);
   if (!install) return false;
   const unused = "http://127.0.0.1:9";
   install(proxy ? { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, no_proxy: noProxy } : { HTTP_PROXY: unused, HTTPS_PROXY: unused, no_proxy: "*" });
   return true;
 }
 
-export const PROXY_UNSUPPORTED_NOTICE = "this Node cannot set the proxy for Headroom's own requests (that needs Node 24.14+ or 25.4+), so they ignore policy.toml's proxy and may still use a proxy Node took from NODE_USE_ENV_PROXY at start; engine requests use policy.toml's proxy";
+export const PROXY_UNSUPPORTED_NOTICE = "the proxy in policy.toml reaches Headroom's own requests only on Node 24.14+ or 25.4+; on this Node they go direct (engine requests still use it)";
+const PROXY_STARTUP_ERROR = "Node started with a proxy from NODE_USE_ENV_PROXY or --use-env-proxy, and this Node (before 24.14 or 25.4) cannot replace it, so Headroom stops rather than send requests through it. Unset NODE_USE_ENV_PROXY and remove --use-env-proxy (also from NODE_OPTIONS), or upgrade Node.";
 
 export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
   const parsed = new URL(url);

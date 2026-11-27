@@ -154,13 +154,15 @@ file you save yourself.
     to install an env-driven proxy dispatcher from the process's *initial* environment, before any
     application code runs. The CLI and daemon strip them again at start, and when Node already
     installed a proxy from `NODE_USE_ENV_PROXY` or `--use-env-proxy` (a service that starts
-    `dist/cli.js` directly), they replace it with a direct route. A `proxy` value in `policy.toml`
+    `dist/cli.js` directly), they replace it with a direct route; a Node too old to replace it
+    makes them stop with an error instead. A `proxy` value in `policy.toml`
     is applied explicitly: to engine child processes through their environment, and to Headroom's
     own in-process requests through Node's built-in `http.setGlobalProxyFromEnv()` (Node 24.14+ or
     25.4+), with `localhost`, `127.0.0.1`, `::1` and the operator's own `no_proxy`/`NO_PROXY` hosts
-    (lowercase first, as Node reads them) kept direct. Those same three hosts are the only ones a
-    webhook bearer may reach over plain `http`. On an older Node the CLI and daemon say on stderr
-    that they cannot apply the proxy setting.
+    (lowercase first, as Node reads them) kept direct. A webhook bearer may reach only `localhost`
+    and `127.0.0.1` over plain `http`; not `::1`, which Node 24.14 and 25.4 can still send through
+    the proxy. On an older Node the CLI and daemon say on stderr that the configured proxy does
+    not reach their own requests.
     The optional CodexBar engine (`adapter: "codexbar"`) is the one exception to this allowlist:
     it links CodexBarCore, an unmodified pinned third-party dependency that performs its own
     authenticated HTTP request to a host read from the account's own `config.toml`

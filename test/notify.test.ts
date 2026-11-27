@@ -206,10 +206,10 @@ describe("channel readiness", () => {
     const webhook = async (url: string) => (await prepareChannels(config(`[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "${url}"\n`), { platform: "darwin", run: bearer }))[0];
     const lan = await webhook("http://192.0.2.10:8123/api/webhook/synthetic-id");
     expect(lan).toMatchObject({ ready: false, detail: "refusing to send the headroom-webhook bearer over plain http to http://192.0.2.10:8123; use https (plain http only to localhost)" });
-    for (const url of ["https://192.0.2.10:8123/hook", "http://127.0.0.1:8123/hook", "http://localhost/hook", "http://[::1]:8123/hook"]) expect((await webhook(url)).ready).toBe(true);
-    // The same loopback list the proxy bypass uses: other 127/8 addresses
-    // would go through a configured proxy, so they get no bearer either.
-    expect((await webhook("http://127.0.0.2:8123/hook")).ready).toBe(false);
+    for (const url of ["https://192.0.2.10:8123/hook", "https://[::1]:8123/hook", "http://127.0.0.1:8123/hook", "http://localhost/hook"]) expect((await webhook(url)).ready).toBe(true);
+    // Only hosts every supported Node keeps off a configured proxy: other
+    // 127/8 addresses and [::1] could go through it, so no plain-http bearer.
+    for (const url of ["http://127.0.0.2:8123/hook", "http://[::1]:8123/hook"]) expect((await webhook(url)).ready).toBe(false);
     // Without a bearer there is nothing to protect, so plain http still posts.
     expect((await prepareChannels(config('[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "http://192.0.2.10/hook"\n'), { platform: "darwin", run: async () => { throw new Error("not found"); } }))[0].ready).toBe(true);
     expect(JSON.stringify(lan)).not.toContain("synthetic-bearer");

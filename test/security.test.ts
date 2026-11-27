@@ -37,9 +37,14 @@ describe("proxy policy", () => {
     expect(installed).toHaveLength(3);
     expect(applyProxyPolicy(undefined, { KEEP: "yes" }, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
     expect(installed).toHaveLength(3);
-    // A Node without http.setGlobalProxyFromEnv says so instead of pretending.
+    expect(applyProxyPolicy(undefined, {}, (proxyEnv) => installed.push(proxyEnv), ["--use_env_proxy"])).toBe(true);
+    expect(applyProxyPolicy(undefined, { NODE_OPTIONS: "--use_env_proxy" }, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(installed).toHaveLength(5);
+    // A Node without http.setGlobalProxyFromEnv says so instead of pretending,
+    // and stops outright when Node already set up a proxy it cannot undo.
     expect(applyProxyPolicy("http://proxy.example.com:8080/", {}, null, [])).toBe(false);
-    expect(applyProxyPolicy(undefined, shell(), null, [])).toBe(false);
+    expect(() => applyProxyPolicy(undefined, shell(), null, [])).toThrow(/Unset NODE_USE_ENV_PROXY and remove --use-env-proxy/);
+    expect(() => applyProxyPolicy("http://proxy.example.com:8080/", {}, null, ["--use_env_proxy"])).toThrow(/cannot replace it/);
     expect(applyProxyPolicy(undefined, {}, null, [])).toBe(true);
   });
 
