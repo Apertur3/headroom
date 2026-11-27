@@ -57,13 +57,32 @@ describe("notify config", () => {
   });
 
   it("refuses an unknown channel, an unknown event, an unknown key and an out-of-range threshold", () => {
-    expect(() => parseNotifyConfig('[notify]\nchannels = ["pager"]\n')).toThrow(/unknown channel/);
+    expect(() => parseNotifyConfig('[notify]\nchannels = ["pager"]\n')).toThrow(/channels may only name telegram, ntfy, webhook/);
     expect(() => parseNotifyConfig('[notify]\nevents = ["reset_seeen"]\n')).toThrow(/unknown event/);
-    expect(() => parseNotifyConfig("[notify]\nthreshold_pct = 90\n")).toThrow(/unknown \[notify\] key/);
+    expect(() => parseNotifyConfig("[notify]\nthreshold_pct = 90\n")).toThrow(/line 2: unknown setting in \[notify\]/);
     expect(() => parseNotifyConfig("[notify]\nthreshold_percent = 140\n")).toThrow(/threshold_percent/);
     expect(() => parseNotifyConfig("[notify]\nthresholds = [90, 140]\n")).toThrow(/thresholds/);
     expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "ftp://example.com/hook"\n')).toThrow(/http or https/);
     expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "not a topic!"\n')).toThrow(/ntfy topic/);
+  });
+
+  it("names the line and the problem in a parse error, never the line's value", () => {
+    const leaks = [
+      '[notify]\n[notify.ntfy]\n"topic" = "synthetic-leaked-topic"\n',
+      '[notify]\n[notify.ntfy]\ntopic = synthetic-leaked-topic\n',
+      '[notify]\nchannels = synthetic-leaked-topic\n',
+      '[notify]\n[notify.synthetic-leaked-topic]\nurl = "https://example.com/synthetic-leaked-topic"\n',
+      '[notify]\nchannels = ["synthetic-leaked-topic"]\n',
+      '[notify]\nquiet_hours = "synthetic-leaked-topic"\n',
+      '[notify]\nnotify_scheduled_short = synthetic-leaked-topic\n',
+    ];
+    for (const text of leaks) {
+      let message = "";
+      try { parseNotifyConfig(text); } catch (error) { message = (error as Error).message; }
+      expect(message, text).toMatch(/^Invalid Headroom notify config: /);
+      expect(message, text).not.toContain("synthetic-leaked-topic");
+    }
+    expect(() => parseNotifyConfig(leaks[0])).toThrow(/line 3 is not a key = value setting/);
   });
 
   it("reads a configured ascending threshold ladder", () => {

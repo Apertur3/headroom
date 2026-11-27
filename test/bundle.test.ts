@@ -77,6 +77,12 @@ describe("bundle redaction of policy.toml secrets (synthetic values)", () => {
     expect(policyListing('[notify]\n[notify.ntfy]\n"topic" = "synthetic-ntfy-topic"')).toEqual(["policy.toml did not parse; contents left out (headroom doctor names the problem)"]);
   });
 
+  it("drops the config line an older version wrote into a daemon-log parse error", () => {
+    const text = redactBundleText('2026-01-01T00:00:00.000Z notification config read failed: Invalid Headroom notify config: "topic" = "synthetic-ntfy-topic"\nnext line');
+    expect(text).not.toContain("synthetic-ntfy-topic");
+    expect(text).toContain("Invalid Headroom notify config: [REDACTED]\nnext line");
+  });
+
   it("strips URL user info up to the last @, whatever the password holds", () => {
     for (const url of ["http://proxyuser:synthetic'pass@192.0.2.10:3128", "http://proxyuser:synthetic\"pass@192.0.2.10:3128", "http://proxyuser:synthetic@pass@example.com/x"]) {
       const text = redactBundleText(`proxy at ${url} failed`);

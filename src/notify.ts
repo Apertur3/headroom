@@ -122,6 +122,9 @@ export interface ProjectionDetails {
   reset_in_seconds: number;
 }
 
+/** Names the problem and, inside the loop, the line number, never a value: a
+ * malformed line may hold a topic or a webhook URL, and this message reaches
+ * the daemon log, which the support bundle copies. */
 function invalid(detail: string): Error { return new Error(`Invalid Headroom notify config: ${detail}`); }
 
 function stringValue(value: string): string | undefined {
@@ -139,9 +142,9 @@ function listValue(value: string): string[] | undefined {
 /** "23:00-07:00" as minutes past local midnight, wrapping allowed. */
 export function parseQuietHours(value: string): QuietHours {
   const match = /^([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})$/.exec(value.trim());
-  if (!match) throw invalid(`quiet_hours must look like "23:00-07:00", got "${value}"`);
+  if (!match) throw invalid(`quiet_hours must look like "23:00-07:00"`);
   const [startHour, startMinute, endHour, endMinute] = match.slice(1).map(Number);
-  if (startHour > 23 || endHour > 23 || startMinute > 59 || endMinute > 59) throw invalid(`quiet_hours is not a clock time: "${value}"`);
+  if (startHour > 23 || endHour > 23 || startMinute > 59 || endMinute > 59) throw invalid("quiet_hours is not a clock time");
   return { start: startHour * 60 + startMinute, end: endHour * 60 + endMinute };
 }
 
@@ -180,14 +183,14 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   let notifyScheduledShort = false;
   let sourceHealthMinPolls = DEFAULT_SOURCE_HEALTH_MIN_POLLS;
   let sourceHealthMinMinutes = DEFAULT_SOURCE_HEALTH_MIN_MINUTES;
-  for (const raw of text.split("\n")) {
+  for (const [index, raw] of text.split("\n").entries()) {
     const line = raw.replace(/("(?:[^"\\]|\\.)*")|#.*/g, (match, quoted: string | undefined) => quoted ?? "").trim();
     if (!line) continue;
     const header = /^\[([^\]]+)\]$/.exec(line);
     if (header) { section = header[1].trim(); if (section === "notify" || section.startsWith("notify.")) present = true; continue; }
     if (section !== "notify" && !section.startsWith("notify.")) continue;
     const entry = /^([A-Za-z0-9_]+)\s*=\s*(.+)$/.exec(line);
-    if (!entry) throw invalid(line);
+    if (!entry) throw invalid(`line ${index + 1} is not a key = value setting`);
     const [, key, value] = entry;
     if (section === "notify") {
       if (key === "preset") {
@@ -196,10 +199,10 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
         preset = name;
         continue;
       }
-      if (key === "events_on") { eventsOn = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
-      if (key === "events_off") { eventsOff = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
-      if (key === "channels") { channels = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
-      if (key === "events") { events = listValue(value) ?? (() => { throw invalid(line); })(); continue; }
+      if (key === "events_on") { eventsOn = listValue(value) ?? (() => { throw invalid(`line ${index + 1}: ${key} must be a list of names`); })(); continue; }
+      if (key === "events_off") { eventsOff = listValue(value) ?? (() => { throw invalid(`line ${index + 1}: ${key} must be a list of names`); })(); continue; }
+      if (key === "channels") { channels = listValue(value) ?? (() => { throw invalid(`line ${index + 1}: ${key} must be a list of names`); })(); continue; }
+      if (key === "events") { events = listValue(value) ?? (() => { throw invalid(`line ${index + 1}: ${key} must be a list of names`); })(); continue; }
       if (key === "threshold_percent") { thresholdPercent = Number(value); continue; }
       if (key === "thresholds") {
         try {
@@ -212,25 +215,25 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
       if (key === "quiet_hours") { quietHours = parseQuietHours(stringValue(value) ?? value); continue; }
       if (key === "notify_scheduled_short") {
         const trimmed = value.trim();
-        if (trimmed !== "true" && trimmed !== "false") throw invalid(`notify_scheduled_short must be true or false, got "${value}"`);
+        if (trimmed !== "true" && trimmed !== "false") throw invalid(`line ${index + 1}: notify_scheduled_short must be true or false`);
         notifyScheduledShort = trimmed === "true";
         continue;
       }
       if (key === "source_health_min_polls") { sourceHealthMinPolls = Number(value); continue; }
       if (key === "source_health_min_minutes") { sourceHealthMinMinutes = Number(value); continue; }
-      throw invalid(`unknown [notify] key "${key}"`);
+      throw invalid(`line ${index + 1}: unknown setting in [notify]`);
     }
     const scalar = stringValue(value);
-    if (scalar === undefined) throw invalid(line);
+    if (scalar === undefined) throw invalid(`line ${index + 1}: ${key} must be a quoted string`);
     if (section === "notify.telegram" && key === "chat_id") { chatId = scalar; continue; }
     if (section === "notify.ntfy" && key === "topic") { topic = scalar; continue; }
     if (section === "notify.ntfy" && key === "server") { server = scalar.replace(/\/+$/, ""); continue; }
     if (section === "notify.webhook" && key === "url") { webhookUrl = scalar; continue; }
-    throw invalid(`unknown key "${key}" in [${section}]`);
+    throw invalid(`line ${index + 1}: unknown setting in a [notify.*] table`);
   }
   if (!present) return undefined;
-  for (const channel of channels ?? []) if (!CHANNEL_NAMES.includes(channel as ChannelName)) throw invalid(`unknown channel "${channel}"`);
-  for (const event of [...(events ?? []), ...eventsOn, ...eventsOff]) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid(`unknown event "${event}"`);
+  for (const channel of channels ?? []) if (!CHANNEL_NAMES.includes(channel as ChannelName)) throw invalid(`channels may only name ${CHANNEL_NAMES.join(", ")}`);
+  for (const event of [...(events ?? []), ...eventsOn, ...eventsOff]) if (!NOTIFY_EVENT_NAMES.includes(event)) throw invalid("an events list names an unknown event (see docs/notifications.md)");
   if (thresholdPercent !== null && (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100)) throw invalid("threshold_percent must be above 0 and at most 100");
   if (thresholds?.some((threshold) => threshold <= 0 || threshold > 100)) throw invalid("thresholds must contain percentages above 0 and at most 100");
   if (!Number.isInteger(sourceHealthMinPolls) || sourceHealthMinPolls < 1) throw invalid("source_health_min_polls must be a whole number of at least 1");

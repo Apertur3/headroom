@@ -124,7 +124,10 @@ function redactKnownStoreLocations(text: string, home: string): string {
 /** The full redaction pass, applied once to the whole assembled bundle
  * rather than per-section, so no section can accidentally skip it. */
 export function redactBundleText(text: string): string {
-  const withTokensAndEmails = redact(redactUrlUserinfo(text));
+  // Older versions put the malformed policy.toml line itself into
+  // this error, and the daemon log keeps it.
+  const withoutConfigLines = text.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]");
+  const withTokensAndEmails = redact(redactUrlUserinfo(withoutConfigLines));
   const withoutNetworkAddresses = redactNetworkAddresses(withTokensAndEmails);
   const withoutAssignedSecrets = redactAssignedSecrets(withoutNetworkAddresses);
   const withoutKnownStoreLocations = redactKnownStoreLocations(withoutAssignedSecrets, headroomHome());
