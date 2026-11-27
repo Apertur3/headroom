@@ -16,6 +16,8 @@ import { homedir, hostname as machineHostname, release as osRelease, userInfo } 
 import { dirname, join, resolve } from "node:path";
 import { formatMeters } from "./cli.js";
 import { readPolicy } from "./config.js";
+import { parseNotifyConfig, type NotifyConfig } from "./notify.js";
+import { parsePolicy, type Policy } from "./policy.js";
 import { doctorChecks, doctorFileStatus, type DoctorCheck } from "./doctor.js";
 import { tailDaemonLog } from "./logs.js";
 import { withPaceInfo } from "./pace.js";
@@ -64,26 +66,34 @@ function redactAssignedSecrets(text: string): string {
   return text.replace(/\b(token|api[_-]?key|secret|password|passwd|client[_-]?secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
 }
 
-/** A URL's `user:pass@` part, whatever host follows (an IP included). */
+/** A URL's `user:pass@` part: everything in the authority up to its last
+ * `@`, whatever characters the password holds and whatever host follows. */
 function redactUrlUserinfo(text: string): string {
-  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@"']+@/gi, "$1[REDACTED]@");
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]*@/gi, "$1[REDACTED]@");
 }
 
-/** Every value under a policy.toml `[notify.*]` table is a channel capability:
- * a webhook URL posts to the channel and an ntfy topic reads and posts it. A
- * URL keeps its scheme and host; anything else is replaced. The table ends at
- * the next TOML header or the next bundle section. */
-function redactNotifyValues(text: string): string {
-  let notify = false;
-  return text.split("\n").map((line) => {
-    const header = /^\s*(?:\[([^\]]*)\]|== )/.exec(line);
-    if (header) { notify = header[1]?.trim().startsWith("notify.") ?? false; return line; }
-    const entry = notify ? /^(\s*[A-Za-z0-9_]+\s*=\s*)"?([^"#\s]*)/.exec(line) : null;
-    if (!entry) return line;
-    let kept = "[REDACTED]";
-    try { const url = new URL(entry[2]); if (/^https?:$/.test(url.protocol)) kept = `${url.protocol}//${url.host}`; } catch { /* not a URL */ }
-    return `${entry[1]}"${kept}"`;
-  }).join("\n");
+/** Scheme and host of an http(s) URL, without user info, path or query. */
+function urlOrigin(value: string): string | undefined {
+  try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? url.origin : undefined; } catch { return undefined; }
+}
+
+/**
+ * policy.toml as Headroom itself parses it, never its raw text: comments and
+ * anything the parsers do not read are dropped. Every notify channel value
+ * (webhook URL, ntfy topic and server, Telegram chat id) is a capability for
+ * that channel, so a URL keeps only its scheme and host and anything else is
+ * replaced; the proxy keeps only its scheme and host. A file that does not
+ * parse is left out whole, since the parse error alone cannot say which line
+ * holds a secret.
+ */
+export function policyListing(text: string): string[] {
+  let policy: Policy, notify: NotifyConfig | undefined;
+  try { policy = parsePolicy(text); notify = parseNotifyConfig(text); }
+  catch { return ["policy.toml did not parse; contents left out (headroom doctor names the problem)"]; }
+  const channel = (values: object) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, typeof value === "string" ? urlOrigin(value) ?? "[REDACTED]" : value]));
+  const { policy_mtime: _mtime, proxy, ...rest } = policy;
+  const listing = { ...rest, ...(proxy ? { proxy: urlOrigin(proxy) ?? "[REDACTED]" } : {}), ...(notify ? { notify: { ...notify, telegram: channel(notify.telegram), ntfy: channel(notify.ntfy), webhook: channel(notify.webhook) } } : {}) };
+  return JSON.stringify(listing, null, 2).split("\n");
 }
 
 /** Replaces this machine's home directory, username, and hostname wherever
@@ -114,7 +124,7 @@ function redactKnownStoreLocations(text: string, home: string): string {
 /** The full redaction pass, applied once to the whole assembled bundle
  * rather than per-section, so no section can accidentally skip it. */
 export function redactBundleText(text: string): string {
-  const withTokensAndEmails = redact(redactUrlUserinfo(redactNotifyValues(text)));
+  const withTokensAndEmails = redact(redactUrlUserinfo(text));
   const withoutNetworkAddresses = redactNetworkAddresses(withTokensAndEmails);
   const withoutAssignedSecrets = redactAssignedSecrets(withoutNetworkAddresses);
   const withoutKnownStoreLocations = redactKnownStoreLocations(withoutAssignedSecrets, headroomHome());
@@ -149,17 +159,15 @@ async function principalLines(): Promise<string[]> {
 }
 
 /** One config file (policy.toml or routing.toml), held to the same file-safety
- * bar doctor's own configCheck() uses. policy.toml does hold secrets: notify
- * webhook URLs and ntfy topics, and a proxy URL may carry a password. The
- * redaction pass over the whole bundle replaces them (redactNotifyValues,
- * redactUrlUserinfo). */
-async function configFileSection(path: string): Promise<string[]> {
+ * bar doctor's own configCheck() uses. routing.toml holds no secrets and is
+ * copied as text; policy.toml does (notify channels, a proxy password), so it
+ * goes through policyListing() instead. */
+async function configFileSection(path: string, render: (text: string) => string[] = (text) => text.split("\n")): Promise<string[]> {
   const status = await doctorFileStatus(path).catch<DoctorFileStatusFallback>(() => "unsafe");
   if (status === "missing") return ["not present; using built-in defaults"];
   if (status === "unsafe") return [`unsafe file, skipped: ${path}`];
   try {
-    const text = await readFile(path, "utf8");
-    return text.split("\n");
+    return render(await readFile(path, "utf8"));
   } catch (error) {
     return [`unreadable: ${errorMessage(error)}`];
   }
@@ -258,7 +266,7 @@ export async function buildBundleText(): Promise<string> {
     headroomVersion(),
     doctorLinesSection(),
     principalLines(),
-    configFileSection(join(home, "policy.toml")),
+    configFileSection(join(home, "policy.toml"), policyListing),
     configFileSection(routingPath),
     daemonLogSection(home),
     auditRowsSection(home),

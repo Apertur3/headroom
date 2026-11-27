@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseBundleFlag, redactBundleText, writeDoctorBundle } from "../src/bundle.js";
+import { parseBundleFlag, policyListing, redactBundleText, writeDoctorBundle } from "../src/bundle.js";
 
 const temporary: string[] = [];
 afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -36,37 +36,53 @@ describe("parseBundleFlag", () => {
 });
 
 describe("bundle redaction of policy.toml secrets (synthetic values)", () => {
-  it("keeps only scheme and host of notify URLs, hides topics and ids, and strips proxy userinfo", () => {
-    const policy = [
-      "== policy.toml ==",
-      'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128"',
-      "[notify]",
-      'channels = ["ntfy", "webhook"]',
-      "[notify.webhook]",
-      'url = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
-      "[notify.discord]",
-      'url = "https://discord.com/api/webhooks/123456789/synthetic-discord-token" # comment',
-      "[notify.ha]",
-      'url = "http://homeassistant.example.com:8123/api/webhook/synthetic-ha-id"',
-      "[notify.ntfy]",
-      'topic = "synthetic-ntfy-topic"',
-      'server = "https://ntfy.example.com/"',
-      "[notify.telegram]",
-      'chat_id = "123456789"',
-      "",
-      "== routing.toml ==",
-      'default = "kept-routing-value"',
-    ].join("\n");
-    const text = redactBundleText(policy);
-    for (const secret of ["synthetic-proxy-pass", "proxyuser", "T0SYNTH", "synthetic-slack-secret", "synthetic-discord-token", "synthetic-ha-id", "synthetic-ntfy-topic", "123456789"]) expect(text).not.toContain(secret);
-    expect(text).toContain('url = "https://hooks.slack.com"');
-    expect(text).toContain('url = "https://discord.com"');
-    expect(text).toContain('url = "http://homeassistant.example.com:8123"');
-    expect(text).toContain('topic = "[REDACTED]"');
-    expect(text).toContain('server = "https://ntfy.example.com"');
-    expect(text).toContain('proxy = "http://[REDACTED]@');
-    expect(text).toContain('channels = ["ntfy", "webhook"]');
-    expect(text).toContain('default = "kept-routing-value"');
+  const SECRETS = ["synthetic-proxy-pass", "proxyuser", "T0SYNTH", "synthetic-slack-secret", "synthetic-ha-id", "synthetic-ntfy-topic", "123456789", "synthetic-comment"];
+  const valid = [
+    'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128"',
+    "[notify]",
+    'channels = ["ntfy", "webhook", "telegram"]',
+    "[notify.webhook] # synthetic-comment",
+    'url = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
+    "[notify.ntfy] # topic synthetic-ntfy-topic",
+    'topic = "synthetic-ntfy-topic"',
+    'server = "https://ntfy.example.com/"',
+    "[notify.telegram]",
+    'chat_id = "123456789"',
+  ].join("\n");
+
+  it("lists policy.toml as parsed: notify URLs keep scheme and host, other channel values and comments are gone", () => {
+    const text = redactBundleText(policyListing(valid).join("\n"));
+    for (const secret of SECRETS) expect(text).not.toContain(secret);
+    expect(text).toContain('"url": "https://hooks.slack.com"');
+    expect(text).toContain('"topic": "[REDACTED]"');
+    expect(text).toContain('"server": "https://ntfy.example.com"');
+    expect(text).toContain('"chat_id": "[REDACTED]"');
+    expect(text).toContain('"proxy": "http://192.0.2.10:3128"');
+    expect(text).toContain('"channels": [');
+  });
+
+  it("leaves out a policy.toml that uses syntax the parser does not read, instead of copying it", () => {
+    const shapes = [
+      '[notify]\n[notify.ntfy]\n"topic" = "synthetic-ntfy-topic"',
+      '[notify]\n["notify".webhook]\nurl = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
+      '[notify]\nwebhook = { url = "https://example.com/api/webhook/synthetic-ha-id" }',
+      '[notify]\n[notify.webhook]\nurl = """\nhttps://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret\n"""',
+      '[notify]\nchannels = [\n"ntfy",\n]\n[notify.ntfy]\ntopic = "synthetic-ntfy-topic"',
+      'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128" garbage',
+    ];
+    for (const shape of shapes) {
+      const text = policyListing(shape).join("\n");
+      for (const secret of SECRETS) expect(text, shape).not.toContain(secret);
+    }
+    expect(policyListing('[notify]\n[notify.ntfy]\n"topic" = "synthetic-ntfy-topic"')).toEqual(["policy.toml did not parse; contents left out (headroom doctor names the problem)"]);
+  });
+
+  it("strips URL user info up to the last @, whatever the password holds", () => {
+    for (const url of ["http://proxyuser:synthetic'pass@192.0.2.10:3128", "http://proxyuser:synthetic\"pass@192.0.2.10:3128", "http://proxyuser:synthetic@pass@example.com/x"]) {
+      const text = redactBundleText(`proxy at ${url} failed`);
+      expect(text).not.toMatch(/proxyuser|synthetic/);
+      expect(text).toContain("[REDACTED]@");
+    }
   });
 });
 
