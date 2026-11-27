@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  CHUNK_LIMIT, DEFAULT_NOTIFY_EVENTS, TELEGRAM_SECRET, chunkMessage, combineTexts, inQuietHours,
+  CHUNK_LIMIT, DEFAULT_NOTIFY_EVENTS, TELEGRAM_SECRET, WEBHOOK_SECRET, chunkMessage, combineTexts, inQuietHours,
   parseNotifyConfig, parseQuietHours, prepareChannels, readSecret, scrubSecrets, secretStoreCommand, secretStoreHint,
   type CommandRunner, type NotifyConfig,
 } from "../src/notify.js";
@@ -167,7 +167,9 @@ describe("channel readiness", () => {
     expect(channels.find((channel) => channel.channel === "telegram")?.detail).toContain("security add-generic-password");
     // ntfy needs no credential, and a webhook without a stored bearer still
     // posts, unauthenticated and saying so.
-    expect(channels.find((channel) => channel.channel === "ntfy")).toMatchObject({ ready: true, detail: "https://ntfy.sh/headroom-example" });
+    // Only the origin: the ntfy topic and a webhook path are the credential.
+    expect(channels.find((channel) => channel.channel === "ntfy")).toMatchObject({ ready: true, detail: "https://ntfy.sh" });
+    expect(channels.find((channel) => channel.channel === "webhook")?.detail).toBe("https://example.com (no bearer stored)");
     expect(channels.find((channel) => channel.channel === "webhook")).toMatchObject({ ready: true });
     expect(channels.find((channel) => channel.channel === "webhook")?.detail).toContain("no bearer stored");
   });
@@ -178,6 +180,17 @@ describe("channel readiness", () => {
     expect(channels[0].detail).toContain("no chat_id");
     expect(channels[1].detail).toContain("no topic");
     expect(channels[2].detail).toContain("no url");
+  });
+
+  it("refuses to send the webhook bearer over plain http except to this machine", async () => {
+    const bearer: CommandRunner = async (_command, args) => { if (args.includes(WEBHOOK_SECRET)) return "synthetic-bearer"; throw new Error("not found"); };
+    const webhook = async (url: string) => (await prepareChannels(config(`[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "${url}"\n`), { platform: "darwin", run: bearer }))[0];
+    const lan = await webhook("http://192.0.2.10:8123/api/webhook/synthetic-id");
+    expect(lan).toMatchObject({ ready: false, detail: "refusing to send the headroom-webhook bearer over plain http to http://192.0.2.10:8123; use https (plain http only to localhost)" });
+    for (const url of ["https://192.0.2.10:8123/hook", "http://127.0.0.1:8123/hook", "http://localhost/hook", "http://[::1]:8123/hook"]) expect((await webhook(url)).ready).toBe(true);
+    // Without a bearer there is nothing to protect, so plain http still posts.
+    expect((await prepareChannels(config('[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "http://192.0.2.10/hook"\n'), { platform: "darwin", run: async () => { throw new Error("not found"); } }))[0].ready).toBe(true);
+    expect(JSON.stringify(lan)).not.toContain("synthetic-bearer");
   });
 
   it("never puts the bot token in a channel's own description", async () => {

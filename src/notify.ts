@@ -488,7 +488,7 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
       if (!topic) { prepared.push({ channel, ready: false, detail: "no topic in [notify.ntfy]", secrets: [], deliver: async () => undefined }); continue; }
       const url = `${config.ntfy.server}/${topic}`;
       prepared.push({
-        channel, ready: true, detail: url, secrets: [],
+        channel, ready: true, detail: new URL(url).origin, secrets: [],
         deliver: async (items, digest) => {
           for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text), digest))) {
             await send(fetcher, url, {
@@ -502,18 +502,18 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
     const url = config.webhook.url;
     if (!url) { prepared.push({ channel, ready: false, detail: "no url in [notify.webhook]", secrets: [], deliver: async () => undefined }); continue; }
     const bearer = await readSecret(WEBHOOK_SECRET, { platform, run });
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (bearer.secret) headers.authorization = `Bearer ${bearer.secret}`;
+    const { origin, protocol, hostname } = new URL(url);
+    // A bearer never crosses a network in clear text: plain http only to this machine.
+    if (bearer.secret && protocol === "http:" && !/^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])$/.test(hostname)) { prepared.push({ channel, ready: false, detail: `refusing to send the ${WEBHOOK_SECRET} bearer over plain http to ${origin}; use https (plain http only to localhost)`, secrets: [], deliver: async () => undefined }); continue; }
+    const headers: Record<string, string> = { "content-type": "application/json", ...(bearer.secret ? { authorization: `Bearer ${bearer.secret}` } : {}) };
     prepared.push({
-      channel, ready: true, detail: `${url}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [bearer.secret] : [],
+      channel, ready: true, detail: `${origin}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [bearer.secret] : [],
       deliver: async (items, digest) => {
         // One POST per event even inside a batch: a webhook consumer wants
         // one structured record per event, not several folded into one text.
         for (const item of items) {
-          await send(fetcher, url, {
-            method: "POST", headers,
-            body: JSON.stringify({ event: item.kind, meter: item.meter, principal: item.principal, at: item.at, text: item.text }),
-          }, [url]);
+          const body = JSON.stringify({ event: item.kind, meter: item.meter, principal: item.principal, at: item.at, text: item.text });
+          await send(fetcher, url, { method: "POST", headers, body }, [url]);
         }
       },
     });
