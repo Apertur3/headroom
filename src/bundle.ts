@@ -96,6 +96,18 @@ export function policyListing(text: string): string[] {
   return JSON.stringify(listing, null, 2).split("\n");
 }
 
+/** The configured channel capabilities (ntfy topic, Telegram chat id, webhook
+ * path): replaced wherever they turn up, since an older version's log line can
+ * carry a channel reply that no line-shape rule can bound. */
+export function channelCapabilities(text: string): string[] {
+  let notify: NotifyConfig | undefined;
+  try { notify = parseNotifyConfig(text); } catch { return []; }
+  if (!notify) return [];
+  let hookPath: string | null = null;
+  try { if (notify.webhook.url) { const url = new URL(notify.webhook.url); hookPath = url.pathname + url.search; } } catch { /* not a URL */ }
+  return [notify.ntfy.topic, notify.telegram.chat_id, hookPath].filter((value): value is string => !!value && value.length >= 4 && value !== "/");
+}
+
 /** Replaces this machine's home directory, username, and hostname wherever
  * they appear verbatim -- identifiers redact() has no way to recognize on
  * its own, since none of them are shaped like a token. Runs after redact()
@@ -123,10 +135,11 @@ function redactKnownStoreLocations(text: string, home: string): string {
 
 /** The full redaction pass, applied once to the whole assembled bundle
  * rather than per-section, so no section can accidentally skip it. */
-export function redactBundleText(text: string): string {
+export function redactBundleText(text: string, capabilities: string[] = []): string {
+  const withoutCapabilities = capabilities.reduce((output, value) => output.replace(new RegExp(escapeRegExp(value), "gi"), "[REDACTED]"), text);
   // Older versions put the malformed policy.toml line itself into
   // this error, and the daemon log keeps it.
-  const withoutConfigLines = text.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]")
+  const withoutConfigLines = withoutCapabilities.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]")
     // Delivery failures in the daemon log, which older versions logged with
     // the channel's reply text.
     .replace(/(notify \S+ (?:failed for \d+ event\(s\)|gave up on \d+ event\(s\) after \d+ attempts): )([^\n]*)/g, (_line, prefix: string, detail: string) => prefix + storedDeliveryError(detail));
@@ -298,7 +311,8 @@ export async function buildBundleText(): Promise<string> {
     ...section(`audit (last ${AUDIT_ROW_LIMIT} rows)`, auditRows),
     ...section("status", statusLines),
   ];
-  return redactBundleText([...header, ...body].join("\n"));
+  const capabilities = channelCapabilities(await readFile(join(home, "policy.toml"), "utf8").catch(() => ""));
+  return redactBundleText([...header, ...body].join("\n"), capabilities);
 }
 
 function defaultBundleFilename(): string {
