@@ -96,6 +96,14 @@ describe("claude /usage runner", () => {
     finally { await chmod(dir, 0o700); }
   });
 
+  it("a successful run that cannot save its rows (disk full) still returns them", async () => {
+    const dir = await stampDir();
+    await observeClaudeUsage(account, { run: async () => reportLine([{ ...okLimits[1], percent: 99 }]), now: () => at, stampDir: dir });
+    const run = async () => { await chmod(dir, 0o500); return reportLine([{ ...okLimits[1], percent: 60 }]); };
+    try { expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS), stampDir: dir })).toEqual({ rows: expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", quantity: expect.objectContaining({ used: 60 }) })]) }); }
+    finally { await chmod(dir, 0o700); }
+  });
+
   it("fails closed with a reason: no usage_report, text only, a missing binary, a crash", async () => {
     const textOnly = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Current session: 7% used" }] } });
     for (const run of [async () => '{"type":"result"}\n', async () => textOnly, async () => { throw Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }); }, async () => { throw new Error("exit 1"); }]) {

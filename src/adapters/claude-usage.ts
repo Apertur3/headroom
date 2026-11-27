@@ -152,7 +152,7 @@ export async function observeClaudeUsage(account: ProviderAccount, dependencies:
   }
   await writeFileAtomic(join(dir, `${key}.${now.getTime()}.rows.json`), JSON.stringify(ran.rows), 0o600).catch(() => undefined);
   for (const name of await readdir(dir).catch((): string[] => [])) if (name.startsWith(`${key}.`) && name.endsWith(".rows.json") && Number(name.split(".")[1]) < now.getTime() - CLAUDE_USAGE_KEEP_MS) await unlink(join(dir, name)).catch(() => undefined);
-  return { rows: await lastGood(dir, key, now) };
+  return { rows: newest([...await lastGood(dir, key, now), ...ran.rows]) }; // this run's rows even when the write failed
 }
 
 async function run(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ rows: Observation[] } | { error: string }> {
