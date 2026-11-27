@@ -29,6 +29,15 @@ export function redact(value: string): string {
  * screen, set the clipboard (OSC 52) or disguise a link (OSC 8). */
 export function clean(text: string): string { return stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " "); }
 
+/** A stored notification delivery error, as it may be shown again. Current
+ * versions record only the channel origin plus an HTTP status, an error code
+ * or name, or a constant refusal; anything else was written by an older
+ * version that kept reply bodies and messages, which can hold a topic, a
+ * webhook path or a token, so it is hidden. */
+export function storedDeliveryError(detail: string): string {
+  return /^https?:\/\/[^\s/]+ (?:HTTP \d{3}|[A-Za-z0-9_]+|redirect refused|Outbound host is not allowed)$/.test(detail) ? detail : "[older error detail hidden]";
+}
+
 export function safeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
 }

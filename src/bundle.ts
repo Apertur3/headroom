@@ -23,7 +23,7 @@ import { tailDaemonLog } from "./logs.js";
 import { withPaceInfo } from "./pace.js";
 import { headroomHome } from "./paths.js";
 import { accountsPath, readAccounts } from "./registry.js";
-import { redact, writeFileAtomic } from "./security.js";
+import { redact, storedDeliveryError, writeFileAtomic } from "./security.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Lease } from "./types.js";
 import { headroomVersion } from "./version.js";
@@ -126,7 +126,10 @@ function redactKnownStoreLocations(text: string, home: string): string {
 export function redactBundleText(text: string): string {
   // Older versions put the malformed policy.toml line itself into
   // this error, and the daemon log keeps it.
-  const withoutConfigLines = text.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]");
+  const withoutConfigLines = text.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]")
+    // Delivery failures in the daemon log, which older versions logged with
+    // the channel's reply text.
+    .replace(/(notify \S+ (?:failed for \d+ event\(s\)|gave up on \d+ event\(s\) after \d+ attempts): )([^\n]*)/g, (_line, prefix: string, detail: string) => prefix + storedDeliveryError(detail));
   const withTokensAndEmails = redact(redactUrlUserinfo(withoutConfigLines));
   const withoutNetworkAddresses = redactNetworkAddresses(withTokensAndEmails);
   const withoutAssignedSecrets = redactAssignedSecrets(withoutNetworkAddresses);

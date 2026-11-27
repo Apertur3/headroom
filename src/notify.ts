@@ -8,7 +8,7 @@ import { appendDaemonLog } from "./logs.js";
 import { blockedWithResetItems } from "./notify-blocked.js"; import { experimentItems } from "./experiment-watch.js";
 import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
-import { clean, isLoopbackHost, outboundFetch, redact } from "./security.js";
+import { clean, isLoopbackHost, outboundFetch, redact, storedDeliveryError } from "./security.js";
 import { readAccountsOrEmpty } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 import type { Account, EventKind, HeadroomEvent, NotifyDelivery, Observation, StoredObservation } from "./types.js";
@@ -1170,7 +1170,7 @@ export async function notifyTest(options: NotifyOptions = {}): Promise<number> {
 export function formatLedger(rows: NotifyDelivery[]): string[] {
   return rows.map((row) => {
     const text = decodeItem(row).text;
-    const detail = row.status === "sent" || !row.detail ? "" : `  ${row.detail}`;
+    const detail = row.status === "sent" || !row.detail ? "" : `  ${storedDeliveryError(row.detail)}`;
     return clean(`${row.updated_at}  ${row.channel.padEnd(8)}  ${row.status.padEnd(7)}  ${row.attempts}  ${text.length > 80 ? `${text.slice(0, 77)}...` : text}${detail}`);
   });
 }

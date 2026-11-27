@@ -83,6 +83,18 @@ describe("bundle redaction of policy.toml secrets (synthetic values)", () => {
     expect(text).toContain("Invalid Headroom notify config: [REDACTED]\nnext line");
   });
 
+  it("hides delivery errors an older version logged with the reply text, and keeps current ones", () => {
+    const text = redactBundleText([
+      "2026-01-01T00:00:00.000Z notify ntfy failed for 2 event(s): 404 Cannot POST /Synthetic-Topic-1234",
+      "2026-01-01T00:00:01.000Z notify webhook gave up on 1 event(s) after 3 attempts: 500 error at /api/webhook/synthetic-hook-id",
+      "2026-01-01T00:00:02.000Z notify ntfy failed for 1 event(s): https://ntfy.sh HTTP 404",
+    ].join("\n"));
+    expect(text).not.toMatch(/Synthetic-Topic-1234|synthetic-hook-id/);
+    expect(text).toContain("notify ntfy failed for 2 event(s): [older error detail hidden]");
+    expect(text).toContain("notify webhook gave up on 1 event(s) after 3 attempts: [older error detail hidden]");
+    expect(text).toContain("notify ntfy failed for 1 event(s): https://ntfy.sh HTTP 404");
+  });
+
   it("strips URL user info up to the last @, whatever the password holds", () => {
     for (const url of ["http://proxyuser:synthetic'pass@192.0.2.10:3128", "http://proxyuser:synthetic\"pass@192.0.2.10:3128", "http://proxyuser:synthetic@pass@example.com/x"]) {
       const text = redactBundleText(`proxy at ${url} failed`);
