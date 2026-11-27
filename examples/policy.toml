@@ -30,7 +30,7 @@ pacing = "even"
 # anything on its own; set false to disable the check entirely.
 update_check = true
 # Proxy environment variables are ignored. Set this explicitly when a proxy is required.
-# It carries every outbound request except to localhost and NO_PROXY hosts
+# It carries every outbound request except to localhost, 127.0.0.1, ::1 and no_proxy hosts
 # (Headroom's own requests need Node 24.14+ or 25.4+ for this).
 # proxy = "http://127.0.0.1:8080"
 # Extra safe directories to scan for statusline snapshots. The default is

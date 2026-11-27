@@ -152,12 +152,15 @@ file you save yourself.
     environment variables are always ignored: the `headroom` launcher (`bin/headroom.js`) strips
     them from the child process's environment *before* spawning Node, because Node decides whether
     to install an env-driven proxy dispatcher from the process's *initial* environment, before any
-    application code runs; the CLI and daemon strip them again at start as defense in depth. A
-    `proxy` value in `policy.toml` is then applied explicitly: to engine child processes through
-    their environment, and to Headroom's own in-process requests through Node's built-in
-    `http.setGlobalProxyFromEnv()` (Node 24.14+ or 25.4+), with loopback and the operator's own
-    `NO_PROXY` hosts kept direct. On an older Node the CLI and daemon say on stderr that their own
-    requests go direct.
+    application code runs. The CLI and daemon strip them again at start, and when Node already
+    installed a proxy from `NODE_USE_ENV_PROXY` or `--use-env-proxy` (a service that starts
+    `dist/cli.js` directly), they replace it with a direct route. A `proxy` value in `policy.toml`
+    is applied explicitly: to engine child processes through their environment, and to Headroom's
+    own in-process requests through Node's built-in `http.setGlobalProxyFromEnv()` (Node 24.14+ or
+    25.4+), with `localhost`, `127.0.0.1`, `::1` and the operator's own `no_proxy`/`NO_PROXY` hosts
+    (lowercase first, as Node reads them) kept direct. Those same three hosts are the only ones a
+    webhook bearer may reach over plain `http`. On an older Node the CLI and daemon say on stderr
+    that they cannot apply the proxy setting.
     The optional CodexBar engine (`adapter: "codexbar"`) is the one exception to this allowlist:
     it links CodexBarCore, an unmodified pinned third-party dependency that performs its own
     authenticated HTTP request to a host read from the account's own `config.toml`

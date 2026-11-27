@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CHUNK_LIMIT, DEFAULT_NOTIFY_EVENTS, TELEGRAM_SECRET, WEBHOOK_SECRET, chunkMessage, combineTexts, inQuietHours,
-  parseNotifyConfig, parseQuietHours, prepareChannels, readSecret, scrubSecrets, secretStoreCommand, secretStoreHint,
+  notifyTest, parseNotifyConfig, parseQuietHours, prepareChannels, readSecret, scrubSecrets, secretStoreCommand, secretStoreHint,
   type CommandRunner, type NotifyConfig,
 } from "../src/notify.js";
 
@@ -188,9 +188,25 @@ describe("channel readiness", () => {
     const lan = await webhook("http://192.0.2.10:8123/api/webhook/synthetic-id");
     expect(lan).toMatchObject({ ready: false, detail: "refusing to send the headroom-webhook bearer over plain http to http://192.0.2.10:8123; use https (plain http only to localhost)" });
     for (const url of ["https://192.0.2.10:8123/hook", "http://127.0.0.1:8123/hook", "http://localhost/hook", "http://[::1]:8123/hook"]) expect((await webhook(url)).ready).toBe(true);
+    // The same loopback list the proxy bypass uses: other 127/8 addresses
+    // would go through a configured proxy, so they get no bearer either.
+    expect((await webhook("http://127.0.0.2:8123/hook")).ready).toBe(false);
     // Without a bearer there is nothing to protect, so plain http still posts.
     expect((await prepareChannels(config('[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "http://192.0.2.10/hook"\n'), { platform: "darwin", run: async () => { throw new Error("not found"); } }))[0].ready).toBe(true);
     expect(JSON.stringify(lan)).not.toContain("synthetic-bearer");
+  });
+
+  it("refuses user info in a channel URL, and scrubs a channel URL out of a delivery error", async () => {
+    expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "https://user:synthetic-pass@example.com/hook"\n')).toThrow(/webhook url must not hold a user name or password/);
+    expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "t"\nserver = "https://user@ntfy.example.com"\n')).toThrow(/ntfy server must not hold/);
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { lines.push(line); });
+    const fetcher = (async (request: Request) => { throw new Error(`connect failed for ${request.url}`); }) as unknown as typeof fetch;
+    try {
+      await notifyTest({ config: config('[notify]\nchannels = ["ntfy", "webhook"]\n[notify.ntfy]\ntopic = "synthetic-topic-1234"\n[notify.webhook]\nurl = "https://example.com/api/webhook/synthetic-hook-id"\n'), fetcher, platform: "darwin", run: async () => { throw new Error("not found"); } });
+    } finally { spy.mockRestore(); }
+    expect(lines.join("\n")).toContain("failed");
+    expect(lines.join("\n")).not.toMatch(/synthetic-topic-1234|synthetic-hook-id/);
   });
 
   it("never puts the bot token in a channel's own description", async () => {

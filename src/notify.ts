@@ -8,7 +8,7 @@ import { appendDaemonLog } from "./logs.js";
 import { blockedWithResetItems } from "./notify-blocked.js"; import { experimentItems } from "./experiment-watch.js";
 import { headroomHome } from "./paths.js";
 import { eventText, planDowngradeText, projectionBatchText, thresholdText } from "./notify-format.js";
-import { outboundFetch, redact } from "./security.js";
+import { clean, isLoopbackHost, outboundFetch, redact } from "./security.js";
 import { readAccountsOrEmpty } from "./registry.js";
 import { HeadroomStore } from "./store.js";
 import type { Account, EventKind, HeadroomEvent, NotifyDelivery, Observation, StoredObservation } from "./types.js";
@@ -239,9 +239,10 @@ export function parseNotifyConfig(text: string): NotifyConfig | undefined {
   if (chatId !== null && !/^-?[0-9]{1,32}$|^@[A-Za-z0-9_]{1,64}$/.test(chatId)) throw invalid("telegram chat_id must be a numeric id or an @name");
   for (const [label, candidate] of [["ntfy server", server], ["webhook url", webhookUrl]] as const) {
     if (candidate === null) continue;
-    let parsed: URL;
-    try { parsed = new URL(candidate); } catch { throw invalid(`${label} is not a URL`); }
-    if (!/^https?:$/.test(parsed.protocol)) throw invalid(`${label} must be http or https`);
+    if (!URL.canParse(candidate)) throw invalid(`${label} is not a URL`);
+    const { protocol, username, password } = new URL(candidate);
+    if (!/^https?:$/.test(protocol)) throw invalid(`${label} must be http or https`);
+    if (username || password) throw invalid(`${label} must not hold a user name or password; store a webhook token as ${WEBHOOK_SECRET} instead`);
   }
   return {
     channels: (channels ?? []) as ChannelName[],
@@ -488,12 +489,11 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
       if (!topic) { prepared.push({ channel, ready: false, detail: "no topic in [notify.ntfy]", secrets: [], deliver: async () => undefined }); continue; }
       const url = `${config.ntfy.server}/${topic}`;
       prepared.push({
-        channel, ready: true, detail: new URL(url).origin, secrets: [],
+        channel, ready: true, detail: new URL(url).origin, secrets: [url],
         deliver: async (items, digest) => {
           for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text), digest))) {
-            await send(fetcher, url, {
-              method: "POST", headers: { "content-type": "text/plain; charset=utf-8", title: `=?UTF-8?B?${Buffer.from(combineTexts(items.map((item) => item.text), digest).split("\n")[0]).toString("base64")}?=` }, body: chunk,
-            }, [config.ntfy.server]);
+            const headers = { "content-type": "text/plain; charset=utf-8", title: `=?UTF-8?B?${Buffer.from(combineTexts(items.map((item) => item.text), digest).split("\n")[0]).toString("base64")}?=` };
+            await send(fetcher, url, { method: "POST", headers, body: chunk }, [config.ntfy.server]);
           }
         },
       });
@@ -504,10 +504,10 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
     const bearer = await readSecret(WEBHOOK_SECRET, { platform, run });
     const { origin, protocol, hostname } = new URL(url);
     // A bearer never crosses a network in clear text: plain http only to this machine.
-    if (bearer.secret && protocol === "http:" && !/^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])$/.test(hostname)) { prepared.push({ channel, ready: false, detail: `refusing to send the ${WEBHOOK_SECRET} bearer over plain http to ${origin}; use https (plain http only to localhost)`, secrets: [], deliver: async () => undefined }); continue; }
+    if (bearer.secret && protocol === "http:" && !isLoopbackHost(hostname)) { prepared.push({ channel, ready: false, detail: `refusing to send the ${WEBHOOK_SECRET} bearer over plain http to ${origin}; use https (plain http only to localhost)`, secrets: [], deliver: async () => undefined }); continue; }
     const headers: Record<string, string> = { "content-type": "application/json", ...(bearer.secret ? { authorization: `Bearer ${bearer.secret}` } : {}) };
     prepared.push({
-      channel, ready: true, detail: `${origin}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [bearer.secret] : [],
+      channel, ready: true, detail: `${origin}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [url, bearer.secret] : [url],
       deliver: async (items, digest) => {
         // One POST per event even inside a batch: a webhook consumer wants
         // one structured record per event, not several folded into one text.
@@ -1177,7 +1177,7 @@ export function formatLedger(rows: NotifyDelivery[]): string[] {
   return rows.map((row) => {
     const text = decodeItem(row).text;
     const detail = row.status === "sent" || !row.detail ? "" : `  ${row.detail}`;
-    return `${row.updated_at}  ${row.channel.padEnd(8)}  ${row.status.padEnd(7)}  ${row.attempts}  ${text.length > 80 ? `${text.slice(0, 77)}...` : text}${detail}`;
+    return clean(`${row.updated_at}  ${row.channel.padEnd(8)}  ${row.status.padEnd(7)}  ${row.attempts}  ${text.length > 80 ? `${text.slice(0, 77)}...` : text}${detail}`);
   });
 }
 

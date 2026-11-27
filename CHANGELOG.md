@@ -12,8 +12,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
-- A webhook with a stored bearer token no longer sends it over plain `http` to another machine. The channel is turned off and says to use `https`; `http` to `localhost` still works.
-- The `proxy` set in `policy.toml` now also carries Headroom's own requests (Codex, Kimi, Grok, notifications), not only the engine's. Proxy variables from your shell are always ignored. This needs Node 24.14+ or 25.4+; on older Node, Headroom prints that its own requests go direct.
+- A webhook with a stored bearer token no longer sends it over plain `http` to another machine. The channel is turned off and says to use `https`; `http` to `localhost`, `127.0.0.1` or `[::1]` still works.
+- A webhook or ntfy server URL with a user name or password in it is refused with a message that says to store a webhook token in the secret store instead. A channel URL that shows up in a delivery error is hidden in the output and the delivery history.
+- The `proxy` set in `policy.toml` now also carries Headroom's own requests (Codex, Kimi, Grok, notifications), not only the engine's. Proxy variables from your shell are always ignored, also when Node picked them up at start (`NODE_USE_ENV_PROXY`). `no_proxy` is read the way Node reads it (lowercase first). This needs Node 24.14+ or 25.4+; on older Node, Headroom prints that it cannot apply the proxy setting.
 - Text that agents write (lease owners and notes, heartbeat resume sentences, timer actions, inbox messages) is printed with terminal control sequences removed, so a planted escape code cannot change your screen, set your clipboard or hide a link when you run `status`, `lease list`, `heartbeat list`, `timer list`, `spend` or `inbox`.
 - `headroom doctor --bundle` no longer copies `policy.toml` as text. It lists the settings as Headroom reads them, without comments: webhook and ntfy server URLs keep only their scheme and host, ntfy topics and Telegram chat ids are replaced, and the `proxy` shows only its scheme and host. A `policy.toml` that does not parse is left out. A `user:password@` in any URL elsewhere in the bundle is removed.
 - `headroom notify --test` and `--text` print only the server of an ntfy or webhook channel (`https://ntfy.sh`), not the topic or path, which work as passwords.

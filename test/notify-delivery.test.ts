@@ -534,6 +534,7 @@ describe("notification delivery", () => {
       expect(logged.join("\n")).not.toContain(TOKEN);
       expect(logged[1]).toContain("gave up");
       expect(formatLedger([row]).join("")).not.toContain(TOKEN);
+      expect(formatLedger([{ ...row, detail: "planted \x1b]52;c;eA==\x07 detail" }]).join("")).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     } finally { store.close(); }
   });
 
