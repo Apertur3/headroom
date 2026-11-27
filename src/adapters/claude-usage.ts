@@ -65,12 +65,29 @@ function stampKey(account: ProviderAccount, dependencies: ClaudeUsageDependencie
   return { dir: dependencies.stampDir ?? join(headroomHome(), "claude-usage"), key: createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12) };
 }
 
-/** The last good /usage rows of at most 30 minutes ago, kept in `<key>.last.json` apart from the run stamps:
- * a poll during a run (5-30 s), after a failed run or after a partial report must still see /usage, or the
- * statusline's stale figure (99% after a free reset) wins and the meter flaps between sources. */
+/** Per meter, the newest fresh reading; a placeholder ("no scoped limit in response") only where there is none. */
+function newest(rows: Observation[]): Observation[] {
+  const rank = (row: Observation): [number, number] => [row.freshness === "fresh" ? 1 : 0, Date.parse(row.observed_at)];
+  const best = new Map<string, Observation>();
+  for (const row of rows) {
+    const key = `${row.meter_id}|${row.window?.minutes ?? "none"}`, held = best.get(key);
+    if (!held || rank(row)[0] > rank(held)[0] || (rank(row)[0] === rank(held)[0] && rank(row)[1] >= rank(held)[1])) best.set(key, row);
+  }
+  return [...best.values()];
+}
+
+/** The last good /usage rows of at most 30 minutes ago, newest per meter. Each successful run writes its own
+ * `<key>.<ms>.rows.json` (no read-modify-write, so overlapping runs cannot lose each other's readings): a poll
+ * during a run (5-30 s), after a failed run or after a partial report must still see /usage, or the statusline's
+ * stale figure (99% after a free reset) wins and the meter flaps between sources. */
 async function lastGood(dir: string, key: string, now: Date): Promise<Observation[]> {
-  const rows = await readFile(join(dir, `${key}.last.json`), "utf8").then((text) => JSON.parse(text) as unknown).catch(() => undefined);
-  return (Array.isArray(rows) ? rows as Observation[] : []).filter((row) => now.getTime() - Date.parse(row.observed_at) <= CLAUDE_USAGE_KEEP_MS);
+  const rows: Observation[] = [];
+  for (const name of await readdir(dir).catch((): string[] => [])) {
+    if (!name.startsWith(`${key}.`) || !name.endsWith(".rows.json")) continue;
+    const parsed = await readFile(join(dir, name), "utf8").then((text) => JSON.parse(text) as unknown).catch(() => undefined);
+    if (Array.isArray(parsed)) rows.push(...parsed as Observation[]);
+  }
+  return newest(rows.filter((row) => now.getTime() - Date.parse(row.observed_at) <= CLAUDE_USAGE_KEEP_MS));
 }
 
 /** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket.
@@ -120,35 +137,22 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
   return undefined;
 }
 
-/** Per meter, the newest fresh reading; a placeholder ("no scoped limit in response") only where there is none. */
-function newest(rows: Observation[]): Observation[] {
-  const rank = (row: Observation): [number, number] => [row.freshness === "fresh" ? 1 : 0, Date.parse(row.observed_at)];
-  const best = new Map<string, Observation>();
-  for (const row of rows) {
-    const key = `${row.meter_id}|${row.window?.minutes ?? "none"}`, held = best.get(key);
-    if (!held || rank(row)[0] > rank(held)[0] || (rank(row)[0] === rank(held)[0] && rank(row)[1] >= rank(held)[1])) best.set(key, row);
-  }
-  return [...best.values()];
-}
-
 export async function observeClaudeUsage(account: ProviderAccount, dependencies: ClaudeUsageDependencies = {}): Promise<ClaudeUsageResult> {
   const now = dependencies.now?.() ?? new Date();
   const { dir, key } = stampKey(account, dependencies);
   const claim = await claimSlot(dir, key, now);
-  const kept = await lastGood(dir, key, now);
-  const withKept = (failed: { error: string }): ClaudeUsageResult => kept.length ? { ...failed, rows: kept } : failed;
-  if ("throttled" in claim) return { throttled: { ...claim.throttled, ...kept.length ? { rows: kept } : {} } };
+  // Read after any run: a newer run may have finished meanwhile.
+  const withKept = async (failed: { error: string }): Promise<ClaudeUsageResult> => { const kept = await lastGood(dir, key, now); return kept.length ? { ...failed, rows: kept } : failed; };
+  if ("throttled" in claim) { const kept = await lastGood(dir, key, now); return { throttled: { ...claim.throttled, ...kept.length ? { rows: kept } : {} } }; }
   if (!("path" in claim)) return withKept(claim);
   const ran = await run(account, dependencies, now);
   if ("error" in ran) {
     await writeFileAtomic(claim.path, JSON.stringify(ran), 0o600).catch(() => undefined);
     return withKept(ran);
   }
-  // Re-read just before writing: a newer run that finished meanwhile must not be overwritten by this older one.
-  // ponytail: read-then-write, two runs finishing within the same milliseconds can still race
-  const rows = newest([...await lastGood(dir, key, now), ...ran.rows]);
-  await writeFileAtomic(join(dir, `${key}.last.json`), JSON.stringify(rows), 0o600).catch(() => undefined);
-  return { rows };
+  await writeFileAtomic(join(dir, `${key}.${now.getTime()}.rows.json`), JSON.stringify(ran.rows), 0o600).catch(() => undefined);
+  for (const name of await readdir(dir).catch((): string[] => [])) if (name.startsWith(`${key}.`) && name.endsWith(".rows.json") && Number(name.split(".")[1]) < now.getTime() - CLAUDE_USAGE_KEEP_MS) await unlink(join(dir, name)).catch(() => undefined);
+  return { rows: await lastGood(dir, key, now) };
 }
 
 async function run(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ rows: Observation[] } | { error: string }> {

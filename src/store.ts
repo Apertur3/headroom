@@ -1479,7 +1479,7 @@ export class HeadroomStore {
         .all(observation.meter_id, since, nowIso)
         .map(observationFromRow)
         .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent" && !row.metadata?.vendor_inconsistent && !row.metadata?.vendor_window_held);
-      let samples = rows.filter((row) => row.source === rows.at(-1)?.source)/* one source: statusline 99% beside /usage 60% is no burn */.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
+      let samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used, source: row.source })).filter((sample) => Number.isFinite(sample.at));
 
       const eventBoundary = this.lastResetEventAt(observation.meter_id, minutes, since, nowIso);
       let sampleBoundary: number | null = null;
@@ -1487,7 +1487,7 @@ export class HeadroomStore {
         if (isUsageReset(samples[i - 1].used, samples[i].used)) sampleBoundary = samples[i].at;
       }
       const boundary = Math.max(eventBoundary ?? -Infinity, sampleBoundary ?? -Infinity);
-      if (Number.isFinite(boundary)) samples = samples.filter((sample) => sample.at >= boundary);
+      samples = samples.filter((sample) => (!Number.isFinite(boundary) || sample.at >= boundary) && sample.source === samples.at(-1)?.source); // one source after the reset cut: statusline 99% beside /usage 60% is no burn
 
       let burn = leastSquaresBurnPerHour(samples);
       if (burn !== null && burn < 0) burn = 0;

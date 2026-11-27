@@ -66,22 +66,33 @@ describe("claude /usage runner", () => {
     expect(await observeClaudeUsage(account, { run: fail, now: minute(45), stampDir: dir })).toEqual({ error: expect.any(String) });
   });
 
-  it("a partial report keeps a scoped reading, an older run never overwrites a newer one, a failed claim still serves the last reading", async () => {
+  it("a partial report keeps a scoped reading, overlapping runs never lose a newer reading, a failed claim still serves the last one", async () => {
     const dir = await stampDir();
     const minute = (n: number) => () => new Date(at.getTime() + n * 60_000);
+    const justBefore = (n: number) => () => new Date(at.getTime() + n * 60_000 - 1_000);
     const fable = { kind: "weekly_scoped", percent: 87, resets_at: "2026-10-25T11:59:59+00:00", scope: { model: { display_name: "Fable" } }, is_active: true };
     const weekly = (used: number) => expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", window: expect.objectContaining({ minutes: 10_080 }), quantity: expect.objectContaining({ used }) })]);
+    const session = expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", window: expect.objectContaining({ minutes: 300 }) })]);
     await observeClaudeUsage(account, { run: async () => reportLine([...okLimits, fable]), now: minute(0), stampDir: dir });
     const partial = await observeClaudeUsage(account, { run: async () => reportLine([okLimits[1]]), now: minute(10), stampDir: dir });
     expect(partial).toEqual({ rows: expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:fable", freshness: "fresh", quantity: expect.objectContaining({ used: 87 }) })]) });
-    let release = (): void => undefined;
-    const gate = new Promise<void>((done) => { release = done; });
-    const older = observeClaudeUsage(account, { run: async () => { await gate; return reportLine([{ ...okLimits[1], percent: 99 }]); }, now: () => new Date(at.getTime() + 20 * 60_000 - 1_000), stampDir: dir });
-    await observeClaudeUsage(account, { run: async () => reportLine([{ ...okLimits[1], percent: 60 }]), now: minute(20), stampDir: dir });
-    release(); await older;
-    expect(await observeClaudeUsage(account, { run: vi.fn(), now: () => new Date(at.getTime() + 20 * 60_000 + 5_000), stampDir: dir })).toEqual({ throttled: { rows: weekly(60) } });
-    await chmod(dir, 0o500); // no new stamp can be created; the cache stays readable
-    try { expect(await observeClaudeUsage(account, { run: vi.fn(), now: minute(30), stampDir: dir })).toEqual({ error: expect.any(String), rows: weekly(60) }); }
+    // An older run (bucket 2) finishing after a newer one (bucket 3), with success and then with failure.
+    const overlap = async (older: () => Promise<string>, at: number, newer: number) => {
+      let release = (): void => undefined;
+      const gate = new Promise<void>((done) => { release = done; });
+      const slow = vi.fn(async () => { await gate; return older(); });
+      const pending = observeClaudeUsage(account, { run: slow, now: justBefore(at), stampDir: dir });
+      await vi.waitFor(() => expect(slow).toHaveBeenCalled());
+      await observeClaudeUsage(account, { run: async () => reportLine([okLimits[0], { ...okLimits[1], percent: newer }]), now: minute(at), stampDir: dir });
+      release(); return pending;
+    };
+    await overlap(async () => reportLine([{ ...okLimits[1], percent: 99 }]), 30, 60);
+    const after = await observeClaudeUsage(account, { run: vi.fn(), now: () => new Date(at.getTime() + 30 * 60_000 + 5_000), stampDir: dir });
+    expect(after).toEqual({ throttled: { rows: weekly(60) } });
+    expect(after).toEqual({ throttled: { rows: session } });
+    expect(await overlap(async () => { throw new Error("exit 1"); }, 50, 55)).toEqual({ error: expect.any(String), rows: weekly(55) });
+    await chmod(dir, 0o500); // no new stamp can be created; the readings stay readable
+    try { expect(await observeClaudeUsage(account, { run: vi.fn(), now: minute(60), stampDir: dir })).toEqual({ error: expect.any(String), rows: weekly(55) }); }
     finally { await chmod(dir, 0o700); }
   });
 

@@ -132,7 +132,7 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
       store.insert(usage);
       expect(store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "usage_dropped" || event.kind === "free_reset_used")).toEqual([]);
       store.insert({ ...usage, source: "native:claude-statusline", quantity: { used: 99, limit: 100, remaining: 1, unit: "percent" }, fetched_at: new Date(Date.parse(usage.fetched_at) + 5_000).toISOString() });
-      expect(store.burnRateFor([usage], new Date(Date.parse(usage.fetched_at) + 10_000)).get("claude-main:all:10080")?.burn_percent_per_hour).toBe(0); // 99, 99 from the statusline; across sources 61 -> 99 read as +4,000%/h
+      expect(store.burnRateFor([usage], new Date(Date.parse(usage.fetched_at) + 10_000)).get("claude-main:all:10080")?.burn_percent_per_hour ?? null).toBeNull(); // one statusline sample after the cut; across sources 61 -> 99 read as +27,000%/h
       // A real free reset seen across sources still counts: statusline 99%, then /usage 3%.
       store.insert({ ...usage, quantity: { used: 3, limit: 100, remaining: 97, unit: "percent" }, fetched_at: new Date(Date.parse(usage.fetched_at) + 6_000).toISOString() });
       expect(store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "free_reset_used")).toHaveLength(1);
