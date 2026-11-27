@@ -15,7 +15,11 @@ file you save yourself.
 
 1. **No secret on disk in plaintext, ever.** Credentials are read at call time from each account's
    own store (macOS Keychain, `~/.codex/auth.json`) and dropped
-   after the request. Headroom has no credential store of its own and never mirrors tokens into
+   after the request. Headroom's own secrets (notification tokens and the billing-linked Moonshot
+   API key) are read only from the OS secret store (Keychain, `secret-tool`, Credential Manager);
+   a leftover `moonshot.key` file is never opened, and `headroom doctor` says how to move it into
+   the store and delete it. The one file a user writes by hand is the Kimi web-session token,
+   which is not billing-linked. Headroom has no credential store of its own and never mirrors tokens into
    config files (CodexBar's `tokenAccounts` path is deliberately not used).
 2. **No secret in output.** Logs, crash dumps, JSON output and history redact tokens (including an
    opaque bearer token with no recognizable prefix, not only `sk-`/`eyJ`/`ya29.`/`GOCSPX-` ones),
@@ -145,11 +149,20 @@ file you save yourself.
     `api.moonshot.ai`, and configured local base URLs. The same allowlist admits
     `registry.npmjs.org` and `api.github.com` for the update check and release notes, which carry
     no credential. Proxy
-    environment variables are ignored unless a `proxy` value is explicitly set in `policy.toml`:
-    the `headroom` launcher (`bin/headroom.js`) strips them from the child process's environment
-    *before* spawning Node, because Node decides whether to install an env-driven proxy dispatcher
-    from the process's *initial* environment, before any application code runs -- stripping them
-    afterward, in-process, is too late to undo that decision and is kept only as defense in depth.
+    environment variables are always ignored: the `headroom` launcher (`bin/headroom.js`) strips
+    them from the child process's environment *before* spawning Node, because Node decides whether
+    to install an env-driven proxy dispatcher from the process's *initial* environment, before any
+    application code runs. The CLI and daemon strip them again at start, and when Node already
+    installed a proxy from `NODE_USE_ENV_PROXY` or `--use-env-proxy` (a service that starts
+    `dist/cli.js` directly), they replace it with a direct route; a Node too old to replace it
+    makes them stop with an error instead. A `proxy` value in `policy.toml`
+    is applied explicitly: to engine child processes through their environment, and to Headroom's
+    own in-process requests through Node's built-in `http.setGlobalProxyFromEnv()` (Node 24.14+ or
+    25.4+), with `localhost`, `127.0.0.1`, `::1` and the operator's own `no_proxy`/`NO_PROXY` hosts
+    (lowercase first, as Node reads them) kept direct. A webhook bearer may reach only `localhost`
+    and `127.0.0.1` over plain `http`; not `::1`, which Node 24.14 and 25.4 can still send through
+    the proxy. On an older Node the CLI and daemon say on stderr that the configured proxy does
+    not reach their own requests.
     The optional CodexBar engine (`adapter: "codexbar"`) is the one exception to this allowlist:
     it links CodexBarCore, an unmodified pinned third-party dependency that performs its own
     authenticated HTTP request to a host read from the account's own `config.toml`

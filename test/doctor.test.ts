@@ -36,6 +36,25 @@ describe("doctor file checks", () => {
   });
 });
 
+describe("doctor: old plaintext Moonshot key file", () => {
+  it("fails and names the secret store command and the delete, without reading the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "headroom-doctor-moonshot-")); temporary.push(root);
+    const token = join(root, "auth.token");
+    await writeFile(token, "synthetic-token", { mode: 0o600 });
+    await writeFile(join(root, "moonshot.key"), "synthetic-moonshot-key", { mode: 0o600 });
+    const home = join(root, ".headroom");
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(join(home, "accounts.toml"), `[[accounts]]\nname = "kimi"\nvendor = "kimi"\nlocation = ${JSON.stringify(token)}\nadapter = "native-ts"\n`, { mode: 0o600 });
+    vi.stubEnv("HEADROOM_HOME", home);
+    try {
+      const found = (await doctorChecks()).find((item) => item.check === "principal kimi Moonshot key");
+      expect(found).toMatchObject({ level: "FAIL", detail: `plaintext key file ${join(root, "moonshot.key")} is no longer read` });
+      expect(found?.fix).toMatch(/^store the key with: .*headroom-moonshot.*, then delete /);
+      expect(JSON.stringify(found)).not.toContain("synthetic-moonshot-key");
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
 describe("doctor adapter check", () => {
   it("warns that codexbar performs its own network calls outside the outbound allowlist", () => {
     const result = adapterCheck({ name: "codex-main", vendor: "codex", location: "/nonexistent/.codex", adapter: "codexbar" });

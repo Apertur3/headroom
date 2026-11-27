@@ -1,7 +1,9 @@
 import { lstat, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import http from "node:http";
 import { performance } from "node:perf_hooks";
+import { stripVTControlCharacters } from "node:util";
 import { assertSafeAncestry } from "./paths.js";
 
 /** Redact values that may identify an account or authorize a provider request. */
@@ -21,6 +23,21 @@ export function redact(value: string): string {
     .replace(/\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b/g, "[REDACTED]");
 }
 
+/** Text another process wrote (a lease note, an inbox body, a resume
+ * sentence), made safe to print to a terminal: escape sequences are removed
+ * and every C0/C1 control character becomes a space, so it cannot rewrite the
+ * screen, set the clipboard (OSC 52) or disguise a link (OSC 8). */
+export function clean(text: string): string { return stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " "); }
+
+/** A stored notification delivery error, as it may be shown again. Current
+ * versions record only the channel origin plus an HTTP status, an error code
+ * or name, or a constant refusal; anything else was written by an older
+ * version that kept reply bodies and messages, which can hold a topic, a
+ * webhook path or a token, so it is hidden. */
+export function storedDeliveryError(detail: string): string {
+  return /^https?:\/\/[^\s/]+ (?:HTTP \d{3}|[A-Za-z0-9_]+|redirect refused|Outbound host is not allowed)$/.test(detail) ? detail : "[older error detail hidden]";
+}
+
 export function safeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
 }
@@ -36,18 +53,43 @@ export function outboundEnvironment(proxy?: string, env: NodeJS.ProcessEnv = pro
   return output;
 }
 
+type ProxyInstaller = (proxyEnv: Record<string, string>) => void;
+
+/** This machine, which the configured proxy never carries. Exact names only:
+ * Node's no_proxy matches exact hosts, not the 127.0.0.0/8 range. */
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "::1"];
+/** Hosts a webhook bearer may reach over plain http: loopback names every
+ * supported Node keeps off the proxy. Not `::1`, which the no_proxy parsing
+ * in Node 24.14 and 25.4 reads wrongly, so it could still go through it. */
+export function isLoopbackHost(hostname: string): boolean { return hostname === "localhost" || hostname === "127.0.0.1"; }
+
 /**
- * Call once at daemon and CLI process start, before any fetch happens. Recent
- * Node versions read HTTP_PROXY/HTTPS_PROXY/ALL_PROXY out of the environment
- * for the global fetch dispatcher when NODE_USE_ENV_PROXY is set; deleting all
- * four here means a proxy the operator's shell happened to have set cannot
- * silently route a credentialed vendor request through it unless Headroom's
- * own policy.toml opts in with an explicit `proxy` value.
+ * Call once at daemon and CLI process start, before any fetch happens. The
+ * shell's proxy variables are always deleted, so they can never route a
+ * credentialed vendor request. A `proxy` from policy.toml is then installed
+ * explicitly as the process-wide proxy for fetch() through Node's built-in
+ * http.setGlobalProxyFromEnv() (Node 24.14+ and 25.4+); loopback, and hosts
+ * in the operator's own no_proxy (lowercase first, as Node reads it), stay
+ * direct. When Node already installed a proxy from the environment at start
+ * (NODE_USE_ENV_PROXY, --use-env-proxy) and none is configured, every host is
+ * routed around a placeholder that is never contacted, which undoes it; a
+ * Node that cannot undo it throws, rather than let that proxy carry requests.
+ * Returns false when a configured proxy cannot reach in-process requests.
  */
-export function stripAmbientProxyEnvironment(proxy: string | undefined, env: NodeJS.ProcessEnv = process.env): void {
-  if (proxy) return;
+export function applyProxyPolicy(proxy: string | undefined, env: NodeJS.ProcessEnv = process.env, install: ProxyInstaller | null | undefined = (http as { setGlobalProxyFromEnv?: ProxyInstaller }).setGlobalProxyFromEnv, execArgv: string[] = process.execArgv): boolean {
+  const noProxy = [env.no_proxy || env.NO_PROXY, ...LOOPBACK_HOSTS].filter(Boolean).join(",");
+  const startupProxy = Boolean(env.NODE_USE_ENV_PROXY) || /--use-env-proxy\b/.test([env.NODE_OPTIONS ?? "", ...execArgv].join(" ").replace(/_/g, "-"));
   for (const key of AMBIENT_PROXY_ENV_KEYS) delete env[key];
+  if (!proxy && !startupProxy) return true;
+  if (!install && startupProxy) throw new Error(PROXY_STARTUP_ERROR);
+  if (!install) return false;
+  const unused = "http://127.0.0.1:9";
+  install(proxy ? { HTTP_PROXY: proxy, HTTPS_PROXY: proxy, no_proxy: noProxy } : { HTTP_PROXY: unused, HTTPS_PROXY: unused, no_proxy: "*" });
+  return true;
 }
+
+export const PROXY_UNSUPPORTED_NOTICE = "the proxy in policy.toml reaches Headroom's own requests only on Node 24.14+ or 25.4+; on this Node they go direct (engine requests still use it)";
+const PROXY_STARTUP_ERROR = "Node started with a proxy from NODE_USE_ENV_PROXY or --use-env-proxy, and this Node (before 24.14 or 25.4) cannot replace it, so Headroom stops rather than send requests through it. Unset NODE_USE_ENV_PROXY and remove --use-env-proxy (also from NODE_OPTIONS), or upgrade Node.";
 
 export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
   const parsed = new URL(url);

@@ -26,7 +26,7 @@ import { fireDueTimers, DELIVERY_TIMEOUT_MS } from "./heartbeat.js";
 import { accountsPath, readAccounts } from "./registry.js";
 import { disabledPrincipalForMeter, disabledPrincipalReason, isAccountEnabled, isLocalAccount, type Account, type Observation, type ProviderAccount } from "./types.js";
 import { safeHeadroomDirectory, HeadroomStore } from "./store.js";
-import { safeError, stripAmbientProxyEnvironment } from "./security.js";
+import { PROXY_UNSUPPORTED_NOTICE, applyProxyPolicy, safeError } from "./security.js";
 import { headroomVersion } from "./version.js";
 
 type Json = Record<string, unknown>;
@@ -416,7 +416,7 @@ export class HeadroomDaemon {
     // Before any fetch can happen: an operator's shell proxy must never
     // silently carry a credentialed vendor request unless policy.toml opts in.
     const startupPolicy = await readPolicy();
-    stripAmbientProxyEnvironment(startupPolicy.proxy);
+    if (!applyProxyPolicy(startupPolicy.proxy)) console.error(`headroom daemon: ${PROXY_UNSUPPORTED_NOTICE}`);
     // Establish notification history before any socket-triggered or scheduled
     // poll can insert new events. No token lookup or transport runs at startup.
     if ((await readNotifyConfig(this.home))?.channels.length) this.store.initializeNotificationEvents();

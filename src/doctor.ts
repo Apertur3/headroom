@@ -7,7 +7,7 @@ import { parseBundleFlag, writeDoctorBundle } from "./bundle.js";
 import { GEMINI_RETIRED_REASON } from "./adapters/gemini.js";
 import { claudeStatuslineNotice, freshStatuslineSnapshot, statuslineSnapshotDirs } from "./adapters/claude-statusline.js";
 import { grokAuthPath } from "./adapters/grok.js";
-import { isKimiCliCredential, kimiTokenPath } from "./adapters/kimi.js";
+import { isKimiCliCredential, kimiTokenPath, legacyMoonshotKeyFile, moonshotKeyFileFix } from "./adapters/kimi.js";
 import { readPolicy, readRouting } from "./config.js";
 import { checkedSocketPath, daemonRequest, legacyPipeFallback } from "./daemon.js";
 import { engineStatus } from "./engine/codexbar/install.js";
@@ -332,6 +332,8 @@ export async function doctorChecks(): Promise<DoctorCheck[]> {
         continue;
       }
       output.push(await credentialCheck(account, grantsNeeded, store));
+      const moonshotFile = !isLocalAccount(account) && account.vendor === "kimi" ? await legacyMoonshotKeyFile(kimiTokenPath(account.location)) : undefined;
+      if (moonshotFile) output.push(check("FAIL", `principal ${account.name} Moonshot key`, `plaintext key file ${moonshotFile} is no longer read`, moonshotKeyFileFix(moonshotFile)));
       const grant = keychainGrantCheck(account, grantsNeeded);
       if (grant) output.push(grant);
       output.push(adapterCheck(account));

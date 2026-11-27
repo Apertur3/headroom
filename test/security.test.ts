@@ -1,8 +1,84 @@
 import { createServer, type RequestListener } from "node:http";
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import ts from "typescript";
 import { afterEach, describe, expect, it } from "vitest";
 import { adaptCodexPayload } from "../src/engine/codexbar/adapt.js";
-import { outboundFetch, redact } from "../src/security.js";
+import { inboxLines } from "../src/cli.js";
+import { applyProxyPolicy, clean, outboundFetch, redact } from "../src/security.js";
+
+const execFileAsync = promisify(execFile);
+
+describe("proxy policy", () => {
+  const shell = (): NodeJS.ProcessEnv => ({ NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: "http://shell-proxy.example:3128", all_proxy: "http://shell-proxy.example:1080", NO_PROXY: "upper.example", no_proxy: "lower.example", KEEP: "yes" });
+
+  it("drops the shell's proxy variables, installs only the configured proxy, and reads no_proxy the way Node does", () => {
+    const installed: Record<string, string>[] = [];
+    const env = shell();
+    expect(applyProxyPolicy("http://proxy.example.com:8080/", env, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(env).toEqual({ NO_PROXY: "upper.example", no_proxy: "lower.example", KEEP: "yes" });
+    // Lowercase no_proxy wins over NO_PROXY, as in Node's own proxy support.
+    expect(installed).toEqual([{ HTTP_PROXY: "http://proxy.example.com:8080/", HTTPS_PROXY: "http://proxy.example.com:8080/", no_proxy: "lower.example,localhost,127.0.0.1,::1" }]);
+    const { no_proxy: _lower, ...upperOnly } = shell();
+    applyProxyPolicy("http://proxy.example.com:8080/", upperOnly, (proxyEnv) => installed.push(proxyEnv), []);
+    expect(installed[1].no_proxy).toBe("upper.example,localhost,127.0.0.1,::1");
+  });
+
+  it("undoes a proxy Node installed at start when none is configured, and installs nothing when there was none", () => {
+    const installed: Record<string, string>[] = [];
+    expect(applyProxyPolicy(undefined, shell(), (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(installed).toEqual([{ HTTP_PROXY: "http://127.0.0.1:9", HTTPS_PROXY: "http://127.0.0.1:9", no_proxy: "*" }]);
+    expect(applyProxyPolicy(undefined, { NODE_OPTIONS: "--use-env-proxy" }, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(applyProxyPolicy(undefined, {}, (proxyEnv) => installed.push(proxyEnv), ["--use-env-proxy"])).toBe(true);
+    expect(installed).toHaveLength(3);
+    expect(applyProxyPolicy(undefined, { KEEP: "yes" }, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(installed).toHaveLength(3);
+    expect(applyProxyPolicy(undefined, {}, (proxyEnv) => installed.push(proxyEnv), ["--use_env_proxy"])).toBe(true);
+    expect(applyProxyPolicy(undefined, { NODE_OPTIONS: "--use_env_proxy" }, (proxyEnv) => installed.push(proxyEnv), [])).toBe(true);
+    expect(installed).toHaveLength(5);
+    // A Node without http.setGlobalProxyFromEnv says so instead of pretending,
+    // and stops outright when Node already set up a proxy it cannot undo.
+    expect(applyProxyPolicy("http://proxy.example.com:8080/", {}, null, [])).toBe(false);
+    expect(() => applyProxyPolicy(undefined, shell(), null, [])).toThrow(/Unset NODE_USE_ENV_PROXY and remove --use-env-proxy/);
+    expect(() => applyProxyPolicy("http://proxy.example.com:8080/", {}, null, ["--use_env_proxy"])).toThrow(/cannot replace it/);
+    expect(applyProxyPolicy(undefined, {}, null, [])).toBe(true);
+  });
+
+  it.skipIf(typeof (http as { setGlobalProxyFromEnv?: unknown }).setGlobalProxyFromEnv !== "function")("wins over a proxy Node set up at start from NODE_USE_ENV_PROXY=1", async () => {
+    // A real child started the way a service might start dist/cli.js, with
+    // the shell's proxy in its startup environment.
+    const root = await mkdtemp(join(tmpdir(), "headroom-proxy-start-"));
+    try {
+      for (const name of ["security", "paths"]) {
+        const source = await readFile(new URL(`../src/${name}.ts`, import.meta.url), "utf8");
+        await writeFile(join(root, `${name}.js`), ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText);
+      }
+      await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
+      await writeFile(join(root, "probe.js"), 'import { applyProxyPolicy } from "./security.js";\napplyProxyPolicy(process.argv[2] || undefined);\nconsole.log(await fetch("http://example.invalid/probe").then((r) => r.text(), (e) => `direct ${e.cause?.code ?? e.message}`));\n');
+      const proxyServer = async (name: string) => { const server = createServer((_request, response) => response.end(name)); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); return { server, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` }; };
+      const shellProxy = await proxyServer("shell-proxy"), configured = await proxyServer("configured-proxy");
+      const run = async (...args: string[]) => (await execFileAsync(process.execPath, [join(root, "probe.js"), ...args], { env: { PATH: process.env.PATH ?? "", NODE_USE_ENV_PROXY: "1", HTTP_PROXY: shellProxy.url } })).stdout.trim();
+      try {
+        expect(await run()).toMatch(/^direct /);
+        expect(await run(configured.url)).toBe("configured-proxy");
+      } finally { shellProxy.server.close(); configured.server.close(); }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("terminal-safe printing of text other processes wrote", () => {
+  it("drops OSC 52, OSC 8, CSI and C1 sequences from an inbox line before it reaches the terminal", () => {
+    const planted = "copy \x1b]52;c;c3ludGhldGlj\x07this \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b[2J\x9b31m\r\nend";
+    expect(clean(planted)).toBe("copy this link   end");
+    const [line] = inboxLines({ messages: [{ id: "m1", at: "2026-01-01T00:00:00Z", kind: "note", from: "agent\x1b]52;c;eA==\x07", body: planted }] as never, remaining: 0 });
+    expect(line).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(line).toContain("from agent  copy this link");
+  });
+});
 
 describe("secret-safe outputs", () => {
   it("redacts child-process diagnostics before they can become an output or log", () => {

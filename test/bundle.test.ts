@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseBundleFlag, writeDoctorBundle } from "../src/bundle.js";
+import { parseBundleFlag, policyListing, redactBundleText, writeDoctorBundle } from "../src/bundle.js";
 
 const temporary: string[] = [];
 afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -32,6 +32,75 @@ describe("parseBundleFlag", () => {
   });
   it("returns undefined when --bundle is absent", () => {
     expect(parseBundleFlag([])).toBeUndefined();
+  });
+});
+
+describe("bundle redaction of policy.toml secrets (synthetic values)", () => {
+  const SECRETS = ["synthetic-proxy-pass", "proxyuser", "T0SYNTH", "synthetic-slack-secret", "synthetic-ha-id", "synthetic-ntfy-topic", "123456789", "synthetic-comment"];
+  const valid = [
+    'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128"',
+    "[notify]",
+    'channels = ["ntfy", "webhook", "telegram"]',
+    "[notify.webhook] # synthetic-comment",
+    'url = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
+    "[notify.ntfy] # topic synthetic-ntfy-topic",
+    'topic = "synthetic-ntfy-topic"',
+    'server = "https://ntfy.example.com/"',
+    "[notify.telegram]",
+    'chat_id = "123456789"',
+  ].join("\n");
+
+  it("lists policy.toml as parsed: notify URLs keep scheme and host, other channel values and comments are gone", () => {
+    const text = redactBundleText(policyListing(valid).join("\n"));
+    for (const secret of SECRETS) expect(text).not.toContain(secret);
+    expect(text).toContain('"url": "https://hooks.slack.com"');
+    expect(text).toContain('"topic": "[REDACTED]"');
+    expect(text).toContain('"server": "https://ntfy.example.com"');
+    expect(text).toContain('"chat_id": "[REDACTED]"');
+    expect(text).toContain('"proxy": "http://192.0.2.10:3128"');
+    expect(text).toContain('"channels": [');
+  });
+
+  it("leaves out a policy.toml that uses syntax the parser does not read, instead of copying it", () => {
+    const shapes = [
+      '[notify]\n[notify.ntfy]\n"topic" = "synthetic-ntfy-topic"',
+      '[notify]\n["notify".webhook]\nurl = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
+      '[notify]\nwebhook = { url = "https://example.com/api/webhook/synthetic-ha-id" }',
+      '[notify]\n[notify.webhook]\nurl = """\nhttps://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret\n"""',
+      '[notify]\nchannels = [\n"ntfy",\n]\n[notify.ntfy]\ntopic = "synthetic-ntfy-topic"',
+      'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128" garbage',
+    ];
+    for (const shape of shapes) {
+      const text = policyListing(shape).join("\n");
+      for (const secret of SECRETS) expect(text, shape).not.toContain(secret);
+    }
+    expect(policyListing('[notify]\n[notify.ntfy]\n"topic" = "synthetic-ntfy-topic"')).toEqual(["policy.toml did not parse; contents left out (headroom doctor names the problem)"]);
+  });
+
+  it("drops the config line an older version wrote into a daemon-log parse error", () => {
+    const text = redactBundleText('2026-01-01T00:00:00.000Z notification config read failed: Invalid Headroom notify config: "topic" = "synthetic-ntfy-topic"\nnext line');
+    expect(text).not.toContain("synthetic-ntfy-topic");
+    expect(text).toContain("Invalid Headroom notify config: [REDACTED]\nnext line");
+  });
+
+  it("hides delivery errors an older version logged with the reply text, and keeps current ones", () => {
+    const text = redactBundleText([
+      "2026-01-01T00:00:00.000Z notify ntfy failed for 2 event(s): 404 Cannot POST /Synthetic-Topic-1234",
+      "2026-01-01T00:00:01.000Z notify webhook gave up on 1 event(s) after 3 attempts: 500 error at /api/webhook/synthetic-hook-id",
+      "2026-01-01T00:00:02.000Z notify ntfy failed for 1 event(s): https://ntfy.sh HTTP 404",
+    ].join("\n"));
+    expect(text).not.toMatch(/Synthetic-Topic-1234|synthetic-hook-id/);
+    expect(text).toContain("notify ntfy failed for 2 event(s): [older error detail hidden]");
+    expect(text).toContain("notify webhook gave up on 1 event(s) after 3 attempts: [older error detail hidden]");
+    expect(text).toContain("notify ntfy failed for 1 event(s): https://ntfy.sh HTTP 404");
+  });
+
+  it("strips URL user info up to the last @, whatever the password holds", () => {
+    for (const url of ["http://proxyuser:synthetic'pass@192.0.2.10:3128", "http://proxyuser:synthetic\"pass@192.0.2.10:3128", "http://proxyuser:synthetic@pass@example.com/x"]) {
+      const text = redactBundleText(`proxy at ${url} failed`);
+      expect(text).not.toMatch(/proxyuser|synthetic/);
+      expect(text).toContain("[REDACTED]@");
+    }
   });
 });
 
@@ -84,6 +153,47 @@ describe("headroom doctor --bundle", () => {
     expect(text.startsWith("Headroom support bundle")).toBe(true);
     expect(text).toMatch(/redacted/i);
     expect(text).toMatch(/read the whole file yourself/i);
+  });
+
+  it("hides the continuation lines of a multi-line delivery error an older version logged", async () => {
+    const headroomHome = await tempDir("headroom-bundle-home-");
+    const outputDir = await tempDir("headroom-bundle-output-");
+    await mkdir(join(headroomHome, "logs"), { recursive: true });
+    await writeFile(join(headroomHome, "logs", "daemon.log"), [
+      "Cannot POST /SyntheticTopic_0000",
+      "2026-01-01T00:00:00.000Z notify ntfy failed for 1 event(s): 404 <html>",
+      "Cannot POST /SyntheticTopic_1234",
+      "</html>",
+      "2026-01-01T00:00:01.000Z daemon started",
+    ].join("\n") + "\n", "utf8");
+    const result = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(undefined, outputDir));
+    const text = await readFile(result.path, "utf8");
+    expect(text).not.toMatch(/SyntheticTopic|<\/html>/);
+    expect(text).toContain("notify ntfy failed for 1 event(s): [older error detail hidden]");
+    expect(text).toContain("[continuation line hidden]");
+    expect(text).toContain("2026-01-01T00:00:01.000Z daemon started");
+  });
+
+  it("hides the configured channel values wherever they appear, even on a log line a reply forged", async () => {
+    const headroomHome = await tempDir("headroom-bundle-home-");
+    const outputDir = await tempDir("headroom-bundle-output-");
+    await mkdir(join(headroomHome, "logs"), { recursive: true });
+    await writeFile(join(headroomHome, "policy.toml"), [
+      "[notify]", 'channels = ["ntfy", "webhook", "telegram"]',
+      "[notify.ntfy]", 'topic = "aBc"', 'server = "https://ntfy.example.com/synthetic-server-path"',
+      "[notify.webhook]", 'url = "https://hooks.example.com/services/synthetic-hook-path?wait=true"',
+      "[notify.telegram]", 'chat_id = "987654321"',
+    ].join("\n") + "\n", { mode: 0o600 });
+    await writeFile(join(headroomHome, "logs", "daemon.log"), [
+      "2026-01-01T00:00:00.000Z notify ntfy failed for 1 event(s): 404",
+      "2026-11-27T12:00:00.000Z Cannot POST /abc",
+      "2026-11-27T12:00:00.500Z Cannot POST /synthetic-server-path/abc",
+      "2026-11-27T12:00:01.000Z 500 at /services/synthetic-hook-path for chat 987654321",
+    ].join("\n") + "\n", "utf8");
+    const result = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(undefined, outputDir));
+    const text = await readFile(result.path, "utf8");
+    expect(text).not.toMatch(/\/abc|synthetic-hook-path|synthetic-server-path|987654321/i);
+    expect(text).toContain("Cannot POST /[REDACTED]");
   });
 
   it("redacts this machine's hostname when it is not localhost", async () => {

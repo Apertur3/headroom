@@ -49,3 +49,42 @@ vi.mock("../src/antigravity-discovery.js", async (original) => {
       actual.externalAntigravityServerPids({ list: async () => [], ...options }),
   };
 });
+
+// No test may read the developer's real Keychain, secret-tool or Credential
+// Manager. Every secret-store read in src goes through node:child_process's
+// execFile (notify.ts's systemRunner, readSecret's default, the Claude and
+// Kimi Keychain reads), so it is refused here, at the one seam they share;
+// test/secret-store-isolation.test.ts proves it. Tests of the store commands
+// themselves inject their own runner.
+vi.mock("node:child_process", async (original) => {
+  const actual = await original<typeof import("node:child_process")>();
+  const { promisify } = await import("node:util");
+  const { accessSync, constants, realpathSync, statSync } = await import("node:fs");
+  const { delimiter, isAbsolute, join: joinPath, sep } = await import("node:path");
+  const scratch = realpathSync(tmpdir());
+  const runnable = (path: string) => { try { accessSync(path, constants.X_OK); return statSync(path).isFile(); } catch { return false; } };
+  // What a store command would really run: the first regular, executable file
+  // on PATH, as the OS picks it (a directory or a non-executable file is
+  // skipped). A fake a test put under the temp directory runs at exactly that
+  // path; anything else, the machine's own tool included, is refused.
+  const target = (command: unknown, args: unknown, options: unknown): string | null => {
+    const name = String(command);
+    if (Array.isArray(args) && args.some((arg) => String(arg).includes("CredReadW"))) return null;
+    if (!/(?:^|[\\/])(?:security|secret-tool)$/.test(name)) return name;
+    const path = ((Array.isArray(args) ? options : args) as { env?: NodeJS.ProcessEnv } | undefined)?.env?.PATH ?? process.env.PATH ?? "";
+    const found = (isAbsolute(name) ? [name] : path.split(delimiter).filter(Boolean).map((dir) => joinPath(dir, name))).find(runnable);
+    const real = found && realpathSync(found);
+    return real && real.startsWith(scratch + sep) ? real : null;
+  };
+  const refusal = (command: unknown) => Object.assign(new Error(`secret store command ${String(command)} is blocked in tests`), { code: "EHEADROOMTEST" });
+  const execFile = ((command: string, args?: unknown, ...rest: unknown[]) => {
+    const run = target(command, args, rest[0]);
+    if (run !== null) return (actual.execFile as (...items: unknown[]) => unknown)(run, args, ...rest);
+    const callback = [args, ...rest].find((item) => typeof item === "function") as ((error: Error) => void) | undefined;
+    queueMicrotask(() => callback?.(refusal(command)));
+    return undefined;
+  }) as typeof actual.execFile;
+  const promised = (actual.execFile as unknown as Record<symbol, (...items: unknown[]) => Promise<unknown>>)[promisify.custom];
+  Object.assign(execFile, { [promisify.custom]: (command: string, args?: unknown, ...rest: unknown[]) => { const run = target(command, args, rest[0]); return run === null ? Promise.reject(refusal(command)) : promised(run, args, ...rest); } });
+  return { ...actual, execFile, default: { ...actual, execFile } };
+});
