@@ -155,6 +155,25 @@ describe("headroom doctor --bundle", () => {
     expect(text).toMatch(/read the whole file yourself/i);
   });
 
+  it("hides the continuation lines of a multi-line delivery error an older version logged", async () => {
+    const headroomHome = await tempDir("headroom-bundle-home-");
+    const outputDir = await tempDir("headroom-bundle-output-");
+    await mkdir(join(headroomHome, "logs"), { recursive: true });
+    await writeFile(join(headroomHome, "logs", "daemon.log"), [
+      "Cannot POST /SyntheticTopic_0000",
+      "2026-01-01T00:00:00.000Z notify ntfy failed for 1 event(s): 404 <html>",
+      "Cannot POST /SyntheticTopic_1234",
+      "</html>",
+      "2026-01-01T00:00:01.000Z daemon started",
+    ].join("\n") + "\n", "utf8");
+    const result = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(undefined, outputDir));
+    const text = await readFile(result.path, "utf8");
+    expect(text).not.toMatch(/SyntheticTopic|<\/html>/);
+    expect(text).toContain("notify ntfy failed for 1 event(s): [older error detail hidden]");
+    expect(text).toContain("[continuation line hidden]");
+    expect(text).toContain("2026-01-01T00:00:01.000Z daemon started");
+  });
+
   it("redacts this machine's hostname when it is not localhost", async () => {
     const headroomHome = await tempDir("headroom-bundle-home-");
     const outputDir = await tempDir("headroom-bundle-output-");

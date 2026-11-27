@@ -183,7 +183,9 @@ type DoctorFileStatusFallback = "present" | "missing" | "unsafe";
 async function daemonLogSection(home: string): Promise<string[]> {
   try {
     const text = await tailDaemonLog(DAEMON_LOG_LINES, home);
-    return text ? text.split("\n") : ["no daemon log written yet"];
+    // Every record starts with its timestamp. A line without one is the rest of a
+    // multi-line message (older versions logged channel replies whole), so it goes.
+    return text ? text.split("\n").map((line) => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) ? line : "[continuation line hidden]") : ["no daemon log written yet"];
   } catch (error) {
     return [`daemon log unavailable: ${errorMessage(error)}`];
   }
