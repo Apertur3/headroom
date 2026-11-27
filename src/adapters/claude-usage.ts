@@ -13,6 +13,8 @@ import { observationsFromClaudeUsage } from "./claude.js";
 export const CLAUDE_USAGE_SOURCE = "native:claude-usage";
 /** At most one `claude -p "/usage"` run per profile in this window. */
 export const CLAUDE_USAGE_MIN_INTERVAL_MS = 10 * 60_000;
+/** A /usage reading stays in use this long when later runs fail: the statusline's figure can be stale for days. */
+const CLAUDE_USAGE_KEEP_MS = 30 * 60_000;
 const TIMEOUT_MS = 30_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 /** `/usage` runs no model turn: it prints a usage_report (an experimental SDK
@@ -25,8 +27,9 @@ const ENV_KEYS = ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "USERPROFILE", "A
 
 export type ClaudeUsageRunner = (binary: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string; timeout: number }) => Promise<string>;
 export interface ClaudeUsageDependencies { run?: ClaudeUsageRunner; now?: () => Date; stampDir?: string; binary?: string }
-/** `throttled`: ran within the interval; `error` carries the reason when that run failed, `rows` that run's readings when it succeeded. */
-export type ClaudeUsageResult = { rows: Observation[] } | { error: string } | { throttled: { error?: string; rows?: Observation[] } };
+/** `throttled`: ran within the interval. `error` carries the reason a run failed; with it, `rows` are the last good
+ * readings of at most 30 minutes ago, kept through the failure. */
+export type ClaudeUsageResult = { rows: Observation[] } | { error: string; rows?: Observation[] } | { throttled: { error?: string; rows?: Observation[] } };
 
 /** Windows npm installs expose `claude.cmd`, which only a shell can start. Safe here: every argument is a constant and the only variable input travels in env. */
 export const needsShell = (binary: string, platform: string = process.platform): boolean => platform === "win32" && /\.(cmd|bat)$/i.test(binary);
@@ -59,9 +62,9 @@ function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
 
 /** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket.
  * The stamp later holds the run's outcome (JSON `{error}` or `{rows}`), so a throttled poll reuses the last reading.
- * A new stamp starts with the previous bucket's rows: a poll during the run (5-30 s) must still see /usage,
- * or a stale statusline 99% wins that poll and the meter flaps between sources. */
-async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ path: string } | { throttled: { error?: string; rows?: Observation[] } } | { error: string }> {
+ * A new stamp starts with the previous bucket's rows of the last 30 minutes: a poll during the run (5-30 s), or
+ * after a failed run, must still see /usage, or the statusline's stale 99% wins and the meter flaps between sources. */
+async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ path: string; kept: Observation[] } | { throttled: { error?: string; rows?: Observation[] } } | { error: string }> {
   const dir = dependencies.stampDir ?? join(headroomHome(), "claude-usage");
   const key = createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12);
   // ponytail: bucket-aligned throttle, two runs can straddle a boundary
@@ -71,17 +74,23 @@ async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDepe
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const previous = await readFile(join(dir, `${key}.${bucket - 1}.stamp`), "utf8").then((text) => (JSON.parse(text) as { rows?: unknown }).rows).catch(() => undefined);
+    const kept = (Array.isArray(previous) ? previous as Observation[] : []).filter((row) => now.getTime() - Date.parse(row.observed_at) <= CLAUDE_USAGE_KEEP_MS);
     // Exclusive create with content: write a temporary file, then link() it in (EEXIST when another poll won).
     const temporary = join(dir, `.${name}.${randomBytes(8).toString("hex")}.tmp`);
-    await writeFile(temporary, Array.isArray(previous) ? JSON.stringify({ rows: previous }) : "", { mode: 0o600, flag: "wx" });
-    try { await link(temporary, path); } finally { await unlink(temporary).catch(() => undefined); }
-    for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old !== name) await unlink(join(dir, old)).catch(() => undefined);
-    return { path };
+    const content = kept.length ? JSON.stringify({ rows: kept }) : "";
+    await writeFile(temporary, content, { mode: 0o600, flag: "wx" });
+    try { await link(temporary, path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
+      await writeFile(path, content, { mode: 0o600, flag: "wx" }); // no hard links (exFAT): exclusive, briefly empty
+    } finally { await unlink(temporary).catch(() => undefined); }
+    // Only older buckets: a slow poll must not delete a newer bucket's claim.
+    for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && Number(old.split(".")[1]) < bucket) await unlink(join(dir, old)).catch(() => undefined);
+    return { path, kept };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") return { error: "claude /usage could not record its run claim" }; // fail closed rather than run unthrottled
     // An empty stamp is a run still in flight with no earlier reading: not a failure.
-    const recorded = await readFile(path, "utf8").then((text) => text ? JSON.parse(text) as { error?: unknown; rows?: unknown } : {}, (): { error?: unknown; rows?: unknown } => ({}));
-    return { throttled: typeof recorded.error === "string" ? { error: recorded.error } : Array.isArray(recorded.rows) ? { rows: recorded.rows as Observation[] } : {} };
+    const recorded = await readFile(path, "utf8").then((text) => JSON.parse(text || "{}") as { error?: unknown; rows?: unknown }).catch((): { error?: unknown; rows?: unknown } => ({}));
+    return { throttled: { ...typeof recorded.error === "string" ? { error: recorded.error } : {}, ...Array.isArray(recorded.rows) ? { rows: recorded.rows as Observation[] } : {} } };
   }
 }
 
@@ -116,7 +125,8 @@ export async function observeClaudeUsage(account: ProviderAccount, dependencies:
   const now = dependencies.now?.() ?? new Date();
   const claim = await claimSlot(account, dependencies, now);
   if (!("path" in claim)) return claim;
-  const result = await run(account, dependencies, now);
+  const ran = await run(account, dependencies, now);
+  const result = "error" in ran && claim.kept.length ? { ...ran, rows: claim.kept } : ran;
   await writeFileAtomic(claim.path, JSON.stringify(result), 0o600).catch(() => undefined);
   return result;
 }

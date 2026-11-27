@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- The Claude weekly reading no longer flips back to a stale 99% for a few seconds every 10 minutes. While Claude Code's `/usage` was running, a poll found no `/usage` reading and took the status line's old figure. That froze agents and sent a false "Usage dropped early" alert. Headroom now keeps the last `/usage` reading until the new one arrives, and a switch from one source to another no longer counts as an early drop.
+- The Claude weekly reading no longer flips back to 99% every 10 minutes after a free reset. Claude Code's status line keeps showing the pre-reset figure, and while `/usage` was running, Headroom briefly had no `/usage` reading and showed the status line's 99% instead. That froze agents, showed a burn rate made from two sources, and sent a false "Usage dropped early" alert. Headroom now keeps the last `/usage` reading until the next one arrives, and for up to 30 minutes when a run fails. Burn rates use one source, and switching sources no longer counts as an early drop.
 
 ## [0.2.25] - 2026-11-26
 

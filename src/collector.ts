@@ -186,11 +186,12 @@ export async function pollAccounts(principal?: string, options: PollOptions = {}
       const usage = await observeClaudeUsage(account, options.claudeUsage);
       const usageError = "error" in usage ? usage.error : "throttled" in usage ? usage.throttled.error : undefined;
       const fromSnapshot = snapshot ? observationsFromStatuslineSnapshot(snapshot, account.name, new Date()) : [];
-      if (snapshot || !usageError) {
-        // /usage wins for every meter it reports: the statusline's rate_limits can stay
-        // at the old figure after a free reset (99% shown, 3% real). The snapshot adds
-        // only what /usage does not carry. ponytail: /usage lags up to 10 min.
-        const rows = "rows" in usage ? usage.rows : "throttled" in usage ? usage.throttled.rows ?? [] : [];
+      // /usage wins for every meter it reports: the statusline's rate_limits can stay
+      // at the old figure after a free reset (99% shown, 60% real), so its last reading
+      // stays in use for 30 min through failed runs. The snapshot adds only what /usage
+      // does not carry. ponytail: /usage lags up to 10 min.
+      const rows = "rows" in usage ? usage.rows ?? [] : "throttled" in usage ? usage.throttled.rows ?? [] : [];
+      if (snapshot || !usageError || rows.length) {
         const covered = new Set(rows.map((item) => `${item.meter_id}|${item.window?.minutes ?? "none"}`));
         const live = fromSnapshot.filter((item) => !covered.has(`${item.meter_id}|${item.window?.minutes ?? "none"}`));
         // Neither a fresh snapshot nor a /usage reading: only an old snapshot can add rows.

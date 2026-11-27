@@ -2,6 +2,11 @@ import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+const fsFault = vi.hoisted(() => ({ link: undefined as NodeJS.ErrnoException | undefined }));
+vi.mock("node:fs/promises", async (original) => {
+  const real = await original<typeof import("node:fs/promises")>();
+  return { ...real, link: (...args: Parameters<typeof real.link>) => fsFault.link ? Promise.reject(fsFault.link) : real.link(...args) };
+});
 import { CLAUDE_USAGE_MIN_INTERVAL_MS, CLAUDE_USAGE_SOURCE, defaultRun, needsShell, observeClaudeUsage, resolveBinary } from "../src/adapters/claude-usage.js";
 import { parseStatuslineSnapshot, reconcileSnapshot, snapshotFromStatuslinePayload, writeSnapshotLocked } from "../src/adapters/claude-statusline.js";
 
@@ -41,6 +46,32 @@ describe("claude /usage runner", () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS + 1000), stampDir: dir })).toHaveProperty("rows");
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("claims without hard links (exFAT), and a slow poll never deletes a newer bucket's claim", async () => {
+    const dir = await stampDir();
+    const run = vi.fn(async () => stream());
+    fsFault.link = Object.assign(new Error("operation not supported"), { code: "ENOTSUP" });
+    try {
+      expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS), stampDir: dir })).toHaveProperty("rows");
+      expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS + 60_000), stampDir: dir })).toHaveProperty("throttled.rows");
+    } finally { fsFault.link = undefined; }
+    await observeClaudeUsage(account, { run, now: () => at, stampDir: dir }); // bucket N, after N+1 claimed
+    expect((await readdir(dir)).filter((name) => !name.startsWith("."))).toHaveLength(2);
+    expect(await observeClaudeUsage(account, { run, now: () => new Date(at.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS + 120_000), stampDir: dir })).toHaveProperty("throttled");
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failed run keeps the last reading for 30 minutes, then drops it", async () => {
+    const dir = await stampDir();
+    const fail = vi.fn(async (): Promise<string> => { throw new Error("exit 1"); });
+    const bucket = (n: number) => () => new Date(at.getTime() + n * CLAUDE_USAGE_MIN_INTERVAL_MS);
+    await observeClaudeUsage(account, { run: vi.fn(async () => stream()), now: () => at, stampDir: dir });
+    const weekly = { meter_id: "claude-work:all", quantity: expect.objectContaining({ used: 61 }) };
+    expect(await observeClaudeUsage(account, { run: fail, now: bucket(1), stampDir: dir })).toEqual({ error: expect.any(String), rows: expect.arrayContaining([expect.objectContaining(weekly)]) });
+    expect(await observeClaudeUsage(account, { run: fail, now: () => new Date(bucket(1)().getTime() + 60_000), stampDir: dir })).toEqual({ throttled: { error: expect.any(String), rows: expect.arrayContaining([expect.objectContaining(weekly)]) } });
+    expect(await observeClaudeUsage(account, { run: fail, now: bucket(2), stampDir: dir })).toHaveProperty("rows");
+    expect(await observeClaudeUsage(account, { run: fail, now: () => new Date(bucket(3)().getTime() + 60_000), stampDir: dir })).toEqual({ error: expect.any(String) });
   });
 
   it("fails closed with a reason: no usage_report, text only, a missing binary, a crash", async () => {

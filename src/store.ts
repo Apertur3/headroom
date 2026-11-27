@@ -1365,7 +1365,7 @@ export class HeadroomStore {
    * below (a vendor correction or a free reset fired ahead of schedule). */
   private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation, createdAt?: string, scheduledRolloverAt?: string): void {
     if (current.window?.kind === "state" || current.window?.kind === "count") return;
-    if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent" || baseline.source !== current.source) return; // stale statusline 99% then /usage 60%: not a drop
+    if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
     const oldUsed = baseline.quantity.used;
     const newUsed = current.quantity.used;
     if (!isUsageReset(oldUsed, newUsed)) return;
@@ -1381,8 +1381,8 @@ export class HeadroomStore {
     const stale = elapsedMs > 24 * 3_600_000;
     const staleHours = Math.floor(elapsedMs / 3_600_000);
     const suffix = (base: string | null): string | null => stale ? `${base ? `${base}; ` : ""}baseline ${staleHours}h old` : base;
-    const freeReset = (): void => this.addEvent(newUsed <= 5 ? "free_reset_used" : "usage_dropped", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt,
-      newUsed > 5 ? { used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : undefined);
+    const freeReset = (): void => { if (newUsed > 5 && baseline.source !== current.source) return; /* stale statusline 99% then /usage 60%: not a drop */ this.addEvent(newUsed <= 5 ? "free_reset_used" : "usage_dropped", "inferred", stale ? 0.5 : 0.8, evidence, current, suffix(`usage dropped from ${Math.round(oldUsed)}% to ${Math.round(newUsed)}% before the scheduled reset`), null, createdAt,
+      newUsed > 5 ? { used_percent: Math.round(newUsed), previous_used_percent: Math.round(oldUsed) } : undefined); };
     const windowMinutes = current.window?.minutes ?? null;
     if (this.failedGapBetween(current.meter_id, current.window, baseline.id, current.id)) {
       if (previousReset > Date.parse(baseline.fetched_at) && previousReset <= Date.parse(current.fetched_at)) {
@@ -1479,7 +1479,7 @@ export class HeadroomStore {
         .all(observation.meter_id, since, nowIso)
         .map(observationFromRow)
         .filter((row) => row.window?.minutes === minutes && row.quantity?.unit === "percent" && !row.metadata?.vendor_inconsistent && !row.metadata?.vendor_window_held);
-      let samples = rows.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
+      let samples = rows.filter((row) => row.source === rows.at(-1)?.source)/* one source: statusline 99% beside /usage 60% is no burn */.map((row) => ({ at: Date.parse(row.fetched_at), used: (row.quantity as { used: number }).used })).filter((sample) => Number.isFinite(sample.at));
 
       const eventBoundary = this.lastResetEventAt(observation.meter_id, minutes, since, nowIso);
       let sampleBoundary: number | null = null;
