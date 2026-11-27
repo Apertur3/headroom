@@ -120,22 +120,33 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
   return undefined;
 }
 
+/** Per meter, the newest fresh reading; a placeholder ("no scoped limit in response") only where there is none. */
+function newest(rows: Observation[]): Observation[] {
+  const rank = (row: Observation): [number, number] => [row.freshness === "fresh" ? 1 : 0, Date.parse(row.observed_at)];
+  const best = new Map<string, Observation>();
+  for (const row of rows) {
+    const key = `${row.meter_id}|${row.window?.minutes ?? "none"}`, held = best.get(key);
+    if (!held || rank(row)[0] > rank(held)[0] || (rank(row)[0] === rank(held)[0] && rank(row)[1] >= rank(held)[1])) best.set(key, row);
+  }
+  return [...best.values()];
+}
+
 export async function observeClaudeUsage(account: ProviderAccount, dependencies: ClaudeUsageDependencies = {}): Promise<ClaudeUsageResult> {
   const now = dependencies.now?.() ?? new Date();
   const { dir, key } = stampKey(account, dependencies);
   const claim = await claimSlot(dir, key, now);
   const kept = await lastGood(dir, key, now);
+  const withKept = (failed: { error: string }): ClaudeUsageResult => kept.length ? { ...failed, rows: kept } : failed;
   if ("throttled" in claim) return { throttled: { ...claim.throttled, ...kept.length ? { rows: kept } : {} } };
-  if (!("path" in claim)) return claim;
+  if (!("path" in claim)) return withKept(claim);
   const ran = await run(account, dependencies, now);
   if ("error" in ran) {
     await writeFileAtomic(claim.path, JSON.stringify(ran), 0o600).catch(() => undefined);
-    return kept.length ? { ...ran, rows: kept } : ran;
+    return withKept(ran);
   }
-  // A report without some meter keeps that meter's recent reading.
-  const meter = (row: Observation): string => `${row.meter_id}|${row.window?.minutes ?? "none"}`;
-  const reported = new Set(ran.rows.map(meter));
-  const rows = [...ran.rows, ...kept.filter((row) => !reported.has(meter(row)))];
+  // Re-read just before writing: a newer run that finished meanwhile must not be overwritten by this older one.
+  // ponytail: read-then-write, two runs finishing within the same milliseconds can still race
+  const rows = newest([...await lastGood(dir, key, now), ...ran.rows]);
   await writeFileAtomic(join(dir, `${key}.last.json`), JSON.stringify(rows), 0o600).catch(() => undefined);
   return { rows };
 }

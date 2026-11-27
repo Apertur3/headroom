@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,6 +64,25 @@ describe("claude /usage runner", () => {
     expect(await observeClaudeUsage(account, { run: fail, now: minute(30), stampDir: dir })).toEqual({ error: expect.any(String), rows: weekly }); // bucket 20-29 skipped
     expect(await observeClaudeUsage(account, { run: fail, now: minute(39), stampDir: dir })).toEqual({ throttled: { error: expect.any(String), rows: expect.not.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", window: expect.objectContaining({ minutes: 10_080 }) })]) } }); // 39 min old: dropped
     expect(await observeClaudeUsage(account, { run: fail, now: minute(45), stampDir: dir })).toEqual({ error: expect.any(String) });
+  });
+
+  it("a partial report keeps a scoped reading, an older run never overwrites a newer one, a failed claim still serves the last reading", async () => {
+    const dir = await stampDir();
+    const minute = (n: number) => () => new Date(at.getTime() + n * 60_000);
+    const fable = { kind: "weekly_scoped", percent: 87, resets_at: "2026-10-25T11:59:59+00:00", scope: { model: { display_name: "Fable" } }, is_active: true };
+    const weekly = (used: number) => expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:all", window: expect.objectContaining({ minutes: 10_080 }), quantity: expect.objectContaining({ used }) })]);
+    await observeClaudeUsage(account, { run: async () => reportLine([...okLimits, fable]), now: minute(0), stampDir: dir });
+    const partial = await observeClaudeUsage(account, { run: async () => reportLine([okLimits[1]]), now: minute(10), stampDir: dir });
+    expect(partial).toEqual({ rows: expect.arrayContaining([expect.objectContaining({ meter_id: "claude-work:fable", freshness: "fresh", quantity: expect.objectContaining({ used: 87 }) })]) });
+    let release = (): void => undefined;
+    const gate = new Promise<void>((done) => { release = done; });
+    const older = observeClaudeUsage(account, { run: async () => { await gate; return reportLine([{ ...okLimits[1], percent: 99 }]); }, now: () => new Date(at.getTime() + 20 * 60_000 - 1_000), stampDir: dir });
+    await observeClaudeUsage(account, { run: async () => reportLine([{ ...okLimits[1], percent: 60 }]), now: minute(20), stampDir: dir });
+    release(); await older;
+    expect(await observeClaudeUsage(account, { run: vi.fn(), now: () => new Date(at.getTime() + 20 * 60_000 + 5_000), stampDir: dir })).toEqual({ throttled: { rows: weekly(60) } });
+    await chmod(dir, 0o500); // no new stamp can be created; the cache stays readable
+    try { expect(await observeClaudeUsage(account, { run: vi.fn(), now: minute(30), stampDir: dir })).toEqual({ error: expect.any(String), rows: weekly(60) }); }
+    finally { await chmod(dir, 0o700); }
   });
 
   it("fails closed with a reason: no usage_report, text only, a missing binary, a crash", async () => {
