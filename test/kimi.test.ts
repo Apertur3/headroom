@@ -214,7 +214,36 @@ describe("observeKimi", () => {
     expect(called).toBe(0);
   });
 
-  it("adds the credits meter only when a Moonshot key file sits beside the token", async () => {
+  // The Moonshot key only ever comes from the secret store (stubbed here).
+  const moonshotStore = (key = "synthetic-moonshot-key") => {
+    const calls: string[][] = [];
+    const run = async (command: string, args: string[]): Promise<string> => {
+      calls.push([command, ...args]);
+      if (args.includes("headroom-moonshot")) return `${key}\n`;
+      throw new Error("not found");
+    };
+    return { calls, run };
+  };
+
+  it("adds the credits meter only when the Moonshot key is in the secret store", async () => {
+    const target = await account();
+    const { calls, run } = moonshotStore();
+    const { fetch: fetcher, requests } = gateway({
+      GetUsages: await fixture("usages"),
+      GetSubscriptionStats: await fixture("subscription-stats"),
+      GetSubscription: await fixture("subscription"),
+      balance: await fixture("moonshot-balance"),
+    });
+    const rows = await observeKimi(target, { fetch: fetcher, now: () => at, platform: "darwin", run });
+    expect(calls).toEqual([["security", "find-generic-password", "-a", "headroom", "-s", "headroom-moonshot", "-w"]]);
+    expect(requests.map((request) => new URL(request.url).hostname)).toContain("api.moonshot.ai");
+    expect(requests.find((request) => new URL(request.url).hostname === "api.moonshot.ai")?.headers.get("authorization")).toBe("Bearer synthetic-moonshot-key");
+    for (const request of requests) expect(request.headers.get("user-agent")).toMatch(/^headroomd\/\S+$/);
+    expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "fresh", quantity: expect.objectContaining({ remaining: 12.5, unit: "credits" }) });
+    expect(JSON.stringify(rows)).not.toContain("synthetic-moonshot-key");
+  });
+
+  it("never reads an old plaintext key file, and names the store command and the delete instead", async () => {
     const target = await account();
     const keyPath = kimiCreditsPath(target.location);
     await writeFile(keyPath, "synthetic-moonshot-key\n", "utf8");
@@ -223,29 +252,28 @@ describe("observeKimi", () => {
       GetUsages: await fixture("usages"),
       GetSubscriptionStats: await fixture("subscription-stats"),
       GetSubscription: await fixture("subscription"),
-      balance: await fixture("moonshot-balance"),
     });
-    const rows = await observeKimi(target, { fetch: fetcher, now: () => at });
-    expect(requests.map((request) => new URL(request.url).hostname)).toContain("api.moonshot.ai");
-    for (const request of requests) expect(request.headers.get("user-agent")).toMatch(/^headroomd\/\S+$/);
-    expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "fresh", quantity: expect.objectContaining({ remaining: 12.5, unit: "credits" }) });
+    const rows = await observeKimi(target, { fetch: fetcher, now: () => at, platform: "darwin", run: async () => { throw new Error("not found"); } });
+    expect(requests.some((request) => new URL(request.url).hostname === "api.moonshot.ai")).toBe(false);
+    const credits = rows.find((row) => row.meter_id === "kimi:credits");
+    expect(credits).toMatchObject({ freshness: "failed" });
+    expect(credits?.reason).toContain("security add-generic-password -U -a headroom -s headroom-moonshot -w");
+    expect(credits?.reason).toContain(`then delete ${keyPath}`);
     expect(JSON.stringify(rows)).not.toContain("synthetic-moonshot-key");
   });
 
   it("keeps a failed credits read from taking the subscription read down with it", async () => {
     const target = await account();
-    const keyPath = kimiCreditsPath(target.location);
-    await writeFile(keyPath, "synthetic-moonshot-key\n", "utf8");
-    await chmod(keyPath, 0o600);
+    const { run } = moonshotStore();
     const { fetch: fetcher } = gateway({
       GetUsages: await fixture("usages"),
       GetSubscriptionStats: await fixture("subscription-stats"),
       GetSubscription: await fixture("subscription"),
       balance: {},
     }, { balance: 401 });
-    const rows = await observeKimi(target, { fetch: fetcher, now: () => at });
+    const rows = await observeKimi(target, { fetch: fetcher, now: () => at, platform: "darwin", run });
     expect(rows.find((row) => row.meter_id === "kimi:main")).toMatchObject({ freshness: "fresh" });
-    expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "failed", reason: expect.stringContaining("Moonshot rejected the API key (401)") });
+    expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "failed", reason: expect.stringContaining("Moonshot rejected the API key (401); replace headroom-moonshot in the secret store") });
   });
 
   it("still reports the allowance when the optional membership calls fail", async () => {
@@ -485,9 +513,9 @@ describe("Kimi Keychain API key and the usages ratio shape", () => {
   it("reads the key from the Keychain per poll, sends it to api.kimi.com only, and never leaks it", async () => {
     const { fetch: fetcher, requests } = gateway({ "coding/v1/usages": recorded });
     const calls: string[][] = [];
-    const run = async (command: string, args: string[]): Promise<string> => { calls.push([command, ...args]); return "synthetic-keychain-key\n"; };
+    const run = async (command: string, args: string[]): Promise<string> => { calls.push([command, ...args]); if (args.includes("headroom-moonshot")) throw new Error("not found"); return "synthetic-keychain-key\n"; };
     const rows = await observeKimi({ ...keyed, keychain_account: "someone" }, { fetch: fetcher, now: () => at, platform: "darwin", run });
-    expect(calls).toEqual([["security", "find-generic-password", "-a", "someone", "-s", "headroom-kimi", "-w"]]);
+    expect(calls).toEqual([["security", "find-generic-password", "-a", "someone", "-s", "headroom-kimi", "-w"], ["security", "find-generic-password", "-a", "headroom", "-s", "headroom-moonshot", "-w"]]);
     expect(requests.map((request) => request.url)).toEqual(["https://api.kimi.com/coding/v1/usages"]);
     expect(requests[0].headers.get("authorization")).toBe("Bearer synthetic-keychain-key");
     expect(rows.every((row) => row.freshness === "fresh")).toBe(true);
@@ -495,12 +523,21 @@ describe("Kimi Keychain API key and the usages ratio shape", () => {
     expect(JSON.stringify(rows)).not.toContain("synthetic-keychain-key");
   });
 
+  it("adds the Moonshot credits meter beside the Keychain key too", async () => {
+    const { fetch: fetcher, requests } = gateway({ "coding/v1/usages": recorded, balance: await fixture("moonshot-balance") });
+    const run = async (_command: string, args: string[]): Promise<string> => args.includes("headroom-moonshot") ? "synthetic-moonshot-key" : "synthetic-keychain-key";
+    const rows = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "darwin", run });
+    expect(requests.map((request) => new URL(request.url).hostname)).toEqual(["api.kimi.com", "api.moonshot.ai"]);
+    expect(rows.find((row) => row.meter_id === "kimi:credits")).toMatchObject({ freshness: "fresh", quantity: expect.objectContaining({ remaining: 12.5 }) });
+    expect(JSON.stringify(rows)).not.toMatch(/synthetic-(?:moonshot|keychain)-key/);
+  });
+
   it("fails with a redacted reason, and sends nothing, when the key is unreadable", async () => {
     let called = 0;
     const fetcher = (async () => { called += 1; return json({}); }) as unknown as typeof fetch;
     const missing = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "darwin", run: async () => { throw new Error("synthetic-keychain-key could not be found"); } });
     expect(missing[0]).toMatchObject({ freshness: "failed", reason: "Kimi API key not readable from the Keychain (service headroom-kimi)" });
-    const other = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "linux", run: async () => "synthetic-keychain-key" });
+    const other = await observeKimi(keyed, { fetch: fetcher, now: () => at, platform: "linux", run: async (_command, args) => { if (args.includes("headroom-moonshot")) throw new Error("not found"); return "synthetic-keychain-key"; } });
     expect(other[0].freshness).toBe("failed");
     expect(JSON.stringify([missing, other])).not.toContain("synthetic-keychain-key");
     expect(called).toBe(0);

@@ -49,3 +49,12 @@ vi.mock("../src/antigravity-discovery.js", async (original) => {
       actual.externalAntigravityServerPids({ list: async () => [], ...options }),
   };
 });
+
+// No test may read the developer's real Keychain, secret-tool or Credential
+// Manager: a readSecret call without an injected runner finds an empty store.
+// Tests of the store commands themselves pass their own runner.
+vi.mock("../src/notify.js", async (original) => {
+  const actual = await original<typeof import("../src/notify.js")>();
+  const emptyStore = async (): Promise<string> => { throw new Error("no secret store in tests"); };
+  return { ...actual, readSecret: (service: string, options: Parameters<typeof actual.readSecret>[1] = {}) => actual.readSecret(service, { ...options, run: options.run ?? emptyStore }) };
+});

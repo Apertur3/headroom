@@ -15,7 +15,11 @@ file you save yourself.
 
 1. **No secret on disk in plaintext, ever.** Credentials are read at call time from each account's
    own store (macOS Keychain, `~/.codex/auth.json`) and dropped
-   after the request. Headroom has no credential store of its own and never mirrors tokens into
+   after the request. Headroom's own secrets (notification tokens and the billing-linked Moonshot
+   API key) are read only from the OS secret store (Keychain, `secret-tool`, Credential Manager);
+   a leftover `moonshot.key` file is never opened, and `headroom doctor` says how to move it into
+   the store and delete it. The one file a user writes by hand is the Kimi web-session token,
+   which is not billing-linked. Headroom has no credential store of its own and never mirrors tokens into
    config files (CodexBar's `tokenAccounts` path is deliberately not used).
 2. **No secret in output.** Logs, crash dumps, JSON output and history redact tokens (including an
    opaque bearer token with no recognizable prefix, not only `sk-`/`eyJ`/`ya29.`/`GOCSPX-` ones),

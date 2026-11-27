@@ -49,8 +49,8 @@ adapter = "native-ts"
 # Kimi, alternative source: a file you write yourself, mode 0600, holding only
 # the kimi-auth token from https://www.kimi.com/code/console. For the desktop
 # app, which keeps that token in a browser cookie store this project does not
-# open. Put an optional Moonshot API key in a `moonshot.key` file beside either
-# credential to also get a credits meter. See docs/vendors.md.
+# open. Store an optional Moonshot API key in the OS secret store as
+# `headroom-moonshot` to also get a credits meter. See docs/vendors.md.
 # [[accounts]]
 # name = "kimi"
 # vendor = "kimi"
