@@ -217,7 +217,7 @@ describe("channel readiness", () => {
 
   it("refuses user info in a channel URL, and scrubs a channel URL out of a delivery error", async () => {
     expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "https://user:synthetic-pass@example.com/hook"\n')).toThrow(/webhook url must not hold a user name or password/);
-    expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "t"\nserver = "https://user@ntfy.example.com"\n')).toThrow(/ntfy server must not hold/);
+    expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "t"\nserver = "https://user@example.com"\n')).toThrow(/ntfy server must not hold/);
     const lines: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { lines.push(line); });
     const fetcher = (async (request: Request) => { throw new Error(`connect failed for ${request.url}`); }) as unknown as typeof fetch;
