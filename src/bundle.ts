@@ -64,6 +64,28 @@ function redactAssignedSecrets(text: string): string {
   return text.replace(/\b(token|api[_-]?key|secret|password|passwd|client[_-]?secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
 }
 
+/** A URL's `user:pass@` part, whatever host follows (an IP included). */
+function redactUrlUserinfo(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@"']+@/gi, "$1[REDACTED]@");
+}
+
+/** Every value under a policy.toml `[notify.*]` table is a channel capability:
+ * a webhook URL posts to the channel and an ntfy topic reads and posts it. A
+ * URL keeps its scheme and host; anything else is replaced. The table ends at
+ * the next TOML header or the next bundle section. */
+function redactNotifyValues(text: string): string {
+  let notify = false;
+  return text.split("\n").map((line) => {
+    const header = /^\s*(?:\[([^\]]*)\]|== )/.exec(line);
+    if (header) { notify = header[1]?.trim().startsWith("notify.") ?? false; return line; }
+    const entry = notify ? /^(\s*[A-Za-z0-9_]+\s*=\s*)"?([^"#\s]*)/.exec(line) : null;
+    if (!entry) return line;
+    let kept = "[REDACTED]";
+    try { const url = new URL(entry[2]); if (/^https?:$/.test(url.protocol)) kept = `${url.protocol}//${url.host}`; } catch { /* not a URL */ }
+    return `${entry[1]}"${kept}"`;
+  }).join("\n");
+}
+
 /** Replaces this machine's home directory, username, and hostname wherever
  * they appear verbatim -- identifiers redact() has no way to recognize on
  * its own, since none of them are shaped like a token. Runs after redact()
@@ -92,7 +114,7 @@ function redactKnownStoreLocations(text: string, home: string): string {
 /** The full redaction pass, applied once to the whole assembled bundle
  * rather than per-section, so no section can accidentally skip it. */
 export function redactBundleText(text: string): string {
-  const withTokensAndEmails = redact(text);
+  const withTokensAndEmails = redact(redactUrlUserinfo(redactNotifyValues(text)));
   const withoutNetworkAddresses = redactNetworkAddresses(withTokensAndEmails);
   const withoutAssignedSecrets = redactAssignedSecrets(withoutNetworkAddresses);
   const withoutKnownStoreLocations = redactKnownStoreLocations(withoutAssignedSecrets, headroomHome());
@@ -127,9 +149,10 @@ async function principalLines(): Promise<string[]> {
 }
 
 /** One config file (policy.toml or routing.toml), held to the same file-safety
- * bar doctor's own configCheck() uses. Contents are included so the redaction
- * pass below can run over them -- never copied in because they are expected
- * to hold anything sensitive; today they don't. */
+ * bar doctor's own configCheck() uses. policy.toml does hold secrets: notify
+ * webhook URLs and ntfy topics, and a proxy URL may carry a password. The
+ * redaction pass over the whole bundle replaces them (redactNotifyValues,
+ * redactUrlUserinfo). */
 async function configFileSection(path: string): Promise<string[]> {
   const status = await doctorFileStatus(path).catch<DoctorFileStatusFallback>(() => "unsafe");
   if (status === "missing") return ["not present; using built-in defaults"];

@@ -13,6 +13,7 @@ All notable changes to this project are documented here. The format follows
 ### Security
 
 - A webhook with a stored bearer token no longer sends it over plain `http` to another machine. The channel is turned off and says to use `https`; `http` to `localhost` still works.
+- `headroom doctor --bundle` no longer copies notification secrets from `policy.toml`. Webhook URLs keep only their scheme and host, ntfy topics and Telegram chat ids are replaced, and a `user:password@` in any URL (the `proxy` setting included) is removed.
 - `headroom notify --test` and `--text` print only the server of an ntfy or webhook channel (`https://ntfy.sh`), not the topic or path, which work as passwords.
 
 ## [0.2.25] - 2026-11-26

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseBundleFlag, writeDoctorBundle } from "../src/bundle.js";
+import { parseBundleFlag, redactBundleText, writeDoctorBundle } from "../src/bundle.js";
 
 const temporary: string[] = [];
 afterEach(async () => { vi.useRealTimers(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
@@ -32,6 +32,41 @@ describe("parseBundleFlag", () => {
   });
   it("returns undefined when --bundle is absent", () => {
     expect(parseBundleFlag([])).toBeUndefined();
+  });
+});
+
+describe("bundle redaction of policy.toml secrets (synthetic values)", () => {
+  it("keeps only scheme and host of notify URLs, hides topics and ids, and strips proxy userinfo", () => {
+    const policy = [
+      "== policy.toml ==",
+      'proxy = "http://proxyuser:synthetic-proxy-pass@192.0.2.10:3128"',
+      "[notify]",
+      'channels = ["ntfy", "webhook"]',
+      "[notify.webhook]",
+      'url = "https://hooks.slack.com/services/T0SYNTH/B0SYNTH/synthetic-slack-secret"',
+      "[notify.discord]",
+      'url = "https://discord.com/api/webhooks/123456789/synthetic-discord-token" # comment',
+      "[notify.ha]",
+      'url = "http://homeassistant.example.com:8123/api/webhook/synthetic-ha-id"',
+      "[notify.ntfy]",
+      'topic = "synthetic-ntfy-topic"',
+      'server = "https://ntfy.example.com/"',
+      "[notify.telegram]",
+      'chat_id = "123456789"',
+      "",
+      "== routing.toml ==",
+      'default = "kept-routing-value"',
+    ].join("\n");
+    const text = redactBundleText(policy);
+    for (const secret of ["synthetic-proxy-pass", "proxyuser", "T0SYNTH", "synthetic-slack-secret", "synthetic-discord-token", "synthetic-ha-id", "synthetic-ntfy-topic", "123456789"]) expect(text).not.toContain(secret);
+    expect(text).toContain('url = "https://hooks.slack.com"');
+    expect(text).toContain('url = "https://discord.com"');
+    expect(text).toContain('url = "http://homeassistant.example.com:8123"');
+    expect(text).toContain('topic = "[REDACTED]"');
+    expect(text).toContain('server = "https://ntfy.example.com"');
+    expect(text).toContain('proxy = "http://[REDACTED]@');
+    expect(text).toContain('channels = ["ntfy", "webhook"]');
+    expect(text).toContain('default = "kept-routing-value"');
   });
 });
 
