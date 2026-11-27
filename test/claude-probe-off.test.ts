@@ -109,7 +109,7 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
   });
 
   it("a poll while the next /usage run is in flight keeps the last /usage reading, not a stale statusline 99%", async () => {
-    // 27 Nov: /usage read 60% at 21:34:16, a poll 5 s later took the statusline's 99% and the hook froze every lead.
+    // Synthetic: /usage reads 61%, the statusline still shows a pre-reset 99%; a poll lands while the next run is in flight.
     const home = await setup(false, "fresh", 99);
     let release = (): void => undefined;
     const gate = new Promise<void>((done) => { release = done; });
