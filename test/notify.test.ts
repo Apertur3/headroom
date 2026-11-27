@@ -228,6 +228,22 @@ describe("channel readiness", () => {
     expect(lines.join("\n")).not.toMatch(/synthetic-topic-1234|synthetic-hook-id/);
   });
 
+  it("keeps only the origin and the status or error name of a failed delivery, never a body or a message", async () => {
+    const run = async (fetcher: typeof fetch) => {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { lines.push(line); });
+      try { await notifyTest({ config: config('[notify]\nchannels = ["ntfy", "webhook"]\n[notify.ntfy]\ntopic = "Synthetic-Topic-1234"\n[notify.webhook]\nurl = "https://example.com/api/webhook/synthetic-hook-id"\n'), fetcher, platform: "darwin", run: async () => { throw new Error("not found"); } }); }
+      finally { spy.mockRestore(); }
+      return lines.join("\n");
+    };
+    const echoed = await run((async (request: Request) => new Response(`Cannot POST ${new URL(request.url).pathname}`, { status: 404 })) as unknown as typeof fetch);
+    expect(echoed).toContain("ntfy     failed    https://ntfy.sh HTTP 404");
+    expect(echoed).toContain("webhook  failed    https://example.com HTTP 404");
+    const thrown = await run((async (request: Request) => { throw Object.assign(new TypeError(`fetch failed for ${request.url.toUpperCase()}`), { cause: { code: "ECONNREFUSED" } }); }) as unknown as typeof fetch);
+    expect(thrown).toContain("https://ntfy.sh ECONNREFUSED");
+    for (const output of [echoed, thrown]) expect(output).not.toMatch(/synthetic-topic-1234|synthetic-hook-id/i);
+  });
+
   it("never puts the bot token in a channel's own description", async () => {
     const channels = await prepareChannels(config(), { platform: "darwin", run: store });
     expect(channels.find((channel) => channel.channel === "telegram")).toMatchObject({ ready: true, detail: "chat 123456" });

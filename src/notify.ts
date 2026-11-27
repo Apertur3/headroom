@@ -18,7 +18,6 @@ import type { Account, EventKind, HeadroomEvent, NotifyDelivery, Observation, St
 export const CHUNK_LIMIT = 3800;
 /** Every outbound notification call is bounded the same way a vendor read is. */
 const TIMEOUT_MS = 5_000;
-const RESPONSE_CAP_BYTES = 8 * 1024;
 /** Attempts per event per channel before the ledger row stops being retried. */
 export const MAX_ATTEMPTS = 3;
 const TELEGRAM_ORIGIN = "https://api.telegram.org", DEFAULT_NTFY_SERVER = "https://ntfy.sh";
@@ -372,31 +371,23 @@ export function scrubSecrets(value: unknown, secrets: string[]): string {
  * Channels.
  * ---------------------------------------------------------------------- */
 
-/** Reads at most RESPONSE_CAP_BYTES of a channel's reply. Only the first
- * bytes are ever needed (an error description), and a channel that answers
- * with an endless body must not be able to grow this process. */
-async function boundedText(response: Response): Promise<string> {
-  const body = response.body;
-  if (!body) return "";
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (total < RESPONSE_CAP_BYTES) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.length;
-    }
-  } finally { await reader.cancel().catch(() => undefined); }
-  return Buffer.concat(chunks).subarray(0, RESPONSE_CAP_BYTES).toString("utf8");
-}
+/** Refusals from outboundFetch, constant text that is safe to keep. */
+const KNOWN_REFUSALS = new Set(["redirect refused", "Outbound host is not allowed"]);
 
+/** One POST to a channel. A failure names the channel's origin and the HTTP
+ * status, or the error's code or name, and nothing else: a response body or
+ * an error message can repeat the topic, the webhook path or the bot token,
+ * and this text reaches the output, the daemon log and the delivery ledger. */
 async function send(fetcher: typeof fetch, url: string, init: RequestInit, allow: string[]): Promise<void> {
-  const request = new Request(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) });
-  const response = await outboundFetch(fetcher, request, { localBaseUrls: allow });
-  const text = await boundedText(response);
-  if (!response.ok) throw new Error(`${response.status} ${text.slice(0, 200)}`.trim());
+  const { origin } = new URL(url);
+  let response: Response;
+  try { response = await outboundFetch(fetcher, new Request(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) }), { localBaseUrls: allow }); }
+  catch (error: unknown) {
+    const failure = error as Error & { code?: string; cause?: { code?: string } };
+    throw new Error(`${origin} ${KNOWN_REFUSALS.has(failure.message) ? failure.message : failure.cause?.code ?? failure.code ?? failure.name ?? "error"}`);
+  }
+  await response.body?.cancel().catch(() => undefined);
+  if (!response.ok) throw new Error(`${origin} HTTP ${response.status}`);
 }
 
 /** Splits on line boundaries where it can and mid-line only when a single
@@ -492,7 +483,7 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
       if (!topic) { prepared.push({ channel, ready: false, detail: "no topic in [notify.ntfy]", secrets: [], deliver: async () => undefined }); continue; }
       const url = `${config.ntfy.server}/${topic}`;
       prepared.push({
-        channel, ready: true, detail: new URL(url).origin, secrets: [url],
+        channel, ready: true, detail: new URL(url).origin, secrets: [],
         deliver: async (items, digest) => {
           for (const chunk of chunkMessage(combineTexts(items.map((item) => item.text), digest))) {
             const headers = { "content-type": "text/plain; charset=utf-8", title: `=?UTF-8?B?${Buffer.from(combineTexts(items.map((item) => item.text), digest).split("\n")[0]).toString("base64")}?=` };
@@ -510,7 +501,7 @@ async function prepareChannelsInternal(config: NotifyConfig, options: NotifyOpti
     if (bearer.secret && protocol === "http:" && !isLoopbackHost(hostname)) { prepared.push({ channel, ready: false, detail: `refusing to send the ${WEBHOOK_SECRET} bearer over plain http to ${origin}; use https (plain http only to localhost)`, secrets: [], deliver: async () => undefined }); continue; }
     const headers: Record<string, string> = { "content-type": "application/json", ...(bearer.secret ? { authorization: `Bearer ${bearer.secret}` } : {}) };
     prepared.push({
-      channel, ready: true, detail: `${origin}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [url, bearer.secret] : [url],
+      channel, ready: true, detail: `${origin}${bearer.secret ? " (bearer)" : " (no bearer stored)"}`, secrets: bearer.secret ? [bearer.secret] : [],
       deliver: async (items, digest) => {
         // One POST per event even inside a batch: a webhook consumer wants
         // one structured record per event, not several folded into one text.
