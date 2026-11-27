@@ -1381,9 +1381,9 @@ async function gate(argv: string[]): Promise<number> {
   // unreadable/never-seen window) is a different state than a refusal
   // because a known usage does not fit the request -- render it the same way
   // status/rate/plan/fill do, rather than as a plain "NO".
-  if (result.unknown) { console.log(`${targetLabel}  UNKNOWN (${result.reason})`); return result.allowed ? 0 : 2; }
+  if (result.unknown) { console.log(clean(`${targetLabel}  UNKNOWN (${result.reason})`)); return result.allowed ? 0 : 2; }
   const lanesRemaining = result.lanes_remaining_for_class !== undefined ? ` (${result.lanes_remaining_for_class === null ? "lane count unknown for " + actionClass : `${result.lanes_remaining_for_class} more ${actionClass} fit`})` : "";
-  console.log(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}`);
+  console.log(clean(`${result.allowed ? "YES" : "NO"} ${targetLabel} (${result.reason})${lanesRemaining}`));
   return result.allowed ? 0 : 2;
 }
 
@@ -1505,12 +1505,12 @@ async function route(argv: string[]): Promise<number> {
   } finally { store.close(); }
   if (argv.includes("--json")) { console.log(JSON.stringify(withContract(result))); return result.principal ? 0 : 2; }
   if (!result.principal) {
-    console.log(`no principal fits ${actionClass} (${result.reason})`);
-    for (const candidate of result.candidates) console.log(`  ${candidate.principal} ${candidate.state} (${candidate.reason})`);
+    console.log(clean(`no principal fits ${actionClass} (${result.reason})`));
+    for (const candidate of result.candidates) console.log(clean(`  ${candidate.principal} ${candidate.state} (${candidate.reason})`));
     return 2;
   }
   const environment = Object.entries(result.environment).map(([key, value]) => `${key}=${value}`).join(" ");
-  console.log(`${result.principal}${environment ? ` ${environment}` : ""}  (${result.reason})`);
+  console.log(clean(`${result.principal}${environment ? ` ${environment}` : ""}  (${result.reason})`));
   return 0;
 }
 
@@ -1837,8 +1837,8 @@ function printCan(decision: CanDecision, cost: CostEstimate, leasedId: string | 
     console.log(JSON.stringify(withContract({ ...decision, cost, leased_id: leasedId ?? null, host, ...cacheFields })));
     return;
   }
-  console.log(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`);
-  for (const meter of decision.meters) console.log(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`);
+  console.log(clean(`${decision.allowed ? "YES" : "NO"} ${decision.meter} ${decision.state} (${dedupeStateReason(decision.state, decision.reason)})`));
+  for (const meter of decision.meters) console.log(clean(`  ${meter.meter} ${meter.state} (${dedupeStateReason(meter.state, meter.reason)})`));
   if (cost.expected_percent !== null) {
     const iqr = cost.iqr_low !== null && cost.iqr_high !== null ? ` (IQR ${cost.iqr_low.toFixed(1)}-${cost.iqr_high.toFixed(1)}%, n=${cost.sample_count})` : "";
     const maxMore = cost.max_more_before_reset === null ? "" : `; max ${cost.max_more_before_reset} more before reset at the current sustainable pace`;
@@ -2060,7 +2060,7 @@ async function logs(argv: string[]): Promise<number> {
   const requested = argv[0] === "--tail" ? Number(argv[1]) : 50;
   if (!Number.isSafeInteger(requested) || requested < 1 || requested > 10_000) throw new Error("--tail must be a whole number from 1 through 10000");
   const output = await tailDaemonLog(requested);
-  if (output) console.log(output);
+  if (output) console.log(output.split("\n").map(clean).join("\n"));
   return 0;
 }
 
