@@ -180,18 +180,18 @@ describe("headroom doctor --bundle", () => {
     await mkdir(join(headroomHome, "logs"), { recursive: true });
     await writeFile(join(headroomHome, "policy.toml"), [
       "[notify]", 'channels = ["ntfy", "webhook", "telegram"]',
-      "[notify.ntfy]", 'topic = "SyntheticTopic_1234"',
-      "[notify.webhook]", 'url = "https://hooks.example.com/services/synthetic-hook-path"',
+      "[notify.ntfy]", 'topic = "aBc"',
+      "[notify.webhook]", 'url = "https://hooks.example.com/services/synthetic-hook-path?wait=true"',
       "[notify.telegram]", 'chat_id = "987654321"',
     ].join("\n") + "\n", { mode: 0o600 });
     await writeFile(join(headroomHome, "logs", "daemon.log"), [
       "2026-01-01T00:00:00.000Z notify ntfy failed for 1 event(s): 404",
-      "2026-11-27T12:00:00.000Z Cannot POST /synthetictopic_1234",
+      "2026-11-27T12:00:00.000Z Cannot POST /abc",
       "2026-11-27T12:00:01.000Z 500 at /services/synthetic-hook-path for chat 987654321",
     ].join("\n") + "\n", "utf8");
     const result = await withEnv({ HEADROOM_HOME: headroomHome }, () => writeDoctorBundle(undefined, outputDir));
     const text = await readFile(result.path, "utf8");
-    expect(text).not.toMatch(/synthetictopic_1234|synthetic-hook-path|987654321/i);
+    expect(text).not.toMatch(/\/abc|synthetic-hook-path|987654321/i);
     expect(text).toContain("Cannot POST /[REDACTED]");
   });
 

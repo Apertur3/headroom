@@ -103,9 +103,11 @@ export function channelCapabilities(text: string): string[] {
   let notify: NotifyConfig | undefined;
   try { notify = parseNotifyConfig(text); } catch { return []; }
   if (!notify) return [];
-  let hookPath: string | null = null;
-  try { if (notify.webhook.url) { const url = new URL(notify.webhook.url); hookPath = url.pathname + url.search; } } catch { /* not a URL */ }
-  return [notify.ntfy.topic, notify.telegram.chat_id, hookPath].filter((value): value is string => !!value && value.length >= 4 && value !== "/");
+  const hook: string[] = [];
+  try { if (notify.webhook.url) { const url = new URL(notify.webhook.url); hook.push(url.pathname + url.search, url.pathname, url.search); } } catch { /* not a URL */ }
+  // Longest first, so a path is replaced before its own query. Values under 3
+  // characters guard nothing (anyone can guess them) and would wipe the bundle.
+  return [notify.ntfy.topic, notify.telegram.chat_id, ...hook].filter((value): value is string => !!value && value.length >= 3 && value !== "/").sort((a, b) => b.length - a.length);
 }
 
 /** Replaces this machine's home directory, username, and hostname wherever
