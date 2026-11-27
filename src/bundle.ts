@@ -104,7 +104,9 @@ export function channelCapabilities(text: string): string[] {
   try { notify = parseNotifyConfig(text); } catch { return []; }
   if (!notify) return [];
   const hook: string[] = [];
-  try { if (notify.webhook.url) { const url = new URL(notify.webhook.url); hook.push(url.pathname + url.search, url.pathname, url.search); } } catch { /* not a URL */ }
+  for (const value of [notify.webhook.url, notify.ntfy.server]) {
+    try { if (value) { const url = new URL(value); hook.push(url.pathname + url.search, url.pathname, url.search); } } catch { /* not a URL */ }
+  }
   // Longest first, so a path is replaced before its own query. Values under 3
   // characters guard nothing (anyone can guess them) and would wipe the bundle.
   return [notify.ntfy.topic, notify.telegram.chat_id, ...hook].filter((value): value is string => !!value && value.length >= 3 && value !== "/").sort((a, b) => b.length - a.length);
