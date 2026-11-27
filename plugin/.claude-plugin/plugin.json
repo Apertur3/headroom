@@ -1,6 +1,6 @@
 {
   "name": "headroom",
-  "version": "0.2.25",
+  "version": "0.2.26",
   "description": "Check how much of each AI subscription is left before Claude starts a job, using the Headroom command.",
   "author": {
     "name": "Apertur3"
