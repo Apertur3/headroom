@@ -13,6 +13,7 @@ All notable changes to this project are documented here. The format follows
 ### Security
 
 - A webhook with a stored bearer token no longer sends it over plain `http` to another machine. The channel is turned off and says to use `https`; `http` to `localhost` still works.
+- The `proxy` set in `policy.toml` now also carries Headroom's own requests (Codex, Kimi, Grok, notifications), not only the engine's. Proxy variables from your shell are always ignored. This needs Node 24.14+ or 25.4+; on older Node, Headroom prints that its own requests go direct.
 - Text that agents write (lease owners and notes, heartbeat resume sentences, timer actions, inbox messages) is printed with terminal control sequences removed, so a planted escape code cannot change your screen, set your clipboard or hide a link when you run `status`, `lease list`, `heartbeat list`, `timer list`, `spend` or `inbox`.
 - `headroom doctor --bundle` no longer copies notification secrets from `policy.toml`. Webhook URLs keep only their scheme and host, ntfy topics and Telegram chat ids are replaced, and a `user:password@` in any URL (the `proxy` setting included) is removed.
 - `headroom notify --test` and `--text` print only the server of an ntfy or webhook channel (`https://ntfy.sh`), not the topic or path, which work as passwords.

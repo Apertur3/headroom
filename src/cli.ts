@@ -45,7 +45,7 @@ import { AccountsMissingError, accountsPath, accountsToml, discoverAccounts, rea
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
-import { clean, readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
+import { clean, readBoundedRegularFile, safeError, PROXY_UNSUPPORTED_NOTICE, safeOutputDirectory, applyProxyPolicy, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { describeServiceStart, installAndStartService, installService, uninstallService } from "./service.js";
 import { DAEMON_POST_STOP_EXIT_MS, DAEMON_STOP_DEADLINE_MS } from "./daemon-stop.js";
 import { modelTokenShare } from "./session-logs.js";
@@ -2339,7 +2339,7 @@ export async function main(argv: string[]): Promise<number> {
   // Before any command can fetch a vendor endpoint: an operator's shell
   // proxy must never silently carry a credentialed request unless
   // policy.toml opts in.
-  stripAmbientProxyEnvironment((await readPolicy()).proxy);
+  if (!applyProxyPolicy((await readPolicy()).proxy)) console.error(`headroom: ${PROXY_UNSUPPORTED_NOTICE}`);
   if (await migrateLegacyHome()) console.log(["Moved ~/.", "ta", "lly", " to ~/.headroom."].join(""));
   if (argv[0] === "engine" && argv[1] === "install") {
     const pin = argv.includes("--pin");

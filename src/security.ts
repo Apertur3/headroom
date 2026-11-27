@@ -1,6 +1,7 @@
 import { lstat, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import http from "node:http";
 import { performance } from "node:perf_hooks";
 import { stripVTControlCharacters } from "node:util";
 import { assertSafeAncestry } from "./paths.js";
@@ -43,18 +44,26 @@ export function outboundEnvironment(proxy?: string, env: NodeJS.ProcessEnv = pro
   return output;
 }
 
+type ProxyInstaller = (proxyEnv: Record<string, string>) => void;
+
 /**
- * Call once at daemon and CLI process start, before any fetch happens. Recent
- * Node versions read HTTP_PROXY/HTTPS_PROXY/ALL_PROXY out of the environment
- * for the global fetch dispatcher when NODE_USE_ENV_PROXY is set; deleting all
- * four here means a proxy the operator's shell happened to have set cannot
- * silently route a credentialed vendor request through it unless Headroom's
- * own policy.toml opts in with an explicit `proxy` value.
+ * Call once at daemon and CLI process start, before any fetch happens. The
+ * shell's proxy variables are always deleted, so they can never route a
+ * credentialed vendor request. A `proxy` from policy.toml is then installed
+ * explicitly as the process-wide proxy for fetch() through Node's built-in
+ * http.setGlobalProxyFromEnv() (Node 24.14+ and 25.4+); loopback, and hosts
+ * in the operator's own NO_PROXY, stay direct. Returns false when a proxy is
+ * configured but this Node has no way to apply it to in-process requests.
  */
-export function stripAmbientProxyEnvironment(proxy: string | undefined, env: NodeJS.ProcessEnv = process.env): void {
-  if (proxy) return;
+export function applyProxyPolicy(proxy: string | undefined, env: NodeJS.ProcessEnv = process.env, install: ProxyInstaller | null | undefined = (http as { setGlobalProxyFromEnv?: ProxyInstaller }).setGlobalProxyFromEnv): boolean {
   for (const key of AMBIENT_PROXY_ENV_KEYS) delete env[key];
+  if (!proxy) return true;
+  if (!install) return false;
+  install({ HTTP_PROXY: proxy, HTTPS_PROXY: proxy, NO_PROXY: [env.NO_PROXY ?? env.no_proxy, "localhost,127.0.0.1,::1"].filter(Boolean).join(",") });
+  return true;
 }
+
+export const PROXY_UNSUPPORTED_NOTICE = "the proxy in policy.toml covers Headroom's own requests only on Node 24.14+ or 25.4+; on this Node they go direct (engine requests still use it)";
 
 export function allowedOutbound(url: string, localBaseUrls: string[] = []): URL {
   const parsed = new URL(url);

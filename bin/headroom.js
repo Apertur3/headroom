@@ -4,10 +4,9 @@
 // older than the version that ships that built-in unflagged. This file is
 // hand-written, not compiled from src/, so it stays tiny and dependency-free.
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 
 export function supportsBuiltinSqlite(version) {
   const [major, minor] = version.split(".").map(Number);
@@ -35,46 +34,18 @@ export function warningSuppressionFlag(version) {
   return supportsDisableWarning ? "--disable-warning=ExperimentalWarning" : "--no-warnings=ExperimentalWarning";
 }
 
-/**
- * Mirrors src/paths.ts's headroomHome() closely enough for this one lookup:
- * HEADROOM_HOME first, then the platform default. Deliberately not imported
- * from dist/ -- this launcher must keep working even when dist/ is stale or
- * absent (e.g. straight from a source checkout before a build).
- */
-function headroomHome() {
-  if (process.env.HEADROOM_HOME) return process.env.HEADROOM_HOME;
-  if (process.platform === "win32") return join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "headroom");
-  return join(homedir(), ".headroom");
-}
-
-/**
- * A minimal, dependency-free read of just the `proxy` key from policy.toml --
- * enough to decide whether the launcher may leave ambient proxy variables in
- * place, not a full policy parse (src/policy.ts's parsePolicy does the real
- * validation once the CLI itself starts). Never throws: a missing or
- * unreadable policy.toml means no proxy is configured, the safe default.
- */
-export function policyProxyConfigured(home = headroomHome()) {
-  try {
-    const text = readFileSync(join(home, "policy.toml"), "utf8");
-    return text.split("\n").some((raw) => /^proxy\s*=\s*"[^"\\]+"\s*$/.test(raw.replace(/#.*/, "").trim()));
-  } catch { return false; }
-}
-
 const PROXY_ENV_KEYS = ["NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
 
 /**
  * Recent Node versions decide whether to install an env-driven proxy
  * dispatcher for the global fetch() from the *initial* process environment,
- * before any application code runs -- so src/security.ts's in-process
- * stripAmbientProxyEnvironment() (kept as defense in depth) is too late on
- * its own. Stripping these variables from the child's environment here,
- * before spawning node at all, means the child process never sees them in
- * the first place, unless the operator has explicitly opted in via
- * policy.toml's `proxy` key.
+ * before any application code runs. Stripping these variables from the
+ * child's environment here, before spawning node at all, means a proxy the
+ * shell happened to set never carries a Headroom request. A `proxy` in
+ * policy.toml is installed explicitly in-process instead (src/security.ts's
+ * applyProxyPolicy()), so this strip is unconditional.
  */
-export function childEnvironment(env = process.env, proxyConfigured = policyProxyConfigured()) {
-  if (proxyConfigured) return env;
+export function childEnvironment(env = process.env) {
   const output = { ...env };
   for (const key of PROXY_ENV_KEYS) delete output[key];
   return output;

@@ -149,11 +149,15 @@ file you save yourself.
     `api.moonshot.ai`, and configured local base URLs. The same allowlist admits
     `registry.npmjs.org` and `api.github.com` for the update check and release notes, which carry
     no credential. Proxy
-    environment variables are ignored unless a `proxy` value is explicitly set in `policy.toml`:
-    the `headroom` launcher (`bin/headroom.js`) strips them from the child process's environment
-    *before* spawning Node, because Node decides whether to install an env-driven proxy dispatcher
-    from the process's *initial* environment, before any application code runs -- stripping them
-    afterward, in-process, is too late to undo that decision and is kept only as defense in depth.
+    environment variables are always ignored: the `headroom` launcher (`bin/headroom.js`) strips
+    them from the child process's environment *before* spawning Node, because Node decides whether
+    to install an env-driven proxy dispatcher from the process's *initial* environment, before any
+    application code runs; the CLI and daemon strip them again at start as defense in depth. A
+    `proxy` value in `policy.toml` is then applied explicitly: to engine child processes through
+    their environment, and to Headroom's own in-process requests through Node's built-in
+    `http.setGlobalProxyFromEnv()` (Node 24.14+ or 25.4+), with loopback and the operator's own
+    `NO_PROXY` hosts kept direct. On an older Node the CLI and daemon say on stderr that their own
+    requests go direct.
     The optional CodexBar engine (`adapter: "codexbar"`) is the one exception to this allowlist:
     it links CodexBarCore, an unmodified pinned third-party dependency that performs its own
     authenticated HTTP request to a host read from the account's own `config.toml`

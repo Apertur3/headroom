@@ -3,7 +3,25 @@ import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { adaptCodexPayload } from "../src/engine/codexbar/adapt.js";
 import { inboxLines } from "../src/cli.js";
-import { clean, outboundFetch, redact } from "../src/security.js";
+import { applyProxyPolicy, clean, outboundFetch, redact } from "../src/security.js";
+
+describe("proxy policy", () => {
+  it("always drops the shell's proxy variables and installs only the configured proxy, loopback direct", () => {
+    const shell = () => ({ NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: "http://shell-proxy.example:3128", all_proxy: "http://shell-proxy.example:1080", NO_PROXY: "pool.example", KEEP: "yes" });
+    const installed: Record<string, string>[] = [];
+    const env: NodeJS.ProcessEnv = shell();
+    expect(applyProxyPolicy("http://proxy.example.com:8080/", env, (proxyEnv) => installed.push(proxyEnv))).toBe(true);
+    expect(env).toEqual({ NO_PROXY: "pool.example", KEEP: "yes" });
+    expect(installed).toEqual([{ HTTP_PROXY: "http://proxy.example.com:8080/", HTTPS_PROXY: "http://proxy.example.com:8080/", NO_PROXY: "pool.example,localhost,127.0.0.1,::1" }]);
+    // No proxy configured: stripped the same way, and nothing is installed.
+    const bare: NodeJS.ProcessEnv = shell();
+    expect(applyProxyPolicy(undefined, bare, (proxyEnv) => installed.push(proxyEnv))).toBe(true);
+    expect(bare).toEqual({ NO_PROXY: "pool.example", KEEP: "yes" });
+    expect(installed).toHaveLength(1);
+    // A Node without http.setGlobalProxyFromEnv says so instead of pretending.
+    expect(applyProxyPolicy("http://proxy.example.com:8080/", shell(), null)).toBe(false);
+  });
+});
 
 describe("terminal-safe printing of text other processes wrote", () => {
   it("drops OSC 52, OSC 8, CSI and C1 sequences from an inbox line before it reaches the terminal", () => {
