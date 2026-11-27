@@ -2,6 +2,7 @@ import { lstat, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } fro
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { stripVTControlCharacters } from "node:util";
 import { assertSafeAncestry } from "./paths.js";
 
 /** Redact values that may identify an account or authorize a provider request. */
@@ -20,6 +21,12 @@ export function redact(value: string): string {
     .replace(/\bGOCSPX-[A-Za-z0-9._~+\/=\-]+/g, "[REDACTED]")
     .replace(/\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b/g, "[REDACTED]");
 }
+
+/** Text another process wrote (a lease note, an inbox body, a resume
+ * sentence), made safe to print to a terminal: escape sequences are removed
+ * and every C0/C1 control character becomes a space, so it cannot rewrite the
+ * screen, set the clipboard (OSC 52) or disguise a link (OSC 8). */
+export function clean(text: string): string { return stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " "); }
 
 export function safeError(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));

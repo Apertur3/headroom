@@ -2,7 +2,18 @@ import { createServer, type RequestListener } from "node:http";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { adaptCodexPayload } from "../src/engine/codexbar/adapt.js";
-import { outboundFetch, redact } from "../src/security.js";
+import { inboxLines } from "../src/cli.js";
+import { clean, outboundFetch, redact } from "../src/security.js";
+
+describe("terminal-safe printing of text other processes wrote", () => {
+  it("drops OSC 52, OSC 8, CSI and C1 sequences from an inbox line before it reaches the terminal", () => {
+    const planted = "copy \x1b]52;c;c3ludGhldGlj\x07this \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b[2J\x9b31m\r\nend";
+    expect(clean(planted)).toBe("copy this link   end");
+    const [line] = inboxLines({ messages: [{ id: "m1", at: "2026-01-01T00:00:00Z", kind: "note", from: "agent\x1b]52;c;eA==\x07", body: planted }] as never, remaining: 0 });
+    expect(line).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(line).toContain("from agent  copy this link");
+  });
+});
 
 describe("secret-safe outputs", () => {
   it("redacts child-process diagnostics before they can become an output or log", () => {

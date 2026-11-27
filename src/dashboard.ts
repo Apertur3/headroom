@@ -1,6 +1,5 @@
 import { leaseSpendText } from "./cost.js";
 import type { ReadStream, WriteStream } from "node:tty";
-import { stripVTControlCharacters } from "node:util";
 import { readPolicy } from "./config.js";
 import { DASHBOARD_HEALTH_TIMEOUT_MS, DASHBOARD_REQUEST_TIMEOUT_MS, dashboardSnapshot, noticeShown, readDashboardStore, type DashboardModel as CachedDashboardModel, type DashboardReader, type DashboardSnapshot } from "./dashboard-data.js";
 import { readAccounts } from "./registry.js";
@@ -10,7 +9,7 @@ import { IDLE_WINDOW_REASON } from "./engine/observation.js";
 import { withEffectiveFreshness } from "./pace.js";
 import { blockedLaneSummary, paceDecision, reserveFor } from "./policy.js";
 import { decodeResetSeen, formatOverdueReset, formatResetsIn, servedResetsIn } from "./resets.js";
-import { safeError } from "./security.js";
+import { clean, safeError } from "./security.js";
 import { barFor, explainUnknown, formatRatePercent, label, labelForMinutes, planDowngradeLine, renderStatus, statusViewOptions } from "./status-view.js";
 import { resetSummary } from "./reset-history.js";
 import { isAccountEnabled, isLocalAccount, type Account, type HeadroomEvent, type Observation } from "./types.js";
@@ -181,7 +180,6 @@ export function decodeDashboardKeys(chunk: string): string[] {
   return keys;
 }
 
-function clean(text: string): string { return stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " "); }
 function cells(char: string): number {
   if (/\p{Mark}/u.test(char)) return 0;
   const code = char.codePointAt(0)!;

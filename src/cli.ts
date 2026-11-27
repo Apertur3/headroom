@@ -45,7 +45,7 @@ import { AccountsMissingError, accountsPath, accountsToml, discoverAccounts, rea
 import { headroomHome, migrateLegacyHome, assertSafeAncestry } from "./paths.js";
 import { formatOverdueReset, formatResetsIn, resetsIn, withResetsIn } from "./resets.js";
 import { parseCreditExpiry, withCreditsLapsed } from "./credits.js";
-import { readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
+import { clean, readBoundedRegularFile, safeError, safeOutputDirectory, stripAmbientProxyEnvironment, withPolicyLock, writeExclusiveFile, writeFileAtomic } from "./security.js";
 import { describeServiceStart, installAndStartService, installService, uninstallService } from "./service.js";
 import { DAEMON_POST_STOP_EXIT_MS, DAEMON_STOP_DEADLINE_MS } from "./daemon-stop.js";
 import { modelTokenShare } from "./session-logs.js";
@@ -457,10 +457,10 @@ async function disabledMeterInList(meters: string[]): Promise<{ meter: string; r
 }
 
 function printLeases(items: Lease[]): void {
-  for (const item of items) console.log(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${leaseSpendText(item, 2)}  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`);
+  for (const item of items) console.log(clean(`${item.id}  ${item.owner}  ${item.meter_id}  expect ${item.expected_percent ?? "-"}%  spent ${leaseSpendText(item, 2)}  ${item.ended_at ? item.ended_reason ?? "ended" : `expires ${item.expires_at}`}${item.note ? `  ${item.note}` : ""}`));
 }
 
-export function endedLeaseMessage(lease: Lease): string { return lease.already_ended ? `already ended ${lease.id} (owner ${lease.owner})` : `ended ${lease.id} (owner ${lease.owner})`; }
+export function endedLeaseMessage(lease: Lease): string { return clean(lease.already_ended ? `already ended ${lease.id} (owner ${lease.owner})` : `ended ${lease.id} (owner ${lease.owner})`); }
 
 async function lease(argv: string[]): Promise<number> {
   if (argv[0] === "start") {
@@ -510,7 +510,7 @@ const HEARTBEAT_HELP = "Usage: headroom heartbeat --owner <name> --every <durati
 
 function printHeartbeats(items: Heartbeat[]): void {
   if (!items.length) { console.log("no registered heartbeats"); return; }
-  for (const item of items) console.log(`${item.owner}  every ${item.interval_ms}ms  last beat ${item.last_beat_at}${item.lapsed_since ? `  LAPSED since ${item.lapsed_since}` : ""}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
+  for (const item of items) console.log(clean(`${item.owner}  every ${item.interval_ms}ms  last beat ${item.last_beat_at}${item.lapsed_since ? `  LAPSED since ${item.lapsed_since}` : ""}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`));
 }
 
 /**
@@ -578,7 +578,7 @@ const TIMER_HELP = [
 
 function printTimers(items: Timer[]): void {
   if (!items.length) { console.log("no pending timers"); return; }
-  for (const item of items) console.log(`${item.owner}/${item.name}  at ${item.at}  if-missed ${item.if_missed}  ${item.action}`);
+  for (const item of items) console.log(clean(`${item.owner}/${item.name}  at ${item.at}  if-missed ${item.if_missed}  ${item.action}`));
 }
 
 /**
@@ -1169,7 +1169,7 @@ function windowLabelFor(minutes: number | null): string {
 }
 
 export function spendLines(rows: SpendRow[]): string[] {
-  return rows.map((row) => `${row.meter_id}  ${windowLabelFor(row.window_minutes)}  ${row.owner}  ${row.attributed_percent.toFixed(2)}%  confidence ${row.confidence.toFixed(2)} (n=${row.samples})`);
+  return rows.map((row) => clean(`${row.meter_id}  ${windowLabelFor(row.window_minutes)}  ${row.owner}  ${row.attributed_percent.toFixed(2)}%  confidence ${row.confidence.toFixed(2)} (n=${row.samples})`));
 }
 
 /**
@@ -1200,7 +1200,7 @@ async function spend(argv: string[]): Promise<number> {
 }
 
 export function inboxLines(result: { messages: InboxMessage[]; remaining: number }): string[] {
-  const lines = result.messages.map((message) => `${message.at}  ${message.kind}  from ${message.from ?? "-"}  ${typeof message.body === "string" ? message.body : JSON.stringify(message.body)}`);
+  const lines = result.messages.map((message) => clean(`${message.at}  ${message.kind}  from ${message.from ?? "-"}  ${typeof message.body === "string" ? message.body : JSON.stringify(message.body)}`));
   if (result.remaining) lines.push(`(${result.remaining} more message${result.remaining === 1 ? "" : "s"} still queued; run inbox again)`);
   return lines;
 }
@@ -1725,8 +1725,8 @@ export async function observe(argv: string[]): Promise<number> {
     // human view stays unchanged -- adding a full section to renderStatus's
     // own layout is a larger, separate change.
     if (view.form !== "grouped") {
-      for (const item of heartbeats.filter((entry) => entry.lapsed_since)) console.log(`heartbeat ${item.owner} LAPSED since ${item.lapsed_since}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`);
-      for (const item of dueTimers) console.log(`timer ${item.owner}/${item.name} due ${item.at}  ${item.action}`);
+      for (const item of heartbeats.filter((entry) => entry.lapsed_since)) console.log(clean(`heartbeat ${item.owner} LAPSED since ${item.lapsed_since}${item.resume_sentence ? `  resume: ${item.resume_sentence}` : ""}`));
+      for (const item of dueTimers) console.log(clean(`timer ${item.owner}/${item.name} due ${item.at}  ${item.action}`));
     }
     // Silent on failure (policy.update_check = false or a network problem):
     // the update notice must never turn a routine status call into one.

@@ -22,6 +22,7 @@ import { creditsLapsed } from "./credits.js";
 import { withEffectiveFreshness } from "./pace.js";
 import { blockedLaneReason, blockedLaneSummary, isVisibilityOnly, paceDecision, reserveFor, reserveNote, type Policy } from "./policy.js";
 import { decodeResetSeen, formatClockTime, formatOverdueReset, formatResetsIn, formatResetsInCoarse, servedResetsIn } from "./resets.js";
+import { clean } from "./security.js";
 import type { PlanDowngrade } from "./store.js";
 import type { Lease, Observation, PaceState } from "./types.js";
 
@@ -243,7 +244,7 @@ export function formatMeters(observations: Observation[], policy: Policy, resetS
     const ordered = orderWindows(windows);
     if (ordered.length === 1 && isLocalPool(ordered[0])) return formatLocal(ordered[0]);
     const active = leases.get(meter) ?? [];
-    const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => item.owner).join(", ")})` : "";
+    const leaseLabel = active.length ? ` leases: ${active.length} (${active.map((item) => clean(item.owner)).join(", ")})` : "";
     return `${meter}  ${ordered.map((item) => {
       const decision = paceDecision(item, policy, now);
       return formatWindow(item, decision.state, decision.reason, resetSeen.get(windowKey(item)), freeResetUsed.get(windowKey(item)), reserveFor(policy.reserve, item.meter_id), now);
@@ -581,7 +582,7 @@ function buildBlocks(input: StatusViewInput, now: Date, ascii = false): Principa
           unknown,
           // The lease belongs to the meter, not to one of its windows, so it
           // is attached to the meter's last row and printed once.
-          lease: index === ordered.length - 1 && active.length ? `held by ${active.map((item) => item.owner).join(", ")}` : undefined,
+          lease: index === ordered.length - 1 && active.length ? `held by ${active.map((item) => clean(item.owner)).join(", ")}` : undefined,
         });
       });
     }
