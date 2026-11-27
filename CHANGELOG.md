@@ -6,9 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.26] - 2026-11-27
+
 ### Changed (action needed)
 
 - The Kimi credits meter (Moonshot balance) now reads the Moonshot API key only from the OS secret store, never from a `moonshot.key` file. That key is tied to billing, so it should not sit on disk in plain text where backups copy it. If you used the file: store the key with `security add-generic-password -U -a headroom -s headroom-moonshot -w` (Linux: `secret-tool store --label=headroom service headroom-moonshot`), then delete the file. Until then the credits meter and `headroom doctor` show the exact command. The credits meter now also works for a Kimi account that reads its API key from the Keychain (`keychain_service`).
+
+### Fixed
+
+- The Claude weekly reading no longer flips back to 99% every 10 minutes after a free reset. Claude Code's status line keeps showing the pre-reset figure, and while `/usage` was running, Headroom briefly had no `/usage` reading and showed the status line's 99% instead. That froze agents, showed a burn rate made from two sources, and sent a false "Usage dropped early" alert. Headroom now keeps the last `/usage` reading until the next one arrives, and for up to 30 minutes when a run fails. Burn rates use one source, and switching sources no longer counts as an early drop.
 
 ### Security
 

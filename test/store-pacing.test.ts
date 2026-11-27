@@ -70,6 +70,17 @@ describe("store.burnRateFor", () => {
     } finally { store.close(); }
   });
 
+  it("uses one source, cut at a reset any source saw", async () => {
+    const store = await open();
+    try {
+      const reset = "2026-09-03T17:00:00Z", usage = { source: "native:claude-usage" }, statusline = { source: "native:claude-statusline" };
+      store.insert(rolling(20, "2026-09-03T12:00:00Z", reset, usage));
+      store.insert(rolling(0, "2026-09-03T12:31:00Z", reset, statusline)); // a free reset, seen first by the statusline
+      store.insert(rolling(30, "2026-09-03T12:40:00Z", reset, usage));
+      expect(store.burnRateFor([store.latest("claude-main:all")!], new Date("2026-09-03T12:40:00Z")).get("claude-main:all:300")?.burn_percent_per_hour).toBeNull();
+    } finally { store.close(); }
+  });
+
   it("computes the exact two-point slope and the projected time to empty", async () => {
     const store = await open();
     try {

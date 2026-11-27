@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, unlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { headroomHome } from "../paths.js";
-import { redact } from "../security.js";
+import { redact, writeFileAtomic } from "../security.js";
 import type { Observation, ProviderAccount } from "../types.js";
 import { observationsFromClaudeUsage } from "./claude.js";
 
@@ -13,6 +13,8 @@ import { observationsFromClaudeUsage } from "./claude.js";
 export const CLAUDE_USAGE_SOURCE = "native:claude-usage";
 /** At most one `claude -p "/usage"` run per profile in this window. */
 export const CLAUDE_USAGE_MIN_INTERVAL_MS = 10 * 60_000;
+/** A /usage reading stays in use this long when later runs fail: the statusline's figure can be stale for days. */
+const CLAUDE_USAGE_KEEP_MS = 30 * 60_000;
 const TIMEOUT_MS = 30_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 /** `/usage` runs no model turn: it prints a usage_report (an experimental SDK
@@ -25,8 +27,9 @@ const ENV_KEYS = ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "USERPROFILE", "A
 
 export type ClaudeUsageRunner = (binary: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string; timeout: number }) => Promise<string>;
 export interface ClaudeUsageDependencies { run?: ClaudeUsageRunner; now?: () => Date; stampDir?: string; binary?: string }
-/** `throttled`: ran within the interval; `error` carries the reason when that run failed, `rows` that run's readings when it succeeded. */
-export type ClaudeUsageResult = { rows: Observation[] } | { error: string } | { throttled: { error?: string; rows?: Observation[] } };
+/** `throttled`: ran within the interval. `error` carries the reason a run failed. `rows` beside `error` or in
+ * `throttled` are the last good readings of at most 30 minutes ago. */
+export type ClaudeUsageResult = { rows: Observation[] } | { error: string; rows?: Observation[] } | { throttled: { error?: string; rows?: Observation[] } };
 
 /** Windows npm installs expose `claude.cmd`, which only a shell can start. Safe here: every argument is a constant and the only variable input travels in env. */
 export const needsShell = (binary: string, platform: string = process.platform): boolean => platform === "win32" && /\.(cmd|bat)$/i.test(binary);
@@ -57,24 +60,53 @@ function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
   return env;
 }
 
+/** This profile's stamp directory and key. */
+function stampKey(account: ProviderAccount, dependencies: ClaudeUsageDependencies): { dir: string; key: string } {
+  return { dir: dependencies.stampDir ?? join(headroomHome(), "claude-usage"), key: createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12) };
+}
+
+/** Per meter, the newest fresh reading; a placeholder ("no scoped limit in response") only where there is none. */
+function newest(rows: Observation[]): Observation[] {
+  const rank = (row: Observation): [number, number] => [row.freshness === "fresh" ? 1 : 0, Date.parse(row.observed_at)];
+  const best = new Map<string, Observation>();
+  for (const row of rows) {
+    const key = `${row.meter_id}|${row.window?.minutes ?? "none"}`, held = best.get(key);
+    if (!held || rank(row)[0] > rank(held)[0] || (rank(row)[0] === rank(held)[0] && rank(row)[1] >= rank(held)[1])) best.set(key, row);
+  }
+  return [...best.values()];
+}
+
+/** The last good /usage rows of at most 30 minutes ago, newest per meter. Each successful run writes its own
+ * `<key>.<ms>.rows.json` (no read-modify-write, so overlapping runs cannot lose each other's readings): a poll
+ * during a run (5-30 s), after a failed run or after a partial report must still see /usage, or the statusline's
+ * stale figure (99% after a free reset) wins and the meter flaps between sources. */
+async function lastGood(dir: string, key: string, now: Date): Promise<Observation[]> {
+  const rows: Observation[] = [];
+  for (const name of await readdir(dir).catch((): string[] => [])) {
+    if (!name.startsWith(`${key}.`) || !name.endsWith(".rows.json")) continue;
+    const parsed = await readFile(join(dir, name), "utf8").then((text) => JSON.parse(text) as unknown).catch(() => undefined);
+    if (Array.isArray(parsed)) rows.push(...parsed as Observation[]);
+  }
+  return newest(rows.filter((row) => now.getTime() - Date.parse(row.observed_at) <= CLAUDE_USAGE_KEEP_MS));
+}
+
 /** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket.
- * The stamp later holds the run's outcome (JSON `{error}` or `{rows}`), so a throttled poll reuses the last reading. */
-async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ path: string } | { throttled: { error?: string; rows?: Observation[] } } | { error: string }> {
-  const dir = dependencies.stampDir ?? join(headroomHome(), "claude-usage");
-  const key = createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12);
+ * The stamp later holds a failed run's reason (JSON `{error}`); readings live in `lastGood`. */
+async function claimSlot(dir: string, key: string, now: Date): Promise<{ path: string } | { throttled: { error?: string } } | { error: string }> {
   // ponytail: bucket-aligned throttle, two runs can straddle a boundary
-  const name = `${key}.${Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS)}.stamp`;
-  const path = join(dir, name);
+  const bucket = Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS);
+  const path = join(dir, `${key}.${bucket}.stamp`);
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
     await (await open(path, "wx", 0o600)).close();
-    for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old !== name) await unlink(join(dir, old)).catch(() => undefined);
+    // Only older buckets: a slow poll must not delete a newer bucket's claim.
+    for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old.endsWith(".stamp") && Number(old.split(".")[1]) < bucket) await unlink(join(dir, old)).catch(() => undefined);
     return { path };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") return { error: "claude /usage could not record its run claim" }; // fail closed rather than run unthrottled
-    // An empty stamp is a run still in flight: not a failure.
-    const recorded = await readFile(path, "utf8").then((text) => text ? JSON.parse(text) as { error?: unknown; rows?: unknown } : {}, (): { error?: unknown; rows?: unknown } => ({}));
-    return { throttled: typeof recorded.error === "string" ? { error: recorded.error } : Array.isArray(recorded.rows) ? { rows: recorded.rows as Observation[] } : {} };
+    // An empty stamp is a run still in flight, or one that succeeded: not a failure.
+    const recorded = await readFile(path, "utf8").then((text) => JSON.parse(text || "{}") as { error?: unknown }).catch((): { error?: unknown } => ({}));
+    return { throttled: typeof recorded.error === "string" ? { error: recorded.error } : {} };
   }
 }
 
@@ -107,11 +139,20 @@ export function usageBodyFromStream(stdout: string): Record<string, unknown> | u
 
 export async function observeClaudeUsage(account: ProviderAccount, dependencies: ClaudeUsageDependencies = {}): Promise<ClaudeUsageResult> {
   const now = dependencies.now?.() ?? new Date();
-  const claim = await claimSlot(account, dependencies, now);
-  if (!("path" in claim)) return claim;
-  const result = await run(account, dependencies, now);
-  await writeFile(claim.path, JSON.stringify(result), { mode: 0o600 }).catch(() => undefined);
-  return result;
+  const { dir, key } = stampKey(account, dependencies);
+  const claim = await claimSlot(dir, key, now);
+  // Read after any run: a newer run may have finished meanwhile.
+  const withKept = async (failed: { error: string }): Promise<ClaudeUsageResult> => { const kept = await lastGood(dir, key, now); return kept.length ? { ...failed, rows: kept } : failed; };
+  if ("throttled" in claim) { const kept = await lastGood(dir, key, now); return { throttled: { ...claim.throttled, ...kept.length ? { rows: kept } : {} } }; }
+  if (!("path" in claim)) return withKept(claim);
+  const ran = await run(account, dependencies, now);
+  if ("error" in ran) {
+    await writeFileAtomic(claim.path, JSON.stringify(ran), 0o600).catch(() => undefined);
+    return withKept(ran);
+  }
+  await writeFileAtomic(join(dir, `${key}.${now.getTime()}.rows.json`), JSON.stringify(ran.rows), 0o600).catch(() => undefined);
+  for (const name of await readdir(dir).catch((): string[] => [])) if (name.startsWith(`${key}.`) && name.endsWith(".rows.json") && Number(name.split(".")[1]) < now.getTime() - CLAUDE_USAGE_KEEP_MS) await unlink(join(dir, name)).catch(() => undefined);
+  return { rows: newest([...await lastGood(dir, key, now), ...ran.rows]) }; // this run's rows even when the write failed
 }
 
 async function run(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ rows: Observation[] } | { error: string }> {
