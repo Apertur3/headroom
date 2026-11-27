@@ -1365,7 +1365,7 @@ export class HeadroomStore {
    * below (a vendor correction or a free reset fired ahead of schedule). */
   private classifyUsageDrop(baseline: StoredObservation, current: StoredObservation, createdAt?: string, scheduledRolloverAt?: string): void {
     if (current.window?.kind === "state" || current.window?.kind === "count") return;
-    if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent") return;
+    if (baseline.quantity?.unit !== "percent" || current.quantity?.unit !== "percent" || baseline.source !== current.source) return; // stale statusline 99% then /usage 60%: not a drop
     const oldUsed = baseline.quantity.used;
     const newUsed = current.quantity.used;
     if (!isUsageReset(oldUsed, newUsed)) return;

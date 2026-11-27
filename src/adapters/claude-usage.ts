@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { headroomHome } from "../paths.js";
-import { redact } from "../security.js";
+import { redact, writeFileAtomic } from "../security.js";
 import type { Observation, ProviderAccount } from "../types.js";
 import { observationsFromClaudeUsage } from "./claude.js";
 
@@ -58,21 +58,28 @@ function childEnvironment(account: ProviderAccount): NodeJS.ProcessEnv {
 }
 
 /** Claims this account's run slot by exclusively creating a stamp named for the current 10-minute bucket.
- * The stamp later holds the run's outcome (JSON `{error}` or `{rows}`), so a throttled poll reuses the last reading. */
+ * The stamp later holds the run's outcome (JSON `{error}` or `{rows}`), so a throttled poll reuses the last reading.
+ * A new stamp starts with the previous bucket's rows: a poll during the run (5-30 s) must still see /usage,
+ * or a stale statusline 99% wins that poll and the meter flaps between sources. */
 async function claimSlot(account: ProviderAccount, dependencies: ClaudeUsageDependencies, now: Date): Promise<{ path: string } | { throttled: { error?: string; rows?: Observation[] } } | { error: string }> {
   const dir = dependencies.stampDir ?? join(headroomHome(), "claude-usage");
   const key = createHash("sha256").update(resolve(account.location)).digest("hex").slice(0, 12);
   // ponytail: bucket-aligned throttle, two runs can straddle a boundary
-  const name = `${key}.${Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS)}.stamp`;
+  const bucket = Math.floor(now.getTime() / CLAUDE_USAGE_MIN_INTERVAL_MS);
+  const name = `${key}.${bucket}.stamp`;
   const path = join(dir, name);
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    await (await open(path, "wx", 0o600)).close();
+    const previous = await readFile(join(dir, `${key}.${bucket - 1}.stamp`), "utf8").then((text) => (JSON.parse(text) as { rows?: unknown }).rows).catch(() => undefined);
+    // Exclusive create with content: write a temporary file, then link() it in (EEXIST when another poll won).
+    const temporary = join(dir, `.${name}.${randomBytes(8).toString("hex")}.tmp`);
+    await writeFile(temporary, Array.isArray(previous) ? JSON.stringify({ rows: previous }) : "", { mode: 0o600, flag: "wx" });
+    try { await link(temporary, path); } finally { await unlink(temporary).catch(() => undefined); }
     for (const old of await readdir(dir)) if (old.startsWith(`${key}.`) && old !== name) await unlink(join(dir, old)).catch(() => undefined);
     return { path };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") return { error: "claude /usage could not record its run claim" }; // fail closed rather than run unthrottled
-    // An empty stamp is a run still in flight: not a failure.
+    // An empty stamp is a run still in flight with no earlier reading: not a failure.
     const recorded = await readFile(path, "utf8").then((text) => text ? JSON.parse(text) as { error?: unknown; rows?: unknown } : {}, (): { error?: unknown; rows?: unknown } => ({}));
     return { throttled: typeof recorded.error === "string" ? { error: recorded.error } : Array.isArray(recorded.rows) ? { rows: recorded.rows as Observation[] } : {} };
   }
@@ -110,7 +117,7 @@ export async function observeClaudeUsage(account: ProviderAccount, dependencies:
   const claim = await claimSlot(account, dependencies, now);
   if (!("path" in claim)) return claim;
   const result = await run(account, dependencies, now);
-  await writeFile(claim.path, JSON.stringify(result), { mode: 0o600 }).catch(() => undefined);
+  await writeFileAtomic(claim.path, JSON.stringify(result), 0o600).catch(() => undefined);
   return result;
 }
 

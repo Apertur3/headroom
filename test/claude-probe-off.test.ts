@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_USAGE_MIN_INTERVAL_MS } from "../src/adapters/claude-usage.js";
+import { HeadroomStore } from "../src/store.js";
 
 const probe = vi.hoisted(() => ({ observeClaude: vi.fn() }));
 vi.mock("../src/adapters/claude.js", async (original) => ({ ...await original<typeof import("../src/adapters/claude.js")>(), observeClaude: probe.observeClaude }));
@@ -12,7 +13,7 @@ const { pollAccounts } = await import("../src/collector.js");
 const temporary: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); probe.observeClaude.mockReset(); await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 
-async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none"): Promise<string> {
+async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none", weeklyUsed = 60): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "headroom-probe-off-")); temporary.push(root);
   const home = join(root, ".headroom"), state = join(root, "state");
   await mkdir(home, { recursive: true, mode: 0o700 }); await mkdir(state, { recursive: true, mode: 0o700 });
@@ -21,7 +22,7 @@ async function setup(claudeProbe: boolean, snapshot: "fresh" | "stale" | "none")
   // The collector-shaped file the owner's fleet writes: alias "main", epoch observed_at, used_pct.
   if (snapshot !== "none") await writeFile(join(state, "main.json"), JSON.stringify({
     alias: "main", observed_at: Math.floor(t0.getTime() / 1000) - (snapshot === "fresh" ? 5 : 3600),
-    five_hour: { used_pct: 4, resets_at: Math.floor(t0.getTime() / 1000) + 3600 }, seven_day: { used_pct: 60, resets_at: Math.floor(t0.getTime() / 1000) + 86_400 }, source: "statusline",
+    five_hour: { used_pct: 4, resets_at: Math.floor(t0.getTime() / 1000) + 3600 }, seven_day: { used_pct: weeklyUsed, resets_at: Math.floor(t0.getTime() / 1000) + 86_400 }, source: "statusline",
   }), { mode: 0o600 });
   return home;
 }
@@ -105,6 +106,32 @@ describe("claude_probe = false: a full collector cycle never reaches the probe, 
     clock += 11 * 60_000;
     await poll(home, run, () => new Date(clock));
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("a poll while the next /usage run is in flight keeps the last /usage reading, not a stale statusline 99%", async () => {
+    // 27 Nov: /usage read 60% at 21:34:16, a poll 5 s later took the statusline's 99% and the hook froze every lead.
+    const home = await setup(false, "fresh", 99);
+    let release = (): void => undefined;
+    const gate = new Promise<void>((done) => { release = done; });
+    const run = vi.fn(async () => stream());
+    const weekly = (result: Awaited<ReturnType<typeof poll>>) => result.observations.filter((item) => item.meter_id === "claude-main:all" && item.window?.minutes === 10_080);
+    expect(weekly(await poll(home, run))).toEqual([expect.objectContaining({ source: "native:claude-usage", quantity: expect.objectContaining({ used: 61 }) })]);
+    const next = new Date(t0.getTime() + CLAUDE_USAGE_MIN_INTERVAL_MS);
+    run.mockImplementationOnce(async () => { await gate; return stream(); });
+    const inFlight = poll(home, run, () => next);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    const during = await poll(home, run, () => new Date(next.getTime() + 5_000));
+    expect(weekly(during)).toEqual([expect.objectContaining({ source: "native:claude-usage", quantity: expect.objectContaining({ used: 61 }) })]);
+    release(); await inFlight;
+    expect(run).toHaveBeenCalledTimes(2);
+    // And had the statusline's 99% reached the store, /usage after it is a change of source, not "usage dropped early".
+    const usage = { ...weekly(during)[0], resets_at: new Date(next.getTime() + 86_400_000).toISOString() };
+    const store = await HeadroomStore.open(home);
+    try {
+      store.insert({ ...usage, source: "native:claude-statusline", quantity: { used: 99, limit: 100, remaining: 1, unit: "percent" }, fetched_at: new Date(Date.parse(usage.fetched_at) - 5_000).toISOString() });
+      store.insert(usage);
+      expect(store.events("2000-01-01T00:00:00Z").filter((event) => event.kind === "usage_dropped" || event.kind === "free_reset_used")).toEqual([]);
+    } finally { store.close(); }
   });
 
   it("throttled after an ok run with no snapshot: no probe, nothing added", async () => {

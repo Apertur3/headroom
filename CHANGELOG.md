@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The Claude weekly reading no longer flips back to a stale 99% for a few seconds every 10 minutes. While Claude Code's `/usage` was running, a poll found no `/usage` reading and took the status line's old figure. That froze agents and sent a false "Usage dropped early" alert. Headroom now keeps the last `/usage` reading until the new one arrives, and a switch from one source to another no longer counts as an early drop.
+
 ## [0.2.25] - 2026-11-26
 
 ### Fixed
