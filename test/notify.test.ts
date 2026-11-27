@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  CHUNK_LIMIT, DEFAULT_NOTIFY_EVENTS, TELEGRAM_SECRET, chunkMessage, combineTexts, inQuietHours,
-  parseNotifyConfig, parseQuietHours, prepareChannels, readSecret, scrubSecrets, secretStoreCommand, secretStoreHint,
+  CHUNK_LIMIT, DEFAULT_NOTIFY_EVENTS, TELEGRAM_SECRET, WEBHOOK_SECRET, chunkMessage, combineTexts, inQuietHours,
+  notifyTest, parseNotifyConfig, parseQuietHours, prepareChannels, readSecret, scrubSecrets, secretStoreCommand, secretStoreHint,
   type CommandRunner, type NotifyConfig,
 } from "../src/notify.js";
 
@@ -57,13 +57,32 @@ describe("notify config", () => {
   });
 
   it("refuses an unknown channel, an unknown event, an unknown key and an out-of-range threshold", () => {
-    expect(() => parseNotifyConfig('[notify]\nchannels = ["pager"]\n')).toThrow(/unknown channel/);
+    expect(() => parseNotifyConfig('[notify]\nchannels = ["pager"]\n')).toThrow(/channels may only name telegram, ntfy, webhook/);
     expect(() => parseNotifyConfig('[notify]\nevents = ["reset_seeen"]\n')).toThrow(/unknown event/);
-    expect(() => parseNotifyConfig("[notify]\nthreshold_pct = 90\n")).toThrow(/unknown \[notify\] key/);
+    expect(() => parseNotifyConfig("[notify]\nthreshold_pct = 90\n")).toThrow(/line 2: unknown setting in \[notify\]/);
     expect(() => parseNotifyConfig("[notify]\nthreshold_percent = 140\n")).toThrow(/threshold_percent/);
     expect(() => parseNotifyConfig("[notify]\nthresholds = [90, 140]\n")).toThrow(/thresholds/);
     expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "ftp://example.com/hook"\n')).toThrow(/http or https/);
     expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "not a topic!"\n')).toThrow(/ntfy topic/);
+  });
+
+  it("names the line and the problem in a parse error, never the line's value", () => {
+    const leaks = [
+      '[notify]\n[notify.ntfy]\n"topic" = "synthetic-leaked-topic"\n',
+      '[notify]\n[notify.ntfy]\ntopic = synthetic-leaked-topic\n',
+      '[notify]\nchannels = synthetic-leaked-topic\n',
+      '[notify]\n[notify.synthetic-leaked-topic]\nurl = "https://example.com/synthetic-leaked-topic"\n',
+      '[notify]\nchannels = ["synthetic-leaked-topic"]\n',
+      '[notify]\nquiet_hours = "synthetic-leaked-topic"\n',
+      '[notify]\nnotify_scheduled_short = synthetic-leaked-topic\n',
+    ];
+    for (const text of leaks) {
+      let message = "";
+      try { parseNotifyConfig(text); } catch (error) { message = (error as Error).message; }
+      expect(message, text).toMatch(/^Invalid Headroom notify config: /);
+      expect(message, text).not.toContain("synthetic-leaked-topic");
+    }
+    expect(() => parseNotifyConfig(leaks[0])).toThrow(/line 3 is not a key = value setting/);
   });
 
   it("reads a configured ascending threshold ladder", () => {
@@ -167,7 +186,9 @@ describe("channel readiness", () => {
     expect(channels.find((channel) => channel.channel === "telegram")?.detail).toContain("security add-generic-password");
     // ntfy needs no credential, and a webhook without a stored bearer still
     // posts, unauthenticated and saying so.
-    expect(channels.find((channel) => channel.channel === "ntfy")).toMatchObject({ ready: true, detail: "https://ntfy.sh/headroom-example" });
+    // Only the origin: the ntfy topic and a webhook path are the credential.
+    expect(channels.find((channel) => channel.channel === "ntfy")).toMatchObject({ ready: true, detail: "https://ntfy.sh" });
+    expect(channels.find((channel) => channel.channel === "webhook")?.detail).toBe("https://example.com (no bearer stored)");
     expect(channels.find((channel) => channel.channel === "webhook")).toMatchObject({ ready: true });
     expect(channels.find((channel) => channel.channel === "webhook")?.detail).toContain("no bearer stored");
   });
@@ -178,6 +199,49 @@ describe("channel readiness", () => {
     expect(channels[0].detail).toContain("no chat_id");
     expect(channels[1].detail).toContain("no topic");
     expect(channels[2].detail).toContain("no url");
+  });
+
+  it("refuses to send the webhook bearer over plain http except to this machine", async () => {
+    const bearer: CommandRunner = async (_command, args) => { if (args.includes(WEBHOOK_SECRET)) return "synthetic-bearer"; throw new Error("not found"); };
+    const webhook = async (url: string) => (await prepareChannels(config(`[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "${url}"\n`), { platform: "darwin", run: bearer }))[0];
+    const lan = await webhook("http://192.0.2.10:8123/api/webhook/synthetic-id");
+    expect(lan).toMatchObject({ ready: false, detail: "refusing to send the headroom-webhook bearer over plain http to http://192.0.2.10:8123; use https (plain http only to localhost)" });
+    for (const url of ["https://192.0.2.10:8123/hook", "https://[::1]:8123/hook", "http://127.0.0.1:8123/hook", "http://localhost/hook"]) expect((await webhook(url)).ready).toBe(true);
+    // Only hosts every supported Node keeps off a configured proxy: other
+    // 127/8 addresses and [::1] could go through it, so no plain-http bearer.
+    for (const url of ["http://127.0.0.2:8123/hook", "http://[::1]:8123/hook"]) expect((await webhook(url)).ready).toBe(false);
+    // Without a bearer there is nothing to protect, so plain http still posts.
+    expect((await prepareChannels(config('[notify]\nchannels = ["webhook"]\n[notify.webhook]\nurl = "http://192.0.2.10/hook"\n'), { platform: "darwin", run: async () => { throw new Error("not found"); } }))[0].ready).toBe(true);
+    expect(JSON.stringify(lan)).not.toContain("synthetic-bearer");
+  });
+
+  it("refuses user info in a channel URL, and scrubs a channel URL out of a delivery error", async () => {
+    expect(() => parseNotifyConfig('[notify]\n[notify.webhook]\nurl = "https://user:synthetic-pass@example.com/hook"\n')).toThrow(/webhook url must not hold a user name or password/);
+    expect(() => parseNotifyConfig('[notify]\n[notify.ntfy]\ntopic = "t"\nserver = "https://user@example.com"\n')).toThrow(/ntfy server must not hold/);
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { lines.push(line); });
+    const fetcher = (async (request: Request) => { throw new Error(`connect failed for ${request.url}`); }) as unknown as typeof fetch;
+    try {
+      await notifyTest({ config: config('[notify]\nchannels = ["ntfy", "webhook"]\n[notify.ntfy]\ntopic = "synthetic-topic-1234"\n[notify.webhook]\nurl = "https://example.com/api/webhook/synthetic-hook-id"\n'), fetcher, platform: "darwin", run: async () => { throw new Error("not found"); } });
+    } finally { spy.mockRestore(); }
+    expect(lines.join("\n")).toContain("failed");
+    expect(lines.join("\n")).not.toMatch(/synthetic-topic-1234|synthetic-hook-id/);
+  });
+
+  it("keeps only the origin and the status or error name of a failed delivery, never a body or a message", async () => {
+    const run = async (fetcher: typeof fetch) => {
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((line: string) => { lines.push(line); });
+      try { await notifyTest({ config: config('[notify]\nchannels = ["ntfy", "webhook"]\n[notify.ntfy]\ntopic = "Synthetic-Topic-1234"\n[notify.webhook]\nurl = "https://example.com/api/webhook/synthetic-hook-id"\n'), fetcher, platform: "darwin", run: async () => { throw new Error("not found"); } }); }
+      finally { spy.mockRestore(); }
+      return lines.join("\n");
+    };
+    const echoed = await run((async (request: Request) => new Response(`Cannot POST ${new URL(request.url).pathname}`, { status: 404 })) as unknown as typeof fetch);
+    expect(echoed).toContain("ntfy     failed    https://ntfy.sh HTTP 404");
+    expect(echoed).toContain("webhook  failed    https://example.com HTTP 404");
+    const thrown = await run((async (request: Request) => { throw Object.assign(new TypeError(`fetch failed for ${request.url.toUpperCase()}`), { cause: { code: "ECONNREFUSED" } }); }) as unknown as typeof fetch);
+    expect(thrown).toContain("https://ntfy.sh ECONNREFUSED");
+    for (const output of [echoed, thrown]) expect(output).not.toMatch(/synthetic-topic-1234|synthetic-hook-id/i);
   });
 
   it("never puts the bot token in a channel's own description", async () => {

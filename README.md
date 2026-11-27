@@ -369,7 +369,7 @@ Each of these is a rule the code enforces and a test pins. Past real-world break
 - **Fail closed: never a fake number.** A missing, stale or inconsistent reading becomes UNKNOWN, and `can` answers NO for it unless you explicitly pass `--allow-unknown`.
 - **A stale-lane canary that cannot be silenced.** A lane with no fresh reading for 6 hours raises an alert, whatever the notification config says.
 - **Only kill what Headroom provably started.** On macOS and Linux, a process is signalled only if its recorded pid, command and start time still match.
-- **Secrets stay in their own stores.** Notification tokens live in the OS secret store; vendor credentials are read at use time from the vendor's own store or credential file and never copied. Output is redacted.
+- **Secrets stay in their own stores.** Notification tokens and the Moonshot API key live in the OS secret store; vendor credentials are read at use time from the vendor's own store or credential file and never copied. Output is redacted.
 - **A redacted fixture per past breakage.** Every Antigravity failure shape seen in the field has a fixture and a test.
 
 <details>
@@ -397,11 +397,11 @@ Each of these is a rule the code enforces and a test pins. Past real-world break
   [`agy-watchdog.test.ts`](test/agy-watchdog.test.ts)). The test suite itself fails if any
   process it started outlives the run ([`global-leak-gate.ts`](test/global-leak-gate.ts)). The
   watchdog and the pid and start-time checks are not active on Windows.
-- **Secrets stay in their own stores.** Headroom's own credentials (notification tokens) are
-  read at use time from the macOS Keychain (`secret-tool` on Linux, Credential Manager on
-  Windows) and never written to disk; vendor tokens are read at call time from the vendor's own
-  store or credential file (for Kimi's manual token and the Moonshot key, a 0600 file you save
-  yourself) and dropped. Output and logs are redacted
+- **Secrets stay in their own stores.** Headroom's own credentials (notification tokens and the
+  optional Moonshot API key) are read at use time from the macOS Keychain (`secret-tool` on
+  Linux, Credential Manager on Windows) and never written to disk; vendor tokens are read at call
+  time from the vendor's own store or credential file (for Kimi's manual web token, a 0600 file
+  you save yourself) and dropped. Output and logs are redacted
   ([`notify.ts`](src/notify.ts), [`security.ts`](src/security.ts),
   [`security.test.ts`](test/security.test.ts), [SECURITY.md](SECURITY.md)).
 - **A redacted fixture per past breakage.** Every Antigravity failure shape seen in the field
@@ -518,7 +518,7 @@ Every request identifies itself as `headroomd/<version>`. The default (`claude_p
 | Kimi, Keychain API key (macOS, recommended unattended) | `GET api.kimi.com/coding/v1/usages` | A Kimi Code console API key in a Keychain item you name with `keychain_service`, read per poll and never written to disk. Sends `User-Agent: headroomd/<version>` | No |
 | Kimi, CLI credential | `GET api.kimi.com/coding/v1/usages` | Access token from `~/.kimi-code/credentials/kimi-code*.json` | No. Sends `User-Agent: headroomd/<version>` |
 | Kimi, manual token | The `www.kimi.com/apiv2` web gateway | A `kimi-auth` web session token you save yourself to a 0600 file (default `~/.kimi/auth.token`) | No |
-| Kimi, optional balance | `GET api.moonshot.ai/v1/users/me/balance` | A Moonshot API key you save to a 0600 `moonshot.key` file | Yes (Moonshot platform API) |
+| Kimi, optional balance | `GET api.moonshot.ai/v1/users/me/balance` | A Moonshot API key in the OS secret store under `headroom-moonshot` (macOS: `security add-generic-password -U -a headroom -s headroom-moonshot -w`), read per poll | Yes (Moonshot platform API) |
 | Local vLLM, llama.cpp | Your own server at the `base_url` you configure | None from a vendor | Not applicable |
 
 Per-vendor detail: [docs/vendors.md](docs/vendors.md).

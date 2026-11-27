@@ -490,15 +490,18 @@ is dropped); `<principal>:credits` is optional, see below. Window kind, window l
 come from the response. The one exception is the allowance bucket, which the gateway reports
 without a window of its own: it is labelled with the vendor's documented 7-day period.
 
-Optional extra location, the Moonshot platform balance: if a file named `moonshot.key` sits beside
-the credential the principal points at (same directory, same 0600 rules) holding a Moonshot API
-key, Headroom also calls
-`GET https://api.moonshot.ai/v1/users/me/balance` and emits `<principal>:credits`, a `count` window
-with no reset. It is informational, never a gate, and its failure never touches the subscription
-meters. Its absence is simply "not configured": no meter, no failure row. A principal on the CLI
-credential also accepts the documented default `~/.kimi/moonshot.key`, so moving from one source to
-the other does not silently drop an already configured credits meter. Only the international host
-is called; there is no `api.moonshot.cn` path.
+Optional extra, the Moonshot platform balance: if a Moonshot API key is in the OS secret store
+under the name `headroom-moonshot` (macOS: `security add-generic-password -U -a headroom -s
+headroom-moonshot -w`; Linux: `secret-tool store --label=headroom service headroom-moonshot`;
+Windows: `cmdkey /generic:headroom-moonshot /user:headroom /pass`), Headroom also calls
+`GET https://api.moonshot.ai/v1/users/me/balance` for every Kimi principal, whatever its credential
+source, and emits `<principal>:credits`, a `count` window with no reset. It is informational, never
+a gate, and its failure never touches the subscription meters. Its absence is simply "not
+configured": no meter, no failure row. The key is billing-linked, so it is never read from a file:
+a `moonshot.key` file left from an older version (beside the credential or at
+`~/.kimi/moonshot.key`) is not opened, and fails the credits meter and `headroom doctor` with the
+store command and a reminder to delete the file. Only the international host is called; there is
+no `api.moonshot.cn` path.
 
 All three hosts (`api.kimi.com`, `www.kimi.com`, `api.moonshot.ai`) are on the outbound allowlist
 and nothing else in this adapter may leave the machine; redirects are refused rather than followed,

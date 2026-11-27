@@ -16,12 +16,14 @@ import { homedir, hostname as machineHostname, release as osRelease, userInfo } 
 import { dirname, join, resolve } from "node:path";
 import { formatMeters } from "./cli.js";
 import { readPolicy } from "./config.js";
+import { parseNotifyConfig, type NotifyConfig } from "./notify.js";
+import { parsePolicy, type Policy } from "./policy.js";
 import { doctorChecks, doctorFileStatus, type DoctorCheck } from "./doctor.js";
 import { tailDaemonLog } from "./logs.js";
 import { withPaceInfo } from "./pace.js";
 import { headroomHome } from "./paths.js";
 import { accountsPath, readAccounts } from "./registry.js";
-import { redact, writeFileAtomic } from "./security.js";
+import { redact, storedDeliveryError, writeFileAtomic } from "./security.js";
 import { HeadroomStore } from "./store.js";
 import { isLocalAccount, type Lease } from "./types.js";
 import { headroomVersion } from "./version.js";
@@ -64,6 +66,52 @@ function redactAssignedSecrets(text: string): string {
   return text.replace(/\b(token|api[_-]?key|secret|password|passwd|client[_-]?secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
 }
 
+/** A URL's `user:pass@` part: everything in the authority up to its last
+ * `@`, whatever characters the password holds and whatever host follows. */
+function redactUrlUserinfo(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]*@/gi, "$1[REDACTED]@");
+}
+
+/** Scheme and host of an http(s) URL, without user info, path or query. */
+function urlOrigin(value: string): string | undefined {
+  try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? url.origin : undefined; } catch { return undefined; }
+}
+
+/**
+ * policy.toml as Headroom itself parses it, never its raw text: comments and
+ * anything the parsers do not read are dropped. Every notify channel value
+ * (webhook URL, ntfy topic and server, Telegram chat id) is a capability for
+ * that channel, so a URL keeps only its scheme and host and anything else is
+ * replaced; the proxy keeps only its scheme and host. A file that does not
+ * parse is left out whole, since the parse error alone cannot say which line
+ * holds a secret.
+ */
+export function policyListing(text: string): string[] {
+  let policy: Policy, notify: NotifyConfig | undefined;
+  try { policy = parsePolicy(text); notify = parseNotifyConfig(text); }
+  catch { return ["policy.toml did not parse; contents left out (headroom doctor names the problem)"]; }
+  const channel = (values: object) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, typeof value === "string" ? urlOrigin(value) ?? "[REDACTED]" : value]));
+  const { policy_mtime: _mtime, proxy, ...rest } = policy;
+  const listing = { ...rest, ...(proxy ? { proxy: urlOrigin(proxy) ?? "[REDACTED]" } : {}), ...(notify ? { notify: { ...notify, telegram: channel(notify.telegram), ntfy: channel(notify.ntfy), webhook: channel(notify.webhook) } } : {}) };
+  return JSON.stringify(listing, null, 2).split("\n");
+}
+
+/** The configured channel capabilities (ntfy topic, Telegram chat id, webhook
+ * path): replaced wherever they turn up, since an older version's log line can
+ * carry a channel reply that no line-shape rule can bound. */
+export function channelCapabilities(text: string): string[] {
+  let notify: NotifyConfig | undefined;
+  try { notify = parseNotifyConfig(text); } catch { return []; }
+  if (!notify) return [];
+  const hook: string[] = [];
+  for (const value of [notify.webhook.url, notify.ntfy.server]) {
+    try { if (value) { const url = new URL(value); hook.push(url.pathname + url.search, url.pathname, url.search); } } catch { /* not a URL */ }
+  }
+  // Longest first, so a path is replaced before its own query. Values under 3
+  // characters guard nothing (anyone can guess them) and would wipe the bundle.
+  return [notify.ntfy.topic, notify.telegram.chat_id, ...hook].filter((value): value is string => !!value && value.length >= 3 && value !== "/").sort((a, b) => b.length - a.length);
+}
+
 /** Replaces this machine's home directory, username, and hostname wherever
  * they appear verbatim -- identifiers redact() has no way to recognize on
  * its own, since none of them are shaped like a token. Runs after redact()
@@ -91,8 +139,15 @@ function redactKnownStoreLocations(text: string, home: string): string {
 
 /** The full redaction pass, applied once to the whole assembled bundle
  * rather than per-section, so no section can accidentally skip it. */
-export function redactBundleText(text: string): string {
-  const withTokensAndEmails = redact(text);
+export function redactBundleText(text: string, capabilities: string[] = []): string {
+  const withoutCapabilities = capabilities.reduce((output, value) => output.replace(new RegExp(escapeRegExp(value), "gi"), "[REDACTED]"), text);
+  // Older versions put the malformed policy.toml line itself into
+  // this error, and the daemon log keeps it.
+  const withoutConfigLines = withoutCapabilities.replace(/(Invalid Headroom notify config:)[^\n]*/g, "$1 [REDACTED]")
+    // Delivery failures in the daemon log, which older versions logged with
+    // the channel's reply text.
+    .replace(/(notify \S+ (?:failed for \d+ event\(s\)|gave up on \d+ event\(s\) after \d+ attempts): )([^\n]*)/g, (_line, prefix: string, detail: string) => prefix + storedDeliveryError(detail));
+  const withTokensAndEmails = redact(redactUrlUserinfo(withoutConfigLines));
   const withoutNetworkAddresses = redactNetworkAddresses(withTokensAndEmails);
   const withoutAssignedSecrets = redactAssignedSecrets(withoutNetworkAddresses);
   const withoutKnownStoreLocations = redactKnownStoreLocations(withoutAssignedSecrets, headroomHome());
@@ -127,16 +182,15 @@ async function principalLines(): Promise<string[]> {
 }
 
 /** One config file (policy.toml or routing.toml), held to the same file-safety
- * bar doctor's own configCheck() uses. Contents are included so the redaction
- * pass below can run over them -- never copied in because they are expected
- * to hold anything sensitive; today they don't. */
-async function configFileSection(path: string): Promise<string[]> {
+ * bar doctor's own configCheck() uses. routing.toml holds no secrets and is
+ * copied as text; policy.toml does (notify channels, a proxy password), so it
+ * goes through policyListing() instead. */
+async function configFileSection(path: string, render: (text: string) => string[] = (text) => text.split("\n")): Promise<string[]> {
   const status = await doctorFileStatus(path).catch<DoctorFileStatusFallback>(() => "unsafe");
   if (status === "missing") return ["not present; using built-in defaults"];
   if (status === "unsafe") return [`unsafe file, skipped: ${path}`];
   try {
-    const text = await readFile(path, "utf8");
-    return text.split("\n");
+    return render(await readFile(path, "utf8"));
   } catch (error) {
     return [`unreadable: ${errorMessage(error)}`];
   }
@@ -146,7 +200,9 @@ type DoctorFileStatusFallback = "present" | "missing" | "unsafe";
 async function daemonLogSection(home: string): Promise<string[]> {
   try {
     const text = await tailDaemonLog(DAEMON_LOG_LINES, home);
-    return text ? text.split("\n") : ["no daemon log written yet"];
+    // Every record starts with its timestamp. A line without one is the rest of a
+    // multi-line message (older versions logged channel replies whole), so it goes.
+    return text ? text.split("\n").map((line) => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) ? line : "[continuation line hidden]") : ["no daemon log written yet"];
   } catch (error) {
     return [`daemon log unavailable: ${errorMessage(error)}`];
   }
@@ -235,7 +291,7 @@ export async function buildBundleText(): Promise<string> {
     headroomVersion(),
     doctorLinesSection(),
     principalLines(),
-    configFileSection(join(home, "policy.toml")),
+    configFileSection(join(home, "policy.toml"), policyListing),
     configFileSection(routingPath),
     daemonLogSection(home),
     auditRowsSection(home),
@@ -259,7 +315,8 @@ export async function buildBundleText(): Promise<string> {
     ...section(`audit (last ${AUDIT_ROW_LIMIT} rows)`, auditRows),
     ...section("status", statusLines),
   ];
-  return redactBundleText([...header, ...body].join("\n"));
+  const capabilities = channelCapabilities(await readFile(join(home, "policy.toml"), "utf8").catch(() => ""));
+  return redactBundleText([...header, ...body].join("\n"), capabilities);
 }
 
 function defaultBundleFilename(): string {

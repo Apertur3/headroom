@@ -4,7 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { vendorJson } from "../limits.js";
 import { expandHome } from "../paths.js";
 import { userAgent } from "../version.js";
-import { systemRunner, type CommandRunner } from "../notify.js";
+import { readSecret, secretStoreHint, systemRunner, type CommandRunner } from "../notify.js";
 import { outboundFetch, readBoundedRegularFile, redact } from "../security.js";
 import { ProviderHTTPError } from "./claude.js";
 import type { Observation, ProviderAccount } from "../types.js";
@@ -71,7 +71,12 @@ const CLI_EXPIRY_GRACE_MS = 60_000;
 const CREDENTIAL_MAX_BYTES = 16 * 1024;
 export const KIMI_TOKEN_FILENAME = "auth.token";
 export const KIMI_CLI_CREDENTIAL_FILENAME = "kimi-code.json";
+/** The old plaintext Moonshot key file. It is never read; its presence only
+ * triggers the notice that tells the operator to move it into the store. */
 export const MOONSHOT_KEY_FILENAME = "moonshot.key";
+/** The Moonshot platform API key is billing-linked, so it lives only in the OS
+ * secret store, read per poll through the same path the notify channels use. */
+export const MOONSHOT_SECRET = "headroom-moonshot";
 
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): value is ObjectValue => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -137,8 +142,7 @@ export function isKimiCliCredential(path: string): boolean {
   return KIMI_CLI_CREDENTIAL_NAME.test(basename(path));
 }
 
-/** The optional second location: the Moonshot platform API key, in a file
- * beside the subscription token. Its presence is the only opt-in. */
+/** Where older versions read the Moonshot key from: beside the credential. */
 export function kimiCreditsPath(tokenPath: string): string {
   return join(dirname(tokenPath), MOONSHOT_KEY_FILENAME);
 }
@@ -506,11 +510,9 @@ function usageReason(error: unknown, path: string): string {
   return "Kimi usage unavailable";
 }
 
-/** The optional Moonshot key sits beside the credential Headroom reads. The
- * documented default location beside the manual token file is also accepted,
- * so a principal that moves to the CLI credential does not silently lose an
- * already configured credits meter. */
-async function moonshotKeyPath(credentialPath: string, home?: string): Promise<string | undefined> {
+/** A leftover plaintext Moonshot key file, beside the credential or at the old
+ * documented default. Only its existence is checked: it is never opened. */
+export async function legacyMoonshotKeyFile(credentialPath: string, home?: string): Promise<string | undefined> {
   const candidates = [kimiCreditsPath(credentialPath)];
   if (isKimiCliCredential(credentialPath)) candidates.push(kimiCreditsPath(kimiTokenPath(undefined, home ?? homedir())));
   for (const candidate of [...new Set(candidates)]) {
@@ -519,17 +521,28 @@ async function moonshotKeyPath(credentialPath: string, home?: string): Promise<s
   return undefined;
 }
 
-async function observeMoonshotCredits(account: ProviderAccount, path: string, doFetch: typeof fetch, at: Date): Promise<Observation[]> {
+/** What the operator runs to move an old key file into the secret store. */
+export function moonshotKeyFileFix(path: string, platform: NodeJS.Platform = process.platform): string {
+  return `store the key with: ${secretStoreHint(MOONSHOT_SECRET, platform)}, then delete ${path}`;
+}
+
+/** The optional credits meter. The key's presence in the secret store is the
+ * opt-in; without it there is no meter, unless an old key file is still on
+ * disk, which fails the meter with the steps to move it. */
+async function observeMoonshotCredits(account: ProviderAccount, credentialPath: string, doFetch: typeof fetch, at: Date, dependencies: KimiDependencies): Promise<Observation[]> {
   const now = at.toISOString();
-  let key: string;
-  try { key = await readKimiToken(path); }
-  catch (error) { return failed(account, `${error instanceof Error ? error.message.replace("token file", "credits key file") : "Moonshot key unavailable"} (${path})`, now, ["credits"], CREDITS_SOURCE); }
+  const platform = dependencies.platform ?? process.platform;
+  const { secret: key } = await readSecret(MOONSHOT_SECRET, { platform, run: dependencies.run });
+  if (!key) {
+    const legacy = await legacyMoonshotKeyFile(credentialPath, dependencies.home);
+    return legacy ? failed(account, `Moonshot key file ${legacy} is plaintext and no longer read; ${moonshotKeyFileFix(legacy, platform)}`, now, ["credits"], CREDITS_SOURCE) : [];
+  }
   try {
     const response = await outboundFetch(doFetch, new Request(MOONSHOT_BALANCE_URL, { headers: { Authorization: `Bearer ${key}`, Accept: "application/json", "User-Agent": userAgent() }, signal: AbortSignal.timeout(TIMEOUT_MS) }));
     if (!response.ok) throw new ProviderHTTPError(response.status, "Moonshot balance");
     return [observationFromMoonshotBalance(await vendorJson(response), account, at)];
   } catch (error) {
-    const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Moonshot rejected the API key (${error.status}); replace it in ${path}`
+    const reason = error instanceof ProviderHTTPError && (error.status === 401 || error.status === 403) ? `Moonshot rejected the API key (${error.status}); replace ${MOONSHOT_SECRET} in the secret store`
       : error instanceof ProviderHTTPError ? error.message
       : error instanceof Error && error.message.startsWith("vendor response") ? error.message : "Moonshot balance unavailable";
     return failed(account, reason, now, ["credits"], CREDITS_SOURCE);
@@ -603,11 +616,9 @@ export async function observeKimi(account: ProviderAccount, dependencies: KimiDe
   const now = dependencies.now?.() ?? new Date();
   const path = kimiTokenPath(account.location, dependencies.home);
   const doFetch = dependencies.fetch ?? fetch;
-  if (account.keychain_service) return observeKimiKeychain(account, account.keychain_service, doFetch, now, dependencies);
-  const output = isKimiCliCredential(path)
-    ? await observeKimiCodeCli(account, path, doFetch, now)
+  const output = account.keychain_service ? await observeKimiKeychain(account, account.keychain_service, doFetch, now, dependencies)
+    : isKimiCliCredential(path) ? await observeKimiCodeCli(account, path, doFetch, now)
     : await observeKimiGateway(account, path, doFetch, now);
-  const creditsKey = await moonshotKeyPath(path, dependencies.home);
-  if (creditsKey) output.push(...await observeMoonshotCredits(account, creditsKey, doFetch, now));
+  output.push(...await observeMoonshotCredits(account, path, doFetch, now, dependencies));
   return output;
 }

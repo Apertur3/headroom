@@ -110,6 +110,28 @@ describe("parsePolicy: dated/reasoned reserve entries", () => {
   });
 });
 
+describe("text output of another agent's lease owner", () => {
+  it("can and gate print a planted lease owner without its escape sequences", async () => {
+    const home = await tempHome();
+    await writeFile(join(home, "routing.toml"), '[consumes]\ncodex-main-fable = ["codex-main:main"]\n', { mode: 0o600 });
+    await writeFile(join(home, "accounts.toml"), '[[accounts]]\nname = "codex-main"\nvendor = "codex"\nlocation = "/tmp/codex-main"\nadapter = "native-ts"\n', { mode: 0o600 });
+    const store = await HeadroomStore.open(home);
+    store.insert(fiveHour("codex-main:main", 60));
+    store.startLease("agent\x1b]52;c;c3ludGhldGlj\x07\x1b[2J", "codex-main:main", 30, 3_600_000, null);
+    store.close();
+    const { logs, restore } = captureLog();
+    try {
+      await withHeadroomHome(home, async () => {
+        await main(["gate", "--need", "5h:6", "--meter", "codex-main:main", "--owner", "orchestrator"]);
+        await main(["can", "codex-main-fable", "--owner", "orchestrator"]);
+      });
+    } finally { restore(); }
+    const output = logs.join("\n");
+    expect(output).toContain("leased by agent");
+    expect(output).not.toMatch(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
+  });
+});
+
 describe("reserve refusal attribution", () => {
   it("names the reserve's own key, reason and set_at date in a gate refusal", async () => {
     const home = await tempHome();

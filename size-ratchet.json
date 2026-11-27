@@ -3,7 +3,7 @@
   "src/browser-report.ts": 1824,
   "src/cli.ts": 2532,
   "src/daemon.ts": 1939,
-  "src/notify.ts": 1210,
+  "src/notify.ts": 1204,
   "src/store.ts": 3225,
   "src/usage-store.ts": 1205,
   "test/antigravity-keepalive-sweep.test.ts": 1314,

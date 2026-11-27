@@ -277,7 +277,11 @@ Tokens stay in the OS secret store. They are read at delivery time, never from
 policy files, and there is no plaintext fallback. The optional webhook bearer
 uses the same command with `headroom-webhook` instead of `headroom-telegram`.
 A missing Telegram token disables Telegram; a missing webhook bearer means the
-webhook sends without an Authorization header. Keep credentials out of URLs.
+webhook sends without an Authorization header. With a bearer stored, the webhook
+URL must be `https`; plain `http` is refused (the channel shows why) unless it
+points at this machine as `localhost` or `127.0.0.1`. `notify --test`
+prints only the origin of an ntfy or webhook URL, never the topic or path.
+Keep credentials out of URLs.
 
 ## Delivery and troubleshooting
 

@@ -6,9 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed (action needed)
+
+- The Kimi credits meter (Moonshot balance) now reads the Moonshot API key only from the OS secret store, never from a `moonshot.key` file. That key is tied to billing, so it should not sit on disk in plain text where backups copy it. If you used the file: store the key with `security add-generic-password -U -a headroom -s headroom-moonshot -w` (Linux: `secret-tool store --label=headroom service headroom-moonshot`), then delete the file. Until then the credits meter and `headroom doctor` show the exact command. The credits meter now also works for a Kimi account that reads its API key from the Keychain (`keychain_service`).
+
 ### Fixed
 
 - The Claude weekly reading no longer flips back to 99% every 10 minutes after a free reset. Claude Code's status line keeps showing the pre-reset figure, and while `/usage` was running, Headroom briefly had no `/usage` reading and showed the status line's 99% instead. That froze agents, showed a burn rate made from two sources, and sent a false "Usage dropped early" alert. Headroom now keeps the last `/usage` reading until the next one arrives, and for up to 30 minutes when a run fails. Burn rates use one source, and switching sources no longer counts as an early drop.
+
+### Security
+
+- A webhook with a stored bearer token no longer sends it over plain `http` to another machine. The channel is turned off and says to use `https`; `http` to `localhost` or `127.0.0.1` still works.
+- A webhook or ntfy server URL with a user name or password in it is refused with a message that says to store a webhook token in the secret store instead. A failed delivery is now recorded as the channel's server plus the HTTP status or error code (`https://ntfy.sh HTTP 404`), never the reply text or error message, which could repeat the topic, the webhook path or the bot token. Failures recorded by older versions are shown as `[older error detail hidden]` in `headroom notify --last` and in the support bundle.
+- The `proxy` set in `policy.toml` now also carries Headroom's own requests (Codex, Kimi, Grok, notifications), not only the engine's. Proxy variables from your shell are always ignored, also when Node picked them up at start (`NODE_USE_ENV_PROXY`). `no_proxy` is read the way Node reads it (lowercase first). This needs Node 24.14+ or 25.4+; on older Node, Headroom prints that its own requests go direct, and stops with an error when Node set up a proxy from `NODE_USE_ENV_PROXY` or `--use-env-proxy` that it cannot replace.
+- Text that agents write (lease owners and notes, heartbeat resume sentences, timer actions, inbox messages) is printed with terminal control sequences removed, so a planted escape code cannot change your screen, set your clipboard or hide a link when you run `status`, `lease list`, `heartbeat list`, `timer list`, `spend` or `inbox`.
+- An invalid `[notify]` setting is reported by line number and problem only, not by repeating the line, which could hold an ntfy topic or webhook URL. The support bundle also hides the line in such errors written to the daemon log by older versions.
+- `headroom doctor --bundle` no longer copies `policy.toml` as text. It lists the settings as Headroom reads them, without comments: webhook and ntfy server URLs keep only their scheme and host, ntfy topics and Telegram chat ids are replaced, and the `proxy` shows only its scheme and host. A `policy.toml` that does not parse is left out. A `user:password@` in any URL elsewhere in the bundle is removed.
+- `headroom notify --test` and `--text` print only the server of an ntfy or webhook channel (`https://ntfy.sh`), not the topic or path, which work as passwords.
 
 ## [0.2.25] - 2026-11-26
 

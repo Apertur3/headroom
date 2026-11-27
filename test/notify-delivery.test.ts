@@ -534,6 +534,12 @@ describe("notification delivery", () => {
       expect(logged.join("\n")).not.toContain(TOKEN);
       expect(logged[1]).toContain("gave up");
       expect(formatLedger([row]).join("")).not.toContain(TOKEN);
+      expect(formatLedger([{ ...row, detail: "planted \x1b]52;c;eA==\x07 detail" }]).join("")).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+      // Rows an older version wrote kept the reply text; only the current
+      // shape (origin plus status, code or a constant refusal) is shown.
+      expect(formatLedger([{ ...row, detail: "404 Cannot POST /Synthetic-Topic-1234" }]).join("")).toContain("  [older error detail hidden]");
+      expect(formatLedger([{ ...row, detail: "404 Cannot POST /Synthetic-Topic-1234" }]).join("")).not.toContain("Synthetic-Topic-1234");
+      for (const current of ["https://ntfy.sh HTTP 404", "https://example.com:8443 ECONNREFUSED", "https://ntfy.sh redirect refused"]) expect(formatLedger([{ ...row, detail: current }]).join("")).toMatch(new RegExp(`  ${current}$`));
     } finally { store.close(); }
   });
 
